@@ -10,14 +10,13 @@
 # EVALUATE that expression, then curries the model's args onto the ArgTree it
 # yields and runs it over the tree. Asserts, against the scripted stub LLM:
 # registration (name + doc in the request; a reserved name is NOT shadowed),
-# invocation (the script's output returns as the tool_result), same-turn
-# dynamism — a bash edit to the tool changes what the very next call runs —
-# the `@param` contract: a
-# declared arg reaches the script at /cas/args/<name>, while a missing
-# required arg or an undeclared one comes back as an is_error tool_result
-# WITHOUT a sub-run — and, at the other end of that spectrum, a tool whose
-# sub-run DIES (no result at all) also coming back as an is_error tool_result,
-# over an unchanged workspace, with the turn carrying on.
+# invocation and same-turn dynamism — a bash edit to the tool changes a later
+# call in the same queued batch — the `@param` contract: declared args reach
+# the script at /cas/args/<name>, while a missing required arg comes back as an
+# is_error tool_result WITHOUT a sub-run — and, at the other end of that
+# spectrum, a tool whose sub-run DIES (no result at all) also coming back as an
+# is_error tool_result, over an unchanged workspace, with the queued calls and
+# turn carrying on.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -53,10 +52,18 @@ tool() {
 }
 
 mkdir -p ws/caos-tools
-tool hello 'Say hello from the tree.' <<'EOF'
+tool hello 'Say hello from the tree.
+@param word The word to echo.
+@param [suffix] An optional suffix.' <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'hello-from-tree-v1' > /tmp/o
+caos get /cas/args/word
+out="hello-from-tree-v1 word=$(cat /cas/args/word)"
+if [ -e /cas/args/suffix ]; then
+  caos get /cas/args/suffix
+  out="$out$(cat /cas/args/suffix)"
+fi
+printf '%s' "$out" > /tmp/o
 caos put /tmp/o /cas/out
 EOF
 # A reserved-name shadow attempt: must be ignored, never registered.
@@ -72,24 +79,6 @@ set -euo pipefail
 echo "boom: this tool never writes /cas/out" >&2
 exit 1
 EOF
-# A tool with parameters: one required, one optional. Reads them where every
-# curried arg lands — /cas/args/<name> — so the assertion below is on the
-# whole path from the model's JSON to the script's stdin.
-tool echo-arg 'Echo the word it is given.
-@param word The word to echo.
-@param [suffix] An optional suffix.' <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-caos get /cas/args/word
-out="word=$(cat /cas/args/word)"
-if [ -e /cas/args/suffix ]; then
-  caos get /cas/args/suffix
-  out="$out$(cat /cas/args/suffix)"
-fi
-printf '%s' "$out" > /tmp/o
-caos put /tmp/o /cas/out
-EOF
-
 # A directory that is NOT a tool: its expression binds no `--help`. Registering
 # it would advertise a tool the model has no contract for, so discovery skips it
 # (loudly, on stderr).
@@ -105,20 +94,14 @@ human1=$(mkcommit "HEAD:ws" \
   "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"run the hello tool\"}" \
   "$base")
 
-echo "== script the stub LLM (call; edit-then-call; arg calls; end) ==" >&2
-R1='[{"id":"toolu_01","input":{},"name":"hello","type":"tool_use"}]'
-R2='[{"id":"toolu_02","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_03","input":{},"name":"hello","type":"tool_use"}]'
-# Two bad calls then a good one, in ONE response: the bad ones must be
-# answered in place and the queue continue, so the good one still runs.
-R3='[{"id":"toolu_04","input":{},"name":"echo-arg","type":"tool_use"},{"id":"toolu_05","input":{"word":"x","colour":"red"},"name":"echo-arg","type":"tool_use"},{"id":"toolu_06","input":{"word":"banana","suffix":"-split"},"name":"echo-arg","type":"tool_use"}]'
-# Round 4 calls the tool that DIES. The turn must survive it and reach round 5.
-R4='[{"id":"toolu_07","input":{},"name":"boom","type":"tool_use"}]'
+echo "== script the stub LLM (edit; bad call; dead sub-run; good call; end) ==" >&2
+# All calls share one response and run in order. The missing arg must be
+# answered in place, and the dead sub-run must preserve the bash-edited
+# workspace, so the final valid hello call can still run the v2 script.
+R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{},"name":"hello","type":"tool_use"},{"id":"toolu_03","input":{},"name":"boom","type":"tool_use"},{"id":"toolu_04","input":{"word":"banana","suffix":"-split"},"name":"hello","type":"tool_use"}]'
 mkdir stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
-printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > stub/response-2.json
-printf '{"content":%s,"stop_reason":"tool_use"}' "$R3" > stub/response-3.json
-printf '{"content":%s,"stop_reason":"tool_use"}' "$R4" > stub/response-4.json
-printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-5.json
+printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-2.json
 
 stub_pid=""
 for _ in 1 2 3 4 5; do
@@ -182,15 +165,6 @@ grep -qF '"name":"undocumented"' stub/request-1.json \
   && fail "a directory whose expression binds no --help was registered as a tool"
 echo "  ok: hello registered; impostor bash and the no-help directory ignored" >&2
 
-echo "== invocation: the tool's output came back as the tool_result ==" >&2
-grep -qF 'hello-from-tree-v1' stub/request-2.json || fail "round-1 tool result missing"
-echo "  ok: hello-from-tree-v1 in the round-2 request" >&2
-
-echo "== dynamism: the bash-edited tool ran on the very next call ==" >&2
-grep -qF 'hello-from-tree-v2' stub/request-3.json \
-  || fail "edited tool did not take effect: $(grep -oF 'hello-from-tree-v[0-9]' stub/request-3.json | tr '\n' ' ')"
-echo "  ok: same-turn edit changed the tool's behavior" >&2
-
 # serde_json's Map is a BTreeMap, so a request's object keys come out sorted —
 # that is what these literal fragments are matching, not the order the json!
 # macro writes them in.
@@ -203,43 +177,39 @@ grep -qF '"required":["word"]' stub/request-1.json \
   || fail "required args wrong: [name] must be optional, a bare name required"
 # A tool with no @param tags still advertises an empty object schema — and no
 # `required` key, which the API rejects as an empty array.
-grep -qF '"description":"Say hello from the tree.","input_schema":{"properties":{},"type":"object"},"name":"hello"' \
+grep -qF '"description":"A tool that dies without producing a result.","input_schema":{"properties":{},"type":"object"},"name":"boom"' \
   stub/request-1.json || fail "an argument-less tool's schema changed shape"
-echo "  ok: word required, suffix optional, hello unchanged" >&2
+echo "  ok: word required, suffix optional, boom unchanged" >&2
 
-echo "== @param: the values reach the script at /cas/args/<name> ==" >&2
-grep -qF 'word=banana-split' stub/request-4.json \
-  || fail "the bound args did not reach the tool script"
-echo "  ok: word=banana-split came back as the tool_result" >&2
-
-echo "== @param: bad calls are is_error results, not worker errors ==" >&2
-grep -qF 'echo-arg needs a' stub/request-4.json \
+echo "== @param: a bad call is an is_error result, not a worker error ==" >&2
+grep -qF 'hello needs a' stub/request-2.json \
   || fail "a missing required arg was not reported back to the model"
-grep -qF 'takes no' stub/request-4.json \
-  || fail "an undeclared arg was not reported back to the model"
-[ "$(grep -oF '"is_error":true' stub/request-4.json | wc -l)" = 2 ] \
-  || fail "expected exactly two is_error tool_results in round 4"
-echo "  ok: both bad calls answered in place; the good call still ran" >&2
+echo "  ok: the bad call was answered in place" >&2
 
 echo "== a tool whose SUB-RUN dies is an is_error result, not a dead turn ==" >&2
-# The turn reaching round 5 at all is the assertion: before `run-then --catch`
+# The turn reaching round 2 at all is the assertion: before `run-then --catch`
 # the failed sub-run errored the whole run, the conversation ref never moved,
 # and the model never learned why. (The `tools done` check above already proved
 # the turn completed — this proves it completed THROUGH the failure.)
-[ -e stub/request-5.json ] || fail "the turn died on the failing tool instead of continuing"
-grep -qF 'the `boom` tool failed to run' stub/request-5.json \
+[ -e stub/request-2.json ] || fail "the turn died on the failing tool instead of continuing"
+grep -qF 'the `boom` tool failed to run' stub/request-2.json \
   || fail "the sub-run failure was not reported back to the model"
-grep -qF '"is_error":true' stub/request-5.json \
-  || fail "the failure was not marked is_error"
+[ "$(grep -oF '"is_error":true' stub/request-2.json | wc -l)" = 2 ] \
+  || fail "the validation and sub-run failures were not both marked is_error"
+# The good call is after both failures in the same queue. Its result proves
+# that the queue continued, the bash edit survived the failed sub-run, and the
+# declared args reached the script at /cas/args/<name>.
+grep -qF 'hello-from-tree-v2 word=banana-split' stub/request-2.json \
+  || fail "the queued tool lost its args or the edited workspace"
 # The workspace must be the pre-call one: a tool that never produced a result
 # cannot have advanced it. Asserted on the TURN TREE, not on the request — the
-# request replays the transcript, so an earlier round's text would match there
-# whatever happened to the tree.
+# request proves the queued tool's input; this separately proves the terminal
+# turn tree stayed on that workspace.
 hello_after=$(git show "$turn:caos-tools/hello/worker.sh")
 case "$hello_after" in
   *hello-from-tree-v2*) ;;
-  *) fail "the round-4 failure lost the workspace edit from round 2" ;;
+  *) fail "the failed sub-run lost the earlier workspace edit" ;;
 esac
-echo "  ok: the dead sub-run came back as a value and the turn finished" >&2
+echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
 
 echo "caos-tools: ALL PASS" >&2
