@@ -1,7 +1,7 @@
 # caos
 
-Caos is a Content-Addressable Operating System. It's functional programming with git as the values and docker as the
-functions, cached by redis
+Caos is a Content-Addressable Operating System: functional programming with git as the values and docker as the
+functions, cached by redis.
 
 # Why?
 
