@@ -10,10 +10,12 @@
 #                                        the server stacks and pushes on first
 #                                        use — the same shape std/flake-builder
 #                                        emits
-#   flake     (bash, merge)               literal checked-in std/<name> dirs —
-#                                        complete worker images, /worker
-#                                        included; the flake-builder images
-#                                        each tree on first use
+#   flake     (bash, merge)              source dirs published whole — a flake
+#                                        (flake.nix + flake.lock + worker) plus
+#                                        a `.caos-expr` (`run /std/flake-builder
+#                                        -- --in:@=.`); resolving the entry
+#                                        evaluates that expression to build the
+#                                        image (design/caos-expr.md, Phase 3)
 #   curry     (bin_names)                curry(runner, worker1=<binary>) — the
 #                                        compiled workers ride the shared
 #                                        runner pool
@@ -29,22 +31,25 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge)
+[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge rgrep)
 
-# std entries that are FLAKE TREES (design/flake-images.md, part 2): the
-# checked-in std/<name> directory IS the published tree, copied whole —
-# nothing generated (std/refresh.sh maintains the checked-in redundancies,
-# tests/std-lint verifies them). The server's flake-builder images each
-# tree on first use.
-is_flake_entry() { case "$1" in bash | merge) return 0 ;; *) return 1 ;; esac; }
+# std entries that are SOURCE DIRS published whole (design/caos-expr.md,
+# Phase 3): the checked-in std/<name> directory IS the published tree, copied
+# verbatim — nothing generated (std/refresh.sh maintains the checked-in
+# redundancies, tests/std-lint verifies them). Each carries a `.caos-expr`, so
+# resolving `/cas/std/<name>` evaluates that expression to build the image:
+#   bash, merge  — flake dirs; the expr runs /std/flake-builder on the dir.
+#   rgrep        — a Rust project; the expr builds it with /std/rustc (its
+#                  regex dep rides the seeded /std/cargo bake).
+is_source_entry() { case "$1" in bash | merge | rgrep) return 0 ;; *) return 1 ;; esac; }
 # Everything else is a DELTA entry: the flake-builder (the bootstrap image),
 # the runner (the pooled interpreter) — both self-contained nix closures — and
 # cargo, whose image the root flake builds from the same `src` and toolchain as
 # the binaries (so its deps are cargoArtifacts, not a second compile of them).
-# The partition is exactly two-way, so "not a flake entry" IS the predicate.
+# The partition is exactly two-way, so "not a source entry" IS the predicate.
 image_names=()
 for name in "${names[@]}"; do
-  is_flake_entry "$name" || image_names+=("$name")
+  is_source_entry "$name" || image_names+=("$name")
 done
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
@@ -105,7 +110,7 @@ done
 # runtime nix), else they're nix-built here. Nothing is staged into flake
 # trees anymore: runner's /worker bakes into its streamed image, cargo's
 # compiles in-flake from the vendored source.
-bin_names=(bash-tool llm-call llm-step rgrep deep-deps rustc)
+bin_names=(bash-tool llm-call llm-step deep-deps rustc)
 if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
   bin_paths=$CAOS_BUILTIN_BINS
 else
@@ -289,28 +294,28 @@ for name in "${image_names[@]}"; do
   echo "$name: git-docker delta ${hash_of[$name]} over $ctag" >&2
 done
 
-# The flake-tree std entries (design/flake-images.md): bash is LITERAL —
-# the checked-in std/<name> directory is the published tree, copied whole,
-# nothing generated. The server's flake-builder images the tree on first
-# use, memoized in the registry on the tree's own hash, so re-publishing an
-# unchanged tree costs nothing.
+# The source-dir std entries (design/caos-expr.md, Phase 3): each checked-in
+# std/<name> directory IS the published tree, copied whole, nothing generated —
+# its `.caos-expr` computes the image when the entry is resolved (bash/merge via
+# /std/flake-builder, rgrep via /std/rustc). Publishing an unchanged tree costs
+# nothing; the build it describes is memoized on first resolution.
 # Staged inside CLIENT (like worker-common below) because only git-tracked
 # paths can be hashed here.
 for name in "${names[@]}"; do
-  is_flake_entry "$name" || continue
+  is_source_entry "$name" || continue
   rm -rf "${CLIENT:?}/$name"
   # -L: PROJECT may be an image layout whose files are SYMLINKS into the nix
   # store (the test stack, design/test-stack-image.md). Copying those verbatim
-  # would publish a tree of links to store paths no other container has — the
-  # flake-builder then finds no flake.nix. Dereference, so what is published
-  # is always the content. On the host every entry is already a real file.
+  # would publish a tree of links to store paths no other container has — a
+  # consumer then finds no source. Dereference, so what is published is always
+  # the content. On the host every entry is already a real file.
   cp -RL "$PROJECT/std/$name" "$CLIENT/$name"
   # PROJECT may be a read-only store copy (caosd); writable so the next
   # publish's rm -rf works.
   chmod -R u+w "$CLIENT/$name"
   git -C "$CLIENT" add "$name"
   hash_of[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
-  echo "$name: flake tree ${hash_of[$name]}" >&2
+  echo "$name: source tree ${hash_of[$name]}" >&2
 done
 
 # The compiled workers: each is published as a ready-to-run curry over the

@@ -45,6 +45,21 @@ use super::{
     post_object, request_compute, resolve_std_image, Transport,
 };
 
+/// Evaluate a std library entry named `<name>` within the std tree `std_tree`
+/// (design/caos-expr.md, Phase 3). This is just [`eval_path`] with the entry
+/// name as the path: a std-root `.caos-expr` is applied to the whole tree first
+/// (e.g. a `deep-deps` transform), then the named entry's own `.caos-expr` (if
+/// any) computes its image — so both the direct-image form and the
+/// source-plus-`.caos-expr` form resolve identically for every
+/// `/cas/std/<name>` consumer.
+pub(crate) fn eval_std_entry(
+    t: &dyn Transport,
+    std_tree: &str,
+    name: &str,
+) -> Result<String, String> {
+    eval_path(t, std_tree, name).map(|(_kind, oid)| oid)
+}
+
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
 /// root of the tree down to `<path>` and print the resulting object's
 /// `"<kind> <hash>"`. With no `--tree`, the tracked workspace tree is the start

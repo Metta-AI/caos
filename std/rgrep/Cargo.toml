@@ -1,0 +1,33 @@
+# std/rgrep — recursive grep as a caos-native std tool (design/caos-expr.md,
+# Phase 3). This directory IS the tool: its Rust source (src/main.rs), its
+# dependency manifest (this file), and its `.caos-expr`. Resolving
+# `/cas/std/rgrep` evaluates the expression, which builds this project with
+# `/std/rustc`.
+#
+# regex is a crates.io dependency; it needs no special handling because the
+# `/std/cargo` image seeds the whole workspace's vendored+precompiled deps
+# (std/cargo/bake.nix), and this project's dev profile below matches the bake,
+# so cargo REUSES the seeded `regex` artifact rather than recompiling it.
+[package]
+name = "rgrep"
+version = "0.0.0"
+edition = "2021"
+
+# /std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by /std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }
+regex = "1"
+
+# Match the caos workspace's dev profile (Cargo.toml) so dependency
+# fingerprints line up with the bake and `regex` is reused from the seeded
+# `/std/cargo` target/ rather than recompiled.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

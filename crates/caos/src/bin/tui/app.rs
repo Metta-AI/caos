@@ -2078,6 +2078,26 @@ impl App {
             KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
                 self.selected_mut().composer.move_end()
             }
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+            {
+                self.selected_mut().composer.select_word_left()
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+            {
+                self.selected_mut().composer.select_word_right()
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.move_word_left()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.move_word_right()
+            }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.selected_mut().composer.move_word_left()
             }
@@ -3253,6 +3273,37 @@ mod tests {
         assert_eq!(app.selected().composer.text, "one  ");
         app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
         assert_eq!(app.selected().composer.text, "");
+    }
+
+    #[test]
+    fn control_arrows_move_by_words() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("one  λambda");
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.selected().composer.cursor,
+            app.selected().composer.text.len()
+        );
+
+        // Shift+Control extends a word-wise selection.
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.selected_composer_text(), Some("λambda"));
     }
 
     #[test]

@@ -66,7 +66,7 @@ focus back to the list. The focused pane's border is highlighted.
 | `Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
-| `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
+| `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right`, or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
 | `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
 | `Ctrl+W` (conversation focused) | Delete the previous word |
 | `Ctrl+K` (conversation focused) | Kill from the cursor to the end of the line |

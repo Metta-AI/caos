@@ -5,11 +5,14 @@
 //! required args, so it matches any job. On a job it runs
 //!
 //! ```text
-//! docker run --rm --network <net> -e CAOS_SERVER_URL=<url> \
+//! docker run --name caos-worker-<nonce> --label caos.runnerd.owner=<id> \
+//!     --network <net> -e CAOS_SERVER_URL=<url> \
 //!     --entrypoint /bin/caos <image_ref> runner --job=<json>
 //! ```
 //!
-//! and waits for the container to exit. The container owns the job from there:
+//! and waits for the container to exit, then removes it itself (`docker rm -f`)
+//! — NOT `--rm`, which would make the CLI wait on `condition=removed` and pin a
+//! core inside podman; see `run_container`. The container owns the job from here:
 //! it posts the result itself, then polls for more work for its image (that's
 //! what makes it a warm runner) — this slot doesn't poll again until the
 //! container dies, so each slot is exactly one machine's worth of capacity.
@@ -48,6 +51,26 @@ const ENGINE_SOCKET_PATH: &str = "/run/caos/engine.sock";
 /// and the runner decides whether to honour it. Before this, every worker in
 /// the pool got the socket because one image needed it.
 const SOCKET_GRANT_ENV: &str = "CAOS_GRANT_ENGINE_SOCKET";
+
+/// Label stamped on every worker container we start, so a restarted runnerd can
+/// find and delete the containers its predecessor left behind. Its value is
+/// `owner_id()`, not a constant: containers are not `--rm` any more, so the
+/// reaper is what keeps a crash from leaking them.
+const OWNER_LABEL: &str = "caos.runnerd.owner";
+
+/// Which runnerd owns a container. The hostname is this runnerd's container id
+/// under docker/podman — stable across process restarts inside one container,
+/// and distinct from any other runnerd sharing the same engine (an inner
+/// runnerd delegating over `--remote` is a different container). Falls back to
+/// a literal, which only costs the reaper precision, never correctness: it only
+/// ever deletes containers already in `exited`.
+fn owner_id() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|h| h.trim().to_string())
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 /// How long each generic poll hangs. Purely a reconnect cadence — a generic
 /// runner never idles out, it just polls again.
@@ -128,6 +151,7 @@ fn main() {
         "caos-runnerd: {} slots, server {}, network {}",
         config.slots, config.server_url, config.network
     );
+    reap_leftovers(&config);
     let mut threads = Vec::new();
     for slot in 1..config.slots {
         let config = Arc::clone(&config);
@@ -272,16 +296,31 @@ fn poll(config: &Config) -> Result<Option<Job>, String> {
 /// Run the job's container and wait it out. The container posts its own
 /// results; we only backstop a crash — nonzero exit means it may never have
 /// reported, so post a failure with the captured log (410 if it did report).
+///
+/// Deliberately NOT `--rm`: an *attached* `docker run --rm` waits with
+/// `condition=removed`, i.e. `POST /containers/<id>/wait?condition=removed`,
+/// and podman's compat handler spins a core on that call for as long as the
+/// container is stopped-but-not-yet-removed. Podman also loses auto-removals
+/// outright (containers sit in `Exited` with `AutoRemove=true` forever), which
+/// turns that spin into a permanent one. So we take exit-wait only — which the
+/// engine answers from an event, not a poll — and delete the container
+/// ourselves afterwards.
 fn run_container(config: &Config, slot: u32, job: &Job) {
     eprintln!(
         "runnerd slot {slot}: arg_tree {} -> container ({})",
         job.arg_tree, job.image_ref
     );
+    let name = format!("caos-worker-{}", job.nonce);
     let mut command = Command::new(&config.docker_bin);
     command
         .args(&config.docker_args) // global flags (e.g. --remote --url …) precede `run`
         .arg("run")
-        .arg("--rm")
+        .args(["--name", &name])
+        // Our mark for the crash reaper — see `reap_leftovers`. Scoped to this
+        // runnerd, because an INNER runnerd delegating to the outer engine
+        // (`--remote --url …`) shares a container namespace with the outer one,
+        // and must not sweep its siblings' containers.
+        .args(["--label", &format!("{OWNER_LABEL}={}", owner_id())])
         .args(["--network", &config.network]);
     if let Some(sock) = &config.socket {
         if image_wants_socket(config, &job.image_ref) {
@@ -301,10 +340,14 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         .arg("runner")
         .arg(format!("--job={}", job.payload))
         .output();
+    // Delete it ourselves, now that we hold its exit status and its log. A
+    // plain `rm -f` is one DELETE the engine answers synchronously — none of
+    // the auto-remove machinery, and nothing polls.
+    remove_container(config, &name);
     let failure = match out {
         Ok(out) => {
             // Relay the container's log (the runner relays its workers' output
-            // to its stderr) so it survives the container's `--rm`.
+            // to its stderr) so it survives the container's removal.
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             if out.status.success() {
                 None
@@ -322,6 +365,69 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         if let Err(e) = post_failure(config, job, &error, &log) {
             eprintln!("runnerd slot {slot}: reporting failure: {e}");
         }
+    }
+}
+
+/// Delete one worker container. Best-effort and quiet: a container that is
+/// already gone is the normal case for the reaper, and a removal that fails is
+/// a leaked container, not a failed job — the job's result is already settled
+/// by the time we get here.
+fn remove_container(config: &Config, name_or_id: &str) {
+    let out = Command::new(&config.docker_bin)
+        .args(&config.docker_args)
+        .args(["rm", "-f", name_or_id])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => eprintln!(
+            "caos-runnerd: removing {name_or_id}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("caos-runnerd: removing {name_or_id}: {e}"),
+    }
+}
+
+/// Delete the exited worker containers this runnerd's predecessor left behind.
+/// Without `--rm` the engine no longer cleans up after a runnerd that died
+/// mid-run, so this is the replacement — run once at startup, before any slot
+/// claims a job.
+///
+/// `status=exited` is load-bearing as well as safe: our own live workers are
+/// still running, and so are any siblings that happen to share the label.
+fn reap_leftovers(config: &Config) {
+    let filter = format!("label={OWNER_LABEL}={}", owner_id());
+    let out = Command::new(&config.docker_bin)
+        .args(&config.docker_args)
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "status=exited",
+            "--filter",
+            &filter,
+        ])
+        .output();
+    let listed = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            eprintln!(
+                "caos-runnerd: listing leftover containers: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("caos-runnerd: listing leftover containers: {e}");
+            return;
+        }
+    };
+    let ids: Vec<&str> = listed.split_whitespace().collect();
+    if ids.is_empty() {
+        return;
+    }
+    eprintln!("caos-runnerd: reaping {} leftover container(s)", ids.len());
+    for id in ids {
+        remove_container(config, id);
     }
 }
 

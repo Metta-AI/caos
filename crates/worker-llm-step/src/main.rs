@@ -31,6 +31,7 @@
 //! Commit structure and the `.caos/step.json` format are documented in
 //! design/agent-harness.md; the constants below are the load-bearing bits.
 
+mod githist;
 mod progress;
 mod tools;
 
@@ -320,6 +321,31 @@ fn drive(
                 }
             }
         }
+        // A built-in history tool (log/show/diff)? Like a tree tool, but the
+        // script ships with the harness and it always gets the `#@git` context.
+        if githist::is_builtin(name) && cfg.tools_image.is_some() {
+            let tool = githist::tool(name).expect("is_builtin implies tool");
+            match tools::tree_tool_args(&call, &tool) {
+                Err(block) => {
+                    results.push(block);
+                    queue.remove(0);
+                    continue;
+                }
+                Ok(bound) => {
+                    return launch_githist(
+                        cfg,
+                        &call,
+                        name,
+                        &bound,
+                        &ws,
+                        &wc,
+                        step_path,
+                        &queue[1..],
+                        &results,
+                    )
+                }
+            }
+        }
         // A tree tool? Resolved in the CURRENT workspace at invocation time,
         // so a call made right after an edit runs the edited script.
         if !tools::is_inline(name) && cfg.tools_image.is_some() {
@@ -340,6 +366,7 @@ fn drive(
                             name,
                             &script,
                             &bound,
+                            tool.git,
                             &ws,
                             &wc,
                             step_path,
@@ -352,7 +379,7 @@ fn drive(
         }
         if !tools::is_inline(name) {
             return Err(format!(
-                "model called unknown tool {name:?} (built-ins: bash, grep, read, read-oid, \
+                "model called unknown tool {name:?} (built-ins: bash, grep, read, \
                  ls, write, edit, merge; plus this workspace's caos-tools/*.sh)"
             ));
         }
@@ -709,6 +736,12 @@ fn launch_grep(
 /// on exactly (workspace tree, script content, the bound `#@arg`s) — and an
 /// edited tool is a new key automatically. The result is a value, not a
 /// workspace — the current `ws` rides the continuation, unchanged by the run.
+///
+/// A `#@git` tool additionally gets the workspace commit (`wc`, a gitlink it
+/// reads as the raw commit object — history's entry point via `caos get-hash`)
+/// and the turn's ref snapshot (`refs`, the same `name <hash>` lines the merge
+/// tool resolves `--theirs` against). Only `#@git` tools get them: `wc` moves
+/// every step, so binding it into build/test would sink their caches.
 #[allow(clippy::too_many_arguments)]
 fn launch_tree_tool(
     cfg: &Config,
@@ -716,6 +749,7 @@ fn launch_tree_tool(
     name: &str,
     script: &str,
     bound: &[(String, String)],
+    git: bool,
     ws: &str,
     wc: &str,
     step_path: &str,
@@ -735,6 +769,15 @@ fn launch_tree_tool(
     // different job, not a cache hit.
     let mut kvs: Vec<(&str, Arg)> = vec![("worker1", Arg::Path(script))];
     kvs.extend(bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))));
+    // History context, for `#@git` tools only. `wc` is commit-kinded, so it
+    // curries as a gitlink (`:commit=`) and the tool reads it as the raw commit
+    // object — exactly how the merge tool receives `ours`.
+    if git {
+        kvs.push(("wc", Arg::Path(wc)));
+        if let Some(refs) = cfg.merge_refs.as_deref() {
+            kvs.push(("refs", Arg::Lit(refs)));
+        }
+    }
     let curried = caos_curry(image, &kvs)?;
     let me = self_curry(
         wc,
@@ -745,6 +788,34 @@ fn launch_tree_tool(
         &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
     )?;
     run_then_catching(ws, &curried, &me)
+}
+
+/// Launch a built-in history tool (`log`/`show`/`diff`): assemble its embedded
+/// script (`githist::script`), `caos put` it into CAS, and hand it to
+/// [`launch_tree_tool`] with `git = true`. So it runs on the tree-tool image
+/// with the `#@git` context and its result is rendered by the same callback
+/// arm — the only difference from a project tool is where the script comes from.
+#[allow(clippy::too_many_arguments)]
+fn launch_githist(
+    cfg: &Config,
+    call: &Value,
+    name: &str,
+    bound: &[(String, String)],
+    ws: &str,
+    wc: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
+    let dir = scratch(&format!("githist-{name}"))?;
+    let file = dir.join("worker.sh");
+    fs::write(&file, body).map_err(|e| format!("writing {name} script: {e}"))?;
+    let script = fresh("githist-script");
+    caos(["put", path(&file), &script])?;
+    launch_tree_tool(
+        cfg, call, name, &script, bound, true, ws, wc, step_path, pending, results,
+    )
 }
 
 /// Rebuild ourselves as the `then` for the next round — the same ArgTree we're
@@ -946,6 +1017,9 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     // Tree tools: whatever caos-tools/*.sh the CURRENT workspace carries —
     // re-discovered every round, so the set tracks the agent's own edits.
     if cfg.tools_image.is_some() {
+        // The built-in history tools (log/show/diff) run on the same std/bash
+        // image as tree tools, so they share its gate.
+        tools.extend(githist::declarations());
         for tool in tools::tree_tools(ws)? {
             tools.push(tools::tree_tool_declaration(&tool));
         }
@@ -963,7 +1037,7 @@ fn merge_tool() -> Value {
     result. A conflict advances it too, with git's inline conflict markers in the files and a \
     reserved `.caos/conflicts` file listing every unresolved path — including structural \
     conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file \
-    (use `read-oid` to inspect a stage's content by its hash), then delete that path's rows \
+    (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows \
     from `.caos/conflicts`. Then build and test.",
         "input_schema": {
             "type": "object",
@@ -1047,8 +1121,8 @@ fn merge_result_block(id: &str, ws: &str) -> Result<Value, String> {
         Some(body) => format!(
             "merge produced conflicts. The workspace now carries git's inline conflict markers \
              in the affected files, plus .caos/conflicts (git's unmerged notation, richer than \
-             markers). Resolve each path — edit the file, using read-oid to inspect a stage's \
-             content by its hash — then delete that path's rows from .caos/conflicts. Build and \
+             markers). Resolve each path — edit the file, reading a stage's content with `read` \
+             (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. Build and \
              test when done.\n\n.caos/conflicts:\n{}",
             body.trim_end()
         ),
