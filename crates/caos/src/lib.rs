@@ -38,6 +38,9 @@ use gix::objs::WriteTo;
 pub mod chat;
 pub use chat::{cli_chat, cli_talk};
 
+mod eval;
+pub use eval::cli_eval_path;
+
 /// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool script as a caos job over this repo's tree, exactly what an
 /// agent's tool invocation does. The bash worker gets the tracked worktree
@@ -439,6 +442,28 @@ impl GitTransport {
     /// The worktree this transport and its subprocess Git commands operate on.
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// Verify that the configured CAOS server accepts connections.
+    ///
+    /// The server deliberately returns 404 at its root, so any HTTP response
+    /// proves reachability. This is a user-facing preflight for interactive
+    /// clients: it fails before they take over the terminal and turns a later,
+    /// low-level Git transport error into one concise diagnosis.
+    pub fn ensure_server_reachable(&self) -> Result<(), String> {
+        const TIMEOUT_SECS: u64 = 5;
+
+        let url = self.server_url()?;
+        minreq::get(url.trim_end_matches('/'))
+            .with_timeout(TIMEOUT_SECS)
+            .send()
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "cannot reach the CAOS server at {url}: {error}\n\
+                     check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
+                )
+            })
     }
 
     pub(crate) fn git_capture(
@@ -2201,13 +2226,28 @@ fn prepare_request(
     cas: Option<&Path>,
     kvs: &[String],
 ) -> Result<String, String> {
+    // Build the call's args (paths resolve per `cas`), then hand them to the
+    // shared assembler, which folds in the image, salt and std.
+    let call = build_arg_entries(t, cas, kvs)?;
+    assemble_arg_tree(t, image, call)
+}
+
+/// Assemble a runnable ArgTree from a base `image` ref and the caller's already
+/// resolved `call` args, folding in the reserved `image`/`salt`/`std` entries,
+/// storing it, and getting it onto the server. Returns the ArgTree hash (the
+/// request id and cache key). Shared by [`prepare_request`] (which resolves
+/// `call` from kvs) and the `.caos-expr` evaluator (which resolves `call`
+/// against a git tree).
+fn assemble_arg_tree(
+    t: &dyn Transport,
+    image: &str,
+    call: Vec<gix::objs::tree::Entry>,
+) -> Result<String, String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it. The image is folded into the args tree below, so the server
     // only ever sees a plain args tree.
     let (image, bound) = unwrap_curry(t, image)?;
 
-    // Build the call's args, then merge them over the bound ones (call wins).
-    let call = build_arg_entries(t, cas, kvs)?;
     // The worker (image) rides *in* the args tree under the reserved `image`
     // entry, rather than as a sibling of `args` in the request. So a computation
     // is identified entirely by its args (an executor can match on the worker
@@ -2272,7 +2312,7 @@ fn prepare_request(
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
-    record_continuation(t, "map-then", input, kvs, &["map", "then"], |given| {
+    record_continuation(t, "map-then", input, kvs, &["map", "then"], &[], |given| {
         if given.is_empty() {
             return Err("`map-then` needs --map and/or --then".to_string());
         }
@@ -2280,36 +2320,61 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     })
 }
 
-/// `run-then <in> -- --run=<image> [--then=<image>]` — the single-valued
-/// [`caos_map_then`]: record a continuation `{in, run, then?}` as this worker's
-/// result at `/cas/out` and exit. The server runs `run(--in=<in>)` once,
-/// yielding R; with `--then` the request's result is `then(--in=<in>,
-/// --result=<R>)` (symmetric with map-then's `--in`/`--children`), else R
-/// itself — so `run` with no `then` is a plain tail call to `run`. `--run` is
-/// required (a bare tail call to one image); `--map` doesn't belong here —
-/// `map` and `run` are mutually exclusive, which this surface enforces
-/// client-side. Image refs resolve exactly as in `map-then`.
+/// `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
+/// single-valued [`caos_map_then`]: record a continuation `{in, run, then?,
+/// catch?}` as this worker's result at `/cas/out` and exit. The server runs
+/// `run(--in=<in>)` once, yielding R; with `--then` the request's result is
+/// `then(--in=<in>, --result=<R>)` (symmetric with map-then's
+/// `--in`/`--children`), else R itself — so `run` with no `then` is a plain tail
+/// call to `run`. `--run` is required (a bare tail call to one image); `--map`
+/// doesn't belong here — `map` and `run` are mutually exclusive, which this
+/// surface enforces client-side. Image refs resolve exactly as in `map-then`.
+///
+/// `--catch` (a bare flag) makes a FAILING `run` a value instead of an error:
+/// the `then` is called with `--error=<blob of the failure text>` in place of
+/// `--result`, and the request succeeds. It needs `--then` — there is nowhere
+/// else for the error to go — and the enclosing request is then left uncached,
+/// so a retry really retries. Reach for it when the caller's job is to react to
+/// the failure rather than propagate it: the agent loop wants a failed tool to
+/// come back as an `is_error` tool_result, not to kill the turn.
 pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
-    record_continuation(t, "run-then", input, kvs, &["run", "then"], |given| {
-        if !given.contains(&"run") {
-            return Err("`run-then` needs --run (with an optional --then)".to_string());
-        }
-        Ok(())
-    })
+    record_continuation(
+        t,
+        "run-then",
+        input,
+        kvs,
+        &["run", "then"],
+        &["catch"],
+        |given| {
+            if !given.contains(&"run") {
+                return Err("`run-then` needs --run (with an optional --then)".to_string());
+            }
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`run-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Shared body of [`caos_map_then`] / [`caos_run_then`]: record a continuation
 /// `{in, <images>}` over `input` as this worker's result at `/cas/out` (a
 /// `promise` placeholder the server resolves once the job is posted). `allowed`
 /// names the image-valued entries this verb accepts — the surface split is the
-/// client-side mutual exclusion of `map` and `run` — and `check` validates the
-/// set actually given, before anything is sealed.
+/// client-side mutual exclusion of `map` and `run` — `markers` names its bare
+/// flags (recorded as one-byte blobs; the interpreter reads only their
+/// presence), and `check` validates the set actually given, before anything is
+/// sealed.
 fn record_continuation(
     t: &dyn Transport,
     verb: &str,
     input: &str,
     kvs: &[String],
     allowed: &[&'static str],
+    markers: &[&'static str],
     check: impl FnOnce(&[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
@@ -2338,13 +2403,37 @@ fn record_continuation(
 
     let mut given: Vec<&str> = Vec::new();
     for kv in kvs {
+        // Markers are bare flags, matched BEFORE parse_kv — which requires a
+        // `=value` and would reject them. Presence is the whole signal, so the
+        // recorded blob's content is arbitrary; the interpreter never reads it.
+        if let Some(&name) = markers.iter().find(|&&m| kv.strip_prefix("--") == Some(m)) {
+            if given.contains(&name) {
+                return Err(format!("--{name} given twice"));
+            }
+            entries.push(Entry {
+                mode: EntryKind::Blob.into(),
+                filename: name.as_bytes().to_vec().into(),
+                oid: post_object(t, "blob", b"1")?,
+            });
+            given.push(name);
+            continue;
+        }
         let (name, value) = parse_kv(kv)?;
         let Some(&name) = allowed.iter().find(|&&a| a == name) else {
-            let flags = allowed
+            let mut flags = allowed
                 .iter()
                 .map(|a| format!("--{a}"))
                 .collect::<Vec<_>>()
                 .join(" and ");
+            if !markers.is_empty() {
+                let m = markers
+                    .iter()
+                    .map(|a| format!("--{a}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                flags = format!("{flags} (each an image ref) and the flag {m}");
+                return Err(format!("`{verb}` takes only {flags}, got --{name}"));
+            }
             return Err(format!(
                 "`{verb}` takes only {flags} (each an image ref), got --{name}"
             ));
@@ -2741,6 +2830,21 @@ fn curry_object(
     unbind: &[&str],
     kvs: &[String],
 ) -> Result<gix::ObjectId, String> {
+    let new = build_arg_entries(t, cas, kvs)?;
+    curry_from_entries(t, arg_tree, unbind, new)
+}
+
+/// The body of [`curry_object`] once the new args are resolved into `new`
+/// entries: decompose `arg_tree` into `(base, bound)`, drop the `unbind` names,
+/// refuse any rebind, add `new`, and store the curry node. Shared with the
+/// `.caos-expr` evaluator, which resolves its `new` entries against a git tree
+/// rather than from kvs.
+fn curry_from_entries(
+    t: &dyn Transport,
+    arg_tree: &str,
+    unbind: &[&str],
+    new: Vec<gix::objs::tree::Entry>,
+) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let (base, mut bound) = unwrap_curry(t, arg_tree)?;
@@ -2765,7 +2869,6 @@ fn curry_object(
     // `worker1`), and silent override turns it into a distant, cryptic
     // failure. Call-time args still override curry bindings at run — only
     // curry-over-curry is strict. Unbind (above) is the deliberate release.
-    let new = build_arg_entries(t, cas, kvs)?;
     for e in &new {
         if bound.iter().any(|b| b.filename == e.filename) {
             return Err(format!(
@@ -3089,6 +3192,43 @@ mod git_transport_tests {
                 .to_string(),
             expected_head
         );
+    }
+
+    #[test]
+    fn unreachable_server_error_names_the_url_and_remote() {
+        let root = TestDir::new("unreachable-server");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        git(&repo, &["remote", "add", CAOS_REMOTE, &url]);
+
+        let error = GitTransport::discover(&repo)
+            .unwrap()
+            .ensure_server_reachable()
+            .unwrap_err();
+
+        assert!(error.contains(&format!("cannot reach the CAOS server at {url}")));
+        assert!(error.contains("check that it is running"));
+        assert!(error.contains("`caos` git remote"));
+    }
+
+    #[test]
+    fn missing_caos_remote_error_explains_how_to_add_it() {
+        let root = TestDir::new("missing-caos-remote");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let error = GitTransport::discover(&repo)
+            .unwrap()
+            .ensure_server_reachable()
+            .unwrap_err();
+
+        assert!(error.contains("no `caos` git remote"));
+        assert!(error.contains("`git remote add caos <server-url>`"));
     }
 
     #[test]

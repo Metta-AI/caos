@@ -329,19 +329,26 @@ fn run_dispatch(
 
     // A promise is not a value: the worker exited leaving a map-then continuation
     // behind. Resolve it — the container (and its slot) are already gone.
-    let result = match result.split_once(' ') {
+    let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
             resolve_promise(config, cont, std, salt, &child_stack, trace_id).map_err(fail)?
         }
-        _ => result,
+        _ => (result, false),
     };
 
-    // Cache the (resolved) result for next time (best-effort).
-    match cache_set(&config.redis_addr, key, &result) {
-        Ok(()) => eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cached)"),
-        Err(e) => {
-            eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cache store failed: {e})")
+    // Cache the (resolved) result for next time (best-effort) — unless a `catch`
+    // folded a sub-run failure into it. A failed sub-run is deliberately never
+    // cached; memoizing the parent that swallowed it would reintroduce exactly
+    // the memoized red that rule exists to prevent, and make it unretryable.
+    if caught {
+        eprintln!("ran worker: arg_tree={arg_tree} -> {result} (not cached: caught a failure)");
+    } else {
+        match cache_set(&config.redis_addr, key, &result) {
+            Ok(()) => eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cached)"),
+            Err(e) => {
+                eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cache store failed: {e})")
+            }
         }
     }
 
@@ -475,8 +482,8 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 
 // ---- Promise resolution ------------------------------------------------------
 
-/// Resolve a continuation — a tree `{in, map?, run?, then?}` where `in` is a
-/// real tree entry (the data node) and `map`/`run`/`then` are blobs naming
+/// Resolve a continuation — a tree `{in, map?, run?, then?, catch?}` where `in`
+/// is a real tree entry (the data node) and `map`/`run`/`then` are blobs naming
 /// images (see `design/map-then.md`). `map` and `run` are mutually exclusive
 /// (the client already refuses to record both; this is defense in depth). One
 /// resolution path covers both forms — a *middle step*, then `then`:
@@ -494,6 +501,23 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 /// Every sub-run goes through [`run_work_request`], so promises nest arbitrarily (a map
 /// child, a `run`, or a `then` may itself promise) and each sub-run gets its
 /// own memoization and cycle detection (via `stack`).
+///
+/// **`catch`** (a marker blob, `run` only) makes a FAILING `run` a value the
+/// `then` receives rather than an error that propagates: `then(--in=<in>,
+/// --error=<blob>)`, the blob holding the failure text, exactly where
+/// `--result` would have been. Without it a failed sub-run fails the whole
+/// request, which is the right default for a pipeline — but wrong for a driver
+/// that must survive its callee, the agent loop being the case that forced it
+/// (`design/agent-harness.md`, "Tool failures are values"). Scoped to `run`
+/// deliberately: a caught `map` would have to say WHICH child failed and what
+/// the surviving siblings' results mean, and nothing needs that yet.
+///
+/// The bool in the return says a catch fired. It rides out to [`run_dispatch`]
+/// so the enclosing request is NOT memoized: sub-run failures are uncached by
+/// design (`design/cargo-workers.md`), and folding one into a cached parent
+/// result would launder it into a permanent answer — a retry would replay the
+/// failure without re-running anything. `then`'s own request still caches
+/// normally; the error blob is in its ArgTree, so same error in, same out.
 fn resolve_promise(
     config: &Config,
     cont: &str,
@@ -501,11 +525,12 @@ fn resolve_promise(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
-) -> Result<String, HttpError> {
+) -> Result<(String, bool), HttpError> {
     use gix::objs::tree::EntryKind;
 
     let mut input: Option<gix::objs::tree::Entry> = None;
     let (mut map, mut run, mut then) = (None, None, None);
+    let mut catch = false;
     for entry in fetch_tree(config, cont)
         .map_err(|e| HttpError::new(500, format!("reading continuation {cont}: {e}")))?
     {
@@ -514,6 +539,8 @@ fn resolve_promise(
             "map" => map = Some(blob_string(config, &entry.oid.to_string())?),
             "run" => run = Some(blob_string(config, &entry.oid.to_string())?),
             "then" => then = Some(blob_string(config, &entry.oid.to_string())?),
+            // Presence is the whole signal; the content is unread.
+            "catch" => catch = true,
             other => {
                 return Err(HttpError::new(
                     500,
@@ -536,6 +563,26 @@ fn resolve_promise(
             format!("continuation {cont} has none of 'map', 'run', or 'then'"),
         ));
     }
+    // Both checked here rather than client-side only: a continuation is a tree
+    // any worker can hand us, so the interpreter states its own contract.
+    if catch && run.is_none() {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has 'catch' without 'run' (catch covers the run step)"),
+        ));
+    }
+    if catch && then.is_none() {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has 'catch' without 'then' (nothing would receive the error)"
+            ),
+        ));
+    }
+
+    // Set when `catch` turns a failed `run` into an `--error` arg; rides out to
+    // [`run_dispatch`], which then skips memoizing this request.
+    let mut caught = false;
 
     // The middle step, if any: `map` fans out over `in`'s children and yields a
     // `children` tree; `run` is one sub-run yielding a `result` entry. Either
@@ -588,8 +635,25 @@ fn resolve_promise(
     } else if let Some(img) = &run {
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_work_request`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        let result = run_image(config, img, vec![input.clone()], std, salt, stack, trace_id)?;
-        Some((result_entry("result", &result)?, result))
+        match run_image(config, img, vec![input.clone()], std, salt, stack, trace_id) {
+            Ok(result) => Some((result_entry("result", &result)?, result)),
+            // `catch`: the failure becomes `--error`, a blob of the message the
+            // caller would otherwise have seen as a 500. `then` is required
+            // alongside `catch` (checked above), so the unused second element
+            // of the pair never reaches a caller.
+            Err(e) if catch => {
+                let text = e.message().to_string();
+                eprintln!("caught sub-run failure in continuation {cont}: {text}");
+                caught = true;
+                let oid = store_git_blob(config, text.as_bytes())
+                    .map_err(|e| HttpError::new(500, format!("storing error blob: {e}")))?;
+                Some((
+                    named_entry("error", EntryKind::Blob.into(), oid),
+                    format!("blob {oid}"),
+                ))
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         None
     };
@@ -597,16 +661,20 @@ fn resolve_promise(
     match (then, mid) {
         // `then` combines: it gets the original `in`, plus the middle step's
         // contribution when one ran — (`--in`, `--children`) after a map,
-        // (`--in`, `--result`) after a run, bare `--in` for a plain tail call.
+        // (`--in`, `--result`) after a run, (`--in`, `--error`) after a caught
+        // run, bare `--in` for a plain tail call.
         (Some(img), mid) => {
             let mut args = vec![input];
             if let Some((extra, _)) = mid {
                 args.push(extra);
             }
-            run_image(config, &img, args, std, salt, stack, trace_id)
+            Ok((
+                run_image(config, &img, args, std, salt, stack, trace_id)?,
+                caught,
+            ))
         }
         // No `then`: the middle step's own result is the request's result.
-        (None, Some((_, result))) => Ok(result),
+        (None, Some((_, result))) => Ok((result, caught)),
         // Unreachable — the presence check above requires some step.
         (None, None) => Err(HttpError::new(
             500,

@@ -36,19 +36,44 @@
 # But ONLY a test outcome is a value. An INFRASTRUCTURE failure — the inner
 # stack, a runner, a tool the test relied on — is a job error: loud and
 # UNCACHED (design/cargo-workers.md), so a re-run retries instead of replaying a
-# memoised red. The whole distinction rides on cli.sh's exit code, a two-word
-# contract the harness (the BASH_ENV file below) sources into every cli.sh:
+# memoised red. The whole distinction rides on cli.sh's exit code, a contract
+# the harness (the BASH_ENV file below) sources into every cli.sh:
 #
 #   exit 0       the test passed                         -> PASS verdict (value)
 #   fail / 1     the thing UNDER TEST was wrong          -> FAIL verdict (value)
+#   abort / 2    cli.sh tripped `set -e` unexpectedly    -> FAIL verdict (value)
 #   infra / *    the environment BROKE                   -> job error (uncached)
 #
-# `fail` is each cli.sh's own helper (exit 1); `infra` the harness provides. A
-# test that GUARDS a risky step says which broke — `... || infra "no runner"`
-# vs `... || fail "tests failed"`. And an UNGUARDED command that trips `set -e`
-# lands on the ERR trap, i.e. defaults to `infra`: an unexpected abort is
-# environment, never the test's verdict, so it can never cache as a spurious
-# red. Getting the split wrong only ever costs a re-run, never a false green.
+# `fail` is each cli.sh's own helper (exit 1); `abort` and `infra` the harness
+# provides. A test that GUARDS a risky step says which broke — `... || infra
+# "no runner"` vs `... || fail "tests failed"`.
+#
+# An UNGUARDED command that trips `set -e` lands on the ERR trap, which calls
+# `abort` — a VERDICT. It used to call `infra`, on the reasoning that an
+# unexpected abort is environment and so must never cache as a spurious red.
+# That reasoning was wrong on both halves, measured twice in a row: an agent's
+# half-written cli.sh, and a genuine push bug in a half-built feature the test
+# was driving. Both were the tree under test being wrong — deterministic,
+# reproducible, and exactly what the author needed to read — and both got filed
+# as "the environment broke". Only the four `|| infra "cargo worker did not
+# run"` guards in tests/unit-* have ever meant it.
+#
+# The cost of caching an abort is small and self-clearing: a per-test job keys
+# on the test's own tree AND the image digest, so fixing either the cli.sh or
+# the code it drives re-keys the job. `--test-salt` forces a re-run when a
+# genuine flake did cache.
+#
+# The cost of the old default was not small. A job error fails the whole map,
+# taking the summary with it — so one aborted cli.sh discarded every other
+# test's result, errored the `test` tool's sub-run, and killed the agent turn
+# that called it. This header used to end "getting the split wrong only ever
+# costs a re-run, never a false green", which was not true while it cost a turn.
+#
+# It is true again, and not only because of the reclassification above: tool
+# sub-runs now launch through `run-then --catch` (design/map-then.md), so even a
+# real `infra` job error reaches the agent as an is_error tool_result over an
+# unchanged workspace instead of killing the turn. Both halves matter — this one
+# puts aborts in the right bucket, that one makes the wrong bucket survivable.
 set -euo pipefail
 
 fail() {
@@ -128,18 +153,19 @@ mkdir /tmp/out
 # stage3 instead, across jobs that really ran.
 t0=$SECONDS
 
-# The pass/fail/infra vocabulary, sourced into cli.sh via BASH_ENV so it lives
-# in ONE place and no tests/<name>/cli.sh has to declare it. `set -o errtrace`
-# so the ERR trap reaches into the test's own functions (its `commit`, its
-# helpers); the trap turns an UNGUARDED `set -e` abort into `infra` (exit 70)
-# instead of the failed command's own code — which, being 1, would be
-# indistinguishable from a deliberate `fail`. `infra` is also callable directly,
-# for the guard points that catch a run failure themselves (unit-test's
-# `|| ok=0`), where the harness cannot see the abort.
+# The pass/fail/abort/infra vocabulary, sourced into cli.sh via BASH_ENV so it
+# lives in ONE place and no tests/<name>/cli.sh has to declare it. `set -o
+# errtrace` so the ERR trap reaches into the test's own functions (its `commit`,
+# its helpers); the trap turns an UNGUARDED `set -e` abort into `abort`
+# (exit 2) instead of the failed command's own code — which, being 1, would be
+# indistinguishable from a deliberate `fail`, and the report says which it was.
+# `infra` stays callable directly, for the guard points that catch a run failure
+# themselves (unit-test's `|| ok=0`), where the harness cannot see the abort.
 cat > /tmp/harness.sh <<'HARNESS'
 set -o errtrace
-infra() { echo "RUN-TEST INFRA: ${*:-cli.sh aborted unexpectedly}" >&2; exit 70; }
-trap 'infra "cli.sh aborted (rc=$?) — a command expected to succeed did not"' ERR
+abort() { echo "RUN-TEST ABORT: ${*:-cli.sh aborted unexpectedly}" >&2; exit 2; }
+infra() { echo "RUN-TEST INFRA: ${*:-the environment broke}" >&2; exit 70; }
+trap 'abort "cli.sh aborted (rc=$?) — a command expected to succeed did not"' ERR
 # Confine the contract to the top-level cli.sh: unexport BASH_ENV so the helper
 # shells and worker scripts a test spawns do NOT re-source this and inherit the
 # errtrace + ERR trap. The current shell keeps them (already sourced); only
@@ -157,11 +183,15 @@ cat /tmp/test.out >&2
 case "$rc" in
   0) echo "RUN-TEST: PASS" > /tmp/out/verdict ;;
   1) echo "RUN-TEST: FAIL" > /tmp/out/verdict ;;
-  # An infra failure is NOT a verdict. `fail` exits this worker non-zero, so the
-  # job errors: the result is not cached (a re-run retries) and the failure is
-  # loud — it fails the whole map, taking the summary with it, rather than
-  # hiding under a cached red. The test's own output is already on stderr above;
-  # fail adds the inner stack's logs.
+  # An unguarded `set -e` abort: still a verdict, but a distinct one, so the
+  # report can say "this test never reached an assertion" rather than implying
+  # the assertion ran and disagreed. The summariser reads the parenthetical.
+  2) echo "RUN-TEST: FAIL (aborted)" > /tmp/out/verdict ;;
+  # An infra failure is NOT a verdict — now only ever an explicit `infra` call.
+  # `fail` exits this worker non-zero, so the job errors: the result is not
+  # cached (a re-run retries) and the failure is loud — it fails the whole map,
+  # taking the summary with it, rather than hiding under a cached red. The
+  # test's own output is already on stderr above; fail adds the stack's logs.
   *) fail "cli.sh exited $rc — an infrastructure failure, not a test verdict" ;;
 esac
 echo $((SECONDS - t0)) > /tmp/out/seconds
