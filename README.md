@@ -41,9 +41,9 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `worker-common` | — | Shared library for the Rust workers. |
 | `worker-runner` | — (`std/runner`'s `/worker`) | The in-image runner trampoline: receives a compiled worker binary as its `worker1` arg and execs it, so every compiled worker rides one shared image as `curry(std/runner, worker1=<binary>)`. |
 | `worker-rustc` | — (run as `curry(runner, worker1)`) | Builds a worker from Rust source. See [workers](#workers). |
-| `worker-bash-tool`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: the bounded bash tool, the LLM step driver, and recursive grep. See `design/agent-harness.md`. |
+| `worker-bash-tool`, `worker-llm-call`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: bounded bash, stateless LLM calls, durable LLM turns, and recursive grep. See `design/agent-harness.md`. |
 | `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (pinned toolchain + pre-compiled deps + this binary as `/worker`; its image is host-built and streamed like the runner, `caos-worker-cargo-docker` — see `std/cargo/` and `design/cargo-workers.md`) — the agent's `build`/`test` tools. |
-| `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
+| `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the LLM worker tests. |
 
 ## Prerequisites
 

@@ -389,33 +389,33 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
 }
 
 fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    // The list's two-cell highlight symbol and our two-cell status prefix are
+    // both inside the border, even for unselected rows.
+    let detail_width = inner.width.saturating_sub(4);
     let items: Vec<ListItem<'_>> = app
         .conversations
         .iter()
         .map(|state| {
             let (mark, color) = if state.running {
                 ("*", Color::Yellow)
+            } else if state.generating_title {
+                ("~", Color::Magenta)
             } else if state.publishing {
                 ("^", Color::Cyan)
             } else {
                 (" ", Color::DarkGray)
             };
-            let (author, author_color, preview) = match state.latest_message_preview() {
-                Some((EntryRole::Human, preview)) => ("You ", Color::Cyan, preview),
-                Some((EntryRole::Agent, preview)) => ("AI  ", Color::Green, preview),
-                Some(_) => unreachable!("conversation previews exclude local notices"),
-                None => ("", Color::DarkGray, "Start a conversation".to_string()),
-            };
+            let (title, detail) = state.sidebar_text(detail_width);
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::raw(state.title.clone()),
+                    Span::raw(title),
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(author, Style::default().fg(author_color)),
                     Span::styled(
-                        preview,
+                        detail,
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::DIM),
@@ -424,7 +424,7 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ])
         })
         .collect();
-    let inner_height = Block::default().borders(Borders::ALL).inner(area).height;
+    let inner_height = inner.height;
     let offset = conversation_list_offset(app.selected, app.conversations.len(), inner_height);
     let mut selected = ListState::default()
         .with_offset(offset)

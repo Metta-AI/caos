@@ -5,10 +5,15 @@ the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
 The interface keeps independent virtual conversations in a left sidebar. Each
-two-row entry shows its title plus an author-labeled, single-line preview of the
-latest user or agent message, with a visible ellipsis instead of hard terminal
-clipping. Internal conversation IDs stay hidden. Each conversation has its own durable history,
-multiline prompt, live activity, completed-turn hashes, and workspace diff.
+entry has a stable task title and a second row reserved for live operation or
+attention status. Idle conversations do not show a stripped message preview.
+Submitting the first message of a fresh conversation runs one separate,
+stateless `llm-call` title job concurrently with the agent turn. The result uses
+the existing durable title metadata, so reopening the TUI does not regenerate
+it or require any additional refs. Text ends with a visible ellipsis instead of
+hard terminal clipping, and internal conversation IDs stay hidden. Each
+conversation has its own durable history, multiline prompt, live activity,
+completed-turn hashes, and workspace diff.
 Turns continue running when another conversation is selected, so several agent
 workspaces can advance concurrently without touching the working checkout.
 
@@ -105,9 +110,11 @@ Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
 A fresh conversation starts with a temporary `talk-N` title. Its first prompt
-automatically becomes a whitespace-collapsed title of at most 60 characters.
-Using `/title` before the first prompt keeps that explicit title instead.
-Existing conversations are never automatically retitled.
+provides an immediate fallback title and starts a stateless `llm-call` job using
+that message alone. Title generation runs concurrently with the agent turn, so
+it does not depend on the turn succeeding. Failure leaves the fallback in
+place, and later messages make no title calls. Using `/title` before the first
+prompt keeps that explicit title instead.
 
 Fresh conversations start from the fetched tip of `origin`'s advertised
 default branch. `--base` and `/from <turn-hash>` override that default.
@@ -138,9 +145,10 @@ verb such as `Thinking…`, `Reading…`, or `Running…` and the current operat
 `Ctrl+A` remains an alias. Up and Down select durable harness steps, and the
 pane beside the list shows the selected step's complete result. Scroll long
 results with PageUp, PageDown, or the mouse wheel. Escape or `Ctrl+T` returns
-to the conversation. If the selection is already on the newest step, new
-activity remains selected. Moving to an older step pauses that tail-follow
-behavior.
+to the conversation. Completed activity is reconstructed from the durable
+step chain when the TUI restarts. If the selection is already on the newest
+step, new activity remains selected. Moving to an older step pauses that
+tail-follow behavior.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other

@@ -194,9 +194,10 @@ stage3)
     #     flake-builder".
     #
     # And grep the CLIENT too, not just the test: `caos-cli talk` resolves
-    # runner/bash-tool/llm-step/rgrep/bash from constants in chat.rs, and a Rust
-    # worker builds its path with `std_image("bash")` (tests/commit) — neither
-    # shows up in a search for /cas/std in the test directory.
+    # runner/bash-tool/llm-call/llm-step/rgrep/bash from constants in chat.rs,
+    # and a Rust worker builds its path with `std_image("bash")`
+    # (tests/commit) — neither shows up in a search for /cas/std in the test
+    # directory.
     mkdir -p "/tmp/sel/$t/std" "/tmp/sel/$t/bin"
     if [ -e "$d/uses-std" ]; then
       caos get "/cas/args/in/tests/$t/uses-std"

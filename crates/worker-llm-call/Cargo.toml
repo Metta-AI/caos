@@ -1,0 +1,15 @@
+[package]
+name = "worker-llm-call"
+version = "0.1.0"
+edition = "2021"
+
+# A stateless, tool-free Messages API call: configuration and a messages array
+# in, plain response text out. Runs as curry(runner, bin) in the shared pool.
+[dependencies]
+llm-client = { path = "../llm-client" }
+worker-common = { path = "../worker-common" }
+serde_json = "1"
+
+[[bin]]
+name = "worker-llm-call"
+path = "src/main.rs"
