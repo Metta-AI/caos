@@ -54,7 +54,57 @@
 #                   the caller's wrapper, per job, so that editing one does not
 #                   move this image and re-key every test that runs it.
 #   /caos/stack     the one bring-up
+#
+# TWO ROLES, one file (SPEC: a worker covers all its stages in one file),
+# selected by `role` — from the environment for the one placement that is not a
+# caos job at all, else from this job's own wrapper:
+#
+#   client        (the only role a test plays) make sure a shared stack exists
+#                 for this image, then run worker1 against it — no stack of its
+#                 own.
+#   stack         BE the shared stack (design/faster-tests.md). NOT a caos job:
+#                 the detached container a client starts, configured
+#                 wholly by environment, exiting when it has been idle.
+#
+# There was a third, `private`: a stack of the job's OWN, which is what all 28
+# tests did before the shared stack. It is gone, and deliberately not kept as a
+# fallback. caos-tools/test.sh writes `role=client` for EVERY test with no
+# branch to leave it unset, so `private` had not run since the shared stack
+# landed — an untested bring-up is not a fallback, it is a second copy of
+# `stack`'s env prefix that every change to stack/serve has to be replicated
+# into by hand, with nothing checking. If a private stack is ever wanted again,
+# derive it from the `stack` role against the stack/serve of that day rather
+# than from a path that stopped being exercised.
+#
+# EVERY CLIENT ASKS FOR THE STACK; there is no separate job that starts one.
+# Starting is safe to ask for concurrently (the lock below is a ref create, so
+# exactly one of any number of simultaneous askers starts it and the rest
+# join), which means the fan-out needs no new shape at all — a test wrapper
+# just says `role=client`.
+#
+# The stack starts EMPTY, and that is fine: a request carries its own closure
+# (`ensure_pushed` ships the whole arg tree), so a test's deps arrive with the
+# request that uses them, and no client has to seed anything it did not ask
+# for. The one exception is the seeder's records, which are read from the
+# stack's git dir rather than from a request — so a client pushes those, which
+# is idempotent and a no-op after the first.
+#
+# The shared stack is named by the IMAGE it runs, and that is load-bearing
+# rather than convenient: a per-run name would have to reach every test job
+# through its ARG TREE, and the arg tree is the cache key, so all 28 tests
+# would re-key on every run — losing exactly the per-test caching the shared
+# stack exists to keep. The image hash is already in every test's key, and a
+# worker can read it back with `caos hash /cas/args/image`, so naming the stack
+# after it costs the key nothing. Two trees get two stacks; two runs of one
+# tree share one, which is the point.
 set -euo pipefail
+
+# A PHASE CLOCK for everything this script does BEFORE worker1 starts, which
+# is time no test's own clock can see: run-test.sh starts counting after the
+# stack is found. The suite's per-test times therefore say nothing about the
+# setup that dominates a run, and `ps` could only say WHAT was busy, never
+# which step it was busy in. run-test.sh copies this into the test's record.
+phase() { echo "$(date +%s%3N) $*" >> /tmp/phases.log; }
 
 LOGS="/tmp/serve.log /tmp/redis.log /tmp/server.log /tmp/runnerd.log"
 fail() {
@@ -67,12 +117,169 @@ fail() {
   exit 1
 }
 
-# Materialize EVERY arg while the environment is still the outer one. This is
+# ---- role: BE the shared stack ----------------------------------------------
+# Reached only as a detached container started by a client below, so
+# there is no /cas here and nothing to materialize — every input is an
+# environment variable, and the objects come by hash from the outer server.
+#
+# It exits when nobody has asked it for anything in a while. Nothing signals
+# it, deliberately: a stop signal would have to come from the suite that
+# started it, and then a second suite sharing this stack would be cut off
+# mid-run. Idling out instead means any number of suites can share it, and a
+# back-to-back run on an unchanged tree finds it still warm.
+if [ "${CAOS_TEST_STACK_ROLE:-}" = stack ]; then
+  : "${CAOS_SERVER_URL:?a shared stack needs the outer server to seed from}"
+  SOCK="${CAOS_ENGINE_SOCKET:?a shared stack needs a granted engine socket}"
+  # GENEROUS, because "idle" is measured from the server's log and a client can
+  # be busy for a long time before its first request. At 120s stacks exited in
+  # the MIDDLE of a suite — later clients then found a dead address, started
+  # replacements, and one image ended a run with SIX live stacks, each with its
+  # own server, redis, runnerd and seeder. A stack lingering after a suite costs
+  # one idle container and is what makes a back-to-back run reuse it, so err
+  # long: being early is expensive, being late is not.
+  #
+  # THIS DEFAULT IS DEAD unless the launcher agrees with it, and for a while it
+  # did not: the `docker run` below always passes CAOS_TEST_STACK_IDLE_SECS, so
+  # whatever IT defaults to is what every stack actually uses. It said 120 while
+  # this said 900, so every stack died two minutes after the suite that started
+  # it and the next run paid a full cold start — which is what "the tests are
+  # consistently 50s" was. The two literals must stay equal.
+  IDLE=${CAOS_TEST_STACK_IDLE_SECS:-900}
+
+  # A HEAD START, NOT A REQUIREMENT. Both hashes are optional: whatever a
+  # client needs arrives with the request that needs it, and the seed records
+  # are pushed by the first client that wants the seeder. Seeding here just
+  # saves that client the trip, using the std the starter happened to declare.
+  SEED=/tmp/seed-git
+  git init -q --bare "$SEED" || fail "creating the seed repo"
+  if [ -n "${CAOS_TEST_STACK_STD:-}" ]; then
+    git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
+      "$CAOS_SERVER_URL" "$CAOS_TEST_STACK_STD" \
+      || fail "fetching std $CAOS_TEST_STACK_STD from the outer server"
+    git -C "$SEED" update-ref refs/caos/deps "$CAOS_TEST_STACK_STD" \
+      || fail "anchoring refs/caos/deps"
+  fi
+  if [ -n "${CAOS_TEST_STACK_SEED:-}" ]; then
+    git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
+      "$CAOS_SERVER_URL" "$CAOS_TEST_STACK_SEED" \
+      || fail "fetching seed $CAOS_TEST_STACK_SEED from the outer server"
+    git -C "$SEED" update-ref refs/caos/seed "$CAOS_TEST_STACK_SEED" \
+      || fail "pointing refs/caos/seed at $CAOS_TEST_STACK_SEED"
+  fi
+
+  # The stack itself is `caosd serve` (design/one-stack-image.md) — the ONE
+  # bring-up in the tree, shared with the host and seed placements, so this
+  # script carries no second copy of how a stack starts. What is set here is
+  # what only this placement knows:
+  #
+  #   - the result cache is non-persistent (REDIS_PERSIST=no): it starts empty
+  #     and dies with the stack, because the incrementality tests assert real
+  #     memoization and a cache outliving them poisons them — unlike the
+  #     registry, which is content-keyed and shared on purpose
+  #   - runnerd's docker client talks to the OUTER engine over the granted
+  #     socket, and each sibling joins THIS container's netns, so the inner
+  #     server on 127.0.0.1 is the address every worker already expects — and,
+  #     being on caos-net through it, each test container's stub server is
+  #     reachable at the address run-test.sh advertises (CAOS_STUB_HOST)
+  #   - the server repo is SEEDED from $SEED. The publisher is still the tree's
+  #     own build-builtins.sh, run once when the image was built
+  #     (design/one-stack-image.md, "The seed"); a test pays only for moving a
+  #     few git objects, never a publish.
+  #
+  # Its registry settings need no overriding: this container sits on caos-net,
+  # so the default push URL (caos-registry:5000) is reachable here, and the
+  # default pull host (localhost:5000) is the name the OUTER docker daemon
+  # resolves — which is exactly the split this stack needs.
+  #
+  # CAOS_RUNNER_SLOTS is the SUITE's concurrency, not one test's: back when
+  # every test brought up a stack of its own each had 6 and there were 28 of
+  # them, so inheriting 6 — or the host's 8 — would throttle the whole fan-out
+  # through one queue.
+  #
+  # It runs in the BACKGROUND because the idle watch below is what this role
+  # does with the rest of its life. serve dies as a group, so watching its pid
+  # is enough to know the stack is alive.
+  #
+  # NO COMMENTS INSIDE THIS BLOCK. Every line ends in a backslash, and a
+  # continuation followed by a comment line joins INTO the comment: the env
+  # prefix is severed and `serve` runs with none of it. That is not a parse
+  # error, it is a stack that dies at bring-up saying "serve needs
+  # CAOS_STACK_STATE", 28 clients polling for an address that never appears,
+  # and a suite that looks slow rather than broken (cost: one 10-minute
+  # timeout and a wrong diagnosis).
+  CAOS_STACK_STATE=/tmp/stack \
+  CAOS_STACK_LOGS=/tmp \
+  CAOS_STACK_READY=/tmp/stack.ready \
+  CAOS_STACK_BIN=/caos/bin \
+  CAOS_STACK_REDIS_PORT=6390 \
+  CAOS_STACK_REDIS_PERSIST=no \
+  CAOS_STACK_REGISTRY=no \
+  CAOS_STACK_RUNNERD=yes \
+  CAOS_STACK_SEEDER=yes \
+  CAOS_STACK_SEED_GIT=$SEED \
+  CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-48}" \
+  CAOS_PENDING_TIMEOUT_SECS=900 \
+  DOCKER_HOST="unix://$SOCK" \
+  CAOS_DOCKER_NETWORK="container:$(cat /etc/hostname)" \
+    bash /caos/stack/serve >/tmp/serve.log 2>&1 &
+  SERVE=$!
+  for _ in $(seq 1 60); do
+    [ -e /tmp/stack.ready ] && break
+    kill -0 "$SERVE" 2>/dev/null || fail "the shared stack died during bring-up"
+    sleep 1
+  done
+  [ -e /tmp/stack.ready ] || fail "the shared stack never came up"
+  echo "test stack: serving; idling out after ${IDLE}s without a request" >&2
+
+  # IDLE IS MEASURED FROM THE SERVER'S LOG, because the server writes a line
+  # per request and nothing else touches that file. A clock over the log's
+  # mtime needs no cooperation from the server and no protocol of its own.
+  while kill -0 "$SERVE" 2>/dev/null; do
+    sleep 15
+    now=$(date +%s)
+    last=$(date +%s -r /tmp/server.log 2>/dev/null || echo "$now")
+    if [ $((now - last)) -ge "$IDLE" ]; then
+      echo "test stack: idle for $((now - last))s; exiting" >&2
+      kill "$SERVE" 2>/dev/null || true
+      exit 0
+    fi
+  done
+  fail "the shared stack exited on its own"
+fi
+
+# Materialize the args while the environment is still the outer one. This is
 # what makes the call-site env flip below sufficient: worker1 runs entirely
 # in the inner world and never needs the outer stack, because both clients
 # read the same CAOS_SERVER_URL and a `caos get` under the flipped env would
 # ask the INNER server for an outer object (it 404s — measured).
-caos get -r /cas/args
+#
+# EVERYTHING EXCEPT `seed`, which is fetched below only by the client that
+# needs it. The seed records carry the core image deltas, so they are most of
+# the bytes in a wrapper, and a `get -r` of the lot cost 3.2s of every test's
+# 5.7s setup — paid by all 29 clients although only the one that STARTS the
+# stack has any use for them. Everything else is small and is needed by
+# something: worker1 itself, and `in` for the test tree, its deps and its role.
+phase start
+caos get -r /cas/args/worker1
+caos get /cas/args/in
+for e in /cas/args/in/*; do
+  case "$e" in */seed) continue ;; esac
+  caos get -r "$e"
+done
+phase "args materialized"
+
+# Which of the job roles this is. From the wrapper, so the CALLER decides — a
+# test does not opt itself into a shared stack.
+#
+# REQUIRED, AND CHECKED, rather than defaulted. `private` used to be the default
+# here and went on looking reachable long after every wrapper named a role; the
+# way that hid was that a missing `role` still did something. A missing or
+# unknown one now says so.
+ROLE=$(cat /cas/args/in/role 2>/dev/null) \
+  || fail "this job carries no \`role\`; a test wrapper writes \`client\` (caos-tools/test.sh)"
+if [ "$ROLE" != client ]; then
+  fail "unknown role \`$ROLE\`; the only job role is \`client\` (\`stack\` is not a caos job — it comes from the environment)"
+fi
 
 # The OUTER run's salt must not reach the inner client (the phase-3
 # isolation lesson). Scrubbed here, so nothing worker1 starts inherits it.
@@ -82,6 +289,261 @@ SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
 [ -S "$SOCK" ] || fail "engine socket $SOCK is not a socket"
 
 INNER=http://127.0.0.1
+
+# ---- the shared stack: where it is, and making sure it exists ----------------
+# Named by the image it runs (see the header). `addr` holds its address; `lock`
+# is held only while someone is starting one.
+# THE ENGINE'S IMAGE ID, asked of the engine. Every tree-derived name was
+# unstable, and each in the same way: `caos hash <path>` and `caos curry <path>`
+# both INGEST materialized content, which is not the object it came from —
+# materializing drops what a git tree can hold and a filesystem cannot. Tried in
+# turn and all three ping-ponged between two values on an unchanged tree, so
+# clients split across two stacks and every other run paid a cold start (34-39s
+# when one was reused, 60-74s when another was started).
+#
+# The image id has none of that: it is what the engine will actually run, it is
+# identical exactly when the image is, and it needs no round trip through a
+# filesystem. Which is also the right meaning — this names "the stack for the
+# image these tests run".
+STACK_KEY=$(docker -H "unix://$SOCK" inspect -f '{{.Image}}' "$(cat /etc/hostname)") \
+  || fail "asking the engine what image this job runs"
+STACK_KEY=${STACK_KEY#sha256:}
+[ -n "$STACK_KEY" ] || fail "the engine named no image for this job"
+STACK_REF=refs/caos/test-stack/$STACK_KEY
+
+# The address a published stack is at, or empty. Read straight off the ref: the
+# blob it points at IS the address, so this is one round trip and no parsing.
+stack_addr() {
+  local oid
+  phase "  addr: ls-remote"
+  oid=$(git ls-remote "$CAOS_SERVER_URL" "$STACK_REF/addr" 2>/dev/null | cut -f1) || return 0
+  phase "  addr: ls-remote done ($oid)"
+  if [ -z "$oid" ]; then return 0; fi
+  git -c fetch.negotiationAlgorithm=noop -C /tmp/refs fetch -q --no-write-fetch-head \
+    "$CAOS_SERVER_URL" "$oid" 2>/dev/null || return 0
+  phase "  addr: fetch done"
+  git -C /tmp/refs cat-file blob "$oid" 2>/dev/null || return 0
+}
+
+# Is that stack still there? A published address outlives the container behind
+# it — the stack idles out — so every reader checks rather than trusts. Cheap,
+# and the alternative is a job that hangs against a dead address.
+# Is that stack still serving? ASKED MORE THAN ONCE, because the answer decides
+# whether to start another one: a single failed probe under load would have
+# every client conclude the stack is dead, take the (already released) lock in
+# turn, and start a stack apiece. Observed exactly that — several stacks racing
+# to publish one address, which surfaces as a compare-and-swap failure on the
+# address ref rather than as anything resembling its cause.
+#
+# Only a REPEATED refusal is death. The cost of being wrong in the other
+# direction is one wasted probe.
+#
+# A BOUNDED TCP CONNECT FIRST, and that is the whole cost of this function. The
+# address of an idled-out stack is an address on caos-net with nothing behind
+# it, so a SYN there is not refused — it is dropped, and `git ls-remote` sits in
+# libcurl's connect for 2.1s (measured). Three of those plus the sleeps is 11.3s
+# per call, and a cold suite pays it TWICE before anyone starts a stack: once on
+# the way in and once more in the wait loop below. That was 23 of the 68 seconds
+# of a cold run.
+#
+# `timeout 1 … /dev/tcp` bounds the dead case at 1s and costs nothing in the
+# live one — a listening socket accepts immediately even when the server behind
+# it is saturated, because the kernel completes the handshake from the backlog.
+# The ls-remote still runs when the port answers, so what this returns still
+# means "serving git", not merely "something is listening".
+stack_alive() { # <addr>
+  local rc=0 i host port
+  host=${1#http://}
+  host=${host%%/*}
+  # The PORT, when the address carries one. Every address published today is a
+  # bare `http://<ip>`, so this is always 80 — but taking the host apart and
+  # then probing a hardcoded 80 would, the first time anything published a port,
+  # report a perfectly live stack as dead and start a duplicate beside it. The
+  # ls-remote below would still have been right, which is exactly why that
+  # failure would be baffling.
+  port=80
+  case "$host" in *:*) port=${host##*:}; host=${host%:*} ;; esac
+  for i in 1 2 3; do
+    rc=0
+    if timeout 1 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+      git ls-remote "$1" >/dev/null 2>&1 || rc=$?
+    else
+      rc=7
+    fi
+    if [ "$rc" = 0 ]; then break; fi
+    if [ "$i" != 3 ]; then sleep 0.3; fi
+  done
+  phase "  alive: checked $1 rc=$rc"
+  return "$rc"
+}
+
+git init -q /tmp/refs || fail "creating the ref-reading repo"
+
+# Make sure a stack is serving for this image, and say where it is. Called by
+# every client, concurrently, and safe exactly because the lock is a create.
+ensure_shared_stack() { # -> address on stdout
+  local addr
+  addr=$(stack_addr)
+  if [ -n "$addr" ] && stack_alive "$addr"; then
+    echo "test stack: $STACK_KEY already served at $addr" >&2
+    printf '%s' "$addr"
+    return 0
+  fi
+  # REMEMBER WHAT WE JUST BURIED. The wait loop below re-reads the same ref, and
+  # until the winner publishes it still says this address — so without this it
+  # probes the corpse it just examined, at full price, once per second of the
+  # winner's bring-up. Only a CHANGED address is worth a probe.
+  DEAD_ADDR=$addr
+
+  # THE LOCK IS A CREATE. Pushing a ref that already exists fails — the very
+  # behaviour ensure_pushed had to retry around — so a create IS a compare-and-
+  # swap, and exactly one of any number of simultaneous suites starts a stack.
+  # Taken through the outer server because it is the only thing all of them can
+  # see.
+  # A BLOB, not a commit: nothing reads the lock's content, only whether the
+  # ref exists. (A commit would need a committer identity this throwaway repo
+  # has not got — "Committer identity unknown".)
+  #
+  # UNIQUE PER CLIENT, and that is the whole lock. A shared constant makes this
+  # not a lock at all: the ref would already point at the very object the next
+  # client pushes, git answers "Everything up-to-date" and exits 0, and EVERY
+  # client believes it won. Measured that way — one image ended a run with
+  # seven live stacks, each with its own server, redis, runnerd and seeder.
+  # With a distinct object per client the push is a real update of an existing
+  # ref, which git refuses without --force, so exactly one wins.
+  LOCK_OID=$(printf 'lock %s' "$(cat /etc/hostname)" \
+    | git -C /tmp/refs hash-object -w --stdin) || fail "minting the lock object"
+  [ -n "$LOCK_OID" ] || fail "minting the lock object"
+  if git -C /tmp/refs push -q "$CAOS_SERVER_URL" "$LOCK_OID:$STACK_REF/lock" 2>/dev/null; then
+    # We own the start. Release the lock whatever happens, or the next run on
+    # this image finds a lock nobody holds and no stack behind it.
+    trap 'git -C /tmp/refs push -q --delete "$CAOS_SERVER_URL" "$STACK_REF/lock" 2>/dev/null || true' EXIT
+    STD_HASH=$(caos hash /cas/args/in/std) || fail "no std in the wrapper to seed the shared stack with"
+    SEED_ARG=""
+    if [ -e /cas/args/in/seed ]; then SEED_ARG=$(caos hash /cas/args/in/seed); fi
+    # QUOTED, and the message has no apostrophe. An unquoted `${VAR:?msg}` is
+    # word-split like any other word, so a `'` in the message opens a quote
+    # that never closes and eats the rest of the file — the parse error lands
+    # hundreds of lines away, on whatever `if` was open at the time.
+    HOST_SOCK="${CAOS_ENGINE_SOCKET_HOST:?runnerd must advertise the engine socket host path to start a sibling}"
+    # Our own image, asked of the engine: a bind mount and an image ref are
+    # both host-side names, and this job knows neither by construction.
+    SELF=$(cat /etc/hostname)
+    IMAGE=$(docker -H "unix://$SOCK" inspect -f '{{.Image}}' "$SELF") \
+      || fail "asking the engine what image this job runs"
+    # A UNIQUE NAME, not a name derived from the key. A fixed name is a second,
+    # weaker lock held by the ENGINE rather than by us, and it fails in a way we
+    # cannot clear: podman keeps a storage entry after the container is gone, so
+    # `run` is refused with "already in use by an external entity" and `rm -f`
+    # cannot remove it (there is no such container to remove). Observed exactly
+    # that, and it took the suite down for the whole run.
+    #
+    # Which stack belongs to which image is what the LABEL says, and which one
+    # is current is what the published address says. Neither needs the engine to
+    # enforce uniqueness — the ref lock already does that — so the name is left
+    # to be merely unique and legible. The client's own container id supplies it.
+    NAME=caos-test-stack-$STACK_KEY-$SELF
+    docker -H "unix://$SOCK" run -d --name "$NAME" \
+      --label "caos.test-stack=$STACK_KEY" \
+      --network "${CAOS_DOCKER_NETWORK:-caos-net}" \
+      -v "$HOST_SOCK:/run/caos/engine.sock" \
+      -e CAOS_ENGINE_SOCKET=/run/caos/engine.sock \
+      -e CAOS_SERVER_URL="$CAOS_SERVER_URL" \
+      -e CAOS_TEST_STACK_ROLE=stack \
+      -e CAOS_TEST_STACK_STD="$STD_HASH" \
+      -e CAOS_TEST_STACK_SEED="$SEED_ARG" \
+      -e CAOS_TEST_STACK_IDLE_SECS="${CAOS_TEST_STACK_IDLE_SECS:-900}" \
+      --entrypoint /worker "$IMAGE" >/dev/null \
+      || fail "starting the shared stack container"
+
+    # Sweep this image's DEAD stacks, now that a live one is starting. They are
+    # only ever idled-out predecessors, and nothing points at them: the address
+    # ref names the one we are about to publish. Best-effort — a leftover
+    # container costs disk, never correctness, and must not fail a suite.
+    for old in $(docker -H "unix://$SOCK" ps -aq \
+                   --filter "label=caos.test-stack=$STACK_KEY" \
+                   --filter status=exited 2>/dev/null); do
+      docker -H "unix://$SOCK" rm -f "$old" >/dev/null 2>&1 || true
+    done
+
+    addr=$(docker -H "unix://$SOCK" inspect \
+      -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$NAME") \
+      || fail "reading the shared stack's address"
+    [ -n "$addr" ] || fail "the shared stack has no address on ${CAOS_DOCKER_NETWORK:-caos-net}"
+    addr="http://$addr"
+    ok=""
+    for _ in $(seq 1 90); do
+      if stack_alive "$addr"; then ok=1; break; fi
+      docker -H "unix://$SOCK" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null \
+        | grep -q true || fail "the shared stack exited during bring-up:
+$(docker -H "unix://$SOCK" logs "$NAME" 2>&1 | tail -n 30)"
+      sleep 1
+    done
+    [ -n "$ok" ] || fail "the shared stack never answered at $addr"
+
+    # Published LAST, so an address that exists is an address that served.
+    # Forced, because a previous run's dead address may still be sitting there.
+    oid=$(printf '%s' "$addr" | git -C /tmp/refs hash-object -w --stdin) \
+      || fail "minting the address blob"
+    # ONE RETRY, for the create race — the same one `ensure_pushed` carries, and
+    # for the same reason. Two clients that both found no address plan a CREATE
+    # (the precondition comes from the advertised state, which is why --force
+    # does not help), and the second to lock fails with "reference already
+    # exists". On the retry the ref IS advertised, so the push is an ordinary
+    # forced update and succeeds. Whichever address wins, both stacks work; the
+    # loser idles out.
+    #
+    # git's own words on a real failure, not just ours: a push fails for reasons
+    # that are nothing like each other, and "publishing failed" sends the reader
+    # looking in the wrong place.
+    if ! out=$(git -C /tmp/refs push --force "$CAOS_SERVER_URL" \
+                 "$oid:$STACK_REF/addr" 2>&1); then
+      if ! out=$(git -C /tmp/refs push --force "$CAOS_SERVER_URL" \
+                   "$oid:$STACK_REF/addr" 2>&1); then
+        # LOSING THIS RACE IS NOT A FAILURE. Someone else published an address
+        # for the same image, and any live stack for that image will do — the
+        # whole point is that they are interchangeable. Adopt theirs and let
+        # ours idle out. Only an address that is BOTH unpublishable and absent
+        # is a real failure.
+        #
+        # Fatal is what it used to be, and it cascaded: this script exiting
+        # released the start lock, the next client took it and started another
+        # stack, and its publish lost the same race. Six stacks for one image,
+        # measured, from one lost push.
+        other=$(stack_addr)
+        if [ -n "$other" ] && stack_alive "$other"; then
+          echo "test stack: lost the publish race; joining $other" >&2
+          addr=$other
+        else
+          fail "publishing the shared stack's address at $addr: $out"
+        fi
+      fi
+    fi
+    # Released as soon as the address is up, not at exit: a client holds the
+    # rest of its job open for as long as its test takes, and the next suite
+    # that finds a dead stack should not wait that out.
+    git -C /tmp/refs push -q --delete "$CAOS_SERVER_URL" "$STACK_REF/lock" 2>/dev/null || true
+    trap - EXIT
+    echo "test stack: $STACK_KEY serving at $addr" >&2
+  else
+    # Someone else is starting it; wait for what they publish.
+    # The count went up with the step down: this has to outlast the winner's
+    # whole bring-up, and 120 tries at 0.3s would be a much shorter patience
+    # than the 120 tries at 1s it replaces.
+    for _ in $(seq 1 400); do
+      addr=$(stack_addr)
+      if [ -n "$addr" ] && [ "$addr" != "${DEAD_ADDR:-}" ] && stack_alive "$addr"; then break; fi
+      addr=""
+      sleep 0.3
+    done
+    [ -n "$addr" ] || fail "another client holds $STACK_REF/lock but published no live stack"
+    echo "test stack: joined $STACK_KEY at $addr" >&2
+  fi
+  printf '%s' "$addr"
+}
+
+INNER=$(ensure_shared_stack) || fail "no shared stack for $STACK_KEY"
+[ -n "$INNER" ] || fail "no shared stack address for $STACK_KEY"
 
 # ---- the seed, from the CALLER's declared deps -------------------------------
 # std used to be baked into this image (/caos/seed-git), which meant the image
@@ -103,6 +565,7 @@ INNER=http://127.0.0.1
 # A test reaches its deps by PATH, through the `DEEP-DEPS/` copy run-test.sh puts
 # in its repo; this ref exists only to keep the fetched objects reachable so they
 # are not collectable.
+phase "stack found ($INNER)"
 DEPS_HASH=$(caos hash /cas/args/in/std) || fail "no deps in the wrapper — the caller hands each job the entries it declared"
 SEED=/tmp/seed-git
 git init -q --bare "$SEED" || fail "creating the seed repo"
@@ -112,6 +575,8 @@ git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head
 git -C "$SEED" update-ref refs/caos/deps "$DEPS_HASH" \
   || fail "anchoring refs/caos/deps at $DEPS_HASH"
 
+phase "deps fetched"
+
 # The seeder's records (design/caos-expr.md, Phase 3): flake-builder resolves
 # via `run docker://seeded`, answered INSIDE by the core-seeder-runner (started
 # by serve, CAOS_STACK_SEEDER=yes below). Its record and the delta it returns
@@ -120,62 +585,77 @@ git -C "$SEED" update-ref refs/caos/deps "$DEPS_HASH" \
 # leaves the seeder idle.
 if [ -e /cas/args/in/seed ]; then
   SEED_HASH=$(caos hash /cas/args/in/seed) || fail "reading the seed hash"
+
+  # ASK THE STACK FIRST, because the answer decides HOW MUCH of the seed this
+  # client has to move. The stack is seeded with these records at boot by the
+  # client that started it, so for the 28 that follow, the push below is a
+  # no-op — and, more expensively, so was the fetch that fed it: 55 MB in 27
+  # blobs, of which 32 MB is one copy of the caos binary. That fetch was 2.8s
+  # warm and 5-6s under eight-way contention, on every client, every run. One
+  # ls-remote is ~50ms.
+  #
+  # SKIPPING THE FETCH ENTIRELY IS WRONG, and was tried: $SEED is what
+  # run-test.sh points the test's own repo at as an ALTERNATE, and the test's
+  # objects reference these TREES — without them a `caos-cli` push inside a
+  # test dies with `fatal: bad tree object <oid>` (rust-worker, measured).
+  #
+  # But it is exactly the trees that are needed, and the closure is 23 trees
+  # totalling under a kilobyte against 55 MB of blobs. `--filter=blob:none`
+  # fetches the shape and none of the payload: 116ms and 92 KB, measured
+  # in-container. The blobs are what the SEEDER hands to a job, and that is the
+  # inner stack's copy — pushed by whoever found the stack unseeded, which is
+  # the one client that still fetches them in full.
+  NEED_BLOBS=yes
+  have=$(git ls-remote "$INNER" refs/caos/seed 2>/dev/null | cut -f1)
+  if [ "$have" = "$SEED_HASH" ]; then NEED_BLOBS=""; fi
+  FILTER=()
+  if [ -z "$NEED_BLOBS" ]; then FILTER=(--filter=blob:none); fi
   git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
-    "$CAOS_SERVER_URL" "$SEED_HASH" \
+    ${FILTER[@]+"${FILTER[@]}"} "$CAOS_SERVER_URL" "$SEED_HASH" \
     || fail "fetching seed $SEED_HASH from the outer server"
   git -C "$SEED" update-ref refs/caos/seed "$SEED_HASH" \
     || fail "pointing refs/caos/seed at $SEED_HASH"
+  phase "seed fetched (blobs=${NEED_BLOBS:-no})"
+
+  # A SHARED stack starts empty and cannot be handed a seed dir at boot, so
+  # whoever needs the seeder pushes the records to it. This is the one thing a
+  # request cannot carry: the core-seeder-runner reads refs/caos/seed out of
+  # the stack's git dir, not out of any arg tree. Idempotent, and a no-op for
+  # every client after the first — and every wrapper carries the same records,
+  # so they agree on what they push.
+  #
+  # The seeder rescans on a timer, so the first sentinel job after this may
+  # wait for it. It waits rather than failing: a `docker://seeded…` job defers
+  # generic runners for its whole pending window (crates/server/src/runner.rs).
+  if [ -n "$NEED_BLOBS" ]; then
+    # RETRIED, because clients that arrive together all plan a CREATE — the
+    # third instance of the race `ensure_pushed` carries a retry for, and it
+    # failed one run in eight before this. A retry is a no-op update: the ref
+    # can only hold these records, since every wrapper carries the same ones.
+    pushed=""
+    for attempt in 1 2 3 4; do
+      if out=$(git -C "$SEED" push --force "$INNER" \
+                 "$SEED_HASH:refs/caos/seed" 2>&1); then
+        pushed=1
+        break
+      fi
+      sleep "0.$((attempt * 2))"
+    done
+    if [ -z "$pushed" ]; then
+      fail "pushing the seed records to the shared stack at $INNER: $out"
+    fi
+  fi
 fi
 
-# The inner stack itself is `caosd serve` (design/one-stack-image.md) — the
-# ONE bring-up in the tree, shared with the host and seed placements, so this
-# script no longer carries a second copy of how a stack starts. What stays
-# here is what only this placement knows:
-#
-#   - the result cache is PRIVATE and non-persistent (REDIS_PERSIST=no): it
-#     starts empty and dies with the job, because the incrementality tests
-#     assert real memoization and a cache outliving a test's stack poisons
-#     them — unlike the registry, which is content-keyed and shared on purpose
-#   - runnerd's docker client talks to the OUTER engine over the granted
-#     socket, and each sibling joins THIS container's netns, so the inner
-#     server on 127.0.0.1 is the address every worker already expects
-#   - the server repo is SEEDED from $SEED, built above out of the std THIS
-#     job was handed. The publisher is still the tree's own build-builtins.sh,
-#     run once when the image was built (design/one-stack-image.md, "The
-#     seed"); a test pays only for moving a few git objects, never a publish.
-#
-# Its registry settings need no overriding: this container sits on caos-net,
-# so the default push URL (caos-registry:5000) is reachable here, and the
-# default pull host (localhost:5000) is the name the OUTER docker daemon
-# resolves — which is exactly the split this stack needs.
-#
-# It runs in the BACKGROUND because worker1 is what this job is for. serve
-# dies as a group, so watching its pid is enough to know the stack is alive.
-CAOS_STACK_STATE=/tmp/stack \
-CAOS_STACK_LOGS=/tmp \
-CAOS_STACK_READY=/tmp/stack.ready \
-CAOS_STACK_BIN=/caos/bin \
-CAOS_STACK_REDIS_PORT=6390 \
-CAOS_STACK_REDIS_PERSIST=no \
-CAOS_STACK_REGISTRY=no \
-CAOS_STACK_RUNNERD=yes \
-CAOS_STACK_SEEDER=yes \
-CAOS_STACK_SEED_GIT=$SEED \
-CAOS_RUNNER_SLOTS=6 \
-CAOS_PENDING_TIMEOUT_SECS=900 \
-DOCKER_HOST="unix://$SOCK" \
-CAOS_DOCKER_NETWORK="container:$(cat /etc/hostname)" \
-  bash /caos/stack/serve >/tmp/serve.log 2>&1 &
-SERVE=$!
-for _ in $(seq 1 60); do
-  [ -e /tmp/stack.ready ] && break
-  kill -0 "$SERVE" 2>/dev/null || fail "the inner stack died during bring-up"
-  sleep 1
-done
-[ -e /tmp/stack.ready ] || fail "the inner stack never came up"
+# NO STACK IS STARTED HERE. This job's stack is the shared one, found above;
+# the only bring-up left in this file is the `stack` role's, near the top. It
+# still built the seed repo, because that is not the stack's — it is what
+# run-test.sh points the test's own git repo at as an ALTERNATE, so a push can
+# skip an object the remote advertises without having to read it.
 
 # worker1 gets the inner stack; this script keeps the outer one. Everything
 # it needs to talk to the stack above is set HERE and nowhere else.
+phase "handing off to worker1"
 PATH=/caos/bin:$PATH \
 CAOS_SERVER_URL=$INNER \
 CAOS_CLI=/caos/bin/caos-cli \

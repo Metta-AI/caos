@@ -125,9 +125,13 @@ reduce)
   # WITHOUT the directive (crates/caos/src/eval.rs `strip_caos_expr`), so the
   # `in` a client's `--in:@=.` forms — and the one build-builtins.sh records as
   # the seed key — is the stripped tree. Hand-simulating the expression means
-  # stripping too: pass the entry verbatim and the key matches no seed record,
-  # the job falls through to the generic runner, and it dies trying to pull
-  # `seeded:latest`.
+  # stripping too: pass the entry verbatim and the key matches no seed record.
+  #
+  # A seeded sentinel does NOT then fall through to a generic runner — it defers
+  # generic polls for its whole pending window, so nothing runs and nothing
+  # logs. The server proves the mismatch instead and 503s after
+  # CAOS_SEEDED_GRACE_SECS naming both oids (crates/server/src/runner.rs
+  # `seeded_verdict`); before that it was 900s of an idle machine.
   F=/tmp/flake-builder
   rm -rf "$F"; mkdir -p "$F"
   cp -RL --preserve=mode /cas/args/in/std/flake-builder/. "$F/"
@@ -190,7 +194,7 @@ make)
   # only observable is one opaque container lifetime, and the two expensive
   # phases (git-writing 167 MB of binaries, then hashing them again into the
   # result) look exactly like a slow compile.
-  ts() { echo "build: [${SECONDS}s] $*" >&2; }
+  ts() { echo "build: [${SECONDS}s] $*" >&2; echo "$(date +%s%3N) $*" >> /tmp/phases.txt; }
   caos get -r /cas/args/src
   caos get -r /cas/args/builder
   ts "fetched src + builder"
@@ -224,6 +228,14 @@ make)
   mkdir -p "${CARGO_HOME:?bake.env should set CARGO_HOME}"
   cp "${CAOS_VENDOR_CONFIG:?bake.env should set CAOS_VENDOR_CONFIG}" \
      "$CARGO_HOME/config.toml"
+  # NO INCREMENTAL COMPILATION. The target dir is the bake's and persists
+  # between builds, and incremental artifacts make rustc's output depend on
+  # what was compiled here BEFORE — so two builds of an unchanged tree produced
+  # different `caos` binaries (measured), hence a different stack image, hence
+  # a new shared test stack and a cold start on every salted run. Everything
+  # downstream keys on the image, so a build that is not reproducible defeats
+  # caching for the whole suite, not just the stack.
+  export CARGO_INCREMENTAL=0
   cargo build --workspace --locked 2>&1 | tee /tmp/compile.log >&2 \
     || fail "cargo build"
 
@@ -280,10 +292,14 @@ make)
   CAOS_STACK_RUNNERD=no \
     bash "$wsroot/stack/serve" > /tmp/seed-serve.log 2>&1 &
   serve=$!
-  for _ in $(seq 1 60); do
+  # 0.05s steps, not 1s: this stack is redis + server with no runnerd and no
+  # registry, and both answer in well under a second — a 1s step meant almost
+  # the whole of this phase's measured second was the poll sleeping, not the
+  # stack starting.
+  for _ in $(seq 1 1200); do
     [ -e /tmp/seed-ready ] && break
     kill -0 "$serve" 2>/dev/null || { cat /tmp/seed-serve.log >&2; fail "seed stack died"; }
-    sleep 1
+    sleep 0.05
   done
   [ -e /tmp/seed-ready ] || { cat /tmp/seed-serve.log >&2; fail "seed stack never came up"; }
   ts "seed stack up"
@@ -292,12 +308,34 @@ make)
   # caos-net — which is also the name the inner server will pull a delta's
   # `base` with. The clean core images push under a store-path-keyed tag, so
   # these are registry hits whenever the host got there first.
+  #
+  # BY ADDRESS, not by name, for the HTTP endpoint build-builtins talks to. A
+  # name costs about a second per lookup in a container here (the resolver
+  # stalls on the AAAA half) and the answer is cached per PROCESS, so each
+  # curl and each skopeo pays it afresh — measured as most of this step's 4.4s.
+  # runnerd already hands us the server as an address, and caos-server and
+  # caos-registry are two aliases of one container, so its host is the
+  # registry's too. VERIFIED before use, and the name is the fallback: if that
+  # ever stops being true this gets slower, never wrong.
+  #
+  # CAOS_REGISTRY_BASE_HOST is deliberately NOT touched. That one is written
+  # into every delta's `base` blob, so it is DATA — changing it would move
+  # every image hash in the tree.
+  reg=caos-registry:5000
+  reg_ip=$(printf '%s' "${CAOS_SERVER_URL:-}" | sed -n 's|^[a-z]*://\([^/:]*\).*|\1|p')
+  if [ -n "$reg_ip" ] && curl -sf -o /dev/null --max-time 5 "http://$reg_ip:5000/v2/"; then
+    reg="$reg_ip:5000"
+  fi
+  ts "registry endpoint $reg"
+
   CAOS_SERVER_URL=http://127.0.0.1 \
   CAOS_CLI="$BIN/caos-cli" \
   CAOS_CLIENT_REPO=/tmp/seed-client \
-  CAOS_REGISTRY_HTTP=caos-registry:5000 \
+  CAOS_REGISTRY_HTTP="$reg" \
   CAOS_BUILTIN_IMAGES="$(echo /caos/images/*.tar.gz)" \
   CAOS_BUILTIN_BINS="$STAGED" \
+  CAOS_PHASES=/tmp/phases.txt \
+  CAOS_CLIENT_REPO_THROWAWAY=yes \
     bash "$wsroot/build-builtins.sh" >&2 || fail "bootstrapping the seeded core"
 
   # The seed records (design/caos-expr.md, Phase 3), if bootstrap published any:
@@ -373,6 +411,34 @@ make)
   # Replayed on a cache hit, like every other duration in a result: it says
   # what this build cost when it last actually ran.
   echo "$SECONDS" > "$OUT/time"
+
+  # WHAT THIS BUILD ACTUALLY COMPILED, as a value. The compile is the one part
+  # of a build nobody can see afterwards — a worker's stderr is not kept for a
+  # job that succeeded — and it is exactly what has to be compared when two
+  # builds of one tree disagree, which they do (design/faster-tests.md). Small,
+  # and it re-keys nothing that matters: `time` beside it already varies per
+  # run, so the result tree is per-run either way.
+  #
+  # The per-artifact hashes are how you find WHICH crate went nondeterministic
+  # when two builds of one tree disagree: the final binary tells you only that
+  # something did. Every workspace rlib and binary, so the first one that
+  # differs between two runs names the culprit.
+  {
+    echo "CGU=[${CARGO_PROFILE_DEV_CODEGEN_UNITS:-unset}] INCR=[${CARGO_INCREMENTAL:-unset}] HOME=[${CARGO_HOME:-unset}]"
+    grep -a "^ *Compiling" /tmp/compile.log
+    echo "--- phases (ms since stage start)"; if [ -f /tmp/phases.txt ]; then awk "NR==1{t=\$1} {printf \"%6d  \", \$1-t; \$1=\"\"; print}" /tmp/phases.txt; fi
+    echo "--- inputs this stage was HANDED (not built here)"
+    for f in /cas/args/builder/layer00/bin/caos /cas/args/builder/config.json \
+             /cas/args/builder/base; do
+      if [ -f "$f" ]; then echo "$(sha1sum "$f" | cut -c1-16)  $f"; fi
+    done
+    echo "--- artifacts"
+    for f in "$BIN"/caos "$BIN"/caos-cli "$BIN"/server "$BIN"/runnerd "$BIN"/worker-* \
+             "$BIN"/deps/libcaos-*.rlib "$BIN"/deps/libcaos_world-*.rlib \
+             "$BIN"/deps/libworker_common-*.rlib; do
+      if [ -f "$f" ]; then echo "$(sha1sum "$f" | cut -c1-16)  $(basename "$f")"; fi
+    done
+  } > "$OUT/compiled" 2>/dev/null || : > "$OUT/compiled"
 
   caos put "$OUT" /cas/out
   ts "put the result tree"

@@ -1293,6 +1293,7 @@ fn turn(
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
     emit(TurnEvent::PhaseStarted(TurnPhase::Model));
+    let phase = std::time::Instant::now();
     let server = t.server_url()?;
     let run = {
         let (server, arg_tree) = (server.clone(), arg_tree);
@@ -1330,6 +1331,10 @@ fn turn(
     let outcome = run
         .join()
         .map_err(|_| "the run thread panicked".to_string())?;
+    emit(TurnEvent::PhaseComplete {
+        label: "the run".to_string(),
+        elapsed_secs: phase.elapsed().as_secs_f64(),
+    });
     let (kind, turn_hash) = match outcome {
         Ok(result) => result,
         Err(e) => {

@@ -306,7 +306,7 @@ bin-workers (file-count, dirs-only, deep-deps, rgrep), the bash tests
 cargo-crates, cargo-self, commit, rust-worker — the cargo base image rides by
 ID like the others; the inner std carries build-builtins' full shape including
 `rustc = curry(runner, bin, cargo, worker-common)`), and the stub tests
-(bash-tool, llm-step, chat-offline — helper binaries come from the job's
+(bash-tool, llm-step, chat-* — helper binaries come from the job's
 `bins` tree via `CAOS_BIN_DIR` instead of host nix, and `CAOS_STUB_HOST`
 points workers at in-job stubs: siblings share the job's netns, so the stub
 lives at 127.0.0.1, not the engine-host alias). The testenv image grew a

@@ -136,7 +136,22 @@ Details:
   slowness). The *voluntary* requeue (`requeue: true` — the provisioning
   handoff) is unaffected.
 - **Pending deadline**: a job no poll and no lineage can serve waits for new
-  capacity, then fails 503 after a dispatch timeout (~60s).
+  capacity, then fails 503 after a dispatch timeout (~60s; a stack sets 900s).
+- **Seeded verdict** (2026-08-13): a `docker://seeded…` job defers generic
+  runners for its *whole* pending window, so an unanswerable one is silent —
+  no container starts, nothing logs, and the machine sits idle until the
+  timeout produces `no runner for arg_tree …`, which blames capacity. But a
+  seeded job's `image` arg is the blob of the sentinel string itself, and the
+  seed record carries that same blob in its `required`, so **a parked poll
+  whose `required["image"]` equals the job's `image` is that sentinel's seeder
+  and nobody else's**. If it is parked and does not match, the two sides
+  disagree about the rest of the key and waiting cannot fix it. After
+  `CAOS_SEEDED_GRACE_SECS` (45s — enough to clear the seeder's own 20s poll
+  TTL plus its 5s rescan, the only windows where a parked poll is legitimately
+  stale) the server fails 503 naming the differing args. On the real failure
+  (the `strip_caos_expr` contract change, where build.sh asked `in=1fa8ec14`
+  of a seeder answering `in=229fc9ba`) this is 46s and the exact cause, in
+  place of ten minutes and a wrong one.
 - **No worker-slot semaphore on this path**: capacity is runner-side.
   `CAOS_MAX_WORKERS` becomes the host agent's `CAOS_RUNNER_SLOTS`.
 
