@@ -8,11 +8,20 @@
 //!     - a blob  → write its bytes to `<path>`;
 //!     - a tree  → create the directory `<path>` and, for each entry, an empty
 //!       file named after that entry.
+//!
+//! Every materialized path is tagged with the git hash it came from in the
+//! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
+//! each child of a tree with that entry's own oid. This is the on-disk,
+//! per-path, thread-safe mapping from CAS paths back to hashes.
 
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Base URL of the object server, e.g. `http://caos-object-server:8080`.
 const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
@@ -21,6 +30,14 @@ const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
 /// runs outside the container) with `CAOS_CAS_DIR`.
 const CAS_DIR_ENV: &str = "CAOS_CAS_DIR";
 const DEFAULT_CAS_DIR: &str = "/cas";
+
+/// xattr recording the git hash a materialized path came from.
+const HASH_XATTR: &str = "user.caos.hash";
+/// xattr used only by the startup support probe.
+const PROBE_XATTR: &str = "user.caos.probe";
+
+/// Disambiguates temp names created within a single process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -61,7 +78,9 @@ fn usage(args: &[String]) -> String {
 fn get_hash(hash: &str, path: &str) -> Result<(), String> {
     let base = std::env::var(OBJECT_SERVER_ENV)
         .map_err(|_| format!("{OBJECT_SERVER_ENV} must be set to the object-server URL"))?;
-    let target = validate_target(path)?;
+    let cas = cas_dir();
+    let target = validate_target(&cas, path)?;
+    probe_xattr(&cas)?;
 
     let url = format!("{}/object/{hash}", base.trim_end_matches('/'));
     let data = http_get(&url)?;
@@ -73,19 +92,23 @@ fn get_hash(hash: &str, path: &str) -> Result<(), String> {
     // blob.
     if !data.is_empty() {
         if let Ok(tree) = gix::objs::TreeRef::from_bytes(&data, gix::hash::Kind::Sha1) {
-            return write_tree(&target, &tree);
+            return write_tree(&target, hash, &tree);
         }
     }
-    write_file(&target, &data)
+    write_file(&target, hash, &data)
+}
+
+/// CAS root directory (`/cas`, or `$CAOS_CAS_DIR`).
+fn cas_dir() -> PathBuf {
+    PathBuf::from(std::env::var(CAS_DIR_ENV).unwrap_or_else(|_| DEFAULT_CAS_DIR.into()))
 }
 
 /// Resolve `<path>` and require it to be a direct child of the CAS directory
 /// (`/cas/foo`, never `/cas/foo/bar` or a path outside `/cas`).
-fn validate_target(path: &str) -> Result<PathBuf, String> {
-    let cas = PathBuf::from(std::env::var(CAS_DIR_ENV).unwrap_or_else(|_| DEFAULT_CAS_DIR.into()));
+fn validate_target(cas: &Path, path: &str) -> Result<PathBuf, String> {
     let target = PathBuf::from(path);
 
-    if target.parent() != Some(cas.as_path()) || target.file_name().is_none() {
+    if target.parent() != Some(cas) || target.file_name().is_none() {
         return Err(format!(
             "path must be a direct child of {} (e.g. {}/foo), got: {path}",
             cas.display(),
@@ -95,21 +118,95 @@ fn validate_target(path: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// Blob → write its bytes verbatim to `target`.
-fn write_file(target: &Path, data: &[u8]) -> Result<(), String> {
-    std::fs::write(target, data).map_err(|e| format!("writing file {}: {e}", target.display()))
+/// Fail fast if the CAS directory can't store the `user.*` xattrs we use to
+/// record source hashes (some filesystems — tmpfs on older kernels, certain
+/// overlay setups — don't support them).
+fn probe_xattr(cas: &Path) -> Result<(), String> {
+    if !cas.is_dir() {
+        return Err(format!("CAS directory {} does not exist", cas.display()));
+    }
+    xattr::set(cas, PROBE_XATTR, b"1").map_err(|e| {
+        format!(
+            "{} does not support user extended attributes, which caos needs to \
+             record source hashes: {e}",
+            cas.display()
+        )
+    })?;
+    let _ = xattr::remove(cas, PROBE_XATTR);
+    Ok(())
 }
 
-/// Tree → create `target` as a directory and an empty file per entry.
-fn write_tree(target: &Path, tree: &gix::objs::TreeRef) -> Result<(), String> {
-    std::fs::create_dir(target)
-        .map_err(|e| format!("creating directory {}: {e}", target.display()))?;
+/// Blob → atomically write `data` to `target`, tagged with `hash`.
+fn write_file(target: &Path, hash: &str, data: &[u8]) -> Result<(), String> {
+    atomically(target, |tmp| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+            .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+        file.write_all(data)
+            .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        set_hash(tmp, hash.as_bytes())
+    })
+}
 
-    for entry in &tree.entries {
-        let child = target.join(OsStr::from_bytes(entry.filename));
-        std::fs::File::create(&child).map_err(|e| format!("creating {}: {e}", child.display()))?;
+/// Tree → atomically create `target` as a directory tagged with `hash`, holding
+/// one empty file per entry, each tagged with that entry's oid.
+fn write_tree(target: &Path, hash: &str, tree: &gix::objs::TreeRef) -> Result<(), String> {
+    atomically(target, |tmp| {
+        std::fs::create_dir(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+        set_hash(tmp, hash.as_bytes())?;
+        for entry in &tree.entries {
+            let child = tmp.join(OsStr::from_bytes(entry.filename));
+            std::fs::File::create(&child)
+                .map_err(|e| format!("creating {}: {e}", child.display()))?;
+            set_hash(&child, entry.oid.to_string().as_bytes())?;
+        }
+        Ok(())
+    })
+}
+
+/// Build content at a unique temp sibling of `target` via `build`, then rename
+/// it into place atomically; the temp path is cleaned up on any failure.
+///
+/// The temp lives in the same directory (hence the same filesystem) as
+/// `target`, so the final `rename` is atomic — concurrent `caos` processes
+/// never see a half-written path or one missing its hash xattr.
+fn atomically(
+    target: &Path,
+    build: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let tmp = temp_path(target)?;
+    let result = build(&tmp).and_then(|()| {
+        std::fs::rename(&tmp, target)
+            .map_err(|e| format!("renaming into place {}: {e}", target.display()))
+    });
+    if result.is_err() {
+        // One of these is a no-op depending on whether `tmp` is a file or dir.
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
-    Ok(())
+    result
+}
+
+/// A unique sibling path of `target` (same directory ⇒ same filesystem).
+fn temp_path(target: &Path) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(".caos-tmp.{pid}.{nanos}.{seq}")))
+}
+
+/// Record the source hash of `path` in its `user.caos.hash` xattr.
+fn set_hash(path: &Path, hash: &[u8]) -> Result<(), String> {
+    xattr::set(path, HASH_XATTR, hash)
+        .map_err(|e| format!("setting {HASH_XATTR} on {}: {e}", path.display()))
 }
 
 /// HTTP GET returning the raw response body. Non-2xx responses are errors.

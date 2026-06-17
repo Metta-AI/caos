@@ -155,6 +155,23 @@ parsed with [gitoxide](https://github.com/GitoxideLabs/gitoxide), and:
 recovered by parsing: data that parses as a tree is a directory, otherwise a
 blob. A 0-byte object is treated as an empty blob.)
 
+### Path → hash mapping
+
+Every materialized path records where it came from in the `user.caos.hash`
+extended attribute: the top-level path gets `<hash>`, and each child of a tree
+gets that entry's own oid (so deeper paths are covered too). This is the on-disk,
+per-path mapping from CAS paths back to hashes.
+
+```bash
+getfattr -n user.caos.hash --only-values /cas/foo
+```
+
+Paths are written atomically (build in a temp sibling, set the xattr, then
+`rename` into place), so concurrent runs never see a half-written path or one
+missing its hash — no locking needed. On startup `caos` probes the CAS directory
+and exits with a clear error if its filesystem doesn't support `user.*` xattrs
+(e.g. tmpfs on older kernels, or some overlay setups).
+
 ```bash
 docker run --rm \
   -e CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080 \

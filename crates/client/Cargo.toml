@@ -16,3 +16,6 @@ gix = { version = "0.84", default-features = false, features = ["sha1"] }
 # (no TLS) and, unlike heavier clients, it pulls no `url`/`idna` tree — so the
 # build stays small, pure-Rust, and static.
 minreq = { version = "2", default-features = false }
+# Read/write extended attributes: each materialized path is tagged with the git
+# hash it came from (`user.caos.hash`).
+xattr = "1"
