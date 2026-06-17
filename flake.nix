@@ -44,43 +44,132 @@
           inherit src;
           strictDeps = true;
 
+          # Shared across deps + both crates so crane keys the dep cache the
+          # same way every time.
+          pname = "caos-workspace";
+          version = "0.1.0";
+
           CARGO_BUILD_TARGET = muslTarget;
 
           # Native build inputs / runtime libs go here as the project grows,
           # e.g. pkgs.openssl + pkgs.pkg-config for TLS. Note: C deps would
-          # need a musl cross-toolchain to stay static.
+          # need a musl cross-toolchain to stay static. (object-server's gix
+          # uses default-features = false, so it stays pure-Rust / static.)
           # buildInputs = [ ];
           # nativeBuildInputs = [ ];
         };
 
-        # Build all dependencies once and cache them separately from the crate
-        # itself — this is crane's key win for fast incremental rebuilds.
+        # Build all workspace dependencies once and cache them separately from
+        # the crates — this is crane's key win for fast incremental rebuilds,
+        # and both binaries below share this single dep build.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        caos = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
+        # One member of the workspace. `--package` scopes the build so each
+        # output contains only that crate's binary (keeps each image minimal).
+        crateBin =
+          pname:
+          craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts pname;
+              cargoExtraArgs = "--package ${pname}";
+              # The package builds only its own binary, so nothing else lands
+              # in the output's /bin.
+              doCheck = false;
+            }
+          );
 
-        # A base image containing *only* the static binary at /bin/caos — no
-        # shell, no libc, no /nix/store. Other images can `FROM caos`.
-        # NOTE: Docker images are Linux-only; build this on Linux (or via a
+        client = crateBin "client";
+        object-server = crateBin "object-server";
+
+        # Minimal images: each contains *only* its static binary — no shell, no
+        # libc, no /nix/store. Crates are unprefixed (client, object-server) but
+        # the published image names carry a `caos-` prefix.
+        # NOTE: Docker images are Linux-only; build these on Linux (or via a
         # remote/linux builder on macOS).
-        dockerImage = pkgs.dockerTools.buildImage {
-          name = "caos";
+        clientImage = pkgs.dockerTools.buildImage {
+          name = "caos-client";
           tag = "latest";
-          copyToRoot = [ caos ];
+          copyToRoot = [ client ];
           config = {
-            Cmd = [ "/bin/caos" ];
+            Cmd = [ "/bin/client" ];
+          };
+        };
+
+        # Run with the git repo bind-mounted at /git, e.g.
+        #   docker run --rm -p 8080:8080 -v /path/to/repo:/git caos-object-server
+        objectServerImage = pkgs.dockerTools.buildImage {
+          name = "caos-object-server";
+          tag = "latest";
+          copyToRoot = [ object-server ];
+          config = {
+            Cmd = [ "/bin/object-server" ];
+            ExposedPorts = {
+              "8080/tcp" = { };
+            };
+          };
+        };
+
+        # `nix run .#load-<name>` builds the image and pipes it straight into the
+        # local docker daemon — build + `docker load` in one go. Uses
+        # streamLayeredImage so nothing big is written to the Nix store; the
+        # layers are streamed directly to docker. `docker` is taken from PATH.
+        loadImage =
+          { name, pkg, config ? { } }:
+          let
+            stream = pkgs.dockerTools.streamLayeredImage {
+              inherit name config;
+              tag = "latest";
+              contents = [ pkg ];
+            };
+          in
+          pkgs.writeShellApplication {
+            name = "load-${name}";
+            text = ''
+              ${stream} | docker load
+            '';
+          };
+
+        loadClient = loadImage {
+          name = "caos-client";
+          pkg = client;
+          config.Cmd = [ "/bin/client" ];
+        };
+        loadObjectServer = loadImage {
+          name = "caos-object-server";
+          pkg = object-server;
+          config = {
+            Cmd = [ "/bin/object-server" ];
+            ExposedPorts = {
+              "8080/tcp" = { };
+            };
           };
         };
       in
       {
         packages = {
-          default = caos;
-          caos = caos;
-          docker = dockerImage;
+          default = client;
+          inherit client object-server;
+
+          # Image tarballs (build with `nix build`, then `docker load < result`).
+          caos-client-docker = clientImage;
+          caos-object-server-docker = objectServerImage;
+        };
+
+        apps = {
+          # Build the image and load it into the local docker daemon in one go.
+          load-caos-client = {
+            type = "app";
+            program = "${loadClient}/bin/load-caos-client";
+          };
+          load-caos-object-server = {
+            type = "app";
+            program = "${loadObjectServer}/bin/load-caos-object-server";
+          };
         };
 
         checks = {
-          inherit caos;
+          inherit client object-server;
 
           clippy = craneLib.cargoClippy (
             commonArgs
