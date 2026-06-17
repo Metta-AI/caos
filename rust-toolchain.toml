@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = [ "rustfmt", "clippy" ]
+# Static target so the Docker image needs no libc closure — just the binary.
+# On aarch64 hosts, change this to "aarch64-unknown-linux-musl".
+targets = [ "x86_64-unknown-linux-musl" ]
