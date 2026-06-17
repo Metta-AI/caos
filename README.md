@@ -8,7 +8,7 @@ Nix flake, so builds are reproducible and consistent across machines.
 
 | Crate | Image | What it is |
 |---|---|---|
-| `client` | `caos-client` | Placeholder binary. |
+| `client` | `caos-client` | CLI that fetches objects from the object server (see below). Exposed as `caos` inside the image. |
 | `object-server` | `caos-object-server` | HTTP daemon over a git object database (see below). |
 
 ## Prerequisites
@@ -78,8 +78,23 @@ nix run .#load-caos-client
 nix run .#load-caos-object-server
 ```
 
-Each image contains **only** its static binary under `/bin` — no shell, no
-libc, no package manager, no `/nix/store`.
+The `caos-client` and `caos-object-server` images contain **only** their static
+binary under `/bin` — no shell, no libc, no package manager, no `/nix/store`.
+The `caos-client` image exposes the binary as `/bin/caos` and includes the empty
+`/cas` directory it writes into.
+
+There's also a `caos-client-bash` image (`.#caos-client-bash-docker`,
+`.#load-caos-client-bash`) for interactive testing: it's the `caos-client` root
+plus `bash`, `coreutils`, and `curl`, with `bash` as the default command and
+`CAOS_OBJECT_SERVER_URL` defaulted to `http://caos-object-server:8080`.
+
+```bash
+nix run .#load-caos-client-bash
+docker run --rm -it \
+  -v /path/to/cas:/cas \
+  caos-client-bash:latest
+# inside: caos get-hash <hash> /cas/foo
+```
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
 > remote or linux builder; the binaries and dev shell build fine natively.
@@ -117,6 +132,55 @@ curl -s "http://localhost:8080/object/$hash"
 The listen address (`OBJECT_SERVER_ADDR`, default `0.0.0.0:8080`) and repo path
 (`OBJECT_SERVER_GIT_DIR`, default `/git`) are overridable via environment
 variables — handy for running outside a container.
+
+## client (`caos`)
+
+The `client` crate (`crates/client`) builds a CLI exposed as `caos` inside its
+image. It finds the object server via `$CAOS_OBJECT_SERVER_URL` and materializes
+objects under `/cas`.
+
+```text
+caos get-hash <hash> <path>
+```
+
+`<path>` must be a **direct child of `/cas`** (e.g. `/cas/foo`, no nested
+subdirectories). The object at `<hash>` is fetched with `GET <url>/object/<hash>`,
+parsed with [gitoxide](https://github.com/GitoxideLabs/gitoxide), and:
+
+- a **blob** is written verbatim to `<path>`;
+- a **tree** creates the directory `<path>`, plus one empty file per entry,
+  named after that entry.
+
+(The object server returns content without a type header, so the type is
+recovered by parsing: data that parses as a tree is a directory, otherwise a
+blob. A 0-byte object is treated as an empty blob.)
+
+```bash
+docker run --rm \
+  -e CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080 \
+  -v /path/to/cas:/cas \
+  caos-client:latest \
+  caos get-hash <hash> /cas/foo
+```
+
+`CAOS_CAS_DIR` (default `/cas`) overrides the target directory — handy for
+running outside a container.
+
+## Local testing
+
+`scripts/dev-up.sh` wires the whole thing together: it loads all three images,
+starts the object server against a repo you pass on the command line (on a
+docker network named so the client's default URL resolves), and prints a
+one-shot bash-client command.
+
+```bash
+scripts/dev-up.sh /path/to/repo
+# ... then run the printed `docker run --rm -it ... caos-client-bash:latest`
+```
+
+Overrides: `CAOS_NET` (network name, default `caos-net`) and `CAOS_PORT` (host
+port for the object server, default `8080`). Stop the server with
+`docker rm -f caos-object-server`.
 
 ## Notes
 

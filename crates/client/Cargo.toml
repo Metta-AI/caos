@@ -6,3 +6,13 @@ edition = "2021"
 [[bin]]
 name = "client"
 path = "src/main.rs"
+
+[dependencies]
+# Parse git objects (trees) returned by the object server. Same pure-Rust,
+# static-musl-friendly config as the object-server crate, so the workspace
+# shares a single gix build.
+gix = { version = "0.84", default-features = false, features = ["sha1"] }
+# Minimal blocking HTTP client. default-features = false keeps it to plain HTTP
+# (no TLS) and, unlike heavier clients, it pulls no `url`/`idna` tree — so the
+# build stays small, pure-Rust, and static.
+minreq = { version = "2", default-features = false }

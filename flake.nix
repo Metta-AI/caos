@@ -87,12 +87,20 @@
         # the published image names carry a `caos-` prefix.
         # NOTE: Docker images are Linux-only; build these on Linux (or via a
         # remote/linux builder on macOS).
+
+        # The client crate's binary is `client` everywhere except inside its
+        # image, where it's exposed as `/bin/caos`. This root also carries the
+        # empty `/cas` directory the binary materializes objects into.
+        clientImageRoot = pkgs.runCommand "caos-client-root" { } ''
+          mkdir -p $out/bin $out/cas
+          cp ${client}/bin/client $out/bin/caos
+        '';
         clientImage = pkgs.dockerTools.buildImage {
           name = "caos-client";
           tag = "latest";
-          copyToRoot = [ client ];
+          copyToRoot = [ clientImageRoot ];
           config = {
-            Cmd = [ "/bin/client" ];
+            Cmd = [ "/bin/caos" ];
           };
         };
 
@@ -110,17 +118,41 @@
           };
         };
 
+        # A testing image: caos-client plus an ordinary interactive shell
+        # (bash + coreutils + curl) so you can poke at /cas and the object
+        # server by hand. Not minimal — for debugging, not production.
+        clientBashContents = [
+          clientImageRoot
+          pkgs.bashInteractive
+          pkgs.coreutils
+          pkgs.curl
+        ];
+        clientBashConfig = {
+          Cmd = [ "/bin/bash" ];
+          Env = [
+            "PATH=/bin"
+            # Convenience default for the usual docker-compose service name;
+            # override with `-e CAOS_OBJECT_SERVER_URL=...`.
+            "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
+          ];
+        };
+        clientBashImage = pkgs.dockerTools.buildImage {
+          name = "caos-client-bash";
+          tag = "latest";
+          copyToRoot = clientBashContents;
+          config = clientBashConfig;
+        };
+
         # `nix run .#load-<name>` builds the image and pipes it straight into the
         # local docker daemon — build + `docker load` in one go. Uses
         # streamLayeredImage so nothing big is written to the Nix store; the
         # layers are streamed directly to docker. `docker` is taken from PATH.
         loadImage =
-          { name, pkg, config ? { } }:
+          { name, contents, config ? { } }:
           let
             stream = pkgs.dockerTools.streamLayeredImage {
-              inherit name config;
+              inherit name config contents;
               tag = "latest";
-              contents = [ pkg ];
             };
           in
           pkgs.writeShellApplication {
@@ -132,18 +164,23 @@
 
         loadClient = loadImage {
           name = "caos-client";
-          pkg = client;
-          config.Cmd = [ "/bin/client" ];
+          contents = [ clientImageRoot ];
+          config.Cmd = [ "/bin/caos" ];
         };
         loadObjectServer = loadImage {
           name = "caos-object-server";
-          pkg = object-server;
+          contents = [ object-server ];
           config = {
             Cmd = [ "/bin/object-server" ];
             ExposedPorts = {
               "8080/tcp" = { };
             };
           };
+        };
+        loadClientBash = loadImage {
+          name = "caos-client-bash";
+          contents = clientBashContents;
+          config = clientBashConfig;
         };
       in
       {
@@ -154,6 +191,7 @@
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-client-docker = clientImage;
           caos-object-server-docker = objectServerImage;
+          caos-client-bash-docker = clientBashImage;
         };
 
         apps = {
@@ -165,6 +203,10 @@
           load-caos-object-server = {
             type = "app";
             program = "${loadObjectServer}/bin/load-caos-object-server";
+          };
+          load-caos-client-bash = {
+            type = "app";
+            program = "${loadClientBash}/bin/load-caos-client-bash";
           };
         };
 
