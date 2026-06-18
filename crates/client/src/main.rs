@@ -3,16 +3,19 @@
 //! Subcommands:
 //!
 //! * `get-hash <hash> <path>` — fetch the git object `<hash>` from the object
-//!   server (its base URL comes from `$CAOS_OBJECT_SERVER_URL`) and materialize
-//!   it under `<path>`, which must be a direct child of `/cas`:
-//!     - a blob  → write its bytes to `<path>`;
-//!     - a tree  → create the directory `<path>` and, for each entry, an empty
-//!       file named after that entry.
+//!   server (base URL from `$CAOS_OBJECT_SERVER_URL`) and materialize it at
+//!   `<path>`, a direct child of `/cas`: a blob becomes a file holding its
+//!   bytes; a tree becomes a directory holding one empty placeholder per entry
+//!   (a directory for subtrees, a file otherwise).
+//! * `get <path>` — expand an existing placeholder anywhere under `/cas`: read
+//!   its recorded hash, fetch that object, and replace the empty file with the
+//!   blob's content, or the empty directory with the tree's entries.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
 //! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
-//! each child of a tree with that entry's own oid. This is the on-disk,
-//! per-path, thread-safe mapping from CAS paths back to hashes.
+//! each child of a tree with that entry's own oid. This is both the on-disk,
+//! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
+//! `get` expand a placeholder later.
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -56,6 +59,10 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(hash), Some(path), None) => get_hash(hash, path),
             _ => Err(usage(args)),
         },
+        Some("get") => match (args.get(2), args.get(3)) {
+            (Some(path), None) => get(path),
+            _ => Err(usage(args)),
+        },
         _ => Err(usage(args)),
     }
 }
@@ -71,17 +78,35 @@ fn prog_name(args: &[String]) -> &str {
 }
 
 fn usage(args: &[String]) -> String {
-    format!("usage: {} get-hash <hash> <path>", prog_name(args))
+    let prog = prog_name(args);
+    format!("usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>")
 }
 
-/// Fetch `<hash>` from the object server and materialize it at `<path>`.
+/// `get-hash <hash> <path>` — fetch `<hash>` and materialize it at `<path>`,
+/// which must be a direct child of the CAS directory.
 fn get_hash(hash: &str, path: &str) -> Result<(), String> {
-    let base = std::env::var(OBJECT_SERVER_ENV)
-        .map_err(|_| format!("{OBJECT_SERVER_ENV} must be set to the object-server URL"))?;
+    let base = object_server_url()?;
     let cas = cas_dir();
     let target = validate_target(&cas, path)?;
     probe_xattr(&cas)?;
+    fetch_and_materialize(&base, &target, hash)
+}
 
+/// `get <path>` — re-materialize the object recorded at `<path>` (a path inside
+/// the CAS directory, possibly deep). Reads `<path>`'s recorded hash, fetches
+/// that object, and replaces the placeholder: an empty file with the blob's
+/// content, or an empty directory with the tree's entries.
+fn get(path: &str) -> Result<(), String> {
+    let base = object_server_url()?;
+    let cas = cas_dir();
+    let target = validate_descendant(&cas, path)?;
+    probe_xattr(&cas)?;
+    let hash = read_hash(&target)?;
+    fetch_and_materialize(&base, &target, &hash)
+}
+
+/// Fetch object `hash` and write it to `target` (blob → file, tree → directory).
+fn fetch_and_materialize(base: &str, target: &Path, hash: &str) -> Result<(), String> {
     let url = format!("{}/object/{hash}", base.trim_end_matches('/'));
     let data = http_get(&url)?;
 
@@ -92,10 +117,16 @@ fn get_hash(hash: &str, path: &str) -> Result<(), String> {
     // blob.
     if !data.is_empty() {
         if let Ok(tree) = gix::objs::TreeRef::from_bytes(&data, gix::hash::Kind::Sha1) {
-            return write_tree(&target, hash, &tree);
+            return write_tree(target, hash, &tree);
         }
     }
-    write_file(&target, hash, &data)
+    write_file(target, hash, &data)
+}
+
+/// Base URL of the object server from the environment.
+fn object_server_url() -> Result<String, String> {
+    std::env::var(OBJECT_SERVER_ENV)
+        .map_err(|_| format!("{OBJECT_SERVER_ENV} must be set to the object-server URL"))
 }
 
 /// CAS root directory (`/cas`, or `$CAOS_CAS_DIR`).
@@ -116,6 +147,33 @@ fn validate_target(cas: &Path, path: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(target)
+}
+
+/// Require an existing `<path>` strictly inside the CAS directory (any depth).
+/// Canonicalizes, so symlinks and `..` can't escape the CAS root.
+fn validate_descendant(cas: &Path, path: &str) -> Result<PathBuf, String> {
+    let cas = cas
+        .canonicalize()
+        .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+    let target = Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("{path}: {e}"))?;
+
+    if target == cas || !target.starts_with(&cas) {
+        return Err(format!(
+            "path must be inside {}, got: {path}",
+            cas.display()
+        ));
+    }
+    Ok(target)
+}
+
+/// Read the git hash recorded in `path`'s `user.caos.hash` xattr.
+fn read_hash(path: &Path) -> Result<String, String> {
+    let bytes = xattr::get(path, HASH_XATTR)
+        .map_err(|e| format!("reading {HASH_XATTR} from {}: {e}", path.display()))?
+        .ok_or_else(|| format!("no {HASH_XATTR} recorded for {}", path.display()))?;
+    String::from_utf8(bytes).map_err(|e| format!("invalid {HASH_XATTR} on {}: {e}", path.display()))
 }
 
 /// Fail fast if the CAS directory can't store the `user.*` xattrs we use to
@@ -151,15 +209,21 @@ fn write_file(target: &Path, hash: &str, data: &[u8]) -> Result<(), String> {
 }
 
 /// Tree → atomically create `target` as a directory tagged with `hash`, holding
-/// one empty file per entry, each tagged with that entry's oid.
+/// one empty placeholder per entry (a directory for subtrees, a file otherwise),
+/// each tagged with that entry's oid so it can later be expanded with `get`.
 fn write_tree(target: &Path, hash: &str, tree: &gix::objs::TreeRef) -> Result<(), String> {
     atomically(target, |tmp| {
         std::fs::create_dir(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
         set_hash(tmp, hash.as_bytes())?;
         for entry in &tree.entries {
             let child = tmp.join(OsStr::from_bytes(entry.filename));
-            std::fs::File::create(&child)
-                .map_err(|e| format!("creating {}: {e}", child.display()))?;
+            if entry.mode.is_tree() {
+                std::fs::create_dir(&child)
+                    .map_err(|e| format!("creating {}: {e}", child.display()))?;
+            } else {
+                std::fs::File::create(&child)
+                    .map_err(|e| format!("creating {}: {e}", child.display()))?;
+            }
             set_hash(&child, entry.oid.to_string().as_bytes())?;
         }
         Ok(())

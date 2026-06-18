@@ -140,20 +140,29 @@ image. It finds the object server via `$CAOS_OBJECT_SERVER_URL` and materializes
 objects under `/cas`.
 
 ```text
-caos get-hash <hash> <path>
+caos get-hash <hash> <path>   # materialize a given hash at a CAS path
+caos get <path>               # expand a placeholder already in /cas
 ```
 
-`<path>` must be a **direct child of `/cas`** (e.g. `/cas/foo`, no nested
-subdirectories). The object at `<hash>` is fetched with `GET <url>/object/<hash>`,
-parsed with [gitoxide](https://github.com/GitoxideLabs/gitoxide), and:
+**`get-hash <hash> <path>`** — `<path>` must be a **direct child of `/cas`**
+(e.g. `/cas/foo`). The object at `<hash>` is fetched with
+`GET <url>/object/<hash>`, parsed with
+[gitoxide](https://github.com/GitoxideLabs/gitoxide), and:
 
 - a **blob** is written verbatim to `<path>`;
-- a **tree** creates the directory `<path>`, plus one empty file per entry,
-  named after that entry.
+- a **tree** creates the directory `<path>` plus one empty placeholder per
+  entry — a **directory** for subtree entries, a **file** otherwise.
 
 (The object server returns content without a type header, so the type is
 recovered by parsing: data that parses as a tree is a directory, otherwise a
 blob. A 0-byte object is treated as an empty blob.)
+
+**`get <path>`** — `<path>` may be anywhere inside `/cas` (any depth) and must
+already exist. `caos` reads the hash recorded on it (see below), fetches that
+object, and expands it in place: an empty **file** is replaced with the blob's
+content; an empty **directory** is filled with the tree's entry placeholders.
+Together with `get-hash` this lets you lazily drill down a tree one level at a
+time — `get-hash` the root, then `get` whichever child you want to expand.
 
 ### Path → hash mapping
 
