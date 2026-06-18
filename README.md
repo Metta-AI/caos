@@ -103,12 +103,14 @@ docker run --rm -it \
 
 An HTTP daemon (`crates/object-server`) that reads and writes git objects in a
 repository **mounted at `/git`**, using [gitoxide](https://github.com/GitoxideLabs/gitoxide)
-(`gix`). Two endpoints:
+(`gix`). Objects cross the wire in git's native **serialized** form —
+`<type> <size>\0<content>`, uncompressed (the same bytes git hashes). Two
+endpoints:
 
 | Request | Behaviour |
 |---|---|
-| `GET /object/<hash>` | Return the raw (decompressed, header-stripped) data of the object with that hash. `400` if the hash is malformed, `404` if it's absent. |
-| `POST /object/?type=<blob\|tree>` | Write the request body into the repo as an object of that type (default `blob`; a `tree` body must be valid git tree encoding) and return git's hash for it (hex). Content-addressed, so it's idempotent. |
+| `GET /object/<hash>` | Return the serialized object with that hash. `400` if the hash is malformed, `404` if it's absent. |
+| `POST /object/` | Store the serialized object in the body (its type and size come from the header) and return git's hash for it (hex). Validates the header, and a `tree` body must be valid tree encoding. Content-addressed, so it's idempotent. |
 
 Run the image with the repo bind-mounted at `/git`:
 
@@ -118,15 +120,16 @@ docker run --rm -p 8080:8080 \
   caos-object-server:latest
 ```
 
-Then:
+Storing is normally driven by `caos put`, which frames objects for you. By hand,
+the body must be a serialized object, e.g. a blob:
 
 ```bash
-# Store data, get its hash back (matches `git hash-object -w`):
-hash=$(curl -s --data-binary @file.bin \
-  http://localhost:8080/object/)
+# Build "blob <size>\0<content>" and POST it; prints the git hash.
+printf 'blob 6\0hello\n' | curl -s --data-binary @- \
+  http://localhost:8080/object/
 
-# Read it back:
-curl -s "http://localhost:8080/object/$hash"
+# Read it back (returns the serialized object, header included):
+curl -s "http://localhost:8080/object/<hash>"
 ```
 
 The listen address (`OBJECT_SERVER_ADDR`, default `0.0.0.0:8080`) and repo path
@@ -153,9 +156,8 @@ caos get <path>               # expand a placeholder already in /cas
 - a **tree** creates the directory `<path>` plus one empty placeholder per
   entry — a **directory** for subtree entries, a **file** otherwise.
 
-(The object server returns content without a type header, so the type is
-recovered by parsing: data that parses as a tree is a directory, otherwise a
-blob. A 0-byte object is treated as an empty blob.)
+(The server returns the serialized object, so its `<type>` header tells the
+client whether it's a blob or a tree — no guessing.)
 
 **`get <path>`** — `<path>` may be anywhere inside `/cas` (any depth) and must
 already exist. `caos` reads the hash recorded on it (see below), fetches that
@@ -171,9 +173,9 @@ blobs and directories become trees. A symlink that resolves to something already
 in the CAS is **not** re-read — its recorded hash is reused, so shared content is
 stored once.
 
-Files become real git **blobs** and directories real git **trees** (the server
-writes each via `POST /object/?type=…`), so the hashes are genuine git object
-hashes — a `put` directory's hash equals what `git write-tree` would produce.
+Files become real git **blobs** and directories real git **trees** — each
+`POST`ed as a serialized object — so the hashes are genuine git object hashes; a
+`put` directory's hash equals what `git write-tree` would produce.
 
 ### Path → hash mapping
 

@@ -2,11 +2,13 @@
 //!
 //! The git repository is mounted at `/git`. Two endpoints are served:
 //!
-//! * `GET  /object/<hash>` — return the raw (decompressed, header-stripped)
-//!   data of the git object with that hash.
-//! * `POST /object/?type=<blob|tree>` — write the request body into the repo as
-//!   an object of that type (default `blob`) and return git's hash for it.
-//!   Content-addressed, so it is idempotent.
+//! Objects cross the wire in git's native serialized form,
+//! `<type> <size>\0<content>` (uncompressed):
+//!
+//! * `GET  /object/<hash>` — return the serialized object with that hash.
+//! * `POST /object/` — store the serialized object in the body (its type comes
+//!   from the header) and return git's hash for it. Content-addressed, so it is
+//!   idempotent.
 
 use tiny_http::{Method, Request, Response, Server};
 
@@ -82,8 +84,7 @@ fn handle(repo: &gix::Repository, mut request: Request) -> std::io::Result<()> {
 
 /// Match the request to a handler and produce the response body.
 fn route(repo: &gix::Repository, request: &mut Request) -> Result<Vec<u8>, HttpError> {
-    let url = request.url().to_string();
-    let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+    let path = request.url().to_string();
 
     match request.method() {
         Method::Get => match path.strip_prefix("/object/") {
@@ -91,24 +92,16 @@ fn route(repo: &gix::Repository, request: &mut Request) -> Result<Vec<u8>, HttpE
             _ => Err(HttpError::new(404, "not found")),
         },
         Method::Post if path == "/object/" || path == "/object" => {
-            let kind = query_param(query, "type").unwrap_or("blob");
             let mut body = Vec::new();
             request.as_reader().read_to_end(&mut body)?;
-            post_object(repo, kind, &body)
+            post_object(repo, &body)
         }
         _ => Err(HttpError::new(404, "not found")),
     }
 }
 
-/// Find a `key=value` pair in a URL query string.
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then_some(v)
-    })
-}
-
-/// `GET /object/<hash>` — return the object's decompressed content bytes.
+/// `GET /object/<hash>` — return the serialized object: git's native
+/// `<type> <size>\0<content>` form (uncompressed).
 fn get_object(repo: &gix::Repository, hash: &str) -> Result<Vec<u8>, HttpError> {
     let id = gix::ObjectId::from_hex(hash.as_bytes())
         .map_err(|err| HttpError::new(400, format!("invalid hash: {err}")))?;
@@ -117,21 +110,25 @@ fn get_object(repo: &gix::Repository, hash: &str) -> Result<Vec<u8>, HttpError> 
         .find_object(id)
         .map_err(|err| HttpError::new(404, format!("object not found: {err}")))?;
 
-    Ok(object.data.clone())
+    let mut out = object_header(object.kind, object.data.len());
+    out.extend_from_slice(&object.data);
+    Ok(out)
 }
 
-/// `POST /object/?type=<blob|tree>` — write the body as an object of that type
-/// and return its hash (hex + `\n`).
-fn post_object(repo: &gix::Repository, kind: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+/// `POST /object/` — store a serialized object (`<type> <size>\0<content>`) and
+/// return its hash (hex + `\n`). The type and size come from the body's header.
+fn post_object(repo: &gix::Repository, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+    let (kind, content) = parse_object(body)?;
+
     let id = match kind {
-        "blob" => repo
-            .write_blob(body)
+        gix::object::Kind::Blob => repo
+            .write_blob(content)
             .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?
             .detach(),
-        "tree" => {
+        gix::object::Kind::Tree => {
             // Validate the canonical tree encoding before writing it as a real
             // tree object (so its hash is a genuine git tree hash).
-            let tree = gix::objs::TreeRef::from_bytes(body, repo.object_hash())
+            let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid tree: {err}")))?;
             repo.write_object(&tree)
                 .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
@@ -140,10 +137,42 @@ fn post_object(repo: &gix::Repository, kind: &str, body: &[u8]) -> Result<Vec<u8
         other => {
             return Err(HttpError::new(
                 400,
-                format!("unsupported object type: {other:?} (expected blob or tree)"),
+                format!("unsupported object type: {other} (expected blob or tree)"),
             ))
         }
     };
 
     Ok(format!("{id}\n").into_bytes())
+}
+
+/// Build a git object header: `<type> <size>\0`.
+fn object_header(kind: gix::object::Kind, size: usize) -> Vec<u8> {
+    format!("{kind} {size}\0").into_bytes()
+}
+
+/// Split a serialized object into its type and content, validating the header.
+fn parse_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpError> {
+    let nul = body
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| HttpError::new(400, "malformed object: missing NUL after header"))?;
+    let header = std::str::from_utf8(&body[..nul])
+        .map_err(|_| HttpError::new(400, "malformed object header"))?;
+    let content = &body[nul + 1..];
+
+    let (kind, size) = header
+        .split_once(' ')
+        .ok_or_else(|| HttpError::new(400, "malformed object header: expected '<type> <size>'"))?;
+    let size: usize = size
+        .parse()
+        .map_err(|_| HttpError::new(400, format!("malformed object size: {size:?}")))?;
+    if size != content.len() {
+        return Err(HttpError::new(
+            400,
+            format!("object size {size} != content length {}", content.len()),
+        ));
+    }
+    let kind = gix::object::Kind::from_bytes(kind.as_bytes())
+        .map_err(|_| HttpError::new(400, format!("unknown object type: {kind:?}")))?;
+    Ok((kind, content))
 }

@@ -118,19 +118,42 @@ fn get(path: &str) -> Result<(), String> {
 /// Fetch object `hash` and write it to `target` (blob → file, tree → directory).
 fn fetch_and_materialize(base: &str, target: &Path, hash: &str) -> Result<(), String> {
     let url = format!("{}/object/{hash}", base.trim_end_matches('/'));
-    let data = http_get(&url)?;
+    let serialized = http_get(&url)?;
 
-    // The object server returns an object's content with no type header, so we
-    // recover the type by parsing: valid tree bytes ⇒ directory, otherwise blob.
-    // An empty object is treated as a blob — an empty blob and an empty tree are
-    // indistinguishable by content, and a 0-byte object is virtually always a
-    // blob.
-    if !data.is_empty() {
-        if let Ok(tree) = gix::objs::TreeRef::from_bytes(&data, gix::hash::Kind::Sha1) {
-            return write_tree(target, hash, &tree);
-        }
+    // The server returns the serialized object (`<type> <size>\0<content>`), so
+    // the type is authoritative — no guessing.
+    let (kind, content) = parse_object(&serialized)?;
+    if kind == "tree" {
+        let tree = gix::objs::TreeRef::from_bytes(content, gix::hash::Kind::Sha1)
+            .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+        write_tree(target, hash, &tree)
+    } else {
+        write_file(target, hash, content)
     }
-    write_file(target, hash, &data)
+}
+
+/// Split a serialized git object (`<type> <size>\0<content>`) into its type and
+/// content, validating the declared size.
+fn parse_object(bytes: &[u8]) -> Result<(&str, &[u8]), String> {
+    let nul = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| "object response missing NUL after header".to_string())?;
+    let header =
+        std::str::from_utf8(&bytes[..nul]).map_err(|e| format!("bad object header: {e}"))?;
+    let content = &bytes[nul + 1..];
+
+    let (kind, size) = header
+        .split_once(' ')
+        .ok_or_else(|| "bad object header: expected '<type> <size>'".to_string())?;
+    let size: usize = size.parse().map_err(|e| format!("bad object size: {e}"))?;
+    if size != content.len() {
+        return Err(format!(
+            "object size {size} != content length {}",
+            content.len()
+        ));
+    }
+    Ok((kind, content))
 }
 
 /// Base URL of the object server from the environment.
@@ -230,12 +253,15 @@ fn store(
     Err(format!("unsupported file type: {}", path.display()))
 }
 
-/// POST `data` to the object server as an object of `kind` (`blob`/`tree`),
-/// returning its hash.
-fn post_object(base: &str, kind: &str, data: &[u8]) -> Result<gix::ObjectId, String> {
-    let url = format!("{}/object/?type={kind}", base.trim_end_matches('/'));
+/// POST a serialized git object (`<type> <size>\0<content>`) to the object
+/// server and return its hash.
+fn post_object(base: &str, kind: &str, content: &[u8]) -> Result<gix::ObjectId, String> {
+    let mut body = format!("{kind} {}\0", content.len()).into_bytes();
+    body.extend_from_slice(content);
+
+    let url = format!("{}/object/", base.trim_end_matches('/'));
     let response = minreq::post(&url)
-        .with_body(data.to_vec())
+        .with_body(body)
         .send()
         .map_err(|e| format!("POST {url}: {e}"))?;
     if !(200..300).contains(&response.status_code) {
