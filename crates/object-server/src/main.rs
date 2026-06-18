@@ -19,7 +19,32 @@ const GIT_DIR: &str = "/git";
 /// Listen address; overridable for local runs outside the container.
 const DEFAULT_ADDR: &str = "0.0.0.0:8080";
 
+/// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
+/// in a container, where the daemon is PID 1: the kernel applies no default
+/// disposition for these signals to PID 1, so without an explicit handler
+/// `docker stop` (and Tilt's Ctrl-C) would hang until the 10s `SIGKILL`.
+fn install_termination_handlers() {
+    // Async-signal-safe: we hold no state that needs flushing, so just exit.
+    extern "C" fn terminate(_signum: std::ffi::c_int) {
+        unsafe { exit_now(0) }
+    }
+    extern "C" {
+        // libc, resolved against what std already links.
+        fn signal(signum: std::ffi::c_int, handler: extern "C" fn(std::ffi::c_int)) -> usize;
+        #[link_name = "_exit"]
+        fn exit_now(code: std::ffi::c_int) -> !;
+    }
+    const SIGINT: std::ffi::c_int = 2;
+    const SIGTERM: std::ffi::c_int = 15;
+    unsafe {
+        signal(SIGINT, terminate);
+        signal(SIGTERM, terminate);
+    }
+}
+
 fn main() {
+    install_termination_handlers();
+
     let addr = std::env::var("OBJECT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let git_dir = std::env::var("OBJECT_SERVER_GIT_DIR").unwrap_or_else(|_| GIT_DIR.to_string());
 
