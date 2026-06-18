@@ -206,6 +206,11 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "worker failed: image={image} args={args} ({}):\n{}",
+            output.status,
+            stderr.trim_end()
+        );
         return Err(HttpError::new(
             500,
             format!("worker container failed ({}):\n{stderr}", output.status),
@@ -215,6 +220,7 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // The container's stdout is the result hash printed by `caos entrypoint`.
     let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if hash.is_empty() {
+        eprintln!("worker produced no result hash on stdout: image={image} args={args}");
         return Err(HttpError::new(
             500,
             "worker container produced no result hash on stdout",

@@ -653,8 +653,16 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         .send()
         .map_err(|e| format!("GET {url}: {e}"))?;
     if !(200..300).contains(&response.status_code) {
+        // Surface the server's response body — for the compute server a 500
+        // carries the worker's failure output, which is what you actually need.
+        let body = response.as_str().unwrap_or("").trim();
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{body}")
+        };
         return Err(format!(
-            "GET {url}: server returned {} {}",
+            "GET {url}: server returned {} {}{detail}",
             response.status_code, response.reason_phrase
         ));
     }
