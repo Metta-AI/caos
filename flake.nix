@@ -81,6 +81,7 @@
 
         client = crateBin "client";
         object-server = crateBin "object-server";
+        compute-server = crateBin "compute-server";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (client, object-server) but
@@ -131,9 +132,19 @@
         # server by hand. Not minimal — for debugging, not production. It runs a
         # plain shell (no entrypoint), so it ships a ready-made /cas to poke at.
         casDir = pkgs.runCommand "caos-cas-dir" { } "mkdir -p $out/cas";
+        # The base caos-client image bakes in no /worker; downstream images
+        # supply it. This debugging image's /worker is just bash, so running it
+        # through `caos entrypoint` (which always runs /worker) drops you in a
+        # shell. For a real worker that reads /cas/args and writes /cas/out, see
+        # the caos-hello-worker image below.
+        workerBash = pkgs.runCommand "caos-worker-bash" { } ''
+          mkdir -p $out
+          ln -s /bin/bash $out/worker
+        '';
         clientBashContents = [
           clientImageRoot
           casDir
+          workerBash
           pkgs.bashInteractive
           pkgs.coreutils
           pkgs.curl
@@ -142,9 +153,10 @@
           Cmd = [ "/bin/bash" ];
           Env = [
             "PATH=/bin"
-            # Convenience default for the usual docker-compose service name;
-            # override with `-e CAOS_OBJECT_SERVER_URL=...`.
+            # Convenience defaults for the usual docker-compose service names;
+            # override with `-e CAOS_OBJECT_SERVER_URL=...` / `-e CAOS_COMPUTE_SERVER_URL=...`.
             "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
+            "CAOS_COMPUTE_SERVER_URL=http://caos-compute-server:9090"
           ];
         };
         clientBashImage = pkgs.dockerTools.buildImage {
@@ -152,6 +164,83 @@
           tag = "latest";
           copyToRoot = clientBashContents;
           config = clientBashConfig;
+        };
+
+        # A real, runnable worker image: caos + bash + coreutils, with a /worker
+        # that reads its inputs from /cas/args (one file per `--name=value` arg
+        # `caos run` passed), copies them into a result directory along with a
+        # small receipt, and stores that at /cas/out. The compute server runs it
+        # via `caos entrypoint`, which populates /cas/args and runs /worker.
+        helloWorkerScript = pkgs.writeTextFile {
+          name = "caos-hello-worker-script";
+          executable = true;
+          destination = "/worker";
+          text = ''
+            #!/bin/bash
+            set -euo pipefail
+            echo "hello-worker: reading /cas/args" >&2
+            out=/tmp/out
+            rm -rf "$out"
+            mkdir -p "$out"
+            for path in /cas/args/*; do
+              name=$(basename "$path")
+              caos get "$path"          # expand the placeholder to real content
+              cp -r "$path" "$out/$name"
+              echo "  saw $name" >&2
+            done
+            {
+              echo "worker ran"
+              for path in /cas/args/*; do
+                echo "saw $(basename "$path")"
+              done
+            } > "$out/receipt"
+            caos put "$out" /cas/out
+          '';
+        };
+        helloWorkerContents = [
+          clientImageRoot
+          helloWorkerScript
+          pkgs.bashInteractive
+          pkgs.coreutils
+        ];
+        helloWorkerConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [
+            "PATH=/bin"
+            "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
+          ];
+        };
+        helloWorkerImage = pkgs.dockerTools.buildImage {
+          name = "caos-hello-worker";
+          tag = "latest";
+          copyToRoot = helloWorkerContents;
+          config = helloWorkerConfig;
+        };
+
+        # compute-server runs worker containers by shelling out to the `docker`
+        # CLI, so — unlike the minimal images — it bundles the docker client and
+        # expects the host's docker socket bind-mounted at /var/run/docker.sock:
+        #   docker run --rm --network caos-net -p 9090:9090 \
+        #     -v /var/run/docker.sock:/var/run/docker.sock caos-compute-server
+        computeServerContents = [
+          compute-server
+          pkgs.docker-client
+        ];
+        computeServerConfig = {
+          Cmd = [ "/bin/compute-server" ];
+          Env = [ "PATH=/bin" ];
+          ExposedPorts = {
+            "9090/tcp" = { };
+          };
+        };
+        computeServerImage = pkgs.dockerTools.buildImage {
+          name = "caos-compute-server";
+          tag = "latest";
+          copyToRoot = computeServerContents;
+          config = computeServerConfig;
         };
 
         # `nix run .#load-<name>` builds the image and pipes it straight into the
@@ -193,16 +282,28 @@
           contents = clientBashContents;
           config = clientBashConfig;
         };
+        loadComputeServer = loadImage {
+          name = "caos-compute-server";
+          contents = computeServerContents;
+          config = computeServerConfig;
+        };
+        loadHelloWorker = loadImage {
+          name = "caos-hello-worker";
+          contents = helloWorkerContents;
+          config = helloWorkerConfig;
+        };
       in
       {
         packages = {
           default = client;
-          inherit client object-server;
+          inherit client object-server compute-server;
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-client-docker = clientImage;
           caos-object-server-docker = objectServerImage;
           caos-client-bash-docker = clientBashImage;
+          caos-compute-server-docker = computeServerImage;
+          caos-hello-worker-docker = helloWorkerImage;
         };
 
         apps = {
@@ -219,10 +320,18 @@
             type = "app";
             program = "${loadClientBash}/bin/load-caos-client-bash";
           };
+          load-caos-compute-server = {
+            type = "app";
+            program = "${loadComputeServer}/bin/load-caos-compute-server";
+          };
+          load-caos-hello-worker = {
+            type = "app";
+            program = "${loadHelloWorker}/bin/load-caos-hello-worker";
+          };
         };
 
         checks = {
-          inherit client object-server;
+          inherit client object-server compute-server;
 
           clippy = craneLib.cargoClippy (
             commonArgs

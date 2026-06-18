@@ -10,6 +10,7 @@ Nix flake, so builds are reproducible and consistent across machines.
 |---|---|---|
 | `client` | `caos-client` | CLI that fetches objects from the object server (see below). Exposed as `caos` inside the image. |
 | `object-server` | `caos-object-server` | HTTP daemon over a git object database (see below). |
+| `compute-server` | `caos-compute-server` | HTTP daemon that runs a worker image over an args tree and returns its result hash (see below). |
 
 ## Prerequisites
 
@@ -27,6 +28,7 @@ No Rust toolchain needs to be installed system-wide; the flake pins it.
 | `Cargo.toml` | Workspace root (members + shared release profile) |
 | `crates/client/` | The `client` crate → `client` binary |
 | `crates/object-server/` | The `object-server` crate → `object-server` binary |
+| `crates/compute-server/` | The `compute-server` crate → `compute-server` binary |
 | `Cargo.lock` | Pinned dependency versions (required for reproducible Nix builds) |
 
 ## Development
@@ -54,6 +56,7 @@ nix flake check
 ```bash
 nix build .#client            # output at ./result/bin/client
 nix build .#object-server     # output at ./result/bin/object-server
+nix build .#compute-server    # output at ./result/bin/compute-server
 ```
 
 Each binary is statically linked against `musl`, so it has no shared-library
@@ -66,6 +69,8 @@ The crates are unprefixed, but the images they produce carry a `caos-` prefix.
 ```bash
 nix build .#caos-client-docker         # image tarball at ./result
 nix build .#caos-object-server-docker
+nix build .#caos-compute-server-docker
+nix build .#caos-hello-worker-docker
 
 docker load < result                   # loads e.g. caos-object-server:latest
 ```
@@ -76,6 +81,8 @@ straight to `docker load`, nothing large written to the Nix store):
 ```bash
 nix run .#load-caos-client
 nix run .#load-caos-object-server
+nix run .#load-caos-compute-server
+nix run .#load-caos-hello-worker
 ```
 
 The `caos-client` and `caos-object-server` images contain **only** their static
@@ -139,14 +146,17 @@ variables — handy for running outside a container.
 ## client (`caos`)
 
 The `client` crate (`crates/client`) builds a CLI exposed as `caos` inside its
-image. It finds the object server via `$CAOS_OBJECT_SERVER_URL` and materializes
+image. It finds the object server via `$CAOS_OBJECT_SERVER_URL` (and, for
+`caos run`, the compute server via `$CAOS_COMPUTE_SERVER_URL`) and materializes
 objects under `/cas`.
 
 ```text
 caos get-hash <hash> <path>   # materialize a given hash at a CAS path
 caos get <path>               # expand a placeholder already in /cas
 caos put <src-path> <cas-path># store an outside path and record it in /cas
-caos entrypoint <command>...  # container entrypoint: set up, run, hash /cas/out
+caos run <image> <out> -- ... # run an image on the compute server (see below)
+caos entrypoint [--args=<hash>]
+                              # container entrypoint: set up, run /worker, hash /cas/out
 ```
 
 **`get-hash <hash> <path>`** — `<path>` must be a **direct child of `/cas`**
@@ -179,30 +189,46 @@ Files become real git **blobs** and directories real git **trees** — each
 `POST`ed as a serialized object — so the hashes are genuine git object hashes; a
 `put` directory's hash equals what `git write-tree` would produce.
 
-**`caos entrypoint <command>...`** — the container's entrypoint, tying it
+**`caos run <image> <output-cas-path> -- [--name=value ...]`** — the host side of
+a compute step. It assembles the `--name=value` args into a git **tree** stored
+in the object server (never written to the filesystem):
+
+- each `--name=value` becomes a tree entry `name`;
+- a `value` that is a path inside `/cas` **must exist**, and its entry references
+  the object that path was materialized from (its recorded hash) — so inputs are
+  passed by reference, not re-uploaded;
+- any other `value` is stored verbatim as a blob.
+
+It then asks the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
+over that args tree and materializes the returned result hash at
+`<output-cas-path>` (a direct child of `/cas`, like `get-hash`). The image is
+passed through to the compute server untouched.
+
+**`caos entrypoint [--args=<hash>]`** — the container's entrypoint, tying it
 together for a single compute step:
 
 1. **set up** — delete the CAS directory and recreate it empty (**fails** if it
    can't) and verify it supports xattrs;
-2. **run** `<command>` — its stdout is redirected to stderr so the container's
-   stdout stays clean;
-3. **report** — print the hash recorded on `/cas/out`. Everything under `/cas`
+2. **load args** — if `--args=<hash>` is given, materialize that object at
+   `/cas/args` (exactly like `get-hash <hash> /cas/args`), so the worker can read
+   its inputs there;
+3. **run `/worker`** — the binary a downstream image is expected to provide. Its
+   stdout is redirected to stderr so the container's stdout stays clean;
+4. **report** — print the hash recorded on `/cas/out`. Everything under `/cas`
    got there via `get`/`put`, which already tag each path with its
    `user.caos.hash`, so this is just a fast xattr read — no re-hashing;
-4. **tear down** — delete the CAS directory.
+5. **tear down** — delete the CAS directory.
 
-So a step typically `caos get`s its inputs into `/cas`, computes its result, and
-writes it to `/cas/out` with `caos put` (or `get`); the printed hash is the
-address of that result. The
-`caos-client` image runs this as its entrypoint, so `docker run` args are the
-command:
+So `/worker` typically reads its inputs from `/cas/args`, computes its result,
+and writes it to `/cas/out` with `caos put` (or `get`); the printed hash is the
+address of that result. The `caos-client` image runs `caos entrypoint` as its
+entrypoint, so to make a compute image you build one that adds a `/worker`:
 
 ```bash
 docker run --rm \
   -e CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080 \
-  -v /path/to/cas:/cas \
-  caos-client:latest \
-  my-build-tool --whatever      # must leave its result at /cas/out
+  your-worker-image:latest \
+  --args=<args-tree-hash>       # /worker must leave its result at /cas/out
 ```
 
 ### Path → hash mapping
@@ -225,11 +251,71 @@ and exits with a clear error if its filesystem doesn't support `user.*` xattrs
 `CAOS_CAS_DIR` (default `/cas`) overrides the CAS directory — handy for running
 outside a container.
 
+## compute-server
+
+An HTTP daemon (`crates/compute-server`) that runs one containerized compute step
+per request. One endpoint:
+
+| Request | Behaviour |
+|---|---|
+| `GET /run?image=<image>&args=<hash>` | Run `<image>` over the args tree `<hash>` and return the hash of its result. `400` for a missing/invalid parameter, `500` if the worker container fails. |
+
+It runs the image by shelling out to the `docker` CLI, forcing the caos
+entrypoint so the image's own entrypoint/command don't matter:
+
+```text
+docker run --rm --network <net> -e CAOS_OBJECT_SERVER_URL=<url> \
+  --entrypoint /bin/caos <image> entrypoint --args=<hash>
+```
+
+`caos entrypoint` populates `/cas/args` from `<hash>`, runs `/worker`, and prints
+the hash of `/cas/out` on its stdout — which `docker run` forwards, so the
+container's stdout *is* the result hash. So any image that carries `/bin/caos`
+and a `/worker` is a valid compute image.
+
+Because it drives Docker, the `caos-compute-server` image is **not** minimal — it
+bundles the `docker` client and expects the host's docker socket bind-mounted.
+The worker containers it spawns join `<net>` so they resolve the object server by
+name:
+
+```bash
+docker run --rm -p 9090:9090 \
+  --network caos-net \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  caos-compute-server:latest
+```
+
+Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:9090`),
+`CAOS_DOCKER_NETWORK` (default `caos-net`), `CAOS_OBJECT_SERVER_URL` (default
+`http://caos-object-server:8080`, passed into each worker), and `CAOS_DOCKER_BIN`
+(default `docker`).
+
+### Writing a worker
+
+The base `caos-client` image bakes in **no** `/worker`. A worker image is built
+`FROM` it (so it keeps `/bin/caos` as the entrypoint) and adds a `/worker` that
+reads its inputs from `/cas/args` and writes its result to `/cas/out` (with
+`caos put`/`get`).
+
+The **`caos-hello-worker`** image (`.#caos-hello-worker-docker`,
+`.#load-caos-hello-worker`) is a real, runnable example: caos + bash + coreutils
+with a `/worker` that copies each `/cas/args` entry into a result directory
+(plus a small `receipt`) and stores it at `/cas/out`. So:
+
+```bash
+caos put /some/file /cas/in
+caos run caos-hello-worker:latest /cas/out -- --in=/cas/in --greeting=hi
+caos get /cas/out/greeting && cat /cas/out/greeting   # => hi
+```
+
+(The debugging `caos-client-bash` image's `/worker` is just `bash`, which doesn't
+write `/cas/out` — handy for poking around, not a real worker.)
+
 ## Local testing
 
-`scripts/dev-up.sh` wires the whole thing together: it loads all three images,
-starts the object server against a repo you pass on the command line (on a
-docker network named so the client's default URL resolves), and prints a
+`scripts/dev-up.sh` wires the whole thing together: it loads the images, starts
+the object server and compute server against a repo you pass on the command line
+(on a docker network named so the clients' default URLs resolve), and prints a
 one-shot bash-client command.
 
 ```bash
@@ -237,9 +323,10 @@ scripts/dev-up.sh /path/to/repo
 # ... then run the printed `docker run --rm -it ... caos-client-bash:latest`
 ```
 
-Overrides: `CAOS_NET` (network name, default `caos-net`) and `CAOS_PORT` (host
-port for the object server, default `8080`). Stop the server with
-`docker rm -f caos-object-server`.
+Overrides: `CAOS_NET` (network name, default `caos-net`), `CAOS_PORT` (host port
+for the object server, default `8080`), and `CAOS_COMPUTE_PORT` (host port for
+the compute server, default `9090`). Stop the servers with
+`docker rm -f caos-object-server caos-compute-server`.
 
 ## Notes
 

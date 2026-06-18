@@ -10,6 +10,9 @@
 //! * `get <path>` — expand an existing placeholder anywhere under `/cas`: read
 //!   its recorded hash, fetch that object, and replace the empty file with the
 //!   blob's content, or the empty directory with the tree's entries.
+//! * `run <image> <output> -- [--name=value ...]` — assemble the args into a git
+//!   tree, ask the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
+//!   over it, and materialize the returned result hash at `<output>`.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
 //! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
@@ -32,6 +35,13 @@ use gix::objs::WriteTo;
 
 /// Base URL of the object server, e.g. `http://caos-object-server:8080`.
 const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
+
+/// Base URL of the compute server, e.g. `http://caos-compute-server:9090`.
+const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
+
+/// The program `entrypoint` always runs. Images that build off the
+/// `caos-client` image supply this binary.
+const DEFAULT_WORKER: &str = "/worker";
 
 /// Directory under which objects are materialized. Override (e.g. for local
 /// runs outside the container) with `CAOS_CAS_DIR`.
@@ -71,7 +81,21 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(src), Some(dst), None) => put(src, dst),
             _ => Err(usage(args)),
         },
-        Some("entrypoint") if args.len() > 2 => entrypoint(&args[2..]),
+        // `run <image> <output> -- [--name=value ...]`. The `--` separates the
+        // fixed arguments from the (possibly empty) list of key/value args.
+        Some("run") => match &args[2..] {
+            [image, output, sep, kvs @ ..] if sep == "--" => caos_run(image, output, kvs),
+            _ => Err(usage(args)),
+        },
+        // `entrypoint [--args=<hash>]` — takes no command; it always runs /worker.
+        Some("entrypoint") => match &args[2..] {
+            [] => entrypoint(None),
+            [flag] => match flag.strip_prefix("--args=") {
+                Some(hash) => entrypoint(Some(hash)),
+                None => Err(usage(args)),
+            },
+            _ => Err(usage(args)),
+        },
         _ => Err(usage(args)),
     }
 }
@@ -90,7 +114,9 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>\n  \
-         {prog} put <src-path> <cas-path>\n  {prog} entrypoint <command> [args...]"
+         {prog} put <src-path> <cas-path>\n  \
+         {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
+         {prog} entrypoint [--args=<hash>]"
     )
 }
 
@@ -117,10 +143,11 @@ fn get(path: &str) -> Result<(), String> {
     fetch_and_materialize(&base, &target, &hash)
 }
 
-/// `entrypoint <command>...` — the container entrypoint. Wipes the CAS directory,
-/// runs the command, prints the hash recorded at `/cas/out`, then removes the CAS
+/// `entrypoint [--args=<hash>]` — the container entrypoint. Wipes the CAS
+/// directory, optionally populates `/cas/args` from `--args=<hash>`, runs
+/// `/worker`, prints the hash recorded at `/cas/out`, then removes the CAS
 /// directory.
-fn entrypoint(command: &[String]) -> Result<(), String> {
+fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     let cas = cas_dir();
 
     // Start clean: delete the CAS directory and recreate it empty (fail if we
@@ -129,19 +156,25 @@ fn entrypoint(command: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(&cas).map_err(|e| format!("creating {}: {e}", cas.display()))?;
     probe_xattr(&cas)?;
 
-    // Run the command, sending its stdout to our stderr so that our own stdout
+    // Populate /cas/args from the given hash, like `get-hash <hash> /cas/args`,
+    // so the worker can read its inputs there.
+    if let Some(hash) = args_hash {
+        let base = object_server_url()?;
+        fetch_and_materialize(&base, &cas.join("args"), hash)?;
+    }
+
+    // Run the worker, sending its stdout to our stderr so that our own stdout
     // carries only the resulting hash.
     let stdout = std::io::stderr()
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| format!("duplicating stderr: {e}"))?;
-    let status = std::process::Command::new(&command[0])
-        .args(&command[1..])
+    let status = std::process::Command::new(DEFAULT_WORKER)
         .stdout(std::process::Stdio::from(stdout))
         .status()
-        .map_err(|e| format!("running {:?}: {e}", command[0]))?;
+        .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
     if !status.success() {
-        return Err(format!("command {:?} exited with {status}", command[0]));
+        return Err(format!("{DEFAULT_WORKER} exited with {status}"));
     }
 
     // Everything under /cas got there via get/put, which tag each path with its
@@ -211,6 +244,12 @@ fn object_server_url() -> Result<String, String> {
         .map_err(|_| format!("{OBJECT_SERVER_ENV} must be set to the object-server URL"))
 }
 
+/// Base URL of the compute server from the environment.
+fn compute_server_url() -> Result<String, String> {
+    std::env::var(COMPUTE_SERVER_ENV)
+        .map_err(|_| format!("{COMPUTE_SERVER_ENV} must be set to the compute-server URL"))
+}
+
 /// `put <src-path> <cas-path>` — recursively store `<src-path>` (a path outside
 /// the CAS) into the object server and record the result at `<cas-path>`, a
 /// direct child of the CAS directory.
@@ -253,12 +292,7 @@ fn store(
         // instead of re-reading the target.
         if let Ok(canon) = path.canonicalize() {
             if canon != cas_real && canon.starts_with(cas_real) {
-                let kind = if canon.is_dir() {
-                    EntryKind::Tree
-                } else {
-                    EntryKind::Blob
-                };
-                return Ok((kind.into(), parse_oid(&read_hash(&canon)?)?));
+                return cas_entry(&canon);
             }
         }
         // Otherwise store it as a git symlink: a blob holding the link target.
@@ -278,13 +312,7 @@ fn store(
                 oid,
             });
         }
-        // Git requires tree entries in a specific order; Entry's Ord implements it.
-        entries.sort();
-        let mut buf = Vec::new();
-        gix::objs::Tree { entries }
-            .write_to(&mut buf)
-            .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
-        let oid = post_object(base, "tree", &buf)?;
+        let oid = post_tree(base, entries)?;
         return Ok((EntryKind::Tree.into(), oid));
     }
 
@@ -300,6 +328,37 @@ fn store(
     }
 
     Err(format!("unsupported file type: {}", path.display()))
+}
+
+/// Tree entry referencing an existing CAS object at `canon` (already
+/// canonicalized and known to be inside the CAS root): reuse the hash recorded
+/// there rather than re-reading content, with the mode following whether it's a
+/// directory. Shared by `store` (symlinks into the CAS) and `build_args_tree`
+/// (CAS-path arg values).
+fn cas_entry(canon: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+    use gix::objs::tree::EntryKind;
+    let kind = if canon.is_dir() {
+        EntryKind::Tree
+    } else {
+        EntryKind::Blob
+    };
+    Ok((kind.into(), parse_oid(&read_hash(canon)?)?))
+}
+
+/// Encode `entries` as a git tree object, POST it to the object server, and
+/// return its hash. Shared by `store` (real directories) and `build_args_tree`
+/// (the synthesized args tree).
+fn post_tree(
+    base: &str,
+    mut entries: Vec<gix::objs::tree::Entry>,
+) -> Result<gix::ObjectId, String> {
+    // Git requires tree entries in a specific order; Entry's Ord implements it.
+    entries.sort();
+    let mut buf = Vec::new();
+    gix::objs::Tree { entries }
+        .write_to(&mut buf)
+        .map_err(|e| format!("encoding tree: {e}"))?;
+    post_object(base, "tree", &buf)
 }
 
 /// POST a serialized git object (`<type> <size>\0<content>`) to the object
@@ -328,6 +387,120 @@ fn post_object(base: &str, kind: &str, content: &[u8]) -> Result<gix::ObjectId, 
 /// Parse a hex git hash (tolerating surrounding whitespace).
 fn parse_oid(hex: &str) -> Result<gix::ObjectId, String> {
     gix::ObjectId::from_hex(hex.trim().as_bytes()).map_err(|e| format!("invalid hash {hex:?}: {e}"))
+}
+
+/// `run <image> <output> -- [--name=value ...]` — assemble the args into a git
+/// tree, ask the compute server to run `<image>` over that tree, and materialize
+/// the result at `<output>` (a direct child of the CAS directory).
+fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
+    let base = object_server_url()?;
+    let compute = compute_server_url()?;
+    let cas = cas_dir();
+    let target = validate_target(&cas, output)?;
+    probe_xattr(&cas)?;
+
+    // Build the args tree in the object store only — nothing is written under
+    // /cas. The worker materializes it inside its own container.
+    let args_tree = build_args_tree(&base, &cas, kvs)?;
+
+    // Hand the image and args-tree hash to the compute server; it runs the
+    // container and returns the hash of the result (its /cas/out).
+    let result = request_compute(&compute, image, &args_tree.to_string())?;
+
+    // Materialize that result at the requested output path.
+    fetch_and_materialize(&base, &target, &result)
+}
+
+/// Build the args git tree from `--name=value` pairs and store it (plus any
+/// literal-value blobs) in the object server, returning the tree's hash. The
+/// tree is never written to the filesystem.
+///
+/// Each `--name=value` becomes a tree entry `name`:
+/// * if `value` is a path inside the CAS directory, it must exist, and the entry
+///   references the object that path was materialized from (its recorded hash);
+/// * otherwise `value` is stored verbatim as a blob and the entry references it.
+fn build_args_tree(base: &str, cas: &Path, kvs: &[String]) -> Result<gix::ObjectId, String> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    // Canonical CAS root, resolved lazily — only needed if a CAS path appears.
+    let cas_real = cas.canonicalize();
+
+    let mut entries = Vec::new();
+    for kv in kvs {
+        let body = kv
+            .strip_prefix("--")
+            .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+        let (name, value) = body
+            .split_once('=')
+            .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+        if name.is_empty() || name.contains('/') {
+            return Err(format!(
+                "argument name must be a single path component, got: {name:?}"
+            ));
+        }
+
+        let (mode, oid) = if Path::new(value).starts_with(cas) {
+            // A CAS path: it must exist; reference whatever it was made from.
+            let canon = Path::new(value)
+                .canonicalize()
+                .map_err(|e| format!("{value}: {e}"))?;
+            let cas_real = cas_real
+                .as_ref()
+                .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+            if !canon.starts_with(cas_real) {
+                return Err(format!("{value} resolves outside {}", cas.display()));
+            }
+            cas_entry(&canon)?
+        } else {
+            // A literal value: store it as a blob and reference that.
+            (
+                EntryKind::Blob.into(),
+                post_object(base, "blob", value.as_bytes())?,
+            )
+        };
+
+        entries.push(Entry {
+            mode,
+            filename: name.as_bytes().to_vec().into(),
+            oid,
+        });
+    }
+
+    post_tree(base, entries)
+}
+
+/// Ask the compute server to run `image` over the args tree `args_hash`,
+/// returning the result hash it prints (the container's /cas/out).
+fn request_compute(base: &str, image: &str, args_hash: &str) -> Result<String, String> {
+    let url = format!(
+        "{}/run?image={}&args={}",
+        base.trim_end_matches('/'),
+        percent_encode(image),
+        args_hash,
+    );
+    let body = http_get(&url)?;
+    let text = String::from_utf8(body)
+        .map_err(|e| format!("compute server returned invalid UTF-8: {e}"))?;
+    let hash = text.trim();
+    if hash.is_empty() {
+        return Err("compute server returned an empty result".to_string());
+    }
+    Ok(hash.to_string())
+}
+
+/// Percent-encode a string for use as a URL query value: unreserved characters
+/// pass through, everything else becomes `%XX`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// CAS root directory (`/cas`, or `$CAOS_CAS_DIR`).

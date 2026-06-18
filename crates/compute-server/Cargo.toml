@@ -1,0 +1,14 @@
+[package]
+name = "compute-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "compute-server"
+path = "src/main.rs"
+
+[dependencies]
+# Minimal synchronous HTTP server: no async runtime, no TLS, pure Rust — same
+# as object-server. compute-server itself does no git work; it just shells out
+# to the `docker` CLI, so it needs nothing beyond this.
+tiny_http = "0.12"
