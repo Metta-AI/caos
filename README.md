@@ -258,7 +258,7 @@ per request. One endpoint:
 
 | Request | Behaviour |
 |---|---|
-| `GET /run?image=<image>&args=<hash>` | Run `<image>` over the args tree `<hash>` and return the hash of its result. `400` for a missing/invalid parameter, `500` if the worker container fails. |
+| `GET /run?image=<image>&args=<hash>` | Return the result hash for running `<image>` over the args tree `<hash>` — from the Redis cache if present, otherwise by running the container and caching the result. `400` for a missing/invalid parameter, `500` if the worker container fails. |
 
 It runs the image by shelling out to the `docker` CLI, forcing the caos
 entrypoint so the image's own entrypoint/command don't matter:
@@ -287,8 +287,17 @@ docker run --rm -p 9090:9090 \
 
 Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:9090`),
 `CAOS_DOCKER_NETWORK` (default `caos-net`), `CAOS_OBJECT_SERVER_URL` (default
-`http://caos-object-server:8080`, passed into each worker), and `CAOS_DOCKER_BIN`
-(default `docker`).
+`http://caos-object-server:8080`, passed into each worker), `CAOS_DOCKER_BIN`
+(default `docker`), and `CAOS_REDIS_ADDR` (default `caos-redis:6379`).
+
+### Caching
+
+Results are cached in Redis. The key is the image plus the args-tree hash and the
+value is the result hash, so an identical request skips the container entirely —
+the compute server logs `cache hit …` instead of `cache miss …; running worker`.
+Redis is best-effort: if it's unreachable the server logs the error and runs
+uncached, so a missing Redis never fails a request. There are no locks yet, so
+two identical requests racing a cold cache may both run the work.
 
 ### Writing a worker
 
@@ -339,14 +348,13 @@ caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
 caos get /cas/out/greeting && cat /cas/out/greeting
 ```
 
-`./Tiltfile` builds each image with Nix and runs the object + compute servers as
-containers Tilt supervises (see Stopping above for teardown). It tracks
-each image's sources, so an
-image is **only** rebuilt and reloaded when its crate (or the flake/lockfiles)
-changes — editing `crates/object-server` reloads just that image and restarts
-just that daemon. It also creates the `caos-net` network and a git repo for the
-object server under the gitignored `.caos-dev/`. New services (e.g. redis) drop
-in as another `local_resource` — there's a commented stub at the bottom.
+`./Tiltfile` builds each image with Nix and runs the object server, compute
+server, and a Redis cache as containers Tilt supervises (see Stopping above for
+teardown). It tracks each image's sources, so an image is **only** rebuilt and
+reloaded when its crate (or the flake/lockfiles) changes — editing
+`crates/object-server` reloads just that image and restarts just that daemon. It
+also creates the `caos-net` network and a git repo for the object server under
+the gitignored `.caos-dev/`.
 
 ## Notes
 

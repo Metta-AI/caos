@@ -63,7 +63,7 @@ local_resource(
 # `exec docker run` forwards Tilt's signal to the container and it exits promptly,
 # `--rm` cleaning it up. The leading `docker rm -f` reclaims any stale container
 # from a prior run that was hard-killed (SIGKILL) before it could exit.
-def daemon(name, srcs, run_args):
+def daemon(name, srcs, run_args, extra_deps=[]):
     local_resource(
         name,
         serve_cmd=' '.join(
@@ -73,9 +73,19 @@ def daemon(name, srcs, run_args):
             + ['%s:latest' % name]
         ),
         deps=COMMON + srcs,
-        resource_deps=['setup', 'img-' + name.replace('caos-', '')],
+        resource_deps=['setup', 'img-' + name.replace('caos-', '')] + extra_deps,
         labels=['daemons'],
     )
+
+# Result cache. Stock image, no persistence yet. It handles SIGTERM itself, so a
+# foreground `exec docker run --rm` tears down cleanly on Ctrl-C.
+local_resource(
+    'caos-redis',
+    serve_cmd='docker rm -f caos-redis >/dev/null 2>&1; ' +
+              'exec docker run --rm --name caos-redis --network %s -p 6379:6379 redis:7' % NET,
+    resource_deps=['setup'],
+    labels=['daemons'],
+)
 
 daemon(
     'caos-object-server',
@@ -90,13 +100,7 @@ daemon(
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
         '-v /var/run/docker.sock:/var/run/docker.sock',
     ],
+    # Compute server reads/writes the cache; start it after Redis. (It degrades
+    # gracefully if Redis is down, so this is just for tidy startup.)
+    extra_deps=['caos-redis'],
 )
-
-# Redis will slot in here later, e.g.:
-# local_resource(
-#     'redis',
-#     serve_cmd='docker rm -f redis >/dev/null 2>&1; ' +
-#               'exec docker run --rm --name redis --network %s -p 6379:6379 redis:7' % NET,
-#     resource_deps=['setup'],
-#     labels=['daemons'],
-# )

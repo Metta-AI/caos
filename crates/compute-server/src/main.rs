@@ -21,8 +21,16 @@
 //!
 //! The container reaches the object server over the Docker network, so it must
 //! be the same network the object server runs on (default `caos-net`).
+//!
+//! Results are cached in Redis (`CAOS_REDIS_ADDR`, default `caos-redis:6379`):
+//! the key is the image + args-tree hash, the value the result hash. A hit skips
+//! the container entirely. Redis is best-effort — if it's unreachable we log and
+//! run uncached.
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::process::Command;
+use std::time::Duration;
 
 use tiny_http::{Method, Request, Response, Server};
 
@@ -40,6 +48,12 @@ const DEFAULT_OBJECT_SERVER_URL: &str = "http://caos-object-server:8080";
 /// `docker` binary to invoke. Override with `CAOS_DOCKER_BIN`.
 const DEFAULT_DOCKER_BIN: &str = "docker";
 
+/// Redis (host:port) used to cache results. Override with `CAOS_REDIS_ADDR`.
+const DEFAULT_REDIS_ADDR: &str = "caos-redis:6379";
+
+/// How long to wait on Redis before giving up and running uncached.
+const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The caos binary inside every compute image, forced as the entrypoint.
 const CAOS_BIN: &str = "/bin/caos";
 
@@ -48,6 +62,7 @@ struct Config {
     network: String,
     object_server_url: String,
     docker_bin: String,
+    redis_addr: String,
 }
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
@@ -81,6 +96,7 @@ fn main() {
         network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
         object_server_url: env_or("CAOS_OBJECT_SERVER_URL", DEFAULT_OBJECT_SERVER_URL),
         docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
+        redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
     };
 
     let server = match Server::http(addr.as_str()) {
@@ -91,8 +107,8 @@ fn main() {
         }
     };
     eprintln!(
-        "compute-server listening on http://{addr}, network {}, object server {}",
-        config.network, config.object_server_url
+        "compute-server listening on http://{addr}, network {}, object server {}, redis {}",
+        config.network, config.object_server_url, config.redis_addr
     );
 
     for request in server.incoming_requests() {
@@ -161,6 +177,18 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         return Err(HttpError::new(400, format!("invalid args hash: {args:?}")));
     }
 
+    // Cache key is the image + args-tree hash; value is the result hash. Redis
+    // is best-effort: a lookup/connection error just means we run uncached.
+    let key = format!("caos:result:{image}\0{args}");
+    match cache_get(&config.redis_addr, &key) {
+        Ok(Some(result)) => {
+            eprintln!("cache hit: image={image} args={args} -> {result}");
+            return Ok(format!("{result}\n").into_bytes());
+        }
+        Ok(None) => eprintln!("cache miss: image={image} args={args}; running worker"),
+        Err(e) => eprintln!("cache lookup failed ({e}); running worker: image={image} args={args}"),
+    }
+
     let output = Command::new(&config.docker_bin)
         .arg("run")
         .arg("--rm")
@@ -192,7 +220,103 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
             "worker container produced no result hash on stdout",
         ));
     }
+
+    // Cache the result for next time (best-effort).
+    match cache_set(&config.redis_addr, &key, &hash) {
+        Ok(()) => eprintln!("ran worker: image={image} args={args} -> {hash} (cached)"),
+        Err(e) => {
+            eprintln!("ran worker: image={image} args={args} -> {hash} (cache store failed: {e})")
+        }
+    }
+
     Ok(format!("{hash}\n").into_bytes())
+}
+
+/// `GET key` from Redis, returning the value or None if the key is absent.
+fn cache_get(addr: &str, key: &str) -> Result<Option<String>, String> {
+    let mut stream = redis_connect(addr)?;
+    stream
+        .write_all(&resp_command(&["GET", key]))
+        .map_err(|e| format!("write: {e}"))?;
+    read_bulk_reply(&mut BufReader::new(stream))
+}
+
+/// `SET key value` in Redis.
+fn cache_set(addr: &str, key: &str, value: &str) -> Result<(), String> {
+    let mut stream = redis_connect(addr)?;
+    stream
+        .write_all(&resp_command(&["SET", key, value]))
+        .map_err(|e| format!("write: {e}"))?;
+    read_status_reply(&mut BufReader::new(stream))
+}
+
+/// Connect to Redis with read/write timeouts so a stuck server can't hang us.
+fn redis_connect(addr: &str) -> Result<TcpStream, String> {
+    let stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(REDIS_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REDIS_TIMEOUT));
+    Ok(stream)
+}
+
+/// Encode a Redis command as a RESP array of bulk strings (binary-safe, so the
+/// NUL in our cache key is fine).
+fn resp_command(args: &[&str]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        buf.extend_from_slice(arg.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
+}
+
+/// Read a RESP bulk-string reply (`$<len>\r\n<data>\r\n`); a nil reply (`$-1`)
+/// becomes None and an error reply (`-...`) becomes Err.
+fn read_bulk_reply(reader: &mut impl BufRead) -> Result<Option<String>, String> {
+    let header = read_reply_line(reader)?;
+    match header.as_bytes().first() {
+        Some(b'$') => {
+            let len: i64 = header[1..]
+                .parse()
+                .map_err(|e| format!("bad bulk length: {e}"))?;
+            if len < 0 {
+                return Ok(None); // nil
+            }
+            let mut buf = vec![0u8; len as usize + 2]; // data + trailing CRLF
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| format!("read: {e}"))?;
+            buf.truncate(len as usize);
+            String::from_utf8(buf)
+                .map(Some)
+                .map_err(|e| format!("non-utf8 value: {e}"))
+        }
+        Some(b'-') => Err(format!("redis error: {}", &header[1..])),
+        _ => Err(format!("unexpected reply: {header:?}")),
+    }
+}
+
+/// Read a RESP simple-status reply (`+OK\r\n`); an error reply becomes Err.
+fn read_status_reply(reader: &mut impl BufRead) -> Result<(), String> {
+    let header = read_reply_line(reader)?;
+    match header.as_bytes().first() {
+        Some(b'+') => Ok(()),
+        Some(b'-') => Err(format!("redis error: {}", &header[1..])),
+        _ => Err(format!("unexpected reply: {header:?}")),
+    }
+}
+
+/// Read one CRLF-terminated reply line, without the trailing CRLF.
+fn read_reply_line(reader: &mut impl BufRead) -> Result<String, String> {
+    let mut line = String::new();
+    if reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read: {e}"))?
+        == 0
+    {
+        return Err("redis closed the connection".to_string());
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 /// Find `name` in an `a=b&c=d` query string and percent-decode its value.
