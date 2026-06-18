@@ -7,6 +7,12 @@ members = ["crates/client", "crates/object-server", "crates/compute-server"]
 [workspace.metadata.crane]
 name = "caos-workspace"
 
+# A version at the workspace root so crane's workspace-level derivations
+# (fmt/test, the dev shell) don't fall back to a placeholder and warn. Members
+# set their own version; this is just the root manifest's.
+[workspace.package]
+version = "0.1.0"
+
 # Shared across every workspace member so all binaries get the same small,
 # static release build.
 [profile.release]

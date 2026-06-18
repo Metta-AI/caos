@@ -313,20 +313,40 @@ write `/cas/out` — handy for poking around, not a real worker.)
 
 ## Local testing
 
-`scripts/dev-up.sh` wires the whole thing together: it loads the images, starts
-the object server and compute server against a repo you pass on the command line
-(on a docker network named so the clients' default URLs resolve), and prints a
-one-shot bash-client command.
+[Tilt](https://tilt.dev) is pinned in the dev shell. From `nix develop`:
 
 ```bash
-scripts/dev-up.sh /path/to/repo
-# ... then run the printed `docker run --rm -it ... caos-worker-bash:latest`
+tilt up      # build images + run the daemons; UI at http://localhost:10350
+# press Ctrl-C in the `tilt up` terminal to stop the daemons
 ```
 
-Overrides: `CAOS_NET` (network name, default `caos-net`), `CAOS_PORT` (host port
-for the object server, default `8080`), and `CAOS_COMPUTE_PORT` (host port for
-the compute server, default `9090`). Stop the servers with
-`docker rm -f caos-object-server caos-compute-server`.
+**Stopping:** Ctrl-C the `tilt up` process — that tears the daemons down. (`tilt
+down` does *not*: it only removes Kubernetes / docker-compose resources, and
+these daemons are `local_resource`s, which it ignores.) Each daemon installs a
+`SIGINT`/`SIGTERM` handler, so Tilt's signal (forwarded through `docker run`)
+makes the container exit and `--rm` removes it. Any container left over from a
+prior hard kill is reclaimed on the next `tilt up`.
+
+Run a one-shot interactive bash client with: `docker run --rm -it --network caos-net caos-worker-bash:latest`
+
+Then inside the container, e.g.:
+
+```
+caos get-hash <hash> /cas/foo
+mkdir -p /tmp && printf hello > /tmp/in
+caos put /tmp/in /cas/in
+caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
+caos get /cas/out/greeting && cat /cas/out/greeting
+```
+
+`./Tiltfile` builds each image with Nix and runs the object + compute servers as
+containers Tilt supervises (see Stopping above for teardown). It tracks
+each image's sources, so an
+image is **only** rebuilt and reloaded when its crate (or the flake/lockfiles)
+changes — editing `crates/object-server` reloads just that image and restarts
+just that daemon. It also creates the `caos-net` network and a git repo for the
+object server under the gitignored `.caos-dev/`. New services (e.g. redis) drop
+in as another `local_resource` — there's a commented stub at the bottom.
 
 ## Notes
 

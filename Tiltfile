@@ -7,6 +7,11 @@
 
 NET = 'caos-net'
 
+# Absolute path to a throwaway git repo for the object server. Computed here (at
+# Tiltfile load, with cwd = this directory) so it doesn't depend on `$PWD` or the
+# working directory the serve command happens to run in.
+GIT_REPO = os.path.abspath('.caos-dev/git')
+
 # Files that affect every image: the flake and the locked workspace.
 COMMON = [
     'flake.nix',
@@ -38,11 +43,14 @@ nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/client'])
 # store objects in (kept under the gitignored .caos-dev/).
 local_resource(
     'setup',
+    # `git init` is idempotent, so run it unconditionally. (Don't probe with
+    # `git rev-parse` first: GIT_REPO sits inside this project's own repo, so the
+    # probe would discover the *parent* repo and wrongly skip init, leaving /git
+    # without a .git of its own.)
     cmd=' && '.join([
-        'docker network create %s >/dev/null 2>&1 || true' % NET,
-        'mkdir -p .caos-dev/git',
-        'git -C .caos-dev/git rev-parse --git-dir >/dev/null 2>&1 ' +
-        '|| git init -q .caos-dev/git',
+        'mkdir -p %s' % GIT_REPO,
+        'git init -q %s' % GIT_REPO,
+        '(docker network create %s >/dev/null 2>&1 || true)' % NET,
     ]),
     labels=['infra'],
 )
@@ -50,6 +58,11 @@ local_resource(
 # Run a daemon as a foreground container Tilt supervises. `deps` restart it when
 # its sources change; `resource_deps` order it after setup and its image build,
 # so a restart always picks up the freshly loaded image.
+#
+# Teardown: the daemons install a SIGINT/SIGTERM handler (see their main.rs), so
+# `exec docker run` forwards Tilt's signal to the container and it exits promptly,
+# `--rm` cleaning it up. The leading `docker rm -f` reclaims any stale container
+# from a prior run that was hard-killed (SIGKILL) before it could exit.
 def daemon(name, srcs, run_args):
     local_resource(
         name,
@@ -67,7 +80,7 @@ def daemon(name, srcs, run_args):
 daemon(
     'caos-object-server',
     ['crates/object-server'],
-    ['-p 8080:8080', '-v "$PWD/.caos-dev/git:/git"'],
+    ['-p 8080:8080', '-v "%s:/git"' % GIT_REPO],
 )
 daemon(
     'caos-compute-server',

@@ -352,6 +352,8 @@
           packages = [
             pkgs.cargo-watch
             pkgs.rust-analyzer
+            # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
+            pkgs.tilt
           ];
         };
       }
