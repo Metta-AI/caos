@@ -108,7 +108,7 @@ repository **mounted at `/git`**, using [gitoxide](https://github.com/GitoxideLa
 | Request | Behaviour |
 |---|---|
 | `GET /object/<hash>` | Return the raw (decompressed, header-stripped) data of the object with that hash. `400` if the hash is malformed, `404` if it's absent. |
-| `POST /object/` | Write the request body into the repo as a blob and return git's hash for it (hex). Content-addressed, so it's idempotent. |
+| `POST /object/?type=<blob\|tree>` | Write the request body into the repo as an object of that type (default `blob`; a `tree` body must be valid git tree encoding) and return git's hash for it (hex). Content-addressed, so it's idempotent. |
 
 Run the image with the repo bind-mounted at `/git`:
 
@@ -163,6 +163,17 @@ object, and expands it in place: an empty **file** is replaced with the blob's
 content; an empty **directory** is filled with the tree's entry placeholders.
 Together with `get-hash` this lets you lazily drill down a tree one level at a
 time — `get-hash` the root, then `get` whichever child you want to expand.
+
+**`put <src-path> <cas-path>`** — the inverse: recursively store a path from
+*outside* the CAS into the object server (`POST /object/`), then record the
+result at `<cas-path>` (a direct child of `/cas`, like `get-hash`). Files become
+blobs and directories become trees. A symlink that resolves to something already
+in the CAS is **not** re-read — its recorded hash is reused, so shared content is
+stored once.
+
+Files become real git **blobs** and directories real git **trees** (the server
+writes each via `POST /object/?type=…`), so the hashes are genuine git object
+hashes — a `put` directory's hash equals what `git write-tree` would produce.
 
 ### Path → hash mapping
 

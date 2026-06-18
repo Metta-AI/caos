@@ -20,11 +20,14 @@
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use gix::objs::WriteTo;
 
 /// Base URL of the object server, e.g. `http://caos-object-server:8080`.
 const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
@@ -63,6 +66,10 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(path), None) => get(path),
             _ => Err(usage(args)),
         },
+        Some("put") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(src), Some(dst), None) => put(src, dst),
+            _ => Err(usage(args)),
+        },
         _ => Err(usage(args)),
     }
 }
@@ -79,7 +86,10 @@ fn prog_name(args: &[String]) -> &str {
 
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
-    format!("usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>")
+    format!(
+        "usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>\n  \
+         {prog} put <src-path> <cas-path>"
+    )
 }
 
 /// `get-hash <hash> <path>` — fetch `<hash>` and materialize it at `<path>`,
@@ -127,6 +137,122 @@ fn fetch_and_materialize(base: &str, target: &Path, hash: &str) -> Result<(), St
 fn object_server_url() -> Result<String, String> {
     std::env::var(OBJECT_SERVER_ENV)
         .map_err(|_| format!("{OBJECT_SERVER_ENV} must be set to the object-server URL"))
+}
+
+/// `put <src-path> <cas-path>` — recursively store `<src-path>` (a path outside
+/// the CAS) into the object server and record the result at `<cas-path>`, a
+/// direct child of the CAS directory.
+///
+/// Files are stored as blobs and directories as trees. A symlink that resolves
+/// to something already in the CAS is *not* re-read — its recorded hash is
+/// reused, so shared content is stored once.
+///
+/// Note: the object server only writes blobs, so tree objects are stored as
+/// their canonical git encoding under a blob hash. These aren't real git tree
+/// hashes, but they round-trip through `get` (which recovers the type by
+/// parsing the bytes).
+fn put(src: &str, dst: &str) -> Result<(), String> {
+    let base = object_server_url()?;
+    let cas = cas_dir();
+    let target = validate_target(&cas, dst)?;
+    probe_xattr(&cas)?;
+    let cas_real = cas
+        .canonicalize()
+        .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+
+    let (_, oid) = store(&base, &cas_real, Path::new(src))?;
+    fetch_and_materialize(&base, &target, &oid.to_string())
+}
+
+/// Recursively store `path` in the object server, returning the git tree entry
+/// (mode + oid) that refers to it.
+fn store(
+    base: &str,
+    cas_real: &Path,
+    path: &Path,
+) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+    use gix::objs::tree::EntryKind;
+
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let ft = meta.file_type();
+
+    if ft.is_symlink() {
+        // A symlink that resolves into the CAS: reuse the hash recorded there
+        // instead of re-reading the target.
+        if let Ok(canon) = path.canonicalize() {
+            if canon != cas_real && canon.starts_with(cas_real) {
+                let kind = if canon.is_dir() {
+                    EntryKind::Tree
+                } else {
+                    EntryKind::Blob
+                };
+                return Ok((kind.into(), parse_oid(&read_hash(&canon)?)?));
+            }
+        }
+        // Otherwise store it as a git symlink: a blob holding the link target.
+        let link = std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let oid = post_object(base, "blob", link.as_os_str().as_bytes())?;
+        return Ok((EntryKind::Link.into(), oid));
+    }
+
+    if ft.is_dir() {
+        let mut entries = Vec::new();
+        for dirent in std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
+            let dirent = dirent.map_err(|e| format!("{}: {e}", path.display()))?;
+            let (mode, oid) = store(base, cas_real, &dirent.path())?;
+            entries.push(gix::objs::tree::Entry {
+                mode,
+                filename: dirent.file_name().into_vec().into(),
+                oid,
+            });
+        }
+        // Git requires tree entries in a specific order; Entry's Ord implements it.
+        entries.sort();
+        let mut buf = Vec::new();
+        gix::objs::Tree { entries }
+            .write_to(&mut buf)
+            .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
+        let oid = post_object(base, "tree", &buf)?;
+        return Ok((EntryKind::Tree.into(), oid));
+    }
+
+    if ft.is_file() {
+        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let oid = post_object(base, "blob", &data)?;
+        let kind = if meta.permissions().mode() & 0o111 != 0 {
+            EntryKind::BlobExecutable
+        } else {
+            EntryKind::Blob
+        };
+        return Ok((kind.into(), oid));
+    }
+
+    Err(format!("unsupported file type: {}", path.display()))
+}
+
+/// POST `data` to the object server as an object of `kind` (`blob`/`tree`),
+/// returning its hash.
+fn post_object(base: &str, kind: &str, data: &[u8]) -> Result<gix::ObjectId, String> {
+    let url = format!("{}/object/?type={kind}", base.trim_end_matches('/'));
+    let response = minreq::post(&url)
+        .with_body(data.to_vec())
+        .send()
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "POST {url}: server returned {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let body = response
+        .as_str()
+        .map_err(|e| format!("POST {url}: invalid response: {e}"))?;
+    parse_oid(body)
+}
+
+/// Parse a hex git hash (tolerating surrounding whitespace).
+fn parse_oid(hex: &str) -> Result<gix::ObjectId, String> {
+    gix::ObjectId::from_hex(hex.trim().as_bytes()).map_err(|e| format!("invalid hash {hex:?}: {e}"))
 }
 
 /// CAS root directory (`/cas`, or `$CAOS_CAS_DIR`).
