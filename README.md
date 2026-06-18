@@ -80,8 +80,8 @@ nix run .#load-caos-object-server
 
 The `caos-client` and `caos-object-server` images contain **only** their static
 binary under `/bin` — no shell, no libc, no package manager, no `/nix/store`.
-The `caos-client` image exposes the binary as `/bin/caos` and includes the empty
-`/cas` directory it writes into.
+The `caos-client` image exposes the binary as `/bin/caos` and runs
+`caos entrypoint` (which creates `/cas` at startup — see below).
 
 There's also a `caos-client-bash` image (`.#caos-client-bash-docker`,
 `.#load-caos-client-bash`) for interactive testing: it's the `caos-client` root
@@ -145,6 +145,8 @@ objects under `/cas`.
 ```text
 caos get-hash <hash> <path>   # materialize a given hash at a CAS path
 caos get <path>               # expand a placeholder already in /cas
+caos put <src-path> <cas-path># store an outside path and record it in /cas
+caos entrypoint <command>...  # container entrypoint: set up, run, hash /cas/out
 ```
 
 **`get-hash <hash> <path>`** — `<path>` must be a **direct child of `/cas`**
@@ -177,6 +179,32 @@ Files become real git **blobs** and directories real git **trees** — each
 `POST`ed as a serialized object — so the hashes are genuine git object hashes; a
 `put` directory's hash equals what `git write-tree` would produce.
 
+**`caos entrypoint <command>...`** — the container's entrypoint, tying it
+together for a single compute step:
+
+1. **set up** — delete the CAS directory and recreate it empty (**fails** if it
+   can't) and verify it supports xattrs;
+2. **run** `<command>` — its stdout is redirected to stderr so the container's
+   stdout stays clean;
+3. **report** — print the hash recorded on `/cas/out`. Everything under `/cas`
+   got there via `get`/`put`, which already tag each path with its
+   `user.caos.hash`, so this is just a fast xattr read — no re-hashing;
+4. **tear down** — delete the CAS directory.
+
+So a step typically `caos get`s its inputs into `/cas`, computes its result, and
+writes it to `/cas/out` with `caos put` (or `get`); the printed hash is the
+address of that result. The
+`caos-client` image runs this as its entrypoint, so `docker run` args are the
+command:
+
+```bash
+docker run --rm \
+  -e CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080 \
+  -v /path/to/cas:/cas \
+  caos-client:latest \
+  my-build-tool --whatever      # must leave its result at /cas/out
+```
+
 ### Path → hash mapping
 
 Every materialized path records where it came from in the `user.caos.hash`
@@ -194,16 +222,8 @@ missing its hash — no locking needed. On startup `caos` probes the CAS directo
 and exits with a clear error if its filesystem doesn't support `user.*` xattrs
 (e.g. tmpfs on older kernels, or some overlay setups).
 
-```bash
-docker run --rm \
-  -e CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080 \
-  -v /path/to/cas:/cas \
-  caos-client:latest \
-  caos get-hash <hash> /cas/foo
-```
-
-`CAOS_CAS_DIR` (default `/cas`) overrides the target directory — handy for
-running outside a container.
+`CAOS_CAS_DIR` (default `/cas`) overrides the CAS directory — handy for running
+outside a container.
 
 ## Local testing
 

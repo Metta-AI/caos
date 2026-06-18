@@ -89,19 +89,27 @@
         # remote/linux builder on macOS).
 
         # The client crate's binary is `client` everywhere except inside its
-        # image, where it's exposed as `/bin/caos`. This root also carries the
-        # empty `/cas` directory the binary materializes objects into.
+        # image, where it's exposed as `/bin/caos`. The `/cas` directory is *not*
+        # baked in — `caos entrypoint` creates it at runtime (so a mounted, empty
+        # /cas volume works too).
         clientImageRoot = pkgs.runCommand "caos-client-root" { } ''
-          mkdir -p $out/bin $out/cas
+          mkdir -p $out/bin
           cp ${client}/bin/client $out/bin/caos
         '';
+        # The container runs `caos entrypoint <command>`: set up /cas, run the
+        # command, then print the hash of /cas/out.
+        clientConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [ "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080" ];
+        };
         clientImage = pkgs.dockerTools.buildImage {
           name = "caos-client";
           tag = "latest";
           copyToRoot = [ clientImageRoot ];
-          config = {
-            Cmd = [ "/bin/caos" ];
-          };
+          config = clientConfig;
         };
 
         # Run with the git repo bind-mounted at /git, e.g.
@@ -120,9 +128,12 @@
 
         # A testing image: caos-client plus an ordinary interactive shell
         # (bash + coreutils + curl) so you can poke at /cas and the object
-        # server by hand. Not minimal — for debugging, not production.
+        # server by hand. Not minimal — for debugging, not production. It runs a
+        # plain shell (no entrypoint), so it ships a ready-made /cas to poke at.
+        casDir = pkgs.runCommand "caos-cas-dir" { } "mkdir -p $out/cas";
         clientBashContents = [
           clientImageRoot
+          casDir
           pkgs.bashInteractive
           pkgs.coreutils
           pkgs.curl
@@ -165,7 +176,7 @@
         loadClient = loadImage {
           name = "caos-client";
           contents = [ clientImageRoot ];
-          config.Cmd = [ "/bin/caos" ];
+          config = clientConfig;
         };
         loadObjectServer = loadImage {
           name = "caos-object-server";

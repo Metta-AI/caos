@@ -74,7 +74,7 @@ cat <<EOF
 
 Object server is up. Run a one-shot interactive bash client with:
 
-  docker run --rm -it --network $NET caos-client-bash:latest
+  docker run --rm -it --network $NET caos-client-bash:latest caos entrypoint bash
 
 Then inside the container, e.g.:
 

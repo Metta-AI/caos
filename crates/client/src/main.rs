@@ -20,6 +20,7 @@
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,7 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(src), Some(dst), None) => put(src, dst),
             _ => Err(usage(args)),
         },
+        Some("entrypoint") if args.len() > 2 => entrypoint(&args[2..]),
         _ => Err(usage(args)),
     }
 }
@@ -88,7 +90,7 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>\n  \
-         {prog} put <src-path> <cas-path>"
+         {prog} put <src-path> <cas-path>\n  {prog} entrypoint <command> [args...]"
     )
 }
 
@@ -113,6 +115,53 @@ fn get(path: &str) -> Result<(), String> {
     probe_xattr(&cas)?;
     let hash = read_hash(&target)?;
     fetch_and_materialize(&base, &target, &hash)
+}
+
+/// `entrypoint <command>...` — the container entrypoint. Wipes the CAS directory,
+/// runs the command, prints the hash recorded at `/cas/out`, then removes the CAS
+/// directory.
+fn entrypoint(command: &[String]) -> Result<(), String> {
+    let cas = cas_dir();
+
+    // Start clean: delete the CAS directory and recreate it empty (fail if we
+    // can't), then verify it supports the xattrs we rely on.
+    remove_cas(&cas)?;
+    std::fs::create_dir_all(&cas).map_err(|e| format!("creating {}: {e}", cas.display()))?;
+    probe_xattr(&cas)?;
+
+    // Run the command, sending its stdout to our stderr so that our own stdout
+    // carries only the resulting hash.
+    let stdout = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| format!("duplicating stderr: {e}"))?;
+    let status = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .stdout(std::process::Stdio::from(stdout))
+        .status()
+        .map_err(|e| format!("running {:?}: {e}", command[0]))?;
+    if !status.success() {
+        return Err(format!("command {:?} exited with {status}", command[0]));
+    }
+
+    // Everything under /cas got there via get/put, which tag each path with its
+    // hash, so /cas/out already knows its hash — read it back before teardown.
+    let hash = read_hash(&cas.join("out"))?;
+
+    // Tear down.
+    remove_cas(&cas)?;
+
+    println!("{hash}");
+    Ok(())
+}
+
+/// Delete the CAS directory and everything in it. Succeeds if it's already gone.
+fn remove_cas(cas: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(cas) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("removing {}: {e}", cas.display())),
+    }
 }
 
 /// Fetch object `hash` and write it to `target` (blob → file, tree → directory).
