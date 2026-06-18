@@ -40,7 +40,7 @@ const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
 const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
 
 /// The program `entrypoint` always runs. Images that build off the
-/// `caos-client` image supply this binary.
+/// `caos-worker-base` image supply this binary.
 const DEFAULT_WORKER: &str = "/worker";
 
 /// Directory under which objects are materialized. Override (e.g. for local

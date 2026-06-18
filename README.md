@@ -8,7 +8,7 @@ Nix flake, so builds are reproducible and consistent across machines.
 
 | Crate | Image | What it is |
 |---|---|---|
-| `client` | `caos-client` | CLI that fetches objects from the object server (see below). Exposed as `caos` inside the image. |
+| `client` | `caos-worker-base` | CLI that fetches objects from the object server (see below). Exposed as `caos` inside the image. |
 | `object-server` | `caos-object-server` | HTTP daemon over a git object database (see below). |
 | `compute-server` | `caos-compute-server` | HTTP daemon that runs a worker image over an args tree and returns its result hash (see below). |
 
@@ -67,10 +67,10 @@ dependencies.
 The crates are unprefixed, but the images they produce carry a `caos-` prefix.
 
 ```bash
-nix build .#caos-client-docker         # image tarball at ./result
+nix build .#caos-worker-base-docker         # image tarball at ./result
 nix build .#caos-object-server-docker
 nix build .#caos-compute-server-docker
-nix build .#caos-hello-worker-docker
+nix build .#caos-worker-hello-docker
 
 docker load < result                   # loads e.g. caos-object-server:latest
 ```
@@ -79,27 +79,27 @@ Or build and load into the local docker daemon in one go (streams the image
 straight to `docker load`, nothing large written to the Nix store):
 
 ```bash
-nix run .#load-caos-client
+nix run .#load-caos-worker-base
 nix run .#load-caos-object-server
 nix run .#load-caos-compute-server
-nix run .#load-caos-hello-worker
+nix run .#load-caos-worker-hello
 ```
 
-The `caos-client` and `caos-object-server` images contain **only** their static
+The `caos-worker-base` and `caos-object-server` images contain **only** their static
 binary under `/bin` — no shell, no libc, no package manager, no `/nix/store`.
-The `caos-client` image exposes the binary as `/bin/caos` and runs
+The `caos-worker-base` image exposes the binary as `/bin/caos` and runs
 `caos entrypoint` (which creates `/cas` at startup — see below).
 
-There's also a `caos-client-bash` image (`.#caos-client-bash-docker`,
-`.#load-caos-client-bash`) for interactive testing: it's the `caos-client` root
+There's also a `caos-worker-bash` image (`.#caos-worker-bash-docker`,
+`.#load-caos-worker-bash`) for interactive testing: it's the `caos-worker-base` root
 plus `bash`, `coreutils`, and `curl`, with `bash` as the default command and
 `CAOS_OBJECT_SERVER_URL` defaulted to `http://caos-object-server:8080`.
 
 ```bash
-nix run .#load-caos-client-bash
+nix run .#load-caos-worker-bash
 docker run --rm -it \
   -v /path/to/cas:/cas \
-  caos-client-bash:latest
+  caos-worker-bash:latest
 # inside: caos get-hash <hash> /cas/foo
 ```
 
@@ -221,7 +221,7 @@ together for a single compute step:
 
 So `/worker` typically reads its inputs from `/cas/args`, computes its result,
 and writes it to `/cas/out` with `caos put` (or `get`); the printed hash is the
-address of that result. The `caos-client` image runs `caos entrypoint` as its
+address of that result. The `caos-worker-base` image runs `caos entrypoint` as its
 entrypoint, so to make a compute image you build one that adds a `/worker`:
 
 ```bash
@@ -292,23 +292,23 @@ Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:9090`),
 
 ### Writing a worker
 
-The base `caos-client` image bakes in **no** `/worker`. A worker image is built
+The base `caos-worker-base` image bakes in **no** `/worker`. A worker image is built
 `FROM` it (so it keeps `/bin/caos` as the entrypoint) and adds a `/worker` that
 reads its inputs from `/cas/args` and writes its result to `/cas/out` (with
 `caos put`/`get`).
 
-The **`caos-hello-worker`** image (`.#caos-hello-worker-docker`,
-`.#load-caos-hello-worker`) is a real, runnable example: caos + bash + coreutils
+The **`caos-worker-hello`** image (`.#caos-worker-hello-docker`,
+`.#load-caos-worker-hello`) is a real, runnable example: caos + bash + coreutils
 with a `/worker` that copies each `/cas/args` entry into a result directory
 (plus a small `receipt`) and stores it at `/cas/out`. So:
 
 ```bash
 caos put /some/file /cas/in
-caos run caos-hello-worker:latest /cas/out -- --in=/cas/in --greeting=hi
+caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
 caos get /cas/out/greeting && cat /cas/out/greeting   # => hi
 ```
 
-(The debugging `caos-client-bash` image's `/worker` is just `bash`, which doesn't
+(The debugging `caos-worker-bash` image's `/worker` is just `bash`, which doesn't
 write `/cas/out` — handy for poking around, not a real worker.)
 
 ## Local testing
@@ -320,7 +320,7 @@ one-shot bash-client command.
 
 ```bash
 scripts/dev-up.sh /path/to/repo
-# ... then run the printed `docker run --rm -it ... caos-client-bash:latest`
+# ... then run the printed `docker run --rm -it ... caos-worker-bash:latest`
 ```
 
 Overrides: `CAOS_NET` (network name, default `caos-net`), `CAOS_PORT` (host port

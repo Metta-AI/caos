@@ -43,10 +43,10 @@ FLAKE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "==> Loading images from $FLAKE"
 nix run "$FLAKE#load-caos-object-server"
-nix run "$FLAKE#load-caos-client"
-nix run "$FLAKE#load-caos-client-bash"
+nix run "$FLAKE#load-caos-worker-base"
+nix run "$FLAKE#load-caos-worker-bash"
 nix run "$FLAKE#load-caos-compute-server"
-nix run "$FLAKE#load-caos-hello-worker"
+nix run "$FLAKE#load-caos-worker-hello"
 
 # --- (re)start the object server --------------------------------------------
 
@@ -104,14 +104,14 @@ cat <<EOF
 
 Servers are up. Run a one-shot interactive bash client with:
 
-  docker run --rm -it --network $NET caos-client-bash:latest bash
+  docker run --rm -it --network $NET caos-worker-bash:latest bash
 
 Then inside the container, e.g.:
 
   caos get-hash <hash> /cas/foo
   mkdir -p /tmp && printf hello > /tmp/in
   caos put /tmp/in /cas/in
-  caos run caos-hello-worker:latest /cas/out -- --in=/cas/in --greeting=hi
+  caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
   caos get /cas/out/greeting && cat /cas/out/greeting
 
 (It reaches the servers via \$CAOS_OBJECT_SERVER_URL / \$CAOS_COMPUTE_SERVER_URL,
@@ -119,8 +119,8 @@ defaulting to http://$SERVER_NAME:8080 and http://$COMPUTE_NAME:9090.)
 
 \`caos run\` asks the compute server to run the image; the compute server forces
 \`caos entrypoint\`, which populates /cas/args and runs /worker. The
-caos-hello-worker image is a real worker: it copies each arg into /cas/out. (The
-caos-client-bash image's /worker is just bash, handy for poking around but it
+caos-worker-hello image is a real worker: it copies each arg into /cas/out. (The
+caos-worker-bash image's /worker is just bash, handy for poking around but it
 won't write /cas/out.)
 
 Stop the servers with:  docker rm -f $SERVER_NAME $COMPUTE_NAME
