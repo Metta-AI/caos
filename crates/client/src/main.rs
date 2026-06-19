@@ -7,9 +7,11 @@
 //!   `<path>`, a direct child of `/cas`: a blob becomes a file holding its
 //!   bytes; a tree becomes a directory holding one empty placeholder per entry
 //!   (a directory for subtrees, a file otherwise).
-//! * `get <path>` — expand an existing placeholder anywhere under `/cas`: read
-//!   its recorded hash, fetch that object, and replace the empty file with the
-//!   blob's content, or the empty directory with the tree's entries.
+//! * `get [-r | --recursive[=<depth>]] <path>` — expand an existing placeholder
+//!   anywhere under `/cas`: read its recorded hash, fetch that object, and
+//!   replace the empty file with the blob's content, or the empty directory with
+//!   the tree's entries. By default it loads one level; `--recursive=<depth>`
+//!   loads that many levels and `-r` loads the whole subtree.
 //! * `run <image> <output> -- [--name=value ...]` — assemble the args into a git
 //!   tree, ask the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
 //!   over it, and materialize the returned result hash at `<output>`.
@@ -102,10 +104,10 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(hash), Some(path), None) => get_hash(hash, path),
             _ => Err(usage(args)),
         },
-        Some("get") => match (args.get(2), args.get(3)) {
-            (Some(path), None) => get(path),
-            _ => Err(usage(args)),
-        },
+        Some("get") => {
+            let (path, depth) = parse_get(&args[2..])?;
+            get(path, depth)
+        }
         Some("put") => match (args.get(2), args.get(3), args.get(4)) {
             (Some(src), Some(dst), None) => put(src, dst),
             _ => Err(usage(args)),
@@ -145,7 +147,8 @@ fn prog_name(args: &[String]) -> &str {
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
-        "usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>\n  \
+        "usage:\n  {prog} get-hash <hash> <path>\n  \
+         {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
          {prog} build-args [--name=value ...]\n  \
@@ -163,17 +166,101 @@ fn get_hash(hash: &str, path: &str) -> Result<(), String> {
     fetch_and_materialize(&base, &target, hash)
 }
 
-/// `get <path>` — re-materialize the object recorded at `<path>` (a path inside
-/// the CAS directory, possibly deep). Reads `<path>`'s recorded hash, fetches
-/// that object, and replaces the placeholder: an empty file with the blob's
-/// content, or an empty directory with the tree's entries.
-fn get(path: &str) -> Result<(), String> {
+/// `get [-r | --recursive[=<depth>]] <path>` — re-materialize the object recorded
+/// at `<path>` (a path inside the CAS directory, possibly deep). Reads `<path>`'s
+/// recorded hash, fetches that object, and replaces the placeholder: an empty
+/// file with the blob's content, or an empty directory with the tree's entries.
+///
+/// `depth` counts how many levels to load: the default (a plain `get`) loads one
+/// — `<path>` itself, leaving a tree's entries as placeholders — while
+/// `--recursive=<n>` loads `n` levels and `-r` (or bare `--recursive`) loads the
+/// whole subtree.
+fn get(path: &str, depth: Option<u32>) -> Result<(), String> {
     let base = object_server_url()?;
     let cas = cas_dir();
     let target = validate_descendant(&cas, path)?;
     probe_xattr(&cas)?;
-    let hash = read_hash(&target)?;
-    fetch_and_materialize(&base, &target, &hash)
+    expand(&base, &target, depth)
+}
+
+/// Materialize the placeholder at `target` from its recorded hash, then — if it
+/// became a directory and `depth` allows another level — expand each child the
+/// same way. `depth` is the number of levels left to load: `Some(1)` stops after
+/// `target` (a plain `get`), `Some(n)` descends `n - 1` more levels, and `None`
+/// loads the whole subtree. (A git object graph is a finite DAG, so unbounded
+/// recursion always terminates at the blobs.)
+fn expand(base: &str, target: &Path, depth: Option<u32>) -> Result<(), String> {
+    // Fetch only an unexpanded placeholder. An already-loaded node is left as is
+    // and we just descend into it, so `get -r` is idempotent and can finish
+    // loading a tree that was already partially expanded (e.g. after `get-hash`).
+    // Re-fetching here would also fail anyway: renaming the fresh copy over a
+    // non-empty directory is `ENOTEMPTY`.
+    if !is_loaded(target) {
+        let hash = read_hash(target)?;
+        fetch_and_materialize(base, target, &hash)?;
+    }
+
+    let child_depth = match depth {
+        Some(1) => return Ok(()), // this was the last level to load
+        Some(n) => Some(n - 1),
+        None => None, // unbounded
+    };
+
+    // A tree just got materialized as a directory of child placeholders. Collect
+    // them before recursing: expanding a child renames a temp sibling into this
+    // same directory, so we must finish reading it first.
+    if target.is_dir() {
+        let mut children = Vec::new();
+        for entry in
+            std::fs::read_dir(target).map_err(|e| format!("reading {}: {e}", target.display()))?
+        {
+            let entry = entry.map_err(|e| format!("reading {}: {e}", target.display()))?;
+            children.push(entry.path());
+        }
+        for child in children {
+            expand(base, &child, child_depth)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` has already been fetched, as opposed to an unexpanded
+/// placeholder. Loaded content is group/other-readable; a placeholder is
+/// owner-only (see `MODE_FETCHED_*` vs `MODE_PLACEHOLDER_*`), so the read bits
+/// double as the "is this loaded yet?" marker.
+fn is_loaded(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.permissions().mode() & 0o044 != 0)
+        .unwrap_or(false)
+}
+
+/// Parse `get`'s arguments: an optional recursion flag plus exactly one path.
+/// `-r` and bare `--recursive` mean the whole subtree (`None`); `--recursive=<n>`
+/// means `n` levels (`n >= 1`); absent, the default is one level (`Some(1)`).
+fn parse_get(args: &[String]) -> Result<(&str, Option<u32>), String> {
+    let mut path: Option<&str> = None;
+    let mut depth = Some(1);
+    for arg in args {
+        if arg == "-r" || arg == "--recursive" {
+            depth = None;
+        } else if let Some(n) = arg.strip_prefix("--recursive=") {
+            let n: u32 = n
+                .parse()
+                .map_err(|_| format!("recursion depth must be a number, got: {n:?}"))?;
+            if n < 1 {
+                return Err("recursion depth must be at least 1".to_string());
+            }
+            depth = Some(n);
+        } else if arg.starts_with('-') && arg != "-" {
+            return Err(format!("unknown option for get: {arg}"));
+        } else if path.is_none() {
+            path = Some(arg);
+        } else {
+            return Err(format!("get takes a single path, got an extra: {arg}"));
+        }
+    }
+    let path = path.ok_or_else(|| "get requires a path".to_string())?;
+    Ok((path, depth))
 }
 
 /// `entrypoint [--args=<hash>]` — the container entrypoint. Wipes the CAS
