@@ -7,10 +7,33 @@
 
 NET = 'caos-net'
 
-# Absolute path to a throwaway git repo for the object server. Computed here (at
-# Tiltfile load, with cwd = this directory) so it doesn't depend on `$PWD` or the
-# working directory the serve command happens to run in.
-GIT_REPO = os.path.abspath('.caos-dev/git')
+# The object server is backed by *this project's own* `.git`, so caos can fetch
+# real repo objects (run `git rev-parse HEAD:README.md` for a blob hash, or any
+# tree hash) instead of an empty throwaway repo — more interesting test data.
+# Computed at Tiltfile load (cwd = this directory) so it doesn't depend on `$PWD`.
+# Note: the mount is read-write, so `caos put`/`caos run` write their objects
+# (args trees, results) here as loose, unreferenced objects — harmless, and
+# reclaimed by `git gc`.
+GIT_REPO = os.path.abspath('.git')
+
+# A checkout often keeps most of its objects in a *shared* store, referenced from
+# .git/objects/info/alternates (here, a sibling bare repo). gix follows that by
+# its absolute path, so the object server must see it at the *same* path inside
+# the container — otherwise every object that lives only in the alternate 404s.
+# Mount .git at /git, plus each alternate object dir at its own absolute path
+# (read-only: git never writes to an alternate). Without this, only the handful
+# of loose objects in this .git would resolve.
+def object_server_mounts():
+    mounts = ['-v "%s:/git"' % GIT_REPO]
+    alternates = os.path.join(GIT_REPO, 'objects', 'info', 'alternates')
+    if os.path.exists(alternates):
+        for line in str(read_file(alternates)).splitlines():
+            alt = line.strip().replace('//', '/')
+            if alt and not alt.startswith('#'):
+                mounts.append('-v "%s:%s:ro"' % (alt, alt))
+    return mounts
+
+OBJECT_SERVER_MOUNTS = object_server_mounts()
 
 # Per-image marker files. Each image build bumps its marker once the new image is
 # loaded; a daemon depends on its image's marker (see `daemon` below), so loading
@@ -47,18 +70,14 @@ nix_image('img-worker-fold', 'load-caos-worker-fold', ['crates/client'])
 nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/client'])
 
 # One-time infra: the docker network the daemons and the worker containers the
-# compute server spawns all share, plus a git repo for the object server to
-# store objects in (kept under the gitignored .caos-dev/).
+# compute server spawns all share. (The object server's git repo is this
+# project's own .git — see GIT_REPO above — so there's nothing to create here.)
 local_resource(
     'setup',
-    # `git init` is idempotent, so run it unconditionally. (Don't probe with
-    # `git rev-parse` first: GIT_REPO sits inside this project's own repo, so the
-    # probe would discover the *parent* repo and wrongly skip init, leaving /git
-    # without a .git of its own.)
+    # GIT_REPO is this project's existing .git, so there's nothing to init — just
+    # the markers dir and the shared docker network.
     cmd=' && '.join([
-        'mkdir -p %s' % GIT_REPO,
         'mkdir -p %s' % MARKERS,
-        'git init -q %s' % GIT_REPO,
         '(docker network create %s >/dev/null 2>&1 || true)' % NET,
     ]),
     labels=['infra'],
@@ -115,7 +134,7 @@ local_resource(
 
 daemon(
     'caos-object-server',
-    ['-p 8080:80', '-v "%s:/git"' % GIT_REPO],
+    ['-p 8080:80'] + OBJECT_SERVER_MOUNTS,
 )
 daemon(
     'caos-compute-server',

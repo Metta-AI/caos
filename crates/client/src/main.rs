@@ -32,6 +32,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +59,34 @@ const DEFAULT_CAS_DIR: &str = "/cas";
 const HASH_XATTR: &str = "user.caos.hash";
 /// xattr used only by the startup support probe.
 const PROBE_XATTR: &str = "user.caos.probe";
+
+/// Permissions for everything under `/cas`. The directory and its contents are
+/// owned by root; the worker runs unprivileged and reaches `/cas` only through
+/// this (setuid-root) binary, so the modes here decide what the worker may *read*
+/// directly — never what it may write (it can't write any of these). Two rules:
+///
+/// * Fetched content is world-readable: a blob is `r--r--r--`, a tree directory
+///   `r-xr-xr-x` plus owner-write so `get`/`put` can fill it. The worker can read
+///   what it has loaded but not tamper with it.
+/// * A placeholder — a path that exists but hasn't been fetched with `get`/
+///   `get-hash` yet — is owner-only (`r--------` / `r-x------`). The worker can't
+///   read it by accident, but the owner (root in the container, or the invoking
+///   user for a local `CAOS_CAS_DIR` run) can still read the recorded hash to
+///   expand it later.
+const MODE_FETCHED_FILE: u32 = 0o444;
+const MODE_FETCHED_DIR: u32 = 0o755;
+const MODE_PLACEHOLDER_FILE: u32 = 0o400;
+const MODE_PLACEHOLDER_DIR: u32 = 0o500;
+
+/// The unprivileged user `entrypoint` runs `/worker` as. The container starts as
+/// root so `entrypoint` can set up — and later tear down — the root-owned
+/// `/cas`; it drops to this uid/gid only for the `/worker` child. The worker
+/// therefore can't tamper with `/cas` directly: it must go through `caos`, which
+/// is setuid-root. Override (e.g. for a different image user) with the env vars.
+const WORKER_UID_ENV: &str = "CAOS_WORKER_UID";
+const WORKER_GID_ENV: &str = "CAOS_WORKER_GID";
+const DEFAULT_WORKER_UID: u32 = 1000;
+const DEFAULT_WORKER_GID: u32 = 1000;
 
 /// Disambiguates temp names created within a single process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -97,6 +126,9 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, output, sep, kvs @ ..] if sep == "--" => caos_run(image, output, kvs),
             _ => Err(usage(args)),
         },
+        // `build-args [--name=value ...]` — print the hash of the assembled args
+        // tree (path values stored from disk, everything else a literal blob).
+        Some("build-args") => build_args(&args[2..]),
         // `entrypoint [--args=<hash>]` — takes no command; it always runs /worker.
         Some("entrypoint") => match &args[2..] {
             [] => entrypoint(None),
@@ -127,6 +159,7 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} import-image <docker-archive> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
+         {prog} build-args [--name=value ...]\n  \
          {prog} entrypoint [--args=<hash>]"
     )
 }
@@ -165,6 +198,9 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     // can't), then verify it supports the xattrs we rely on.
     remove_cas(&cas)?;
     std::fs::create_dir_all(&cas).map_err(|e| format!("creating {}: {e}", cas.display()))?;
+    // Root-owned and only root-writable: the worker reaches `/cas` solely through
+    // this setuid-root binary, never by writing here directly.
+    set_mode(&cas, MODE_FETCHED_DIR)?;
     probe_xattr(&cas)?;
 
     // Populate /cas/args from the given hash, like `get-hash <hash> /cas/args`,
@@ -175,13 +211,31 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     }
 
     // Run the worker, sending its stdout to our stderr so that our own stdout
-    // carries only the resulting hash.
+    // carries only the resulting hash. We stay root (to tear down `/cas` after),
+    // but drop the *worker* to an unprivileged user so it can't tamper with the
+    // root-owned `/cas` — only the setuid-root `caos` it invokes can.
     let stdout = std::io::stderr()
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| format!("duplicating stderr: {e}"))?;
-    let status = std::process::Command::new(DEFAULT_WORKER)
-        .stdout(std::process::Stdio::from(stdout))
+    let uid = env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
+    let gid = env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
+    let mut command = std::process::Command::new(DEFAULT_WORKER);
+    command.stdout(std::process::Stdio::from(stdout));
+    // SAFETY: the closure runs in the forked child before exec and only makes
+    // async-signal-safe syscalls. We drop privileges by hand (rather than
+    // `Command::uid`/`gid`) so we can also clear supplementary groups — `groups`
+    // is still unstable — and in the right order: groups, then gid, then uid,
+    // each while we're still root.
+    unsafe {
+        command.pre_exec(move || {
+            if drop_privileges(uid, gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = command
         .status()
         .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
     if !status.success() {
@@ -576,6 +630,73 @@ fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
     ))
 }
 
+/// Split a `--name=value` argument into its name and value, validating that the
+/// name is a single path component (it becomes a tree-entry filename).
+fn parse_kv(kv: &str) -> Result<(&str, &str), String> {
+    let body = kv
+        .strip_prefix("--")
+        .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+    let (name, value) = body
+        .split_once('=')
+        .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+    if name.is_empty() || name.contains('/') {
+        return Err(format!(
+            "argument name must be a single path component, got: {name:?}"
+        ));
+    }
+    Ok((name, value))
+}
+
+/// `build-args [--name=value ...]` — assemble an args git tree and print its
+/// hash. For each pair, a `value` that names an existing path (relative to the
+/// working directory) is stored recursively from the filesystem, so the entry
+/// references that content's own hash (git's hash for the path); any other value
+/// is stored verbatim as a blob. The printed hash is meant to be passed to
+/// `caos entrypoint --args=<hash>` (which is what `run-worker-bash.sh` does).
+fn build_args(kvs: &[String]) -> Result<(), String> {
+    let base = object_server_url()?;
+    let hash = build_host_args_tree(&base, kvs)?;
+    println!("{hash}");
+    Ok(())
+}
+
+/// The args-tree builder behind `build-args`: like [`build_args_tree`], but a
+/// `value` naming an existing filesystem path is stored from disk (reusing
+/// [`store`]) instead of being read as a CAS path. The tree is never written to
+/// the filesystem.
+fn build_host_args_tree(base: &str, kvs: &[String]) -> Result<gix::ObjectId, String> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    // There's no CAS here, so `store` should never treat a symlink as one
+    // pointing into a CAS. A NUL byte can't appear in a real (canonicalized)
+    // path, so no path ever starts with this sentinel — the CAS-reuse branch
+    // stays dormant and symlinks are stored as plain git symlinks.
+    let no_cas = PathBuf::from("/\0");
+
+    let mut entries = Vec::new();
+    for kv in kvs {
+        let (name, value) = parse_kv(kv)?;
+
+        let (mode, oid) = if Path::new(value).exists() {
+            store(base, &no_cas, Path::new(value))?
+        } else {
+            // Not a path: store the literal value as a blob.
+            (
+                EntryKind::Blob.into(),
+                post_object(base, "blob", value.as_bytes())?,
+            )
+        };
+
+        entries.push(Entry {
+            mode,
+            filename: name.as_bytes().to_vec().into(),
+            oid,
+        });
+    }
+
+    post_tree(base, entries)
+}
+
 /// Build the args git tree from `--name=value` pairs and store it (plus any
 /// literal-value blobs) in the object server, returning the tree's hash. The
 /// tree is never written to the filesystem.
@@ -592,17 +713,7 @@ fn build_args_tree(base: &str, cas: &Path, kvs: &[String]) -> Result<gix::Object
 
     let mut entries = Vec::new();
     for kv in kvs {
-        let body = kv
-            .strip_prefix("--")
-            .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
-        let (name, value) = body
-            .split_once('=')
-            .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
-        if name.is_empty() || name.contains('/') {
-            return Err(format!(
-                "argument name must be a single path component, got: {name:?}"
-            ));
-        }
+        let (name, value) = parse_kv(kv)?;
 
         let (mode, oid) = if Path::new(value).starts_with(cas) {
             // A CAS path: it must exist; reference whatever it was made from.
@@ -743,7 +854,9 @@ fn write_file(target: &Path, hash: &str, data: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
         file.write_all(data)
             .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-        set_hash(tmp, hash.as_bytes())
+        set_hash(tmp, hash.as_bytes())?;
+        // Fetched blob: world-readable, writable by no one.
+        set_mode(tmp, MODE_FETCHED_FILE)
     })
 }
 
@@ -756,16 +869,25 @@ fn write_tree(target: &Path, hash: &str, tree: &gix::objs::TreeRef) -> Result<()
         set_hash(tmp, hash.as_bytes())?;
         for entry in &tree.entries {
             let child = tmp.join(OsStr::from_bytes(entry.filename));
-            if entry.mode.is_tree() {
+            // Each child is a placeholder: it records its hash but holds no
+            // content until expanded with `get`, so it stays owner-only — the
+            // worker mustn't read what it hasn't fetched.
+            let placeholder_mode = if entry.mode.is_tree() {
                 std::fs::create_dir(&child)
                     .map_err(|e| format!("creating {}: {e}", child.display()))?;
+                MODE_PLACEHOLDER_DIR
             } else {
                 std::fs::File::create(&child)
                     .map_err(|e| format!("creating {}: {e}", child.display()))?;
-            }
+                MODE_PLACEHOLDER_FILE
+            };
             set_hash(&child, entry.oid.to_string().as_bytes())?;
+            set_mode(&child, placeholder_mode)?;
         }
-        Ok(())
+        // The tree itself *was* fetched (its entries are now visible), so make it
+        // readable and traversable. Last, so creating the children above — which
+        // needs write on this dir — isn't blocked.
+        set_mode(tmp, MODE_FETCHED_DIR)
     })
 }
 
@@ -810,6 +932,44 @@ fn temp_path(target: &Path) -> Result<PathBuf, String> {
 fn set_hash(path: &Path, hash: &[u8]) -> Result<(), String> {
     xattr::set(path, HASH_XATTR, hash)
         .map_err(|e| format!("setting {HASH_XATTR} on {}: {e}", path.display()))
+}
+
+/// Set `path`'s permission bits. Always done *after* the hash xattr is recorded,
+/// since a read-only mode would otherwise stop a non-root owner from setting it.
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("setting mode on {}: {e}", path.display()))
+}
+
+/// Parse `key` from the environment as a `u32`, or `None` if unset/unparseable.
+fn env_u32(key: &str) -> Option<u32> {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// Drop to `uid`/`gid`, clearing supplementary groups first. Returns 0 on
+/// success, or a non-zero return from the first failing syscall (the caller then
+/// reads `errno`). Must be called while still privileged, in this order:
+/// supplementary groups, then the group, then the user — once the uid is dropped
+/// the others would be denied. Only used from `entrypoint`'s `pre_exec`, so it
+/// must stay async-signal-safe: these three raw syscalls are.
+fn drop_privileges(uid: u32, gid: u32) -> i32 {
+    // Resolved against the libc std already links (musl in the image).
+    extern "C" {
+        fn setgroups(size: usize, list: *const u32) -> i32;
+        fn setgid(gid: u32) -> i32;
+        fn setuid(uid: u32) -> i32;
+    }
+    unsafe {
+        let rc = setgroups(0, std::ptr::null());
+        if rc != 0 {
+            return rc;
+        }
+        let rc = setgid(gid);
+        if rc != 0 {
+            return rc;
+        }
+        setuid(uid)
+    }
 }
 
 /// HTTP GET returning the raw response body. Non-2xx responses are errors.
