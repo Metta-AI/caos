@@ -116,6 +116,9 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, output, sep, kvs @ ..] if sep == "--" => caos_run(image, output, kvs),
             _ => Err(usage(args)),
         },
+        // `build-args [--name=value ...]` — print the hash of the assembled args
+        // tree (path values stored from disk, everything else a literal blob).
+        Some("build-args") => build_args(&args[2..]),
         // `entrypoint [--args=<hash>]` — takes no command; it always runs /worker.
         Some("entrypoint") => match &args[2..] {
             [] => entrypoint(None),
@@ -145,6 +148,7 @@ fn usage(args: &[String]) -> String {
         "usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
+         {prog} build-args [--name=value ...]\n  \
          {prog} entrypoint [--args=<hash>]"
     )
 }
@@ -461,6 +465,73 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     fetch_and_materialize(&base, &target, &result)
 }
 
+/// Split a `--name=value` argument into its name and value, validating that the
+/// name is a single path component (it becomes a tree-entry filename).
+fn parse_kv(kv: &str) -> Result<(&str, &str), String> {
+    let body = kv
+        .strip_prefix("--")
+        .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+    let (name, value) = body
+        .split_once('=')
+        .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+    if name.is_empty() || name.contains('/') {
+        return Err(format!(
+            "argument name must be a single path component, got: {name:?}"
+        ));
+    }
+    Ok((name, value))
+}
+
+/// `build-args [--name=value ...]` — assemble an args git tree and print its
+/// hash. For each pair, a `value` that names an existing path (relative to the
+/// working directory) is stored recursively from the filesystem, so the entry
+/// references that content's own hash (git's hash for the path); any other value
+/// is stored verbatim as a blob. The printed hash is meant to be passed to
+/// `caos entrypoint --args=<hash>` (which is what `run-worker-bash.sh` does).
+fn build_args(kvs: &[String]) -> Result<(), String> {
+    let base = object_server_url()?;
+    let hash = build_host_args_tree(&base, kvs)?;
+    println!("{hash}");
+    Ok(())
+}
+
+/// The args-tree builder behind `build-args`: like [`build_args_tree`], but a
+/// `value` naming an existing filesystem path is stored from disk (reusing
+/// [`store`]) instead of being read as a CAS path. The tree is never written to
+/// the filesystem.
+fn build_host_args_tree(base: &str, kvs: &[String]) -> Result<gix::ObjectId, String> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    // There's no CAS here, so `store` should never treat a symlink as one
+    // pointing into a CAS. A NUL byte can't appear in a real (canonicalized)
+    // path, so no path ever starts with this sentinel — the CAS-reuse branch
+    // stays dormant and symlinks are stored as plain git symlinks.
+    let no_cas = PathBuf::from("/\0");
+
+    let mut entries = Vec::new();
+    for kv in kvs {
+        let (name, value) = parse_kv(kv)?;
+
+        let (mode, oid) = if Path::new(value).exists() {
+            store(base, &no_cas, Path::new(value))?
+        } else {
+            // Not a path: store the literal value as a blob.
+            (
+                EntryKind::Blob.into(),
+                post_object(base, "blob", value.as_bytes())?,
+            )
+        };
+
+        entries.push(Entry {
+            mode,
+            filename: name.as_bytes().to_vec().into(),
+            oid,
+        });
+    }
+
+    post_tree(base, entries)
+}
+
 /// Build the args git tree from `--name=value` pairs and store it (plus any
 /// literal-value blobs) in the object server, returning the tree's hash. The
 /// tree is never written to the filesystem.
@@ -477,17 +548,7 @@ fn build_args_tree(base: &str, cas: &Path, kvs: &[String]) -> Result<gix::Object
 
     let mut entries = Vec::new();
     for kv in kvs {
-        let body = kv
-            .strip_prefix("--")
-            .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
-        let (name, value) = body
-            .split_once('=')
-            .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
-        if name.is_empty() || name.contains('/') {
-            return Err(format!(
-                "argument name must be a single path component, got: {name:?}"
-            ));
-        }
+        let (name, value) = parse_kv(kv)?;
 
         let (mode, oid) = if Path::new(value).starts_with(cas) {
             // A CAS path: it must exist; reference whatever it was made from.

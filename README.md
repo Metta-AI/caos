@@ -112,6 +112,17 @@ nix run .#load-caos-worker-bash
 # inside: caos get-hash <hash> /cas/foo
 ```
 
+The helper also accepts `--name=value` args, like `caos run`: a value that names
+an existing path (relative to your current directory) is stored from the
+filesystem and referenced by its git hash; anything else becomes a literal
+string. It assembles them into an args tree (via `caos build-args`) and starts
+the container with `--args=<hash>`, so they land under `/cas/args`:
+
+```bash
+./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/client
+# inside: caos get /cas/args/conf && cat /cas/args/conf
+```
+
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
 > remote or linux builder; the binaries and dev shell build fine natively.
 
@@ -164,6 +175,9 @@ caos get-hash <hash> <path>   # materialize a given hash at a CAS path
 caos get <path>               # expand a placeholder already in /cas
 caos put <src-path> <cas-path># store an outside path and record it in /cas
 caos run <image> <out> -- ... # run an image on the compute server (see below)
+caos build-args [--name=value ...]
+                              # print the hash of an args tree (paths from disk,
+                              # else literals); used by ./run-worker-bash.sh
 caos entrypoint [--args=<hash>]
                               # container entrypoint: set up, run /worker, hash /cas/out
 ```
