@@ -115,13 +115,21 @@ nix run .#load-caos-worker-bash
 The helper also accepts `--name=value` args, like `caos run`: a value that names
 an existing path (relative to your current directory) is stored from the
 filesystem and referenced by its git hash; anything else becomes a literal
-string. It assembles them into an args tree (via `caos build-args`) and starts
-the container with `--args=<hash>`, so they land under `/cas/args`:
+string. It assembles them into an args tree and starts the container with
+`--args=<hash>`, so they land under `/cas/args`:
 
 ```bash
 ./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/client
 # inside: caos get /cas/args/conf && cat /cas/args/conf
 ```
+
+When you're running against the default (Tilt) object server — which is backed by
+this repo's `.git` — the helper builds the tree with git plumbing directly in the
+repo: a **clean, tracked path reuses the hash git already has** (a single
+`git ls-tree`, no re-read or upload), so passing a large unchanged directory is
+effectively free; only dirty/untracked paths (and literal strings) are hashed in.
+It never touches HEAD, the index, or commits. Against any other object server it
+falls back to `caos build-args`, which uploads the content through that server.
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
 > remote or linux builder; the binaries and dev shell build fine natively.
@@ -172,7 +180,9 @@ objects under `/cas`.
 
 ```text
 caos get-hash <hash> <path>   # materialize a given hash at a CAS path
-caos get <path>               # expand a placeholder already in /cas
+caos get [-r | --recursive[=<n>]] <path>
+                              # expand a placeholder in /cas; -r loads the whole
+                              # subtree, --recursive=<n> loads n levels (default 1)
 caos put <src-path> <cas-path># store an outside path and record it in /cas
 caos run <image> <out> -- ... # run an image on the compute server (see below)
 caos build-args [--name=value ...]
@@ -194,12 +204,20 @@ caos entrypoint [--args=<hash>]
 (The server returns the serialized object, so its `<type>` header tells the
 client whether it's a blob or a tree — no guessing.)
 
-**`get <path>`** — `<path>` may be anywhere inside `/cas` (any depth) and must
-already exist. `caos` reads the hash recorded on it (see below), fetches that
-object, and expands it in place: an empty **file** is replaced with the blob's
-content; an empty **directory** is filled with the tree's entry placeholders.
-Together with `get-hash` this lets you lazily drill down a tree one level at a
-time — `get-hash` the root, then `get` whichever child you want to expand.
+**`get [-r | --recursive[=<depth>]] <path>`** — `<path>` may be anywhere inside
+`/cas` (any depth) and must already exist. `caos` reads the hash recorded on it
+(see below), fetches that object, and expands it in place: an empty **file** is
+replaced with the blob's content; an empty **directory** is filled with the
+tree's entry placeholders. Together with `get-hash` this lets you lazily drill
+down a tree one level at a time — `get-hash` the root, then `get` whichever child
+you want to expand.
+
+By default `get` loads a single level. `--recursive=<depth>` loads that many
+levels, and `-r` (or a bare `--recursive`) loads the whole subtree. It's
+idempotent and resumable: a node that's already expanded is skipped and only its
+unexpanded descendants are fetched, so `get-hash foo` then `get -r foo` finishes
+loading the tree. (Each node is a separate fetch, so a deep tree is many
+sequential requests.)
 
 **`put <src-path> <cas-path>`** — the inverse: recursively store a path from
 *outside* the CAS into the object server (`POST /object/`), then record the
@@ -506,8 +524,9 @@ server, and a Redis cache as containers Tilt supervises (see Stopping above for
 teardown). It tracks each image's sources, so an image is **only** rebuilt and
 reloaded when its crate (or the flake/lockfiles) changes — editing
 `crates/object-server` reloads just that image and restarts just that daemon. It
-also creates the `caos-net` network and a git repo for the object server under
-the gitignored `.caos-dev/`.
+also creates the `caos-net` network and backs the object server with this repo's
+own `.git` (plus any alternate object store it references), so caos can fetch real
+repo objects as test data.
 
 ## Notes
 
