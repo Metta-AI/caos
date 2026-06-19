@@ -9,6 +9,17 @@ path = "src/main.rs"
 
 [dependencies]
 # Minimal synchronous HTTP server: no async runtime, no TLS, pure Rust — same
-# as object-server. compute-server itself does no git work; it just shells out
-# to the `docker` CLI, so it needs nothing beyond this.
+# as object-server.
 tiny_http = "0.12"
+# Parse git objects (trees/blobs) fetched from the object server when converting
+# a git-docker image. Same pure-Rust, static-musl config as the other crates.
+gix = { version = "0.84", default-features = false, features = ["sha1"] }
+# Minimal blocking HTTP client (plain HTTP, no TLS) for fetching git objects from
+# the object server and pushing blobs/manifests to the registry. Same config as
+# the client crate.
+minreq = { version = "2", default-features = false }
+# SHA-256 for docker/OCI content digests (layer tars, config, manifest).
+sha2 = "0.10"
+# Read/patch the image config JSON (recompute rootfs.diff_ids) and build the OCI
+# manifest.
+serde_json = "1"

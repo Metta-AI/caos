@@ -100,6 +100,19 @@ local_resource(
     labels=['daemons'],
 )
 
+# Docker registry the compute server pushes converted git images to. The compute
+# server reaches it by name on caos-net (caos-registry:5000); the host docker
+# daemon, which runs the workers, pulls via the published localhost:5000 (which
+# docker treats as an insecure registry, so no TLS config is needed). Stock
+# image; handles SIGTERM itself.
+local_resource(
+    'caos-registry',
+    serve_cmd='docker rm -f caos-registry >/dev/null 2>&1; ' +
+              'exec docker run --rm --name caos-registry --network %s -p 5000:5000 registry:2' % NET,
+    resource_deps=['setup'],
+    labels=['daemons'],
+)
+
 daemon(
     'caos-object-server',
     ['-p 8080:80', '-v "%s:/git"' % GIT_REPO],
@@ -111,7 +124,8 @@ daemon(
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
         '-v /var/run/docker.sock:/var/run/docker.sock',
     ],
-    # Compute server reads/writes the cache; start it after Redis. (It degrades
-    # gracefully if Redis is down, so this is just for tidy startup.)
-    extra_deps=['caos-redis'],
+    # Compute server uses the cache and pushes converted images to the registry;
+    # start it after both. (It degrades gracefully if Redis is down; the registry
+    # is only needed when running a git image.)
+    extra_deps=['caos-redis', 'caos-registry'],
 )

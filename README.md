@@ -206,8 +206,14 @@ in the object server (never written to the filesystem):
 
 It then asks the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
 over that args tree and materializes the returned result hash at
-`<output-cas-path>` (a direct child of `/cas`, like `get-hash`). The image is
-passed through to the compute server untouched.
+`<output-cas-path>` (a direct child of `/cas`, like `get-hash`).
+
+`<image>` is a **git image by default**: a path inside `/cas` is resolved to the
+git hash recorded on it (so you can run an image stored in the CAS), and a bare
+value is assumed to already be a git hash. An **ordinary docker image** is written
+`docker://<ref>` (e.g. `docker://caos-worker-hello:latest`). The compute server
+converts a git image to a real image and pushes it to a registry before running
+it (see below); a `docker://` ref is run directly.
 
 **`caos entrypoint [--args=<hash>]`** — the container's entrypoint, tying it
 together for a single compute step:
@@ -316,6 +322,34 @@ Redis is best-effort: if it's unreachable the server logs the error and runs
 uncached, so a missing Redis never fails a request. There are no locks yet, so
 two identical requests racing a cold cache may both run the work.
 
+### Git images
+
+When the `image` parameter isn't a `docker://` ref, it's the git hash of an image
+stored in the CAS, in our **git-docker form** — a tree holding `config.json` (the
+image config) and one `layer<NN>` subtree per layer (the layer's extracted
+filesystem). The compute server converts it to a real image and pushes it to a
+registry, then runs it by digest:
+
+- each `layer<NN>` tree is materialized and tarred (uncompressed, GNU format,
+  zeroed owners/mtimes, sorted) — `digest = sha256(tar)`;
+- `config.json`'s `rootfs.diff_ids` are **generated** from those layer hashes
+  (since the layers are uncompressed, a layer's digest *is* its diff_id), making
+  the config self-consistent with the layers we push — so nothing has to match any
+  pre-existing tar bytes, and the stored config needn't carry diff_ids at all;
+- an OCI manifest tying the config and layers together is pushed by digest.
+
+The conversion is deterministic, so it's cached in Redis: `caos:image:<git-hash> →
+manifest digest` and `caos:layer:<git-layer-tree-hash> → layer digest`, checked
+before doing (or re-pushing) any work.
+
+The registry is reached at two addresses for one instance: the compute server
+pushes to it by name on the docker network (`CAOS_REGISTRY_PUSH_URL`, default
+`http://caos-registry:5000`), while the host docker daemon — which actually runs
+the worker — pulls via its published port (`CAOS_REGISTRY_PULL_HOST`, default
+`localhost:5000`, which docker treats as insecure, so no TLS setup is needed).
+Converted images are pushed under the fixed repo `caos` and referenced by digest,
+so there are no tags.
+
 ### Writing a worker
 
 The base `caos-worker-base` image bakes in **no** `/worker`. A worker image is built
@@ -330,7 +364,7 @@ with a `/worker` that copies each `/cas/args` entry into a result directory
 
 ```bash
 caos put /some/file /cas/in
-caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
+caos run docker://caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
 caos get /cas/out/greeting && cat /cas/out/greeting   # => hi
 ```
 
@@ -355,8 +389,8 @@ applied image takes its single input as `--in`, and the final tree is left at
 
 ```bash
 caos put /some/tree /cas/in
-caos run caos-worker-fold:latest /cas/out -- \
-  --func=caos-worker-hello:latest --in=/cas/in
+caos run docker://caos-worker-fold:latest /cas/out -- \
+  --func=docker://caos-worker-hello:latest --in=/cas/in
 ```
 
 Because it drives the compute server itself, the image relies on
@@ -379,7 +413,7 @@ The result, a blob holding the count, is left at `/cas/out`. On its own:
 
 ```bash
 printf hi > /tmp/f && caos put /tmp/f /cas/f
-caos run caos-worker-file-count:latest /cas/n -- --in=/cas/f
+caos run docker://caos-worker-file-count:latest /cas/n -- --in=/cas/f
 caos get /cas/n && cat /cas/n        # => 1
 ```
 
@@ -387,8 +421,8 @@ Composed under `fold`, it counts every leaf file in a tree:
 
 ```bash
 caos put /some/tree /cas/in
-caos run caos-worker-fold:latest /cas/out -- \
-  --func=caos-worker-file-count:latest --in=/cas/in
+caos run docker://caos-worker-fold:latest /cas/out -- \
+  --func=docker://caos-worker-file-count:latest --in=/cas/in
 caos get /cas/out && cat /cas/out    # => number of files in the tree
 ```
 
@@ -416,7 +450,7 @@ Then inside the container, e.g.:
 caos get-hash <hash> /cas/foo
 mkdir -p /tmp && printf hello > /tmp/in
 caos put /tmp/in /cas/in
-caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
+caos run docker://caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
 caos get /cas/out/greeting && cat /cas/out/greeting
 ```
 

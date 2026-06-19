@@ -32,10 +32,15 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tiny_http::{Method, Request, Response, Server};
 
 /// Listen address; overridable for local runs outside the container.
@@ -55,6 +60,25 @@ const DEFAULT_OBJECT_SERVER_URL: &str = "http://caos-object-server";
 /// `CAOS_COMPUTE_SERVER_URL`.
 const DEFAULT_COMPUTE_SERVER_URL: &str = "http://caos-compute-server";
 
+/// Registry base URL converted git-docker images are pushed to, reachable from
+/// *this* container over the docker network. Override with
+/// `CAOS_REGISTRY_PUSH_URL`.
+const DEFAULT_REGISTRY_PUSH_URL: &str = "http://caos-registry:5000";
+
+/// How the host's docker daemon (which actually runs the worker) refers to that
+/// same registry — a published port on localhost, which docker treats as an
+/// insecure registry, so no TLS/daemon config is needed. Override with
+/// `CAOS_REGISTRY_PULL_HOST`.
+const DEFAULT_REGISTRY_PULL_HOST: &str = "localhost:5000";
+
+/// Repository name converted images are pushed under. They're addressed by
+/// digest, so the name is arbitrary and fixed.
+const REGISTRY_REPO: &str = "caos";
+
+/// Prefix marking the `image` parameter as an ordinary docker reference rather
+/// than one of our git images (the default).
+const DOCKER_SCHEME: &str = "docker://";
+
 /// `docker` binary to invoke. Override with `CAOS_DOCKER_BIN`.
 const DEFAULT_DOCKER_BIN: &str = "docker";
 
@@ -72,6 +96,8 @@ struct Config {
     network: String,
     object_server_url: String,
     compute_server_url: String,
+    registry_push_url: String,
+    registry_pull_host: String,
     docker_bin: String,
     redis_addr: String,
 }
@@ -108,6 +134,8 @@ fn main() {
         network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
         object_server_url: env_or("CAOS_OBJECT_SERVER_URL", DEFAULT_OBJECT_SERVER_URL),
         compute_server_url: env_or("CAOS_COMPUTE_SERVER_URL", DEFAULT_COMPUTE_SERVER_URL),
+        registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
+        registry_pull_host: env_or("CAOS_REGISTRY_PULL_HOST", DEFAULT_REGISTRY_PULL_HOST),
         docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
     });
@@ -121,8 +149,13 @@ fn main() {
     };
     eprintln!(
         "compute-server listening on http://{addr}, network {}, object server {}, \
-         compute server {}, redis {}",
-        config.network, config.object_server_url, config.compute_server_url, config.redis_addr
+         compute server {}, registry push {} / pull {}, redis {}",
+        config.network,
+        config.object_server_url,
+        config.compute_server_url,
+        config.registry_push_url,
+        config.registry_pull_host,
+        config.redis_addr
     );
 
     // One thread per request, not a serial loop: a worker can itself call back
@@ -190,18 +223,18 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let args = query_param(query, "args")
         .ok_or_else(|| HttpError::new(400, "missing 'args' query parameter"))?;
 
-    // The image becomes a positional `docker run` argument; reject a leading '-'
-    // so it can't be misread as a flag. The args hash is interpolated into
-    // `--args=`; require it to be a plain hex object id.
-    if image.is_empty() || image.starts_with('-') {
-        return Err(HttpError::new(400, format!("invalid image: {image:?}")));
+    if image.is_empty() {
+        return Err(HttpError::new(400, "empty image"));
     }
+    // The args hash is interpolated into `--args=`; require a plain hex object id.
     if args.is_empty() || !args.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid args hash: {args:?}")));
     }
 
-    // Cache key is the image + args-tree hash; value is the result hash. Redis
-    // is best-effort: a lookup/connection error just means we run uncached.
+    // Cache key is the image + args-tree hash; value is the result hash. Keying on
+    // the image param as given (a git hash, or a `docker://` ref) means a hit
+    // skips both image conversion and the container run. Redis is best-effort: a
+    // lookup/connection error just means we run uncached.
     let key = format!("caos:result:{image}\0{args}");
     match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
@@ -211,6 +244,11 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         Ok(None) => eprintln!("cache miss: image={image} args={args}; running worker"),
         Err(e) => eprintln!("cache lookup failed ({e}); running worker: image={image} args={args}"),
     }
+
+    // Resolve to a reference the host's docker daemon can run: a `docker://`
+    // image is used directly; one of our git images is converted to a real image,
+    // pushed to the registry, and referenced by digest.
+    let docker_ref = resolve_image(config, &image)?;
 
     let output = Command::new(&config.docker_bin)
         .arg("run")
@@ -225,7 +263,7 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
             &format!("CAOS_COMPUTE_SERVER_URL={}", config.compute_server_url),
         ])
         .args(["--entrypoint", CAOS_BIN])
-        .arg(&image)
+        .arg(&docker_ref)
         .arg("entrypoint")
         .arg(format!("--args={args}"))
         .output()
@@ -263,6 +301,407 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     }
 
     Ok(format!("{hash}\n").into_bytes())
+}
+
+/// Disambiguates temp dirs created across handler threads.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve the `image` parameter to a reference the host docker daemon can run.
+///
+/// `docker://<ref>` is an ordinary docker reference, used as-is. Anything else is
+/// one of our git images (the default): convert it to a real image, push it to
+/// the registry, and return a digest reference into the registry.
+fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
+    if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
+        if reference.is_empty() || reference.starts_with('-') {
+            return Err(HttpError::new(
+                400,
+                format!("invalid docker image: {reference:?}"),
+            ));
+        }
+        return Ok(reference.to_string());
+    }
+    if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(HttpError::new(
+            400,
+            format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
+        ));
+    }
+    convert_git_image(config, image)
+        .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
+}
+
+/// A git tree entry, owned so it outlives the fetched object bytes.
+struct TreeEntry {
+    name: String,
+    mode: gix::objs::tree::EntryMode,
+    oid: gix::ObjectId,
+}
+
+/// Convert the git-docker image tree `git_hash` to a real image and push it to
+/// the registry, returning a digest reference. Cached in Redis by git hash.
+fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> {
+    let image_key = format!("caos:image:{git_hash}");
+    if let Ok(Some(manifest_digest)) = cache_get(&config.redis_addr, &image_key) {
+        eprintln!("image cache hit: {git_hash} -> {manifest_digest}");
+        return Ok(image_ref(config, &manifest_digest));
+    }
+
+    // The image tree holds `config.json` (a blob) and `layer<NN>` subtrees.
+    let mut config_oid: Option<String> = None;
+    let mut layers: Vec<(u64, String)> = Vec::new();
+    for entry in fetch_tree(config, git_hash)? {
+        if entry.name == "config.json" {
+            config_oid = Some(entry.oid.to_string());
+        } else if let Some(suffix) = entry.name.strip_prefix("layer") {
+            // layer<NN>: number it for ordering (matches config.rootfs.diff_ids).
+            if let Ok(num) = suffix.parse::<u64>() {
+                if !entry.mode.is_tree() {
+                    return Err(format!("layer entry {} is not a directory", entry.name));
+                }
+                layers.push((num, entry.oid.to_string()));
+            }
+        }
+    }
+    let config_oid = config_oid.ok_or("image tree has no config.json")?;
+    if layers.is_empty() {
+        return Err("image tree has no layer<NN> entries".to_string());
+    }
+    layers.sort_by_key(|(num, _)| *num);
+
+    // Each layer becomes an uncompressed tar; since it's uncompressed, the blob
+    // digest and the config's diff_id are the same sha256.
+    let mut layer_descs: Vec<(String, u64)> = Vec::new();
+    let mut diff_ids: Vec<String> = Vec::new();
+    for (_, oid) in &layers {
+        let (digest, size) = ensure_layer(config, oid)?;
+        diff_ids.push(digest.clone());
+        layer_descs.push((digest, size));
+    }
+
+    // Set the config's diff_ids to the layers we just built, so the image is
+    // self-consistent. We generate them outright — the stored config needn't
+    // carry diff_ids (the producer can't know them without tarring).
+    let config_bytes = fetch_blob(config, &config_oid)?;
+    let new_config = set_config_diff_ids(&config_bytes, &diff_ids)?;
+    let config_digest = format!("sha256:{}", sha256_hex(&new_config));
+    push_blob(config, &config_digest, &new_config)?;
+
+    let manifest = build_manifest(&config_digest, new_config.len() as u64, &layer_descs);
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).map_err(|e| format!("serializing manifest: {e}"))?;
+    let manifest_digest = format!("sha256:{}", sha256_hex(&manifest_bytes));
+    push_manifest(config, &manifest_digest, &manifest_bytes)?;
+
+    let _ = cache_set(&config.redis_addr, &image_key, &manifest_digest);
+    eprintln!("converted image {git_hash} -> {manifest_digest}");
+    Ok(image_ref(config, &manifest_digest))
+}
+
+/// The digest reference the host daemon uses to pull the converted image.
+fn image_ref(config: &Config, manifest_digest: &str) -> String {
+    format!(
+        "{}/{REGISTRY_REPO}@{manifest_digest}",
+        config.registry_pull_host.trim_end_matches('/')
+    )
+}
+
+/// Build (if not cached) and push the layer whose git tree is `layer_oid`,
+/// returning its `(digest, size)`. The git-hash → digest+size mapping is cached
+/// in Redis so an unchanged layer is never re-tarred or re-pushed.
+fn ensure_layer(config: &Config, layer_oid: &str) -> Result<(String, u64), String> {
+    let key = format!("caos:layer:{layer_oid}");
+    if let Ok(Some(value)) = cache_get(&config.redis_addr, &key) {
+        if let Some((digest, size)) = value.split_once(' ') {
+            if let Ok(size) = size.parse::<u64>() {
+                eprintln!("layer cache hit: {layer_oid} -> {digest}");
+                return Ok((digest.to_string(), size));
+            }
+        }
+    }
+    let tar = build_layer_tar(config, layer_oid)?;
+    let digest = format!("sha256:{}", sha256_hex(&tar));
+    let size = tar.len() as u64;
+    push_blob(config, &digest, &tar)?;
+    let _ = cache_set(&config.redis_addr, &key, &format!("{digest} {size}"));
+    eprintln!("converted layer {layer_oid} -> {digest} ({size} bytes)");
+    Ok((digest, size))
+}
+
+/// Materialize a layer's git tree to a temp dir and tar it deterministically
+/// (GNU format handles the long /nix/store paths and symlinks; the flags zero out
+/// owners/mtimes and sort entries, so the output — hence its digest — is stable).
+fn build_layer_tar(config: &Config, tree_hash: &str) -> Result<Vec<u8>, String> {
+    let dir = temp_dir()?;
+    let result = (|| {
+        materialize_tree(config, &dir, tree_hash)?;
+        tar_dir(&dir)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// A fresh, unique temp directory.
+fn temp_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir().join("caos-convert");
+    std::fs::create_dir_all(&base).map_err(|e| format!("creating {}: {e}", base.display()))?;
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = base.join(format!("{}-{n}", std::process::id()));
+    std::fs::create_dir(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Write a git tree's contents into `dir`: files (with their exec bit), symlinks,
+/// and subdirectories, recursively. Modes are set explicitly so the tar is
+/// independent of the umask.
+fn materialize_tree(config: &Config, dir: &Path, tree_hash: &str) -> Result<(), String> {
+    use gix::objs::tree::EntryKind;
+    for entry in fetch_tree(config, tree_hash)? {
+        let path = dir.join(&entry.name);
+        match entry.mode.kind() {
+            EntryKind::Tree => {
+                std::fs::create_dir(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                set_mode(&path, 0o755)?;
+                materialize_tree(config, &path, &entry.oid.to_string())?;
+            }
+            EntryKind::Link => {
+                let target = fetch_blob(config, &entry.oid.to_string())?;
+                symlink(Path::new(std::ffi::OsStr::from_bytes(&target)), &path)
+                    .map_err(|e| format!("symlink {}: {e}", path.display()))?;
+            }
+            EntryKind::Blob | EntryKind::BlobExecutable => {
+                let content = fetch_blob(config, &entry.oid.to_string())?;
+                std::fs::write(&path, content).map_err(|e| format!("{}: {e}", path.display()))?;
+                let mode = if entry.mode.kind() == EntryKind::BlobExecutable {
+                    0o755
+                } else {
+                    0o644
+                };
+                set_mode(&path, mode)?;
+            }
+            EntryKind::Commit => {
+                return Err(format!("unexpected submodule entry: {}", entry.name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set a path's permission bits.
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+/// Tar `dir`'s contents reproducibly (GNU format, zeroed owners/mtimes, sorted).
+fn tar_dir(dir: &Path) -> Result<Vec<u8>, String> {
+    let output = Command::new("tar")
+        .args([
+            "--format=gnu",
+            "--numeric-owner",
+            "--owner=0",
+            "--group=0",
+            "--mtime=@0",
+            "--sort=name",
+        ])
+        .arg("-C")
+        .arg(dir)
+        .args(["-cf", "-", "."])
+        .output()
+        .map_err(|e| format!("running tar: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tar failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Set `rootfs.diff_ids` in the image config to `diff_ids` (in layer order),
+/// creating `rootfs` if absent — we generate these outright rather than reading
+/// any stored value, so the config needn't carry diff_ids (the producer can't
+/// know them without tarring). Everything else in the config passes through;
+/// other keys may be reordered by re-serialization, which is fine since we
+/// compute the config digest from the result.
+fn set_config_diff_ids(config_bytes: &[u8], diff_ids: &[String]) -> Result<Vec<u8>, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(config_bytes).map_err(|e| format!("parsing config.json: {e}"))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or("config.json is not a JSON object")?;
+    let rootfs = obj.entry("rootfs").or_insert_with(|| serde_json::json!({}));
+    let rootfs = rootfs
+        .as_object_mut()
+        .ok_or("config.json rootfs is not an object")?;
+    rootfs.insert(
+        "type".to_string(),
+        serde_json::Value::String("layers".to_string()),
+    );
+    rootfs.insert(
+        "diff_ids".to_string(),
+        serde_json::Value::Array(
+            diff_ids
+                .iter()
+                .map(|d| serde_json::Value::String(d.clone()))
+                .collect(),
+        ),
+    );
+    serde_json::to_vec(&value).map_err(|e| format!("serializing config.json: {e}"))
+}
+
+/// Build the OCI image manifest referencing the config and layer blobs.
+fn build_manifest(
+    config_digest: &str,
+    config_size: u64,
+    layers: &[(String, u64)],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_size,
+        },
+        "layers": layers.iter().map(|(digest, size)| serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": digest,
+            "size": size,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Fetch and parse a git tree from the object server.
+fn fetch_tree(config: &Config, hash: &str) -> Result<Vec<TreeEntry>, String> {
+    let (kind, content) = fetch_object(config, hash)?;
+    if kind != "tree" {
+        return Err(format!("expected tree, got {kind} for {hash}"));
+    }
+    let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+        .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+    Ok(tree
+        .entries
+        .iter()
+        .map(|e| TreeEntry {
+            name: String::from_utf8_lossy(e.filename).into_owned(),
+            mode: e.mode,
+            oid: e.oid.to_owned(),
+        })
+        .collect())
+}
+
+/// Fetch a git blob's bytes from the object server.
+fn fetch_blob(config: &Config, hash: &str) -> Result<Vec<u8>, String> {
+    let (kind, content) = fetch_object(config, hash)?;
+    if kind != "blob" {
+        return Err(format!("expected blob, got {kind} for {hash}"));
+    }
+    Ok(content)
+}
+
+/// Fetch a git object from the object server, returning its `(type, content)`.
+fn fetch_object(config: &Config, hash: &str) -> Result<(String, Vec<u8>), String> {
+    let url = format!(
+        "{}/object/{hash}",
+        config.object_server_url.trim_end_matches('/')
+    );
+    let response = minreq::get(&url)
+        .send()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "GET {url}: server returned {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let bytes = response.into_bytes();
+    let nul = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or("object response missing NUL after header")?;
+    let header =
+        std::str::from_utf8(&bytes[..nul]).map_err(|e| format!("bad object header: {e}"))?;
+    let (kind, size) = header
+        .split_once(' ')
+        .ok_or("bad object header: expected '<type> <size>'")?;
+    let content = bytes[nul + 1..].to_vec();
+    let size: usize = size.parse().map_err(|e| format!("bad object size: {e}"))?;
+    if size != content.len() {
+        return Err(format!(
+            "object size {size} != content length {}",
+            content.len()
+        ));
+    }
+    Ok((kind.to_string(), content))
+}
+
+/// Upload a blob to the registry (monolithic two-step: start, then PUT bytes).
+fn push_blob(config: &Config, digest: &str, data: &[u8]) -> Result<(), String> {
+    let base = config.registry_push_url.trim_end_matches('/');
+    let start = format!("{base}/v2/{REGISTRY_REPO}/blobs/uploads/");
+    let response = minreq::post(&start)
+        .send()
+        .map_err(|e| format!("POST {start}: {e}"))?;
+    if response.status_code != 202 {
+        return Err(format!(
+            "starting blob upload: {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let location = response
+        .headers
+        .get("location")
+        .ok_or("blob upload response missing Location")?
+        .clone();
+    let upload = if location.starts_with("http://") || location.starts_with("https://") {
+        location
+    } else {
+        format!("{base}{location}")
+    };
+    let sep = if upload.contains('?') { '&' } else { '?' };
+    let put = format!("{upload}{sep}digest={digest}");
+    let response = minreq::put(&put)
+        .with_header("Content-Type", "application/octet-stream")
+        .with_body(data.to_vec())
+        .send()
+        .map_err(|e| format!("PUT {put}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "uploading blob {digest}: {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    Ok(())
+}
+
+/// Upload a manifest to the registry, addressed by its digest.
+fn push_manifest(config: &Config, digest: &str, data: &[u8]) -> Result<(), String> {
+    let base = config.registry_push_url.trim_end_matches('/');
+    let url = format!("{base}/v2/{REGISTRY_REPO}/manifests/{digest}");
+    let response = minreq::put(&url)
+        .with_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .with_body(data.to_vec())
+        .send()
+        .map_err(|e| format!("PUT {url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "uploading manifest {digest}: {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    Ok(())
+}
+
+/// Hex sha256 of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// `GET key` from Redis, returning the value or None if the key is absent.

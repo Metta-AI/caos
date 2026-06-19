@@ -298,7 +298,8 @@
           ];
           Env = [
             "PATH=/bin"
-            "CAOS_FOLD_IMAGE=caos-worker-fold:latest"
+            # caos run defaults to git images, so name the docker image explicitly.
+            "CAOS_FOLD_IMAGE=docker://caos-worker-fold:latest"
           ];
         };
         workerFoldImage = pkgs.dockerTools.buildImage {
@@ -367,12 +368,15 @@
 
         # compute-server runs worker containers by shelling out to the `docker`
         # CLI, so — unlike the minimal images — it bundles the docker client and
-        # expects the host's docker socket bind-mounted at /var/run/docker.sock:
+        # expects the host's docker socket bind-mounted at /var/run/docker.sock.
+        # It also shells out to GNU `tar` to build layer tarballs when converting
+        # a git image, so it bundles that too:
         #   docker run --rm --network caos-net -p 9090:80 \
         #     -v /var/run/docker.sock:/var/run/docker.sock caos-compute-server
         computeServerContents = [
           compute-server
           pkgs.docker-client
+          pkgs.gnutar
         ];
         computeServerConfig = {
           Cmd = [ "/bin/compute-server" ];

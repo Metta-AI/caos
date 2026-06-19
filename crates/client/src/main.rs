@@ -12,7 +12,9 @@
 //!   blob's content, or the empty directory with the tree's entries.
 //! * `run <image> <output> -- [--name=value ...]` — assemble the args into a git
 //!   tree, ask the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
-//!   over it, and materialize the returned result hash at `<output>`.
+//!   over it, and materialize the returned result hash at `<output>`. `<image>`
+//!   is either a CAS path — a git image, resolved to the git hash recorded on it
+//!   — or `docker://<ref>` for an ordinary docker image.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
 //! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
@@ -399,16 +401,48 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     let target = validate_target(&cas, output)?;
     probe_xattr(&cas)?;
 
+    // Resolve the image: a CAS path becomes the git hash recorded on it, so the
+    // compute server converts it from our git-docker form; a `docker://` ref or a
+    // bare hash is sent through unchanged.
+    let image = resolve_run_image(&cas, image)?;
+
     // Build the args tree in the object store only — nothing is written under
     // /cas. The worker materializes it inside its own container.
     let args_tree = build_args_tree(&base, &cas, kvs)?;
 
     // Hand the image and args-tree hash to the compute server; it runs the
     // container and returns the hash of the result (its /cas/out).
-    let result = request_compute(&compute, image, &args_tree.to_string())?;
+    let result = request_compute(&compute, &image, &args_tree.to_string())?;
 
     // Materialize that result at the requested output path.
     fetch_and_materialize(&base, &target, &result)
+}
+
+/// Resolve the `<image>` argument of `caos run` into what the compute server
+/// expects. A git image is given as a path inside the CAS, which resolves to the
+/// git hash recorded on it; a `docker://<ref>` value is an ordinary docker image
+/// and passes through unchanged. Anything else is rejected.
+fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
+    if image.starts_with("docker://") {
+        return Ok(image.to_string());
+    }
+    // A path inside the CAS: reference whatever git object it was made from.
+    if Path::new(image).starts_with(cas) {
+        let canon = Path::new(image)
+            .canonicalize()
+            .map_err(|e| format!("{image}: {e}"))?;
+        let cas_real = cas
+            .canonicalize()
+            .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+        if !canon.starts_with(&cas_real) {
+            return Err(format!("{image} resolves outside {}", cas.display()));
+        }
+        return read_hash(&canon);
+    }
+    Err(format!(
+        "image must be a path under {} (a git image) or docker://<ref>, got: {image}",
+        cas.display()
+    ))
 }
 
 /// Build the args git tree from `--name=value` pairs and store it (plus any
