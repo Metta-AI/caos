@@ -92,13 +92,13 @@ local_resource(
 daemon(
     'caos-object-server',
     ['crates/object-server'],
-    ['-p 8080:8080', '-v "%s:/git"' % GIT_REPO],
+    ['-p 8080:80', '-v "%s:/git"' % GIT_REPO],
 )
 daemon(
     'caos-compute-server',
     ['crates/compute-server'],
     [
-        '-p 9090:9090',
+        '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
         '-v /var/run/docker.sock:/var/run/docker.sock',
     ],

@@ -33,10 +33,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
-/// Base URL of the object server, e.g. `http://caos-object-server:8080`.
+/// Base URL of the object server, e.g. `http://caos-object-server`.
 const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
 
-/// Base URL of the compute server, e.g. `http://caos-compute-server:9090`.
+/// Base URL of the compute server, e.g. `http://caos-compute-server`.
 const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
 
 /// The program `entrypoint` always runs. Images that build off the

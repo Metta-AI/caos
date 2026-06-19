@@ -39,7 +39,7 @@ use std::time::Duration;
 use tiny_http::{Method, Request, Response, Server};
 
 /// Listen address; overridable for local runs outside the container.
-const DEFAULT_ADDR: &str = "0.0.0.0:9090";
+const DEFAULT_ADDR: &str = "0.0.0.0:80";
 
 /// Docker network the worker container joins, so the object server resolves by
 /// name. Override with `CAOS_DOCKER_NETWORK`.
@@ -47,13 +47,13 @@ const DEFAULT_NETWORK: &str = "caos-net";
 
 /// Object-server URL passed into the worker container. Override with
 /// `CAOS_OBJECT_SERVER_URL`.
-const DEFAULT_OBJECT_SERVER_URL: &str = "http://caos-object-server:8080";
+const DEFAULT_OBJECT_SERVER_URL: &str = "http://caos-object-server";
 
 /// Compute-server URL passed into the worker container, so a worker that calls
 /// `caos run` (e.g. the fold worker, which recurses) can reach us. This is our
 /// own address as seen from inside the Docker network. Override with
 /// `CAOS_COMPUTE_SERVER_URL`.
-const DEFAULT_COMPUTE_SERVER_URL: &str = "http://caos-compute-server:9090";
+const DEFAULT_COMPUTE_SERVER_URL: &str = "http://caos-compute-server";
 
 /// `docker` binary to invoke. Override with `CAOS_DOCKER_BIN`.
 const DEFAULT_DOCKER_BIN: &str = "docker";

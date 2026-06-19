@@ -127,7 +127,7 @@ endpoints:
 Run the image with the repo bind-mounted at `/git`:
 
 ```bash
-docker run --rm -p 8080:8080 \
+docker run --rm -p 8080:80 \
   -v /path/to/repo:/git \
   caos-object-server:latest
 ```
@@ -144,7 +144,7 @@ printf 'blob 6\0hello\n' | curl -s --data-binary @- \
 curl -s "http://localhost:8080/object/<hash>"
 ```
 
-The listen address (`OBJECT_SERVER_ADDR`, default `0.0.0.0:8080`) and repo path
+The listen address (`OBJECT_SERVER_ADDR`, default `0.0.0.0:80`) and repo path
 (`OBJECT_SERVER_GIT_DIR`, default `/git`) are overridable via environment
 variables — handy for running outside a container.
 
@@ -231,7 +231,7 @@ entrypoint, so to make a compute image you build one that adds a `/worker`:
 
 ```bash
 docker run --rm \
-  -e CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080 \
+  -e CAOS_OBJECT_SERVER_URL=http://caos-object-server \
   your-worker-image:latest \
   --args=<args-tree-hash>       # /worker must leave its result at /cas/out
 ```
@@ -294,18 +294,18 @@ The worker containers it spawns join `<net>` so they resolve the daemons by
 name:
 
 ```bash
-docker run --rm -p 9090:9090 \
+docker run --rm -p 9090:80 \
   --network caos-net \
   -v /var/run/docker.sock:/var/run/docker.sock \
   caos-compute-server:latest
 ```
 
-Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:9090`),
+Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:80`),
 `CAOS_DOCKER_NETWORK` (default `caos-net`), `CAOS_OBJECT_SERVER_URL` (default
-`http://caos-object-server:8080`, passed into each worker), `CAOS_COMPUTE_SERVER_URL`
-(default `http://caos-compute-server:9090`, our own address passed into each
-worker so it can call back), `CAOS_DOCKER_BIN` (default `docker`), and
-`CAOS_REDIS_ADDR` (default `caos-redis:6379`).
+`http://caos-object-server`, passed into each worker), `CAOS_COMPUTE_SERVER_URL`
+(default `http://caos-compute-server`, our own address passed into each worker so
+it can call back), `CAOS_DOCKER_BIN` (default `docker`), and `CAOS_REDIS_ADDR`
+(default `caos-redis:6379`).
 
 ### Caching
 

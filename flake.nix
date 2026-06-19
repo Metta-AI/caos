@@ -116,7 +116,7 @@
         };
 
         # Run with the git repo bind-mounted at /git, e.g.
-        #   docker run --rm -p 8080:8080 -v /path/to/repo:/git caos-object-server
+        #   docker run --rm -p 8080:80 -v /path/to/repo:/git caos-object-server
         objectServerImage = pkgs.dockerTools.buildImage {
           name = "caos-object-server";
           tag = "latest";
@@ -124,7 +124,7 @@
           config = {
             Cmd = [ "/bin/object-server" ];
             ExposedPorts = {
-              "8080/tcp" = { };
+              "80/tcp" = { };
             };
           };
         };
@@ -368,7 +368,7 @@
         # compute-server runs worker containers by shelling out to the `docker`
         # CLI, so — unlike the minimal images — it bundles the docker client and
         # expects the host's docker socket bind-mounted at /var/run/docker.sock:
-        #   docker run --rm --network caos-net -p 9090:9090 \
+        #   docker run --rm --network caos-net -p 9090:80 \
         #     -v /var/run/docker.sock:/var/run/docker.sock caos-compute-server
         computeServerContents = [
           compute-server
@@ -378,7 +378,7 @@
           Cmd = [ "/bin/compute-server" ];
           Env = [ "PATH=/bin" ];
           ExposedPorts = {
-            "9090/tcp" = { };
+            "80/tcp" = { };
           };
         };
         computeServerImage = pkgs.dockerTools.buildImage {
@@ -418,7 +418,7 @@
           config = {
             Cmd = [ "/bin/object-server" ];
             ExposedPorts = {
-              "8080/tcp" = { };
+              "80/tcp" = { };
             };
           };
         };

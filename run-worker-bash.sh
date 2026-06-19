@@ -7,8 +7,8 @@
 set -euo pipefail
 
 NET="${CAOS_DOCKER_NETWORK:-caos-net}"
-OBJECT_URL="${CAOS_OBJECT_SERVER_URL:-http://caos-object-server:8080}"
-COMPUTE_URL="${CAOS_COMPUTE_SERVER_URL:-http://caos-compute-server:9090}"
+OBJECT_URL="${CAOS_OBJECT_SERVER_URL:-http://caos-object-server}"
+COMPUTE_URL="${CAOS_COMPUTE_SERVER_URL:-http://caos-compute-server}"
 
 exec docker run --rm -it \
   --network "$NET" \

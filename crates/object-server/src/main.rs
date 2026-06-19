@@ -17,7 +17,7 @@ use tiny_http::{Method, Request, Response, Server};
 const GIT_DIR: &str = "/git";
 
 /// Listen address; overridable for local runs outside the container.
-const DEFAULT_ADDR: &str = "0.0.0.0:8080";
+const DEFAULT_ADDR: &str = "0.0.0.0:80";
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
 /// in a container, where the daemon is PID 1: the kernel applies no default
