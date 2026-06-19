@@ -71,6 +71,8 @@ nix build .#caos-worker-base-docker         # image tarball at ./result
 nix build .#caos-object-server-docker
 nix build .#caos-compute-server-docker
 nix build .#caos-worker-hello-docker
+nix build .#caos-worker-fold-docker
+nix build .#caos-worker-file-count-docker
 
 docker load < result                   # loads e.g. caos-object-server:latest
 ```
@@ -83,6 +85,8 @@ nix run .#load-caos-worker-base
 nix run .#load-caos-object-server
 nix run .#load-caos-compute-server
 nix run .#load-caos-worker-hello
+nix run .#load-caos-worker-fold
+nix run .#load-caos-worker-file-count
 ```
 
 The `caos-worker-base` and `caos-object-server` images contain **only** their static
@@ -254,7 +258,12 @@ outside a container.
 ## compute-server
 
 An HTTP daemon (`crates/compute-server`) that runs one containerized compute step
-per request. One endpoint:
+per request. It serves requests **concurrently — one thread per request** —
+which is required, not just an optimization: a worker can call back into the
+compute server (the fold worker recurses via `caos run`), and that nested request
+must be served while the parent's request is still blocked waiting on the `docker
+run` it spawned. A serial loop, or any thread pool shallower than the deepest
+tree, would deadlock. One endpoint:
 
 | Request | Behaviour |
 |---|---|
@@ -319,6 +328,66 @@ caos get /cas/out/greeting && cat /cas/out/greeting   # => hi
 
 (The debugging `caos-worker-bash` image's `/worker` is just `bash`, which doesn't
 write `/cas/out` — handy for poking around, not a real worker.)
+
+#### A recursive worker: `caos-worker-fold`
+
+The **`caos-worker-fold`** image (`.#caos-worker-fold-docker`,
+`.#load-caos-worker-fold`) is a worker whose `/worker` itself calls `caos run` —
+both to invoke another image and to recurse into itself. It's a *fold*
+(catamorphism) over a CAS tree, taking two args:
+
+- `func` — the worker image to apply (the "algebra");
+- `in` — the file or tree to fold over.
+
+Given a **file**, it runs `func` on it. Given a **tree**, it folds each child
+with itself (the same `func`), assembles the results into a tree with the
+original child names, then runs `func` on that tree. Like every worker, the
+applied image takes its single input as `--in`, and the final tree is left at
+`/cas/out`:
+
+```bash
+caos put /some/tree /cas/in
+caos run caos-worker-fold:latest /cas/out -- \
+  --func=caos-worker-hello:latest --in=/cas/in
+```
+
+Because it drives the compute server itself, the image relies on
+`CAOS_COMPUTE_SERVER_URL` (baked in via `workerEnv` in `flake.nix`) and learns
+its own name, for the recursive call, from `CAOS_FOLD_IMAGE`. Each sub-fold is a
+normal compute step, so identical subtrees are memoized by the Redis cache.
+
+> `caos run` needs `CAOS_COMPUTE_SERVER_URL`, but the compute server currently
+> injects only `CAOS_OBJECT_SERVER_URL` into the workers it spawns — so for now
+> both URLs are baked into the worker images (see the `TODO` on `workerEnv` in
+> `flake.nix`). The fix is to have the compute server pass the compute-server URL
+> into child workers too.
+
+#### A fold algebra: `caos-worker-file-count`
+
+The **`caos-worker-file-count`** image (`.#caos-worker-file-count-docker`,
+`.#load-caos-worker-file-count`) is a small leaf worker meant to be driven by
+`caos-worker-fold`. Its single input arrives as `--in`:
+
+- a **file** counts as `1`;
+- a **directory** (assumed to hold only files, each containing a number — the
+  per-child counts `fold` assembles) returns their **sum**.
+
+The result, a blob holding the count, is left at `/cas/out`. On its own:
+
+```bash
+printf hi > /tmp/f && caos put /tmp/f /cas/f
+caos run caos-worker-file-count:latest /cas/n -- --in=/cas/f
+caos get /cas/n && cat /cas/n        # => 1
+```
+
+Composed under `fold`, it counts every leaf file in a tree:
+
+```bash
+caos put /some/tree /cas/in
+caos run caos-worker-fold:latest /cas/out -- \
+  --func=caos-worker-file-count:latest --in=/cas/in
+caos get /cas/out && cat /cas/out    # => number of files in the tree
+```
 
 ## Local testing
 

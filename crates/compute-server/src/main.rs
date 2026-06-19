@@ -30,6 +30,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tiny_http::{Method, Request, Response, Server};
@@ -92,12 +93,13 @@ fn main() {
     install_termination_handlers();
 
     let addr = std::env::var("COMPUTE_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let config = Config {
+    // Shared read-only across handler threads (one per request, see below).
+    let config = Arc::new(Config {
         network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
         object_server_url: env_or("CAOS_OBJECT_SERVER_URL", DEFAULT_OBJECT_SERVER_URL),
         docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
-    };
+    });
 
     let server = match Server::http(addr.as_str()) {
         Ok(server) => server,
@@ -111,11 +113,20 @@ fn main() {
         config.network, config.object_server_url, config.redis_addr
     );
 
+    // One thread per request, not a serial loop: a worker can itself call back
+    // into us (the fold worker recurses via `caos run`), and that nested request
+    // must be served while its parent's request is still blocked waiting on the
+    // `docker run` it spawned. A serial loop — or any pool smaller than the tree
+    // is deep — would deadlock. Threads are cheap here: each just blocks in
+    // `docker run`'s `waitpid`.
     for request in server.incoming_requests() {
-        if let Err(err) = handle(&config, request) {
-            // Only reachable if writing the response itself fails.
-            eprintln!("failed to send response: {err}");
-        }
+        let config = Arc::clone(&config);
+        std::thread::spawn(move || {
+            if let Err(err) = handle(&config, request) {
+                // Only reachable if writing the response itself fails.
+                eprintln!("failed to send response: {err}");
+            }
+        });
     }
 }
 

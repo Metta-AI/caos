@@ -97,6 +97,19 @@
           mkdir -p $out/bin
           cp ${client}/bin/client $out/bin/caos
         '';
+        # Defaults pointing a worker at both daemons by their docker-network
+        # names. Every worker needs the object server; ones that themselves call
+        # `caos run` (e.g. the fold worker, which recurses) also need the compute
+        # server.
+        #
+        # TODO: the compute server should inject *both* of these URLs into the
+        # worker containers it spawns (today it injects only CAOS_OBJECT_SERVER_URL),
+        # so workers don't each have to bake them in — at which point workerEnv
+        # can go away entirely. Baked into the images here for now.
+        workerEnv = [
+          "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
+          "CAOS_COMPUTE_SERVER_URL=http://caos-compute-server:9090"
+        ];
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
         # print the hash of /cas/out.
         workerBaseConfig = {
@@ -104,7 +117,7 @@
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [ "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080" ];
+          Env = workerEnv;
         };
         workerBaseImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-base";
@@ -151,13 +164,9 @@
         ];
         workerBashConfig = {
           Cmd = [ "/bin/bash" ];
-          Env = [
-            "PATH=/bin"
-            # Convenience defaults for the usual docker-compose service names;
-            # override with `-e CAOS_OBJECT_SERVER_URL=...` / `-e CAOS_COMPUTE_SERVER_URL=...`.
-            "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
-            "CAOS_COMPUTE_SERVER_URL=http://caos-compute-server:9090"
-          ];
+          # Same daemon URLs as every other worker (see workerEnv); override with
+          # `-e CAOS_OBJECT_SERVER_URL=...` / `-e CAOS_COMPUTE_SERVER_URL=...`.
+          Env = [ "PATH=/bin" ] ++ workerEnv;
         };
         workerBashImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-bash";
@@ -208,16 +217,151 @@
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [
-            "PATH=/bin"
-            "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
-          ];
+          Env = [ "PATH=/bin" ] ++ workerEnv;
         };
         workerHelloImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-hello";
           tag = "latest";
           copyToRoot = workerHelloContents;
           config = workerHelloConfig;
+        };
+
+        # A recursive "fold" worker — a catamorphism over a CAS tree. Two args:
+        #   func — the worker image to apply (the "algebra"), a literal value
+        #   in   — the file or tree to fold over, a CAS path
+        # Given a file it runs `func` on it. Given a tree it folds each child
+        # with itself (the same func), assembles the results into a tree with
+        # the original child names, then runs `func` on that tree. Like every
+        # worker, the applied image takes its single input as `--in`; the result
+        # is left at /cas/out. Unlike the other workers it drives the compute
+        # server via `caos run` — both to apply `func` and to recurse — so it
+        # relies on CAOS_COMPUTE_SERVER_URL (in workerEnv) and learns its own
+        # image name, for the recursive call, from CAOS_FOLD_IMAGE.
+        workerFoldScript = pkgs.writeTextFile {
+          name = "caos-worker-fold-script";
+          executable = true;
+          destination = "/worker";
+          text = ''
+            #!/bin/bash
+            set -euo pipefail
+
+            fold_image=''${CAOS_FOLD_IMAGE:-caos-worker-fold:latest}
+
+            # The function to apply is a blob arg: expand the placeholder and read it.
+            caos get /cas/args/func
+            func=$(cat /cas/args/func)
+
+            if [ -d /cas/args/in ]; then
+              echo "fold: input is a tree; folding its children with $func" >&2
+
+              # Expand the tree one level: a placeholder per child.
+              caos get /cas/args/in
+
+              work=/tmp/folded
+              rm -rf "$work"
+              mkdir -p "$work"
+
+              i=0
+              for child in /cas/args/in/*; do
+                [ -e "$child" ] || continue   # empty tree: the glob stays literal
+                name=$(basename "$child")
+                # Fold this child with the same function; its result lands at /cas/c<i>.
+                caos run "$fold_image" "/cas/c$i" -- \
+                  --func="$func" --in="$child"
+                # Symlink into the CAS so `caos put` reuses the result's recorded
+                # hash (no content re-read) under the child's original name.
+                ln -s "/cas/c$i" "$work/$name"
+                echo "  folded $name -> /cas/c$i" >&2
+                i=$((i + 1))
+              done
+
+              # Assemble the folded children into a tree, then apply the function.
+              caos put "$work" /cas/folded
+              caos run "$func" /cas/out -- --in=/cas/folded
+            else
+              echo "fold: input is a file; applying $func" >&2
+              caos run "$func" /cas/out -- --in=/cas/args/in
+            fi
+          '';
+        };
+        workerFoldContents = [
+          workerBaseRoot
+          workerFoldScript
+          pkgs.bashInteractive
+          pkgs.coreutils
+        ];
+        workerFoldConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [
+            "PATH=/bin"
+            "CAOS_FOLD_IMAGE=caos-worker-fold:latest"
+          ] ++ workerEnv;
+        };
+        workerFoldImage = pkgs.dockerTools.buildImage {
+          name = "caos-worker-fold";
+          tag = "latest";
+          copyToRoot = workerFoldContents;
+          config = workerFoldConfig;
+        };
+
+        # A "file-count" worker: a leaf algebra meant to be driven by the fold
+        # worker. Its single input arrives as `--in`. A file counts as 1; a
+        # directory (assumed to hold only files, each containing a number — e.g.
+        # the per-child counts fold assembles) returns their sum. The result, a
+        # blob holding the count, is left at /cas/out. So folding a tree with
+        # this image totals the leaf files. It only touches the object server
+        # (no `caos run`), though it carries the shared workerEnv like the others.
+        workerFileCountScript = pkgs.writeTextFile {
+          name = "caos-worker-file-count-script";
+          executable = true;
+          destination = "/worker";
+          text = ''
+            #!/bin/bash
+            set -euo pipefail
+
+            if [ -d /cas/args/in ]; then
+              echo "file-count: summing child counts" >&2
+              # Expand the directory one level: a placeholder per child file.
+              caos get /cas/args/in
+              total=0
+              for child in /cas/args/in/*; do
+                [ -e "$child" ] || continue   # empty directory: glob stays literal
+                caos get "$child"             # expand the placeholder to its bytes
+                total=$((total + $(cat "$child")))
+              done
+            else
+              echo "file-count: a file counts as 1" >&2
+              total=1
+            fi
+
+            # These minimal images ship no /tmp; create it before writing there.
+            mkdir -p /tmp
+            out=/tmp/count
+            printf '%s\n' "$total" > "$out"
+            caos put "$out" /cas/out
+          '';
+        };
+        workerFileCountContents = [
+          workerBaseRoot
+          workerFileCountScript
+          pkgs.bashInteractive
+          pkgs.coreutils
+        ];
+        workerFileCountConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [ "PATH=/bin" ] ++ workerEnv;
+        };
+        workerFileCountImage = pkgs.dockerTools.buildImage {
+          name = "caos-worker-file-count";
+          tag = "latest";
+          copyToRoot = workerFileCountContents;
+          config = workerFileCountConfig;
         };
 
         # compute-server runs worker containers by shelling out to the `docker`
@@ -292,6 +436,16 @@
           contents = workerHelloContents;
           config = workerHelloConfig;
         };
+        loadWorkerFold = loadImage {
+          name = "caos-worker-fold";
+          contents = workerFoldContents;
+          config = workerFoldConfig;
+        };
+        loadWorkerFileCount = loadImage {
+          name = "caos-worker-file-count";
+          contents = workerFileCountContents;
+          config = workerFileCountConfig;
+        };
       in
       {
         packages = {
@@ -304,6 +458,8 @@
           caos-worker-bash-docker = workerBashImage;
           caos-compute-server-docker = computeServerImage;
           caos-worker-hello-docker = workerHelloImage;
+          caos-worker-fold-docker = workerFoldImage;
+          caos-worker-file-count-docker = workerFileCountImage;
         };
 
         apps = {
@@ -327,6 +483,14 @@
           load-caos-worker-hello = {
             type = "app";
             program = "${loadWorkerHello}/bin/load-caos-worker-hello";
+          };
+          load-caos-worker-fold = {
+            type = "app";
+            program = "${loadWorkerFold}/bin/load-caos-worker-fold";
+          };
+          load-caos-worker-file-count = {
+            type = "app";
+            program = "${loadWorkerFileCount}/bin/load-caos-worker-file-count";
           };
         };
 
