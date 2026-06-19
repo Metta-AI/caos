@@ -10,6 +10,10 @@
 //! * `get <path>` — expand an existing placeholder anywhere under `/cas`: read
 //!   its recorded hash, fetch that object, and replace the empty file with the
 //!   blob's content, or the empty directory with the tree's entries.
+//! * `import-image <docker-archive> <cas-path>` — store a docker-archive image
+//!   (e.g. `nix build .#caos-worker-hello-docker`) into the CAS in git-docker
+//!   form (a tree of `config.json` + `layer<NN>` subtrees), so it can be run with
+//!   `run <cas-path>`.
 //! * `run <image> <output> -- [--name=value ...]` — assemble the args into a git
 //!   tree, ask the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
 //!   over it, and materialize the returned result hash at `<output>`. `<image>`
@@ -24,7 +28,7 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
@@ -83,6 +87,10 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(src), Some(dst), None) => put(src, dst),
             _ => Err(usage(args)),
         },
+        Some("import-image") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(archive), Some(dst), None) => import_image(archive, dst),
+            _ => Err(usage(args)),
+        },
         // `run <image> <output> -- [--name=value ...]`. The `--` separates the
         // fixed arguments from the (possibly empty) list of key/value args.
         Some("run") => match &args[2..] {
@@ -117,6 +125,7 @@ fn usage(args: &[String]) -> String {
     format!(
         "usage:\n  {prog} get-hash <hash> <path>\n  {prog} get <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
+         {prog} import-image <docker-archive> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
          {prog} entrypoint [--args=<hash>]"
     )
@@ -275,6 +284,128 @@ fn put(src: &str, dst: &str) -> Result<(), String> {
 
     let (_, oid) = store(&base, &cas_real, Path::new(src))?;
     fetch_and_materialize(&base, &target, &oid.to_string())
+}
+
+/// `import-image <docker-archive> <cas-path>` — store a docker-archive image (the
+/// kind `nix build .#caos-*-docker` / `docker save` produce) into the CAS in
+/// git-docker form: a tree holding `config.json` (the image config, verbatim) and
+/// one `layer<NN>` subtree per layer (the layer tar's extracted filesystem),
+/// materialized at `<cas-path>`. `run <cas-path>` then has the compute server
+/// convert it back into a real image.
+///
+/// Only the layer *contents* are captured (files, the exec bit, and symlinks);
+/// mtimes/owners are dropped, which is fine — the compute server re-tars the trees
+/// deterministically and generates the diff_ids itself.
+fn import_image(archive: &str, dst: &str) -> Result<(), String> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let base = object_server_url()?;
+    let cas = cas_dir();
+    let target = validate_target(&cas, dst)?;
+    probe_xattr(&cas)?;
+    let cas_real = cas
+        .canonicalize()
+        .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+
+    let work = scratch_dir()?;
+    let outcome = (|| {
+        // Unpack the (possibly gzipped) outer archive into the scratch dir.
+        let bytes = maybe_gunzip(std::fs::read(archive).map_err(|e| format!("{archive}: {e}"))?)?;
+        unpack_tar(&bytes, &work)?;
+
+        // manifest.json names the config blob and the ordered layers.
+        let manifest_bytes = std::fs::read(work.join("manifest.json"))
+            .map_err(|e| format!("reading manifest.json from {archive}: {e}"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| format!("parsing manifest.json: {e}"))?;
+        let image = manifest.get(0).ok_or("manifest.json is empty")?;
+        let config_name = image
+            .get("Config")
+            .and_then(|v| v.as_str())
+            .ok_or("manifest.json: missing string Config")?;
+        let layers = image
+            .get("Layers")
+            .and_then(|v| v.as_array())
+            .ok_or("manifest.json: missing Layers array")?;
+
+        let mut entries: Vec<Entry> = Vec::new();
+
+        // config.json, stored verbatim.
+        let config_bytes = std::fs::read(work.join(config_name))
+            .map_err(|e| format!("reading {config_name}: {e}"))?;
+        entries.push(Entry {
+            mode: EntryKind::Blob.into(),
+            filename: "config.json".as_bytes().to_vec().into(),
+            oid: post_object(&base, "blob", &config_bytes)?,
+        });
+
+        // layer<NN>: one subtree per layer, in manifest order.
+        for (i, layer) in layers.iter().enumerate() {
+            let layer_path = layer
+                .as_str()
+                .ok_or("manifest.json: Layers entry is not a string")?;
+            let layer_bytes = maybe_gunzip(
+                std::fs::read(work.join(layer_path))
+                    .map_err(|e| format!("reading {layer_path}: {e}"))?,
+            )?;
+            let layer_dir = work.join(format!("extract-layer{i:02}"));
+            std::fs::create_dir(&layer_dir).map_err(|e| format!("{}: {e}", layer_dir.display()))?;
+            unpack_tar(&layer_bytes, &layer_dir)?;
+            let (_, oid) = store(&base, &cas_real, &layer_dir)?;
+            entries.push(Entry {
+                mode: EntryKind::Tree.into(),
+                filename: format!("layer{i:02}").into_bytes().into(),
+                oid,
+            });
+            eprintln!("imported layer{i:02} from {layer_path}");
+        }
+
+        let image_oid = post_tree(&base, entries)?;
+        fetch_and_materialize(&base, &target, &image_oid.to_string())
+    })();
+
+    let _ = std::fs::remove_dir_all(&work);
+    outcome
+}
+
+/// Decompress `bytes` if it's gzip (magic `1f 8b`); otherwise return it as-is.
+/// Image archives are gzipped; the layer tars inside usually aren't.
+fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut out)
+            .map_err(|e| format!("gunzip: {e}"))?;
+        Ok(out)
+    } else {
+        Ok(bytes)
+    }
+}
+
+/// Unpack a tar archive into `dir`, preserving permissions so the exec bit on
+/// layer files survives into the git tree.
+fn unpack_tar(bytes: &[u8], dir: &Path) -> Result<(), String> {
+    let mut archive = tar::Archive::new(bytes);
+    archive.set_preserve_permissions(true);
+    archive
+        .unpack(dir)
+        .map_err(|e| format!("unpacking tar into {}: {e}", dir.display()))
+}
+
+/// A fresh, unique scratch directory under the system temp dir (no xattrs needed
+/// — only the final CAS path is tagged).
+fn scratch_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir().join("caos-import");
+    std::fs::create_dir_all(&base).map_err(|e| format!("creating {}: {e}", base.display()))?;
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = base.join(format!("{pid}.{nanos}.{seq}"));
+    std::fs::create_dir(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Recursively store `path` in the object server, returning the git tree entry

@@ -19,3 +19,9 @@ minreq = { version = "2", default-features = false }
 # Read/write extended attributes: each materialized path is tagged with the git
 # hash it came from (`user.caos.hash`).
 xattr = "1"
+# `import-image` only: read a docker-archive image tarball — unpack it (tar),
+# gunzip it (flate2, pure-Rust backend to stay static), and parse its
+# manifest.json/config (serde_json).
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde_json = "1"
