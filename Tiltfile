@@ -12,6 +12,11 @@ NET = 'caos-net'
 # working directory the serve command happens to run in.
 GIT_REPO = os.path.abspath('.caos-dev/git')
 
+# Per-image marker files. Each image build bumps its marker once the new image is
+# loaded; a daemon depends on its image's marker (see `daemon` below), so loading
+# a fresh image restarts the daemon onto it. Kept under the gitignored .caos-dev/.
+MARKERS = os.path.abspath('.caos-dev/markers')
+
 # Files that affect every image: the flake and the locked workspace.
 COMMON = [
     'flake.nix',
@@ -21,13 +26,14 @@ COMMON = [
     'rust-toolchain.toml',
 ]
 
-# Build an image with Nix and load it into the local engine. Tilt re-runs this
-# only when one of `deps` changes, so unchanged images are not rebuilt or
-# reloaded on every `tilt up` — that is what made dev-up.sh slow.
+# Build an image with Nix and load it into the local engine, then bump its marker
+# so any daemon running it restarts onto the fresh image. Tilt re-runs this only
+# when one of `deps` changes, so unchanged images are not rebuilt or reloaded on
+# every `tilt up` — that is what made dev-up.sh slow.
 def nix_image(res, app, srcs):
     local_resource(
         res,
-        cmd='nix run .#%s' % app,
+        cmd='nix run .#%s && mkdir -p %s && date +%%s%%N > %s/%s' % (app, MARKERS, MARKERS, res),
         deps=COMMON + srcs,
         labels=['images'],
     )
@@ -51,21 +57,26 @@ local_resource(
     # without a .git of its own.)
     cmd=' && '.join([
         'mkdir -p %s' % GIT_REPO,
+        'mkdir -p %s' % MARKERS,
         'git init -q %s' % GIT_REPO,
         '(docker network create %s >/dev/null 2>&1 || true)' % NET,
     ]),
     labels=['infra'],
 )
 
-# Run a daemon as a foreground container Tilt supervises. `deps` restart it when
-# its sources change; `resource_deps` order it after setup and its image build,
-# so a restart always picks up the freshly loaded image.
+# Run a daemon as a foreground container Tilt supervises. It depends on its
+# image's marker file, so rebuilding+reloading that image (which bumps the marker)
+# restarts the container onto the fresh image; `resource_deps` orders it after
+# setup and the image build. Depending on the marker rather than the crate sources
+# directly is deliberate: it restarts *after* the new image is loaded, not racing
+# the rebuild and coming up on the stale image.
 #
 # Teardown: the daemons install a SIGINT/SIGTERM handler (see their main.rs), so
 # `exec docker run` forwards Tilt's signal to the container and it exits promptly,
 # `--rm` cleaning it up. The leading `docker rm -f` reclaims any stale container
 # from a prior run that was hard-killed (SIGKILL) before it could exit.
-def daemon(name, srcs, run_args, extra_deps=[]):
+def daemon(name, run_args, extra_deps=[]):
+    img = 'img-' + name.replace('caos-', '')
     local_resource(
         name,
         serve_cmd=' '.join(
@@ -74,8 +85,8 @@ def daemon(name, srcs, run_args, extra_deps=[]):
             + run_args
             + ['%s:latest' % name]
         ),
-        deps=COMMON + srcs,
-        resource_deps=['setup', 'img-' + name.replace('caos-', '')] + extra_deps,
+        deps=['%s/%s' % (MARKERS, img)],
+        resource_deps=['setup', img] + extra_deps,
         labels=['daemons'],
     )
 
@@ -91,12 +102,10 @@ local_resource(
 
 daemon(
     'caos-object-server',
-    ['crates/object-server'],
     ['-p 8080:80', '-v "%s:/git"' % GIT_REPO],
 )
 daemon(
     'caos-compute-server',
-    ['crates/compute-server'],
     [
         '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
