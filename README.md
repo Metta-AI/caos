@@ -115,13 +115,21 @@ nix run .#load-caos-worker-bash
 The helper also accepts `--name=value` args, like `caos run`: a value that names
 an existing path (relative to your current directory) is stored from the
 filesystem and referenced by its git hash; anything else becomes a literal
-string. It assembles them into an args tree (via `caos build-args`) and starts
-the container with `--args=<hash>`, so they land under `/cas/args`:
+string. It assembles them into an args tree and starts the container with
+`--args=<hash>`, so they land under `/cas/args`:
 
 ```bash
 ./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/client
 # inside: caos get /cas/args/conf && cat /cas/args/conf
 ```
+
+When you're running against the default (Tilt) object server — which is backed by
+this repo's `.git` — the helper builds the tree with git plumbing directly in the
+repo: a **clean, tracked path reuses the hash git already has** (a single
+`git ls-tree`, no re-read or upload), so passing a large unchanged directory is
+effectively free; only dirty/untracked paths (and literal strings) are hashed in.
+It never touches HEAD, the index, or commits. Against any other object server it
+falls back to `caos build-args`, which uploads the content through that server.
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
 > remote or linux builder; the binaries and dev shell build fine natively.
