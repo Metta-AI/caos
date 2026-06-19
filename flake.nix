@@ -97,27 +97,16 @@
           mkdir -p $out/bin
           cp ${client}/bin/client $out/bin/caos
         '';
-        # Defaults pointing a worker at both daemons by their docker-network
-        # names. Every worker needs the object server; ones that themselves call
-        # `caos run` (e.g. the fold worker, which recurses) also need the compute
-        # server.
-        #
-        # TODO: the compute server should inject *both* of these URLs into the
-        # worker containers it spawns (today it injects only CAOS_OBJECT_SERVER_URL),
-        # so workers don't each have to bake them in — at which point workerEnv
-        # can go away entirely. Baked into the images here for now.
-        workerEnv = [
-          "CAOS_OBJECT_SERVER_URL=http://caos-object-server:8080"
-          "CAOS_COMPUTE_SERVER_URL=http://caos-compute-server:9090"
-        ];
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
-        # print the hash of /cas/out.
+        # print the hash of /cas/out. The object- and compute-server URLs a worker
+        # needs are injected at runtime — by the compute server for the containers
+        # it spawns, and by ./run-worker-bash.sh for the debug shell — so none are
+        # baked into the images.
         workerBaseConfig = {
           Entrypoint = [
             "/bin/caos"
             "entrypoint"
           ];
-          Env = workerEnv;
         };
         workerBaseImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-base";
@@ -141,32 +130,44 @@
         };
 
         # A testing image: caos-worker-base plus an ordinary interactive shell
-        # (bash + coreutils + curl) so you can poke at /cas and the object
-        # server by hand. Not minimal — for debugging, not production. It runs a
-        # plain shell (no entrypoint), so it ships a ready-made /cas to poke at.
-        casDir = pkgs.runCommand "caos-cas-dir" { } "mkdir -p $out/cas";
-        # The base caos-worker-base image bakes in no /worker; downstream images
-        # supply it. This debugging image's /worker is just bash, so running it
-        # through `caos entrypoint` (which always runs /worker) drops you in a
-        # shell. For a real worker that reads /cas/args and writes /cas/out, see
-        # the caos-worker-hello image below.
-        workerBashLink = pkgs.runCommand "caos-worker-bash-link" { } ''
-          mkdir -p $out
-          ln -s /bin/bash $out/worker
-        '';
+        # (bash + coreutils + curl) so you can poke at /cas and the object server
+        # by hand. Not minimal — for debugging, not production. Like the other
+        # workers it extends caos-worker-base and runs `caos entrypoint`, which
+        # sets up /cas and runs /worker; here /worker drops you into an interactive
+        # shell. Run it with ./run-worker-bash.sh, which wires up the daemon URLs.
+        workerBashScript = pkgs.writeTextFile {
+          name = "caos-worker-bash-script";
+          executable = true;
+          destination = "/worker";
+          text = ''
+            #!/bin/bash
+            # Interactive debugging shell. `caos entrypoint` runs us as /worker
+            # (with /cas already set up) and, on exit, reads the hash of /cas/out.
+            # Drop into a shell, then — if you didn't leave a result there — store
+            # an empty blob at /cas/out so exiting doesn't error.
+            bash
+            if [ ! -e /cas/out ]; then
+              mkdir -p /tmp
+              touch /tmp/caos-empty-out
+              caos put /tmp/caos-empty-out /cas/out
+            fi
+            exit 0
+          '';
+        };
         workerBashContents = [
           workerBaseRoot
-          casDir
-          workerBashLink
+          workerBashScript
           pkgs.bashInteractive
           pkgs.coreutils
           pkgs.curl
         ];
         workerBashConfig = {
-          Cmd = [ "/bin/bash" ];
-          # Same daemon URLs as every other worker (see workerEnv); override with
-          # `-e CAOS_OBJECT_SERVER_URL=...` / `-e CAOS_COMPUTE_SERVER_URL=...`.
-          Env = [ "PATH=/bin" ] ++ workerEnv;
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          # Daemon URLs are injected at runtime by ./run-worker-bash.sh.
+          Env = [ "PATH=/bin" ];
         };
         workerBashImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-bash";
@@ -217,7 +218,7 @@
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [ "PATH=/bin" ] ++ workerEnv;
+          Env = [ "PATH=/bin" ];
         };
         workerHelloImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-hello";
@@ -235,8 +236,8 @@
         # worker, the applied image takes its single input as `--in`; the result
         # is left at /cas/out. Unlike the other workers it drives the compute
         # server via `caos run` — both to apply `func` and to recurse — so it
-        # relies on CAOS_COMPUTE_SERVER_URL (in workerEnv) and learns its own
-        # image name, for the recursive call, from CAOS_FOLD_IMAGE.
+        # relies on CAOS_COMPUTE_SERVER_URL (injected by the compute server) and
+        # learns its own image name, for the recursive call, from CAOS_FOLD_IMAGE.
         workerFoldScript = pkgs.writeTextFile {
           name = "caos-worker-fold-script";
           executable = true;
@@ -298,7 +299,7 @@
           Env = [
             "PATH=/bin"
             "CAOS_FOLD_IMAGE=caos-worker-fold:latest"
-          ] ++ workerEnv;
+          ];
         };
         workerFoldImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-fold";
@@ -313,7 +314,7 @@
         # the per-child counts fold assembles) returns their sum. The result, a
         # blob holding the count, is left at /cas/out. So folding a tree with
         # this image totals the leaf files. It only touches the object server
-        # (no `caos run`), though it carries the shared workerEnv like the others.
+        # (no `caos run`); the compute server injects that URL at runtime.
         workerFileCountScript = pkgs.writeTextFile {
           name = "caos-worker-file-count-script";
           executable = true;
@@ -355,7 +356,7 @@
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [ "PATH=/bin" ] ++ workerEnv;
+          Env = [ "PATH=/bin" ];
         };
         workerFileCountImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-file-count";

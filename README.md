@@ -95,15 +95,16 @@ The `caos-worker-base` image exposes the binary as `/bin/caos` and runs
 `caos entrypoint` (which creates `/cas` at startup — see below).
 
 There's also a `caos-worker-bash` image (`.#caos-worker-bash-docker`,
-`.#load-caos-worker-bash`) for interactive testing: it's the `caos-worker-base` root
-plus `bash`, `coreutils`, and `curl`, with `bash` as the default command and
-`CAOS_OBJECT_SERVER_URL` defaulted to `http://caos-object-server:8080`.
+`.#load-caos-worker-bash`) for interactive testing: it's the `caos-worker-base`
+root plus `bash`, `coreutils`, and `curl`. Like the other workers it runs
+`caos entrypoint`, which sets up `/cas` and runs `/worker` — here `/worker` just
+drops you into an interactive shell (and stores an empty `/cas/out` on exit, so
+`caos entrypoint` doesn't error if you didn't leave a result). Run it with the
+helper script, which wires up the daemon URLs:
 
 ```bash
 nix run .#load-caos-worker-bash
-docker run --rm -it \
-  -v /path/to/cas:/cas \
-  caos-worker-bash:latest
+./run-worker-bash.sh
 # inside: caos get-hash <hash> /cas/foo
 ```
 
@@ -273,7 +274,8 @@ It runs the image by shelling out to the `docker` CLI, forcing the caos
 entrypoint so the image's own entrypoint/command don't matter:
 
 ```text
-docker run --rm --network <net> -e CAOS_OBJECT_SERVER_URL=<url> \
+docker run --rm --network <net> \
+  -e CAOS_OBJECT_SERVER_URL=<url> -e CAOS_COMPUTE_SERVER_URL=<url> \
   --entrypoint /bin/caos <image> entrypoint --args=<hash>
 ```
 
@@ -282,9 +284,13 @@ the hash of `/cas/out` on its stdout — which `docker run` forwards, so the
 container's stdout *is* the result hash. So any image that carries `/bin/caos`
 and a `/worker` is a valid compute image.
 
+Both daemon URLs are injected into the worker so it can reach the object server
+and — for a worker that itself calls `caos run`, like the fold worker — call back
+into the compute server. (Workers bake in no URLs of their own.)
+
 Because it drives Docker, the `caos-compute-server` image is **not** minimal — it
 bundles the `docker` client and expects the host's docker socket bind-mounted.
-The worker containers it spawns join `<net>` so they resolve the object server by
+The worker containers it spawns join `<net>` so they resolve the daemons by
 name:
 
 ```bash
@@ -296,8 +302,10 @@ docker run --rm -p 9090:9090 \
 
 Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:9090`),
 `CAOS_DOCKER_NETWORK` (default `caos-net`), `CAOS_OBJECT_SERVER_URL` (default
-`http://caos-object-server:8080`, passed into each worker), `CAOS_DOCKER_BIN`
-(default `docker`), and `CAOS_REDIS_ADDR` (default `caos-redis:6379`).
+`http://caos-object-server:8080`, passed into each worker), `CAOS_COMPUTE_SERVER_URL`
+(default `http://caos-compute-server:9090`, our own address passed into each
+worker so it can call back), `CAOS_DOCKER_BIN` (default `docker`), and
+`CAOS_REDIS_ADDR` (default `caos-redis:6379`).
 
 ### Caching
 
@@ -326,8 +334,8 @@ caos run caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
 caos get /cas/out/greeting && cat /cas/out/greeting   # => hi
 ```
 
-(The debugging `caos-worker-bash` image's `/worker` is just `bash`, which doesn't
-write `/cas/out` — handy for poking around, not a real worker.)
+(The debugging `caos-worker-bash` image's `/worker` drops you into an interactive
+shell instead of computing a result — handy for poking around, not a real worker.)
 
 #### A recursive worker: `caos-worker-fold`
 
@@ -352,15 +360,10 @@ caos run caos-worker-fold:latest /cas/out -- \
 ```
 
 Because it drives the compute server itself, the image relies on
-`CAOS_COMPUTE_SERVER_URL` (baked in via `workerEnv` in `flake.nix`) and learns
-its own name, for the recursive call, from `CAOS_FOLD_IMAGE`. Each sub-fold is a
-normal compute step, so identical subtrees are memoized by the Redis cache.
-
-> `caos run` needs `CAOS_COMPUTE_SERVER_URL`, but the compute server currently
-> injects only `CAOS_OBJECT_SERVER_URL` into the workers it spawns — so for now
-> both URLs are baked into the worker images (see the `TODO` on `workerEnv` in
-> `flake.nix`). The fix is to have the compute server pass the compute-server URL
-> into child workers too.
+`CAOS_COMPUTE_SERVER_URL` (injected into the worker by the compute server, along
+with `CAOS_OBJECT_SERVER_URL`) and learns its own name, for the recursive call,
+from `CAOS_FOLD_IMAGE`. Each sub-fold is a normal compute step, so identical
+subtrees are memoized by the Redis cache.
 
 #### A fold algebra: `caos-worker-file-count`
 
@@ -405,7 +408,7 @@ these daemons are `local_resource`s, which it ignores.) Each daemon installs a
 makes the container exit and `--rm` removes it. Any container left over from a
 prior hard kill is reclaimed on the next `tilt up`.
 
-Run a one-shot interactive bash client with: `docker run --rm -it --network caos-net caos-worker-bash:latest`
+Run a one-shot interactive bash client with: `./run-worker-bash.sh`
 
 Then inside the container, e.g.:
 

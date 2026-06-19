@@ -8,7 +8,8 @@
 //! It shells out to the `docker` CLI:
 //!
 //! ```text
-//! docker run --rm --network <net> -e CAOS_OBJECT_SERVER_URL=<url> \
+//! docker run --rm --network <net> \
+//!     -e CAOS_OBJECT_SERVER_URL=<url> -e CAOS_COMPUTE_SERVER_URL=<url> \
 //!     --entrypoint /bin/caos <image> entrypoint --args=<hash>
 //! ```
 //!
@@ -19,8 +20,10 @@
 //! which `docker run` forwards to ours, so the container's stdout *is* the
 //! result hash. We return it as the response body.
 //!
-//! The container reaches the object server over the Docker network, so it must
-//! be the same network the object server runs on (default `caos-net`).
+//! Both daemon URLs are injected so the worker can reach the object server and —
+//! for a worker that itself calls `caos run`, like the fold worker — call back
+//! into us. The container reaches both over the Docker network, so it must be the
+//! same network the daemons run on (default `caos-net`).
 //!
 //! Results are cached in Redis (`CAOS_REDIS_ADDR`, default `caos-redis:6379`):
 //! the key is the image + args-tree hash, the value the result hash. A hit skips
@@ -46,6 +49,12 @@ const DEFAULT_NETWORK: &str = "caos-net";
 /// `CAOS_OBJECT_SERVER_URL`.
 const DEFAULT_OBJECT_SERVER_URL: &str = "http://caos-object-server:8080";
 
+/// Compute-server URL passed into the worker container, so a worker that calls
+/// `caos run` (e.g. the fold worker, which recurses) can reach us. This is our
+/// own address as seen from inside the Docker network. Override with
+/// `CAOS_COMPUTE_SERVER_URL`.
+const DEFAULT_COMPUTE_SERVER_URL: &str = "http://caos-compute-server:9090";
+
 /// `docker` binary to invoke. Override with `CAOS_DOCKER_BIN`.
 const DEFAULT_DOCKER_BIN: &str = "docker";
 
@@ -62,6 +71,7 @@ const CAOS_BIN: &str = "/bin/caos";
 struct Config {
     network: String,
     object_server_url: String,
+    compute_server_url: String,
     docker_bin: String,
     redis_addr: String,
 }
@@ -97,6 +107,7 @@ fn main() {
     let config = Arc::new(Config {
         network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
         object_server_url: env_or("CAOS_OBJECT_SERVER_URL", DEFAULT_OBJECT_SERVER_URL),
+        compute_server_url: env_or("CAOS_COMPUTE_SERVER_URL", DEFAULT_COMPUTE_SERVER_URL),
         docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
     });
@@ -109,8 +120,9 @@ fn main() {
         }
     };
     eprintln!(
-        "compute-server listening on http://{addr}, network {}, object server {}, redis {}",
-        config.network, config.object_server_url, config.redis_addr
+        "compute-server listening on http://{addr}, network {}, object server {}, \
+         compute server {}, redis {}",
+        config.network, config.object_server_url, config.compute_server_url, config.redis_addr
     );
 
     // One thread per request, not a serial loop: a worker can itself call back
@@ -207,6 +219,10 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         .args([
             "-e",
             &format!("CAOS_OBJECT_SERVER_URL={}", config.object_server_url),
+        ])
+        .args([
+            "-e",
+            &format!("CAOS_COMPUTE_SERVER_URL={}", config.compute_server_url),
         ])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&image)
