@@ -93,9 +93,32 @@
         # image, where it's exposed as `/bin/caos`. The `/cas` directory is *not*
         # baked in — `caos entrypoint` creates it at runtime (so a mounted, empty
         # /cas volume works too).
+        #
+        # This store path holds only what needs *no* special permissions: the user
+        # database. `caos` itself can't live here — it must be setuid-root (so a
+        # non-root worker can mutate the root-owned /cas through it, and only
+        # through it), and Nix strips the setuid bit when it seals a store path.
+        # So caos (and a writable /tmp) are installed per-image by
+        # `installWorkerFiles` below, which runs while the image layer is built.
         workerBaseRoot = pkgs.runCommand "caos-worker-base-root" { } ''
-          mkdir -p $out/bin
-          cp ${client}/bin/client $out/bin/caos
+          mkdir -p $out/etc
+          printf 'root:x:0:0:root:/root:/sbin/nologin\n' > $out/etc/passwd
+          printf 'worker:x:1000:1000:caos worker:/tmp:/sbin/nologin\n' >> $out/etc/passwd
+          printf 'root:x:0:\nworker:x:1000:\n' > $out/etc/group
+        '';
+
+        # Commands run while assembling a worker image's layer (under fakeroot, so
+        # everything is recorded as root-owned): install caos as a setuid-root
+        # binary and create the world-writable /tmp the unprivileged worker needs
+        # (it can't create one under the root-owned /). `bin` is always a real
+        # directory here (the base image makes it; the others get it from
+        # bash/coreutils), so the copy lands as a real file the chmod can mark.
+        installWorkerFiles = ''
+          mkdir -p bin
+          cp ${client}/bin/client bin/caos
+          chmod 4755 bin/caos
+          mkdir -p tmp
+          chmod 1777 tmp
         '';
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
         # print the hash of /cas/out. The object- and compute-server URLs a worker
@@ -108,11 +131,14 @@
             "entrypoint"
           ];
         };
-        workerBaseImage = pkgs.dockerTools.buildImage {
+        # Layered (not buildImage) so we can use fakeRootCommands to install the
+        # setuid-root caos — see installWorkerFiles.
+        workerBaseImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-base";
           tag = "latest";
-          copyToRoot = [ workerBaseRoot ];
+          contents = [ workerBaseRoot ];
           config = workerBaseConfig;
+          fakeRootCommands = installWorkerFiles;
         };
 
         # Run with the git repo bind-mounted at /git, e.g.
@@ -169,11 +195,12 @@
           # Daemon URLs are injected at runtime by ./run-worker-bash.sh.
           Env = [ "PATH=/bin" ];
         };
-        workerBashImage = pkgs.dockerTools.buildImage {
+        workerBashImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-bash";
           tag = "latest";
-          copyToRoot = workerBashContents;
+          contents = workerBashContents;
           config = workerBashConfig;
+          fakeRootCommands = installWorkerFiles;
         };
 
         # A real, runnable worker image: caos + bash + coreutils, with a /worker
@@ -220,11 +247,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerHelloImage = pkgs.dockerTools.buildImage {
+        workerHelloImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-hello";
           tag = "latest";
-          copyToRoot = workerHelloContents;
+          contents = workerHelloContents;
           config = workerHelloConfig;
+          fakeRootCommands = installWorkerFiles;
         };
 
         # A recursive "fold" worker — a catamorphism over a CAS tree. Two args:
@@ -301,11 +329,12 @@
             "CAOS_FOLD_IMAGE=caos-worker-fold:latest"
           ];
         };
-        workerFoldImage = pkgs.dockerTools.buildImage {
+        workerFoldImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-fold";
           tag = "latest";
-          copyToRoot = workerFoldContents;
+          contents = workerFoldContents;
           config = workerFoldConfig;
+          fakeRootCommands = installWorkerFiles;
         };
 
         # A "file-count" worker: a leaf algebra meant to be driven by the fold
@@ -358,11 +387,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerFileCountImage = pkgs.dockerTools.buildImage {
+        workerFileCountImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-file-count";
           tag = "latest";
-          copyToRoot = workerFileCountContents;
+          contents = workerFileCountContents;
           config = workerFileCountConfig;
+          fakeRootCommands = installWorkerFiles;
         };
 
         # compute-server runs worker containers by shelling out to the `docker`
@@ -393,10 +423,10 @@
         # streamLayeredImage so nothing big is written to the Nix store; the
         # layers are streamed directly to docker. `docker` is taken from PATH.
         loadImage =
-          { name, contents, config ? { } }:
+          { name, contents, config ? { }, fakeRootCommands ? "" }:
           let
             stream = pkgs.dockerTools.streamLayeredImage {
-              inherit name config contents;
+              inherit name config contents fakeRootCommands;
               tag = "latest";
             };
           in
@@ -411,6 +441,7 @@
           name = "caos-worker-base";
           contents = [ workerBaseRoot ];
           config = workerBaseConfig;
+          fakeRootCommands = installWorkerFiles;
         };
         loadObjectServer = loadImage {
           name = "caos-object-server";
@@ -426,6 +457,7 @@
           name = "caos-worker-bash";
           contents = workerBashContents;
           config = workerBashConfig;
+          fakeRootCommands = installWorkerFiles;
         };
         loadComputeServer = loadImage {
           name = "caos-compute-server";
@@ -436,16 +468,19 @@
           name = "caos-worker-hello";
           contents = workerHelloContents;
           config = workerHelloConfig;
+          fakeRootCommands = installWorkerFiles;
         };
         loadWorkerFold = loadImage {
           name = "caos-worker-fold";
           contents = workerFoldContents;
           config = workerFoldConfig;
+          fakeRootCommands = installWorkerFiles;
         };
         loadWorkerFileCount = loadImage {
           name = "caos-worker-file-count";
           contents = workerFileCountContents;
           config = workerFileCountConfig;
+          fakeRootCommands = installWorkerFiles;
         };
       in
       {

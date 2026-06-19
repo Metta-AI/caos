@@ -92,7 +92,11 @@ nix run .#load-caos-worker-file-count
 The `caos-worker-base` and `caos-object-server` images contain **only** their static
 binary under `/bin` — no shell, no libc, no package manager, no `/nix/store`.
 The `caos-worker-base` image exposes the binary as `/bin/caos` and runs
-`caos entrypoint` (which creates `/cas` at startup — see below).
+`caos entrypoint` (which creates `/cas` at startup — see below). On the worker
+images `/bin/caos` is **setuid-root** and there's a `worker` user (uid 1000) plus
+a world-writable `/tmp`, so `entrypoint` can run the worker unprivileged while
+still letting it reach the root-owned `/cas` through `caos` — see
+[Permissions](#permissions-load-before-read-and-no-tampering).
 
 There's also a `caos-worker-bash` image (`.#caos-worker-bash-docker`,
 `.#load-caos-worker-bash`) for interactive testing: it's the `caos-worker-base`
@@ -213,11 +217,15 @@ passed through to the compute server untouched.
 together for a single compute step:
 
 1. **set up** — delete the CAS directory and recreate it empty (**fails** if it
-   can't) and verify it supports xattrs;
+   can't), owned by root and not writable by anyone else, and verify it supports
+   xattrs;
 2. **load args** — if `--args=<hash>` is given, materialize that object at
    `/cas/args` (exactly like `get-hash <hash> /cas/args`), so the worker can read
    its inputs there;
-3. **run `/worker`** — the binary a downstream image is expected to provide. Its
+3. **run `/worker`** — the binary a downstream image is expected to provide,
+   dropped to the unprivileged `worker` user (uid/gid 1000) so it can't tamper
+   with the root-owned `/cas` directly — only through the setuid-root `caos`.
+   `entrypoint` itself stays root, to tear `/cas` down afterwards. The worker's
    stdout is redirected to stderr so the container's stdout stays clean;
 4. **report** — print the hash recorded on `/cas/out`. Everything under `/cas`
    got there via `get`/`put`, which already tag each path with its
@@ -255,6 +263,31 @@ and exits with a clear error if its filesystem doesn't support `user.*` xattrs
 
 `CAOS_CAS_DIR` (default `/cas`) overrides the CAS directory — handy for running
 outside a container.
+
+### Permissions: load-before-read, and no tampering
+
+`/cas` is locked down so a worker can only see what it has explicitly fetched,
+and can't alter what's there. Two rules, both enforced by file permissions
+(everything under `/cas` is owned by root):
+
+- **Nothing is readable until it's fetched.** Expanding a tree with `get`/
+  `get-hash` leaves one *placeholder* per entry — an empty file or directory that
+  records its hash but holds no content yet. Placeholders are owner-only
+  (`r--------` / `r-x------`), so the worker can't read data it hasn't loaded by
+  accident. `get` on a placeholder fetches its content and makes it
+  world-readable (`r--r--r--` for a blob, `r-xr-xr-x` for a tree, whose own
+  entries are again placeholders). This means you load a tree one level at a
+  time, on purpose.
+- **The worker can't tamper with `/cas`.** It runs as the unprivileged `worker`
+  user, while `/cas` and everything in it is root-owned and not writable by
+  others. The worker mutates `/cas` *only* through `caos`, which is **setuid-root**
+  inside the image: `get`/`put`/`run` materialize content faithfully (and record
+  its hash), but the worker has no other way to write there. (The `caos` binary
+  is static, so setuid carries no dynamic-linker attack surface.)
+
+Both rules relax outside the container: with `CAOS_CAS_DIR` pointing at a normal
+directory you own, the owner-only modes still let *you* read placeholders' hashes
+to expand them, so the round-trip works without root or setuid.
 
 ## compute-server
 
