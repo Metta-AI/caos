@@ -428,17 +428,66 @@ fn ensure_layer(config: &Config, layer_oid: &str) -> Result<(String, u64), Strin
     Ok((digest, size))
 }
 
-/// Materialize a layer's git tree to a temp dir and tar it deterministically
-/// (GNU format handles the long /nix/store paths and symlinks; the flags zero out
-/// owners/mtimes and sort entries, so the output — hence its digest — is stable).
+/// Reserved suffix for the per-entry permission sidecars `import-image` writes.
+const META_SUFFIX: &str = ".caosmeta";
+
+/// Materialize a layer's git tree to a temp dir, apply its `.caosmeta` sidecars,
+/// and tar it deterministically (GNU format handles the long /nix/store paths and
+/// symlinks; the flags zero the mtimes and sort entries, so the output — hence its
+/// digest — is stable).
 fn build_layer_tar(config: &Config, tree_hash: &str) -> Result<Vec<u8>, String> {
     let dir = temp_dir()?;
     let result = (|| {
         materialize_tree(config, &dir, tree_hash)?;
+        apply_layer_metadata(&dir)?;
         tar_dir(&dir)
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
+}
+
+/// Apply the `<name>.caosmeta` sidecars written by `import-image`: for each one,
+/// restore the sibling entry's mode and owner, then remove the sidecar so it
+/// doesn't land in the layer tar. We run as root, so chmod/chown/unlink and the
+/// later read-for-tar all work regardless of the perms we set.
+fn apply_layer_metadata(dir: &Path) -> Result<(), String> {
+    let mut sidecars = Vec::new();
+    let mut subdirs = Vec::new();
+    for dirent in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let dirent = dirent.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let name = dirent.file_name().to_string_lossy().into_owned();
+        if let Some(target) = name.strip_suffix(META_SUFFIX) {
+            sidecars.push((dirent.path(), dir.join(target)));
+        } else if dirent
+            .file_type()
+            .map_err(|e| format!("{}: {e}", dirent.path().display()))?
+            .is_dir()
+        {
+            subdirs.push(dirent.path());
+        }
+    }
+
+    for (sidecar, target) in sidecars {
+        let bytes = std::fs::read(&sidecar).map_err(|e| format!("{}: {e}", sidecar.display()))?;
+        let meta: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", sidecar.display()))?;
+        let mode = meta
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u32::from_str_radix(s, 8).ok())
+            .ok_or_else(|| format!("{}: missing/invalid mode", sidecar.display()))?;
+        let uid = meta.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let gid = meta.get("gid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        std::os::unix::fs::chown(&target, Some(uid), Some(gid))
+            .map_err(|e| format!("chown {}: {e}", target.display()))?;
+        set_mode(&target, mode)?;
+        std::fs::remove_file(&sidecar).map_err(|e| format!("{}: {e}", sidecar.display()))?;
+    }
+
+    for subdir in subdirs {
+        apply_layer_metadata(&subdir)?;
+    }
+    Ok(())
 }
 
 /// A fresh, unique temp directory.
@@ -493,14 +542,13 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("chmod {}: {e}", path.display()))
 }
 
-/// Tar `dir`'s contents reproducibly (GNU format, zeroed owners/mtimes, sorted).
+/// Tar `dir`'s contents reproducibly (GNU format, zeroed mtimes, sorted, numeric
+/// owners read from disk — which the `.caosmeta` sidecars already set).
 fn tar_dir(dir: &Path) -> Result<Vec<u8>, String> {
     let output = Command::new("tar")
         .args([
             "--format=gnu",
             "--numeric-owner",
-            "--owner=0",
-            "--group=0",
             "--mtime=@0",
             "--sort=name",
         ])

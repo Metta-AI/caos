@@ -405,6 +405,9 @@ fn import_image(archive: &str, dst: &str) -> Result<(), String> {
             let layer_dir = work.join(format!("extract-layer{i:02}"));
             std::fs::create_dir(&layer_dir).map_err(|e| format!("{}: {e}", layer_dir.display()))?;
             unpack_tar(&layer_bytes, &layer_dir)?;
+            // Record perms/ownership a git tree can't carry, as sidecars beside
+            // each entry, before storing the layer as a tree.
+            write_layer_metadata(&layer_bytes, &layer_dir)?;
             let (_, oid) = store(&base, &cas_real, &layer_dir)?;
             entries.push(Entry {
                 mode: EntryKind::Tree.into(),
@@ -420,6 +423,90 @@ fn import_image(archive: &str, dst: &str) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&work);
     outcome
+}
+
+/// Reserved suffix for the per-entry permission sidecars (see [`write_layer_metadata`]).
+const META_SUFFIX: &str = ".caosmeta";
+
+/// Beside any entry in the already-unpacked layer at `dir` whose permissions or
+/// ownership a git tree can't reproduce, write a `<name>.caosmeta` sidecar — a
+/// small JSON `{"mode":"<octal>","uid":N,"gid":N}` — so the compute server can
+/// restore them when it rebuilds the layer's tar. Files and directories are
+/// treated alike: the sidecar sits next to the entry, in its parent.
+///
+/// Metadata comes from the layer **tar headers**, not from the unpacked files:
+/// the headers are authoritative, whereas the unpacked owner/mode depend on who
+/// ran the unpack (a non-root unpack can't reproduce a non-root owner).
+///
+/// "Can't reproduce" means the entry's bits differ from what a plain materialize
+/// would recreate: a directory not `0755`, a file not `0644`/`0755` (so setuid,
+/// setgid, sticky, and odd perms are all captured), or non-root owner/group. Only
+/// regular files and directories are recorded; symlinks, hardlinks, and device
+/// nodes are skipped. Errors if the layer itself already uses the reserved suffix
+/// (we'd otherwise shadow a real file).
+fn write_layer_metadata(layer_tar: &[u8], dir: &Path) -> Result<(), String> {
+    let mut archive = tar::Archive::new(layer_tar);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("reading layer tar: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("reading layer tar: {e}"))?;
+        let header = entry.header();
+        let is_dir = header.entry_type().is_dir();
+        // Only plain files and directories carry perms we record here.
+        if !is_dir && !header.entry_type().is_file() {
+            continue;
+        }
+        let mode = header.mode().map_err(|e| format!("layer tar mode: {e}"))? & 0o7777;
+        let uid = header.uid().map_err(|e| format!("layer tar uid: {e}"))?;
+        let gid = header.gid().map_err(|e| format!("layer tar gid: {e}"))?;
+
+        let rel = normalize_tar_path(&entry.path().map_err(|e| format!("layer tar path: {e}"))?);
+        if rel.as_os_str().is_empty() {
+            continue; // the layer root (".") — no parent to hold a sidecar
+        }
+        if rel.to_string_lossy().ends_with(META_SUFFIX) {
+            return Err(format!(
+                "layer uses the reserved {META_SUFFIX} suffix: {}",
+                rel.display()
+            ));
+        }
+
+        let default = if is_dir || mode & 0o111 != 0 {
+            0o755
+        } else {
+            0o644
+        };
+        if mode == default && uid == 0 && gid == 0 {
+            continue;
+        }
+
+        // Drop the sidecar next to the (already unpacked) entry. Its parent may be
+        // a read-only nix store dir, so make it writable first — harmless, since a
+        // git tree records no directory mode and the parent's own mode rides in
+        // its own sidecar.
+        let entry_path = dir.join(&rel);
+        let parent = entry_path.parent().unwrap_or(dir);
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", parent.display()))?;
+        let name = entry_path
+            .file_name()
+            .ok_or_else(|| format!("layer entry has no name: {}", rel.display()))?
+            .to_string_lossy();
+        let sidecar = parent.join(format!("{name}{META_SUFFIX}"));
+        let json = serde_json::json!({ "mode": format!("{mode:04o}"), "uid": uid, "gid": gid });
+        let bytes = serde_json::to_vec(&json).map_err(|e| format!("encoding metadata: {e}"))?;
+        std::fs::write(&sidecar, bytes).map_err(|e| format!("{}: {e}", sidecar.display()))?;
+    }
+    Ok(())
+}
+
+/// A tar entry path reduced to its normal components (drops a leading `./` and
+/// any trailing slash), so it lines up with the unpacked path under the layer dir.
+fn normalize_tar_path(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .collect()
 }
 
 /// Decompress `bytes` if it's gzip (magic `1f 8b`); otherwise return it as-is.
