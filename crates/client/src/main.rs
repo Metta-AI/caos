@@ -19,8 +19,12 @@
 //! * `run <image> <output> -- [--name=value ...]` — assemble the args into a git
 //!   tree, ask the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
 //!   over it, and materialize the returned result hash at `<output>`. `<image>`
-//!   is either a CAS path — a git image, resolved to the git hash recorded on it
-//!   — or `docker://<ref>` for an ordinary docker image.
+//!   is a CAS path — a git image, resolved to the git hash recorded on it — a
+//!   bare git hash, or `docker://<ref>` for an ordinary docker image.
+//! * `curry <image> -- [--name=value ...]` — bind some args to `<image>`,
+//!   printing a ref to the resulting curried image. The ref runs (supplying the
+//!   rest of the args) and curries again just like any image; the binding is
+//!   partial application stored as a small CAS tree, not a rebuilt image.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
 //! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
@@ -54,6 +58,16 @@ const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
 /// (an unresolvable cycle). It rides in env, never the args tree, so the result
 /// cache key (image + args) is unaffected.
 const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
+
+/// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
+const DOCKER_SCHEME: &str = "docker://";
+
+/// Marker entry naming a curry node: a CAS tree that pairs a `base` image ref
+/// with an `args` subtree of bound arguments. `run`/`curry` expand it client-side
+/// (merging the bound args under the call's args) so the compute server only ever
+/// sees an ordinary image + args hash. The marker lets it be told apart from a
+/// git-docker image tree, which it otherwise resembles. See [`unwrap_curry`].
+const CURRY_MARKER: &str = ".caos-curry";
 
 /// The program `entrypoint` always runs. Images that build off the
 /// `caos-worker-base` image supply this binary.
@@ -135,6 +149,12 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, output, sep, kvs @ ..] if sep == "--" => caos_run(image, output, kvs),
             _ => Err(usage(args)),
         },
+        // `curry <image> -- [--name=value ...]` — bind args to an image, printing
+        // a ref to the resulting curried image (run/curry it like any image).
+        Some("curry") => match &args[2..] {
+            [image, sep, kvs @ ..] if sep == "--" => caos_curry(image, kvs),
+            _ => Err(usage(args)),
+        },
         // `build-args [--name=value ...]` — print the hash of the assembled args
         // tree (path values stored from disk, everything else a literal blob).
         Some("build-args") => build_args(&args[2..]),
@@ -169,6 +189,7 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} import-image <docker-archive> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
+         {prog} curry <image> -- [--name=value ...]\n  \
          {prog} build-args [--name=value ...]\n  \
          {prog} entrypoint [--args=<hash>]"
     )
@@ -772,9 +793,14 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     // bare hash is sent through unchanged.
     let image = resolve_run_image(&cas, image)?;
 
-    // Build the args tree in the object store only — nothing is written under
-    // /cas. The worker materializes it inside its own container.
-    let args_tree = build_args_tree(&base, &cas, kvs)?;
+    // Expand any curry layers: pull the underlying image out and collect the args
+    // bound into it, so the compute server only ever sees a plain image + args.
+    let (image, bound) = unwrap_curry(&base, &image)?;
+
+    // Build the call's args, then merge them over the bound ones (call wins).
+    // Nothing is written under /cas — the worker materializes the tree itself.
+    let call = build_arg_entries(&base, &cas, kvs)?;
+    let args_tree = post_tree(&base, merge_entries(bound, call))?;
 
     // Hand the image and args-tree hash to the compute server; it runs the
     // container and returns the hash of the result (its /cas/out).
@@ -789,7 +815,13 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
 /// git hash recorded on it; a `docker://<ref>` value is an ordinary docker image
 /// and passes through unchanged. Anything else is rejected.
 fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
-    if image.starts_with("docker://") {
+    if image.starts_with(DOCKER_SCHEME) {
+        return Ok(image.to_string());
+    }
+    // A bare git hash — a git image or a curry node already in the store, e.g. a
+    // ref produced by `caos curry`. Location-independent, so it survives being
+    // passed through args into a worker (a CAS path would not). Sent as-is.
+    if is_hex_hash(image) {
         return Ok(image.to_string());
     }
     // A path inside the CAS: reference whatever git object it was made from.
@@ -806,9 +838,165 @@ fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
         return read_hash(&canon);
     }
     Err(format!(
-        "image must be a path under {} (a git image) or docker://<ref>, got: {image}",
+        "image must be a path under {} (a git image), a git hash, or \
+         {DOCKER_SCHEME}<ref>, got: {image}",
         cas.display()
     ))
+}
+
+/// A bare 40-char SHA-1 hash, naming a git object directly (a git image or a
+/// curry node). Length-checked so a short CAS-relative path isn't mistaken for
+/// one.
+fn is_hex_hash(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `curry <image> -- [--name=value ...]` — bind arguments to `<image>`, printing
+/// a ref (a git hash) to the resulting curried image. The ref can be `run` —
+/// which supplies the rest of the args — or `curry`'d again, exactly like any
+/// image; the binding is partial application, not a rebuilt container image.
+///
+/// The curried image is a small CAS tree: a `base` blob (the underlying image
+/// ref), an `args` subtree (the bound args, in `build_arg_entries` shape), and a
+/// [`CURRY_MARKER`] blob. Currying flattens: if `<image>` is itself curried, its
+/// bindings are folded in and `base` stays a plain (docker/git) image, so the
+/// result is canonical (`curry (curry img a) b` == `curry img a b`).
+fn caos_curry(image: &str, kvs: &[String]) -> Result<(), String> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let base = object_server_url()?;
+    let cas = cas_dir();
+
+    let image = resolve_run_image(&cas, image)?;
+    let (image, bound) = unwrap_curry(&base, &image)?;
+
+    // New bindings override any already bound to the same name.
+    let args = merge_entries(bound, build_arg_entries(&base, &cas, kvs)?);
+    let args_tree = post_tree(&base, args)?;
+
+    let entries = vec![
+        Entry {
+            mode: EntryKind::Blob.into(),
+            filename: b"base".to_vec().into(),
+            oid: post_object(&base, "blob", image.as_bytes())?,
+        },
+        Entry {
+            mode: EntryKind::Tree.into(),
+            filename: b"args".to_vec().into(),
+            oid: args_tree,
+        },
+        Entry {
+            mode: EntryKind::Blob.into(),
+            filename: CURRY_MARKER.as_bytes().to_vec().into(),
+            oid: post_object(&base, "blob", b"1")?,
+        },
+    ];
+    println!("{}", post_tree(&base, entries)?);
+    Ok(())
+}
+
+/// Peel any curry layers off `image` (a resolved ref: `docker://…` or a git
+/// hash), returning the underlying plain image and the args bound into it. A
+/// caller merges these *under* its own args, so call-time args win; with curry's
+/// flattening there is normally a single layer, but nested layers are handled
+/// defensively (an outer binding wins over an inner one for the same name).
+fn unwrap_curry(base: &str, image: &str) -> Result<(String, Vec<gix::objs::tree::Entry>), String> {
+    let mut image = image.to_string();
+    let mut bound = Vec::new();
+    while is_hex_hash(&image) {
+        match curry_node(base, &image)? {
+            None => break, // a plain git image, not a curry node
+            Some((inner_image, inner_args)) => {
+                // `bound` holds outer layers, which win over this deeper one.
+                bound = merge_entries(inner_args, bound);
+                image = inner_image;
+            }
+        }
+    }
+    Ok((image, bound))
+}
+
+/// If `hash` names a curry node, return its base image ref and bound-args
+/// entries; otherwise `None` (a blob, or a tree without the [`CURRY_MARKER`] —
+/// e.g. a git-docker image).
+fn curry_node(
+    base: &str,
+    hash: &str,
+) -> Result<Option<(String, Vec<gix::objs::tree::Entry>)>, String> {
+    let entries = match fetch_tree_entries(base, hash)? {
+        Some(entries) => entries,
+        None => return Ok(None),
+    };
+    if !entries.iter().any(|e| entry_name(e) == CURRY_MARKER.as_bytes()) {
+        return Ok(None);
+    }
+    let oid_of = |name: &[u8]| {
+        entries
+            .iter()
+            .find(|e| entry_name(e) == name)
+            .map(|e| e.oid)
+            .ok_or_else(|| format!("curry node {hash} missing {:?}", String::from_utf8_lossy(name)))
+    };
+    let base_ref = fetch_blob_string(base, &oid_of(b"base")?.to_string())?;
+    let args = fetch_tree_entries(base, &oid_of(b"args")?.to_string())?
+        .ok_or_else(|| format!("curry node {hash} 'args' is not a tree"))?;
+    Ok(Some((base_ref, args)))
+}
+
+/// Fetch object `hash`; if it's a tree, return its entries as owned values, else
+/// `None`.
+fn fetch_tree_entries(
+    base: &str,
+    hash: &str,
+) -> Result<Option<Vec<gix::objs::tree::Entry>>, String> {
+    let url = format!("{}/object/{hash}", base.trim_end_matches('/'));
+    let serialized = http_get(&url)?;
+    let (kind, content) = parse_object(&serialized)?;
+    if kind != "tree" {
+        return Ok(None);
+    }
+    let tree = gix::objs::TreeRef::from_bytes(content, gix::hash::Kind::Sha1)
+        .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+    Ok(Some(
+        tree.entries
+            .iter()
+            .map(|e| gix::objs::tree::Entry {
+                mode: e.mode,
+                filename: e.filename.to_vec().into(),
+                oid: e.oid.to_owned(),
+            })
+            .collect(),
+    ))
+}
+
+/// Fetch blob `hash` as a trimmed UTF-8 string.
+fn fetch_blob_string(base: &str, hash: &str) -> Result<String, String> {
+    let url = format!("{}/object/{hash}", base.trim_end_matches('/'));
+    let serialized = http_get(&url)?;
+    let (kind, content) = parse_object(&serialized)?;
+    if kind != "blob" {
+        return Err(format!("expected a blob at {hash}, got {kind}"));
+    }
+    let text = std::str::from_utf8(content).map_err(|e| format!("blob {hash} not UTF-8: {e}"))?;
+    Ok(text.trim().to_string())
+}
+
+/// A tree entry's filename as raw bytes (pins the `AsRef` impl `BString` offers).
+fn entry_name(e: &gix::objs::tree::Entry) -> &[u8] {
+    e.filename.as_ref()
+}
+
+/// Merge two sets of tree entries by filename; entries in `high` override those
+/// in `low`. Order is irrelevant — `post_tree` sorts before encoding.
+fn merge_entries(
+    low: Vec<gix::objs::tree::Entry>,
+    high: Vec<gix::objs::tree::Entry>,
+) -> Vec<gix::objs::tree::Entry> {
+    let mut by_name = std::collections::BTreeMap::new();
+    for e in low.into_iter().chain(high) {
+        by_name.insert(e.filename.to_vec(), e);
+    }
+    by_name.into_values().collect()
 }
 
 /// Split a `--name=value` argument into its name and value, validating that the
@@ -878,15 +1066,18 @@ fn build_host_args_tree(base: &str, kvs: &[String]) -> Result<gix::ObjectId, Str
     post_tree(base, entries)
 }
 
-/// Build the args git tree from `--name=value` pairs and store it (plus any
-/// literal-value blobs) in the object server, returning the tree's hash. The
-/// tree is never written to the filesystem.
+/// The per-`--name=value` tree entries that make up an args tree — `run`/`curry`
+/// merge call args with a curry node's bound args, then `post_tree` the result.
 ///
 /// Each `--name=value` becomes a tree entry `name`:
 /// * if `value` is a path inside the CAS directory, it must exist, and the entry
 ///   references the object that path was materialized from (its recorded hash);
 /// * otherwise `value` is stored verbatim as a blob and the entry references it.
-fn build_args_tree(base: &str, cas: &Path, kvs: &[String]) -> Result<gix::ObjectId, String> {
+fn build_arg_entries(
+    base: &str,
+    cas: &Path,
+    kvs: &[String],
+) -> Result<Vec<gix::objs::tree::Entry>, String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     // Canonical CAS root, resolved lazily — only needed if a CAS path appears.
@@ -923,7 +1114,7 @@ fn build_args_tree(base: &str, cas: &Path, kvs: &[String]) -> Result<gix::Object
         });
     }
 
-    post_tree(base, entries)
+    Ok(entries)
 }
 
 /// Ask the compute server to run `image` over the args tree `args_hash`,
