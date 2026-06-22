@@ -441,7 +441,9 @@
 
             case "$mode" in
               "")
-                # Deepen one package (the public API).
+                # Deepen one package (the public API). A dependency cycle is
+                # caught by the compute server (it re-enters the same image+args),
+                # so nothing is needed here.
                 caos get /cas/args/name
                 name=$(cat /cas/args/name)
                 # Per-entry lookup: expand the map one level so the child exists,

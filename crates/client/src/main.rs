@@ -48,6 +48,13 @@ const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
 /// Base URL of the compute server, e.g. `http://caos-compute-server`.
 const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
 
+/// The chain of `(image, args)` computations currently in progress, set by the
+/// compute server on each worker it spawns. `caos run` echoes it back so the
+/// server can detect a run that re-enters a computation already on the stack
+/// (an unresolvable cycle). It rides in env, never the args tree, so the result
+/// cache key (image + args) is unaffected.
+const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
+
 /// The program `entrypoint` always runs. Images that build off the
 /// `caos-worker-base` image supply this binary.
 const DEFAULT_WORKER: &str = "/worker";
@@ -922,12 +929,20 @@ fn build_args_tree(base: &str, cas: &Path, kvs: &[String]) -> Result<gix::Object
 /// Ask the compute server to run `image` over the args tree `args_hash`,
 /// returning the result hash it prints (the container's /cas/out).
 fn request_compute(base: &str, image: &str, args_hash: &str) -> Result<String, String> {
-    let url = format!(
+    let mut url = format!(
         "{}/run?image={}&args={}",
         base.trim_end_matches('/'),
         percent_encode(image),
         args_hash,
     );
+    // Echo back the in-progress run stack (see RUN_STACK_ENV) so the compute
+    // server can detect cycles. Empty/unset at the top level.
+    if let Ok(stack) = std::env::var(RUN_STACK_ENV) {
+        if !stack.is_empty() {
+            url.push_str("&stack=");
+            url.push_str(&percent_encode(&stack));
+        }
+    }
     let body = http_get(&url)?;
     let text = String::from_utf8(body)
         .map_err(|e| format!("compute server returned invalid UTF-8: {e}"))?;
