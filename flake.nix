@@ -82,6 +82,9 @@
         client = crateBin "client";
         object-server = crateBin "object-server";
         compute-server = crateBin "compute-server";
+        worker-hello = crateBin "worker-hello";
+        worker-fold = crateBin "worker-fold";
+        worker-file-count = crateBin "worker-file-count";
         worker-deep-deps = crateBin "worker-deep-deps";
 
         # Minimal images: each contains *only* its static binary — no shell, no
@@ -101,6 +104,16 @@
         # through it), and Nix strips the setuid bit when it seals a store path.
         # So caos (and a writable /tmp) are installed per-image by
         # `installWorkerFiles` below, which runs while the image layer is built.
+        # A worker image root: a single static worker binary placed at /worker.
+        # Each Rust worker crate's binary is named after its package, so pass that
+        # name and the built crate. The result is combined with workerBaseRoot
+        # (the user database) and the setuid caos installed by installWorkerFiles —
+        # no shell or coreutils, since the worker itself does all the file work.
+        workerRoot = binName: drv: pkgs.runCommand "caos-${binName}-root" { } ''
+          mkdir -p $out
+          cp ${drv}/bin/${binName} $out/worker
+        '';
+
         workerBaseRoot = pkgs.runCommand "caos-worker-base-root" { } ''
           mkdir -p $out/etc
           printf 'root:x:0:0:root:/root:/sbin/nologin\n' > $out/etc/passwd
@@ -204,42 +217,16 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # A real, runnable worker image: caos + bash + coreutils, with a /worker
-        # that reads its inputs from /cas/args (one file per `--name=value` arg
-        # `caos run` passed), copies them into a result directory along with a
-        # small receipt, and stores that at /cas/out. The compute server runs it
-        # via `caos entrypoint`, which populates /cas/args and runs /worker.
-        workerHelloScript = pkgs.writeTextFile {
-          name = "caos-worker-hello-script";
-          executable = true;
-          destination = "/worker";
-          text = ''
-            #!/bin/bash
-            set -euo pipefail
-            echo "hello-worker: reading /cas/args" >&2
-            out=/tmp/out
-            rm -rf "$out"
-            mkdir -p "$out"
-            for path in /cas/args/*; do
-              name=$(basename "$path")
-              caos get "$path"          # expand the placeholder to real content
-              cp -r "$path" "$out/$name"
-              echo "  saw $name" >&2
-            done
-            {
-              echo "worker ran"
-              for path in /cas/args/*; do
-                echo "saw $(basename "$path")"
-              done
-            } > "$out/receipt"
-            caos put "$out" /cas/out
-          '';
-        };
+        # A real, runnable worker image, with a /worker that reads its inputs from
+        # /cas/args (one entry per `--name=value` arg `caos run` passed), assembles
+        # them into a result tree along with a small receipt, and stores that at
+        # /cas/out. The compute server runs it via `caos entrypoint`, which
+        # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
+        # static binary at /worker — so the image needs no shell or coreutils.
+        workerHelloRoot = workerRoot "worker-hello" worker-hello;
         workerHelloContents = [
           workerBaseRoot
-          workerHelloScript
-          pkgs.bashInteractive
-          pkgs.coreutils
+          workerHelloRoot
         ];
         workerHelloConfig = {
           Entrypoint = [
@@ -267,58 +254,12 @@
         # server via `caos run` — both to apply `func` and to recurse — so it
         # relies on CAOS_COMPUTE_SERVER_URL (injected by the compute server) and
         # learns its own image name, for the recursive call, from CAOS_FOLD_IMAGE.
-        workerFoldScript = pkgs.writeTextFile {
-          name = "caos-worker-fold-script";
-          executable = true;
-          destination = "/worker";
-          text = ''
-            #!/bin/bash
-            set -euo pipefail
-
-            fold_image=''${CAOS_FOLD_IMAGE:-caos-worker-fold:latest}
-
-            # The function to apply is a blob arg: expand the placeholder and read it.
-            caos get /cas/args/func
-            func=$(cat /cas/args/func)
-
-            if [ -d /cas/args/in ]; then
-              echo "fold: input is a tree; folding its children with $func" >&2
-
-              # Expand the tree one level: a placeholder per child.
-              caos get /cas/args/in
-
-              work=/tmp/folded
-              rm -rf "$work"
-              mkdir -p "$work"
-
-              i=0
-              for child in /cas/args/in/*; do
-                [ -e "$child" ] || continue   # empty tree: the glob stays literal
-                name=$(basename "$child")
-                # Fold this child with the same function; its result lands at /cas/c<i>.
-                caos run "$fold_image" "/cas/c$i" -- \
-                  --func="$func" --in="$child"
-                # Symlink into the CAS so `caos put` reuses the result's recorded
-                # hash (no content re-read) under the child's original name.
-                ln -s "/cas/c$i" "$work/$name"
-                echo "  folded $name -> /cas/c$i" >&2
-                i=$((i + 1))
-              done
-
-              # Assemble the folded children into a tree, then apply the function.
-              caos put "$work" /cas/folded
-              caos run "$func" /cas/out -- --in=/cas/folded
-            else
-              echo "fold: input is a file; applying $func" >&2
-              caos run "$func" /cas/out -- --in=/cas/args/in
-            fi
-          '';
-        };
+        # This is the `worker-fold` crate, a static binary at /worker — so the
+        # image needs no shell or coreutils.
+        workerFoldRoot = workerRoot "worker-fold" worker-fold;
         workerFoldContents = [
           workerBaseRoot
-          workerFoldScript
-          pkgs.bashInteractive
-          pkgs.coreutils
+          workerFoldRoot
         ];
         workerFoldConfig = {
           Entrypoint = [
@@ -345,42 +286,13 @@
         # the per-child counts fold assembles) returns their sum. The result, a
         # blob holding the count, is left at /cas/out. So folding a tree with
         # this image totals the leaf files. It only touches the object server
-        # (no `caos run`); the compute server injects that URL at runtime.
-        workerFileCountScript = pkgs.writeTextFile {
-          name = "caos-worker-file-count-script";
-          executable = true;
-          destination = "/worker";
-          text = ''
-            #!/bin/bash
-            set -euo pipefail
-
-            if [ -d /cas/args/in ]; then
-              echo "file-count: summing child counts" >&2
-              # Expand the directory one level: a placeholder per child file.
-              caos get /cas/args/in
-              total=0
-              for child in /cas/args/in/*; do
-                [ -e "$child" ] || continue   # empty directory: glob stays literal
-                caos get "$child"             # expand the placeholder to its bytes
-                total=$((total + $(cat "$child")))
-              done
-            else
-              echo "file-count: a file counts as 1" >&2
-              total=1
-            fi
-
-            # These minimal images ship no /tmp; create it before writing there.
-            mkdir -p /tmp
-            out=/tmp/count
-            printf '%s\n' "$total" > "$out"
-            caos put "$out" /cas/out
-          '';
-        };
+        # (no `caos run`); the compute server injects that URL at runtime. This is
+        # the `worker-file-count` crate, a static binary at /worker — so the image
+        # needs no shell or coreutils.
+        workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
         workerFileCountContents = [
           workerBaseRoot
-          workerFileCountScript
-          pkgs.bashInteractive
-          pkgs.coreutils
+          workerFileCountRoot
         ];
         workerFileCountConfig = {
           Entrypoint = [
@@ -422,12 +334,9 @@
         # CAOS_DEEP_DEPS_IMAGE. Acyclic input only.
         #
         # This worker is the `worker-deep-deps` crate, a static binary placed at
-        # /worker — so, unlike the bash workers, its image needs no shell or
+        # /worker — so, like the other Rust workers, its image needs no shell or
         # coreutils, just caos (installed setuid by installWorkerFiles).
-        workerDeepDepsRoot = pkgs.runCommand "caos-worker-deep-deps-root" { } ''
-          mkdir -p $out
-          cp ${worker-deep-deps}/bin/worker-deep-deps $out/worker
-        '';
+        workerDeepDepsRoot = workerRoot "worker-deep-deps" worker-deep-deps;
         workerDeepDepsContents = [
           workerBaseRoot
           workerDeepDepsRoot

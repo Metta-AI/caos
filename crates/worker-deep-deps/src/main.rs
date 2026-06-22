@@ -13,11 +13,10 @@
 
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::path::Path;
+use std::process::ExitCode;
 
-/// Where `caos entrypoint` materializes this run's arguments.
-const ARGS: &str = "/cas/args";
+use worker_common::{arg, caos, entries, file_name, path, read_arg, read_arg_opt, scratch, ARGS};
 
 /// Env var naming this worker's own image, used for the recursive `caos run`
 /// calls. Defaults to the conventional name/tag as a plain docker image.
@@ -128,45 +127,9 @@ fn deepen_all() -> Result<(), String> {
     caos(["put", path(&work), "/cas/out"])
 }
 
-// --- helpers ---------------------------------------------------------------
-
 /// This worker's own image, for the recursive `caos run` calls.
 fn self_image() -> String {
-    std::env::var(SELF_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_SELF_IMAGE.to_string())
-}
-
-/// Absolute path of an argument under `/cas/args`.
-fn arg(name: &str) -> String {
-    format!("{ARGS}/{name}")
-}
-
-/// Run `caos` with the given arguments, inheriting stdio; error on failure.
-fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
-    let status = Command::new("caos")
-        .args(args)
-        .status()
-        .map_err(|e| format!("running caos: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("caos {} exited with {status}", args.join(" ")))
-    }
-}
-
-/// Fetch and read a blob argument as a trimmed string.
-fn read_arg(name: &str) -> Result<String, String> {
-    caos(["get", &arg(name)])?;
-    let text = fs::read_to_string(arg(name)).map_err(|e| format!("reading {name}: {e}"))?;
-    Ok(text.trim().to_string())
-}
-
-/// Like [`read_arg`], but `Ok(None)` if the argument wasn't passed.
-fn read_arg_opt(name: &str) -> Result<Option<String>, String> {
-    if Path::new(&arg(name)).exists() {
-        read_arg(name).map(Some)
-    } else {
-        Ok(None)
-    }
+    worker_common::self_image(SELF_IMAGE_ENV, DEFAULT_SELF_IMAGE)
 }
 
 /// The non-empty dependency names listed in `<pkg_dir>/DEPS`, or none if absent.
@@ -182,42 +145,4 @@ fn deps_of(pkg_dir: &str) -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-/// (Re)create an empty scratch directory under `/tmp` and return its path.
-fn scratch(name: &str) -> Result<PathBuf, String> {
-    let dir = PathBuf::from(format!("/tmp/{name}"));
-    if let Err(e) = fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(format!("clearing {}: {e}", dir.display()));
-        }
-    }
-    fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Child paths of `dir`, sorted for deterministic ordering.
-fn entries(dir: &str) -> Result<Vec<PathBuf>, String> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
-        .map_err(|e| format!("reading {dir}: {e}"))?
-        .map(|e| {
-            e.map(|e| e.path())
-                .map_err(|e| format!("reading {dir}: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
-    paths.sort();
-    Ok(paths)
-}
-
-/// The final path component of `p` as a string (entries never end in `..`).
-fn file_name(p: &Path) -> String {
-    p.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// `&Path`/`&PathBuf` as a `&str` for passing to `caos` (CAS paths are UTF-8).
-fn path(p: &Path) -> &str {
-    p.to_str().unwrap_or_default()
 }

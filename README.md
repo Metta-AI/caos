@@ -423,9 +423,9 @@ reads its inputs from `/cas/args` and writes its result to `/cas/out` (with
 `caos put`/`get`).
 
 The **`caos-worker-hello`** image (`.#caos-worker-hello-docker`,
-`.#load-caos-worker-hello`) is a real, runnable example: caos + bash + coreutils
-with a `/worker` that copies each `/cas/args` entry into a result directory
-(plus a small `receipt`) and stores it at `/cas/out`. So:
+`.#load-caos-worker-hello`) is a real, runnable example: a tiny static worker
+binary (no shell) with a `/worker` that gathers each `/cas/args` entry into a
+result tree (plus a small `receipt`) and stores it at `/cas/out`. So:
 
 ```bash
 caos put /some/file /cas/in

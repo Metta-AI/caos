@@ -1,0 +1,12 @@
+[package]
+name = "worker-common"
+version = "0.1.0"
+edition = "2021"
+
+# Shared glue for the Rust workers: thin wrappers over the `caos` CLI plus the
+# bits of std file I/O every worker repeats. No dependencies, so workers that use
+# it still build to tiny static binaries needing no shell or coreutils.
+
+[lib]
+name = "worker_common"
+path = "src/lib.rs"
