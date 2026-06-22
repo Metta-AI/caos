@@ -396,6 +396,153 @@
           fakeRootCommands = installWorkerFiles;
         };
 
+        # A "deep-deps" worker: turns a flat, name-keyed package map into a DAG of
+        # deepened nodes. The input `packages` tree holds one subtree per
+        # package, each with a `DEPS` blob (dependency names, one per line). The
+        # output mirrors it, but each node carries a `DEEP-DEPS` subtree of its
+        # recursively-deepened direct deps (which themselves carry DEEP-DEPS).
+        #
+        # Incrementality comes entirely from CAOS call memoization. `--mode` is
+        # optional — omitting it is the simple public API:
+        #   (no mode)       — deepen one package (`--name`): look it up, recurse
+        #                     on its direct deps, hand off to finishDeepening. It
+        #                     takes the whole map (`packages`), so it re-runs on
+        #                     any edit — but that's cheap orchestration, not real
+        #                     recompute. Returns that package's deep node.
+        #   finishDeepening — the memoized boundary: build a node from one
+        #                     package's own content (`pkg`) plus its deepened deps
+        #                     (`deep-deps`). It never sees the map, so its cache
+        #                     key is just this package + its subgraph — a hit
+        #                     unless one of those moved. So real recompute is
+        #                     O(changed package + its dependents).
+        #   all             — top-level convenience: deepen every package.
+        # Like fold it drives the compute server via `caos run`, so it relies on
+        # CAOS_COMPUTE_SERVER_URL (injected) and learns its own image name from
+        # CAOS_DEEP_DEPS_IMAGE. Acyclic input only.
+        workerDeepDepsScript = pkgs.writeTextFile {
+          name = "caos-worker-deep-deps-script";
+          executable = true;
+          destination = "/worker";
+          text = ''
+            #!/bin/bash
+            set -euo pipefail
+
+            self=''${CAOS_DEEP_DEPS_IMAGE:-caos-worker-deep-deps:latest}
+
+            # `--mode` is optional (default = deepen one package). Blob args arrive
+            # as placeholders; `caos get` expands them to bytes the unprivileged
+            # worker can read. Test existence before reading, since mode may be
+            # absent.
+            mode=""
+            if [ -e /cas/args/mode ]; then
+              caos get /cas/args/mode
+              mode=$(cat /cas/args/mode)
+            fi
+
+            case "$mode" in
+              "")
+                # Deepen one package (the public API).
+                caos get /cas/args/name
+                name=$(cat /cas/args/name)
+                # Per-entry lookup: expand the map one level so the child exists,
+                # then this package fully so its DEPS blob is readable.
+                caos get /cas/args/packages
+                caos get -r "/cas/args/packages/$name"
+
+                work=/tmp/deep-deps
+                rm -rf "$work"
+                mkdir -p "$work"
+
+                i=0
+                deps="/cas/args/packages/$name/DEPS"
+                if [ -f "$deps" ]; then
+                  while read -r dep || [ -n "$dep" ]; do
+                    [ -n "$dep" ] || continue
+                    # Deepen the dep with the same image; node lands at /cas/d<i>.
+                    caos run "$self" "/cas/d$i" -- \
+                      --packages=/cas/args/packages --name="$dep"
+                    # Share by hash under the dep's name: B and C both depending
+                    # on D reference the one deepened D node.
+                    ln -s "/cas/d$i" "$work/$dep"
+                    i=$((i + 1))
+                  done < "$deps"
+                fi
+
+                caos put "$work" /cas/deep-deps
+                # Hand off to the content-keyed boundary (no whole-map handle).
+                caos run "$self" /cas/out -- \
+                  --mode=finishDeepening \
+                  --pkg="/cas/args/packages/$name" \
+                  --deep-deps=/cas/deep-deps
+                ;;
+
+              finishDeepening)
+                # Memoized boundary: node = the package's own files (minus DEPS)
+                # plus a DEEP-DEPS subtree of its deepened direct deps.
+                caos get /cas/args/pkg
+                node=/tmp/node
+                rm -rf "$node"
+                mkdir -p "$node"
+                for f in /cas/args/pkg/*; do
+                  [ -e "$f" ] || continue
+                  bn=$(basename "$f")
+                  [ "$bn" = DEPS ] && continue
+                  ln -s "$f" "$node/$bn"
+                done
+                ln -s /cas/args/deep-deps "$node/DEEP-DEPS"
+                caos put "$node" /cas/out
+                ;;
+
+              all)
+                # Deepen every package into a tree {name: node}.
+                caos get /cas/args/packages
+                work=/tmp/all
+                rm -rf "$work"
+                mkdir -p "$work"
+                i=0
+                for pkg in /cas/args/packages/*; do
+                  [ -e "$pkg" ] || continue
+                  name=$(basename "$pkg")
+                  caos run "$self" "/cas/a$i" -- \
+                    --packages=/cas/args/packages --name="$name"
+                  ln -s "/cas/a$i" "$work/$name"
+                  i=$((i + 1))
+                done
+                caos put "$work" /cas/out
+                ;;
+
+              *)
+                echo "deep-deps: unknown mode '$mode'" >&2
+                exit 1
+                ;;
+            esac
+          '';
+        };
+        workerDeepDepsContents = [
+          workerBaseRoot
+          workerDeepDepsScript
+          pkgs.bashInteractive
+          pkgs.coreutils
+        ];
+        workerDeepDepsConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [
+            "PATH=/bin"
+            # caos run defaults to git images, so name the docker image explicitly.
+            "CAOS_DEEP_DEPS_IMAGE=docker://caos-worker-deep-deps:latest"
+          ];
+        };
+        workerDeepDepsImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-deep-deps";
+          tag = "latest";
+          contents = workerDeepDepsContents;
+          config = workerDeepDepsConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
+
         # compute-server runs worker containers by shelling out to the `docker`
         # CLI, so — unlike the minimal images — it bundles the docker client and
         # expects the host's docker socket bind-mounted at /var/run/docker.sock.
@@ -486,6 +633,12 @@
           config = workerFileCountConfig;
           fakeRootCommands = installWorkerFiles;
         };
+        loadWorkerDeepDeps = loadImage {
+          name = "caos-worker-deep-deps";
+          contents = workerDeepDepsContents;
+          config = workerDeepDepsConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
       in
       {
         packages = {
@@ -500,6 +653,7 @@
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-fold-docker = workerFoldImage;
           caos-worker-file-count-docker = workerFileCountImage;
+          caos-worker-deep-deps-docker = workerDeepDepsImage;
         };
 
         apps = {
@@ -531,6 +685,10 @@
           load-caos-worker-file-count = {
             type = "app";
             program = "${loadWorkerFileCount}/bin/load-caos-worker-file-count";
+          };
+          load-caos-worker-deep-deps = {
+            type = "app";
+            program = "${loadWorkerDeepDeps}/bin/load-caos-worker-deep-deps";
           };
         };
 

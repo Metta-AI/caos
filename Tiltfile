@@ -68,6 +68,7 @@ nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/client'])
 nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/client'])
 nix_image('img-worker-fold', 'load-caos-worker-fold', ['crates/client'])
 nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/client'])
+nix_image('img-worker-deep-deps', 'load-caos-worker-deep-deps', ['crates/client'])
 
 # One-time infra: the docker network the daemons and the worker containers the
 # compute server spawns all share. (The object server's git repo is this
