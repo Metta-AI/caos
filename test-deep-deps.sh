@@ -16,10 +16,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Host-side caos: build the client and point it at the dev daemons.
-echo "building caos client + loading deep-deps image..." >&2
+# Host-side caos: build the client and point it at the dev daemons. deep-deps is
+# written as a fold, so both images must be loaded.
+echo "building caos client + loading deep-deps/fold images..." >&2
 nix build .#client -o result-client
 nix run .#load-caos-worker-deep-deps >/dev/null
+nix run .#load-caos-worker-fold >/dev/null
 caos=$PWD/result-client/bin/client
 
 export CAOS_OBJECT_SERVER_URL=${CAOS_OBJECT_SERVER_URL:-http://localhost:8080}
@@ -102,8 +104,9 @@ done
 echo "  ok: a,b,c,d all recomputed (misses: $(misses_since "$since"))" >&2
 
 echo "== Phase D: a dependency cycle is detected (by the compute server) ==" >&2
-# Close a loop: d -> a, so a -> b -> d -> a (and a -> c -> d -> a). The compute
-# server catches the run re-entering the same image+args.
+# Close a loop: d -> a, so a -> b -> d -> a (and a -> c -> d -> a). The fold
+# recursion re-enters the same (fold image, args) and the compute server's
+# run-cycle detection catches it.
 rm -rf "$CAS/pkgs2" "$CAS/cyc"
 printf 'a\n' > "$PKGS/d/DEPS"
 "$caos" put "$PKGS" "$CAS/pkgs2" >/dev/null

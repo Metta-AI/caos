@@ -319,23 +319,30 @@
         # output mirrors it, but each node carries a `DEEP-DEPS` subtree of its
         # recursively-deepened direct deps (which themselves carry DEEP-DEPS).
         #
-        # Incrementality comes entirely from CAOS call memoization. `--mode` is
-        # optional — omitting it is the simple public API:
-        #   (no mode)       — deepen one package (`--name`): look it up, recurse
-        #                     on its direct deps, hand off to finishDeepening. It
-        #                     takes the whole map (`packages`), so it re-runs on
-        #                     any edit — but that's cheap orchestration, not real
-        #                     recompute. Returns that package's deep node.
-        #   finishDeepening — the memoized boundary: build a node from one
-        #                     package's own content (`pkg`) plus its deepened deps
-        #                     (`deep-deps`). It never sees the map, so its cache
-        #                     key is just this package + its subgraph — a hit
-        #                     unless one of those moved. So real recompute is
-        #                     O(changed package + its dependents).
-        #   all             — top-level convenience: deepen every package.
+        # It's written as a fold (caos-worker-fold) over the dependency graph,
+        # with this same image — curried so fold sees plain images — supplying
+        # the fold's two functions. `--mode` is optional; omitting it is the
+        # simple public API:
+        #   (no mode) — deepen one package (`--name`): run fold over it.
+        #   all       — top-level convenience: deepen every package.
+        # The internal modes, reached only via curry by the driver:
+        #   resolve — fold's `pre`, curried with `--packages` (the whole map):
+        #             given a package as `--in`, resolve its `DEPS` names to the
+        #             dep subtrees to recurse into.
+        #   finish  — fold's `post`: given a package as `--in` and its deepened
+        #             deps as `--children`, build the node (the package's files,
+        #             minus DEPS, plus a DEEP-DEPS of the children).
+        # Incrementality comes entirely from CAOS call memoization. The driver
+        # and resolve carry the whole map, so they re-run on any edit — cheap
+        # orchestration. But finish (curried with nothing) is keyed only on a
+        # package and its deepened subgraph, so real recompute is O(changed
+        # package + its dependents). A cycle re-enters the same fold (image,
+        # args) and is caught by the compute server's run-cycle detection.
+        #
         # Like fold it drives the compute server via `caos run`, so it relies on
-        # CAOS_COMPUTE_SERVER_URL (injected) and learns its own image name from
-        # CAOS_DEEP_DEPS_IMAGE. Acyclic input only.
+        # CAOS_COMPUTE_SERVER_URL (injected) and learns its own image (to curry
+        # resolve/finish) from CAOS_DEEP_DEPS_IMAGE and fold's from
+        # CAOS_FOLD_IMAGE.
         #
         # This worker is the `worker-deep-deps` crate, a static binary placed at
         # /worker — so, like the other Rust workers, its image needs no shell or
@@ -352,8 +359,9 @@
           ];
           Env = [
             "PATH=/bin"
-            # caos run defaults to git images, so name the docker image explicitly.
+            # caos run defaults to git images, so name the docker images explicitly.
             "CAOS_DEEP_DEPS_IMAGE=docker://caos-worker-deep-deps:latest"
+            "CAOS_FOLD_IMAGE=docker://caos-worker-fold:latest"
           ];
         };
         workerDeepDepsImage = pkgs.dockerTools.buildLayeredImage {

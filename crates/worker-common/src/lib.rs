@@ -47,6 +47,23 @@ pub fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
     }
 }
 
+/// Run `caos` with the given arguments, capturing its stdout (stderr is
+/// inherited) and returning it trimmed; error on failure. For commands that
+/// print a result — e.g. `caos curry`, whose stdout is the curried image ref.
+pub fn caos_stdout<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let output = Command::new("caos")
+        .args(args)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("running caos: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("caos {} exited with {}", args.join(" "), output.status));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("caos {} stdout not UTF-8: {e}", args.join(" ")))?;
+    Ok(text.trim().to_string())
+}
+
 /// Fetch and read a blob argument as a trimmed string.
 pub fn read_arg(name: &str) -> Result<String, String> {
     caos(["get", &arg(name)])?;
