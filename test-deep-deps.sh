@@ -22,8 +22,8 @@ nix build .#client -o result-client
 nix run .#load-caos-worker-deep-deps >/dev/null
 caos=$PWD/result-client/bin/client
 
-export CAOS_OBJECT_SERVER_URL=http://localhost:8080
-export CAOS_COMPUTE_SERVER_URL=http://localhost:9090
+export CAOS_OBJECT_SERVER_URL=${CAOS_OBJECT_SERVER_URL:-http://localhost:8080}
+export CAOS_COMPUTE_SERVER_URL=${CAOS_COMPUTE_SERVER_URL:-http://localhost:9090}
 # CAS must live on an xattr-capable fs (caos records each path's hash in
 # user.caos.hash); the repo's fs qualifies, /tmp may not.
 CAS=$PWD/.caos-dev/test-cas
@@ -100,5 +100,17 @@ for n in a b c d; do
 done
 [ -e "$CAS/out/d/DEEP-DEPS/x" ] || fail "d should now depend on x"
 echo "  ok: a,b,c,d all recomputed (misses: $(misses_since "$since"))" >&2
+
+echo "== Phase D: a dependency cycle is detected (by the compute server) ==" >&2
+# Close a loop: d -> a, so a -> b -> d -> a (and a -> c -> d -> a). The compute
+# server catches the run re-entering the same image+args.
+rm -rf "$CAS/pkgs2" "$CAS/cyc"
+printf 'a\n' > "$PKGS/d/DEPS"
+"$caos" put "$PKGS" "$CAS/pkgs2" >/dev/null
+if msg=$("$caos" run "$IMG" "$CAS/cyc" -- --mode=all --packages="$CAS/pkgs2" 2>&1); then
+  fail "expected the cyclic graph to fail, but the run succeeded"
+fi
+echo "$msg" | grep -q "run cycle detected" || fail "no cycle reported; got: $msg"
+echo "  ok: run failed with a run-cycle error" >&2
 
 echo "ALL PASS" >&2

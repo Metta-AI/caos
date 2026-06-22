@@ -48,6 +48,9 @@ fn run() -> Result<(), String> {
 /// the whole `--packages` map. Recurses on each direct dep, then hands off to
 /// the memoized `finishDeepening` boundary. Because it takes the whole map it
 /// re-runs on any edit — but that's cheap orchestration, not real recompute.
+///
+/// A dependency cycle is caught by the compute server (it re-enters the same
+/// image+args), so nothing is needed here.
 fn deepen_one() -> Result<(), String> {
     let name = read_arg("name")?;
 

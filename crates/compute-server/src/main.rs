@@ -91,6 +91,13 @@ const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 /// The caos binary inside every compute image, forced as the entrypoint.
 const CAOS_BIN: &str = "/bin/caos";
 
+/// Env var carrying the run stack — the newline-separated `(image, args)`
+/// computations currently in progress. We set it on each spawned worker (this
+/// computation appended); `caos run` echoes it back via the `stack` query param
+/// so we can catch a run that re-enters a computation already on the stack.
+/// Threaded through env, never the args tree, so it doesn't affect the cache key.
+const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
+
 /// Runtime configuration, read once from the environment at startup.
 struct Config {
     network: String,
@@ -245,6 +252,31 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         Err(e) => eprintln!("cache lookup failed ({e}); running worker: image={image} args={args}"),
     }
 
+    // Cycle detection (system-level): the run stack is the chain of (image,args)
+    // computations currently in progress, threaded through nested runs via the
+    // CAOS_RUN_STACK env var (echoed back as the `stack` param). Re-entering a
+    // computation already on the stack has no fixpoint — fail, listing the cycle.
+    // (The cache hit above can't be on the stack: a computation inside a cycle
+    // never completes, so it never caches — which is why checking only on a miss
+    // is sound.) This frame's identity is exactly the cache key's (image, args).
+    let incoming = query_param(query, "stack").unwrap_or_default();
+    let frame = format!("{image} {args}");
+    let stack: Vec<&str> = incoming.lines().filter(|l| !l.is_empty()).collect();
+    if let Some(pos) = stack.iter().position(|&f| f == frame) {
+        let mut cycle: Vec<&str> = stack[pos..].to_vec();
+        cycle.push(&frame);
+        let listing = cycle.join("\n  -> ");
+        eprintln!("run cycle detected:\n  {listing}");
+        return Err(HttpError::new(
+            400,
+            format!("run cycle detected:\n  {listing}"),
+        ));
+    }
+    // Child runs see this computation as an ancestor.
+    let mut child_stack: Vec<&str> = stack.clone();
+    child_stack.push(&frame);
+    let child_stack = child_stack.join("\n");
+
     // Resolve to a reference the host's docker daemon can run: a `docker://`
     // image is used directly; one of our git images is converted to a real image,
     // pushed to the registry, and referenced by digest.
@@ -262,6 +294,7 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
             "-e",
             &format!("CAOS_COMPUTE_SERVER_URL={}", config.compute_server_url),
         ])
+        .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&docker_ref)
         .arg("entrypoint")
