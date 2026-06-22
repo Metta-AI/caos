@@ -13,8 +13,9 @@
 //! worker needs no `cp`/coreutils — and so no shell in its image.
 
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
 /// Where `caos entrypoint` materializes this run's arguments.
 pub const ARGS: &str = "/cas/args";
@@ -34,8 +35,53 @@ pub fn self_image(env: &str, default: &str) -> String {
     }
 }
 
+/// A worker's `main`: run `run`, map its `Result` to an exit code, and prefix any
+/// error with the worker's `name`. Every worker is `fn main() -> ExitCode {
+/// worker_common::run_worker("name", run) }`.
+pub fn run_worker(name: &str, run: fn() -> Result<(), String>) -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{name}: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Run `caos` with the given arguments, inheriting stdio; error on failure.
 pub fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
+    caos_argv(&args)
+}
+
+/// `caos run <image> <out> -- --name=value …` — run `image` over the given named
+/// arguments, leaving its result at `out`.
+pub fn caos_run(image: &str, out: &str, args: &[(&str, &str)]) -> Result<(), String> {
+    let argv = verb_argv("run", image, Some(out), args);
+    caos_argv(&str_refs(&argv))
+}
+
+/// `caos curry <image> -- --name=value …` — bind the given named arguments to
+/// `image`, returning a ref to the resulting curried image.
+pub fn caos_curry(image: &str, args: &[(&str, &str)]) -> Result<String, String> {
+    let argv = verb_argv("curry", image, None, args);
+    caos_capture(&str_refs(&argv))
+}
+
+/// Build a `caos <verb> <image> [<out>] -- --name=value …` argument vector.
+fn verb_argv(verb: &str, image: &str, out: Option<&str>, args: &[(&str, &str)]) -> Vec<String> {
+    let mut argv = vec![verb.to_string(), image.to_string()];
+    argv.extend(out.map(str::to_string));
+    argv.push("--".to_string());
+    argv.extend(args.iter().map(|(k, v)| format!("--{k}={v}")));
+    argv
+}
+
+fn str_refs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// Run `caos`, inheriting stdio; error on failure. Slice form behind [`caos`].
+fn caos_argv(args: &[&str]) -> Result<(), String> {
     let status = Command::new("caos")
         .args(args)
         .status()
@@ -47,10 +93,9 @@ pub fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
     }
 }
 
-/// Run `caos` with the given arguments, capturing its stdout (stderr is
-/// inherited) and returning it trimmed; error on failure. For commands that
-/// print a result — e.g. `caos curry`, whose stdout is the curried image ref.
-pub fn caos_stdout<const N: usize>(args: [&str; N]) -> Result<String, String> {
+/// Run `caos`, capturing its stdout (stderr inherited) and returning it trimmed;
+/// error on failure. For commands whose stdout is a result, e.g. `caos curry`.
+fn caos_capture(args: &[&str]) -> Result<String, String> {
     let output = Command::new("caos")
         .args(args)
         .stderr(std::process::Stdio::inherit())
@@ -59,9 +104,9 @@ pub fn caos_stdout<const N: usize>(args: [&str; N]) -> Result<String, String> {
     if !output.status.success() {
         return Err(format!("caos {} exited with {}", args.join(" "), output.status));
     }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|e| format!("caos {} stdout not UTF-8: {e}", args.join(" ")))?;
-    Ok(text.trim().to_string())
+    String::from_utf8(output.stdout)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("caos {} stdout not UTF-8: {e}", args.join(" ")))
 }
 
 /// Fetch and read a blob argument as a trimmed string.
@@ -90,6 +135,14 @@ pub fn scratch(name: &str) -> Result<PathBuf, String> {
     }
     fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+/// Symlink `at` -> `target`, for staging an already-fetched CAS path into a
+/// scratch tree before `caos put` (which resolves the link to the content's
+/// recorded hash, so nothing is re-read).
+pub fn link(target: impl AsRef<Path>, at: impl AsRef<Path>) -> Result<(), String> {
+    let (target, at) = (target.as_ref(), at.as_ref());
+    symlink(target, at).map_err(|e| format!("symlink {} -> {}: {e}", at.display(), target.display()))
 }
 
 /// Child paths of `dir`, sorted for deterministic ordering.

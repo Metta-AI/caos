@@ -12,16 +12,10 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use worker_common::{arg, caos, entries, path, scratch};
+use worker_common::{arg, caos, entries, path, run_worker, scratch};
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("file-count: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    run_worker("file-count", run)
 }
 
 fn run() -> Result<(), String> {

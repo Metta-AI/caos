@@ -19,12 +19,12 @@
 //! (injected by the compute server) and learns its own image name, for the
 //! recursive call, from `CAOS_FOLD_IMAGE`.
 
-use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, entries, file_name, path, read_arg, read_arg_opt, scratch, self_image,
+    arg, caos, caos_run, entries, file_name, link, path, read_arg, read_arg_opt, run_worker,
+    scratch, self_image,
 };
 
 /// Env var naming this worker's own image, used for the recursive `caos run`
@@ -33,13 +33,7 @@ const SELF_IMAGE_ENV: &str = "CAOS_FOLD_IMAGE";
 const DEFAULT_SELF_IMAGE: &str = "docker://caos-worker-fold:latest";
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("fold: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    run_worker("fold", run)
 }
 
 fn run() -> Result<(), String> {
@@ -54,7 +48,7 @@ fn run() -> Result<(), String> {
     // input's own children — and a plain file has none, so it's a leaf.
     let children = if let Some(pre) = &pre {
         eprintln!("fold: applying pre {pre} to {in_path}");
-        caos(["run", pre, "/cas/pre", "--", &format!("--in={in_path}")])?;
+        caos_run(pre, "/cas/pre", &[("in", &in_path)])?;
         caos(["get", "/cas/pre"])?; // one level: a placeholder per child
         entries("/cas/pre")?
     } else if Path::new(&in_path).is_dir() {
@@ -69,29 +63,20 @@ fn run() -> Result<(), String> {
     for (i, child) in children.iter().enumerate() {
         let name = file_name(child);
         let node = format!("/cas/c{i}");
-        let in_arg = format!("--in={}", path(child));
-        let post_arg = format!("--post={post}");
+        // Thread pre (if any) and post through unchanged; recurse on the child.
+        let mut fold_args = vec![("post", post.as_str()), ("in", path(child))];
         if let Some(pre) = &pre {
-            let pre_arg = format!("--pre={pre}");
-            caos(["run", &fold_image, &node, "--", &pre_arg, &post_arg, &in_arg])?;
-        } else {
-            caos(["run", &fold_image, &node, "--", &post_arg, &in_arg])?;
+            fold_args.insert(0, ("pre", pre));
         }
-        // Symlink into the CAS so `caos put` reuses the result's recorded hash
-        // (no content re-read) under the child's original name.
-        symlink(&node, work.join(&name)).map_err(|e| format!("symlink {name}: {e}"))?;
+        caos_run(&fold_image, &node, &fold_args)?;
+        // Link into the CAS so `caos put` reuses the result's recorded hash (no
+        // content re-read) under the child's original name.
+        link(&node, work.join(&name))?;
         eprintln!("  folded {name} -> {node}");
     }
 
     // Assemble the folded children, then combine them with `post` over (`in`,
     // children). A leaf passes an empty children tree.
     caos(["put", path(&work), "/cas/children"])?;
-    caos([
-        "run",
-        &post,
-        "/cas/out",
-        "--",
-        &format!("--in={in_path}"),
-        "--children=/cas/children",
-    ])
+    caos_run(&post, "/cas/out", &[("in", &in_path), ("children", "/cas/children")])
 }

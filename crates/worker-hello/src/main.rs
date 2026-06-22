@@ -8,19 +8,12 @@
 //! hash, so nothing is re-read. Only `receipt` is a real file.
 
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::process::ExitCode;
 
-use worker_common::{caos, entries, file_name, path, scratch, ARGS};
+use worker_common::{caos, entries, file_name, link, path, run_worker, scratch, ARGS};
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("hello: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    run_worker("hello", run)
 }
 
 fn run() -> Result<(), String> {
@@ -30,7 +23,7 @@ fn run() -> Result<(), String> {
     for entry in entries(ARGS)? {
         let name = file_name(&entry);
         caos(["get", path(&entry)])?; // expand the placeholder to real content
-        symlink(&entry, out.join(&name)).map_err(|e| format!("symlink {name}: {e}"))?;
+        link(&entry, out.join(&name))?;
         eprintln!("  saw {name}");
         receipt.push_str(&format!("saw {name}\n"));
     }

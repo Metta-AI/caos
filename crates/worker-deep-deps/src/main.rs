@@ -4,35 +4,29 @@
 //! it, but every node carries a `DEEP-DEPS` subtree of its recursively-deepened
 //! direct deps (which themselves carry `DEEP-DEPS`).
 //!
-//! It's written as a fold (`caos-worker-fold`) over the dependency graph, with
-//! this same image supplying the fold's two functions — curried so the fold
-//! treats them as plain images:
-//!   * `--mode=resolve` is the fold's `pre`, curried with `--packages` (the whole
-//!     map): given a package subtree as `--in`, it resolves that package's `DEPS`
-//!     names to the dep subtrees to recurse into.
-//!   * `--mode=finish` is the fold's `post`: given a package subtree as `--in`
-//!     and its deepened deps as `--children`, it builds the node (the package's
-//!     own files, minus `DEPS`, plus a `DEEP-DEPS` of the children).
+//! It's a fold (`caos-worker-fold`) over the dependency graph, with this same
+//! image supplying the fold's two functions — curried so the fold treats them as
+//! plain images (see `fold_functions`):
+//!   * `resolve` is the fold's `pre`, curried with the whole map: given a package
+//!     as `--in`, it resolves that package's `DEPS` names to the dep subtrees to
+//!     recurse into.
+//!   * `finish` is the fold's `post`: given a package as `--in` and its deepened
+//!     deps as `--children`, it builds the node.
 //!
-//! Incrementality comes entirely from CAOS call memoization. The driver and
-//! `resolve` carry the whole map, so they re-run on any edit — cheap
-//! orchestration. But `finish` (curried with nothing) is keyed only on a package
-//! and its deepened subgraph, so real recompute is O(changed package + its
-//! dependents). A dependency cycle re-enters the same fold `(image, args)` and is
-//! caught by the compute server's run-cycle detection.
-//!
-//! This is a `/worker`: it reads inputs from `/cas/args`, shells out to `caos`
-//! for every CAS operation, and leaves its result at `/cas/out`. It learns its
-//! own image (to curry `resolve`/`finish`) from `CAOS_DEEP_DEPS_IMAGE` and the
-//! fold image from `CAOS_FOLD_IMAGE`.
+//! Incrementality comes from CAOS call memoization. The driver and `resolve`
+//! carry the whole map, so they re-run on any edit — cheap orchestration. But
+//! `finish` (curried with nothing) is keyed only on a package and its deepened
+//! subgraph, so real recompute is O(changed package + its dependents). A cycle
+//! re-enters the same fold `(image, args)` and is caught by the compute server's
+//! run-cycle detection.
 
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, caos_stdout, entries, file_name, path, read_arg_opt, scratch, self_image, ARGS,
+    arg, caos, caos_curry, caos_run, entries, file_name, link, path, read_arg_opt, run_worker,
+    scratch, self_image, ARGS,
 };
 
 /// Env var naming this worker's own image, curried into the fold's `pre`/`post`.
@@ -44,19 +38,13 @@ const FOLD_IMAGE_ENV: &str = "CAOS_FOLD_IMAGE";
 const DEFAULT_FOLD_IMAGE: &str = "docker://caos-worker-fold:latest";
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("deep-deps: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    run_worker("deep-deps", run)
 }
 
 fn run() -> Result<(), String> {
     // `--mode` is optional; omitting it is the simple public API (deepen one
-    // package). The internal `resolve`/`finish` modes are reached via curry by
-    // the driver, never passed by a caller directly.
+    // package). The internal `resolve`/`finish` modes are reached only via curry
+    // by the driver, never passed by a caller directly.
     match read_arg_opt("mode")?.as_deref() {
         None | Some("") => deepen_one(),
         Some("all") => deepen_all(),
@@ -66,68 +54,10 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// Default mode: deepen the single package `--name` from the `--packages` map,
-/// leaving its node at `/cas/out`.
-fn deepen_one() -> Result<(), String> {
-    let name = read_arg_opt("name")?.ok_or("deepen: --name is required")?;
-    let fold = self_image(FOLD_IMAGE_ENV, DEFAULT_FOLD_IMAGE);
-    let (pre, post) = fold_functions()?;
+// ---- the fold algebra: how one package becomes a deepened node ----------------
 
-    caos(["get", &arg("packages")])?; // one level: a placeholder per package
-    let in_pkg = format!("--in={ARGS}/packages/{name}");
-    caos([
-        "run",
-        &fold,
-        "/cas/out",
-        "--",
-        &format!("--pre={pre}"),
-        &format!("--post={post}"),
-        &in_pkg,
-    ])
-}
-
-/// Top-level convenience: deepen every package into a tree `{name: node}`.
-fn deepen_all() -> Result<(), String> {
-    let fold = self_image(FOLD_IMAGE_ENV, DEFAULT_FOLD_IMAGE);
-    let (pre, post) = fold_functions()?;
-
-    caos(["get", &arg("packages")])?;
-    let work = scratch("all")?;
-    for (i, pkg) in entries(&arg("packages"))?.iter().enumerate() {
-        let name = file_name(pkg);
-        let node = format!("/cas/a{i}");
-        caos([
-            "run",
-            &fold,
-            &node,
-            "--",
-            &format!("--pre={pre}"),
-            &format!("--post={post}"),
-            &format!("--in={}", path(pkg)),
-        ])?;
-        symlink(&node, work.join(&name)).map_err(|e| format!("symlink {name}: {e}"))?;
-    }
-    caos(["put", path(&work), "/cas/out"])
-}
-
-/// Curry this image into the fold's `pre` (`resolve`, carrying the whole map) and
-/// `post` (`finish`), returning refs to both. `resolve` carries `--packages` so
-/// it can look up dep names; `finish` carries nothing, keeping it map-free.
-fn fold_functions() -> Result<(String, String), String> {
-    let me = self_image(SELF_IMAGE_ENV, DEFAULT_SELF_IMAGE);
-    let pre = caos_stdout([
-        "curry",
-        &me,
-        "--",
-        "--mode=resolve",
-        &format!("--packages={}", arg("packages")),
-    ])?;
-    let post = caos_stdout(["curry", &me, "--", "--mode=finish"])?;
-    Ok((pre, post))
-}
-
-/// The fold's `pre`: given a package subtree as `--in` and the whole map as
-/// `--packages` (curried), produce the tree of dep subtrees to recurse into —
+/// The fold's `pre`: given a package as `--in` and the whole map as `--packages`
+/// (curried in), produce the tree of dep subtrees to recurse into —
 /// `{dep: <map[dep] subtree>}`, one per name in the package's `DEPS`. Sharing is
 /// by hash, so a dep reached from two parents is one node.
 fn resolve() -> Result<(), String> {
@@ -139,7 +69,7 @@ fn resolve() -> Result<(), String> {
         if !Path::new(&target).exists() {
             return Err(format!("dependency {dep:?} is not in the package map"));
         }
-        symlink(&target, work.join(&dep)).map_err(|e| format!("symlink {dep}: {e}"))?;
+        link(&target, work.join(&dep))?;
     }
     caos(["put", path(&work), "/cas/out"])
 }
@@ -156,9 +86,9 @@ fn finish() -> Result<(), String> {
         if name == "DEPS" {
             continue; // replaced by DEEP-DEPS
         }
-        symlink(&entry, node.join(&name)).map_err(|e| format!("symlink {name}: {e}"))?;
+        link(&entry, node.join(&name))?;
     }
-    symlink(arg("children"), node.join("DEEP-DEPS")).map_err(|e| format!("symlink deps: {e}"))?;
+    link(arg("children"), node.join("DEEP-DEPS"))?;
     caos(["put", path(&node), "/cas/out"])
 }
 
@@ -177,4 +107,56 @@ fn deps_of(pkg_dir: &str) -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+// ---- the driver: fold the algebra over the package map -----------------------
+
+/// Default mode: deepen the single package `--name` from the `--packages` map,
+/// leaving its node at `/cas/out`.
+fn deepen_one() -> Result<(), String> {
+    let name = read_arg_opt("name")?.ok_or("deepen: --name is required")?;
+    caos(["get", &arg("packages")])?; // one level: a placeholder per package
+    let (pre, post) = fold_functions()?;
+    let in_pkg = format!("{ARGS}/packages/{name}");
+    caos_run(
+        &fold_image(),
+        "/cas/out",
+        &[("pre", &pre), ("post", &post), ("in", &in_pkg)],
+    )
+}
+
+/// Top-level convenience: deepen every package into a tree `{name: node}`.
+fn deepen_all() -> Result<(), String> {
+    caos(["get", &arg("packages")])?;
+    let (pre, post) = fold_functions()?;
+    let work = scratch("all")?;
+    for (i, pkg) in entries(&arg("packages"))?.iter().enumerate() {
+        let node = format!("/cas/a{i}");
+        caos_run(
+            &fold_image(),
+            &node,
+            &[("pre", &pre), ("post", &post), ("in", path(pkg))],
+        )?;
+        link(&node, work.join(file_name(pkg)))?;
+    }
+    caos(["put", path(&work), "/cas/out"])
+}
+
+/// Curry this image into the fold's `pre` (`resolve`, carrying the whole map) and
+/// `post` (`finish`). Currying the map into `pre` is what keeps it out of
+/// `finish`'s cache key.
+fn fold_functions() -> Result<(String, String), String> {
+    let pre = caos_curry(&me(), &[("mode", "resolve"), ("packages", &arg("packages"))])?;
+    let post = caos_curry(&me(), &[("mode", "finish")])?;
+    Ok((pre, post))
+}
+
+/// This image, for currying `resolve`/`finish`.
+fn me() -> String {
+    self_image(SELF_IMAGE_ENV, DEFAULT_SELF_IMAGE)
+}
+
+/// The fold worker's image, which the driver runs.
+fn fold_image() -> String {
+    self_image(FOLD_IMAGE_ENV, DEFAULT_FOLD_IMAGE)
 }
