@@ -243,15 +243,19 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # A recursive "fold" worker — a catamorphism over a CAS tree. Two args:
-        #   func — the worker image to apply (the "algebra"), a literal value
-        #   in   — the file or tree to fold over, a CAS path
-        # Given a file it runs `func` on it. Given a tree it folds each child
-        # with itself (the same func), assembles the results into a tree with
-        # the original child names, then runs `func` on that tree. Like every
-        # worker, the applied image takes its single input as `--in`; the result
+        # A recursive "fold" worker — a catamorphism over a CAS tree. Args:
+        #   pre  — (optional) image applied to `in` to produce the tree of
+        #          children to fold; omitted means the structural default (a
+        #          tree's own children; a file is a childless leaf).
+        #   post — image applied to `in` plus `--children` (the folded child
+        #          results, by name) to combine them into this node's result.
+        #   in   — the file or tree to fold over, a CAS path.
+        # So fold decides a node's children (via pre, or structurally), folds
+        # each child with itself (the same pre/post), then combines them with
+        # post. pre/post are image refs — often curried with the context they
+        # need — and the applied images take their input as `--in`; the result
         # is left at /cas/out. Unlike the other workers it drives the compute
-        # server via `caos run` — both to apply `func` and to recurse — so it
+        # server via `caos run` — both to apply pre/post and to recurse — so it
         # relies on CAOS_COMPUTE_SERVER_URL (injected by the compute server) and
         # learns its own image name, for the recursive call, from CAOS_FOLD_IMAGE.
         # This is the `worker-fold` crate, a static binary at /worker — so the
@@ -280,15 +284,15 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # A "file-count" worker: a leaf algebra meant to be driven by the fold
-        # worker. Its single input arrives as `--in`. A file counts as 1; a
-        # directory (assumed to hold only files, each containing a number — e.g.
-        # the per-child counts fold assembles) returns their sum. The result, a
-        # blob holding the count, is left at /cas/out. So folding a tree with
-        # this image totals the leaf files. It only touches the object server
-        # (no `caos run`); the compute server injects that URL at runtime. This is
-        # the `worker-file-count` crate, a static binary at /worker — so the image
-        # needs no shell or coreutils.
+        # A "file-count" worker: a leaf algebra meant to drive fold as its
+        # `post`. It gets the node as `--in` and the folded child results as
+        # `--children`. A file (a leaf) counts as 1; otherwise it returns the sum
+        # of its child counts (each `--children` entry holds a number). The
+        # result, a blob holding the count, is left at /cas/out. So
+        # `fold --post=file-count` over a tree totals its leaf files. It only
+        # touches the object server (no `caos run`); the compute server injects
+        # that URL at runtime. This is the `worker-file-count` crate, a static
+        # binary at /worker — so the image needs no shell or coreutils.
         workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
         workerFileCountContents = [
           workerBaseRoot
