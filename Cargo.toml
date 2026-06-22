@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/client", "crates/object-server", "crates/compute-server"]
+members = [
+    "crates/client",
+    "crates/object-server",
+    "crates/compute-server",
+    "crates/worker-deep-deps",
+]
 
 # Name for crane's workspace-level derivations (fmt/test) so it doesn't warn
 # about a missing package name at the workspace root.

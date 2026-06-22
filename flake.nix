@@ -82,6 +82,7 @@
         client = crateBin "client";
         object-server = crateBin "object-server";
         compute-server = crateBin "compute-server";
+        worker-deep-deps = crateBin "worker-deep-deps";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (client, object-server) but
@@ -419,110 +420,17 @@
         # Like fold it drives the compute server via `caos run`, so it relies on
         # CAOS_COMPUTE_SERVER_URL (injected) and learns its own image name from
         # CAOS_DEEP_DEPS_IMAGE. Acyclic input only.
-        workerDeepDepsScript = pkgs.writeTextFile {
-          name = "caos-worker-deep-deps-script";
-          executable = true;
-          destination = "/worker";
-          text = ''
-            #!/bin/bash
-            set -euo pipefail
-
-            self=''${CAOS_DEEP_DEPS_IMAGE:-caos-worker-deep-deps:latest}
-
-            # `--mode` is optional (default = deepen one package). Blob args arrive
-            # as placeholders; `caos get` expands them to bytes the unprivileged
-            # worker can read. Test existence before reading, since mode may be
-            # absent.
-            mode=""
-            if [ -e /cas/args/mode ]; then
-              caos get /cas/args/mode
-              mode=$(cat /cas/args/mode)
-            fi
-
-            case "$mode" in
-              "")
-                # Deepen one package (the public API).
-                caos get /cas/args/name
-                name=$(cat /cas/args/name)
-                # Per-entry lookup: expand the map one level so the child exists,
-                # then this package fully so its DEPS blob is readable.
-                caos get /cas/args/packages
-                caos get -r "/cas/args/packages/$name"
-
-                work=/tmp/deep-deps
-                rm -rf "$work"
-                mkdir -p "$work"
-
-                i=0
-                deps="/cas/args/packages/$name/DEPS"
-                if [ -f "$deps" ]; then
-                  while read -r dep || [ -n "$dep" ]; do
-                    [ -n "$dep" ] || continue
-                    # Deepen the dep with the same image; node lands at /cas/d<i>.
-                    caos run "$self" "/cas/d$i" -- \
-                      --packages=/cas/args/packages --name="$dep"
-                    # Share by hash under the dep's name: B and C both depending
-                    # on D reference the one deepened D node.
-                    ln -s "/cas/d$i" "$work/$dep"
-                    i=$((i + 1))
-                  done < "$deps"
-                fi
-
-                caos put "$work" /cas/deep-deps
-                # Hand off to the content-keyed boundary (no whole-map handle).
-                caos run "$self" /cas/out -- \
-                  --mode=finishDeepening \
-                  --pkg="/cas/args/packages/$name" \
-                  --deep-deps=/cas/deep-deps
-                ;;
-
-              finishDeepening)
-                # Memoized boundary: node = the package's own files (minus DEPS)
-                # plus a DEEP-DEPS subtree of its deepened direct deps.
-                caos get /cas/args/pkg
-                node=/tmp/node
-                rm -rf "$node"
-                mkdir -p "$node"
-                for f in /cas/args/pkg/*; do
-                  [ -e "$f" ] || continue
-                  bn=$(basename "$f")
-                  [ "$bn" = DEPS ] && continue
-                  ln -s "$f" "$node/$bn"
-                done
-                ln -s /cas/args/deep-deps "$node/DEEP-DEPS"
-                caos put "$node" /cas/out
-                ;;
-
-              all)
-                # Deepen every package into a tree {name: node}.
-                caos get /cas/args/packages
-                work=/tmp/all
-                rm -rf "$work"
-                mkdir -p "$work"
-                i=0
-                for pkg in /cas/args/packages/*; do
-                  [ -e "$pkg" ] || continue
-                  name=$(basename "$pkg")
-                  caos run "$self" "/cas/a$i" -- \
-                    --packages=/cas/args/packages --name="$name"
-                  ln -s "/cas/a$i" "$work/$name"
-                  i=$((i + 1))
-                done
-                caos put "$work" /cas/out
-                ;;
-
-              *)
-                echo "deep-deps: unknown mode '$mode'" >&2
-                exit 1
-                ;;
-            esac
-          '';
-        };
+        #
+        # This worker is the `worker-deep-deps` crate, a static binary placed at
+        # /worker — so, unlike the bash workers, its image needs no shell or
+        # coreutils, just caos (installed setuid by installWorkerFiles).
+        workerDeepDepsRoot = pkgs.runCommand "caos-worker-deep-deps-root" { } ''
+          mkdir -p $out
+          cp ${worker-deep-deps}/bin/worker-deep-deps $out/worker
+        '';
         workerDeepDepsContents = [
           workerBaseRoot
-          workerDeepDepsScript
-          pkgs.bashInteractive
-          pkgs.coreutils
+          workerDeepDepsRoot
         ];
         workerDeepDepsConfig = {
           Entrypoint = [
