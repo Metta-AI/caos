@@ -37,12 +37,7 @@ rm -rf "$CAS"; mkdir -p "$CAS"
 export CAOS_CAS_DIR=$CAS
 trap 'rm -rf "$CAS"' EXIT
 
-image_attr() { # std name -> nix docker image attribute
-  case "$1" in
-    base) echo caos-worker-base-docker ;;
-    *) echo "caos-worker-$1-docker" ;;
-  esac
-}
+image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
 
 # Build + import each builtin, collecting `git mktree` lines (name -> tree hash).
 # `import-image` (run inside the client repo, so its git transport finds it)
