@@ -124,6 +124,18 @@ pub trait Transport {
     fn ensure_pushed(&self, _hash: &str) -> Result<(), String> {
         Ok(())
     }
+
+    /// Ingest the filesystem path named by an arg `value` into the store, if this
+    /// transport does host-path ingestion — returning its `(mode, oid)`. The
+    /// default is `Ok(None)`: the worker has no host filesystem to read (only
+    /// `/cas`), so it treats a non-CAS value as a literal. The git transport
+    /// overrides this to reuse git's recorded objects (see its impl).
+    fn ingest_path(
+        &self,
+        _value: &str,
+    ) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, String> {
+        Ok(None)
+    }
 }
 
 /// Transport over the server's HTTP object API (`GET`/`POST /object`). Used by
@@ -253,13 +265,143 @@ impl Transport for GitTransport {
         run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
             .map_err(|e| format!("pushing {hash} to {CAOS_REMOTE}: {e}"))
     }
+
+    fn ingest_path(
+        &self,
+        value: &str,
+    ) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, String> {
+        let path = Path::new(value);
+        if !path.exists() {
+            return Ok(None); // not a path — the caller stores it as a literal blob
+        }
+        self.git_ingest(path).map(Some)
+    }
+}
+
+impl GitTransport {
+    /// Hash a filesystem path into the local repo, reusing git's recorded objects.
+    /// A clean, tracked path keeps its committed hash with no read at all; a dirty
+    /// or untracked one is hashed now — and for a directory only its *changed*
+    /// files are re-read, the rest reusing their cached hash via a throwaway copy
+    /// of the index (the same trick `git stash`/`commit` use). A path outside the
+    /// worktree has no index to diff against, so it's read in full.
+    fn git_ingest(&self, path: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+        use gix::objs::tree::EntryKind;
+        let abs = path
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let rel = self
+            .repo
+            .workdir()
+            .and_then(|w| abs.strip_prefix(w).ok())
+            .map(Path::to_path_buf);
+
+        if let Some(rel) = &rel {
+            // Inside the worktree: reuse git's objects where we can.
+            if self.is_clean(&abs)? {
+                return self.tracked_entry(&abs); // committed hash, no read
+            }
+            if abs.is_dir() {
+                return self.hash_dir(&abs, rel); // incremental: only changed files
+            }
+        }
+
+        // A file (anywhere) hashes directly; a directory outside the worktree we
+        // read in full (`store` walks it and writes objects via `put_object`).
+        if abs.is_dir() {
+            store(self, &PathBuf::from("/\0"), &abs)
+        } else {
+            let oid = self.hash_file(&abs)?;
+            let exec = std::fs::metadata(&abs)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            let kind = if exec {
+                EntryKind::BlobExecutable
+            } else {
+                EntryKind::Blob
+            };
+            Ok((kind.into(), oid))
+        }
+    }
+
+    /// Whether `abs` (inside the worktree) is clean and tracked — `git status`
+    /// reports nothing for it (a dirty or untracked path is non-empty).
+    fn is_clean(&self, abs: &Path) -> Result<bool, String> {
+        let out = git_capture(
+            &["status", "--porcelain", "--", &abs.to_string_lossy()],
+            None,
+        )?;
+        Ok(out.trim().is_empty())
+    }
+
+    /// The `(mode, oid)` git records for a clean tracked path, read from `HEAD`
+    /// (`ls-tree` prints `<mode> <type> <hash>\t<name>`). No file is read.
+    fn tracked_entry(
+        &self,
+        abs: &Path,
+    ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+        let out = git_capture(&["ls-tree", "HEAD", "--", &abs.to_string_lossy()], None)?;
+        let line = out
+            .lines()
+            .next()
+            .ok_or_else(|| format!("{} not found in HEAD", abs.display()))?;
+        let meta = line.split('\t').next().unwrap_or("");
+        let mut fields = meta.split_whitespace();
+        let mode = fields.next().unwrap_or("");
+        let _kind = fields.next();
+        let hash = fields.next().unwrap_or("");
+        Ok((mode_from_git(mode)?, parse_oid(hash)?))
+    }
+
+    /// Hash a single file into the repo (`git hash-object -w`), returning its oid.
+    fn hash_file(&self, abs: &Path) -> Result<gix::ObjectId, String> {
+        let out = git_capture(&["hash-object", "-w", "--", &abs.to_string_lossy()], None)?;
+        parse_oid(out.trim())
+    }
+
+    /// Hash a dirty/untracked directory `abs` (worktree-relative `rel`) into the
+    /// repo, re-reading only its changed files. We copy the real index to a
+    /// throwaway one (inheriting its stat-cache), `git add` the directory there,
+    /// then `write-tree --prefix` to read back just that subtree.
+    fn hash_dir(
+        &self,
+        abs: &Path,
+        rel: &Path,
+    ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+        use gix::objs::tree::EntryKind;
+        let tmp = temp_index_path()?;
+        let real_index = self.git_dir.join("index");
+        if real_index.exists() {
+            std::fs::copy(&real_index, &tmp).map_err(|e| format!("copying index: {e}"))?;
+        }
+        let oid = (|| {
+            git_capture(&["add", "--", &abs.to_string_lossy()], Some(&tmp))?;
+            let prefix = format!("--prefix={}/", rel.to_string_lossy());
+            let tree = git_capture(&["write-tree", &prefix], Some(&tmp))?;
+            parse_oid(tree.trim())
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        Ok((EntryKind::Tree.into(), oid?))
+    }
 }
 
 /// Run `git` (in the current working directory, i.e. the working repo) for the
 /// network steps gix doesn't drive for us (push/fetch over smart-HTTP).
 fn run_git(args: &[&str]) -> Result<(), String> {
-    let output = std::process::Command::new("git")
-        .args(args)
+    git_capture(args, None).map(|_| ())
+}
+
+/// Run `git` in the working repo and return its stdout; error on failure. With
+/// `index` set, `GIT_INDEX_FILE` points at a throwaway index (so `git add` /
+/// `write-tree` don't touch the real one). Used for both the network steps and
+/// the path-ingestion plumbing.
+fn git_capture(args: &[&str], index: Option<&Path>) -> Result<String, String> {
+    let mut command = std::process::Command::new("git");
+    command.args(args);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command
         .output()
         .map_err(|e| format!("running git {}: {e}", args.join(" ")))?;
     if !output.status.success() {
@@ -269,7 +411,30 @@ fn run_git(args: &[&str]) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Map a git tree-entry mode string (as `ls-tree` prints it) to a gix `EntryMode`.
+fn mode_from_git(mode: &str) -> Result<gix::objs::tree::EntryMode, String> {
+    use gix::objs::tree::EntryKind;
+    let kind = match mode {
+        "40000" | "040000" => EntryKind::Tree,
+        "100644" => EntryKind::Blob,
+        "100755" => EntryKind::BlobExecutable,
+        "120000" => EntryKind::Link,
+        "160000" => EntryKind::Commit,
+        other => return Err(format!("unknown git mode {other:?}")),
+    };
+    Ok(kind.into())
+}
+
+/// A fresh, unique throwaway-index path (under the system temp dir).
+fn temp_index_path() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir().join("caos-index");
+    std::fs::create_dir_all(&base).map_err(|e| format!("creating {}: {e}", base.display()))?;
+    let pid = std::process::id();
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(base.join(format!("{pid}.{seq}")))
 }
 
 /// Base URL of the caos server (storage + compute), from [`SERVER_ENV`].
@@ -1041,7 +1206,12 @@ fn build_host_args_tree(t: &dyn Transport, kvs: &[String]) -> Result<gix::Object
     for kv in kvs {
         let (name, value) = parse_kv(kv)?;
 
-        let (mode, oid) = if Path::new(value).exists() {
+        let (mode, oid) = if let Some(entry) = t.ingest_path(value)? {
+            // The git transport ingests a path reusing git's recorded objects.
+            entry
+        } else if Path::new(value).exists() {
+            // The HTTP transport (a worker, e.g. run-worker-bash's) reads it from
+            // disk and uploads it.
             store(t, &no_cas, Path::new(value))?
         } else {
             // Not a path: store the literal value as a blob.
@@ -1067,6 +1237,10 @@ fn build_host_args_tree(t: &dyn Transport, kvs: &[String]) -> Result<gix::Object
 /// Each `--name=value` becomes a tree entry `name`:
 /// * if `value` is a path inside the CAS directory, it must exist, and the entry
 ///   references the object that path was materialized from (its recorded hash);
+/// * else if `value` names a host filesystem path, it's ingested via the transport
+///   (the git transport reuses git's recorded objects for clean tracked paths —
+///   see [`GitTransport::ingest_path`]); the worker has no host paths, so its
+///   transport declines and the value falls through to a literal;
 /// * otherwise `value` is stored verbatim as a blob and the entry references it.
 fn build_arg_entries(
     t: &dyn Transport,
@@ -1094,6 +1268,9 @@ fn build_arg_entries(
                 return Err(format!("{value} resolves outside {}", cas.display()));
             }
             cas_entry(&canon)?
+        } else if let Some(entry) = t.ingest_path(value)? {
+            // A host filesystem path, ingested by the transport.
+            entry
         } else {
             // A literal value: store it as a blob and reference that.
             (
