@@ -5,7 +5,7 @@
 //! holds a number). The result, a blob holding the count, is left at `/cas/out`.
 //! So `fold --post=file-count` over a tree totals its leaf files.
 //!
-//! It only touches the object server (no `caos run`); the compute server injects
+//! It only touches the server (no `caos run`); the server injects
 //! that URL at runtime.
 
 use std::fs;

@@ -12,7 +12,7 @@
 #      map edit by design and so raw miss-counts are noisy (reported as info).
 #
 # Requires the dev daemons running (`tilt up`): the caos server :9090 (storage +
-# compute), redis, registry — and a docker the compute server can reach.
+# compute), redis, registry — and a docker the server can reach.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -38,7 +38,7 @@ SNAP=$(mktemp -d)
 IMG=docker://caos-worker-deep-deps:latest
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-misses_since() { docker logs --since "$1" caos-compute-server 2>&1 \
+misses_since() { docker logs --since "$1" caos-server 2>&1 \
                    | grep -c "cache miss:" || true; }
 
 # Fixture: a -> {b,c}, b -> {d}, c -> {d}, d -> {}.
@@ -103,9 +103,9 @@ done
 [ -e "$CAS/out/d/DEEP-DEPS/x" ] || fail "d should now depend on x"
 echo "  ok: a,b,c,d all recomputed (misses: $(misses_since "$since"))" >&2
 
-echo "== Phase D: a dependency cycle is detected (by the compute server) ==" >&2
+echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
 # Close a loop: d -> a, so a -> b -> d -> a (and a -> c -> d -> a). The fold
-# recursion re-enters the same (fold image, args) and the compute server's
+# recursion re-enters the same (fold image, args) and the server's
 # run-cycle detection catches it.
 rm -rf "$CAS/pkgs2" "$CAS/cyc"
 printf 'a\n' > "$PKGS/d/DEPS"

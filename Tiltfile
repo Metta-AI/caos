@@ -18,7 +18,7 @@ GIT_REPO = os.path.abspath('.git')
 
 # A checkout often keeps most of its objects in a *shared* store, referenced from
 # .git/objects/info/alternates (here, a sibling bare repo). gix follows that by
-# its absolute path, so the object server must see it at the *same* path inside
+# its absolute path, so the server must see it at the *same* path inside
 # the container — otherwise every object that lives only in the alternate 404s.
 # Mount .git at /git, plus each alternate object dir at its own absolute path
 # (read-only: git never writes to an alternate). Without this, only the handful
@@ -61,7 +61,7 @@ def nix_image(res, app, srcs):
         labels=['images'],
     )
 
-nix_image('img-compute-server', 'load-caos-compute-server', ['crates/compute-server'])
+nix_image('img-server', 'load-caos-server', ['crates/server'])
 nix_image('img-worker-base', 'load-caos-worker-base', ['crates/client'])
 nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/client'])
 nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/client'])
@@ -70,7 +70,7 @@ nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/clien
 nix_image('img-worker-deep-deps', 'load-caos-worker-deep-deps', ['crates/client'])
 
 # One-time infra: the docker network the daemons and the worker containers the
-# compute server spawns all share. (The object server's git repo is this
+# server spawns all share. (The server's git repo is this
 # project's own .git — see GIT_REPO above — so there's nothing to create here.)
 local_resource(
     'setup',
@@ -119,7 +119,7 @@ local_resource(
     labels=['daemons'],
 )
 
-# Docker registry the compute server pushes converted git images to. The compute
+# Docker registry the server pushes converted git images to. The compute
 # server reaches it by name on caos-net (caos-registry:5000); the host docker
 # daemon, which runs the workers, pulls via the published localhost:5000 (which
 # docker treats as an insecure registry, so no TLS config is needed). Stock
@@ -137,7 +137,7 @@ local_resource(
 # the docker socket), so it needs all of: the git mounts, the docker socket, the
 # network, the cache, and the registry.
 daemon(
-    'caos-compute-server',
+    'caos-server',
     [
         '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,

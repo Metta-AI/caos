@@ -53,7 +53,7 @@
 
           # Native build inputs / runtime libs go here as the project grows,
           # e.g. pkgs.openssl + pkgs.pkg-config for TLS. Note: C deps would
-          # need a musl cross-toolchain to stay static. (object-server's gix
+          # need a musl cross-toolchain to stay static. (the server's gix
           # uses default-features = false, so it stays pure-Rust / static.)
           # buildInputs = [ ];
           # nativeBuildInputs = [ ];
@@ -80,7 +80,7 @@
           );
 
         client = crateBin "client";
-        compute-server = crateBin "compute-server";
+        server = crateBin "server";
         worker-hello = crateBin "worker-hello";
         worker-fold = crateBin "worker-fold";
         worker-file-count = crateBin "worker-file-count";
@@ -88,7 +88,7 @@
         worker-rustc = crateBin "worker-rustc";
 
         # Minimal images: each contains *only* its static binary — no shell, no
-        # libc, no /nix/store. Crates are unprefixed (client, compute-server) but
+        # libc, no /nix/store. Crates are unprefixed (client, server) but
         # the published image names carry a `caos-` prefix.
         # NOTE: Docker images are Linux-only; build these on Linux (or via a
         # remote/linux builder on macOS).
@@ -135,8 +135,8 @@
           chmod 1777 tmp
         '';
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
-        # print the hash of /cas/out. The object- and compute-server URLs a worker
-        # needs are injected at runtime — by the compute server for the containers
+        # print the hash of /cas/out. The server URL a worker needs is injected at
+        # runtime — by the server for the containers
         # it spawns, and by ./run-worker-bash.sh for the debug shell — so none are
         # baked into the images.
         workerBaseConfig = {
@@ -157,7 +157,7 @@
 
 
         # A testing image: caos-worker-base plus an ordinary interactive shell
-        # (bash + coreutils + curl) so you can poke at /cas and the object server
+        # (bash + coreutils + curl) so you can poke at /cas and the server
         # by hand. Not minimal — for debugging, not production. Like the other
         # workers it extends caos-worker-base and runs `caos entrypoint`, which
         # sets up /cas and runs /worker; here /worker drops you into an interactive
@@ -207,7 +207,7 @@
         # A real, runnable worker image, with a /worker that reads its inputs from
         # /cas/args (one entry per `--name=value` arg `caos run` passed), assembles
         # them into a result tree along with a small receipt, and stores that at
-        # /cas/out. The compute server runs it via `caos entrypoint`, which
+        # /cas/out. The server runs it via `caos entrypoint`, which
         # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
         # static binary at /worker — so the image needs no shell or coreutils.
         workerHelloRoot = workerRoot "worker-hello" worker-hello;
@@ -243,7 +243,7 @@
         # need — and the applied images take their input as `--in`; the result
         # is left at /cas/out. Unlike the other workers it drives the compute
         # server via `caos run` — both to apply pre/post and to recurse — so it
-        # relies on CAOS_COMPUTE_SERVER_URL (injected by the compute server) and
+        # relies on CAOS_SERVER_URL (injected by the server) and
         # learns its own image name, for the recursive call, from CAOS_FOLD_IMAGE.
         # This is the `worker-fold` crate, a static binary at /worker — so the
         # image needs no shell or coreutils.
@@ -277,7 +277,7 @@
         # of its child counts (each `--children` entry holds a number). The
         # result, a blob holding the count, is left at /cas/out. So
         # `fold --post=file-count` over a tree totals its leaf files. It only
-        # touches the object server (no `caos run`); the compute server injects
+        # touches the server (no `caos run`); the server injects
         # that URL at runtime. This is the `worker-file-count` crate, a static
         # binary at /worker — so the image needs no shell or coreutils.
         workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
@@ -324,10 +324,10 @@
         # orchestration. But finish (curried with nothing) is keyed only on a
         # package and its deepened subgraph, so real recompute is O(changed
         # package + its dependents). A cycle re-enters the same fold (image,
-        # args) and is caught by the compute server's run-cycle detection.
+        # args) and is caught by the server's run-cycle detection.
         #
-        # Like fold it drives the compute server via `caos run`, so it relies on
-        # CAOS_COMPUTE_SERVER_URL (injected) and learns its own image (to curry
+        # Like fold it drives the server via `caos run`, so it relies on
+        # CAOS_SERVER_URL (injected) and learns its own image (to curry
         # resolve/finish) from CAOS_DEEP_DEPS_IMAGE and fold's from
         # CAOS_FOLD_IMAGE.
         #
@@ -419,24 +419,24 @@
         # CAOS_GIT_DIR):
         #   docker run --rm --network caos-net -p 9090:80 \
         #     -v /var/run/docker.sock:/var/run/docker.sock -v /repo/.git:/git \
-        #     caos-compute-server
-        computeServerContents = [
-          compute-server
+        #     caos-server
+        serverContents = [
+          server
           pkgs.docker-client
           pkgs.gnutar
         ];
-        computeServerConfig = {
-          Cmd = [ "/bin/compute-server" ];
+        serverConfig = {
+          Cmd = [ "/bin/server" ];
           Env = [ "PATH=/bin" ];
           ExposedPorts = {
             "80/tcp" = { };
           };
         };
-        computeServerImage = pkgs.dockerTools.buildImage {
-          name = "caos-compute-server";
+        serverImage = pkgs.dockerTools.buildImage {
+          name = "caos-server";
           tag = "latest";
-          copyToRoot = computeServerContents;
-          config = computeServerConfig;
+          copyToRoot = serverContents;
+          config = serverConfig;
         };
 
         # `nix run .#load-<name>` builds the image and pipes it straight into the
@@ -470,10 +470,10 @@
           config = workerBashConfig;
           fakeRootCommands = installWorkerFiles;
         };
-        loadComputeServer = loadImage {
-          name = "caos-compute-server";
-          contents = computeServerContents;
-          config = computeServerConfig;
+        loadServer = loadImage {
+          name = "caos-server";
+          contents = serverContents;
+          config = serverConfig;
         };
         loadWorkerHello = loadImage {
           name = "caos-worker-hello";
@@ -509,12 +509,12 @@
       {
         packages = {
           default = client;
-          inherit client compute-server;
+          inherit client server;
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-worker-base-docker = workerBaseImage;
           caos-worker-bash-docker = workerBashImage;
-          caos-compute-server-docker = computeServerImage;
+          caos-server-docker = serverImage;
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-fold-docker = workerFoldImage;
           caos-worker-file-count-docker = workerFileCountImage;
@@ -532,9 +532,9 @@
             type = "app";
             program = "${loadWorkerBash}/bin/load-caos-worker-bash";
           };
-          load-caos-compute-server = {
+          load-caos-server = {
             type = "app";
-            program = "${loadComputeServer}/bin/load-caos-compute-server";
+            program = "${loadServer}/bin/load-caos-server";
           };
           load-caos-worker-hello = {
             type = "app";
@@ -559,7 +559,7 @@
         };
 
         checks = {
-          inherit client compute-server;
+          inherit client server;
 
           clippy = craneLib.cargoClippy (
             commonArgs

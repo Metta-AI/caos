@@ -120,7 +120,7 @@ fn cargo_toml() -> String {
     )
 }
 
-/// A minimal OCI image config. The compute server fills `rootfs.diff_ids` when it
+/// A minimal OCI image config. The server fills `rootfs.diff_ids` when it
 /// converts the image, so we leave them empty. `Env` carries `PATH` so the
 /// worker can find the setuid `caos` at `/bin`.
 fn image_config() -> String {

@@ -101,17 +101,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "compute-server"
-version = "0.1.0"
-dependencies = [
- "gix",
- "minreq",
- "serde_json",
- "sha2",
- "tiny_http",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1196,6 +1185,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "gix",
+ "minreq",
+ "serde_json",
+ "sha2",
+ "tiny_http",
 ]
 
 [[package]]

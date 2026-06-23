@@ -14,9 +14,9 @@
 //! worker the applied images take their input as `--in` and leave the result at
 //! `/cas/out`.
 //!
-//! Unlike the leaf workers it drives the compute server via `caos run` — both to
-//! apply `pre`/`post` and to recurse — so it relies on `CAOS_COMPUTE_SERVER_URL`
-//! (injected by the compute server) and learns its own image name, for the
+//! Unlike the leaf workers it drives the server via `caos run` — both to
+//! apply `pre`/`post` and to recurse — so it relies on `CAOS_SERVER_URL`
+//! (injected by the server) and learns its own image name, for the
 //! recursive call, from `CAOS_FOLD_IMAGE`.
 
 use std::path::Path;

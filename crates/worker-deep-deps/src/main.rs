@@ -17,7 +17,7 @@
 //! carry the whole map, so they re-run on any edit — cheap orchestration. But
 //! `finish` (curried with nothing) is keyed only on a package and its deepened
 //! subgraph, so real recompute is O(changed package + its dependents). A cycle
-//! re-enters the same fold `(image, args)` and is caught by the compute server's
+//! re-enters the same fold `(image, args)` and is caught by the server's
 //! run-cycle detection.
 
 use std::fs;

@@ -1,9 +1,9 @@
-//! caos: client for the object server.
+//! caos: client for the caos server (storage + compute).
 //!
 //! Subcommands:
 //!
 //! * `get-hash <hash> <path>` — fetch the git object `<hash>` from the object
-//!   server (base URL from `$CAOS_OBJECT_SERVER_URL`) and materialize it at
+//!   server (base URL from `$CAOS_SERVER_URL`) and materialize it at
 //!   `<path>`, a direct child of `/cas`: a blob becomes a file holding its
 //!   bytes; a tree becomes a directory holding one empty placeholder per entry
 //!   (a directory for subtrees, a file otherwise).
@@ -17,7 +17,7 @@
 //!   form (a tree of `config.json` + `layer<NN>` subtrees), so it can be run with
 //!   `run <cas-path>`.
 //! * `run <image> <output> -- [--name=value ...]` — assemble the args into a git
-//!   tree, ask the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
+//!   tree, ask the server (`$CAOS_SERVER_URL`) to run `<image>`
 //!   over it, and materialize the returned result hash at `<output>`. `<image>`
 //!   is a CAS path — a git image, resolved to the git hash recorded on it — a
 //!   bare git hash, or `docker://<ref>` for an ordinary docker image.
@@ -46,19 +46,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
-/// Base URL of the object server, e.g. `http://caos-object-server`.
-const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
-
-/// Base URL of the compute server, e.g. `http://caos-compute-server`.
-const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
-
-/// Single front-end URL serving both storage and compute. Used as the fallback
-/// for both [`OBJECT_SERVER_ENV`] and [`COMPUTE_SERVER_ENV`], so a user can set
-/// just one variable. The specific vars still override it when set.
+/// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
 /// The chain of `(image, args)` computations currently in progress, set by the
-/// compute server on each worker it spawns. `caos run` echoes it back so the
+/// server on each worker it spawns. `caos run` echoes it back so the
 /// server can detect a run that re-enters a computation already on the stack
 /// (an unresolvable cycle). It rides in env, never the args tree, so the result
 /// cache key (image + args) is unaffected.
@@ -69,7 +61,7 @@ const DOCKER_SCHEME: &str = "docker://";
 
 /// Marker entry naming a curry node: a CAS tree that pairs a `base` image ref
 /// with an `args` subtree of bound arguments. `run`/`curry` expand it client-side
-/// (merging the bound args under the call's args) so the compute server only ever
+/// (merging the bound args under the call's args) so the server only ever
 /// sees an ordinary image + args hash. The marker lets it be told apart from a
 /// git-docker image tree, which it otherwise resembles. See [`unwrap_curry`].
 const CURRY_MARKER: &str = ".caos-curry";
@@ -203,7 +195,7 @@ fn usage(args: &[String]) -> String {
 /// `get-hash <hash> <path>` — fetch `<hash>` and materialize it at `<path>`,
 /// which must be a direct child of the CAS directory.
 fn get_hash(hash: &str, path: &str) -> Result<(), String> {
-    let base = object_server_url()?;
+    let base = server_url()?;
     let cas = cas_dir();
     let target = validate_target(&cas, path)?;
     probe_xattr(&cas)?;
@@ -220,7 +212,7 @@ fn get_hash(hash: &str, path: &str) -> Result<(), String> {
 /// `--recursive=<n>` loads `n` levels and `-r` (or bare `--recursive`) loads the
 /// whole subtree.
 fn get(path: &str, depth: Option<u32>) -> Result<(), String> {
-    let base = object_server_url()?;
+    let base = server_url()?;
     let cas = cas_dir();
     let target = validate_descendant(&cas, path)?;
     probe_xattr(&cas)?;
@@ -326,7 +318,7 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     // Populate /cas/args from the given hash, like `get-hash <hash> /cas/args`,
     // so the worker can read its inputs there.
     if let Some(hash) = args_hash {
-        let base = object_server_url()?;
+        let base = server_url()?;
         fetch_and_materialize(&base, &cas.join("args"), hash)?;
     }
 
@@ -423,27 +415,14 @@ fn parse_object(bytes: &[u8]) -> Result<(&str, &[u8]), String> {
     Ok((kind, content))
 }
 
-/// Base URL of the object server: `CAOS_OBJECT_SERVER_URL`, or the single
-/// front-end `CAOS_SERVER_URL`.
-fn object_server_url() -> Result<String, String> {
-    server_url(OBJECT_SERVER_ENV)
-}
-
-/// Base URL of the compute server: `CAOS_COMPUTE_SERVER_URL`, or the single
-/// front-end `CAOS_SERVER_URL`.
-fn compute_server_url() -> Result<String, String> {
-    server_url(COMPUTE_SERVER_ENV)
-}
-
-/// The URL from `specific`, falling back to the single front-end [`SERVER_ENV`].
-fn server_url(specific: &str) -> Result<String, String> {
-    std::env::var(specific)
-        .or_else(|_| std::env::var(SERVER_ENV))
-        .map_err(|_| format!("set {specific} (or {SERVER_ENV} for a single front-end)"))
+/// Base URL of the caos server (storage + compute), from [`SERVER_ENV`].
+fn server_url() -> Result<String, String> {
+    std::env::var(SERVER_ENV)
+        .map_err(|_| format!("{SERVER_ENV} must be set to the caos server URL"))
 }
 
 /// `put <src-path> <cas-path>` — recursively store `<src-path>` (a path outside
-/// the CAS) into the object server and record the result at `<cas-path>`, a
+/// the CAS) into the server and record the result at `<cas-path>`, a
 /// direct child of the CAS directory.
 ///
 /// Files are stored as blobs and directories as trees — both as real git objects
@@ -451,7 +430,7 @@ fn server_url(specific: &str) -> Result<String, String> {
 /// tree hashes). A symlink that resolves to something already in the CAS is *not*
 /// re-read — its recorded hash is reused, so shared content is stored once.
 fn put(src: &str, dst: &str) -> Result<(), String> {
-    let base = object_server_url()?;
+    let base = server_url()?;
     let cas = cas_dir();
     let target = validate_target(&cas, dst)?;
     probe_xattr(&cas)?;
@@ -467,16 +446,16 @@ fn put(src: &str, dst: &str) -> Result<(), String> {
 /// kind `nix build .#caos-*-docker` / `docker save` produce) into the CAS in
 /// git-docker form: a tree holding `config.json` (the image config, verbatim) and
 /// one `layer<NN>` subtree per layer (the layer tar's extracted filesystem),
-/// materialized at `<cas-path>`. `run <cas-path>` then has the compute server
+/// materialized at `<cas-path>`. `run <cas-path>` then has the server
 /// convert it back into a real image.
 ///
 /// Only the layer *contents* are captured (files, the exec bit, and symlinks);
-/// mtimes/owners are dropped, which is fine — the compute server re-tars the trees
+/// mtimes/owners are dropped, which is fine — the server re-tars the trees
 /// deterministically and generates the diff_ids itself.
 fn import_image(archive: &str, dst: &str) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
-    let base = object_server_url()?;
+    let base = server_url()?;
     let cas = cas_dir();
     let target = validate_target(&cas, dst)?;
     probe_xattr(&cas)?;
@@ -553,7 +532,7 @@ const META_SUFFIX: &str = ".caosmeta";
 
 /// Beside any entry in the already-unpacked layer at `dir` whose permissions or
 /// ownership a git tree can't reproduce, write a `<name>.caosmeta` sidecar — a
-/// small JSON `{"mode":"<octal>","uid":N,"gid":N}` — so the compute server can
+/// small JSON `{"mode":"<octal>","uid":N,"gid":N}` — so the server can
 /// restore them when it rebuilds the layer's tar. Files and directories are
 /// treated alike: the sidecar sits next to the entry, in its parent.
 ///
@@ -672,7 +651,7 @@ fn scratch_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Recursively store `path` in the object server, returning the git tree entry
+/// Recursively store `path` in the server, returning the git tree entry
 /// (mode + oid) that refers to it.
 fn store(
     base: &str,
@@ -742,7 +721,7 @@ fn cas_entry(canon: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId)
     Ok((kind.into(), parse_oid(&read_hash(canon)?)?))
 }
 
-/// Encode `entries` as a git tree object, POST it to the object server, and
+/// Encode `entries` as a git tree object, POST it to the server, and
 /// return its hash. Shared by `store` (real directories) and `build_args_tree`
 /// (the synthesized args tree).
 fn post_tree(
@@ -787,22 +766,22 @@ fn parse_oid(hex: &str) -> Result<gix::ObjectId, String> {
 }
 
 /// `run <image> <output> -- [--name=value ...]` — assemble the args into a git
-/// tree, ask the compute server to run `<image>` over that tree, and materialize
+/// tree, ask the server to run `<image>` over that tree, and materialize
 /// the result at `<output>` (a direct child of the CAS directory).
 fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
-    let base = object_server_url()?;
-    let compute = compute_server_url()?;
+    let base = server_url()?;
+    let compute = server_url()?;
     let cas = cas_dir();
     let target = validate_target(&cas, output)?;
     probe_xattr(&cas)?;
 
     // Resolve the image: a CAS path becomes the git hash recorded on it, so the
-    // compute server converts it from our git-docker form; a `docker://` ref or a
+    // server converts it from our git-docker form; a `docker://` ref or a
     // bare hash is sent through unchanged.
     let image = resolve_run_image(&cas, image)?;
 
     // Expand any curry layers: pull the underlying image out and collect the args
-    // bound into it, so the compute server only ever sees a plain image + args.
+    // bound into it, so the server only ever sees a plain image + args.
     let (image, bound) = unwrap_curry(&base, &image)?;
 
     // Build the call's args, then merge them over the bound ones (call wins).
@@ -810,7 +789,7 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     let call = build_arg_entries(&base, &cas, kvs)?;
     let args_tree = post_tree(&base, merge_entries(bound, call))?;
 
-    // Hand the image and args-tree hash to the compute server; it runs the
+    // Hand the image and args-tree hash to the server; it runs the
     // container and returns the hash of the result (its /cas/out).
     let result = request_compute(&compute, &image, &args_tree.to_string())?;
 
@@ -818,7 +797,7 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     fetch_and_materialize(&base, &target, &result)
 }
 
-/// Resolve the `<image>` argument of `caos run` into what the compute server
+/// Resolve the `<image>` argument of `caos run` into what the server
 /// expects. A git image is given as a path inside the CAS, which resolves to the
 /// git hash recorded on it; a `docker://<ref>` value is an ordinary docker image
 /// and passes through unchanged. Anything else is rejected.
@@ -872,7 +851,7 @@ fn is_hex_hash(s: &str) -> bool {
 fn caos_curry(image: &str, kvs: &[String]) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
-    let base = object_server_url()?;
+    let base = server_url()?;
     let cas = cas_dir();
 
     let image = resolve_run_image(&cas, image)?;
@@ -1031,7 +1010,7 @@ fn parse_kv(kv: &str) -> Result<(&str, &str), String> {
 /// is stored verbatim as a blob. The printed hash is meant to be passed to
 /// `caos entrypoint --args=<hash>` (which is what `run-worker-bash.sh` does).
 fn build_args(kvs: &[String]) -> Result<(), String> {
-    let base = object_server_url()?;
+    let base = server_url()?;
     let hash = build_host_args_tree(&base, kvs)?;
     println!("{hash}");
     Ok(())
@@ -1125,7 +1104,7 @@ fn build_arg_entries(
     Ok(entries)
 }
 
-/// Ask the compute server to run `image` over the args tree `args_hash`,
+/// Ask the server to run `image` over the args tree `args_hash`,
 /// returning the result hash it prints (the container's /cas/out).
 fn request_compute(base: &str, image: &str, args_hash: &str) -> Result<String, String> {
     let mut url = format!(
@@ -1144,10 +1123,10 @@ fn request_compute(base: &str, image: &str, args_hash: &str) -> Result<String, S
     }
     let body = http_get(&url)?;
     let text = String::from_utf8(body)
-        .map_err(|e| format!("compute server returned invalid UTF-8: {e}"))?;
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let hash = text.trim();
     if hash.is_empty() {
-        return Err("compute server returned an empty result".to_string());
+        return Err("server returned an empty result".to_string());
     }
     Ok(hash.to_string())
 }
@@ -1366,7 +1345,7 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         .send()
         .map_err(|e| format!("GET {url}: {e}"))?;
     if !(200..300).contains(&response.status_code) {
-        // Surface the server's response body — for the compute server a 500
+        // Surface the server's response body — for the server a 500
         // carries the worker's failure output, which is what you actually need.
         let body = response.as_str().unwrap_or("").trim();
         let detail = if body.is_empty() {

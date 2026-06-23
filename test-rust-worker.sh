@@ -8,7 +8,7 @@
 # source yields a different worker.
 #
 # Requires the dev daemons running (`tilt up`): the caos server :9090 (storage +
-# compute), redis, registry — and a docker the compute server can reach.
+# compute), redis, registry — and a docker the server can reach.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -28,7 +28,7 @@ SRC=$(mktemp -d)
 trap 'rm -rf "$CAS" "$SRC"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-misses_since() { docker logs --since "$1" caos-compute-server 2>&1 \
+misses_since() { docker logs --since "$1" caos-server 2>&1 \
                    | grep -c "cache miss:" || true; }
 
 # The worker-base git-docker image the produced workers extend; curried into the

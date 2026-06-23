@@ -1,34 +1,9 @@
-//! compute-server: run a containerized compute step and return its result hash.
+//! Compute: the `/run` pipeline.
 //!
-//! One endpoint:
-//!
-//! * `GET /run?image=<image>&args=<hash>` — run `<image>` over the args tree
-//!   `<hash>` and return the hash of its result.
-//!
-//! It shells out to the `docker` CLI:
-//!
-//! ```text
-//! docker run --rm --network <net> \
-//!     -e CAOS_OBJECT_SERVER_URL=<url> -e CAOS_COMPUTE_SERVER_URL=<url> \
-//!     --entrypoint /bin/caos <image> entrypoint --args=<hash>
-//! ```
-//!
-//! Forcing `--entrypoint /bin/caos` means any image carrying the `caos` binary
-//! and a `/worker` works as a compute image, regardless of its own configured
-//! entrypoint/command. `caos entrypoint` populates `/cas/args` from `<hash>`,
-//! runs `/worker`, and prints the hash recorded at `/cas/out` on its stdout —
-//! which `docker run` forwards to ours, so the container's stdout *is* the
-//! result hash. We return it as the response body.
-//!
-//! Both daemon URLs are injected so the worker can reach the object server and —
-//! for a worker that itself calls `caos run`, like the fold worker — call back
-//! into us. The container reaches both over the Docker network, so it must be the
-//! same network the daemons run on (default `caos-net`).
-//!
-//! Results are cached in Redis (`CAOS_REDIS_ADDR`, default `caos-redis:6379`):
-//! the key is the image + args-tree hash, the value the result hash. A hit skips
-//! the container entirely. Redis is best-effort — if it's unreachable we log and
-//! run uncached.
+//! Cache lookup (Redis) → run-cycle detection → image resolution (a `docker://`
+//! ref used as-is, or a git-docker image converted and pushed to the registry) →
+//! the worker container run, whose stdout is the result hash. Results, converted
+//! images, and built layers are all cached in Redis (best-effort).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -37,40 +12,12 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use tiny_http::{Method, Request, Response, Server};
 
-/// Listen address; overridable for local runs outside the container.
-const DEFAULT_ADDR: &str = "0.0.0.0:80";
-
-/// Docker network the worker container joins, so the object server resolves by
-/// name. Override with `CAOS_DOCKER_NETWORK`.
-const DEFAULT_NETWORK: &str = "caos-net";
-
-/// This server's URL as seen from inside the Docker network, passed into each
-/// worker container — for both storage (`caos get`/`put`) and compute (a worker
-/// that calls `caos run`, e.g. the fold worker, which recurses). Now that storage
-/// and compute are one server, workers get this single URL for both. Override
-/// with `CAOS_COMPUTE_SERVER_URL`.
-const DEFAULT_COMPUTE_SERVER_URL: &str = "http://caos-compute-server";
-
-/// Where the git object database lives (the storage half, now in-process).
-/// Override with `CAOS_GIT_DIR` (useful for local runs outside the container).
-const DEFAULT_GIT_DIR: &str = "/git";
-
-/// Registry base URL converted git-docker images are pushed to, reachable from
-/// *this* container over the docker network. Override with
-/// `CAOS_REGISTRY_PUSH_URL`.
-const DEFAULT_REGISTRY_PUSH_URL: &str = "http://caos-registry:5000";
-
-/// How the host's docker daemon (which actually runs the worker) refers to that
-/// same registry — a published port on localhost, which docker treats as an
-/// insecure registry, so no TLS/daemon config is needed. Override with
-/// `CAOS_REGISTRY_PULL_HOST`.
-const DEFAULT_REGISTRY_PULL_HOST: &str = "localhost:5000";
+use crate::storage::{fetch_blob, fetch_tree};
+use crate::{Config, HttpError};
 
 /// Repository name converted images are pushed under. They're addressed by
 /// digest, so the name is arbitrary and fixed.
@@ -79,12 +26,6 @@ const REGISTRY_REPO: &str = "caos";
 /// Prefix marking the `image` parameter as an ordinary docker reference rather
 /// than one of our git images (the default).
 const DOCKER_SCHEME: &str = "docker://";
-
-/// `docker` binary to invoke. Override with `CAOS_DOCKER_BIN`.
-const DEFAULT_DOCKER_BIN: &str = "docker";
-
-/// Redis (host:port) used to cache results. Override with `CAOS_REDIS_ADDR`.
-const DEFAULT_REDIS_ADDR: &str = "caos-redis:6379";
 
 /// How long to wait on Redis before giving up and running uncached.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,233 +40,14 @@ const CAOS_BIN: &str = "/bin/caos";
 /// Threaded through env, never the args tree, so it doesn't affect the cache key.
 const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
 
-/// Runtime configuration, read once from the environment at startup.
-struct Config {
-    network: String,
-    compute_server_url: String,
-    registry_push_url: String,
-    registry_pull_host: String,
-    docker_bin: String,
-    redis_addr: String,
-    /// The git object database, served directly (storage is now in-process).
-    /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
-    repo: gix::ThreadSafeRepository,
-}
+/// Reserved suffix for the per-entry permission sidecars `import-image` writes.
+const META_SUFFIX: &str = ".caosmeta";
 
-/// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
-/// in a container, where the daemon is PID 1: the kernel applies no default
-/// disposition for these signals to PID 1, so without an explicit handler
-/// `docker stop` (and Tilt's Ctrl-C) would hang until the 10s `SIGKILL`.
-fn install_termination_handlers() {
-    // Async-signal-safe: we hold no state that needs flushing, so just exit.
-    extern "C" fn terminate(_signum: std::ffi::c_int) {
-        unsafe { exit_now(0) }
-    }
-    extern "C" {
-        // libc, resolved against what std already links.
-        fn signal(signum: std::ffi::c_int, handler: extern "C" fn(std::ffi::c_int)) -> usize;
-        #[link_name = "_exit"]
-        fn exit_now(code: std::ffi::c_int) -> !;
-    }
-    const SIGINT: std::ffi::c_int = 2;
-    const SIGTERM: std::ffi::c_int = 15;
-    unsafe {
-        signal(SIGINT, terminate);
-        signal(SIGTERM, terminate);
-    }
-}
-
-fn main() {
-    install_termination_handlers();
-
-    let addr = std::env::var("COMPUTE_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
-    // Open the object database once as a thread-safe handle; each request thread
-    // takes a cheap local handle from it (see `handle`).
-    let repo = match gix::open(&git_dir) {
-        Ok(repo) => repo.into_sync(),
-        Err(err) => {
-            eprintln!("fatal: cannot open git repo at {git_dir}: {err}");
-            std::process::exit(1);
-        }
-    };
-    // Shared read-only across handler threads (one per request, see below).
-    let config = Arc::new(Config {
-        network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
-        compute_server_url: env_or("CAOS_COMPUTE_SERVER_URL", DEFAULT_COMPUTE_SERVER_URL),
-        registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
-        registry_pull_host: env_or("CAOS_REGISTRY_PULL_HOST", DEFAULT_REGISTRY_PULL_HOST),
-        docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
-        redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
-        repo,
-    });
-
-    let server = match Server::http(addr.as_str()) {
-        Ok(server) => server,
-        Err(err) => {
-            eprintln!("fatal: cannot bind {addr}: {err}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!(
-        "caos-server listening on http://{addr} (storage + compute), network {}, \
-         git repo {git_dir}, compute server {}, registry push {} / pull {}, redis {}",
-        config.network,
-        config.compute_server_url,
-        config.registry_push_url,
-        config.registry_pull_host,
-        config.redis_addr
-    );
-
-    // One thread per request, not a serial loop: a worker can itself call back
-    // into us (the fold worker recurses via `caos run`), and that nested request
-    // must be served while its parent's request is still blocked waiting on the
-    // `docker run` it spawned. A serial loop — or any pool smaller than the tree
-    // is deep — would deadlock. Threads are cheap here: each just blocks in
-    // `docker run`'s `waitpid`.
-    for request in server.incoming_requests() {
-        let config = Arc::clone(&config);
-        std::thread::spawn(move || {
-            if let Err(err) = handle(&config, request) {
-                // Only reachable if writing the response itself fails.
-                eprintln!("failed to send response: {err}");
-            }
-        });
-    }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// An error that maps cleanly onto an HTTP status code + body.
-struct HttpError {
-    status: u16,
-    message: String,
-}
-
-impl HttpError {
-    fn new(status: u16, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
-    }
-}
-
-impl From<std::io::Error> for HttpError {
-    fn from(err: std::io::Error) -> Self {
-        HttpError::new(500, format!("io error: {err}"))
-    }
-}
-
-/// Dispatch a single request and send its response.
-fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
-    match route(config, &mut request) {
-        Ok(body) => request.respond(Response::from_data(body)),
-        Err(err) => request.respond(
-            Response::from_string(format!("{}\n", err.message))
-                .with_status_code(tiny_http::StatusCode(err.status)),
-        ),
-    }
-}
-
-/// Match the request to a handler and produce the response body. Serves both the
-/// storage endpoints (`/object*`) and compute (`/run`).
-fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
-    let url = request.url().to_string();
-    let (path, query) = match url.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (url.clone(), String::new()),
-    };
-
-    match request.method() {
-        Method::Get if path == "/run" => run(config, &query),
-        Method::Get => match path.strip_prefix("/object/") {
-            Some(hash) if !hash.is_empty() => get_object(config, hash),
-            _ => Err(HttpError::new(404, "not found")),
-        },
-        Method::Post if path == "/object/" || path == "/object" => {
-            let mut body = Vec::new();
-            request.as_reader().read_to_end(&mut body)?;
-            post_object(config, &body)
-        }
-        _ => Err(HttpError::new(404, "not found")),
-    }
-}
-
-/// `GET /object/<hash>` — return the serialized object: git's native
-/// `<type> <size>\0<content>` form (uncompressed).
-fn get_object(config: &Config, hash: &str) -> Result<Vec<u8>, HttpError> {
-    let repo = config.repo.to_thread_local();
-    let id = gix::ObjectId::from_hex(hash.as_bytes())
-        .map_err(|err| HttpError::new(400, format!("invalid hash: {err}")))?;
-    let object = repo
-        .find_object(id)
-        .map_err(|err| HttpError::new(404, format!("object not found: {err}")))?;
-    let mut out = format!("{} {}\0", object.kind, object.data.len()).into_bytes();
-    out.extend_from_slice(&object.data);
-    Ok(out)
-}
-
-/// `POST /object/` — store a serialized object (`<type> <size>\0<content>`) and
-/// return its hash (hex + `\n`). The type and size come from the body's header.
-fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpError> {
-    let repo = config.repo.to_thread_local();
-    let (kind, content) = parse_posted_object(body)?;
-    let id = match kind {
-        gix::object::Kind::Blob => repo
-            .write_blob(content)
-            .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?
-            .detach(),
-        gix::object::Kind::Tree => {
-            // Validate the canonical tree encoding before writing it as a real
-            // tree object (so its hash is a genuine git tree hash).
-            let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
-                .map_err(|err| HttpError::new(400, format!("invalid tree: {err}")))?;
-            repo.write_object(&tree)
-                .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
-                .detach()
-        }
-        other => {
-            return Err(HttpError::new(
-                400,
-                format!("unsupported object type: {other} (expected blob or tree)"),
-            ))
-        }
-    };
-    Ok(format!("{id}\n").into_bytes())
-}
-
-/// Split a posted serialized object into its type and content, validating the
-/// header (`<type> <size>\0`).
-fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpError> {
-    let nul = body
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| HttpError::new(400, "malformed object: missing NUL after header"))?;
-    let header = std::str::from_utf8(&body[..nul])
-        .map_err(|_| HttpError::new(400, "malformed object header"))?;
-    let content = &body[nul + 1..];
-    let (kind, size) = header
-        .split_once(' ')
-        .ok_or_else(|| HttpError::new(400, "malformed object header: expected '<type> <size>'"))?;
-    let size: usize = size
-        .parse()
-        .map_err(|_| HttpError::new(400, format!("malformed object size: {size:?}")))?;
-    if size != content.len() {
-        return Err(HttpError::new(
-            400,
-            format!("object size {size} != content length {}", content.len()),
-        ));
-    }
-    let kind = gix::object::Kind::from_bytes(kind.as_bytes())
-        .map_err(|_| HttpError::new(400, format!("unknown object type: {kind:?}")))?;
-    Ok((kind, content))
-}
+/// Disambiguates temp dirs created across handler threads.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `GET /run?image=<image>&args=<hash>` — run the image and return its result.
-fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
+pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let image = query_param(query, "image")
         .ok_or_else(|| HttpError::new(400, "missing 'image' query parameter"))?;
     let args = query_param(query, "args")
@@ -387,16 +109,8 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         .arg("run")
         .arg("--rm")
         .args(["--network", &config.network])
-        // Storage and compute are one server now, so the worker gets a single
-        // URL for both `caos get`/`put` and `caos run`.
-        .args([
-            "-e",
-            &format!("CAOS_OBJECT_SERVER_URL={}", config.compute_server_url),
-        ])
-        .args([
-            "-e",
-            &format!("CAOS_COMPUTE_SERVER_URL={}", config.compute_server_url),
-        ])
+        // One server, so the worker gets one URL for `caos get`/`put`/`run`.
+        .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
         .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&docker_ref)
@@ -439,9 +153,6 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     Ok(format!("{hash}\n").into_bytes())
 }
 
-/// Disambiguates temp dirs created across handler threads.
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Resolve the `image` parameter to a reference the host docker daemon can run.
 ///
 /// `docker://<ref>` is an ordinary docker reference, used as-is. Anything else is
@@ -465,13 +176,6 @@ fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
     }
     convert_git_image(config, image)
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
-}
-
-/// A git tree entry, owned so it outlives the fetched object bytes.
-struct TreeEntry {
-    name: String,
-    mode: gix::objs::tree::EntryMode,
-    oid: gix::ObjectId,
 }
 
 /// Convert the git-docker image tree `git_hash` to a real image and push it to
@@ -563,9 +267,6 @@ fn ensure_layer(config: &Config, layer_oid: &str) -> Result<(String, u64), Strin
     eprintln!("converted layer {layer_oid} -> {digest} ({size} bytes)");
     Ok((digest, size))
 }
-
-/// Reserved suffix for the per-entry permission sidecars `import-image` writes.
-const META_SUFFIX: &str = ".caosmeta";
 
 /// Materialize a layer's git tree to a temp dir, apply its `.caosmeta` sidecars,
 /// and tar it deterministically (GNU format handles the long /nix/store paths and
@@ -755,45 +456,6 @@ fn build_manifest(
             "size": size,
         })).collect::<Vec<_>>(),
     })
-}
-
-/// Fetch and parse a git tree from the object server.
-fn fetch_tree(config: &Config, hash: &str) -> Result<Vec<TreeEntry>, String> {
-    let (kind, content) = fetch_object(config, hash)?;
-    if kind != "tree" {
-        return Err(format!("expected tree, got {kind} for {hash}"));
-    }
-    let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
-        .map_err(|e| format!("malformed tree {hash}: {e}"))?;
-    Ok(tree
-        .entries
-        .iter()
-        .map(|e| TreeEntry {
-            name: String::from_utf8_lossy(e.filename).into_owned(),
-            mode: e.mode,
-            oid: e.oid.to_owned(),
-        })
-        .collect())
-}
-
-/// Fetch a git blob's bytes from the object server.
-fn fetch_blob(config: &Config, hash: &str) -> Result<Vec<u8>, String> {
-    let (kind, content) = fetch_object(config, hash)?;
-    if kind != "blob" {
-        return Err(format!("expected blob, got {kind} for {hash}"));
-    }
-    Ok(content)
-}
-
-/// Read a git object from the in-process object database, returning its
-/// `(type, content)`.
-fn fetch_object(config: &Config, hash: &str) -> Result<(String, Vec<u8>), String> {
-    let repo = config.repo.to_thread_local();
-    let id = gix::ObjectId::from_hex(hash.as_bytes()).map_err(|e| format!("invalid hash {hash}: {e}"))?;
-    let object = repo
-        .find_object(id)
-        .map_err(|e| format!("object {hash} not found: {e}"))?;
-    Ok((object.kind.to_string(), object.data.clone()))
 }
 
 /// Upload a blob to the registry (monolithic two-step: start, then PUT bytes).
