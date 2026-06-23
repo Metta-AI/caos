@@ -64,11 +64,11 @@ printf 'd\n'    > "$PKGS/b/DEPS"
 printf 'd\n'    > "$PKGS/c/DEPS"
 : > "$PKGS/d/DEPS"
 
-# Put the fixture, deepen every package, and materialize the result tree.
+# Deepen every package and materialize the result tree. The fixture is passed
+# straight from the host: `caos run` ingests the path's content itself.
 run() {
-  rm -rf "$CAS/pkgs" "$CAS/out"
-  caos put "$PKGS" "$CAS/pkgs" >/dev/null
-  caos run "$IMG" "$CAS/out" -- --mode=all --packages="$CAS/pkgs" >/dev/null
+  rm -rf "$CAS/out"
+  caos run "$IMG" "$CAS/out" -- --mode=all --packages="$PKGS" >/dev/null
   caos get -r "$CAS/out" >/dev/null
 }
 
@@ -130,11 +130,10 @@ echo "  ok: std bump forced recompute; output still correct" >&2
 
 echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
 # Close a loop: d -> a, so a -> b -> d -> a. The fold recursion re-enters the same
-# (fold image, args) and the server's run-cycle detection catches it.
-rm -rf "$CAS/pkgs2" "$CAS/cyc"
+# request and the server's run-cycle detection catches it.
+rm -rf "$CAS/cyc"
 printf 'a\n' > "$PKGS/d/DEPS"
-caos put "$PKGS" "$CAS/pkgs2" >/dev/null
-if msg=$(caos run "$IMG" "$CAS/cyc" -- --mode=all --packages="$CAS/pkgs2" 2>&1); then
+if msg=$(caos run "$IMG" "$CAS/cyc" -- --mode=all --packages="$PKGS" 2>&1); then
   fail "expected the cyclic graph to fail, but the run succeeded"
 fi
 echo "$msg" | grep -q "run cycle detected" || fail "no cycle reported; got: $msg"

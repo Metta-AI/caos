@@ -59,16 +59,15 @@ fn run() -> Result<(), String> {
 RS
 }
 
-build_and_run() { # <src-cas> <img-cas> <result-cas>
-  caos run "$builder" "$2" -- --src="$1" >/dev/null
+build_and_run() { # <src-path> <img-cas> <result-cas>
+  caos run "$builder" "$2" -- --src="$1" >/dev/null   # host path, ingested directly
   caos run "$2" "$3" -- >/dev/null
   caos get -r "$3" >/dev/null
 }
 
 echo "== Phase A: source -> worker image -> run ==" >&2
 greeter "hello from a source-built worker"
-caos put "$SRC/worker.rs" "$CAS/src" >/dev/null
-build_and_run "$CAS/src" "$CAS/img" "$CAS/result"
+build_and_run "$SRC/worker.rs" "$CAS/img" "$CAS/result"
 grep -q "source-built worker" "$CAS/result/greeting" \
   || fail "built worker did not produce the expected output"
 echo "  ok: compiled from source, ran, produced expected output" >&2
@@ -77,7 +76,7 @@ echo "== Phase B: rebuilding identical source is a cache hit ==" >&2
 # A hit means the build (and the whole compile) is skipped: 0 cache misses, and
 # the cached result is by definition the same image.
 sleep 1; since=$(date +%s)
-caos run "$builder" "$CAS/img2" -- --src="$CAS/src" >/dev/null
+caos run "$builder" "$CAS/img2" -- --src="$SRC/worker.rs" >/dev/null
 sleep 1
 m=$(misses_since "$since")
 [ "$m" -eq 0 ] || fail "rebuild of identical source should be a hit, saw $m misses"
@@ -88,8 +87,7 @@ echo "== Phase C: editing the source yields a different worker ==" >&2
 # miss count is unreliable here (a warm cache from a prior run may already hold
 # this build), so we assert on content.
 greeter "a different greeting entirely"
-caos put "$SRC/worker.rs" "$CAS/src2" >/dev/null
-build_and_run "$CAS/src2" "$CAS/img3" "$CAS/result3"
+build_and_run "$SRC/worker.rs" "$CAS/img3" "$CAS/result3"
 grep -q "different greeting" "$CAS/result3/greeting" \
   || fail "edited worker did not produce the new output"
 grep -q "different greeting" "$CAS/result/greeting" \
