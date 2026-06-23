@@ -124,13 +124,6 @@ pub trait Transport {
     fn ensure_pushed(&self, _hash: &str) -> Result<(), String> {
         Ok(())
     }
-
-    /// Pull a server ref's objects into the local store. HTTP: a no-op —
-    /// `get_object` reaches the server directly. Git: `git fetch <remote>
-    /// <refname>`, so the now-local objects can be read with `get_object`.
-    fn fetch_ref(&self, _refname: &str) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 /// Transport over the server's HTTP object API (`GET`/`POST /object`). Used by
@@ -175,6 +168,108 @@ impl Transport for HttpTransport {
         let (kind, content) = parse_object(&serialized)?;
         Ok((kind.to_string(), content.to_vec()))
     }
+}
+
+/// The remote name a `caos-cli` working tree gives the server (`git remote add
+/// caos <url>`). Push/fetch use it.
+pub const CAOS_REMOTE: &str = "caos";
+
+/// Transport over the server as a `caos` git remote, used by `caos-cli`. Objects
+/// are built in the local working repo (cheap, in-process via gix) and exchanged
+/// with the server by negotiated git push/fetch — so a large unchanged tree costs
+/// almost nothing to "upload", and an edit ships only the changed blobs.
+///
+/// `put_object`/`get_object` are *local*: `put` writes a loose object,
+/// `get` reads one (fetching from the remote first if it's missing, e.g. a
+/// computation result). `ensure_pushed` is the one batch network step — it pushes
+/// an object graph to the server so a `/run` can read it.
+pub struct GitTransport {
+    /// The discovered working repo, cached for local reads/writes.
+    repo: gix::Repository,
+    /// Its git directory, to re-open a fresh handle after a `git fetch` (the
+    /// cached `repo`'s odb won't see a pack written behind its back).
+    git_dir: PathBuf,
+}
+
+impl GitTransport {
+    /// Discover the working repo from the current directory. `caos-cli` must run
+    /// inside a git working tree that has the server as its `caos` remote.
+    pub fn from_cwd() -> Result<Self, String> {
+        let repo = gix::discover(".").map_err(|e| {
+            format!("caos-cli must run inside a git working tree (none found): {e}")
+        })?;
+        let git_dir = repo.git_dir().to_path_buf();
+        Ok(Self { repo, git_dir })
+    }
+}
+
+impl Transport for GitTransport {
+    fn put_object(&self, kind: &str, content: &[u8]) -> Result<gix::ObjectId, String> {
+        match kind {
+            "blob" => self
+                .repo
+                .write_blob(content)
+                .map(|id| id.detach())
+                .map_err(|e| format!("writing blob: {e}")),
+            "tree" => {
+                // Validate the canonical tree encoding, then write it as a real
+                // tree object so its hash is a genuine git tree hash.
+                let tree = gix::objs::TreeRef::from_bytes(content, self.repo.object_hash())
+                    .map_err(|e| format!("invalid tree: {e}"))?;
+                self.repo
+                    .write_object(&tree)
+                    .map(|id| id.detach())
+                    .map_err(|e| format!("writing tree: {e}"))
+            }
+            other => Err(format!("cannot store object of kind {other}")),
+        }
+    }
+
+    fn get_object(&self, hash: &str) -> Result<(String, Vec<u8>), String> {
+        let oid = parse_oid(hash)?;
+        if let Ok(object) = self.repo.find_object(oid) {
+            return Ok((object.kind.to_string(), object.data.clone()));
+        }
+        // Missing locally — it's on the server (e.g. a computation result, which
+        // lives there unreferenced). Fetch it by bare hash, then read it from a
+        // fresh handle: the cached `repo` won't pick up the pack `git fetch` just
+        // wrote.
+        run_git(&["fetch", "--quiet", CAOS_REMOTE, hash])
+            .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))?;
+        let repo = gix::open(&self.git_dir)
+            .map_err(|e| format!("reopening {}: {e}", self.git_dir.display()))?;
+        let object = repo
+            .find_object(oid)
+            .map_err(|e| format!("object {hash} not found after fetch: {e}"))?;
+        Ok((object.kind.to_string(), object.data.clone()))
+    }
+
+    fn ensure_pushed(&self, hash: &str) -> Result<(), String> {
+        // Content-addressed ref: clobber-free across clients, idempotent (a
+        // re-push of the same content is a no-op), and it persists as the
+        // negotiation base for the next push, so an edited tree ships only its
+        // delta. The push carries the whole object graph reachable from `hash`.
+        let refspec = format!("{hash}:refs/caos/req/{hash}");
+        run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
+            .map_err(|e| format!("pushing {hash} to {CAOS_REMOTE}: {e}"))
+    }
+}
+
+/// Run `git` (in the current working directory, i.e. the working repo) for the
+/// network steps gix doesn't drive for us (push/fetch over smart-HTTP).
+fn run_git(args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("running git {}: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Base URL of the caos server (storage + compute), from [`SERVER_ENV`].
@@ -1049,9 +1144,9 @@ pub fn caos_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) ->
     // container and returns the hash of the result (its /cas/out).
     let result = request_compute(&image, &args_tree.to_string(), &std)?;
 
-    // Pull the result objects (a no-op for HTTP; the git transport fetches the
-    // server-pinned result ref), then materialize them at the output path.
-    t.fetch_ref(&format!("refs/caos/res/{result}"))?;
+    // Materialize the result. The git transport fetches the result objects from
+    // the server on demand (they're unreferenced there, so by bare hash); HTTP
+    // GETs them. See [`Transport::get_object`].
     fetch_and_materialize(t, &target, &result)
 }
 

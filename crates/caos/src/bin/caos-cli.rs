@@ -1,17 +1,17 @@
 //! caos-cli: the user-facing caos client.
 //!
-//! This is what a person runs from inside their working tree. It will use the
-//! server as a `caos` git remote — building objects in the local repo and
-//! exchanging them with the server by negotiated push/fetch — but for now it
-//! shares the worker's HTTP transport ([`caos::HttpTransport`]); swapping in the
-//! git remote is the next step.
+//! This is what a person runs from inside their working tree. It uses the server
+//! as a `caos` git remote ([`caos::GitTransport`]): objects are built in the
+//! local working repo and exchanged with the server by negotiated push/fetch, so
+//! a large unchanged tree is almost free to "upload" and an edit ships only its
+//! delta. Compute is still triggered over HTTP (`$CAOS_SERVER_URL`, `/run`).
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `import-image`, `resolve`, `run`,
 //! `curry`, `build-args`. (There is no `entrypoint` — that's the worker's job.)
 
 use std::process::ExitCode;
 
-use caos::{prog_name, HttpTransport};
+use caos::{prog_name, GitTransport};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -72,10 +72,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// For now the CLI uses the same HTTP transport as the worker; the git remote
-/// transport replaces this in the next step.
-fn transport() -> Result<HttpTransport, String> {
-    HttpTransport::from_env()
+/// The CLI talks to the server as the `caos` git remote, over the local repo.
+fn transport() -> Result<GitTransport, String> {
+    GitTransport::from_cwd()
 }
 
 fn usage(args: &[String]) -> String {
