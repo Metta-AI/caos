@@ -434,14 +434,10 @@ fn compute_server_url() -> Result<String, String> {
 /// the CAS) into the object server and record the result at `<cas-path>`, a
 /// direct child of the CAS directory.
 ///
-/// Files are stored as blobs and directories as trees. A symlink that resolves
-/// to something already in the CAS is *not* re-read — its recorded hash is
-/// reused, so shared content is stored once.
-///
-/// Note: the object server only writes blobs, so tree objects are stored as
-/// their canonical git encoding under a blob hash. These aren't real git tree
-/// hashes, but they round-trip through `get` (which recovers the type by
-/// parsing the bytes).
+/// Files are stored as blobs and directories as trees — both as real git objects
+/// (the server writes trees with `write_object`, so their hashes are genuine git
+/// tree hashes). A symlink that resolves to something already in the CAS is *not*
+/// re-read — its recorded hash is reused, so shared content is stored once.
 fn put(src: &str, dst: &str) -> Result<(), String> {
     let base = object_server_url()?;
     let cas = cas_dir();
