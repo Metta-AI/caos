@@ -16,28 +16,23 @@
 //!
 //! Unlike the leaf workers it drives the server via `caos run` — both to
 //! apply `pre`/`post` and to recurse — so it relies on `CAOS_SERVER_URL`
-//! (injected by the server) and learns its own image name, for the
-//! recursive call, from `CAOS_FOLD_IMAGE`.
+//! (injected by the server) and reaches its own image, for the recursive call,
+//! as the built-in `/cas/std/fold`.
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use worker_common::{
     arg, caos, caos_run, entries, file_name, link, path, read_arg, read_arg_opt, run_worker,
-    scratch, self_image,
+    scratch, std_image,
 };
-
-/// Env var naming this worker's own image, used for the recursive `caos run`
-/// calls. Defaults to the conventional name/tag as a plain docker image.
-const SELF_IMAGE_ENV: &str = "CAOS_FOLD_IMAGE";
-const DEFAULT_SELF_IMAGE: &str = "docker://caos-worker-fold:latest";
 
 fn main() -> ExitCode {
     run_worker("fold", run)
 }
 
 fn run() -> Result<(), String> {
-    let fold_image = self_image(SELF_IMAGE_ENV, DEFAULT_SELF_IMAGE);
+    let fold_image = std_image("fold");
     // `pre` is optional; `post` (the combining algebra, formerly `func`) is not.
     // Both arrive as blobs naming an image to apply.
     let pre = read_arg_opt("pre")?;

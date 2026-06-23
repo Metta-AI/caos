@@ -25,14 +25,13 @@ pub fn arg(name: &str) -> String {
     format!("{ARGS}/{name}")
 }
 
-/// A worker's own image name, for the recursive `caos run` calls of workers that
-/// reinvoke themselves: the value of environment variable `env`, or `default`
-/// when it's unset or empty.
-pub fn self_image(env: &str, default: &str) -> String {
-    match std::env::var(env) {
-        Ok(v) if !v.is_empty() => v,
-        _ => default.to_string(),
-    }
+/// A built-in's image, referenced as a path into the standard-library tree the
+/// server materialized at `/cas/std`. Pass the result to `caos run`/`caos curry`
+/// like any image ref — `caos` resolves the recorded hash. Workers reach their
+/// own image and other built-ins this way, so the binding rides in `std` (and
+/// thus the cache key), not in env.
+pub fn std_image(name: &str) -> String {
+    format!("/cas/std/{name}")
 }
 
 /// A worker's `main`: run `run`, map its `Result` to an exit code, and prefix any

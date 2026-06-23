@@ -60,12 +60,22 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     if args.is_empty() || !args.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid args hash: {args:?}")));
     }
+    // The built-in tree (`std`) the caller pinned, threaded down from the top. It
+    // names the standard library, materialized at `/cas/std` in the worker, and is
+    // folded into the cache key so a different `std` is a different computation.
+    let std = query_param(query, "std").unwrap_or_default();
+    if !std.is_empty() && !std.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(HttpError::new(400, format!("invalid std hash: {std:?}")));
+    }
 
-    // Cache key is the image + args-tree hash; value is the result hash. Keying on
-    // the image param as given (a git hash, or a `docker://` ref) means a hit
-    // skips both image conversion and the container run. Redis is best-effort: a
-    // lookup/connection error just means we run uncached.
-    let key = format!("caos:result:{image}\0{args}");
+    // Cache key is the image + args-tree hash + the built-in pin (`std`); value is
+    // the result hash. Keying on the image param as given (a git hash, or a
+    // `docker://` ref) means a hit skips both image conversion and the container
+    // run. Folding in `std` means bumping the built-ins recomputes everything
+    // (every worker can reach any built-in via `/cas/std`, so any of them might
+    // affect any result). Redis is best-effort: a lookup/connection error just
+    // means we run uncached.
+    let key = format!("caos:result:{image}\0{args}\0{std}");
     match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
             eprintln!("cache hit: image={image} args={args} -> {result}");
@@ -111,6 +121,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         .args(["--network", &config.network])
         // One server, so the worker gets one URL for `caos get`/`put`/`run`.
         .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
+        // The built-in tree, materialized at /cas/std and re-passed by nested
+        // `caos run`s so it threads down the whole tree (empty = none).
+        .args(["-e", &format!("CAOS_STD={std}")])
         .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&docker_ref)

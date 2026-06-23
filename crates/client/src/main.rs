@@ -56,6 +56,17 @@ const SERVER_ENV: &str = "CAOS_SERVER_URL";
 /// cache key (image + args) is unaffected.
 const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
 
+/// The built-in tree hash (`std`) in effect for this run. The server sets it on
+/// each worker it spawns (materialized at `/cas/std`); `caos run` echoes it back
+/// so it threads down the whole tree. At the top it's unset, and the ref named by
+/// [`STD_REF_ENV`] is resolved instead. Unlike the run stack, `std` *is* part of
+/// the result cache key (it names the standard library a worker can reach).
+const STD_ENV: &str = "CAOS_STD";
+/// Ref resolved to `std` at the top of a run (overridable). Default
+/// `refs/caos/std`, read from the local repo.
+const STD_REF_ENV: &str = "CAOS_STD_REF";
+const DEFAULT_STD_REF: &str = "refs/caos/std";
+
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 const DOCKER_SCHEME: &str = "docker://";
 
@@ -138,6 +149,15 @@ fn run(args: &[String]) -> Result<(), String> {
         },
         Some("import-image") => match (args.get(2), args.get(3), args.get(4)) {
             (Some(archive), Some(dst), None) => import_image(archive, dst),
+            _ => Err(usage(args)),
+        },
+        // `resolve <ref>` — print the tree hash a local git ref points at (e.g.
+        // refs/caos/std).
+        Some("resolve") => match (args.get(2), args.get(3)) {
+            (Some(name), None) => {
+                println!("{}", resolve_ref(name)?);
+                Ok(())
+            }
             _ => Err(usage(args)),
         },
         // `run <image> <output> -- [--name=value ...]`. The `--` separates the
@@ -300,9 +320,9 @@ fn parse_get(args: &[String]) -> Result<(&str, Option<u32>), String> {
 }
 
 /// `entrypoint [--args=<hash>]` — the container entrypoint. Wipes the CAS
-/// directory, optionally populates `/cas/args` from `--args=<hash>`, runs
-/// `/worker`, prints the hash recorded at `/cas/out`, then removes the CAS
-/// directory.
+/// directory, optionally populates `/cas/args` from `--args=<hash>` and `/cas/std`
+/// from `$CAOS_STD`, runs `/worker`, prints the hash recorded at `/cas/out`, then
+/// removes the CAS directory.
 fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     let cas = cas_dir();
 
@@ -320,6 +340,15 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     if let Some(hash) = args_hash {
         let base = server_url()?;
         fetch_and_materialize(&base, &cas.join("args"), hash)?;
+    }
+
+    // Populate /cas/std (one level) from the built-in tree the server threaded in,
+    // so the worker can reach builtins as `/cas/std/<name>`.
+    if let Ok(std) = std::env::var(STD_ENV) {
+        if !std.is_empty() {
+            let base = server_url()?;
+            fetch_and_materialize(&base, &cas.join("std"), &std)?;
+        }
     }
 
     // Run the worker, sending its stdout to our stderr so that our own stdout
@@ -520,7 +549,11 @@ fn import_image(archive: &str, dst: &str) -> Result<(), String> {
         }
 
         let image_oid = post_tree(&base, entries)?;
-        fetch_and_materialize(&base, &target, &image_oid.to_string())
+        fetch_and_materialize(&base, &target, &image_oid.to_string())?;
+        // Print the stored git-docker tree's hash, e.g. so a script can assemble
+        // it into a larger tree (the built-ins library does this).
+        println!("{image_oid}");
+        Ok(())
     })();
 
     let _ = std::fs::remove_dir_all(&work);
@@ -770,7 +803,6 @@ fn parse_oid(hex: &str) -> Result<gix::ObjectId, String> {
 /// the result at `<output>` (a direct child of the CAS directory).
 fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     let base = server_url()?;
-    let compute = server_url()?;
     let cas = cas_dir();
     let target = validate_target(&cas, output)?;
     probe_xattr(&cas)?;
@@ -789,12 +821,54 @@ fn caos_run(image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
     let call = build_arg_entries(&base, &cas, kvs)?;
     let args_tree = post_tree(&base, merge_entries(bound, call))?;
 
+    // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
+    // resolved from the `refs/caos/std` ref at the top. Passed to the server so it
+    // keys on it and threads it down (materialized at /cas/std in the worker).
+    let std = run_std()?;
+
     // Hand the image and args-tree hash to the server; it runs the
     // container and returns the hash of the result (its /cas/out).
-    let result = request_compute(&compute, &image, &args_tree.to_string())?;
+    let result = request_compute(&base, &image, &args_tree.to_string(), &std)?;
 
     // Materialize that result at the requested output path.
     fetch_and_materialize(&base, &target, &result)
+}
+
+/// The built-in tree hash (`std`) for a run. Inside a worker the server sets
+/// [`STD_ENV`], so reuse it (threading). At the top, resolve the built-ins ref
+/// ([`STD_REF_ENV`], default `refs/caos/std`) from the local repo; tolerate its
+/// absence (no built-ins published) — a worker that needs them will fail clearly.
+fn run_std() -> Result<String, String> {
+    if let Ok(std) = std::env::var(STD_ENV) {
+        return Ok(std);
+    }
+    let refname = std::env::var(STD_REF_ENV).unwrap_or_else(|_| DEFAULT_STD_REF.to_string());
+    Ok(resolve_ref(&refname).unwrap_or_default())
+}
+
+/// Resolve a git ref (e.g. `refs/caos/std`) to its tree hash, read from the local
+/// repository — the same one the server is backed by, for now. Peels tags and
+/// commits to a tree. No server round-trip: the CLI already has the refs.
+fn resolve_ref(name: &str) -> Result<String, String> {
+    let repo = gix::discover(".").map_err(|e| format!("no git repo for ref {name}: {e}"))?;
+    let mut reference = repo
+        .find_reference(name)
+        .map_err(|e| format!("ref {name} not found: {e}"))?;
+    let id = reference
+        .peel_to_id()
+        .map_err(|e| format!("peeling ref {name}: {e}"))?;
+    let object = id.object().map_err(|e| format!("reading {id}: {e}"))?;
+    let tree = match object.kind {
+        gix::object::Kind::Tree => id.detach(),
+        gix::object::Kind::Commit => object
+            .try_into_commit()
+            .map_err(|e| format!("{name}: {e}"))?
+            .tree_id()
+            .map_err(|e| format!("{name} has no tree: {e}"))?
+            .detach(),
+        other => return Err(format!("ref {name} points at a {other}, not a tree or commit")),
+    };
+    Ok(tree.to_string())
 }
 
 /// Resolve the `<image>` argument of `caos run` into what the server
@@ -1104,17 +1178,27 @@ fn build_arg_entries(
     Ok(entries)
 }
 
-/// Ask the server to run `image` over the args tree `args_hash`,
-/// returning the result hash it prints (the container's /cas/out).
-fn request_compute(base: &str, image: &str, args_hash: &str) -> Result<String, String> {
+/// Ask the server to run `image` over the args tree `args_hash` with built-ins
+/// `std`, returning the result hash it prints (the container's /cas/out).
+fn request_compute(
+    base: &str,
+    image: &str,
+    args_hash: &str,
+    std: &str,
+) -> Result<String, String> {
     let mut url = format!(
         "{}/run?image={}&args={}",
         base.trim_end_matches('/'),
         percent_encode(image),
         args_hash,
     );
-    // Echo back the in-progress run stack (see RUN_STACK_ENV) so the compute
-    // server can detect cycles. Empty/unset at the top level.
+    // The built-in tree, keyed on and threaded down by the server (see STD_ENV).
+    if !std.is_empty() {
+        url.push_str("&std=");
+        url.push_str(std);
+    }
+    // Echo back the in-progress run stack (see RUN_STACK_ENV) so the server can
+    // detect cycles. Empty/unset at the top level.
     if let Ok(stack) = std::env::var(RUN_STACK_ENV) {
         if !stack.is_empty() {
             url.push_str("&stack=");

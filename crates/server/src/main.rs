@@ -119,6 +119,7 @@ fn main() {
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
+
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
     let repo = match gix::open(&git_dir) {
@@ -128,6 +129,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
         network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
@@ -153,7 +155,7 @@ fn main() {
         config.server_url,
         config.registry_push_url,
         config.registry_pull_host,
-        config.redis_addr
+        config.redis_addr,
     );
 
     // One thread per request, not a serial loop: a worker can itself call back

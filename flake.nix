@@ -241,10 +241,10 @@
         # each child with itself (the same pre/post), then combines them with
         # post. pre/post are image refs — often curried with the context they
         # need — and the applied images take their input as `--in`; the result
-        # is left at /cas/out. Unlike the other workers it drives the compute
-        # server via `caos run` — both to apply pre/post and to recurse — so it
-        # relies on CAOS_SERVER_URL (injected by the server) and
-        # learns its own image name, for the recursive call, from CAOS_FOLD_IMAGE.
+        # is left at /cas/out. Unlike the other workers it drives the server via
+        # `caos run` — both to apply pre/post and to recurse — so it relies on
+        # CAOS_SERVER_URL (injected by the server) and reaches its own image, for
+        # the recursive call, as the built-in /cas/std/fold.
         # This is the `worker-fold` crate, a static binary at /worker — so the
         # image needs no shell or coreutils.
         workerFoldRoot = workerRoot "worker-fold" worker-fold;
@@ -257,11 +257,7 @@
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [
-            "PATH=/bin"
-            # caos run defaults to git images, so name the docker image explicitly.
-            "CAOS_FOLD_IMAGE=docker://caos-worker-fold:latest"
-          ];
+          Env = [ "PATH=/bin" ];
         };
         workerFoldImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-fold";
@@ -327,9 +323,9 @@
         # args) and is caught by the server's run-cycle detection.
         #
         # Like fold it drives the server via `caos run`, so it relies on
-        # CAOS_SERVER_URL (injected) and learns its own image (to curry
-        # resolve/finish) from CAOS_DEEP_DEPS_IMAGE and fold's from
-        # CAOS_FOLD_IMAGE.
+        # CAOS_SERVER_URL (injected) and reaches its own image (to curry
+        # resolve/finish) and fold's as the built-ins /cas/std/deep-deps and
+        # /cas/std/fold.
         #
         # This worker is the `worker-deep-deps` crate, a static binary placed at
         # /worker — so, like the other Rust workers, its image needs no shell or
@@ -344,12 +340,7 @@
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [
-            "PATH=/bin"
-            # caos run defaults to git images, so name the docker images explicitly.
-            "CAOS_DEEP_DEPS_IMAGE=docker://caos-worker-deep-deps:latest"
-            "CAOS_FOLD_IMAGE=docker://caos-worker-fold:latest"
-          ];
+          Env = [ "PATH=/bin" ];
         };
         workerDeepDepsImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-deep-deps";

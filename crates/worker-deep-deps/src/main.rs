@@ -26,16 +26,8 @@ use std::process::ExitCode;
 
 use worker_common::{
     arg, caos, caos_curry, caos_run, entries, file_name, link, path, read_arg_opt, run_worker,
-    scratch, self_image, ARGS,
+    scratch, std_image, ARGS,
 };
-
-/// Env var naming this worker's own image, curried into the fold's `pre`/`post`.
-const SELF_IMAGE_ENV: &str = "CAOS_DEEP_DEPS_IMAGE";
-const DEFAULT_SELF_IMAGE: &str = "docker://caos-worker-deep-deps:latest";
-
-/// Env var naming the fold worker's image, which the driver runs.
-const FOLD_IMAGE_ENV: &str = "CAOS_FOLD_IMAGE";
-const DEFAULT_FOLD_IMAGE: &str = "docker://caos-worker-fold:latest";
 
 fn main() -> ExitCode {
     run_worker("deep-deps", run)
@@ -151,12 +143,12 @@ fn fold_functions() -> Result<(String, String), String> {
     Ok((pre, post))
 }
 
-/// This image, for currying `resolve`/`finish`.
+/// This image, for currying `resolve`/`finish` — the built-in `/cas/std/deep-deps`.
 fn me() -> String {
-    self_image(SELF_IMAGE_ENV, DEFAULT_SELF_IMAGE)
+    std_image("deep-deps")
 }
 
-/// The fold worker's image, which the driver runs.
+/// The fold worker's image, which the driver runs — the built-in `/cas/std/fold`.
 fn fold_image() -> String {
-    self_image(FOLD_IMAGE_ENV, DEFAULT_FOLD_IMAGE)
+    std_image("fold")
 }
