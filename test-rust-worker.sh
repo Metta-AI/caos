@@ -7,8 +7,8 @@
 # memoized (rebuilding identical source is a cache hit) and that editing the
 # source yields a different worker.
 #
-# Requires the dev daemons running (`tilt up`): object server :8080, compute
-# server :9090, redis, registry — and a docker the compute server can reach.
+# Requires the dev daemons running (`tilt up`): the caos server :9090 (storage +
+# compute), redis, registry — and a docker the compute server can reach.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,8 +19,8 @@ nix run .#load-caos-worker-rustc >/dev/null
 nix build .#caos-worker-base-docker -o result-base
 caos=$PWD/result-client/bin/client
 
-export CAOS_OBJECT_SERVER_URL=${CAOS_OBJECT_SERVER_URL:-http://localhost:8080}
-export CAOS_COMPUTE_SERVER_URL=${CAOS_COMPUTE_SERVER_URL:-http://localhost:9090}
+# Storage and compute are one server now — a single URL covers both.
+export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 CAS=$PWD/.caos-dev/rustc-cas
 rm -rf "$CAS"; mkdir -p "$CAS"
 export CAOS_CAS_DIR=$CAS

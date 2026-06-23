@@ -11,9 +11,11 @@ path = "src/main.rs"
 # Minimal synchronous HTTP server: no async runtime, no TLS, pure Rust — same
 # as object-server.
 tiny_http = "0.12"
-# Parse git objects (trees/blobs) fetched from the object server when converting
-# a git-docker image. Same pure-Rust, static-musl config as the other crates.
-gix = { version = "0.84", default-features = false, features = ["sha1"] }
+# Serve and read the git object database in-process (storage is merged in here).
+# `parallel` makes gix's shared pointers `Arc`, so `ThreadSafeRepository` is
+# genuinely `Send + Sync` — needed because storage is served on the per-request
+# worker threads. Pure-Rust, static-musl, like the other crates.
+gix = { version = "0.84", default-features = false, features = ["sha1", "parallel"] }
 # Minimal blocking HTTP client (plain HTTP, no TLS) for fetching git objects from
 # the object server and pushing blobs/manifests to the registry. Same config as
 # the client crate.

@@ -52,6 +52,11 @@ const OBJECT_SERVER_ENV: &str = "CAOS_OBJECT_SERVER_URL";
 /// Base URL of the compute server, e.g. `http://caos-compute-server`.
 const COMPUTE_SERVER_ENV: &str = "CAOS_COMPUTE_SERVER_URL";
 
+/// Single front-end URL serving both storage and compute. Used as the fallback
+/// for both [`OBJECT_SERVER_ENV`] and [`COMPUTE_SERVER_ENV`], so a user can set
+/// just one variable. The specific vars still override it when set.
+const SERVER_ENV: &str = "CAOS_SERVER_URL";
+
 /// The chain of `(image, args)` computations currently in progress, set by the
 /// compute server on each worker it spawns. `caos run` echoes it back so the
 /// server can detect a run that re-enters a computation already on the stack
@@ -418,16 +423,23 @@ fn parse_object(bytes: &[u8]) -> Result<(&str, &[u8]), String> {
     Ok((kind, content))
 }
 
-/// Base URL of the object server from the environment.
+/// Base URL of the object server: `CAOS_OBJECT_SERVER_URL`, or the single
+/// front-end `CAOS_SERVER_URL`.
 fn object_server_url() -> Result<String, String> {
-    std::env::var(OBJECT_SERVER_ENV)
-        .map_err(|_| format!("{OBJECT_SERVER_ENV} must be set to the object-server URL"))
+    server_url(OBJECT_SERVER_ENV)
 }
 
-/// Base URL of the compute server from the environment.
+/// Base URL of the compute server: `CAOS_COMPUTE_SERVER_URL`, or the single
+/// front-end `CAOS_SERVER_URL`.
 fn compute_server_url() -> Result<String, String> {
-    std::env::var(COMPUTE_SERVER_ENV)
-        .map_err(|_| format!("{COMPUTE_SERVER_ENV} must be set to the compute-server URL"))
+    server_url(COMPUTE_SERVER_ENV)
+}
+
+/// The URL from `specific`, falling back to the single front-end [`SERVER_ENV`].
+fn server_url(specific: &str) -> Result<String, String> {
+    std::env::var(specific)
+        .or_else(|_| std::env::var(SERVER_ENV))
+        .map_err(|_| format!("set {specific} (or {SERVER_ENV} for a single front-end)"))
 }
 
 /// `put <src-path> <cas-path>` — recursively store `<src-path>` (a path outside

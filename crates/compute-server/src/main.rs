@@ -50,15 +50,16 @@ const DEFAULT_ADDR: &str = "0.0.0.0:80";
 /// name. Override with `CAOS_DOCKER_NETWORK`.
 const DEFAULT_NETWORK: &str = "caos-net";
 
-/// Object-server URL passed into the worker container. Override with
-/// `CAOS_OBJECT_SERVER_URL`.
-const DEFAULT_OBJECT_SERVER_URL: &str = "http://caos-object-server";
-
-/// Compute-server URL passed into the worker container, so a worker that calls
-/// `caos run` (e.g. the fold worker, which recurses) can reach us. This is our
-/// own address as seen from inside the Docker network. Override with
-/// `CAOS_COMPUTE_SERVER_URL`.
+/// This server's URL as seen from inside the Docker network, passed into each
+/// worker container — for both storage (`caos get`/`put`) and compute (a worker
+/// that calls `caos run`, e.g. the fold worker, which recurses). Now that storage
+/// and compute are one server, workers get this single URL for both. Override
+/// with `CAOS_COMPUTE_SERVER_URL`.
 const DEFAULT_COMPUTE_SERVER_URL: &str = "http://caos-compute-server";
+
+/// Where the git object database lives (the storage half, now in-process).
+/// Override with `CAOS_GIT_DIR` (useful for local runs outside the container).
+const DEFAULT_GIT_DIR: &str = "/git";
 
 /// Registry base URL converted git-docker images are pushed to, reachable from
 /// *this* container over the docker network. Override with
@@ -101,12 +102,14 @@ const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
 /// Runtime configuration, read once from the environment at startup.
 struct Config {
     network: String,
-    object_server_url: String,
     compute_server_url: String,
     registry_push_url: String,
     registry_pull_host: String,
     docker_bin: String,
     redis_addr: String,
+    /// The git object database, served directly (storage is now in-process).
+    /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
+    repo: gix::ThreadSafeRepository,
 }
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
@@ -136,15 +139,25 @@ fn main() {
     install_termination_handlers();
 
     let addr = std::env::var("COMPUTE_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
+    // Open the object database once as a thread-safe handle; each request thread
+    // takes a cheap local handle from it (see `handle`).
+    let repo = match gix::open(&git_dir) {
+        Ok(repo) => repo.into_sync(),
+        Err(err) => {
+            eprintln!("fatal: cannot open git repo at {git_dir}: {err}");
+            std::process::exit(1);
+        }
+    };
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
         network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
-        object_server_url: env_or("CAOS_OBJECT_SERVER_URL", DEFAULT_OBJECT_SERVER_URL),
         compute_server_url: env_or("CAOS_COMPUTE_SERVER_URL", DEFAULT_COMPUTE_SERVER_URL),
         registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
         registry_pull_host: env_or("CAOS_REGISTRY_PULL_HOST", DEFAULT_REGISTRY_PULL_HOST),
         docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
+        repo,
     });
 
     let server = match Server::http(addr.as_str()) {
@@ -155,10 +168,9 @@ fn main() {
         }
     };
     eprintln!(
-        "compute-server listening on http://{addr}, network {}, object server {}, \
-         compute server {}, registry push {} / pull {}, redis {}",
+        "caos-server listening on http://{addr} (storage + compute), network {}, \
+         git repo {git_dir}, compute server {}, registry push {} / pull {}, redis {}",
         config.network,
-        config.object_server_url,
         config.compute_server_url,
         config.registry_push_url,
         config.registry_pull_host,
@@ -201,9 +213,15 @@ impl HttpError {
     }
 }
 
+impl From<std::io::Error> for HttpError {
+    fn from(err: std::io::Error) -> Self {
+        HttpError::new(500, format!("io error: {err}"))
+    }
+}
+
 /// Dispatch a single request and send its response.
-fn handle(config: &Config, request: Request) -> std::io::Result<()> {
-    match route(config, &request) {
+fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
+    match route(config, &mut request) {
         Ok(body) => request.respond(Response::from_data(body)),
         Err(err) => request.respond(
             Response::from_string(format!("{}\n", err.message))
@@ -212,15 +230,98 @@ fn handle(config: &Config, request: Request) -> std::io::Result<()> {
     }
 }
 
-/// Match the request to a handler and produce the response body.
-fn route(config: &Config, request: &Request) -> Result<Vec<u8>, HttpError> {
-    let url = request.url();
-    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+/// Match the request to a handler and produce the response body. Serves both the
+/// storage endpoints (`/object*`) and compute (`/run`).
+fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
+    let url = request.url().to_string();
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url.clone(), String::new()),
+    };
 
-    match (request.method(), path) {
-        (Method::Get, "/run") => run(config, query),
+    match request.method() {
+        Method::Get if path == "/run" => run(config, &query),
+        Method::Get => match path.strip_prefix("/object/") {
+            Some(hash) if !hash.is_empty() => get_object(config, hash),
+            _ => Err(HttpError::new(404, "not found")),
+        },
+        Method::Post if path == "/object/" || path == "/object" => {
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body)?;
+            post_object(config, &body)
+        }
         _ => Err(HttpError::new(404, "not found")),
     }
+}
+
+/// `GET /object/<hash>` — return the serialized object: git's native
+/// `<type> <size>\0<content>` form (uncompressed).
+fn get_object(config: &Config, hash: &str) -> Result<Vec<u8>, HttpError> {
+    let repo = config.repo.to_thread_local();
+    let id = gix::ObjectId::from_hex(hash.as_bytes())
+        .map_err(|err| HttpError::new(400, format!("invalid hash: {err}")))?;
+    let object = repo
+        .find_object(id)
+        .map_err(|err| HttpError::new(404, format!("object not found: {err}")))?;
+    let mut out = format!("{} {}\0", object.kind, object.data.len()).into_bytes();
+    out.extend_from_slice(&object.data);
+    Ok(out)
+}
+
+/// `POST /object/` — store a serialized object (`<type> <size>\0<content>`) and
+/// return its hash (hex + `\n`). The type and size come from the body's header.
+fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+    let repo = config.repo.to_thread_local();
+    let (kind, content) = parse_posted_object(body)?;
+    let id = match kind {
+        gix::object::Kind::Blob => repo
+            .write_blob(content)
+            .map_err(|err| HttpError::new(500, format!("failed to write blob: {err}")))?
+            .detach(),
+        gix::object::Kind::Tree => {
+            // Validate the canonical tree encoding before writing it as a real
+            // tree object (so its hash is a genuine git tree hash).
+            let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
+                .map_err(|err| HttpError::new(400, format!("invalid tree: {err}")))?;
+            repo.write_object(&tree)
+                .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
+                .detach()
+        }
+        other => {
+            return Err(HttpError::new(
+                400,
+                format!("unsupported object type: {other} (expected blob or tree)"),
+            ))
+        }
+    };
+    Ok(format!("{id}\n").into_bytes())
+}
+
+/// Split a posted serialized object into its type and content, validating the
+/// header (`<type> <size>\0`).
+fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpError> {
+    let nul = body
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| HttpError::new(400, "malformed object: missing NUL after header"))?;
+    let header = std::str::from_utf8(&body[..nul])
+        .map_err(|_| HttpError::new(400, "malformed object header"))?;
+    let content = &body[nul + 1..];
+    let (kind, size) = header
+        .split_once(' ')
+        .ok_or_else(|| HttpError::new(400, "malformed object header: expected '<type> <size>'"))?;
+    let size: usize = size
+        .parse()
+        .map_err(|_| HttpError::new(400, format!("malformed object size: {size:?}")))?;
+    if size != content.len() {
+        return Err(HttpError::new(
+            400,
+            format!("object size {size} != content length {}", content.len()),
+        ));
+    }
+    let kind = gix::object::Kind::from_bytes(kind.as_bytes())
+        .map_err(|_| HttpError::new(400, format!("unknown object type: {kind:?}")))?;
+    Ok((kind, content))
 }
 
 /// `GET /run?image=<image>&args=<hash>` — run the image and return its result.
@@ -286,9 +387,11 @@ fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         .arg("run")
         .arg("--rm")
         .args(["--network", &config.network])
+        // Storage and compute are one server now, so the worker gets a single
+        // URL for both `caos get`/`put` and `caos run`.
         .args([
             "-e",
-            &format!("CAOS_OBJECT_SERVER_URL={}", config.object_server_url),
+            &format!("CAOS_OBJECT_SERVER_URL={}", config.compute_server_url),
         ])
         .args([
             "-e",
@@ -682,40 +785,15 @@ fn fetch_blob(config: &Config, hash: &str) -> Result<Vec<u8>, String> {
     Ok(content)
 }
 
-/// Fetch a git object from the object server, returning its `(type, content)`.
+/// Read a git object from the in-process object database, returning its
+/// `(type, content)`.
 fn fetch_object(config: &Config, hash: &str) -> Result<(String, Vec<u8>), String> {
-    let url = format!(
-        "{}/object/{hash}",
-        config.object_server_url.trim_end_matches('/')
-    );
-    let response = minreq::get(&url)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "GET {url}: server returned {} {}",
-            response.status_code, response.reason_phrase
-        ));
-    }
-    let bytes = response.into_bytes();
-    let nul = bytes
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or("object response missing NUL after header")?;
-    let header =
-        std::str::from_utf8(&bytes[..nul]).map_err(|e| format!("bad object header: {e}"))?;
-    let (kind, size) = header
-        .split_once(' ')
-        .ok_or("bad object header: expected '<type> <size>'")?;
-    let content = bytes[nul + 1..].to_vec();
-    let size: usize = size.parse().map_err(|e| format!("bad object size: {e}"))?;
-    if size != content.len() {
-        return Err(format!(
-            "object size {size} != content length {}",
-            content.len()
-        ));
-    }
-    Ok((kind.to_string(), content))
+    let repo = config.repo.to_thread_local();
+    let id = gix::ObjectId::from_hex(hash.as_bytes()).map_err(|e| format!("invalid hash {hash}: {e}"))?;
+    let object = repo
+        .find_object(id)
+        .map_err(|e| format!("object {hash} not found: {e}"))?;
+    Ok((object.kind.to_string(), object.data.clone()))
 }
 
 /// Upload a blob to the registry (monolithic two-step: start, then PUT bytes).

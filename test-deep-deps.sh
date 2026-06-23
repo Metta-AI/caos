@@ -11,8 +11,8 @@
 #      it. Proven by content (diff -r), since the deepen driver re-runs on any
 #      map edit by design and so raw miss-counts are noisy (reported as info).
 #
-# Requires the dev daemons running (`tilt up`): object server :8080, compute
-# server :9090, redis, registry — and a docker the compute server can reach.
+# Requires the dev daemons running (`tilt up`): the caos server :9090 (storage +
+# compute), redis, registry — and a docker the compute server can reach.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -24,8 +24,8 @@ nix run .#load-caos-worker-deep-deps >/dev/null
 nix run .#load-caos-worker-fold >/dev/null
 caos=$PWD/result-client/bin/client
 
-export CAOS_OBJECT_SERVER_URL=${CAOS_OBJECT_SERVER_URL:-http://localhost:8080}
-export CAOS_COMPUTE_SERVER_URL=${CAOS_COMPUTE_SERVER_URL:-http://localhost:9090}
+# Storage and compute are one server now — a single URL covers both.
+export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 # CAS must live on an xattr-capable fs (caos records each path's hash in
 # user.caos.hash); the repo's fs qualifies, /tmp may not.
 CAS=$PWD/.caos-dev/test-cas

@@ -80,7 +80,6 @@
           );
 
         client = crateBin "client";
-        object-server = crateBin "object-server";
         compute-server = crateBin "compute-server";
         worker-hello = crateBin "worker-hello";
         worker-fold = crateBin "worker-fold";
@@ -89,7 +88,7 @@
         worker-rustc = crateBin "worker-rustc";
 
         # Minimal images: each contains *only* its static binary — no shell, no
-        # libc, no /nix/store. Crates are unprefixed (client, object-server) but
+        # libc, no /nix/store. Crates are unprefixed (client, compute-server) but
         # the published image names carry a `caos-` prefix.
         # NOTE: Docker images are Linux-only; build these on Linux (or via a
         # remote/linux builder on macOS).
@@ -156,19 +155,6 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # Run with the git repo bind-mounted at /git, e.g.
-        #   docker run --rm -p 8080:80 -v /path/to/repo:/git caos-object-server
-        objectServerImage = pkgs.dockerTools.buildImage {
-          name = "caos-object-server";
-          tag = "latest";
-          copyToRoot = [ object-server ];
-          config = {
-            Cmd = [ "/bin/object-server" ];
-            ExposedPorts = {
-              "80/tcp" = { };
-            };
-          };
-        };
 
         # A testing image: caos-worker-base plus an ordinary interactive shell
         # (bash + coreutils + curl) so you can poke at /cas and the object server
@@ -423,13 +409,17 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # compute-server runs worker containers by shelling out to the `docker`
-        # CLI, so — unlike the minimal images — it bundles the docker client and
-        # expects the host's docker socket bind-mounted at /var/run/docker.sock.
-        # It also shells out to GNU `tar` to build layer tarballs when converting
-        # a git image, so it bundles that too:
+        # The caos server: storage *and* compute in one process (it serves
+        # /object from a git repo and /run by spawning worker containers). It runs
+        # those containers by shelling out to the `docker` CLI, so — unlike the
+        # minimal images — it bundles the docker client and expects the host's
+        # docker socket bind-mounted at /var/run/docker.sock, and it shells out to
+        # GNU `tar` to build layer tarballs when converting a git image. It also
+        # needs the git object database bind-mounted at /git (override with
+        # CAOS_GIT_DIR):
         #   docker run --rm --network caos-net -p 9090:80 \
-        #     -v /var/run/docker.sock:/var/run/docker.sock caos-compute-server
+        #     -v /var/run/docker.sock:/var/run/docker.sock -v /repo/.git:/git \
+        #     caos-compute-server
         computeServerContents = [
           compute-server
           pkgs.docker-client
@@ -473,16 +463,6 @@
           contents = [ workerBaseRoot ];
           config = workerBaseConfig;
           fakeRootCommands = installWorkerFiles;
-        };
-        loadObjectServer = loadImage {
-          name = "caos-object-server";
-          contents = [ object-server ];
-          config = {
-            Cmd = [ "/bin/object-server" ];
-            ExposedPorts = {
-              "80/tcp" = { };
-            };
-          };
         };
         loadWorkerBash = loadImage {
           name = "caos-worker-bash";
@@ -529,11 +509,10 @@
       {
         packages = {
           default = client;
-          inherit client object-server compute-server;
+          inherit client compute-server;
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-worker-base-docker = workerBaseImage;
-          caos-object-server-docker = objectServerImage;
           caos-worker-bash-docker = workerBashImage;
           caos-compute-server-docker = computeServerImage;
           caos-worker-hello-docker = workerHelloImage;
@@ -548,10 +527,6 @@
           load-caos-worker-base = {
             type = "app";
             program = "${loadWorkerBase}/bin/load-caos-worker-base";
-          };
-          load-caos-object-server = {
-            type = "app";
-            program = "${loadObjectServer}/bin/load-caos-object-server";
           };
           load-caos-worker-bash = {
             type = "app";
@@ -584,7 +559,7 @@
         };
 
         checks = {
-          inherit client object-server compute-server;
+          inherit client compute-server;
 
           clippy = craneLib.cargoClippy (
             commonArgs

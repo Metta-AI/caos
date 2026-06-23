@@ -7,7 +7,7 @@
 
 NET = 'caos-net'
 
-# The object server is backed by *this project's own* `.git`, so caos can fetch
+# The caos server is backed by *this project's own* `.git`, so caos can fetch
 # real repo objects (run `git rev-parse HEAD:README.md` for a blob hash, or any
 # tree hash) instead of an empty throwaway repo — more interesting test data.
 # Computed at Tiltfile load (cwd = this directory) so it doesn't depend on `$PWD`.
@@ -23,7 +23,7 @@ GIT_REPO = os.path.abspath('.git')
 # Mount .git at /git, plus each alternate object dir at its own absolute path
 # (read-only: git never writes to an alternate). Without this, only the handful
 # of loose objects in this .git would resolve.
-def object_server_mounts():
+def git_mounts():
     mounts = ['-v "%s:/git"' % GIT_REPO]
     alternates = os.path.join(GIT_REPO, 'objects', 'info', 'alternates')
     if os.path.exists(alternates):
@@ -33,7 +33,7 @@ def object_server_mounts():
                 mounts.append('-v "%s:%s:ro"' % (alt, alt))
     return mounts
 
-OBJECT_SERVER_MOUNTS = object_server_mounts()
+GIT_MOUNTS = git_mounts()
 
 # Per-image marker files. Each image build bumps its marker once the new image is
 # loaded; a daemon depends on its image's marker (see `daemon` below), so loading
@@ -61,7 +61,6 @@ def nix_image(res, app, srcs):
         labels=['images'],
     )
 
-nix_image('img-object-server', 'load-caos-object-server', ['crates/object-server'])
 nix_image('img-compute-server', 'load-caos-compute-server', ['crates/compute-server'])
 nix_image('img-worker-base', 'load-caos-worker-base', ['crates/client'])
 nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/client'])
@@ -133,19 +132,19 @@ local_resource(
     labels=['daemons'],
 )
 
-daemon(
-    'caos-object-server',
-    ['-p 8080:80'] + OBJECT_SERVER_MOUNTS,
-)
+# The one caos server: storage + compute in a single process. It serves /object
+# from the bind-mounted git repo and /run by spawning worker containers (hence
+# the docker socket), so it needs all of: the git mounts, the docker socket, the
+# network, the cache, and the registry.
 daemon(
     'caos-compute-server',
     [
         '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
         '-v /var/run/docker.sock:/var/run/docker.sock',
-    ],
-    # Compute server uses the cache and pushes converted images to the registry;
-    # start it after both. (It degrades gracefully if Redis is down; the registry
-    # is only needed when running a git image.)
+    ] + GIT_MOUNTS,
+    # Uses the cache and pushes converted images to the registry; start it after
+    # both. (It degrades gracefully if Redis is down; the registry is only needed
+    # when running a git image.)
     extra_deps=['caos-redis', 'caos-registry'],
 )
