@@ -43,27 +43,29 @@ def nix_image(res, app, srcs):
     )
 
 nix_image('img-server', 'load-caos-server', ['crates/server'])
-nix_image('img-worker-base', 'load-caos-worker-base', ['crates/client'])
-nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/client'])
-nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/client'])
-nix_image('img-worker-fold', 'load-caos-worker-fold', ['crates/client'])
-nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/client'])
-nix_image('img-worker-deep-deps', 'load-caos-worker-deep-deps', ['crates/client'])
+nix_image('img-worker-base', 'load-caos-worker-base', ['crates/caos'])
+nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/caos'])
+nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/caos'])
+nix_image('img-worker-fold', 'load-caos-worker-fold', ['crates/caos'])
+nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/caos'])
+nix_image('img-worker-deep-deps', 'load-caos-worker-deep-deps', ['crates/caos'])
 
 # One-time infra: the docker network the daemons and the worker containers the
-# server spawns all share. (The server's git repo is this
-# project's own .git — see GIT_REPO above — so there's nothing to create here.)
+# server spawns all share, plus the server's own bare repo (see SERVER_REPO).
 local_resource(
     'setup',
     # Create the markers dir, the shared docker network, and the server's own bare
-    # repo. `http.receivepack=true` is what lets clients `git push` to it over
-    # smart-HTTP; `git init --bare` is idempotent, so re-running setup is safe and
-    # leaves an existing repo (and its pushed objects/refs) untouched.
+    # repo. `http.receivepack=true` lets clients `git push` to it over smart-HTTP;
+    # `uploadpack.allowAnySHA1InWant=true` lets them `git fetch` a computation
+    # result by its bare hash (results live unreferenced in the repo). `git init
+    # --bare` is idempotent, so re-running setup is safe and leaves an existing
+    # repo (and its pushed objects/refs) untouched.
     cmd=' && '.join([
         'mkdir -p %s' % MARKERS,
         '(docker network create %s >/dev/null 2>&1 || true)' % NET,
         'git init -q --bare %s' % SERVER_REPO,
         'git -C %s config http.receivepack true' % SERVER_REPO,
+        'git -C %s config uploadpack.allowAnySHA1InWant true' % SERVER_REPO,
     ]),
     labels=['infra'],
 )

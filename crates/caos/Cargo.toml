@@ -1,0 +1,44 @@
+[package]
+name = "caos"
+version = "0.1.0"
+edition = "2021"
+
+# Two binaries over one shared library:
+#   * `caos`     — the worker-side client: talks HTTP `/object`, runs the
+#                  container `entrypoint`, is installed setuid-root in worker
+#                  images so an unprivileged worker reaches the root-owned /cas.
+#   * `caos-cli` — the user-facing client: uses the server as a `caos` git remote
+#                  (negotiated push/fetch over the local working repo).
+# The shared logic — object model, currying, args trees, CAS materialization —
+# lives in `lib.rs`, generic over a `Transport` (see there).
+
+[lib]
+name = "caos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "caos"
+path = "src/bin/caos.rs"
+
+[[bin]]
+name = "caos-cli"
+path = "src/bin/caos-cli.rs"
+
+[dependencies]
+# Read/write git objects (blobs/trees) in the local repo and parse those the
+# object server returns. Same pure-Rust, static-musl-friendly config as the
+# server crate, so the workspace shares a single gix build.
+gix = { version = "0.84", default-features = false, features = ["sha1"] }
+# Minimal blocking HTTP client. default-features = false keeps it to plain HTTP
+# (no TLS) and, unlike heavier clients, it pulls no `url`/`idna` tree — so the
+# build stays small, pure-Rust, and static.
+minreq = { version = "2", default-features = false }
+# Read/write extended attributes: each materialized path is tagged with the git
+# hash it came from (`user.caos.hash`).
+xattr = "1"
+# `import-image` only: read a docker-archive image tarball — unpack it (tar),
+# gunzip it (flate2, pure-Rust backend to stay static), and parse its
+# manifest.json/config (serde_json).
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde_json = "1"

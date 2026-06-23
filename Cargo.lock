@@ -68,6 +68,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "caos"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "gix",
+ "minreq",
+ "serde_json",
+ "tar",
+ "xattr",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,18 +90,6 @@ name = "chunked_transfer"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
-
-[[package]]
-name = "client"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "gix",
- "minreq",
- "serde_json",
- "tar",
- "xattr",
-]
 
 [[package]]
 name = "clru"

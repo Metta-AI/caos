@@ -79,7 +79,10 @@
             }
           );
 
-        client = crateBin "client";
+        # One crate, two binaries: `caos` (worker-side, baked into images) and
+        # `caos-cli` (user-facing). crateBin builds the package, so both land in
+        # the output's /bin; consumers pick the one they need.
+        caos = crateBin "caos";
         server = crateBin "server";
         worker-hello = crateBin "worker-hello";
         worker-fold = crateBin "worker-fold";
@@ -88,15 +91,14 @@
         worker-rustc = crateBin "worker-rustc";
 
         # Minimal images: each contains *only* its static binary — no shell, no
-        # libc, no /nix/store. Crates are unprefixed (client, server) but
+        # libc, no /nix/store. Crates are unprefixed (caos, server) but
         # the published image names carry a `caos-` prefix.
         # NOTE: Docker images are Linux-only; build these on Linux (or via a
         # remote/linux builder on macOS).
 
-        # The client crate's binary is `client` everywhere except inside its
-        # image, where it's exposed as `/bin/caos`. The `/cas` directory is *not*
-        # baked in — `caos entrypoint` creates it at runtime (so a mounted, empty
-        # /cas volume works too).
+        # Worker images carry the `caos` binary (the worker-side client) at
+        # `/bin/caos`. The `/cas` directory is *not* baked in — `caos entrypoint`
+        # creates it at runtime (so a mounted, empty /cas volume works too).
         #
         # This store path holds only what needs *no* special permissions: the user
         # database. `caos` itself can't live here — it must be setuid-root (so a
@@ -129,7 +131,7 @@
         # bash/coreutils), so the copy lands as a real file the chmod can mark.
         installWorkerFiles = ''
           mkdir -p bin
-          cp ${client}/bin/client bin/caos
+          cp ${caos}/bin/caos bin/caos
           chmod 4755 bin/caos
           mkdir -p tmp
           chmod 1777 tmp
@@ -502,8 +504,8 @@
       in
       {
         packages = {
-          default = client;
-          inherit client server;
+          default = caos;
+          inherit caos server;
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-worker-base-docker = workerBaseImage;
@@ -553,7 +555,7 @@
         };
 
         checks = {
-          inherit client server;
+          inherit caos server;
 
           clippy = craneLib.cargoClippy (
             commonArgs
