@@ -419,6 +419,8 @@ Integration tests (require `tilt up` running):
 ./test-deep-deps.sh      # deep-deps via /cas/std: correctness, caching, Merkle
                          # incrementality, std-key invalidation, cycle detection
 ./test-rust-worker.sh    # rustc builder: source -> worker image -> run, memoized
+./test-host-path.sh      # a host path passed to `caos run`: content delivered,
+                         # clean tracked tree reused, dirty tree hashed incrementally
 ```
 
 Both build `.#caos`, set up a throwaway client repo with the server as its `caos`
