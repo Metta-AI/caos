@@ -7,7 +7,7 @@
 # current directory) is stored from the filesystem and referenced by its git
 # hash; anything else is stored as a literal string. For example:
 #
-#   ./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/client
+#   ./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/caos
 #
 # then, inside the shell:  caos get /cas/args/conf && cat /cas/args/conf
 #
@@ -21,83 +21,17 @@ NET="${CAOS_DOCKER_NETWORK:-caos-net}"
 SERVER_URL="${CAOS_SERVER_URL:-$DEFAULT_SERVER_URL}"
 IMAGE="${CAOS_WORKER_BASH_IMAGE:-caos-worker-bash:latest}"
 
-# Build the args tree on the host with git plumbing and print its hash. Objects
-# go straight into the repo (the one the default server is backed by — see
-# the Tiltfile), so:
-#   * a clean, tracked path costs a single `git ls-tree` — no re-read, no upload,
-#     so a large unchanged directory is effectively free;
-#   * a dirty/untracked path is hashed into the object store now (a directory via
-#     a throwaway index, so .gitignore'd files are skipped); and
-#   * a non-path value is stored as a literal blob.
-# Entries are assembled with `git mktree`. Nothing here touches HEAD, the real
-# index, or commits. Only used when the server is this repo's (the default
-# Tilt one); otherwise we fall back to `caos build-args`, which uploads via
-# whatever server the container is wired to.
-build_args_via_git() {
-  local kv name value rest mode type hash idx full entries=""
-  for kv in "$@"; do
-    case "$kv" in
-      --*=*) ;;
-      *) echo "argument must look like --name=value, got: $kv" >&2; return 1 ;;
-    esac
-    name=${kv#--}; name=${name%%=*}
-    value=${kv#--*=}
-    if [ -z "$name" ] || [ "${name%/*}" != "$name" ]; then
-      echo "argument name must be a single path component, got: $name" >&2
-      return 1
-    fi
-
-    if [ -e "$value" ]; then
-      if [ -z "$(git status --porcelain -- "./$value" 2>/dev/null)" ] \
-         && rest=$(git ls-tree HEAD -- "./$value" 2>/dev/null) && [ -n "$rest" ]; then
-        # Clean and tracked: reuse git's recorded entry as-is (instant).
-        mode=${rest%% *}; rest=${rest#* }
-        type=${rest%% *}; rest=${rest#* }
-        hash=${rest%%$'\t'*}
-      elif [ -d "$value" ]; then
-        # Dirty/untracked directory: hash its current contents via a throwaway
-        # index (skips .gitignore'd files), then pull out the subtree's hash. The
-        # index must not pre-exist (git rejects an empty file), so use a fresh dir.
-        idx=$(mktemp -d)
-        GIT_INDEX_FILE="$idx/index" git add -A -- "./$value"
-        full=$(GIT_INDEX_FILE="$idx/index" git write-tree)
-        rm -rf "$idx"
-        hash=$(git rev-parse "$full:./$value")
-        mode=040000; type=tree
-      else
-        # Dirty/untracked file: hash it now.
-        hash=$(git hash-object -w -- "$value")
-        mode=100644; [ -x "$value" ] && mode=100755; type=blob
-      fi
-    else
-      # Not a path: store the literal value as a blob.
-      hash=$(printf '%s' "$value" | git hash-object -w --stdin)
-      mode=100644; type=blob
-    fi
-
-    entries+="$mode $type $hash"$'\t'"$name"$'\n'
-  done
-  printf '%s' "$entries" | git mktree
-}
-
-# Turn any --name=value args into an args tree and pass its hash as --args, so
-# `caos entrypoint` materializes them at /cas/args.
+# Turn any --name=value args into an args tree (via `caos build-args` in a
+# throwaway container on the docker network, so it reaches the server by name and
+# uploads the args over HTTP `/object`), and pass its hash as --args so `caos
+# entrypoint` materializes them at /cas/args. The current directory is mounted
+# read-only at /work so path-valued args resolve.
 args=()
 if [ "$#" -gt 0 ]; then
-  if [ "$SERVER_URL" = "$DEFAULT_SERVER_URL" ] \
-     && command -v git >/dev/null 2>&1 \
-     && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    # Fast path: build the tree with git, writing straight into this repo.
-    hash=$(build_args_via_git "$@")
-  else
-    # Fallback: build it with `caos build-args` in a throwaway container that
-    # shares the docker network (to reach the server by name) and mounts
-    # the current directory read-only at /work (so path values resolve).
-    hash=$(docker run --rm --network "$NET" \
-      -e "CAOS_SERVER_URL=$SERVER_URL" \
-      -v "$PWD:/work:ro" -w /work \
-      --entrypoint /bin/caos "$IMAGE" build-args "$@")
-  fi
+  hash=$(docker run --rm --network "$NET" \
+    -e "CAOS_SERVER_URL=$SERVER_URL" \
+    -v "$PWD:/work:ro" -w /work \
+    --entrypoint /bin/caos "$IMAGE" build-args "$@")
   args=("--args=$hash")
 fi
 

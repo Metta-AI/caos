@@ -8,24 +8,32 @@
 # source yields a different worker.
 #
 # Requires the dev daemons running (`tilt up`): the caos server :9090 (storage +
-# compute), redis, registry — and a docker the server can reach.
+# compute + git), redis, registry — and a docker the server can reach.
 set -euo pipefail
 cd "$(dirname "$0")"
+PROJECT=$PWD
 
 echo "building caos client + loading base/rustc images..." >&2
-nix build .#client -o result-client
+nix build .#caos -o result-caos
 nix run .#load-caos-worker-base >/dev/null
 nix run .#load-caos-worker-rustc >/dev/null
 nix build .#caos-worker-base-docker -o result-base
-caos=$PWD/result-client/bin/client
+caosbin=$PROJECT/result-caos/bin/caos-cli
 
-# Storage and compute are one server now — a single URL covers both.
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
-CAS=$PWD/.caos-dev/rustc-cas
+
+# A client working repo with the server as its `caos` remote; `caos` runs the CLI
+# from inside it so its git transport finds it.
+CLIENT=$PROJECT/.caos-dev/rustc-client-repo
+rm -rf "$CLIENT"; git init -q "$CLIENT"
+git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
+caos() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
+
+CAS=$PROJECT/.caos-dev/rustc-cas
 rm -rf "$CAS"; mkdir -p "$CAS"
 export CAOS_CAS_DIR=$CAS
 SRC=$(mktemp -d)
-trap 'rm -rf "$CAS" "$SRC"' EXIT
+trap 'rm -rf "$CAS" "$SRC" "$CLIENT"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 misses_since() { docker logs --since "$1" caos-server 2>&1 \
@@ -33,8 +41,8 @@ misses_since() { docker logs --since "$1" caos-server 2>&1 \
 
 # The worker-base git-docker image the produced workers extend; curried into the
 # builder so callers only pass --src.
-"$caos" import-image result-base "$CAS/base" >/dev/null
-builder=$("$caos" curry docker://caos-worker-rustc:latest -- --base="$CAS/base")
+caos import-image "$PROJECT/result-base" "$CAS/base" >/dev/null
+builder=$(caos curry docker://caos-worker-rustc:latest -- --base="$CAS/base")
 
 # A trivial worker, defined in source: write a greeting to /cas/out.
 greeter() {
@@ -52,14 +60,14 @@ RS
 }
 
 build_and_run() { # <src-cas> <img-cas> <result-cas>
-  "$caos" run "$builder" "$2" -- --src="$1" >/dev/null
-  "$caos" run "$2" "$3" -- >/dev/null
-  "$caos" get -r "$3" >/dev/null
+  caos run "$builder" "$2" -- --src="$1" >/dev/null
+  caos run "$2" "$3" -- >/dev/null
+  caos get -r "$3" >/dev/null
 }
 
 echo "== Phase A: source -> worker image -> run ==" >&2
 greeter "hello from a source-built worker"
-"$caos" put "$SRC/worker.rs" "$CAS/src" >/dev/null
+caos put "$SRC/worker.rs" "$CAS/src" >/dev/null
 build_and_run "$CAS/src" "$CAS/img" "$CAS/result"
 grep -q "source-built worker" "$CAS/result/greeting" \
   || fail "built worker did not produce the expected output"
@@ -69,7 +77,7 @@ echo "== Phase B: rebuilding identical source is a cache hit ==" >&2
 # A hit means the build (and the whole compile) is skipped: 0 cache misses, and
 # the cached result is by definition the same image.
 sleep 1; since=$(date +%s)
-"$caos" run "$builder" "$CAS/img2" -- --src="$CAS/src" >/dev/null
+caos run "$builder" "$CAS/img2" -- --src="$CAS/src" >/dev/null
 sleep 1
 m=$(misses_since "$since")
 [ "$m" -eq 0 ] || fail "rebuild of identical source should be a hit, saw $m misses"
@@ -80,7 +88,7 @@ echo "== Phase C: editing the source yields a different worker ==" >&2
 # miss count is unreliable here (a warm cache from a prior run may already hold
 # this build), so we assert on content.
 greeter "a different greeting entirely"
-"$caos" put "$SRC/worker.rs" "$CAS/src2" >/dev/null
+caos put "$SRC/worker.rs" "$CAS/src2" >/dev/null
 build_and_run "$CAS/src2" "$CAS/img3" "$CAS/result3"
 grep -q "different greeting" "$CAS/result3/greeting" \
   || fail "edited worker did not produce the new output"

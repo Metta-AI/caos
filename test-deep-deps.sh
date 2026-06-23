@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Integration test for the `deep-deps` worker, driven through the built-ins
-# (`/cas/std`). It also exercises the whole built-in path: populate the `refs/caos/std`
-# tag, run the deep-deps built-in by `/cas/std/deep-deps`, and check that bumping
-# `std` recomputes (since `std` is part of every cache key).
+# (`/cas/std`). It also exercises the whole built-in path: publish the
+# `refs/caos/std` library to the server, fetch it into a client repo, run the
+# deep-deps built-in by `/cas/std/deep-deps`, and check that bumping `std`
+# recomputes (since `std` is part of every cache key).
 #
 # Checks:
 #   A. correctness + DAG sharing — right shape, and a package depended on by two
@@ -14,32 +15,42 @@
 #   D. a dependency cycle is detected.
 #
 # Requires the dev daemons running (`tilt up`): the caos server :9090 (storage +
-# compute), redis, registry — and a docker the server can reach. The server's
-# object DB must be this repo's .git (so build-builtins.sh.s refs/caos/std is
-# visible to it), as the Tiltfile arranges.
+# compute + git), redis, registry — and a docker the server can reach.
 set -euo pipefail
 cd "$(dirname "$0")"
+PROJECT=$PWD
 
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 
-# Publish the built-ins deep-deps needs (itself + fold) at refs/caos/std.
+# Publish the built-ins deep-deps needs (itself + fold) to the server, then build
+# the user-facing client.
 echo "building caos client + publishing caos/std (fold, deep-deps)..." >&2
-nix build .#client -o result-client
+nix build .#caos -o result-caos
 ./build-builtins.sh fold deep-deps >/dev/null
-caos=$PWD/result-client/bin/client
+caosbin=$PROJECT/result-caos/bin/caos-cli
+
+# A client working repo with the server as its `caos` remote — the shape a user
+# has. `caos` (below) runs the CLI from inside it, so its git transport finds it.
+CLIENT=$PROJECT/.caos-dev/test-client-repo
+rm -rf "$CLIENT"; git init -q "$CLIENT"
+git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
+caos() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
 
 # CAS must live on an xattr-capable fs (caos records each path's hash in
 # user.caos.hash); the repo's fs qualifies, /tmp may not.
-CAS=$PWD/.caos-dev/test-cas
+CAS=$PROJECT/.caos-dev/test-cas
 PKGS=$(mktemp -d)
 rm -rf "$CAS"; mkdir -p "$CAS"
 export CAOS_CAS_DIR=$CAS
-trap 'rm -rf "$CAS" "$PKGS" "$SNAP"' EXIT
+trap 'rm -rf "$CAS" "$PKGS" "$SNAP" "$CLIENT"' EXIT
 SNAP=$(mktemp -d)
 
-# Materialize std locally so we can run the deep-deps built-in by path. (`caos
+# Fetch the published std library from the server into the client repo, then
+# materialize it locally so we can run the deep-deps built-in by path. (`caos
 # run` independently resolves caos/std and threads it in as the run's `std`.)
-"$caos" get-hash "$("$caos" resolve refs/caos/std)" "$CAS/std" >/dev/null
+fetch_std() { git -C "$CLIENT" fetch -q caos '+refs/caos/std:refs/caos/std'; }
+fetch_std
+caos get-hash "$(caos resolve refs/caos/std)" "$CAS/std" >/dev/null
 IMG="$CAS/std/deep-deps"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -56,9 +67,9 @@ printf 'd\n'    > "$PKGS/c/DEPS"
 # Put the fixture, deepen every package, and materialize the result tree.
 run() {
   rm -rf "$CAS/pkgs" "$CAS/out"
-  "$caos" put "$PKGS" "$CAS/pkgs" >/dev/null
-  "$caos" run "$IMG" "$CAS/out" -- --mode=all --packages="$CAS/pkgs" >/dev/null
-  "$caos" get -r "$CAS/out" >/dev/null
+  caos put "$PKGS" "$CAS/pkgs" >/dev/null
+  caos run "$IMG" "$CAS/out" -- --mode=all --packages="$CAS/pkgs" >/dev/null
+  caos get -r "$CAS/out" >/dev/null
 }
 
 echo "== Phase A: correctness + DAG sharing ==" >&2
@@ -105,10 +116,12 @@ done
 echo "  ok: a,b,c,d all recomputed" >&2
 
 echo "== Phase E: bumping caos/std recomputes (std is in the key) ==" >&2
-# Re-publish std with an extra entry (hello) — same fold/deep-deps, new std tree.
-# `caos run` re-resolves caos/std, so the run is keyed on the new std and misses.
+# Re-publish std with an extra entry (hello) — same fold/deep-deps, new std tree —
+# then re-fetch it. `caos run` re-resolves caos/std, so the run keys on the new
+# std and misses.
 sleep 1; since=$(date +%s)
 ./build-builtins.sh fold deep-deps hello >/dev/null
+fetch_std
 run
 sleep 1
 [ "$(misses_since "$since")" -gt 0 ] || fail "bumping std should have recomputed"
@@ -120,8 +133,8 @@ echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
 # (fold image, args) and the server's run-cycle detection catches it.
 rm -rf "$CAS/pkgs2" "$CAS/cyc"
 printf 'a\n' > "$PKGS/d/DEPS"
-"$caos" put "$PKGS" "$CAS/pkgs2" >/dev/null
-if msg=$("$caos" run "$IMG" "$CAS/cyc" -- --mode=all --packages="$CAS/pkgs2" 2>&1); then
+caos put "$PKGS" "$CAS/pkgs2" >/dev/null
+if msg=$(caos run "$IMG" "$CAS/cyc" -- --mode=all --packages="$CAS/pkgs2" 2>&1); then
   fail "expected the cyclic graph to fail, but the run succeeded"
 fi
 echo "$msg" | grep -q "run cycle detected" || fail "no cycle reported; got: $msg"
