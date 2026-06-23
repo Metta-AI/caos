@@ -66,7 +66,8 @@ fn run(args: &[String]) -> Result<(), String> {
             _ => Err(usage(args)),
         },
         // `build-args [--name=value ...]` — print the hash of the assembled args
-        // tree (path values stored from disk, everything else a literal blob).
+        // tree (a path value is ingested, reusing git's recorded objects for a
+        // clean tracked path; everything else is a literal blob).
         Some("build-args") => caos::build_args(&transport()?, &args[2..]),
         _ => Err(usage(args)),
     }

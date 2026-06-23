@@ -1190,9 +1190,11 @@ pub fn build_args(t: &dyn Transport, kvs: &[String]) -> Result<(), String> {
 }
 
 /// The args-tree builder behind `build-args`: like [`build_arg_entries`], but a
-/// `value` naming an existing filesystem path is stored from disk (reusing
-/// [`store`]) instead of being read as a CAS path. The tree is never written to
-/// the filesystem.
+/// `value` naming an existing filesystem path is ingested as its content rather
+/// than reused from the CAS. Ingestion goes through [`Transport::ingest_path`],
+/// so the git transport (`caos-cli`) reuses git's recorded objects (see
+/// [`GitTransport::ingest_path`]) while the HTTP transport (a worker) reads it
+/// from disk via [`store`]. The tree is never written to the filesystem.
 fn build_host_args_tree(t: &dyn Transport, kvs: &[String]) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
 
