@@ -7,33 +7,14 @@
 
 NET = 'caos-net'
 
-# The caos server is backed by *this project's own* `.git`, so caos can fetch
-# real repo objects (run `git rev-parse HEAD:README.md` for a blob hash, or any
-# tree hash) instead of an empty throwaway repo — more interesting test data.
-# Computed at Tiltfile load (cwd = this directory) so it doesn't depend on `$PWD`.
-# Note: the mount is read-write, so `caos put`/`caos run` write their objects
-# (args trees, results) here as loose, unreferenced objects — harmless, and
-# reclaimed by `git gc`.
-GIT_REPO = os.path.abspath('.git')
-
-# A checkout often keeps most of its objects in a *shared* store, referenced from
-# .git/objects/info/alternates (here, a sibling bare repo). gix follows that by
-# its absolute path, so the server must see it at the *same* path inside
-# the container — otherwise every object that lives only in the alternate 404s.
-# Mount .git at /git, plus each alternate object dir at its own absolute path
-# (read-only: git never writes to an alternate). Without this, only the handful
-# of loose objects in this .git would resolve.
-def git_mounts():
-    mounts = ['-v "%s:/git"' % GIT_REPO]
-    alternates = os.path.join(GIT_REPO, 'objects', 'info', 'alternates')
-    if os.path.exists(alternates):
-        for line in str(read_file(alternates)).splitlines():
-            alt = line.strip().replace('//', '/')
-            if alt and not alt.startswith('#'):
-                mounts.append('-v "%s:%s:ro"' % (alt, alt))
-    return mounts
-
-GIT_MOUNTS = git_mounts()
+# The caos server owns a *dedicated* bare repo — not the project's own `.git`.
+# Clients never touch it directly; they reach it only through the server, using
+# it as the `caos` git remote: `git push` objects up, `git fetch` refs/results
+# back down (over the smart-HTTP transport the server now speaks). It lives under
+# the gitignored .caos-dev/ so it's easy to inspect and survives `tilt down`;
+# `setup` (below) creates it, idempotently. Computed at Tiltfile load
+# (cwd = this directory) so it doesn't depend on `$PWD`.
+SERVER_REPO = os.path.abspath('.caos-dev/server-repo.git')
 
 # Per-image marker files. Each image build bumps its marker once the new image is
 # loaded; a daemon depends on its image's marker (see `daemon` below), so loading
@@ -74,11 +55,15 @@ nix_image('img-worker-deep-deps', 'load-caos-worker-deep-deps', ['crates/client'
 # project's own .git — see GIT_REPO above — so there's nothing to create here.)
 local_resource(
     'setup',
-    # GIT_REPO is this project's existing .git, so there's nothing to init — just
-    # the markers dir and the shared docker network.
+    # Create the markers dir, the shared docker network, and the server's own bare
+    # repo. `http.receivepack=true` is what lets clients `git push` to it over
+    # smart-HTTP; `git init --bare` is idempotent, so re-running setup is safe and
+    # leaves an existing repo (and its pushed objects/refs) untouched.
     cmd=' && '.join([
         'mkdir -p %s' % MARKERS,
         '(docker network create %s >/dev/null 2>&1 || true)' % NET,
+        'git init -q --bare %s' % SERVER_REPO,
+        'git -C %s config http.receivepack true' % SERVER_REPO,
     ]),
     labels=['infra'],
 )
@@ -133,16 +118,17 @@ local_resource(
 )
 
 # The one caos server: storage + compute in a single process. It serves /object
-# from the bind-mounted git repo and /run by spawning worker containers (hence
-# the docker socket), so it needs all of: the git mounts, the docker socket, the
-# network, the cache, and the registry.
+# and the git smart-HTTP transport from its own bare repo (mounted at /git), and
+# /run by spawning worker containers (hence the docker socket), so it needs all
+# of: the repo mount, the docker socket, the network, the cache, and the registry.
 daemon(
     'caos-server',
     [
         '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
         '-v /var/run/docker.sock:/var/run/docker.sock',
-    ] + GIT_MOUNTS,
+        '-v "%s:/git"' % SERVER_REPO,
+    ],
     # Uses the cache and pushes converted images to the registry; start it after
     # both. (It degrades gracefully if Redis is down; the registry is only needed
     # when running a git image.)
