@@ -1,494 +1,385 @@
 # caos
 
-A Cargo workspace of small Rust binaries, each packaged into a minimal Docker
-image with Nix.
+Content-addressed storage and compute over git objects. A worker is just a
+container that reads inputs from a content-addressed store (CAS), writes a
+result back, and is addressed — inputs, image, and output — entirely by git
+hashes. Computations are pure functions of their inputs, so results are
+memoized; trees are real git objects, so unchanged data is shared and transfers
+are incremental.
 
-The whole environment — Rust toolchain, build, and images — is defined by the
-Nix flake, so builds are reproducible and consistent across machines.
+It's a Cargo workspace of small static Rust binaries, each packaged into a
+minimal Docker image with Nix, and wired together for local dev with Tilt. The
+whole environment — toolchain, builds, images — is defined by the Nix flake, so
+it's reproducible across machines.
 
-| Crate | Image | What it is |
+| Crate | Binaries / image | What it is |
 |---|---|---|
-| `client` | `caos-worker-base` | CLI that fetches objects from the object server (see below). Exposed as `caos` inside the image. |
-| `object-server` | `caos-object-server` | HTTP daemon over a git object database (see below). |
-| `compute-server` | `caos-compute-server` | HTTP daemon that runs a worker image over an args tree and returns its result hash (see below). |
+| `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
+| `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
+| `worker-common` | — | Shared library for the Rust workers. |
+| `worker-hello`, `worker-fold`, `worker-file-count`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
 
 ## Prerequisites
 
 - [Nix](https://nixos.org/download) with flakes enabled.
-- Docker, to load and run the image.
+- Docker, to load and run the images.
 
-No Rust toolchain needs to be installed system-wide; the flake pins it.
+No Rust toolchain is needed system-wide; the flake pins it.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `flake.nix` | Dev shell, binary packages, and Docker images — all from one pinned toolchain |
-| `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt) and the static `musl` target |
+| `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
 | `Cargo.toml` | Workspace root (members + shared release profile) |
-| `crates/client/` | The `client` crate → `client` binary |
-| `crates/object-server/` | The `object-server` crate → `object-server` binary |
-| `crates/compute-server/` | The `compute-server` crate → `compute-server` binary |
-| `Cargo.lock` | Pinned dependency versions (required for reproducible Nix builds) |
+| `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
+| `crates/server/` | The `server` crate → `caos-server` |
+| `crates/worker-*/` | The worker crates |
+| `Tiltfile`, `build-builtins.sh`, `test-*.sh`, `run-worker-bash.sh` | Local dev + integration tests |
 
 ## Development
 
 Enter a shell with the pinned `rustc`, `cargo`, `clippy`, `rustfmt`, plus
-`rust-analyzer` and `cargo-watch`:
+`rust-analyzer`, `cargo-watch`, and `tilt`:
 
 ```bash
 nix develop
 ```
 
-Inside it, use Cargo as normal (`cargo build`, `cargo run`, `cargo test`).
+Inside it, use Cargo as normal (`cargo build`, `cargo run`, `cargo test`). Run
+lint/format/test the way CI does with `nix flake check`.
 
-Run lint, format, and test checks the same way CI would:
+> Nix flakes only see files **tracked by git** (uncommitted edits to tracked
+> files are included, but new files are not). After adding a new source file,
+> `git add` it before building.
 
-```bash
-nix flake check
-```
-
-> Nix flakes only see files tracked by git. After adding a new file
-> (e.g. a new source module), `git add` it before building.
-
-## Building the binaries
+## Building
 
 ```bash
-nix build .#client            # output at ./result/bin/client
-nix build .#object-server     # output at ./result/bin/object-server
-nix build .#compute-server    # output at ./result/bin/compute-server
+nix build .#caos              # ./result/bin/{caos,caos-cli}
+nix build .#server            # ./result/bin/server
 ```
 
-Each binary is statically linked against `musl`, so it has no shared-library
-dependencies.
+Binaries are statically linked against `musl` — no shared-library dependencies.
 
-## Building the Docker images
-
-The crates are unprefixed, but the images they produce carry a `caos-` prefix.
+Docker images (crates are unprefixed; images carry a `caos-` prefix):
 
 ```bash
-nix build .#caos-worker-base-docker         # image tarball at ./result
-nix build .#caos-object-server-docker
-nix build .#caos-compute-server-docker
-nix build .#caos-worker-hello-docker
-nix build .#caos-worker-fold-docker
-nix build .#caos-worker-file-count-docker
+nix build .#caos-server-docker            # image tarball at ./result
+nix build .#caos-worker-base-docker
+nix build .#caos-worker-hello-docker      # ...-fold, -file-count, -deep-deps, -rustc, -bash
 
-docker load < result                   # loads e.g. caos-object-server:latest
+docker load < result
 ```
 
-Or build and load into the local docker daemon in one go (streams the image
-straight to `docker load`, nothing large written to the Nix store):
+Or build and load into the local docker daemon in one step (streamed, nothing
+large written to the Nix store):
 
 ```bash
-nix run .#load-caos-worker-base
-nix run .#load-caos-object-server
-nix run .#load-caos-compute-server
-nix run .#load-caos-worker-hello
-nix run .#load-caos-worker-fold
-nix run .#load-caos-worker-file-count
+nix run .#load-caos-server
+nix run .#load-caos-worker-hello          # load-caos-worker-{base,fold,...}
 ```
 
-The `caos-worker-base` and `caos-object-server` images contain **only** their static
-binary under `/bin` — no shell, no libc, no package manager, no `/nix/store`.
-The `caos-worker-base` image exposes the binary as `/bin/caos` and runs
-`caos entrypoint` (which creates `/cas` at startup — see below). On the worker
-images `/bin/caos` is **setuid-root** and there's a `worker` user (uid 1000) plus
-a world-writable `/tmp`, so `entrypoint` can run the worker unprivileged while
-still letting it reach the root-owned `/cas` through `caos` — see
-[Permissions](#permissions-load-before-read-and-no-tampering).
-
-There's also a `caos-worker-bash` image (`.#caos-worker-bash-docker`,
-`.#load-caos-worker-bash`) for interactive testing: it's the `caos-worker-base`
-root plus `bash`, `coreutils`, and `curl`. Like the other workers it runs
-`caos entrypoint`, which sets up `/cas` and runs `/worker` — here `/worker` just
-drops you into an interactive shell (and stores an empty `/cas/out` on exit, so
-`caos entrypoint` doesn't error if you didn't leave a result). Run it with the
-helper script, which wires up the daemon URLs:
-
-```bash
-nix run .#load-caos-worker-bash
-./run-worker-bash.sh
-# inside: caos get-hash <hash> /cas/foo
-```
-
-The helper also accepts `--name=value` args, like `caos run`: a value that names
-an existing path (relative to your current directory) is stored from the
-filesystem and referenced by its git hash; anything else becomes a literal
-string. It assembles them into an args tree and starts the container with
-`--args=<hash>`, so they land under `/cas/args`:
-
-```bash
-./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/client
-# inside: caos get /cas/args/conf && cat /cas/args/conf
-```
-
-When you're running against the default (Tilt) object server — which is backed by
-this repo's `.git` — the helper builds the tree with git plumbing directly in the
-repo: a **clean, tracked path reuses the hash git already has** (a single
-`git ls-tree`, no re-read or upload), so passing a large unchanged directory is
-effectively free; only dirty/untracked paths (and literal strings) are hashed in.
-It never touches HEAD, the index, or commits. Against any other object server it
-falls back to `caos build-args`, which uploads the content through that server.
+Worker images contain **only** their static `/worker` binary plus a setuid-root
+`/bin/caos`, the `worker` user (uid 1000), and a writable `/tmp` — no shell, no
+libc, no `/nix/store`. The `caos-server` image is not minimal: it bundles the
+`docker` client, `git`, and `tar`, and expects the host's docker socket.
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
-> remote or linux builder; the binaries and dev shell build fine natively.
+> remote/linux builder; the binaries and dev shell build natively.
 
-## object-server
+## The big picture
 
-An HTTP daemon (`crates/object-server`) that reads and writes git objects in a
-repository **mounted at `/git`**, using [gitoxide](https://github.com/GitoxideLabs/gitoxide)
-(`gix`). Objects cross the wire in git's native **serialized** form —
-`<type> <size>\0<content>`, uncompressed (the same bytes git hashes). Two
-endpoints:
+- A **server** holds the canonical CAS and runs compute. It exposes three faces
+  over one URL: an HTTP object API (`/object`), an HTTP compute trigger
+  (`/run`), and a **git smart-HTTP transport** over its own repo.
+- A **worker** is a container the server runs. It reaches the server over HTTP,
+  reading inputs from and writing results to a per-run `/cas` directory through
+  the setuid `caos` binary.
+- A **user** drives it all with `caos-cli` from inside a git working tree that
+  has the server configured as a remote named `caos`. Objects are built locally
+  and exchanged with the server by **negotiated git push/fetch**, so passing a
+  large, mostly-unchanged tree only transfers the delta.
 
-| Request | Behaviour |
-|---|---|
-| `GET /object/<hash>` | Return the serialized object with that hash. `400` if the hash is malformed, `404` if it's absent. |
-| `POST /object/` | Store the serialized object in the body (its type and size come from the header) and return git's hash for it (hex). Validates the header, and a `tree` body must be valid tree encoding. Content-addressed, so it's idempotent. |
+Everything — an input file, a worker image, a result — is a git object named by
+its hash, so identical work is deduplicated and memoized.
 
-Run the image with the repo bind-mounted at `/git`:
+## server
 
-```bash
-docker run --rm -p 8080:80 \
-  -v /path/to/repo:/git \
-  caos-object-server:latest
-```
+One daemon (`crates/server`), image `caos-server`, serving everything over a
+single URL. It backs onto a git repository it **owns** (mounted at `/git`); in
+dev, Tilt creates a dedicated bare repo for it (see [local testing](#local-testing)).
 
-Storing is normally driven by `caos put`, which frames objects for you. By hand,
-the body must be a serialized object, e.g. a blob:
-
-```bash
-# Build "blob <size>\0<content>" and POST it; prints the git hash.
-printf 'blob 6\0hello\n' | curl -s --data-binary @- \
-  http://localhost:8080/object/
-
-# Read it back (returns the serialized object, header included):
-curl -s "http://localhost:8080/object/<hash>"
-```
-
-The listen address (`OBJECT_SERVER_ADDR`, default `0.0.0.0:80`) and repo path
-(`OBJECT_SERVER_GIT_DIR`, default `/git`) are overridable via environment
-variables — handy for running outside a container.
-
-## client (`caos`)
-
-The `client` crate (`crates/client`) builds a CLI exposed as `caos` inside its
-image. It finds the object server via `$CAOS_OBJECT_SERVER_URL` (and, for
-`caos run`, the compute server via `$CAOS_COMPUTE_SERVER_URL`) and materializes
-objects under `/cas`.
-
-```text
-caos get-hash <hash> <path>   # materialize a given hash at a CAS path
-caos get [-r | --recursive[=<n>]] <path>
-                              # expand a placeholder in /cas; -r loads the whole
-                              # subtree, --recursive=<n> loads n levels (default 1)
-caos put <src-path> <cas-path># store an outside path and record it in /cas
-caos run <image> <out> -- ... # run an image on the compute server (see below)
-caos build-args [--name=value ...]
-                              # print the hash of an args tree (paths from disk,
-                              # else literals); used by ./run-worker-bash.sh
-caos entrypoint [--args=<hash>]
-                              # container entrypoint: set up, run /worker, hash /cas/out
-```
-
-**`get-hash <hash> <path>`** — `<path>` must be a **direct child of `/cas`**
-(e.g. `/cas/foo`). The object at `<hash>` is fetched with
-`GET <url>/object/<hash>`, parsed with
-[gitoxide](https://github.com/GitoxideLabs/gitoxide), and:
-
-- a **blob** is written verbatim to `<path>`;
-- a **tree** creates the directory `<path>` plus one empty placeholder per
-  entry — a **directory** for subtree entries, a **file** otherwise.
-
-(The server returns the serialized object, so its `<type>` header tells the
-client whether it's a blob or a tree — no guessing.)
-
-**`get [-r | --recursive[=<depth>]] <path>`** — `<path>` may be anywhere inside
-`/cas` (any depth) and must already exist. `caos` reads the hash recorded on it
-(see below), fetches that object, and expands it in place: an empty **file** is
-replaced with the blob's content; an empty **directory** is filled with the
-tree's entry placeholders. Together with `get-hash` this lets you lazily drill
-down a tree one level at a time — `get-hash` the root, then `get` whichever child
-you want to expand.
-
-By default `get` loads a single level. `--recursive=<depth>` loads that many
-levels, and `-r` (or a bare `--recursive`) loads the whole subtree. It's
-idempotent and resumable: a node that's already expanded is skipped and only its
-unexpanded descendants are fetched, so `get-hash foo` then `get -r foo` finishes
-loading the tree. (Each node is a separate fetch, so a deep tree is many
-sequential requests.)
-
-**`put <src-path> <cas-path>`** — the inverse: recursively store a path from
-*outside* the CAS into the object server (`POST /object/`), then record the
-result at `<cas-path>` (a direct child of `/cas`, like `get-hash`). Files become
-blobs and directories become trees. A symlink that resolves to something already
-in the CAS is **not** re-read — its recorded hash is reused, so shared content is
-stored once.
-
-Files become real git **blobs** and directories real git **trees** — each
-`POST`ed as a serialized object — so the hashes are genuine git object hashes; a
-`put` directory's hash equals what `git write-tree` would produce.
-
-**`caos run <image> <output-cas-path> -- [--name=value ...]`** — the host side of
-a compute step. It assembles the `--name=value` args into a git **tree** stored
-in the object server (never written to the filesystem):
-
-- each `--name=value` becomes a tree entry `name`;
-- a `value` that is a path inside `/cas` **must exist**, and its entry references
-  the object that path was materialized from (its recorded hash) — so inputs are
-  passed by reference, not re-uploaded;
-- any other `value` is stored verbatim as a blob.
-
-It then asks the compute server (`$CAOS_COMPUTE_SERVER_URL`) to run `<image>`
-over that args tree and materializes the returned result hash at
-`<output-cas-path>` (a direct child of `/cas`, like `get-hash`).
-
-`<image>` is a **git image by default**: a path inside `/cas` is resolved to the
-git hash recorded on it (so you can run an image stored in the CAS), and a bare
-value is assumed to already be a git hash. An **ordinary docker image** is written
-`docker://<ref>` (e.g. `docker://caos-worker-hello:latest`). The compute server
-converts a git image to a real image and pushes it to a registry before running
-it (see below); a `docker://` ref is run directly.
-
-**`caos entrypoint [--args=<hash>]`** — the container's entrypoint, tying it
-together for a single compute step:
-
-1. **set up** — delete the CAS directory and recreate it empty (**fails** if it
-   can't), owned by root and not writable by anyone else, and verify it supports
-   xattrs;
-2. **load args** — if `--args=<hash>` is given, materialize that object at
-   `/cas/args` (exactly like `get-hash <hash> /cas/args`), so the worker can read
-   its inputs there;
-3. **run `/worker`** — the binary a downstream image is expected to provide,
-   dropped to the unprivileged `worker` user (uid/gid 1000) so it can't tamper
-   with the root-owned `/cas` directly — only through the setuid-root `caos`.
-   `entrypoint` itself stays root, to tear `/cas` down afterwards. The worker's
-   stdout is redirected to stderr so the container's stdout stays clean;
-4. **report** — print the hash recorded on `/cas/out`. Everything under `/cas`
-   got there via `get`/`put`, which already tag each path with its
-   `user.caos.hash`, so this is just a fast xattr read — no re-hashing;
-5. **tear down** — delete the CAS directory.
-
-So `/worker` typically reads its inputs from `/cas/args`, computes its result,
-and writes it to `/cas/out` with `caos put` (or `get`); the printed hash is the
-address of that result. The `caos-worker-base` image runs `caos entrypoint` as its
-entrypoint, so to make a compute image you build one that adds a `/worker`:
-
-```bash
-docker run --rm \
-  -e CAOS_OBJECT_SERVER_URL=http://caos-object-server \
-  your-worker-image:latest \
-  --args=<args-tree-hash>       # /worker must leave its result at /cas/out
-```
-
-### Path → hash mapping
-
-Every materialized path records where it came from in the `user.caos.hash`
-extended attribute: the top-level path gets `<hash>`, and each child of a tree
-gets that entry's own oid (so deeper paths are covered too). This is the on-disk,
-per-path mapping from CAS paths back to hashes.
-
-```bash
-getfattr -n user.caos.hash --only-values /cas/foo
-```
-
-Paths are written atomically (build in a temp sibling, set the xattr, then
-`rename` into place), so concurrent runs never see a half-written path or one
-missing its hash — no locking needed. On startup `caos` probes the CAS directory
-and exits with a clear error if its filesystem doesn't support `user.*` xattrs
-(e.g. tmpfs on older kernels, or some overlay setups).
-
-`CAOS_CAS_DIR` (default `/cas`) overrides the CAS directory — handy for running
-outside a container.
-
-### Permissions: load-before-read, and no tampering
-
-`/cas` is locked down so a worker can only see what it has explicitly fetched,
-and can't alter what's there. Two rules, both enforced by file permissions
-(everything under `/cas` is owned by root):
-
-- **Nothing is readable until it's fetched.** Expanding a tree with `get`/
-  `get-hash` leaves one *placeholder* per entry — an empty file or directory that
-  records its hash but holds no content yet. Placeholders are owner-only
-  (`r--------` / `r-x------`), so the worker can't read data it hasn't loaded by
-  accident. `get` on a placeholder fetches its content and makes it
-  world-readable (`r--r--r--` for a blob, `r-xr-xr-x` for a tree, whose own
-  entries are again placeholders). This means you load a tree one level at a
-  time, on purpose.
-- **The worker can't tamper with `/cas`.** It runs as the unprivileged `worker`
-  user, while `/cas` and everything in it is root-owned and not writable by
-  others. The worker mutates `/cas` *only* through `caos`, which is **setuid-root**
-  inside the image: `get`/`put`/`run` materialize content faithfully (and record
-  its hash), but the worker has no other way to write there. (The `caos` binary
-  is static, so setuid carries no dynamic-linker attack surface.)
-
-Both rules relax outside the container: with `CAOS_CAS_DIR` pointing at a normal
-directory you own, the owner-only modes still let *you* read placeholders' hashes
-to expand them, so the round-trip works without root or setuid.
-
-## compute-server
-
-An HTTP daemon (`crates/compute-server`) that runs one containerized compute step
-per request. It serves requests **concurrently — one thread per request** —
-which is required, not just an optimization: a worker can call back into the
-compute server (the fold worker recurses via `caos run`), and that nested request
-must be served while the parent's request is still blocked waiting on the `docker
-run` it spawned. A serial loop, or any thread pool shallower than the deepest
-tree, would deadlock. One endpoint:
+It serves requests **concurrently — one thread per request** — which is
+required, not just an optimization: a worker can call back into `/run` (the fold
+worker recurses), and that nested request must be served while the parent's is
+still blocked on the `docker run` it spawned. A serial loop, or a pool shallower
+than the deepest tree, would deadlock.
 
 | Request | Behaviour |
 |---|---|
-| `GET /run?image=<image>&args=<hash>` | Return the result hash for running `<image>` over the args tree `<hash>` — from the Redis cache if present, otherwise by running the container and caching the result. `400` for a missing/invalid parameter, `500` if the worker container fails. |
+| `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
+| `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
+| `GET /run?req=<reqHash>[&stack=…]` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the result). See [compute](#compute). |
+| `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
 
-It runs the image by shelling out to the `docker` CLI, forcing the caos
-entrypoint so the image's own entrypoint/command don't matter:
+The git transport is what makes the server a `caos` remote: `git http-backend`
+runs `upload-pack`/`receive-pack` over the same `/git` repo, with hooks intact
+(so a `post-receive` trigger is a natural future evolution). The dedicated repo
+is created with `http.receivepack=true` (to accept pushes) and
+`uploadpack.allowAnySHA1InWant=true` (so a client can `git fetch` a result by
+its bare hash; `/object` itself never needs that flag).
 
-```text
-docker run --rm --network <net> \
-  -e CAOS_OBJECT_SERVER_URL=<url> -e CAOS_COMPUTE_SERVER_URL=<url> \
-  --entrypoint /bin/caos <image> entrypoint --args=<hash>
-```
+Environment overrides: `SERVER_ADDR` (`0.0.0.0:80`), `CAOS_GIT_DIR` (`/git`),
+`CAOS_DOCKER_NETWORK` (`caos-net`), `CAOS_SERVER_URL` (`http://caos-server`,
+injected into each worker), `CAOS_REGISTRY_PUSH_URL`
+(`http://caos-registry:5000`), `CAOS_REGISTRY_PULL_HOST` (`localhost:5000`),
+`CAOS_DOCKER_BIN` (`docker`), `CAOS_REDIS_ADDR` (`caos-redis:6379`).
 
-`caos entrypoint` populates `/cas/args` from `<hash>`, runs `/worker`, and prints
-the hash of `/cas/out` on its stdout — which `docker run` forwards, so the
-container's stdout *is* the result hash. So any image that carries `/bin/caos`
-and a `/worker` is a valid compute image.
+### Compute
 
-Both daemon URLs are injected into the worker so it can reach the object server
-and — for a worker that itself calls `caos run`, like the fold worker — call back
-into the compute server. (Workers bake in no URLs of their own.)
+A run **request** is itself a content-addressed git object: a tree
+`{image, args, std}` whose hash, `reqHash`, *is* the cache key and the
+rendezvous id. `GET /run?req=<reqHash>`:
 
-Because it drives Docker, the `caos-compute-server` image is **not** minimal — it
-bundles the `docker` client and expects the host's docker socket bind-mounted.
-The worker containers it spawns join `<net>` so they resolve the daemons by
-name:
+1. **read** the request tree (`image` ref, `args` tree, `std` tree);
+2. **cache** lookup in Redis keyed on `reqHash` — a hit returns the cached
+   `"<type> <hash>"` and skips everything below;
+3. **cycle check** — `&stack=` carries the chain of in-progress `reqHash`es
+   (threaded through nested runs via `CAOS_RUN_STACK`); re-entering one on the
+   stack has no fixpoint, so the run fails listing the cycle;
+4. **resolve the image** — a `docker://<ref>` is used directly; one of our git
+   images is converted to a real image, pushed to the registry, and run by
+   digest (see [git images](#git-images));
+5. **run the container**, forcing `/bin/caos entrypoint --args=<args>` with
+   `CAOS_SERVER_URL`, `CAOS_STD`, and the child `CAOS_RUN_STACK` injected;
+6. its stdout — `"<type> <hash>"` printed by `entrypoint` — is the result;
+7. **cache** it, and for a **top-level** run (empty stack) pin
+   `refs/caos/res/<reqHash>` at the result, for durability and as a fetch/watch
+   point. Nested runs set no ref.
 
-```bash
-docker run --rm -p 9090:80 \
-  --network caos-net \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  caos-compute-server:latest
-```
-
-Overridable via environment: `COMPUTE_SERVER_ADDR` (default `0.0.0.0:80`),
-`CAOS_DOCKER_NETWORK` (default `caos-net`), `CAOS_OBJECT_SERVER_URL` (default
-`http://caos-object-server`, passed into each worker), `CAOS_COMPUTE_SERVER_URL`
-(default `http://caos-compute-server`, our own address passed into each worker so
-it can call back), `CAOS_DOCKER_BIN` (default `docker`), and `CAOS_REDIS_ADDR`
-(default `caos-redis:6379`).
+Results stay on the server. The caller gets back the hash and a type; it does
+**not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
 
 ### Caching
 
-Results are cached in Redis. The key is the image plus the args-tree hash and the
-value is the result hash, so an identical request skips the container entirely —
-the compute server logs `cache hit …` instead of `cache miss …; running worker`.
-Redis is best-effort: if it's unreachable the server logs the error and runs
-uncached, so a missing Redis never fails a request. There are no locks yet, so
-two identical requests racing a cold cache may both run the work.
+Results, converted images, and built layers are cached in Redis
+(`caos:result:<reqHash>`, `caos:image:<git-hash>`, `caos:layer:<tree-hash>`).
+A hit on the result key skips the container entirely (logged `cache hit …` vs
+`cache miss …`). Redis is best-effort: if it's unreachable the server logs and
+runs uncached. There are no locks yet, so two identical cold-cache requests may
+both run.
 
 ### Git images
 
-When the `image` parameter isn't a `docker://` ref, it's the git hash of an image
-stored in the CAS, in our **git-docker form** — a tree holding `config.json` (the
-image config) and one `layer<NN>` subtree per layer (the layer's extracted
-filesystem). The compute server converts it to a real image and pushes it to a
-registry, then runs it by digest:
+A non-`docker://` image is the git hash of an image in **git-docker form** — a
+tree of `config.json` plus one `layer<NN>` subtree per layer (the layer's
+extracted filesystem). The server converts it to a real image:
 
 - each `layer<NN>` tree is materialized and tarred (uncompressed, GNU format,
   zeroed owners/mtimes, sorted) — `digest = sha256(tar)`;
 - `config.json`'s `rootfs.diff_ids` are **generated** from those layer hashes
-  (since the layers are uncompressed, a layer's digest *is* its diff_id), making
-  the config self-consistent with the layers we push — so nothing has to match any
-  pre-existing tar bytes, and the stored config needn't carry diff_ids at all;
-- an OCI manifest tying the config and layers together is pushed by digest.
+  (uncompressed ⇒ a layer's digest *is* its diff_id), so the producer needn't
+  supply diff_ids and per-entry perms/ownership ride in `.caosmeta` sidecars;
+- an OCI manifest is pushed by digest.
 
-The conversion is deterministic, so it's cached in Redis: `caos:image:<git-hash> →
-manifest digest` and `caos:layer:<git-layer-tree-hash> → layer digest`, checked
-before doing (or re-pushing) any work.
+Deterministic, so it's Redis-cached by git hash. The registry is reached two
+ways for one instance: the server pushes by name on the docker network
+(`CAOS_REGISTRY_PUSH_URL`), the host daemon (which runs the worker) pulls via the
+published port (`CAOS_REGISTRY_PULL_HOST`, insecure, no TLS).
 
-The registry is reached at two addresses for one instance: the compute server
-pushes to it by name on the docker network (`CAOS_REGISTRY_PUSH_URL`, default
-`http://caos-registry:5000`), while the host docker daemon — which actually runs
-the worker — pulls via its published port (`CAOS_REGISTRY_PULL_HOST`, default
-`localhost:5000`, which docker treats as insecure, so no TLS setup is needed).
-Converted images are pushed under the fixed repo `caos` and referenced by digest,
-so there are no tags.
+## The two clients
 
-### Writing a worker
+`crates/caos` is one library with two binaries. They share all the object
+logic — the difference is the **transport** and the privilege model.
 
-The base `caos-worker-base` image bakes in **no** `/worker`. A worker image is built
-`FROM` it (so it keeps `/bin/caos` as the entrypoint) and adds a `/worker` that
-reads its inputs from `/cas/args` and writes its result to `/cas/out` (with
-`caos put`/`get`).
+- **`caos`** (worker-side) talks to the server over **HTTP** (`/object`, `/run`),
+  and provides the container `entrypoint`. It's installed **setuid-root** in
+  worker images so an unprivileged worker can reach the root-owned `/cas` only
+  through it. Subcommands: `get-hash`, `get`, `put`, `run`, `curry`,
+  `build-args`, `entrypoint`.
+- **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
+  builds objects in the local working repo and exchanges them by negotiated
+  push/fetch. Subcommands: `get-hash`, `get`, `put`, `import-image`, `resolve`,
+  `run`, `curry`, `build-args`. No `entrypoint`.
 
-The **`caos-worker-hello`** image (`.#caos-worker-hello-docker`,
-`.#load-caos-worker-hello`) is a real, runnable example: a tiny static worker
-binary (no shell) with a `/worker` that gathers each `/cas/args` entry into a
-result tree (plus a small `receipt`) and stores it at `/cas/out`. So:
+`caos-cli` must run inside a git working tree with the server as its `caos`
+remote, and `CAOS_SERVER_URL` set (used for `/run` and to fetch results):
 
 ```bash
-caos put /some/file /cas/in
-caos run docker://caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
-caos get /cas/out/greeting && cat /cas/out/greeting   # => hi
+git remote add caos http://localhost:9090
+export CAOS_SERVER_URL=http://localhost:9090
+export CAOS_CAS_DIR=$PWD/.caos-cas      # a local working CAS (see below)
 ```
 
-(The debugging `caos-worker-bash` image's `/worker` drops you into an interactive
-shell instead of computing a result — handy for poking around, not a real worker.)
+### The CAS and `/cas`
 
-#### A recursive worker: `caos-worker-fold`
+Objects are materialized under a CAS directory (`/cas`, or `$CAOS_CAS_DIR`).
+`get-hash`/`get`/`put`/`run` all operate there, and every materialized path is
+tagged with the git hash it came from in the `user.caos.hash` xattr — the
+on-disk, per-path mapping from a path back to its hash. Writes are atomic (build
+in a temp sibling, set the xattr, `rename` into place), so concurrent runs never
+see a half-written path; startup probes that the filesystem supports `user.*`
+xattrs.
 
-The **`caos-worker-fold`** image (`.#caos-worker-fold-docker`,
-`.#load-caos-worker-fold`) is a worker whose `/worker` itself calls `caos run` —
-both to invoke another image and to recurse into itself. It's a *fold*
-(catamorphism) over a CAS tree, taking two args:
+`get-hash <hash> <path>` materializes an object at `<path>` (a direct child of
+the CAS): a **blob** becomes a file; a **tree** becomes a directory of one-level
+**placeholders** (empty, hash-tagged — a dir for subtrees, a file otherwise).
+`get [-r|--recursive[=<n>]] <path>` expands a placeholder in place: one level by
+default, `<n>` levels, or the whole subtree with `-r`. So you drill down a tree
+lazily, one level at a time, and `get -r` is idempotent/resumable.
 
-- `func` — the worker image to apply (the "algebra");
-- `in` — the file or tree to fold over.
+On a worker, `/cas` is genuinely protected (see [permissions](#permissions-load-before-read-and-no-tampering));
+under `caos-cli` it's just a local working directory you own, and the permission
+modes are vestigial bookkeeping.
 
-Given a **file**, it runs `func` on it. Given a **tree**, it folds each child
-with itself (the same `func`), assembles the results into a tree with the
-original child names, then runs `func` on that tree. Like every worker, the
-applied image takes its single input as `--in`, and the final tree is left at
-`/cas/out`:
+### Requests and results
+
+`caos run <image> <output> -- [--name=value …]`:
+
+1. assembles the `--name=value` args into a git **tree** (see [hashing](#how-arguments-are-hashed));
+2. bundles `{image, args, std}` into a content-addressed **request object**
+   (`reqHash`), where `std` is the standard library in effect (resolved from
+   `refs/caos/std`, see [built-ins](#built-ins-casstd));
+3. gets the request onto the server — `caos-cli` **pushes** it (one negotiated
+   `git push` to `refs/caos/req/<reqHash>`, plus a git image's own objects);
+   the worker `caos` had POSTed it via `/object`;
+4. calls `/run?req=<reqHash>`;
+5. records the result at `<output>` as a **typed, tagged placeholder** — and
+   **fetches nothing**. The result stays on the server; `caos get <output>`
+   pulls the bytes on demand if you want them.
+
+So a result never comes back to the caller automatically. A deep fold propagates
+hashes up the tree, materializing only the leaves a worker actually reads. The
+worker, recursing, references child results by hash (it `link`s the placeholder
+and `caos put` reuses the recorded hash — no content needed).
+
+`<image>` is a **git image by default** (a `/cas` path resolved to its recorded
+hash, or a bare git hash — e.g. a `caos curry` ref); an **ordinary docker image**
+is written `docker://<ref>`.
+
+### How arguments are hashed
+
+For each `--name=value`, `caos-cli` decides the entry's hash doing as little work
+as possible:
+
+- a `value` inside `$CAOS_CAS_DIR` → reuse the hash recorded on it (no read);
+- a `value` that **names a host filesystem path** → ingest its content via git,
+  reusing git's own objects:
+  - **clean + tracked** → reuse the committed hash from `git ls-tree HEAD` — no
+    read at all, so a large unchanged directory is effectively free;
+  - **dirty/untracked file** → `git hash-object -w`;
+  - **dirty/untracked directory** → copy `.git/index` to a throwaway index and
+    `git add` + `write-tree --prefix` there, so only the **changed** files are
+    re-read (the index stat-cache covers the rest) and your real index is never
+    touched — the trick `git stash`/`commit` use;
+  - **outside the worktree** (no index to diff against) → read in full;
+- anything else → a literal string blob.
+
+The worker `caos` has no host filesystem (only `/cas`), so it skips path
+ingestion: a non-CAS value is a literal in `run`/`curry`, and `build-args` reads
+it from disk over `/object`.
+
+### Other subcommands
+
+- `put <src-path> <cas-path>` — store an outside path into the CAS and record it
+  at a `/cas` path. Files become blobs, directories trees; a symlink into the CAS
+  reuses the recorded hash. (`caos-cli` writes objects to the local repo; the
+  worker POSTs them.)
+- `import-image <docker-archive> <cas-path>` (`caos-cli`) — store a docker-archive
+  image (`nix build .#caos-*-docker` output) as a git-docker tree, printing its
+  hash. Used to ingest images into the CAS so they can be `run`.
+- `resolve <ref>` (`caos-cli`) — print the tree hash a local git ref points at
+  (peeling commits/tags), e.g. `caos resolve refs/caos/std`. Ref name → hash; it
+  does **not** hash filesystem paths.
+- `curry <image> -- [--name=value …]` — bind some args to an image, printing a
+  ref to the curried image. It's a small content-addressed tree (`base`, `args`,
+  a `.caos-curry` marker); `run`/`curry` expand it client-side (call args win),
+  so the server only ever sees a plain image + args. Currying flattens, so it's
+  canonical.
+- `build-args [--name=value …]` — print the hash of an assembled args tree (paths
+  ingested as above, else literals); used by `./run-worker-bash.sh`.
+- `entrypoint [--args=<hash>]` (`caos` only) — the container entrypoint; see below.
+
+### `entrypoint`
+
+`caos entrypoint` ties a single compute step together inside the container:
+
+1. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
+2. **load** — if `--args=<hash>`, materialize it at `/cas/args`; if `$CAOS_STD`
+   is set, materialize the standard library at `/cas/std`;
+3. **run `/worker`** — dropped to the unprivileged `worker` user so it can't
+   touch the root-owned `/cas` except through setuid `caos`; `entrypoint` stays
+   root to tear down. The worker's stdout is sent to stderr so the container's
+   stdout stays clean;
+4. **report** — print `"<type> <hash>"` for `/cas/out` (a fast xattr read plus an
+   `is_dir` check — no re-hashing). The server returns this to the caller, which
+   uses the type to make a correctly-typed result placeholder without fetching;
+5. **tear down** — delete `/cas`.
+
+So a `/worker` reads inputs from `/cas/args`, reaches built-ins at `/cas/std`,
+and writes its result to `/cas/out`.
+
+### Permissions: load-before-read, and no tampering
+
+In a worker, `/cas` is locked down (everything root-owned), two rules enforced by
+file modes:
+
+- **Nothing is readable until fetched.** Placeholders are owner-only
+  (`r--------`/`r-x------`); `get` makes loaded content world-readable. So a
+  worker reads only what it explicitly loaded.
+- **The worker can't tamper with `/cas`.** It runs unprivileged and mutates
+  `/cas` only through `caos`, which is **setuid-root** in the image (and static,
+  so no dynamic-linker attack surface).
+
+Outside a container (`caos-cli`, `CAOS_CAS_DIR` a directory you own) the rules
+relax — you own everything, so the modes are just bookkeeping.
+
+## Workers
+
+A worker image is built `FROM` `caos-worker-base` (keeping `/bin/caos` as the
+entrypoint) and adds a `/worker` that reads `/cas/args` and writes `/cas/out`.
+The Rust workers share `worker-common` (arg helpers, `caos`/`caos run`/`caos
+curry` wrappers, result staging).
+
+- **`worker-hello`** — a leaf example: gathers its `/cas/args` entries into a
+  result tree.
+- **`worker-fold`** — a recursive fold (catamorphism) over a CAS tree, driving
+  `caos run` to recurse and to apply two image "functions":
+  - `pre` (optional) — applied to `--in` to produce the tree of children to fold
+    (default: a tree's own children; a file is a leaf);
+  - `post` — applied to `--in` plus `--children` (the folded child results) to
+    produce this node's result.
+
+  Identical subtrees are memoized, so a fold is incremental in the changed nodes.
+- **`worker-file-count`** — a `post` algebra: a file counts as `1`, a directory
+  sums its children's counts.
+- **`worker-deep-deps`** — computes transitive dependencies, implemented as a
+  curried fold (`pre` resolves a package's deps against a package map; `post`
+  assembles the deep-deps tree).
+- **`worker-rustc`** — compiles a Rust source file into a new worker image:
+  given `--src` and a base worker image (`--base`, usually curried in), it builds
+  static-musl, linking the vendored `worker-common`, and emits a git-docker
+  worker image. So building a worker is itself a (memoized) worker.
+
+### Built-ins (`/cas/std`)
+
+The standard library is a `{name: git-docker-image}` tree reached by workers as
+`/cas/std/<name>`. It's published to the server under `refs/caos/std` by
+`./build-builtins.sh` (which imports each worker image into a client repo and
+`git push`es the assembled tree — one push uploads every referenced image). A
+client `git fetch`es `refs/caos/std`, `caos-cli resolve`s it locally to a tree
+hash, and `caos run` threads that hash through as the request's `std`.
+
+Because `std` is part of every request (hence every cache key), bumping the
+built-ins recomputes everything that could reach them — coarse but correct. The
+name→hash binding lives outside any worker (in the request), so it's captured in
+the cache key, never hidden inside a memoized computation.
 
 ```bash
-caos put /some/tree /cas/in
-caos run docker://caos-worker-fold:latest /cas/out -- \
-  --func=docker://caos-worker-hello:latest --in=/cas/in
-```
-
-Because it drives the compute server itself, the image relies on
-`CAOS_COMPUTE_SERVER_URL` (injected into the worker by the compute server, along
-with `CAOS_OBJECT_SERVER_URL`) and learns its own name, for the recursive call,
-from `CAOS_FOLD_IMAGE`. Each sub-fold is a normal compute step, so identical
-subtrees are memoized by the Redis cache.
-
-#### A fold algebra: `caos-worker-file-count`
-
-The **`caos-worker-file-count`** image (`.#caos-worker-file-count-docker`,
-`.#load-caos-worker-file-count`) is a small leaf worker meant to be driven by
-`caos-worker-fold`. Its single input arrives as `--in`:
-
-- a **file** counts as `1`;
-- a **directory** (assumed to hold only files, each containing a number — the
-  per-child counts `fold` assembles) returns their **sum**.
-
-The result, a blob holding the count, is left at `/cas/out`. On its own:
-
-```bash
-printf hi > /tmp/f && caos put /tmp/f /cas/f
-caos run docker://caos-worker-file-count:latest /cas/n -- --in=/cas/f
-caos get /cas/n && cat /cas/n        # => 1
-```
-
-Composed under `fold`, it counts every leaf file in a tree:
-
-```bash
-caos put /some/tree /cas/in
-caos run docker://caos-worker-fold:latest /cas/out -- \
-  --func=docker://caos-worker-file-count:latest --in=/cas/in
-caos get /cas/out && cat /cas/out    # => number of files in the tree
+./build-builtins.sh                 # publish all built-ins to refs/caos/std
+./build-builtins.sh fold deep-deps  # publish a subset
 ```
 
 ## Local testing
@@ -497,45 +388,53 @@ caos get /cas/out && cat /cas/out    # => number of files in the tree
 
 ```bash
 tilt up      # build images + run the daemons; UI at http://localhost:10350
-# press Ctrl-C in the `tilt up` terminal to stop the daemons
 ```
+
+The `Tiltfile` builds each image with Nix (only when its sources, or the
+flake/lockfiles, change), creates the `caos-net` network and the server's
+**dedicated bare repo** (`.caos-dev/server-repo.git`, with `http.receivepack`
+and `uploadpack.allowAnySHA1InWant`), and runs three daemons: `caos-server`
+(`:9090`, with the docker socket and the repo mounted at `/git`), `caos-redis`,
+and a `caos-registry`.
 
 **Stopping:** Ctrl-C the `tilt up` process — that tears the daemons down. (`tilt
-down` does *not*: it only removes Kubernetes / docker-compose resources, and
-these daemons are `local_resource`s, which it ignores.) Each daemon installs a
-`SIGINT`/`SIGTERM` handler, so Tilt's signal (forwarded through `docker run`)
-makes the container exit and `--rm` removes it. Any container left over from a
-prior hard kill is reclaimed on the next `tilt up`.
+down` does *not*: the daemons are `local_resource`s, which it ignores.) Each
+daemon handles `SIGINT`/`SIGTERM`, so it exits and `--rm` removes it.
 
-Run a one-shot interactive bash client with: `./run-worker-bash.sh`
+Interactive worker shell (sets up `/cas`, drops you into bash):
 
-Then inside the container, e.g.:
-
-```
-caos get-hash <hash> /cas/foo
-mkdir -p /tmp && printf hello > /tmp/in
-caos put /tmp/in /cas/in
-caos run docker://caos-worker-hello:latest /cas/out -- --in=/cas/in --greeting=hi
-caos get /cas/out/greeting && cat /cas/out/greeting
+```bash
+nix run .#load-caos-worker-bash
+./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/caos
+# inside: caos get /cas/args/conf && cat /cas/args/conf
 ```
 
-`./Tiltfile` builds each image with Nix and runs the object server, compute
-server, and a Redis cache as containers Tilt supervises (see Stopping above for
-teardown). It tracks each image's sources, so an image is **only** rebuilt and
-reloaded when its crate (or the flake/lockfiles) changes — editing
-`crates/object-server` reloads just that image and restarts just that daemon. It
-also creates the `caos-net` network and backs the object server with this repo's
-own `.git` (plus any alternate object store it references), so caos can fetch real
-repo objects as test data.
+`run-worker-bash.sh` builds the args tree by running `caos build-args` in a
+throwaway container on `caos-net` (uploading over `/object`), then starts the
+shell with `--args=<hash>`.
+
+Integration tests (require `tilt up` running):
+
+```bash
+./test-deep-deps.sh      # deep-deps via /cas/std: correctness, caching, Merkle
+                         # incrementality, std-key invalidation, cycle detection
+./test-rust-worker.sh    # rustc builder: source -> worker image -> run, memoized
+```
+
+Both build `.#caos`, set up a throwaway client repo with the server as its `caos`
+remote, and drive everything through `caos-cli`.
 
 ## Notes
 
 - **Toolchain version** is whatever `stable` resolves to against the locked
-  `rust-overlay` revision in `flake.lock`. To pin an exact version, set e.g.
-  `channel = "1.96.0"` in `rust-toolchain.toml`.
+  `rust-overlay` revision in `flake.lock`. Pin an exact version with `channel =
+  "1.96.0"` in `rust-toolchain.toml`.
 - **Architecture**: the static target is `x86_64-unknown-linux-musl`. On ARM,
   switch both `rust-toolchain.toml` and `muslTarget` in `flake.nix` to
   `aarch64-unknown-linux-musl`.
-- **Native (C) dependencies**: adding a crate that links C libraries (e.g.
-  `openssl`) requires a `musl` cross-toolchain to keep the binary static.
-  See the commented `buildInputs` / `nativeBuildInputs` in `flake.nix`.
+- **Native (C) dependencies**: a crate linking C libraries (e.g. `openssl`)
+  needs a `musl` cross-toolchain to stay static — see the commented
+  `buildInputs`/`nativeBuildInputs` in `flake.nix`.
+- **Cleanup (dev)**: `refs/caos/req/*` and `refs/caos/res/*` accumulate on the
+  server repo (content-addressed, so they dedup); a real deployment should expire
+  them by age and `git gc`.
