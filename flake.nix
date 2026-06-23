@@ -415,6 +415,9 @@
           server
           pkgs.docker-client
           pkgs.gnutar
+          # `git http-backend` (and the `git` it dispatches): the smart-HTTP
+          # transport the caos client uses as its `caos` remote.
+          pkgs.git
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];

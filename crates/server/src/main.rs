@@ -34,10 +34,18 @@
 //! result hash. A hit skips the container entirely. Redis is best-effort — if
 //! it's unreachable we log and run uncached.
 //!
-//! The two halves live in [`mod storage`] and [`mod compute`]; this file is the
-//! entry point, the shared [`Config`]/[`HttpError`], and the request router.
+//! Git transport:
+//!
+//! * `GET  /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack`
+//!   — git smart-HTTP over the same repo, so the caos client can use the server as
+//!   a `caos` git remote (push objects up, fetch refs/results down). See
+//!   [`mod git`]; it delegates to `git http-backend`.
+//!
+//! The halves live in [`mod storage`], [`mod compute`], and [`mod git`]; this file
+//! is the entry point, the shared [`Config`]/[`HttpError`], and the request router.
 
 mod compute;
+mod git;
 mod storage;
 
 use std::sync::Arc;
@@ -86,6 +94,9 @@ struct Config {
     registry_pull_host: String,
     docker_bin: String,
     redis_addr: String,
+    /// Filesystem path to the git object database, passed to `git http-backend`
+    /// as `GIT_PROJECT_ROOT` for the smart-HTTP transport (see [`mod git`]).
+    git_dir: String,
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
@@ -138,6 +149,7 @@ fn main() {
         registry_pull_host: env_or("CAOS_REGISTRY_PULL_HOST", DEFAULT_REGISTRY_PULL_HOST),
         docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
+        git_dir,
         repo,
     });
 
@@ -150,8 +162,9 @@ fn main() {
     };
     eprintln!(
         "caos-server listening on http://{addr} (storage + compute), network {}, \
-         git repo {git_dir}, url {}, registry push {} / pull {}, redis {}",
+         git repo {}, url {}, registry push {} / pull {}, redis {}",
         config.network,
+        config.git_dir,
         config.server_url,
         config.registry_push_url,
         config.registry_pull_host,
@@ -202,6 +215,13 @@ impl From<std::io::Error> for HttpError {
 
 /// Dispatch a single request and send its response.
 fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
+    // Git smart-HTTP (the `caos` remote) is served by a separate CGI delegate that
+    // sets its own status/headers, so it bypasses the `route` -> `from_data` path.
+    let path = request.url().split('?').next().unwrap_or("").to_string();
+    if git::is_git_path(&path) {
+        return git::serve(config, request);
+    }
+
     match route(config, &mut request) {
         Ok(body) => request.respond(Response::from_data(body)),
         Err(err) => request.respond(
