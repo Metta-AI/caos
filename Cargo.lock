@@ -1433,6 +1433,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "worker-rustc"
+version = "0.1.0"
+dependencies = [
+ "worker-common",
+]
+
+[[package]]
 name = "xattr"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

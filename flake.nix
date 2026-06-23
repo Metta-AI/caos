@@ -86,6 +86,7 @@
         worker-fold = crateBin "worker-fold";
         worker-file-count = crateBin "worker-file-count";
         worker-deep-deps = crateBin "worker-deep-deps";
+        worker-rustc = crateBin "worker-rustc";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (client, object-server) but
@@ -372,6 +373,56 @@
           fakeRootCommands = installWorkerFiles;
         };
 
+        # A "rustc" worker: it *builds other workers*. Given a Rust source file as
+        # `--src` and a worker-base git-docker image as `--base` (curried in), it
+        # compiles the source (static, musl, linking the vendored worker-common)
+        # and emits a new worker image at /cas/out — the base's layers plus one
+        # carrying the compiled /worker. So this image is far from minimal: it
+        # bakes a whole Rust + C toolchain, merged with the worker root via
+        # buildEnv so cargo/rustc/cc all land on PATH=/bin. The worker-common
+        # source is vendored at /vendor/worker-common for user code to depend on.
+        # This is the `worker-rustc` crate at /worker.
+        workerRustcRoot = workerRoot "worker-rustc" worker-rustc;
+        # The worker-common crate source, for the in-image `cargo build` to link
+        # user code against (it has no deps, so no registry/network is needed).
+        workerCommonVendor = pkgs.runCommand "caos-worker-common-vendor" { } ''
+          mkdir -p $out/vendor
+          cp -r ${./crates/worker-common} $out/vendor/worker-common
+        '';
+        # One merged root tree: the worker bits plus the build toolchain, so a
+        # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc.
+        workerRustcRootEnv = pkgs.buildEnv {
+          name = "caos-worker-rustc-root";
+          paths = [
+            workerBaseRoot
+            workerRustcRoot
+            workerCommonVendor
+            rustToolchain
+            pkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
+            pkgs.coreutils
+            pkgs.bash # cc-wrapper and cargo shell out to these
+          ];
+        };
+        workerRustcContents = [ workerRustcRootEnv ];
+        workerRustcConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [
+            "PATH=/bin"
+            # cargo writes here; /tmp is the only world-writable dir for the worker.
+            "CARGO_HOME=/tmp/cargo"
+          ];
+        };
+        workerRustcImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-rustc";
+          tag = "latest";
+          contents = workerRustcContents;
+          config = workerRustcConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
+
         # compute-server runs worker containers by shelling out to the `docker`
         # CLI, so — unlike the minimal images — it bundles the docker client and
         # expects the host's docker socket bind-mounted at /var/run/docker.sock.
@@ -468,6 +519,12 @@
           config = workerDeepDepsConfig;
           fakeRootCommands = installWorkerFiles;
         };
+        loadWorkerRustc = loadImage {
+          name = "caos-worker-rustc";
+          contents = workerRustcContents;
+          config = workerRustcConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
       in
       {
         packages = {
@@ -483,6 +540,7 @@
           caos-worker-fold-docker = workerFoldImage;
           caos-worker-file-count-docker = workerFileCountImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
+          caos-worker-rustc-docker = workerRustcImage;
         };
 
         apps = {
@@ -518,6 +576,10 @@
           load-caos-worker-deep-deps = {
             type = "app";
             program = "${loadWorkerDeepDeps}/bin/load-caos-worker-deep-deps";
+          };
+          load-caos-worker-rustc = {
+            type = "app";
+            program = "${loadWorkerRustc}/bin/load-caos-worker-rustc";
           };
         };
 
