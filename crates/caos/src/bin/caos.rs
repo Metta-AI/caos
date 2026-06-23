@@ -167,14 +167,18 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
         return Err(format!("{DEFAULT_WORKER} exited with {status}"));
     }
 
-    // Everything under /cas got there via get/put, which tag each path with its
-    // hash, so /cas/out already knows its hash — read it back before teardown.
-    let hash = caos::read_hash(&cas.join("out"))?;
+    // Everything under /cas got there via get/put/run, which tag each path with
+    // its hash, so /cas/out already knows its hash — read it (and its type) back
+    // before teardown. The server returns this `"<type> <hash>"` to the caller so
+    // it can record a correctly-typed result placeholder without fetching.
+    let out = cas.join("out");
+    let hash = caos::read_hash(&out)?;
+    let kind = if out.is_dir() { "tree" } else { "blob" };
 
     // Tear down.
     remove_cas(&cas)?;
 
-    println!("{hash}");
+    println!("{kind} {hash}");
     Ok(())
 }
 

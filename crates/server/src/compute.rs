@@ -1,9 +1,11 @@
 //! Compute: the `/run` pipeline.
 //!
-//! Cache lookup (Redis) → run-cycle detection → image resolution (a `docker://`
-//! ref used as-is, or a git-docker image converted and pushed to the registry) →
-//! the worker container run, whose stdout is the result hash. Results, converted
-//! images, and built layers are all cached in Redis (best-effort).
+//! A request is a content-addressed tree `{image, args, std}`; `/run?req=<hash>`
+//! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
+//! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
+//! the registry) → the worker container run, whose stdout is `"<type> <hash>"`.
+//! A top-level run also pins `refs/caos/res/<req>` at the result. Results,
+//! converted images, and built layers are all cached in Redis (best-effort).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -46,58 +48,66 @@ const META_SUFFIX: &str = ".caosmeta";
 /// Disambiguates temp dirs created across handler threads.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// `GET /run?image=<image>&args=<hash>` — run the image and return its result.
+/// `GET /run?req=<reqHash>[&stack=...]` — run the request object `<reqHash>` (a
+/// tree `{image, args, std}`) and return its result as `"<type> <hash>"`.
+///
+/// The request being a content-addressed object means `reqHash` *is* the cache
+/// key (it captures image + args + std) and the rendezvous id: a top-level run
+/// also pins `refs/caos/res/<reqHash>` at the result, so a client can fetch it by
+/// ref. Workers POST the request via `/object` and call this; the CLI pushes it.
 pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
-    let image = query_param(query, "image")
-        .ok_or_else(|| HttpError::new(400, "missing 'image' query parameter"))?;
-    let args = query_param(query, "args")
-        .ok_or_else(|| HttpError::new(400, "missing 'args' query parameter"))?;
+    let req = query_param(query, "req")
+        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
+    if req.is_empty() || !req.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(HttpError::new(400, format!("invalid req hash: {req:?}")));
+    }
 
+    // Unpack the request: image (a ref blob), args (a tree), std (a ref blob).
+    // `std` names the standard library, materialized at `/cas/std` in the worker;
+    // it's part of the request (hence the key) so bumping built-ins recomputes.
+    let (image, args, std) = read_request(config, &req)?;
     if image.is_empty() {
-        return Err(HttpError::new(400, "empty image"));
+        return Err(HttpError::new(400, "request has empty image"));
     }
     // The args hash is interpolated into `--args=`; require a plain hex object id.
     if args.is_empty() || !args.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid args hash: {args:?}")));
     }
-    // The built-in tree (`std`) the caller pinned, threaded down from the top. It
-    // names the standard library, materialized at `/cas/std` in the worker, and is
-    // folded into the cache key so a different `std` is a different computation.
-    let std = query_param(query, "std").unwrap_or_default();
     if !std.is_empty() && !std.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid std hash: {std:?}")));
     }
 
-    // Cache key is the image + args-tree hash + the built-in pin (`std`); value is
-    // the result hash. Keying on the image param as given (a git hash, or a
-    // `docker://` ref) means a hit skips both image conversion and the container
-    // run. Folding in `std` means bumping the built-ins recomputes everything
-    // (every worker can reach any built-in via `/cas/std`, so any of them might
-    // affect any result). Redis is best-effort: a lookup/connection error just
-    // means we run uncached.
-    let key = format!("caos:result:{image}\0{args}\0{std}");
+    // The run stack (cycle detection) is the chain of request hashes in progress,
+    // threaded through nested runs via CAOS_RUN_STACK (echoed back as `stack`). An
+    // empty stack means this is a top-level (external) run — the one we pin a
+    // result ref for; nested runs are transient.
+    let incoming = query_param(query, "stack").unwrap_or_default();
+    let stack: Vec<&str> = incoming.lines().filter(|l| !l.is_empty()).collect();
+    let top_level = stack.is_empty();
+
+    // The request hash is the cache key (it captures image+args+std); the value is
+    // the result "<type> <hash>". A hit skips image conversion and the container
+    // run. Redis is best-effort: a lookup error just means we run uncached.
+    let key = format!("caos:result:{req}");
     match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
-            eprintln!("cache hit: image={image} args={args} -> {result}");
+            eprintln!("cache hit: req={req} -> {result}");
+            if top_level {
+                pin_result(config, &req, &result);
+            }
             return Ok(format!("{result}\n").into_bytes());
         }
-        Ok(None) => eprintln!("cache miss: image={image} args={args}; running worker"),
-        Err(e) => eprintln!("cache lookup failed ({e}); running worker: image={image} args={args}"),
+        Ok(None) => eprintln!("cache miss: req={req} (image={image} args={args}); running worker"),
+        Err(e) => eprintln!("cache lookup failed ({e}); running worker: req={req}"),
     }
 
-    // Cycle detection (system-level): the run stack is the chain of (image,args)
-    // computations currently in progress, threaded through nested runs via the
-    // CAOS_RUN_STACK env var (echoed back as the `stack` param). Re-entering a
-    // computation already on the stack has no fixpoint — fail, listing the cycle.
-    // (The cache hit above can't be on the stack: a computation inside a cycle
-    // never completes, so it never caches — which is why checking only on a miss
-    // is sound.) This frame's identity is exactly the cache key's (image, args).
-    let incoming = query_param(query, "stack").unwrap_or_default();
-    let frame = format!("{image} {args}");
-    let stack: Vec<&str> = incoming.lines().filter(|l| !l.is_empty()).collect();
-    if let Some(pos) = stack.iter().position(|&f| f == frame) {
+    // Re-entering a request already on the stack has no fixpoint — fail, listing
+    // the cycle. (A cache hit can't be on the stack: a cyclic computation never
+    // completes, so it never caches, which is why checking only on a miss is
+    // sound.) The request hash is exactly this frame's identity.
+    if let Some(pos) = stack.iter().position(|&f| f == req) {
         let mut cycle: Vec<&str> = stack[pos..].to_vec();
-        cycle.push(&frame);
+        cycle.push(&req);
         let listing = cycle.join("\n  -> ");
         eprintln!("run cycle detected:\n  {listing}");
         return Err(HttpError::new(
@@ -107,7 +117,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     }
     // Child runs see this computation as an ancestor.
     let mut child_stack: Vec<&str> = stack.clone();
-    child_stack.push(&frame);
+    child_stack.push(&req);
     let child_stack = child_stack.join("\n");
 
     // Resolve to a reference the host's docker daemon can run: a `docker://`
@@ -135,7 +145,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!(
-            "worker failed: image={image} args={args} ({}):\n{}",
+            "worker failed: req={req} ({}):\n{}",
             output.status,
             stderr.trim_end()
         );
@@ -145,25 +155,83 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         ));
     }
 
-    // The container's stdout is the result hash printed by `caos entrypoint`.
-    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if hash.is_empty() {
-        eprintln!("worker produced no result hash on stdout: image={image} args={args}");
+    // The container's stdout is "<type> <hash>" printed by `caos entrypoint`.
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if result_hash(&result).is_empty() {
+        eprintln!("worker produced no result on stdout: req={req}");
         return Err(HttpError::new(
             500,
-            "worker container produced no result hash on stdout",
+            "worker container produced no result on stdout",
         ));
     }
 
     // Cache the result for next time (best-effort).
-    match cache_set(&config.redis_addr, &key, &hash) {
-        Ok(()) => eprintln!("ran worker: image={image} args={args} -> {hash} (cached)"),
-        Err(e) => {
-            eprintln!("ran worker: image={image} args={args} -> {hash} (cache store failed: {e})")
-        }
+    match cache_set(&config.redis_addr, &key, &result) {
+        Ok(()) => eprintln!("ran worker: req={req} -> {result} (cached)"),
+        Err(e) => eprintln!("ran worker: req={req} -> {result} (cache store failed: {e})"),
     }
 
-    Ok(format!("{hash}\n").into_bytes())
+    // Pin a top-level (external) run's result so a client can fetch it by ref and
+    // it survives gc; nested runs set no ref (they'd flood the namespace).
+    if top_level {
+        pin_result(config, &req, &result);
+    }
+
+    Ok(format!("{result}\n").into_bytes())
+}
+
+/// Unpack a request object (a tree `{image, args, std}`) into its parts: the
+/// image ref, the args-tree hash, and the std-tree hash (empty if none).
+fn read_request(config: &Config, req: &str) -> Result<(String, String, String), HttpError> {
+    let entries =
+        fetch_tree(config, req).map_err(|e| HttpError::new(400, format!("reading request: {e}")))?;
+    let mut image = None;
+    let mut args = None;
+    let mut std = String::new();
+    for entry in entries {
+        match entry.name.as_str() {
+            "image" => image = Some(blob_string(config, &entry.oid.to_string())?),
+            "args" => args = Some(entry.oid.to_string()),
+            "std" => std = blob_string(config, &entry.oid.to_string())?,
+            _ => {}
+        }
+    }
+    let image = image.ok_or_else(|| HttpError::new(400, "request missing 'image'"))?;
+    let args = args.ok_or_else(|| HttpError::new(400, "request missing 'args'"))?;
+    Ok((image, args, std))
+}
+
+/// Fetch a blob and return its content as a trimmed string.
+fn blob_string(config: &Config, hash: &str) -> Result<String, HttpError> {
+    let bytes =
+        fetch_blob(config, hash).map_err(|e| HttpError::new(400, format!("reading blob: {e}")))?;
+    String::from_utf8(bytes)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| HttpError::new(400, format!("blob {hash} not UTF-8: {e}")))
+}
+
+/// The hash in a `"<type> <hash>"` result string (empty if malformed).
+fn result_hash(result: &str) -> &str {
+    result.split_whitespace().nth(1).unwrap_or("")
+}
+
+/// Pin `refs/caos/res/<req>` at the result so a client can fetch it by ref and it
+/// survives gc. Best-effort: a failure just means the result isn't ref-pinned
+/// (it's still cached and reachable by hash). `result` is `"<type> <hash>"`.
+fn pin_result(config: &Config, req: &str, result: &str) {
+    let hash = result_hash(result);
+    if hash.is_empty() {
+        return;
+    }
+    let refname = format!("refs/caos/res/{req}");
+    match Command::new("git")
+        .args(["-C", &config.git_dir, "update-ref", &refname, hash])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("warning: git update-ref {refname} exited with {status}"),
+        Err(e) => eprintln!("warning: pinning {refname}: {e}"),
+    }
 }
 
 /// Resolve the `image` parameter to a reference the host docker daemon can run.

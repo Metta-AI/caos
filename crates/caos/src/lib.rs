@@ -536,6 +536,29 @@ fn write_tree(target: &Path, hash: &str, tree: &gix::objs::TreeRef) -> Result<()
     })
 }
 
+/// Record a result as a typed, tagged placeholder at `target`, fetching nothing:
+/// an empty directory for a tree, an empty file for a blob, tagged with `hash` and
+/// owner-only (the placeholder mode). It's an unloaded handle — `caos put`
+/// references it by its recorded hash (no content needed) and `caos get` expands
+/// it on demand — so a `caos run` result never has to come back to the caller.
+fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String> {
+    atomically(target, |tmp| {
+        let mode = match kind {
+            "tree" => {
+                std::fs::create_dir(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+                MODE_PLACEHOLDER_DIR
+            }
+            "blob" => {
+                std::fs::File::create(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+                MODE_PLACEHOLDER_FILE
+            }
+            other => return Err(format!("unknown result type {other:?}")),
+        };
+        set_hash(tmp, hash.as_bytes())?;
+        set_mode(tmp, mode)
+    })
+}
+
 /// Build content at a unique temp sibling of `target` via `build`, then rename
 /// it into place atomically; the temp path is cleaned up on any failure.
 ///
@@ -1129,25 +1152,60 @@ pub fn caos_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) ->
     let args_tree = post_tree(t, merge_entries(bound, call))?;
 
     // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
-    // resolved from the `refs/caos/std` ref at the top. Passed to the server so it
-    // keys on it and threads it down (materialized at /cas/std in the worker).
+    // resolved from the `refs/caos/std` ref at the top. Part of the request so the
+    // server keys on it and threads it down (materialized at /cas/std).
     let std = run_std()?;
 
-    // Make sure the server can read what we built locally (a no-op for the HTTP
-    // transport, which posted as it went; the git transport pushes here).
-    t.ensure_pushed(&args_tree.to_string())?;
+    // Bundle the request as a content-addressed object {image, args, std}; its
+    // hash is the request id (and the server's cache key). Get it onto the server
+    // — a no-op POST-as-you-go for the HTTP transport, a push for the git one —
+    // plus a git image's own objects (referenced by hash in a blob, so not carried
+    // by the request tree).
+    let req = build_request(t, &image, &args_tree, &std)?;
+    t.ensure_pushed(&req.to_string())?;
     if is_hex_hash(&image) {
         t.ensure_pushed(&image)?;
     }
 
-    // Hand the image and args-tree hash to the server; it runs the
-    // container and returns the hash of the result (its /cas/out).
-    let result = request_compute(&image, &args_tree.to_string(), &std)?;
+    // Trigger compute; the server runs the container and returns the result's
+    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
+    let (kind, result) = request_compute(&req.to_string())?;
 
-    // Materialize the result. The git transport fetches the result objects from
-    // the server on demand (they're unreferenced there, so by bare hash); HTTP
-    // GETs them. See [`Transport::get_object`].
-    fetch_and_materialize(t, &target, &result)
+    // Record the result as a typed, tagged placeholder — fetch nothing. The result
+    // stays on the server; `caos get <output>` loads it on demand if wanted.
+    write_placeholder(&target, &kind, &result)
+}
+
+/// Bundle a run request as a content-addressed object: a tree `{image, args,
+/// std}` — `image`/`std` as ref blobs, `args` as the args subtree. Its hash is
+/// the request id: the server's cache key and the result-ref rendezvous. (The
+/// git-docker image's own objects aren't reachable from here — `image` is a blob
+/// naming it by hash — so `caos run` pushes them separately.)
+fn build_request(
+    t: &dyn Transport,
+    image: &str,
+    args_tree: &gix::ObjectId,
+    std: &str,
+) -> Result<gix::ObjectId, String> {
+    use gix::objs::tree::{Entry, EntryKind};
+    let entries = vec![
+        Entry {
+            mode: EntryKind::Blob.into(),
+            filename: b"image".to_vec().into(),
+            oid: post_object(t, "blob", image.as_bytes())?,
+        },
+        Entry {
+            mode: EntryKind::Tree.into(),
+            filename: b"args".to_vec().into(),
+            oid: *args_tree,
+        },
+        Entry {
+            mode: EntryKind::Blob.into(),
+            filename: b"std".to_vec().into(),
+            oid: post_object(t, "blob", std.as_bytes())?,
+        },
+    ];
+    post_tree(t, entries)
 }
 
 /// The built-in tree hash (`std`) for a run. Inside a worker the server sets
@@ -1333,24 +1391,12 @@ fn merge_entries(
     by_name.into_values().collect()
 }
 
-/// Ask the server to run the request and return the result hash it reports (the
-/// container's /cas/out). `image`/`args_hash`/`std` are passed as query params;
-/// the server keys its result cache on them and pins `refs/caos/res/<result>`.
-fn request_compute(image: &str, args_hash: &str, std: &str) -> Result<String, String> {
+/// Trigger compute for request `req` and return the result's `(type, hash)`. The
+/// server runs the container and replies `"<type> <hash>"`. `&stack=` rides along
+/// for cycle detection — it's threaded state, not part of the request's identity.
+fn request_compute(req: &str) -> Result<(String, String), String> {
     let base = server_url()?;
-    let mut url = format!(
-        "{}/run?image={}&args={}",
-        base.trim_end_matches('/'),
-        percent_encode(image),
-        args_hash,
-    );
-    // The built-in tree, keyed on and threaded down by the server (see STD_ENV).
-    if !std.is_empty() {
-        url.push_str("&std=");
-        url.push_str(std);
-    }
-    // Echo back the in-progress run stack (see RUN_STACK_ENV) so the server can
-    // detect cycles. Empty/unset at the top level.
+    let mut url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
     if let Ok(stack) = std::env::var(RUN_STACK_ENV) {
         if !stack.is_empty() {
             url.push_str("&stack=");
@@ -1359,11 +1405,14 @@ fn request_compute(image: &str, args_hash: &str, std: &str) -> Result<String, St
     }
     let body = http_get(&url)?;
     let text = String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
-    let hash = text.trim();
+    let (kind, hash) = text
+        .trim()
+        .split_once(' ')
+        .ok_or_else(|| format!("server returned a malformed result: {:?}", text.trim()))?;
     if hash.is_empty() {
         return Err("server returned an empty result".to_string());
     }
-    Ok(hash.to_string())
+    Ok((kind.to_string(), hash.to_string()))
 }
 
 /// Percent-encode a string for use as a URL query value: unreserved characters
