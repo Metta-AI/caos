@@ -7,7 +7,7 @@
 //! delta. Compute is still triggered over HTTP (`$CAOS_SERVER_URL`, `/run`).
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `import-image`, `resolve`, `run`,
-//! `curry`, `build-args`. (There is no `entrypoint` — that's the worker's job.)
+//! `curry`. (There is no `entrypoint` — that's the worker's job.)
 
 use std::process::ExitCode;
 
@@ -65,10 +65,6 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, sep, kvs @ ..] if sep == "--" => caos::caos_curry(&transport()?, image, kvs),
             _ => Err(usage(args)),
         },
-        // `build-args [--name=value | --name:@=path ...]` — print the hash of the assembled args
-        // tree (a path value is ingested, reusing git's recorded objects for a
-        // clean tracked path; everything else is a literal blob).
-        Some("build-args") => caos::build_args(&transport()?, &args[2..]),
         _ => Err(usage(args)),
     }
 }
@@ -87,7 +83,6 @@ fn usage(args: &[String]) -> String {
          {prog} import-image <docker-archive> <cas-path>\n  \
          {prog} resolve <ref>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
-         {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
-         {prog} build-args [--name=value | --name:@=path ...]"
+         {prog} curry <image> -- [--name=value | --name:@=path ...]"
     )
 }

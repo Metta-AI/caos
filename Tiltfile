@@ -44,7 +44,6 @@ def nix_image(res, app, srcs):
 
 nix_image('img-server', 'load-caos-server', ['crates/server'])
 nix_image('img-worker-base', 'load-caos-worker-base', ['crates/caos'])
-nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/caos'])
 nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/caos'])
 nix_image('img-worker-fold', 'load-caos-worker-fold', ['crates/caos'])
 nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/caos'])

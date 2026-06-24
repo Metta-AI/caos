@@ -36,7 +36,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
-| `Tiltfile`, `build-builtins.sh`, `test-*.sh`, `run-worker-bash.sh` | Local dev + integration tests |
+| `Tiltfile`, `build-builtins.sh`, `test-*.sh` | Local dev + integration tests |
 
 ## Development
 
@@ -199,11 +199,11 @@ logic — the difference is the **transport** and the privilege model.
   and provides the container `entrypoint`. It's installed **setuid-root** in
   worker images so an unprivileged worker can reach the root-owned `/cas` only
   through it. Subcommands: `get-hash`, `get`, `put`, `run`, `curry`,
-  `build-args`, `entrypoint`.
+  `entrypoint`.
 - **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
   builds objects in the local working repo and exchanges them by negotiated
   push/fetch. Subcommands: `get-hash`, `get`, `put`, `import-image`, `resolve`,
-  `run`, `curry`, `build-args`. No `entrypoint`.
+  `run`, `curry`. No `entrypoint`.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote, and `CAOS_SERVER_URL` set (used for `/run` and to fetch results):
@@ -283,8 +283,7 @@ escaping):
 
 The grammar is `--name[:type]=value` and extensible: `@` (path) is the only type
 today, leaving room for more. The worker `caos` has no host filesystem (only
-`/cas`), so a non-`/cas` path there is an error — except `build-args`, which a
-worker uses (run-worker-bash) to read host files from disk over `/object`.
+`/cas`), so a non-`/cas` path there is an error.
 
 ### Other subcommands
 
@@ -303,8 +302,6 @@ worker uses (run-worker-bash) to read host files from disk over `/object`.
   (`base`, `args`, a `.caos-curry` marker); `run`/`curry` expand it client-side
   (call args win), so the server only ever sees a plain image + args. Currying
   flattens, so it's canonical.
-- `build-args [--name=value | --name:@=path …]` — print the hash of an assembled
-  args tree (same literal/path rules as above); used by `./run-worker-bash.sh`.
 - `entrypoint [--args=<hash>]` (`caos` only) — the container entrypoint; see below.
 
 ### `entrypoint`
@@ -405,18 +402,6 @@ and a `caos-registry`.
 **Stopping:** Ctrl-C the `tilt up` process — that tears the daemons down. (`tilt
 down` does *not*: the daemons are `local_resource`s, which it ignores.) Each
 daemon handles `SIGINT`/`SIGTERM`, so it exits and `--rm` removes it.
-
-Interactive worker shell (sets up `/cas`, drops you into bash):
-
-```bash
-nix run .#load-caos-worker-bash
-./run-worker-bash.sh --greeting=hi --conf:@=Cargo.toml --src:@=crates/caos
-# inside: caos get /cas/args/conf && cat /cas/args/conf
-```
-
-`run-worker-bash.sh` builds the args tree by running `caos build-args` in a
-throwaway container on `caos-net` (uploading over `/object`), then starts the
-shell with `--args=<hash>`.
 
 Integration tests (require `tilt up` running):
 

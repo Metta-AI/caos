@@ -138,9 +138,8 @@
         '';
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
         # print the hash of /cas/out. The server URL a worker needs is injected at
-        # runtime — by the server for the containers
-        # it spawns, and by ./run-worker-bash.sh for the debug shell — so none are
-        # baked into the images.
+        # runtime by the server for the containers it spawns — so none are baked
+        # into the images.
         workerBaseConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -157,54 +156,6 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-
-        # A testing image: caos-worker-base plus an ordinary interactive shell
-        # (bash + coreutils + curl) so you can poke at /cas and the server
-        # by hand. Not minimal — for debugging, not production. Like the other
-        # workers it extends caos-worker-base and runs `caos entrypoint`, which
-        # sets up /cas and runs /worker; here /worker drops you into an interactive
-        # shell. Run it with ./run-worker-bash.sh, which wires up the daemon URLs.
-        workerBashScript = pkgs.writeTextFile {
-          name = "caos-worker-bash-script";
-          executable = true;
-          destination = "/worker";
-          text = ''
-            #!/bin/bash
-            # Interactive debugging shell. `caos entrypoint` runs us as /worker
-            # (with /cas already set up) and, on exit, reads the hash of /cas/out.
-            # Drop into a shell, then — if you didn't leave a result there — store
-            # an empty blob at /cas/out so exiting doesn't error.
-            bash
-            if [ ! -e /cas/out ]; then
-              mkdir -p /tmp
-              touch /tmp/caos-empty-out
-              caos put /tmp/caos-empty-out /cas/out
-            fi
-            exit 0
-          '';
-        };
-        workerBashContents = [
-          workerBaseRoot
-          workerBashScript
-          pkgs.bashInteractive
-          pkgs.coreutils
-          pkgs.curl
-        ];
-        workerBashConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "entrypoint"
-          ];
-          # Daemon URLs are injected at runtime by ./run-worker-bash.sh.
-          Env = [ "PATH=/bin" ];
-        };
-        workerBashImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-bash";
-          tag = "latest";
-          contents = workerBashContents;
-          config = workerBashConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
 
         # A real, runnable worker image, with a /worker that reads its inputs from
         # /cas/args (one entry per `--name=value` arg `caos run` passed), assembles
@@ -460,12 +411,6 @@
           config = workerBaseConfig;
           fakeRootCommands = installWorkerFiles;
         };
-        loadWorkerBash = loadImage {
-          name = "caos-worker-bash";
-          contents = workerBashContents;
-          config = workerBashConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
         loadServer = loadImage {
           name = "caos-server";
           contents = serverContents;
@@ -509,7 +454,6 @@
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-worker-base-docker = workerBaseImage;
-          caos-worker-bash-docker = workerBashImage;
           caos-server-docker = serverImage;
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-fold-docker = workerFoldImage;
@@ -523,10 +467,6 @@
           load-caos-worker-base = {
             type = "app";
             program = "${loadWorkerBase}/bin/load-caos-worker-base";
-          };
-          load-caos-worker-bash = {
-            type = "app";
-            program = "${loadWorkerBash}/bin/load-caos-worker-bash";
           };
           load-caos-server = {
             type = "app";

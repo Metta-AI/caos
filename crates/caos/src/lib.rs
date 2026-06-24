@@ -136,9 +136,8 @@ pub trait Transport {
     /// Ingest the filesystem path named by a `:@=` arg `value`, returning its
     /// `(mode, oid)` — or `Ok(None)` if this transport doesn't read host paths.
     /// The default is `None`: the worker has no host filesystem (only `/cas`), so
-    /// the caller handles it (an error for `run`/`curry`, a read-from-disk for
-    /// `build-args` over `/object`). The git transport overrides this to ingest
-    /// from the working repo, reusing git's recorded objects (see its impl).
+    /// a non-CAS path there is an error. The git transport overrides this to
+    /// ingest from the working repo, reusing git's recorded objects (see its impl).
     fn ingest_path(
         &self,
         _value: &str,
@@ -1191,62 +1190,6 @@ fn scratch_dir() -> Result<PathBuf, String> {
     let dir = base.join(format!("{pid}.{nanos}.{seq}"));
     std::fs::create_dir(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     Ok(dir)
-}
-
-/// `build-args [--name=value ...]` — assemble an args git tree and print its
-/// hash. For each pair, a `value` that names an existing path (relative to the
-/// working directory) is stored recursively from the filesystem, so the entry
-/// references that content's own hash (git's hash for the path); any other value
-/// is stored verbatim as a blob. The printed hash is meant to be passed to
-/// `caos entrypoint --args=<hash>` (which is what `run-worker-bash.sh` does).
-pub fn build_args(t: &dyn Transport, kvs: &[String]) -> Result<(), String> {
-    let hash = build_host_args_tree(t, kvs)?;
-    println!("{hash}");
-    Ok(())
-}
-
-/// The args-tree builder behind `build-args`: like [`build_arg_entries`], but a
-/// `value` naming an existing filesystem path is ingested as its content rather
-/// than reused from the CAS. Ingestion goes through [`Transport::ingest_path`],
-/// so the git transport (`caos-cli`) reuses git's recorded objects (see
-/// [`GitTransport::ingest_path`]) while the HTTP transport (a worker) reads it
-/// from disk via [`store`]. The tree is never written to the filesystem.
-fn build_host_args_tree(t: &dyn Transport, kvs: &[String]) -> Result<gix::ObjectId, String> {
-    use gix::objs::tree::{Entry, EntryKind};
-
-    // There's no CAS here, so `store` should never treat a symlink as one
-    // pointing into a CAS. A NUL byte can't appear in a real (canonicalized)
-    // path, so no path ever starts with this sentinel — the CAS-reuse branch
-    // stays dormant and symlinks are stored as plain git symlinks.
-    let no_cas = PathBuf::from("/\0");
-
-    let mut entries = Vec::new();
-    for kv in kvs {
-        let (name, value) = parse_kv(kv)?;
-
-        let (mode, oid) = match value {
-            // `--name=value` — the literal verbatim as a blob.
-            ArgValue::Literal(v) => (
-                EntryKind::Blob.into(),
-                post_object(t, "blob", v.as_bytes())?,
-            ),
-            // `--name:@=path` — the git transport ingests it (reusing git's
-            // objects); the HTTP transport (a worker, e.g. run-worker-bash's)
-            // reads it from disk and uploads it.
-            ArgValue::Path(p) => match t.ingest_path(p)? {
-                Some(entry) => entry,
-                None => store(t, &no_cas, Path::new(p))?,
-            },
-        };
-
-        entries.push(Entry {
-            mode,
-            filename: name.as_bytes().to_vec().into(),
-            oid,
-        });
-    }
-
-    post_tree(t, entries)
 }
 
 /// The per-arg tree entries that make up an args tree — `run`/`curry` merge call

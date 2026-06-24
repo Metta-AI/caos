@@ -8,9 +8,8 @@
 //! library; this binary is the worker's CLI surface plus the privileged
 //! entrypoint.
 //!
-//! Subcommands: `get-hash`, `get`, `put`, `run`, `curry`, `build-args`, and
-//! `entrypoint`. (Image import and ref resolution are user-facing only — see
-//! `caos-cli`.)
+//! Subcommands: `get-hash`, `get`, `put`, `run`, `curry`, and `entrypoint`.
+//! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
@@ -71,9 +70,6 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, sep, kvs @ ..] if sep == "--" => caos::caos_curry(&http()?, image, kvs),
             _ => Err(usage(args)),
         },
-        // `build-args [--name=value | --name:@=path ...]` — print the hash of the assembled args
-        // tree (path values stored from disk, everything else a literal blob).
-        Some("build-args") => caos::build_args(&http()?, &args[2..]),
         // `entrypoint [--args=<hash>]` — takes no command; it always runs /worker.
         Some("entrypoint") => match &args[2..] {
             [] => entrypoint(None),
@@ -100,7 +96,6 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
-         {prog} build-args [--name=value | --name:@=path ...]\n  \
          {prog} entrypoint [--args=<hash>]"
     )
 }
