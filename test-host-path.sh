@@ -19,6 +19,10 @@ nix run .#load-caos-worker-hello >/dev/null
 caosbin=$PROJECT/result-caos/bin/caos-cli
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 
+# A per-run salt threads into every request, so this run is independent of any
+# other without clearing Redis.
+export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
+
 # A client working repo with the server as its `caos` remote; `caos` runs the CLI
 # from inside it so its git transport finds it. The fixture lives *inside* this
 # repo, so path ingestion can reuse git's objects.

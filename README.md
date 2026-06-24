@@ -140,10 +140,10 @@ injected into each worker), `CAOS_REGISTRY_PUSH_URL`
 ### Compute
 
 A run **request** is itself a content-addressed git object: a tree
-`{image, args, std}` whose hash, `reqHash`, *is* the cache key and the
+`{image, args, std, salt}` whose hash, `reqHash`, *is* the cache key and the
 rendezvous id. `GET /run?req=<reqHash>`:
 
-1. **read** the request tree (`image` ref, `args` tree, `std` tree);
+1. **read** the request tree (`image` ref, `args` tree, `std` tree, `salt`);
 2. **cache** lookup in Redis keyed on `reqHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
 3. **cycle check** — `&stack=` carries the chain of in-progress `reqHash`es
@@ -153,7 +153,8 @@ rendezvous id. `GET /run?req=<reqHash>`:
    images is converted to a real image, pushed to the registry, and run by
    digest (see [git images](#git-images));
 5. **run the container**, forcing `/bin/caos entrypoint --args=<args>` with
-   `CAOS_SERVER_URL`, `CAOS_STD`, and the child `CAOS_RUN_STACK` injected;
+   `CAOS_SERVER_URL`, `CAOS_STD`, `CAOS_SALT`, and the child `CAOS_RUN_STACK`
+   injected (so `std`/`salt`/stack thread into nested runs);
 6. its stdout — `"<type> <hash>"` printed by `entrypoint` — is the result;
 7. **cache** it, and for a **top-level** run (empty stack) pin
    `refs/caos/res/<reqHash>` at the result, for durability and as a fetch/watch
@@ -239,7 +240,7 @@ modes are vestigial bookkeeping.
 `caos run <image> <output> -- [--name=value …]`:
 
 1. assembles the `--name=value` args into a git **tree** (see [hashing](#how-arguments-are-hashed));
-2. bundles `{image, args, std}` into a content-addressed **request object**
+2. bundles `{image, args, std, salt}` into a content-addressed **request object**
    (`reqHash`), where `std` is the standard library in effect (resolved from
    `refs/caos/std`, see [built-ins](#built-ins-casstd));
 3. gets the request onto the server — `caos-cli` **pushes** it (one negotiated

@@ -1,6 +1,6 @@
 //! Compute: the `/run` pipeline.
 //!
-//! A request is a content-addressed tree `{image, args, std}`; `/run?req=<hash>`
+//! A request is a content-addressed tree `{image, args, std, salt}`; `/run?req=<hash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
 //! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
 //! the registry) → the worker container run, whose stdout is `"<type> <hash>"`.
@@ -49,7 +49,7 @@ const META_SUFFIX: &str = ".caosmeta";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `GET /run?req=<reqHash>[&stack=...]` — run the request object `<reqHash>` (a
-/// tree `{image, args, std}`) and return its result as `"<type> <hash>"`.
+/// tree `{image, args, std, salt}`) and return its result as `"<type> <hash>"`.
 ///
 /// The request being a content-addressed object means `reqHash` *is* the cache
 /// key (it captures image + args + std) and the rendezvous id: a top-level run
@@ -62,10 +62,11 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         return Err(HttpError::new(400, format!("invalid req hash: {req:?}")));
     }
 
-    // Unpack the request: image (a ref blob), args (a tree), std (a ref blob).
-    // `std` names the standard library, materialized at `/cas/std` in the worker;
-    // it's part of the request (hence the key) so bumping built-ins recomputes.
-    let (image, args, std) = read_request(config, &req)?;
+    // Unpack the request: image (a ref blob), args (a tree), std (a ref blob),
+    // salt (an opaque blob). `std` names the standard library, materialized at
+    // `/cas/std` in the worker; `salt` is a cache-buster. Both are part of the
+    // request (hence the key) and threaded into the worker.
+    let (image, args, std, salt) = read_request(config, &req)?;
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
     }
@@ -134,6 +135,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         // The built-in tree, materialized at /cas/std and re-passed by nested
         // `caos run`s so it threads down the whole tree (empty = none).
         .args(["-e", &format!("CAOS_STD={std}")])
+        // The cache-busting salt, re-passed by nested runs so the whole tree
+        // shares it (empty = none).
+        .args(["-e", &format!("CAOS_SALT={salt}")])
         .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&docker_ref)
@@ -180,25 +184,28 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     Ok(format!("{result}\n").into_bytes())
 }
 
-/// Unpack a request object (a tree `{image, args, std}`) into its parts: the
-/// image ref, the args-tree hash, and the std-tree hash (empty if none).
-fn read_request(config: &Config, req: &str) -> Result<(String, String, String), HttpError> {
+/// Unpack a request object (a tree `{image, args, std, salt}`) into its parts:
+/// the image ref, the args-tree hash, the std-tree hash (empty if none), and the
+/// salt (empty if none).
+fn read_request(config: &Config, req: &str) -> Result<(String, String, String, String), HttpError> {
     let entries =
         fetch_tree(config, req).map_err(|e| HttpError::new(400, format!("reading request: {e}")))?;
     let mut image = None;
     let mut args = None;
     let mut std = String::new();
+    let mut salt = String::new();
     for entry in entries {
         match entry.name.as_str() {
             "image" => image = Some(blob_string(config, &entry.oid.to_string())?),
             "args" => args = Some(entry.oid.to_string()),
             "std" => std = blob_string(config, &entry.oid.to_string())?,
+            "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }
     }
     let image = image.ok_or_else(|| HttpError::new(400, "request missing 'image'"))?;
     let args = args.ok_or_else(|| HttpError::new(400, "request missing 'args'"))?;
-    Ok((image, args, std))
+    Ok((image, args, std, salt))
 }
 
 /// Fetch a blob and return its content as a trimmed string.

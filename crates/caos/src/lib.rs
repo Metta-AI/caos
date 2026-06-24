@@ -53,6 +53,14 @@ pub const STD_ENV: &str = "CAOS_STD";
 pub const STD_REF_ENV: &str = "CAOS_STD_REF";
 pub const DEFAULT_STD_REF: &str = "refs/caos/std";
 
+/// An opaque cache-busting value mixed into every run's request — and so into its
+/// `reqHash` and cache key. Empty by default, so runs are cached purely by their
+/// inputs. Like `std` and the run stack it's threaded: the server injects it into
+/// each worker, whose nested `caos run` reads it back, so a whole run tree shares
+/// one salt. Tests set it to a per-run random value, making their cache entries
+/// collision-free across runs without ever touching Redis.
+pub const SALT_ENV: &str = "CAOS_SALT";
+
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
 
@@ -1334,13 +1342,15 @@ pub fn caos_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) ->
     // resolved from the `refs/caos/std` ref at the top. Part of the request so the
     // server keys on it and threads it down (materialized at /cas/std).
     let std = run_std()?;
+    // The cache-busting salt (empty by default), threaded like std.
+    let salt = run_salt();
 
-    // Bundle the request as a content-addressed object {image, args, std}; its
-    // hash is the request id (and the server's cache key). Get it onto the server
-    // — a no-op POST-as-you-go for the HTTP transport, a push for the git one —
-    // plus a git image's own objects (referenced by hash in a blob, so not carried
-    // by the request tree).
-    let req = build_request(t, &image, &args_tree, &std)?;
+    // Bundle the request as a content-addressed object {image, args, std, salt};
+    // its hash is the request id (and the server's cache key). Get it onto the
+    // server — a no-op POST-as-you-go for the HTTP transport, a push for the git
+    // one — plus a git image's own objects (referenced by hash in a blob, so not
+    // carried by the request tree).
+    let req = build_request(t, &image, &args_tree, &std, &salt)?;
     t.ensure_pushed(&req.to_string())?;
     if is_hex_hash(&image) {
         t.ensure_pushed(&image)?;
@@ -1356,15 +1366,16 @@ pub fn caos_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) ->
 }
 
 /// Bundle a run request as a content-addressed object: a tree `{image, args,
-/// std}` — `image`/`std` as ref blobs, `args` as the args subtree. Its hash is
-/// the request id: the server's cache key and the result-ref rendezvous. (The
-/// git-docker image's own objects aren't reachable from here — `image` is a blob
-/// naming it by hash — so `caos run` pushes them separately.)
+/// std, salt}` — `image`/`std`/`salt` as blobs, `args` as the args subtree. Its
+/// hash is the request id: the server's cache key and the result-ref rendezvous.
+/// (The git-docker image's own objects aren't reachable from here — `image` is a
+/// blob naming it by hash — so `caos run` pushes them separately.)
 fn build_request(
     t: &dyn Transport,
     image: &str,
     args_tree: &gix::ObjectId,
     std: &str,
+    salt: &str,
 ) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
     let entries = vec![
@@ -1383,6 +1394,11 @@ fn build_request(
             filename: b"std".to_vec().into(),
             oid: post_object(t, "blob", std.as_bytes())?,
         },
+        Entry {
+            mode: EntryKind::Blob.into(),
+            filename: b"salt".to_vec().into(),
+            oid: post_object(t, "blob", salt.as_bytes())?,
+        },
     ];
     post_tree(t, entries)
 }
@@ -1397,6 +1413,13 @@ fn run_std() -> Result<String, String> {
     }
     let refname = std::env::var(STD_REF_ENV).unwrap_or_else(|_| DEFAULT_STD_REF.to_string());
     Ok(resolve_ref(&refname).unwrap_or_default())
+}
+
+/// The cache-busting salt for this run (see [`SALT_ENV`]): read from `CAOS_SALT`,
+/// empty if unset. Threaded — the server injects it into each worker, whose
+/// nested `caos run` reads it back here — so a whole run tree shares one salt.
+fn run_salt() -> String {
+    std::env::var(SALT_ENV).unwrap_or_default()
 }
 
 /// Resolve a git ref (e.g. `refs/caos/std`) to its tree hash, read from the local

@@ -22,6 +22,12 @@ caosbin=$PROJECT/result-caos/bin/caos-cli
 
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 
+# A per-run salt threads into every request (hence every cache key), so this
+# run's cache entries can't collide with any other run's — runs are independent
+# without ever clearing Redis. Constant within the run, so the cache-hit
+# assertion below still holds.
+export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
+
 # A client working repo with the server as its `caos` remote; `caos` runs the CLI
 # from inside it so its git transport finds it.
 CLIENT=$PROJECT/.caos-dev/rustc-client-repo

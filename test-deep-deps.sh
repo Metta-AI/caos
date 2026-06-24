@@ -22,6 +22,12 @@ PROJECT=$PWD
 
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 
+# A per-run salt threads into every request (hence every cache key), so this
+# run's cache entries can't collide with any other run's — runs are fully
+# independent without ever clearing Redis. Constant within this run, so the
+# cache hit/miss assertions below still hold.
+export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
+
 # Publish the built-ins deep-deps needs (itself + fold) to the server, then build
 # the user-facing client.
 echo "building caos client + publishing caos/std (fold, deep-deps)..." >&2
@@ -71,12 +77,6 @@ run() {
   caos-cli run "$IMG" "$CAS/out" -- --mode=all --packages="$PKGS" >/dev/null
   caos-cli get -r "$CAS/out" >/dev/null
 }
-
-# Start from a cold result cache so the hit/miss assertions are deterministic
-# across runs (Redis persists between runs). Only result keys are cleared, so
-# image/layer conversions stay cached and nothing is needlessly rebuilt.
-docker exec caos-redis sh -c \
-  "redis-cli --scan --pattern 'caos:result:*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
 
 echo "== Phase A: correctness + DAG sharing ==" >&2
 run
