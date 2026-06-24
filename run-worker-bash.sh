@@ -2,12 +2,12 @@
 # Run the caos-worker-bash debugging image: an interactive shell with /cas set
 # up by `caos entrypoint`, wired to the caos server.
 #
-# Any --name=value arguments become the worker's inputs under /cas/args, the same
-# shape `caos run` produces. A value that names an existing path (relative to the
-# current directory) is stored from the filesystem and referenced by its git
-# hash; anything else is stored as a literal string. For example:
+# Arguments become the worker's inputs under /cas/args, the same shape `caos run`
+# produces. `--name=value` is a literal string; `--name:@=path` reads a filesystem
+# path (relative to the current directory) and references its content by git hash.
+# For example:
 #
-#   ./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/caos
+#   ./run-worker-bash.sh --greeting=hi --conf:@=Cargo.toml --src:@=crates/caos
 #
 # then, inside the shell:  caos get /cas/args/conf && cat /cas/args/conf
 #
@@ -21,7 +21,7 @@ NET="${CAOS_DOCKER_NETWORK:-caos-net}"
 SERVER_URL="${CAOS_SERVER_URL:-$DEFAULT_SERVER_URL}"
 IMAGE="${CAOS_WORKER_BASH_IMAGE:-caos-worker-bash:latest}"
 
-# Turn any --name=value args into an args tree (via `caos build-args` in a
+# Turn any --name=value / --name:@=path args into an args tree (via `caos build-args` in a
 # throwaway container on the docker network, so it reaches the server by name and
 # uploads the args over HTTP `/object`), and pass its hash as --args so `caos
 # entrypoint` materializes them at /cas/args. The current directory is mounted

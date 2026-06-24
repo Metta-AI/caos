@@ -57,7 +57,7 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(src), Some(dst), None) => caos::put(&http()?, src, dst),
             _ => Err(usage(args)),
         },
-        // `run <image> <output> -- [--name=value ...]`. The `--` separates the
+        // `run <image> <output> -- [--name=value | --name:@=path ...]`. The `--` separates the
         // fixed arguments from the (possibly empty) list of key/value args.
         Some("run") => match &args[2..] {
             [image, output, sep, kvs @ ..] if sep == "--" => {
@@ -65,13 +65,13 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
-        // `curry <image> -- [--name=value ...]` — bind args to an image, printing
+        // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an image, printing
         // a ref to the resulting curried image (run/curry it like any image).
         Some("curry") => match &args[2..] {
             [image, sep, kvs @ ..] if sep == "--" => caos::caos_curry(&http()?, image, kvs),
             _ => Err(usage(args)),
         },
-        // `build-args [--name=value ...]` — print the hash of the assembled args
+        // `build-args [--name=value | --name:@=path ...]` — print the hash of the assembled args
         // tree (path values stored from disk, everything else a literal blob).
         Some("build-args") => caos::build_args(&http()?, &args[2..]),
         // `entrypoint [--args=<hash>]` — takes no command; it always runs /worker.
@@ -98,9 +98,9 @@ fn usage(args: &[String]) -> String {
         "usage:\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
-         {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
-         {prog} curry <image> -- [--name=value ...]\n  \
-         {prog} build-args [--name=value ...]\n  \
+         {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
+         {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
+         {prog} build-args [--name=value | --name:@=path ...]\n  \
          {prog} entrypoint [--args=<hash>]"
     )
 }

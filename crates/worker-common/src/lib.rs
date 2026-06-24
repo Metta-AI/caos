@@ -52,26 +52,40 @@ pub fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
     caos_argv(&args)
 }
 
-/// `caos run <image> <out> -- --name=value …` — run `image` over the given named
-/// arguments, leaving its result at `out`.
-pub fn caos_run(image: &str, out: &str, args: &[(&str, &str)]) -> Result<(), String> {
+/// An argument value for `caos run`/`caos curry`. The two kinds serialize with
+/// different operators — `--name=value` for a literal, `--name:@=value` for a
+/// path — so the distinction is explicit, never sniffed from the value.
+pub enum Arg<'a> {
+    /// A literal string (e.g. a mode, or an image ref to bind).
+    Lit(&'a str),
+    /// A `/cas` path to reference (or, off-worker, a host path to ingest).
+    Path(&'a str),
+}
+
+/// `caos run <image> <out> -- …` — run `image` over the given named arguments,
+/// leaving its result at `out`.
+pub fn caos_run(image: &str, out: &str, args: &[(&str, Arg)]) -> Result<(), String> {
     let argv = verb_argv("run", image, Some(out), args);
     caos_argv(&str_refs(&argv))
 }
 
-/// `caos curry <image> -- --name=value …` — bind the given named arguments to
-/// `image`, returning a ref to the resulting curried image.
-pub fn caos_curry(image: &str, args: &[(&str, &str)]) -> Result<String, String> {
+/// `caos curry <image> -- …` — bind the given named arguments to `image`,
+/// returning a ref to the resulting curried image.
+pub fn caos_curry(image: &str, args: &[(&str, Arg)]) -> Result<String, String> {
     let argv = verb_argv("curry", image, None, args);
     caos_capture(&str_refs(&argv))
 }
 
-/// Build a `caos <verb> <image> [<out>] -- --name=value …` argument vector.
-fn verb_argv(verb: &str, image: &str, out: Option<&str>, args: &[(&str, &str)]) -> Vec<String> {
+/// Build a `caos <verb> <image> [<out>] -- …` argument vector, serializing each
+/// arg per its kind (literal `--k=v`, path `--k:@=v`).
+fn verb_argv(verb: &str, image: &str, out: Option<&str>, args: &[(&str, Arg)]) -> Vec<String> {
     let mut argv = vec![verb.to_string(), image.to_string()];
     argv.extend(out.map(str::to_string));
     argv.push("--".to_string());
-    argv.extend(args.iter().map(|(k, v)| format!("--{k}={v}")));
+    argv.extend(args.iter().map(|(k, v)| match v {
+        Arg::Lit(s) => format!("--{k}={s}"),
+        Arg::Path(s) => format!("--{k}:@={s}"),
+    }));
     argv
 }
 
@@ -101,7 +115,11 @@ fn caos_capture(args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("running caos: {e}"))?;
     if !output.status.success() {
-        return Err(format!("caos {} exited with {}", args.join(" "), output.status));
+        return Err(format!(
+            "caos {} exited with {}",
+            args.join(" "),
+            output.status
+        ));
     }
     String::from_utf8(output.stdout)
         .map(|s| s.trim().to_string())
@@ -141,7 +159,8 @@ pub fn scratch(name: &str) -> Result<PathBuf, String> {
 /// recorded hash, so nothing is re-read).
 pub fn link(target: impl AsRef<Path>, at: impl AsRef<Path>) -> Result<(), String> {
     let (target, at) = (target.as_ref(), at.as_ref());
-    symlink(target, at).map_err(|e| format!("symlink {} -> {}: {e}", at.display(), target.display()))
+    symlink(target, at)
+        .map_err(|e| format!("symlink {} -> {}: {e}", at.display(), target.display()))
 }
 
 /// Child paths of `dir`, sorted for deterministic ordering.

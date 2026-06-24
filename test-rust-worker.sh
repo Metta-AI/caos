@@ -48,7 +48,7 @@ misses_since() { docker logs --since "$1" caos-server 2>&1 \
 # The worker-base git-docker image the produced workers extend; curried into the
 # builder so callers only pass --src.
 caos-cli import-image "$PROJECT/result-base" "$CAS/base" >/dev/null
-builder=$(caos-cli curry docker://caos-worker-rustc:latest -- --base="$CAS/base")
+builder=$(caos-cli curry docker://caos-worker-rustc:latest -- --base:@="$CAS/base")
 
 # A trivial worker, defined in source: write a greeting to /cas/out.
 greeter() {
@@ -66,7 +66,7 @@ RS
 }
 
 build_and_run() { # <src-path> <img-cas> <result-cas>
-  caos-cli run "$builder" "$2" -- --src="$1" >/dev/null   # host path, ingested directly
+  caos-cli run "$builder" "$2" -- --src:@="$1" >/dev/null   # host path, ingested directly
   caos-cli run "$2" "$3" -- >/dev/null
   caos-cli get -r "$3" >/dev/null
 }
@@ -82,7 +82,7 @@ echo "== Phase B: rebuilding identical source is a cache hit ==" >&2
 # A hit means the build (and the whole compile) is skipped: 0 cache misses, and
 # the cached result is by definition the same image.
 sleep 1; since=$(date +%s)
-caos-cli run "$builder" "$CAS/img2" -- --src="$SRC/worker.rs" >/dev/null
+caos-cli run "$builder" "$CAS/img2" -- --src:@="$SRC/worker.rs" >/dev/null
 sleep 1
 m=$(misses_since "$since")
 [ "$m" -eq 0 ] || fail "rebuild of identical source should be a hit, saw $m misses"

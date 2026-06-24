@@ -51,7 +51,8 @@ fn compile(src: &str) -> Result<String, String> {
     let proj = scratch("proj")?;
     fs::create_dir_all(proj.join("src")).map_err(|e| format!("creating src dir: {e}"))?;
     fs::copy(src, proj.join("src/main.rs")).map_err(|e| format!("copying source: {e}"))?;
-    fs::write(proj.join("Cargo.toml"), cargo_toml()).map_err(|e| format!("writing manifest: {e}"))?;
+    fs::write(proj.join("Cargo.toml"), cargo_toml())
+        .map_err(|e| format!("writing manifest: {e}"))?;
 
     let status = Command::new("cargo")
         .args(["build", "--release", "--offline", "--target", TARGET])
@@ -90,7 +91,10 @@ fn assemble_image(base: &str, layer: &str) -> Result<(), String> {
     let mut top = 0u64;
     for entry in entries(base)? {
         let name = file_name(&entry);
-        if let Some(num) = name.strip_prefix("layer").and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(num) = name
+            .strip_prefix("layer")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             link(&entry, out.join(&name))?;
             top = top.max(num + 1);
         }

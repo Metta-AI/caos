@@ -188,8 +188,8 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
 /// the image ref, the args-tree hash, the std-tree hash (empty if none), and the
 /// salt (empty if none).
 fn read_request(config: &Config, req: &str) -> Result<(String, String, String, String), HttpError> {
-    let entries =
-        fetch_tree(config, req).map_err(|e| HttpError::new(400, format!("reading request: {e}")))?;
+    let entries = fetch_tree(config, req)
+        .map_err(|e| HttpError::new(400, format!("reading request: {e}")))?;
     let mut image = None;
     let mut args = None;
     let mut std = String::new();

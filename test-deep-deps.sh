@@ -74,7 +74,7 @@ printf 'd\n'    > "$PKGS/c/DEPS"
 # straight from the host: `caos-cli run` ingests the path's content itself.
 run() {
   rm -rf "$CAS/out"
-  caos-cli run "$IMG" "$CAS/out" -- --mode=all --packages="$PKGS" >/dev/null
+  caos-cli run "$IMG" "$CAS/out" -- --mode=all --packages:@="$PKGS" >/dev/null
   caos-cli get -r "$CAS/out" >/dev/null
 }
 
@@ -139,7 +139,7 @@ echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
 # request and the server's run-cycle detection catches it.
 rm -rf "$CAS/cyc"
 printf 'a\n' > "$PKGS/d/DEPS"
-if msg=$(caos-cli run "$IMG" "$CAS/cyc" -- --mode=all --packages="$PKGS" 2>&1); then
+if msg=$(caos-cli run "$IMG" "$CAS/cyc" -- --mode=all --packages:@="$PKGS" 2>&1); then
   fail "expected the cyclic graph to fail, but the run succeeded"
 fi
 echo "$msg" | grep -q "run cycle detected" || fail "no cycle reported; got: $msg"

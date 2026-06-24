@@ -26,7 +26,7 @@ use std::process::ExitCode;
 
 use worker_common::{
     arg, caos, caos_curry, caos_run, entries, file_name, link, path, read_arg_opt, run_worker,
-    scratch, std_image, ARGS,
+    scratch, std_image, Arg, ARGS,
 };
 
 fn main() -> ExitCode {
@@ -113,7 +113,11 @@ fn deepen_one() -> Result<(), String> {
     caos_run(
         &fold_image(),
         "/cas/out",
-        &[("pre", &pre), ("post", &post), ("in", &in_pkg)],
+        &[
+            ("pre", Arg::Lit(&pre)),
+            ("post", Arg::Lit(&post)),
+            ("in", Arg::Path(&in_pkg)),
+        ],
     )
 }
 
@@ -127,7 +131,11 @@ fn deepen_all() -> Result<(), String> {
         caos_run(
             &fold_image(),
             &node,
-            &[("pre", &pre), ("post", &post), ("in", path(pkg))],
+            &[
+                ("pre", Arg::Lit(&pre)),
+                ("post", Arg::Lit(&post)),
+                ("in", Arg::Path(path(pkg))),
+            ],
         )?;
         link(&node, work.join(file_name(pkg)))?;
     }
@@ -138,8 +146,14 @@ fn deepen_all() -> Result<(), String> {
 /// `post` (`finish`). Currying the map into `pre` is what keeps it out of
 /// `finish`'s cache key.
 fn fold_functions() -> Result<(String, String), String> {
-    let pre = caos_curry(&me(), &[("mode", "resolve"), ("packages", &arg("packages"))])?;
-    let post = caos_curry(&me(), &[("mode", "finish")])?;
+    let pre = caos_curry(
+        &me(),
+        &[
+            ("mode", Arg::Lit("resolve")),
+            ("packages", Arg::Path(&arg("packages"))),
+        ],
+    )?;
+    let post = caos_curry(&me(), &[("mode", Arg::Lit("finish"))])?;
     Ok((pre, post))
 }
 

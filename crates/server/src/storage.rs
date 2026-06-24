@@ -116,8 +116,8 @@ pub(crate) fn fetch_blob(config: &Config, hash: &str) -> Result<Vec<u8>, String>
 /// `(type, content)`.
 fn fetch_object(config: &Config, hash: &str) -> Result<(String, Vec<u8>), String> {
     let repo = config.repo.to_thread_local();
-    let id =
-        gix::ObjectId::from_hex(hash.as_bytes()).map_err(|e| format!("invalid hash {hash}: {e}"))?;
+    let id = gix::ObjectId::from_hex(hash.as_bytes())
+        .map_err(|e| format!("invalid hash {hash}: {e}"))?;
     let object = repo
         .find_object(id)
         .map_err(|e| format!("object {hash} not found: {e}"))?;

@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use worker_common::{
     arg, caos, caos_run, entries, file_name, link, path, read_arg, read_arg_opt, run_worker,
-    scratch, std_image,
+    scratch, std_image, Arg,
 };
 
 fn main() -> ExitCode {
@@ -43,7 +43,7 @@ fn run() -> Result<(), String> {
     // input's own children — and a plain file has none, so it's a leaf.
     let children = if let Some(pre) = &pre {
         eprintln!("fold: applying pre {pre} to {in_path}");
-        caos_run(pre, "/cas/pre", &[("in", &in_path)])?;
+        caos_run(pre, "/cas/pre", &[("in", Arg::Path(&in_path))])?;
         caos(["get", "/cas/pre"])?; // one level: a placeholder per child
         entries("/cas/pre")?
     } else if Path::new(&in_path).is_dir() {
@@ -59,9 +59,10 @@ fn run() -> Result<(), String> {
         let name = file_name(child);
         let node = format!("/cas/c{i}");
         // Thread pre (if any) and post through unchanged; recurse on the child.
-        let mut fold_args = vec![("post", post.as_str()), ("in", path(child))];
+        // `pre`/`post` are image refs (literals); `in` is a CAS path.
+        let mut fold_args = vec![("post", Arg::Lit(&post)), ("in", Arg::Path(path(child)))];
         if let Some(pre) = &pre {
-            fold_args.insert(0, ("pre", pre));
+            fold_args.insert(0, ("pre", Arg::Lit(pre)));
         }
         caos_run(&fold_image, &node, &fold_args)?;
         // Link into the CAS so `caos put` reuses the result's recorded hash (no
@@ -73,5 +74,12 @@ fn run() -> Result<(), String> {
     // Assemble the folded children, then combine them with `post` over (`in`,
     // children). A leaf passes an empty children tree.
     caos(["put", path(&work), "/cas/children"])?;
-    caos_run(&post, "/cas/out", &[("in", &in_path), ("children", "/cas/children")])
+    caos_run(
+        &post,
+        "/cas/out",
+        &[
+            ("in", Arg::Path(&in_path)),
+            ("children", Arg::Path("/cas/children")),
+        ],
+    )
 }

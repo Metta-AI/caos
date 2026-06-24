@@ -133,11 +133,12 @@ pub trait Transport {
         Ok(())
     }
 
-    /// Ingest the filesystem path named by an arg `value` into the store, if this
-    /// transport does host-path ingestion — returning its `(mode, oid)`. The
-    /// default is `Ok(None)`: the worker has no host filesystem to read (only
-    /// `/cas`), so it treats a non-CAS value as a literal. The git transport
-    /// overrides this to reuse git's recorded objects (see its impl).
+    /// Ingest the filesystem path named by a `:@=` arg `value`, returning its
+    /// `(mode, oid)` — or `Ok(None)` if this transport doesn't read host paths.
+    /// The default is `None`: the worker has no host filesystem (only `/cas`), so
+    /// the caller handles it (an error for `run`/`curry`, a read-from-disk for
+    /// `build-args` over `/object`). The git transport overrides this to ingest
+    /// from the working repo, reusing git's recorded objects (see its impl).
     fn ingest_path(
         &self,
         _value: &str,
@@ -156,7 +157,9 @@ pub struct HttpTransport {
 impl HttpTransport {
     /// Read the server URL from [`SERVER_ENV`].
     pub fn from_env() -> Result<Self, String> {
-        Ok(Self { base: server_url()? })
+        Ok(Self {
+            base: server_url()?,
+        })
     }
 }
 
@@ -279,8 +282,10 @@ impl Transport for GitTransport {
         value: &str,
     ) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, String> {
         let path = Path::new(value);
+        // The value was declared a path (`:@=`), so a missing one is an error —
+        // not silently a literal.
         if !path.exists() {
-            return Ok(None); // not a path — the caller stores it as a literal blob
+            return Err(format!("path not found: {value}"));
         }
         self.git_ingest(path).map(Some)
     }
@@ -293,7 +298,10 @@ impl GitTransport {
     /// files are re-read, the rest reusing their cached hash via a throwaway copy
     /// of the index (the same trick `git stash`/`commit` use). A path outside the
     /// worktree has no index to diff against, so it's read in full.
-    fn git_ingest(&self, path: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+    fn git_ingest(
+        &self,
+        path: &Path,
+    ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
         use gix::objs::tree::EntryKind;
         let abs = path
             .canonicalize()
@@ -535,11 +543,7 @@ fn post_tree(
 }
 
 /// Fetch object `hash` and write it to `target` (blob → file, tree → directory).
-pub fn fetch_and_materialize(
-    t: &dyn Transport,
-    target: &Path,
-    hash: &str,
-) -> Result<(), String> {
+pub fn fetch_and_materialize(t: &dyn Transport, target: &Path, hash: &str) -> Result<(), String> {
     let (kind, content) = t.get_object(hash)?;
 
     // The transport returns the object's true type, so no guessing.
@@ -621,7 +625,10 @@ fn validate_descendant(cas: &Path, path: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("{path}: {e}"))?;
 
     if target == cas || !target.starts_with(&cas) {
-        return Err(format!("path must be inside {}, got: {path}", cas.display()));
+        return Err(format!(
+            "path must be inside {}, got: {path}",
+            cas.display()
+        ));
     }
     Ok(target)
 }
@@ -722,7 +729,8 @@ fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String
                 MODE_PLACEHOLDER_DIR
             }
             "blob" => {
-                std::fs::File::create(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+                std::fs::File::create(tmp)
+                    .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
                 MODE_PLACEHOLDER_FILE
             }
             other => return Err(format!("unknown result type {other:?}")),
@@ -1216,19 +1224,19 @@ fn build_host_args_tree(t: &dyn Transport, kvs: &[String]) -> Result<gix::Object
     for kv in kvs {
         let (name, value) = parse_kv(kv)?;
 
-        let (mode, oid) = if let Some(entry) = t.ingest_path(value)? {
-            // The git transport ingests a path reusing git's recorded objects.
-            entry
-        } else if Path::new(value).exists() {
-            // The HTTP transport (a worker, e.g. run-worker-bash's) reads it from
-            // disk and uploads it.
-            store(t, &no_cas, Path::new(value))?
-        } else {
-            // Not a path: store the literal value as a blob.
-            (
+        let (mode, oid) = match value {
+            // `--name=value` — the literal verbatim as a blob.
+            ArgValue::Literal(v) => (
                 EntryKind::Blob.into(),
-                post_object(t, "blob", value.as_bytes())?,
-            )
+                post_object(t, "blob", v.as_bytes())?,
+            ),
+            // `--name:@=path` — the git transport ingests it (reusing git's
+            // objects); the HTTP transport (a worker, e.g. run-worker-bash's)
+            // reads it from disk and uploads it.
+            ArgValue::Path(p) => match t.ingest_path(p)? {
+                Some(entry) => entry,
+                None => store(t, &no_cas, Path::new(p))?,
+            },
         };
 
         entries.push(Entry {
@@ -1241,17 +1249,16 @@ fn build_host_args_tree(t: &dyn Transport, kvs: &[String]) -> Result<gix::Object
     post_tree(t, entries)
 }
 
-/// The per-`--name=value` tree entries that make up an args tree — `run`/`curry`
-/// merge call args with a curry node's bound args, then `post_tree` the result.
+/// The per-arg tree entries that make up an args tree — `run`/`curry` merge call
+/// args with a curry node's bound args, then `post_tree` the result.
 ///
-/// Each `--name=value` becomes a tree entry `name`:
-/// * if `value` is a path inside the CAS directory, it must exist, and the entry
-///   references the object that path was materialized from (its recorded hash);
-/// * else if `value` names a host filesystem path, it's ingested via the transport
-///   (the git transport reuses git's recorded objects for clean tracked paths —
-///   see [`GitTransport::ingest_path`]); the worker has no host paths, so its
-///   transport declines and the value falls through to a literal;
-/// * otherwise `value` is stored verbatim as a blob and the entry references it.
+/// Each `--name[:type]=value` becomes a tree entry `name` (see [`parse_kv`]):
+/// * `--name=value` — a literal, stored verbatim as a blob;
+/// * `--name:@=path` inside the CAS — references the object that path was
+///   materialized from (its recorded hash);
+/// * `--name:@=path` elsewhere — a host path, ingested via the transport (the git
+///   transport reuses git's recorded objects — see [`GitTransport::ingest_path`]);
+///   a worker has no host filesystem, so this is an error there.
 fn build_arg_entries(
     t: &dyn Transport,
     cas: &Path,
@@ -1266,27 +1273,30 @@ fn build_arg_entries(
     for kv in kvs {
         let (name, value) = parse_kv(kv)?;
 
-        let (mode, oid) = if Path::new(value).starts_with(cas) {
-            // A CAS path: it must exist; reference whatever it was made from.
-            let canon = Path::new(value)
-                .canonicalize()
-                .map_err(|e| format!("{value}: {e}"))?;
-            let cas_real = cas_real
-                .as_ref()
-                .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
-            if !canon.starts_with(cas_real) {
-                return Err(format!("{value} resolves outside {}", cas.display()));
-            }
-            cas_entry(&canon)?
-        } else if let Some(entry) = t.ingest_path(value)? {
-            // A host filesystem path, ingested by the transport.
-            entry
-        } else {
-            // A literal value: store it as a blob and reference that.
-            (
+        let (mode, oid) = match value {
+            // `--name=value` — store the literal verbatim as a blob.
+            ArgValue::Literal(v) => (
                 EntryKind::Blob.into(),
-                post_object(t, "blob", value.as_bytes())?,
-            )
+                post_object(t, "blob", v.as_bytes())?,
+            ),
+            // `--name:@=path` under the CAS — reference whatever it was made from.
+            ArgValue::Path(p) if Path::new(p).starts_with(cas) => {
+                let canon = Path::new(p)
+                    .canonicalize()
+                    .map_err(|e| format!("{p}: {e}"))?;
+                let cas_real = cas_real
+                    .as_ref()
+                    .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+                if !canon.starts_with(cas_real) {
+                    return Err(format!("{p} resolves outside {}", cas.display()));
+                }
+                cas_entry(&canon)?
+            }
+            // `--name:@=path` elsewhere — ingest a host path (git transport only;
+            // the worker has no host filesystem, so it errors clearly).
+            ArgValue::Path(p) => t.ingest_path(p)?.ok_or_else(|| {
+                format!("`{name}`: {p:?} is a host path, but this client only reads /cas paths")
+            })?,
         };
 
         entries.push(Entry {
@@ -1299,15 +1309,38 @@ fn build_arg_entries(
     Ok(entries)
 }
 
-/// Split a `--name=value` argument into its name and value, validating that the
-/// name is a single path component (it becomes a tree-entry filename).
-fn parse_kv(kv: &str) -> Result<(&str, &str), String> {
+/// A parsed `--name[:type]=value` argument value. The type marker lives in the
+/// operator, not the value, so the value is unconstrained (it may start with
+/// anything, no escaping). Bare `=` is a literal; `:@=` marks a path. The grammar
+/// is extensible — a new type adds a variant here and a case in [`parse_kv`].
+enum ArgValue<'a> {
+    /// `--name=value` — the value verbatim, stored as a blob.
+    Literal(&'a str),
+    /// `--name:@=path` — the value names a filesystem path to resolve/ingest.
+    Path(&'a str),
+}
+
+/// Split a `--name[:type]=value` argument into its name and typed value,
+/// validating that the name is a single path component (it becomes a tree-entry
+/// filename). The only type is `@` (a path); bare is a literal.
+fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
     let body = kv
         .strip_prefix("--")
         .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
-    let (name, value) = body
+    let (key, value) = body
         .split_once('=')
-        .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
+        .ok_or_else(|| format!("argument must look like --name[:type]=value, got: {kv}"))?;
+    // The key is `name` (literal) or `name:type` (typed); the type sits before `=`.
+    let (name, value) = match key.split_once(':') {
+        None => (key, ArgValue::Literal(value)),
+        Some((name, "@")) => (name, ArgValue::Path(value)),
+        Some((_, ty)) => {
+            return Err(format!(
+                "unknown argument type {ty:?} in {kv:?}; use --name=value (literal) \
+                 or --name:@=value (path)"
+            ))
+        }
+    };
     if name.is_empty() || name.contains('/') {
         return Err(format!(
             "argument name must be a single path component, got: {name:?}"
@@ -1319,7 +1352,12 @@ fn parse_kv(kv: &str) -> Result<(&str, &str), String> {
 /// `run <image> <output> -- [--name=value ...]` — assemble the args into a git
 /// tree, ask the server to run `<image>` over that tree, and materialize the
 /// result at `<output>` (a direct child of the CAS directory).
-pub fn caos_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
+pub fn caos_run(
+    t: &dyn Transport,
+    image: &str,
+    output: &str,
+    kvs: &[String],
+) -> Result<(), String> {
     let cas = cas_dir();
     let target = validate_target(&cas, output)?;
     probe_xattr(&cas)?;
@@ -1442,7 +1480,11 @@ pub fn resolve_ref(name: &str) -> Result<String, String> {
             .tree_id()
             .map_err(|e| format!("{name} has no tree: {e}"))?
             .detach(),
-        other => return Err(format!("ref {name} points at a {other}, not a tree or commit")),
+        other => {
+            return Err(format!(
+                "ref {name} points at a {other}, not a tree or commit"
+            ))
+        }
     };
     Ok(tree.to_string())
 }
@@ -1559,7 +1601,10 @@ fn curry_node(
         Some(entries) => entries,
         None => return Ok(None),
     };
-    if !entries.iter().any(|e| entry_name(e) == CURRY_MARKER.as_bytes()) {
+    if !entries
+        .iter()
+        .any(|e| entry_name(e) == CURRY_MARKER.as_bytes())
+    {
         return Ok(None);
     }
     let oid_of = |name: &[u8]| {
@@ -1567,7 +1612,12 @@ fn curry_node(
             .iter()
             .find(|e| entry_name(e) == name)
             .map(|e| e.oid)
-            .ok_or_else(|| format!("curry node {hash} missing {:?}", String::from_utf8_lossy(name)))
+            .ok_or_else(|| {
+                format!(
+                    "curry node {hash} missing {:?}",
+                    String::from_utf8_lossy(name)
+                )
+            })
     };
     let base_ref = fetch_blob_string(t, &oid_of(b"base")?.to_string())?;
     let args = fetch_tree_entries(t, &oid_of(b"args")?.to_string())?
@@ -1606,7 +1656,8 @@ fn request_compute(req: &str) -> Result<(String, String), String> {
         }
     }
     let body = http_get(&url)?;
-    let text = String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+    let text =
+        String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
         .trim()
         .split_once(' ')

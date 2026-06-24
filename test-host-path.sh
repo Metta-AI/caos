@@ -38,11 +38,11 @@ trap 'rm -rf "$CAS" "$CLIENT"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# The hash caos records for `--data=data`, recovered from a `curry` node (curry
+# The hash caos records for `--data:@=data`, recovered from a `curry` node (curry
 # runs the same arg-ingestion as run, but leaves an inspectable object locally).
 arg_hash() {
   local c args
-  c=$(caos-cli curry docker://unused -- --data=data)
+  c=$(caos-cli curry docker://unused -- --data:@=data)
   args=$(git -C "$CLIENT" ls-tree "$c" args | awk '{print $3}')
   git -C "$CLIENT" ls-tree "$args" data | awk '{print $3}'
 }
@@ -56,7 +56,7 @@ git -C "$CLIENT" add data
 git -C "$CLIENT" -c user.email=t -c user.name=t commit -qm fixture
 
 echo "== Phase A: clean tracked dir — content delivered, git's tree reused ==" >&2
-caos-cli run docker://caos-worker-hello:latest "$CAS/out" -- --data=data >/dev/null
+caos-cli run docker://caos-worker-hello:latest "$CAS/out" -- --data:@=data >/dev/null
 caos-cli get -r "$CAS/out" >/dev/null
 grep -q "saw data" "$CAS/out/receipt" || fail "worker didn't see the data arg"
 diff -r "$CLIENT/data" "$CAS/out/data" >/dev/null \
@@ -70,7 +70,7 @@ echo "== Phase B: dirty dir — change delivered, hashed incrementally ==" >&2
 echo CHANGED > "$CLIENT/data/a.txt"   # modify a tracked file (uncommitted)
 echo four    > "$CLIENT/data/d.txt"   # add an untracked file
 rm -rf "$CAS/out"
-caos-cli run docker://caos-worker-hello:latest "$CAS/out" -- --data=data >/dev/null
+caos-cli run docker://caos-worker-hello:latest "$CAS/out" -- --data:@=data >/dev/null
 caos-cli get -r "$CAS/out" >/dev/null
 diff -r "$CLIENT/data" "$CAS/out/data" >/dev/null \
   || fail "delivered content doesn't match the dirty host dir"

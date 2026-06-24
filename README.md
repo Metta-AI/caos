@@ -237,9 +237,9 @@ modes are vestigial bookkeeping.
 
 ### Requests and results
 
-`caos run <image> <output> -- [--name=value …]`:
+`caos run <image> <output> -- [--name=value | --name:@=path …]`:
 
-1. assembles the `--name=value` args into a git **tree** (see [hashing](#how-arguments-are-hashed));
+1. assembles the args into a git **tree** (see [arguments](#arguments-literals-and-paths));
 2. bundles `{image, args, std, salt}` into a content-addressed **request object**
    (`reqHash`), where `std` is the standard library in effect (resolved from
    `refs/caos/std`, see [built-ins](#built-ins-casstd));
@@ -260,27 +260,31 @@ and `caos put` reuses the recorded hash — no content needed).
 hash, or a bare git hash — e.g. a `caos curry` ref); an **ordinary docker image**
 is written `docker://<ref>`.
 
-### How arguments are hashed
+### Arguments: literals and paths
 
-For each `--name=value`, `caos-cli` decides the entry's hash doing as little work
-as possible:
+An argument is a **literal** or a **path**, chosen by the *operator* — not by
+sniffing the value — so a value is never misread and may contain anything (no
+escaping):
 
-- a `value` inside `$CAOS_CAS_DIR` → reuse the hash recorded on it (no read);
-- a `value` that **names a host filesystem path** → ingest its content via git,
-  reusing git's own objects:
-  - **clean + tracked** → reuse the committed hash from `git ls-tree HEAD` — no
-    read at all, so a large unchanged directory is effectively free;
-  - **dirty/untracked file** → `git hash-object -w`;
-  - **dirty/untracked directory** → copy `.git/index` to a throwaway index and
-    `git add` + `write-tree --prefix` there, so only the **changed** files are
-    re-read (the index stat-cache covers the rest) and your real index is never
-    touched — the trick `git stash`/`commit` use;
-  - **outside the worktree** (no index to diff against) → read in full;
-- anything else → a literal string blob.
+- `--name=value` → a literal string, stored as a blob;
+- `--name:@=path` → a path (the `@` nods to curl/HTTPie). It's resolved doing as
+  little work as possible:
+  - inside `$CAOS_CAS_DIR` → reference the hash recorded on it (no read);
+  - a host path (caos-cli) → ingest via git, reusing git's own objects:
+    - **clean + tracked** → reuse the committed hash from `git ls-tree HEAD` — no
+      read at all, so a large unchanged directory is effectively free;
+    - **dirty file** → `git hash-object -w`;
+    - **dirty directory** → copy `.git/index` to a throwaway index and `git add`
+      + `write-tree --prefix` there, so only the **changed** files are re-read
+      (the stat-cache covers the rest) and your real index is untouched — the
+      trick `git stash`/`commit` use;
+    - **outside the worktree** → read in full;
+  - a **missing** path is an error, not silently a literal.
 
-The worker `caos` has no host filesystem (only `/cas`), so it skips path
-ingestion: a non-CAS value is a literal in `run`/`curry`, and `build-args` reads
-it from disk over `/object`.
+The grammar is `--name[:type]=value` and extensible: `@` (path) is the only type
+today, leaving room for more. The worker `caos` has no host filesystem (only
+`/cas`), so a non-`/cas` path there is an error — except `build-args`, which a
+worker uses (run-worker-bash) to read host files from disk over `/object`.
 
 ### Other subcommands
 
@@ -294,13 +298,13 @@ it from disk over `/object`.
 - `resolve <ref>` (`caos-cli`) — print the tree hash a local git ref points at
   (peeling commits/tags), e.g. `caos resolve refs/caos/std`. Ref name → hash; it
   does **not** hash filesystem paths.
-- `curry <image> -- [--name=value …]` — bind some args to an image, printing a
-  ref to the curried image. It's a small content-addressed tree (`base`, `args`,
-  a `.caos-curry` marker); `run`/`curry` expand it client-side (call args win),
-  so the server only ever sees a plain image + args. Currying flattens, so it's
-  canonical.
-- `build-args [--name=value …]` — print the hash of an assembled args tree (paths
-  ingested as above, else literals); used by `./run-worker-bash.sh`.
+- `curry <image> -- [--name=value | --name:@=path …]` — bind some args to an
+  image, printing a ref to the curried image. It's a small content-addressed tree
+  (`base`, `args`, a `.caos-curry` marker); `run`/`curry` expand it client-side
+  (call args win), so the server only ever sees a plain image + args. Currying
+  flattens, so it's canonical.
+- `build-args [--name=value | --name:@=path …]` — print the hash of an assembled
+  args tree (same literal/path rules as above); used by `./run-worker-bash.sh`.
 - `entrypoint [--args=<hash>]` (`caos` only) — the container entrypoint; see below.
 
 ### `entrypoint`
@@ -406,7 +410,7 @@ Interactive worker shell (sets up `/cas`, drops you into bash):
 
 ```bash
 nix run .#load-caos-worker-bash
-./run-worker-bash.sh --greeting=hi --conf=Cargo.toml --src=crates/caos
+./run-worker-bash.sh --greeting=hi --conf:@=Cargo.toml --src:@=crates/caos
 # inside: caos get /cas/args/conf && cat /cas/args/conf
 ```
 

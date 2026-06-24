@@ -39,7 +39,10 @@ use crate::Config;
 /// True if `path` is one of the git smart-HTTP service paths we serve. Routed
 /// ahead of the `/object` + `/run` endpoints, which use disjoint paths.
 pub(crate) fn is_git_path(path: &str) -> bool {
-    matches!(path, "/info/refs" | "/git-upload-pack" | "/git-receive-pack")
+    matches!(
+        path,
+        "/info/refs" | "/git-upload-pack" | "/git-receive-pack"
+    )
 }
 
 /// Serve a git smart-HTTP request by delegating to `git http-backend` (CGI), then

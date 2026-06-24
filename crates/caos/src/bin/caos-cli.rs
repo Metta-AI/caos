@@ -51,7 +51,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
-        // `run <image> <output> -- [--name=value ...]`. The `--` separates the
+        // `run <image> <output> -- [--name=value | --name:@=path ...]`. The `--` separates the
         // fixed arguments from the (possibly empty) list of key/value args.
         Some("run") => match &args[2..] {
             [image, output, sep, kvs @ ..] if sep == "--" => {
@@ -59,13 +59,13 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
-        // `curry <image> -- [--name=value ...]` — bind args to an image, printing
+        // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an image, printing
         // a ref to the resulting curried image (run/curry it like any image).
         Some("curry") => match &args[2..] {
             [image, sep, kvs @ ..] if sep == "--" => caos::caos_curry(&transport()?, image, kvs),
             _ => Err(usage(args)),
         },
-        // `build-args [--name=value ...]` — print the hash of the assembled args
+        // `build-args [--name=value | --name:@=path ...]` — print the hash of the assembled args
         // tree (a path value is ingested, reusing git's recorded objects for a
         // clean tracked path; everything else is a literal blob).
         Some("build-args") => caos::build_args(&transport()?, &args[2..]),
@@ -86,8 +86,8 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} import-image <docker-archive> <cas-path>\n  \
          {prog} resolve <ref>\n  \
-         {prog} run <image> <output-cas-path> -- [--name=value ...]\n  \
-         {prog} curry <image> -- [--name=value ...]\n  \
-         {prog} build-args [--name=value ...]"
+         {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
+         {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
+         {prog} build-args [--name=value | --name:@=path ...]"
     )
 }
