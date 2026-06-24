@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test: passing a host filesystem path straight to `caos run`.
+# Integration test: passing a host filesystem path straight to `caos-cli run`.
 #
 # caos-cli ingests the path's content via git — reusing git's recorded object for
 # a clean, tracked path (no read), and hashing only the changed files of a dirty
@@ -25,7 +25,7 @@ export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 CLIENT=$PROJECT/.caos-dev/host-path-client
 rm -rf "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
-caos() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
+caos-cli() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
 
 CAS=$PROJECT/.caos-dev/host-path-cas
 rm -rf "$CAS"; mkdir -p "$CAS"
@@ -38,7 +38,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # runs the same arg-ingestion as run, but leaves an inspectable object locally).
 arg_hash() {
   local c args
-  c=$(caos curry docker://unused -- --data=data)
+  c=$(caos-cli curry docker://unused -- --data=data)
   args=$(git -C "$CLIENT" ls-tree "$c" args | awk '{print $3}')
   git -C "$CLIENT" ls-tree "$args" data | awk '{print $3}'
 }
@@ -52,8 +52,8 @@ git -C "$CLIENT" add data
 git -C "$CLIENT" -c user.email=t -c user.name=t commit -qm fixture
 
 echo "== Phase A: clean tracked dir — content delivered, git's tree reused ==" >&2
-caos run docker://caos-worker-hello:latest "$CAS/out" -- --data=data >/dev/null
-caos get -r "$CAS/out" >/dev/null
+caos-cli run docker://caos-worker-hello:latest "$CAS/out" -- --data=data >/dev/null
+caos-cli get -r "$CAS/out" >/dev/null
 grep -q "saw data" "$CAS/out/receipt" || fail "worker didn't see the data arg"
 diff -r "$CLIENT/data" "$CAS/out/data" >/dev/null \
   || fail "delivered content doesn't match the host dir"
@@ -66,8 +66,8 @@ echo "== Phase B: dirty dir — change delivered, hashed incrementally ==" >&2
 echo CHANGED > "$CLIENT/data/a.txt"   # modify a tracked file (uncommitted)
 echo four    > "$CLIENT/data/d.txt"   # add an untracked file
 rm -rf "$CAS/out"
-caos run docker://caos-worker-hello:latest "$CAS/out" -- --data=data >/dev/null
-caos get -r "$CAS/out" >/dev/null
+caos-cli run docker://caos-worker-hello:latest "$CAS/out" -- --data=data >/dev/null
+caos-cli get -r "$CAS/out" >/dev/null
 diff -r "$CLIENT/data" "$CAS/out/data" >/dev/null \
   || fail "delivered content doesn't match the dirty host dir"
 got=$(arg_hash)

@@ -34,7 +34,7 @@ caosbin=$PROJECT/result-caos/bin/caos-cli
 CLIENT=$PROJECT/.caos-dev/test-client-repo
 rm -rf "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
-caos() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
+caos-cli() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
 
 # CAS must live on an xattr-capable fs (caos records each path's hash in
 # user.caos.hash); the repo's fs qualifies, /tmp may not.
@@ -50,7 +50,7 @@ SNAP=$(mktemp -d)
 # run` independently resolves caos/std and threads it in as the run's `std`.)
 fetch_std() { git -C "$CLIENT" fetch -q caos '+refs/caos/std:refs/caos/std'; }
 fetch_std
-caos get-hash "$(caos resolve refs/caos/std)" "$CAS/std" >/dev/null
+caos-cli get-hash "$(caos-cli resolve refs/caos/std)" "$CAS/std" >/dev/null
 IMG="$CAS/std/deep-deps"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -65,12 +65,18 @@ printf 'd\n'    > "$PKGS/c/DEPS"
 : > "$PKGS/d/DEPS"
 
 # Deepen every package and materialize the result tree. The fixture is passed
-# straight from the host: `caos run` ingests the path's content itself.
+# straight from the host: `caos-cli run` ingests the path's content itself.
 run() {
   rm -rf "$CAS/out"
-  caos run "$IMG" "$CAS/out" -- --mode=all --packages="$PKGS" >/dev/null
-  caos get -r "$CAS/out" >/dev/null
+  caos-cli run "$IMG" "$CAS/out" -- --mode=all --packages="$PKGS" >/dev/null
+  caos-cli get -r "$CAS/out" >/dev/null
 }
+
+# Start from a cold result cache so the hit/miss assertions are deterministic
+# across runs (Redis persists between runs). Only result keys are cleared, so
+# image/layer conversions stay cached and nothing is needlessly rebuilt.
+docker exec caos-redis sh -c \
+  "redis-cli --scan --pattern 'caos:result:*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
 
 echo "== Phase A: correctness + DAG sharing ==" >&2
 run
@@ -117,7 +123,7 @@ echo "  ok: a,b,c,d all recomputed" >&2
 
 echo "== Phase E: bumping caos/std recomputes (std is in the key) ==" >&2
 # Re-publish std with an extra entry (hello) — same fold/deep-deps, new std tree —
-# then re-fetch it. `caos run` re-resolves caos/std, so the run keys on the new
+# then re-fetch it. `caos-cli run` re-resolves caos/std, so the run keys on the new
 # std and misses.
 sleep 1; since=$(date +%s)
 ./build-builtins.sh fold deep-deps hello >/dev/null
@@ -133,7 +139,7 @@ echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
 # request and the server's run-cycle detection catches it.
 rm -rf "$CAS/cyc"
 printf 'a\n' > "$PKGS/d/DEPS"
-if msg=$(caos run "$IMG" "$CAS/cyc" -- --mode=all --packages="$PKGS" 2>&1); then
+if msg=$(caos-cli run "$IMG" "$CAS/cyc" -- --mode=all --packages="$PKGS" 2>&1); then
   fail "expected the cyclic graph to fail, but the run succeeded"
 fi
 echo "$msg" | grep -q "run cycle detected" || fail "no cycle reported; got: $msg"

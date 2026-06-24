@@ -27,7 +27,7 @@ export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 CLIENT=$PROJECT/.caos-dev/rustc-client-repo
 rm -rf "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
-caos() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
+caos-cli() { ( cd "$CLIENT" && "$caosbin" "$@" ); }
 
 CAS=$PROJECT/.caos-dev/rustc-cas
 rm -rf "$CAS"; mkdir -p "$CAS"
@@ -41,8 +41,8 @@ misses_since() { docker logs --since "$1" caos-server 2>&1 \
 
 # The worker-base git-docker image the produced workers extend; curried into the
 # builder so callers only pass --src.
-caos import-image "$PROJECT/result-base" "$CAS/base" >/dev/null
-builder=$(caos curry docker://caos-worker-rustc:latest -- --base="$CAS/base")
+caos-cli import-image "$PROJECT/result-base" "$CAS/base" >/dev/null
+builder=$(caos-cli curry docker://caos-worker-rustc:latest -- --base="$CAS/base")
 
 # A trivial worker, defined in source: write a greeting to /cas/out.
 greeter() {
@@ -60,9 +60,9 @@ RS
 }
 
 build_and_run() { # <src-path> <img-cas> <result-cas>
-  caos run "$builder" "$2" -- --src="$1" >/dev/null   # host path, ingested directly
-  caos run "$2" "$3" -- >/dev/null
-  caos get -r "$3" >/dev/null
+  caos-cli run "$builder" "$2" -- --src="$1" >/dev/null   # host path, ingested directly
+  caos-cli run "$2" "$3" -- >/dev/null
+  caos-cli get -r "$3" >/dev/null
 }
 
 echo "== Phase A: source -> worker image -> run ==" >&2
@@ -76,7 +76,7 @@ echo "== Phase B: rebuilding identical source is a cache hit ==" >&2
 # A hit means the build (and the whole compile) is skipped: 0 cache misses, and
 # the cached result is by definition the same image.
 sleep 1; since=$(date +%s)
-caos run "$builder" "$CAS/img2" -- --src="$SRC/worker.rs" >/dev/null
+caos-cli run "$builder" "$CAS/img2" -- --src="$SRC/worker.rs" >/dev/null
 sleep 1
 m=$(misses_since "$since")
 [ "$m" -eq 0 ] || fail "rebuild of identical source should be a hit, saw $m misses"
