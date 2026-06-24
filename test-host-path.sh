@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 echo "building caos client + loading hello image..." >&2
-nix build .#caos -o result-caos
+nix build .#caos-cli -o result-caos
 nix run .#load-caos-worker-hello >/dev/null
 caosbin=$PROJECT/result-caos/bin/caos-cli
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}

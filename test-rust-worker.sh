@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 echo "building caos client + loading base/rustc images..." >&2
-nix build .#caos -o result-caos
+nix build .#caos-cli -o result-caos
 nix run .#load-caos-worker-base >/dev/null
 nix run .#load-caos-worker-rustc >/dev/null
 nix build .#caos-worker-base-docker -o result-base

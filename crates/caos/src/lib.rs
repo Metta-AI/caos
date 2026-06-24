@@ -750,16 +750,52 @@ fn atomically(
     build: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let tmp = temp_path(target)?;
-    let result = build(&tmp).and_then(|()| {
-        std::fs::rename(&tmp, target)
-            .map_err(|e| format!("renaming into place {}: {e}", target.display()))
-    });
+    let result = build(&tmp).and_then(|()| rename_into_place(&tmp, target));
     if result.is_err() {
         // One of these is a no-op depending on whether `tmp` is a file or dir.
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_dir_all(&tmp);
     }
     result
+}
+
+/// `rename(2)` `tmp` onto `target`. macOS requires owner-write on a directory to
+/// rename it — and to replace an existing one — since it rewrites the dir's `..`;
+/// Linux imposes no such check for a same-parent rename. So a read-only
+/// placeholder dir (e.g. 0o500) on either side would fail with EACCES on macOS:
+/// we add owner-write across the rename and reapply the builder's intended mode
+/// to the result. Off macOS this is a plain rename, so the worker's Linux
+/// behavior is untouched. (Under caos-cli, where this runs, the CAS modes are
+/// vestigial bookkeeping anyway.)
+fn rename_into_place(tmp: &Path, target: &Path) -> Result<(), String> {
+    let restore = make_renamable(tmp);
+    let _ = make_renamable(target); // an existing read-only placeholder being replaced
+    std::fs::rename(tmp, target)
+        .map_err(|e| format!("renaming into place {}: {e}", target.display()))?;
+    if let Some(mode) = restore {
+        set_mode(target, mode)?;
+    }
+    Ok(())
+}
+
+/// If `path` is a directory whose mode lacks owner-write, add it and return the
+/// original mode (to reapply after the rename); otherwise `None`. macOS-only;
+/// elsewhere a rename needs no such thing, so it's a no-op that leaves the mode be.
+#[cfg(target_os = "macos")]
+fn make_renamable(path: &Path) -> Option<u32> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let mode = meta.permissions().mode() & 0o7777;
+    if meta.is_dir() && mode & 0o200 == 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o200));
+        Some(mode)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn make_renamable(_path: &Path) -> Option<u32> {
+    None
 }
 
 /// A unique sibling path of `target` (same directory ⇒ same filesystem).

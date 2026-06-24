@@ -31,7 +31,7 @@ export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
 # Publish the built-ins deep-deps needs (itself + fold) to the server, then build
 # the user-facing client.
 echo "building caos client + publishing caos/std (fold, deep-deps)..." >&2
-nix build .#caos -o result-caos
+nix build .#caos-cli -o result-caos
 ./build-builtins.sh fold deep-deps >/dev/null
 caosbin=$PROJECT/result-caos/bin/caos-cli
 

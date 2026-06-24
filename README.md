@@ -24,7 +24,9 @@ it's reproducible across machines.
 - [Nix](https://nixos.org/download) with flakes enabled.
 - Docker, to load and run the images.
 
-No Rust toolchain is needed system-wide; the flake pins it.
+No Rust toolchain is needed system-wide; the flake pins it. Linux and macOS
+(Apple Silicon) are both first-class: on macOS everything builds natively — the
+Linux images cross-compile (no VM) and run under Docker Desktop or OrbStack.
 
 ## Layout
 
@@ -57,11 +59,15 @@ lint/format/test the way CI does with `nix flake check`.
 ## Building
 
 ```bash
-nix build .#caos              # ./result/bin/{caos,caos-cli}
+nix build .#caos              # ./result/bin/{caos,caos-cli} — static musl (Linux)
 nix build .#server            # ./result/bin/server
+nix build .#caos-cli          # the user-facing client, native to the build host
 ```
 
-Binaries are statically linked against `musl` — no shared-library dependencies.
+The `caos`/`server` binaries are statically linked against `musl` — no
+shared-library dependencies. `caos-cli` drives the server from your working tree,
+so it runs on the *host* and is built for the host platform; on Linux the musl
+`caos-cli` inside `.#caos` is host-runnable too.
 
 Docker images (crates are unprefixed; images carry a `caos-` prefix):
 
@@ -86,8 +92,12 @@ Worker images contain **only** their static `/worker` binary plus a setuid-root
 libc, no `/nix/store`. The `caos-server` image is not minimal: it bundles the
 `docker` client, `git`, and `tar`, and expects the host's docker socket.
 
-> Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
-> remote/linux builder; the binaries and dev shell build natively.
+> The images are Linux, but build directly on macOS too — no Linux builder or VM.
+> The flake cross-compiles the Rust binaries for the build host's architecture
+> with the toolchain's bundled `rust-lld` (so an `aarch64` Mac produces `aarch64`
+> images that run natively under Docker Desktop/OrbStack), and the server image's
+> general-purpose tools (`git`/`tar`/`docker`) are substituted prebuilt from the
+> binary cache rather than built.
 
 ## The big picture
 
@@ -413,17 +423,18 @@ Integration tests (require `tilt up` running):
                          # clean tracked tree reused, dirty tree hashed incrementally
 ```
 
-Both build `.#caos`, set up a throwaway client repo with the server as its `caos`
-remote, and drive everything through `caos-cli`.
+Each builds `.#caos-cli` (the host-native client), sets up a throwaway client repo
+with the server as its `caos` remote, and drives everything through `caos-cli`.
 
 ## Notes
 
 - **Toolchain version** is whatever `stable` resolves to against the locked
   `rust-overlay` revision in `flake.lock`. Pin an exact version with `channel =
   "1.96.0"` in `rust-toolchain.toml`.
-- **Architecture**: the static target is `x86_64-unknown-linux-musl`. On ARM,
-  switch both `rust-toolchain.toml` and `muslTarget` in `flake.nix` to
-  `aarch64-unknown-linux-musl`.
+- **Architecture**: the musl target follows the build host's architecture
+  (`aarch64-unknown-linux-musl` on Apple Silicon / ARM Linux, `x86_64` elsewhere);
+  `rust-toolchain.toml` carries both. macOS cross-links with the toolchain's
+  `rust-lld` (see `muslCrossLinker` in `flake.nix`), so no Linux builder is needed.
 - **Native (C) dependencies**: a crate linking C libraries (e.g. `openssl`)
   needs a `musl` cross-toolchain to stay static — see the commented
   `buildInputs`/`nativeBuildInputs` in `flake.nix`.
