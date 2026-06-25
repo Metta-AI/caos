@@ -266,8 +266,7 @@ impl Transport for GitTransport {
         // lives there unreferenced). Fetch it by bare hash, then read it from a
         // fresh handle: the cached `repo` won't pick up the pack `git fetch` just
         // wrote.
-        run_git(&["fetch", "--quiet", CAOS_REMOTE, hash])
-            .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))?;
+        fetch_object(hash)?;
         let repo = gix::open(&self.git_dir)
             .map_err(|e| format!("reopening {}: {e}", self.git_dir.display()))?;
         let object = repo
@@ -430,6 +429,27 @@ impl GitTransport {
 /// network steps gix doesn't drive for us (push/fetch over smart-HTTP).
 fn run_git(args: &[&str]) -> Result<(), String> {
     git_capture(args, None).map(|_| ())
+}
+
+/// Fetch object `hash` (and its closure) from the `caos` remote into the local
+/// repo.
+///
+/// `fetch.negotiationAlgorithm=noop` makes git send *no* "have" lines, so the
+/// negotiation is a single round. That's deliberate: the server's smart-HTTP
+/// delegate returns an empty body partway through a *multi-round* negotiation —
+/// which a client repo with real history (many refs/commits) triggers — and the
+/// fetch then dies with "the remote end hung up unexpectedly". The client and the
+/// caos server share no history anyway, so suppressing haves costs nothing here.
+fn fetch_object(hash: &str) -> Result<(), String> {
+    run_git(&[
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        "--quiet",
+        CAOS_REMOTE,
+        hash,
+    ])
+    .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
 }
 
 /// Run `git` in the working repo and return its stdout; error on failure. With
@@ -1531,10 +1551,25 @@ fn std_tree() -> Result<String, String> {
     if let Ok(hash) = resolve_ref(DEFAULT_STD_REF) {
         return Ok(hash);
     }
-    let refspec = format!("{DEFAULT_STD_REF}:{DEFAULT_STD_REF}");
-    run_git(&["fetch", "--quiet", CAOS_REMOTE, &refspec])
-        .map_err(|e| format!("fetching {DEFAULT_STD_REF} from {CAOS_REMOTE}: {e}"))?;
-    resolve_ref(DEFAULT_STD_REF)
+    // Not local yet — pull it from the server. We can't `git fetch <ref>` here:
+    // refs/caos/std points at a *tree*, and fetching a non-commit ref over
+    // smart-HTTP does a commit-style negotiation that hangs up. So read the hash
+    // from the remote's advertisement (`ls-remote` — no pack negotiation, works
+    // for any object type) and fetch the object *by hash*: the same path results
+    // take, which the server allows via uploadpack.allowAnySHA1InWant.
+    let advertised = git_capture(&["ls-remote", CAOS_REMOTE, DEFAULT_STD_REF], None)?;
+    let hash = advertised
+        .split_whitespace()
+        .next()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("{DEFAULT_STD_REF} not found on the `{CAOS_REMOTE}` remote"))?
+        .to_string();
+    fetch_object(&hash)?;
+    // Record it locally so the next run resolves with no network round-trip.
+    // Plain update-ref (unlike fetch/push) happily points a ref at a tree.
+    run_git(&["update-ref", DEFAULT_STD_REF, &hash])
+        .map_err(|e| format!("recording {DEFAULT_STD_REF} locally: {e}"))?;
+    Ok(hash)
 }
 
 /// `curry <image> -- [--name=value ...]` — bind arguments to `<image>`, printing
