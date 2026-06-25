@@ -119,6 +119,7 @@
         worker-file-count = crateBin "worker-file-count";
         worker-deep-deps = crateBin "worker-deep-deps";
         worker-rustc = crateBin "worker-rustc";
+        worker-llm-summary = crateBin "worker-llm-summary";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
@@ -278,6 +279,37 @@
           tag = "latest";
           contents = workerFileCountContents;
           config = workerFileCountConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
+
+        # An "llm-summary" worker: a fold `post` that summarizes a document tree,
+        # folding each file's summary up into directory summaries. The driver (no
+        # `--mode`) curries this image as fold's `post` and runs fold over `--in`;
+        # there's no `pre` — a tree's own structure is the fold structure. So
+        # `caos run llm-summary <out> -- --in:@=<docs>` leaves a tree of summaries
+        # at <out> (`<out>/summary` summarizes the whole tree). Editing one file
+        # recomputes only that file's summary and the directory summaries on the
+        # path to the root — every sibling is a cache hit. Like fold/deep-deps it
+        # drives the server via `caos run`, reaching its own image and fold's as
+        # /cas/std/llm-summary and /cas/std/fold. The `worker-llm-summary` crate, a
+        # static binary at /worker — so the image needs no shell or coreutils.
+        workerLlmSummaryRoot = workerRoot "worker-llm-summary" worker-llm-summary;
+        workerLlmSummaryContents = [
+          workerBaseRoot
+          workerLlmSummaryRoot
+        ];
+        workerLlmSummaryConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [ "PATH=/bin" ];
+        };
+        workerLlmSummaryImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-llm-summary";
+          tag = "latest";
+          contents = workerLlmSummaryContents;
+          config = workerLlmSummaryConfig;
           fakeRootCommands = installWorkerFiles;
         };
 
@@ -481,6 +513,12 @@
           config = workerRustcConfig;
           fakeRootCommands = installWorkerFiles;
         };
+        loadWorkerLlmSummary = loadImage {
+          name = "caos-worker-llm-summary";
+          contents = workerLlmSummaryContents;
+          config = workerLlmSummaryConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
 
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
         # These let another tree (one that has caos as a flake input) get the
@@ -535,6 +573,7 @@
           file-count = workerFileCountImage;
           deep-deps = workerDeepDepsImage;
           rustc = workerRustcImage;
+          llm-summary = workerLlmSummaryImage;
         };
 
         # One import per builtin, baked at eval time (image store paths inlined —
@@ -670,6 +709,7 @@
           caos-worker-file-count-docker = workerFileCountImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-rustc-docker = workerRustcImage;
+          caos-worker-llm-summary-docker = workerLlmSummaryImage;
         };
 
         apps = {
@@ -707,6 +747,10 @@
           load-caos-worker-rustc = {
             type = "app";
             program = "${loadWorkerRustc}/bin/load-caos-worker-rustc";
+          };
+          load-caos-worker-llm-summary = {
+            type = "app";
+            program = "${loadWorkerLlmSummary}/bin/load-caos-worker-llm-summary";
           };
         };
 

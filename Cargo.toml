@@ -9,6 +9,7 @@ members = [
     "crates/worker-file-count",
     "crates/worker-deep-deps",
     "crates/worker-rustc",
+    "crates/worker-llm-summary",
 ]
 
 # Name for crane's workspace-level derivations (fmt/test) so it doesn't warn

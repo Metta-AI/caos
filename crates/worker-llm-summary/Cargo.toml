@@ -1,0 +1,13 @@
+[package]
+name = "worker-llm-summary"
+version = "0.1.0"
+edition = "2021"
+
+# Glue over the `caos` CLI lives in worker-common; this crate is just the
+# summary worker's logic, so it builds to a tiny static binary needing no shell.
+[dependencies]
+worker-common = { path = "../worker-common" }
+
+[[bin]]
+name = "worker-llm-summary"
+path = "src/main.rs"
