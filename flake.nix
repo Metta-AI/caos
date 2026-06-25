@@ -156,6 +156,59 @@
           fakeRootCommands = installWorkerFiles;
         };
 
+        # A "bash" worker: it runs a shell script you hand it. `caos entrypoint`
+        # sets up /cas, materializes the run's args under /cas/args (one per
+        # --name=value / --name:@=path), and runs us as /worker; we fetch the
+        # `script` arg (a text file) and execute it with bash. The script does its
+        # work with the in-sandbox `caos` (get/put/run/curry/import-image), reads
+        # any other args from /cas/args/<name>, and leaves its result at /cas/out
+        # — so orchestration that used to run host-side now runs *inside* a worker,
+        # with a real /cas. Curry it (binding the script, or other args) and run it
+        # like any other image. Unlike the minimal Rust workers it carries a shell
+        # and coreutils, so it's not minimal — but it's a real, memoized worker.
+        workerBashScript = pkgs.writeTextFile {
+          name = "caos-worker-bash-script";
+          executable = true;
+          destination = "/worker";
+          text = ''
+            #!/bin/bash
+            # caos entrypoint runs us as /worker, with /cas set up and the args
+            # materialized under /cas/args. Fetch the script and run it; on exit
+            # caos reads the hash of /cas/out. If the script left no result there,
+            # store an empty blob so there's something to read.
+            set -euo pipefail
+            caos get /cas/args/script
+            bash /cas/args/script
+            if [ ! -e /cas/out ]; then
+              : > /tmp/caos-empty-out
+              caos put /tmp/caos-empty-out /cas/out
+            fi
+          '';
+        };
+        workerBashContents = [
+          workerBaseRoot
+          workerBashScript
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.diffutils
+          pkgs.gnugrep
+          pkgs.findutils
+        ];
+        workerBashConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [ "PATH=/bin" ];
+        };
+        workerBashImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-bash";
+          tag = "latest";
+          contents = workerBashContents;
+          config = workerBashConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
+
 
         # A real, runnable worker image, with a /worker that reads its inputs from
         # /cas/args (one entry per `--name=value` arg `caos run` passed), assembles
@@ -411,6 +464,12 @@
           config = workerBaseConfig;
           fakeRootCommands = installWorkerFiles;
         };
+        loadWorkerBash = loadImage {
+          name = "caos-worker-bash";
+          contents = workerBashContents;
+          config = workerBashConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
         loadServer = loadImage {
           name = "caos-server";
           contents = serverContents;
@@ -476,6 +535,7 @@
         # images by their library name (clients reach them as `/cas/std/<name>`).
         builtinImages = {
           base = workerBaseImage;
+          bash = workerBashImage;
           hello = workerHelloImage;
           fold = workerFoldImage;
           file-count = workerFileCountImage;
@@ -610,6 +670,7 @@
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-worker-base-docker = workerBaseImage;
+          caos-worker-bash-docker = workerBashImage;
           caos-server-docker = serverImage;
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-fold-docker = workerFoldImage;
@@ -629,6 +690,10 @@
           load-caos-worker-base = {
             type = "app";
             program = "${loadWorkerBase}/bin/load-caos-worker-base";
+          };
+          load-caos-worker-bash = {
+            type = "app";
+            program = "${loadWorkerBash}/bin/load-caos-worker-bash";
           };
           load-caos-server = {
             type = "app";
