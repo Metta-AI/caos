@@ -37,8 +37,14 @@
 
         # Build for musl so the binary is fully static (crt-static is on by
         # default for musl targets) — its runtime closure is just itself.
-        # Keep this in sync with the target in ./rust-toolchain.toml.
-        muslTarget = "x86_64-unknown-linux-musl";
+        # Follow the build host's architecture (no arch-cross) so the flake also
+        # builds natively on an aarch64 Linux host (e.g. an Apple-Silicon dev VM),
+        # not just x86_64. rust-toolchain.toml carries the std for both.
+        muslTarget =
+          if pkgs.stdenv.hostPlatform.isAarch64 then
+            "aarch64-unknown-linux-musl"
+          else
+            "x86_64-unknown-linux-musl";
 
         commonArgs = {
           inherit src;
@@ -374,7 +380,17 @@
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];
-          Env = [ "PATH=/bin" ];
+          Env = [
+            "PATH=/bin"
+            # The server shells out to `git` on its bind-mounted /git repo. On a
+            # native-Linux host that repo is owned by the (non-root) user who
+            # created it, so git's "dubious ownership" check rejects it and the
+            # transport fails. Trust it unconditionally — this is a dedicated,
+            # single-purpose container. (On macOS the file-sharing layer hid this.)
+            "GIT_CONFIG_COUNT=1"
+            "GIT_CONFIG_KEY_0=safe.directory"
+            "GIT_CONFIG_VALUE_0=*"
+          ];
           ExposedPorts = {
             "80/tcp" = { };
           };
@@ -680,6 +696,12 @@
             pkgs.rust-analyzer
             # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
             pkgs.tilt
+            # Tools the integration scripts (./test-*.sh) shell out to, bundled so
+            # they work on a minimal host (e.g. a bare NixOS dev VM), not only a
+            # Mac/workstation that happens to have them preinstalled.
+            pkgs.git
+            pkgs.diffutils
+            pkgs.gawk
           ];
         };
       }

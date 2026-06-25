@@ -3,6 +3,8 @@ channel = "stable"
 components = [ "rustfmt", "clippy", "rust-src" ]
 # rust-src is the stdlib source — not needed to build, but it lets IDEs (which
 # get the toolchain from Nix, not rustup) resolve and navigate into std.
-# Static target so the Docker image needs no libc closure — just the binary.
-# On aarch64 hosts, change this to "aarch64-unknown-linux-musl".
-targets = [ "x86_64-unknown-linux-musl" ]
+# Static targets so the Docker image needs no libc closure — just the binary.
+# Both arches are carried so the flake can build for the host's architecture
+# (aarch64 on Apple Silicon / aarch64 Linux, x86_64 otherwise); see muslTarget
+# in flake.nix.
+targets = [ "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl" ]

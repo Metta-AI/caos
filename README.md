@@ -54,6 +54,29 @@ lint/format/test the way CI does with `nix flake check`.
 > files are included, but new files are not). After adding a new source file,
 > `git add` it before building.
 
+### On Linux, or a Linux VM from macOS
+
+The whole stack — images, daemons, the dev loop — is Linux and builds/runs
+natively on a Linux host (x86_64 or aarch64). The host just needs a running
+**Docker daemon** and **Nix with flakes enabled**; the rest (including the tools
+`./test-*.sh` use) comes from `nix develop`.
+
+On Apple Silicon the lightest full-Linux environment is an **OrbStack NixOS
+machine** (`orbctl create nixos`, arm64-native, Nix built in). The repo doesn't
+manage your machine; the host config it needs is just Docker + flakes, e.g. a
+NixOS module:
+
+```nix
+{ ... }:
+{
+  virtualisation.docker.enable = true;            # the server spawns worker containers
+  users.users.<you>.extraGroups = [ "docker" ];
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+}
+```
+
+Then clone the repo inside it and `nix develop && tilt up` as usual.
+
 ## Building
 
 ```bash
@@ -421,9 +444,9 @@ remote, and drive everything through `caos-cli`.
 - **Toolchain version** is whatever `stable` resolves to against the locked
   `rust-overlay` revision in `flake.lock`. Pin an exact version with `channel =
   "1.96.0"` in `rust-toolchain.toml`.
-- **Architecture**: the static target is `x86_64-unknown-linux-musl`. On ARM,
-  switch both `rust-toolchain.toml` and `muslTarget` in `flake.nix` to
-  `aarch64-unknown-linux-musl`.
+- **Architecture**: the musl target follows the build host's architecture
+  (`aarch64-unknown-linux-musl` on aarch64, `x86_64-unknown-linux-musl`
+  otherwise); `rust-toolchain.toml` carries both.
 - **Native (C) dependencies**: a crate linking C libraries (e.g. `openssl`)
   needs a `musl` cross-toolchain to stay static — see the commented
   `buildInputs`/`nativeBuildInputs` in `flake.nix`.
