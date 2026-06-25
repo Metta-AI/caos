@@ -127,6 +127,13 @@ daemon(
     [
         '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
+        # Forward the host's ANTHROPIC_API_KEY (if exported before `tilt up`) into
+        # the worker containers the server spawns, so the llm-summary worker can
+        # call the real API. `-e VAR` (no value) passes it through only when set;
+        # unset means the worker falls back to its local stand-in. Via env, never
+        # the args tree, so the key stays out of the request hash / cache key.
+        '-e CAOS_WORKER_ENV=ANTHROPIC_API_KEY',
+        '-e ANTHROPIC_API_KEY',
         '-v /var/run/docker.sock:/var/run/docker.sock',
         '-v "%s:/git"' % SERVER_REPO,
     ],

@@ -291,19 +291,40 @@
         # recomputes only that file's summary and the directory summaries on the
         # path to the root — every sibling is a cache hit. Like fold/deep-deps it
         # drives the server via `caos run`, reaching its own image and fold's as
-        # /cas/std/llm-summary and /cas/std/fold. The `worker-llm-summary` crate, a
-        # static binary at /worker — so the image needs no shell or coreutils.
+        # /cas/std/llm-summary and /cas/std/fold.
+        #
+        # Unlike the minimal leaf workers, this image is NOT minimal: it bundles
+        # `curl` + a CA bundle so the worker can call the Anthropic API over HTTPS
+        # (the static `/worker` binary stays pure-Rust — curl handles TLS). The
+        # summarize step uses a real model when ANTHROPIC_API_KEY is present in the
+        # worker's env (forwarded by the server via CAOS_WORKER_ENV), else a local
+        # deterministic stand-in. `worker-llm-summary` is the crate at /worker.
         workerLlmSummaryRoot = workerRoot "worker-llm-summary" worker-llm-summary;
-        workerLlmSummaryContents = [
-          workerBaseRoot
-          workerLlmSummaryRoot
-        ];
+        # curl + CA certs come from the matching *Linux* nixpkgs (substituted
+        # prebuilt on macOS, like the server image's git/tar/docker), so the image
+        # is all-Linux regardless of build host. One merged root so PATH=/bin
+        # reaches caos, /worker, and curl.
+        workerLlmSummaryRootEnv = pkgs.buildEnv {
+          name = "caos-worker-llm-summary-root";
+          paths = [
+            workerBaseRoot
+            workerLlmSummaryRoot
+            linuxPkgs.curl
+            linuxPkgs.cacert
+          ];
+        };
+        workerLlmSummaryContents = [ workerLlmSummaryRootEnv ];
         workerLlmSummaryConfig = {
           Entrypoint = [
             "/bin/caos"
             "entrypoint"
           ];
-          Env = [ "PATH=/bin" ];
+          Env = [
+            "PATH=/bin"
+            # Where curl finds the bundled CA roots (the worker also passes
+            # --cacert explicitly); cacert lays this path down via buildEnv.
+            "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+          ];
         };
         workerLlmSummaryImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-llm-summary";
@@ -621,6 +642,13 @@
               ports: ["9090:80"]
               environment:
                 CAOS_DOCKER_NETWORK: caos-net
+                # Forward the host's ANTHROPIC_API_KEY (if any) into the worker
+                # containers the server spawns, so the llm-summary worker can call
+                # the real API. Empty when unset — the worker then uses its local
+                # stand-in. The key rides in env, never the args tree, so it stays
+                # out of the request hash / result cache key.
+                CAOS_WORKER_ENV: ANTHROPIC_API_KEY
+                ANTHROPIC_API_KEY: "''${ANTHROPIC_API_KEY:-}"
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - "''${CAOS_DATA:?set CAOS_DATA to an absolute data dir}/server-repo.git:/git"

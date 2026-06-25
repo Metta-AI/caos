@@ -3,10 +3,14 @@
 # built-ins (`/cas/std`). It folds a per-file summary up into directory
 # summaries — and shows that editing one file recomputes only that file's
 # summary and the directory summaries on the path to the root; every sibling is
-# a cache hit. (The "LLM" here is a deterministic local stand-in with a small
-# simulated latency, so the demo runs anywhere — no API key, no egress. The
-# incremental-recompute behaviour is identical to a real model; see
-# crates/worker-llm-summary for the seam where a real Anthropic call goes.)
+# a cache hit.
+#
+# Summaries are REAL Anthropic calls when the caos *server* has an
+# ANTHROPIC_API_KEY to forward to workers (see "Real summaries" below); with no
+# key the worker uses a deterministic local stand-in, so this demo runs anywhere
+# — no key, no egress. The incrementality is identical either way — and caching
+# even makes a nondeterministic model byte-reproducible here: an unchanged node
+# is a cache hit, never re-sampled.
 #
 # The result mirrors the input tree: every node is `{ summary, <children…> }`,
 # so `<out>/summary` summarizes the whole tree and `<out>/guide/intro.md/summary`
@@ -22,6 +26,12 @@
 #
 # Requires the dev daemons running (`tilt up`, or `nix run .#caosd`): the caos
 # server :9090, redis, registry — and a docker the server can reach.
+#
+# Real summaries: export your key before bringing the stack up, so the server
+# forwards it to workers (both stacks set CAOS_WORKER_ENV=ANTHROPIC_API_KEY):
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   tilt up            # or: nix run .#caosd
+# The worker container also needs outbound HTTPS to api.anthropic.com.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT=$PWD

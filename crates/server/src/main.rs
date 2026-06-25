@@ -86,6 +86,13 @@ const DEFAULT_DOCKER_BIN: &str = "docker";
 /// Redis (host:port) used to cache results. Override with `CAOS_REDIS_ADDR`.
 const DEFAULT_REDIS_ADDR: &str = "caos-redis:6379";
 
+/// Comma-separated names of host env vars to forward into each worker container
+/// (e.g. `ANTHROPIC_API_KEY`). Read from this var on the server; empty/unset means
+/// forward nothing. Passed to the worker via `-e NAME=value` from the server's own
+/// environment — never through the args tree — so a forwarded secret stays out of
+/// the request hash and result cache key. See `compute::run`.
+const WORKER_ENV_VAR: &str = "CAOS_WORKER_ENV";
+
 /// Runtime configuration, read once from the environment at startup.
 struct Config {
     network: String,
@@ -100,6 +107,9 @@ struct Config {
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
+    /// Names of host env vars to forward into each worker (from `CAOS_WORKER_ENV`).
+    /// Empty = forward nothing. See [`WORKER_ENV_VAR`] and `compute::run`.
+    worker_env: Vec<String>,
 }
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
@@ -151,6 +161,13 @@ fn main() {
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         git_dir,
         repo,
+        worker_env: std::env::var(WORKER_ENV_VAR)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect(),
     });
 
     let server = match Server::http(addr.as_str()) {

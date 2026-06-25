@@ -3,10 +3,13 @@ name = "worker-llm-summary"
 version = "0.1.0"
 edition = "2021"
 
-# Glue over the `caos` CLI lives in worker-common; this crate is just the
-# summary worker's logic, so it builds to a tiny static binary needing no shell.
+# Glue over the `caos` CLI lives in worker-common; this crate is the summary
+# worker's logic. It builds/parses the Anthropic request/response JSON with
+# serde_json (pure-Rust, already a workspace dep) and shells out to `curl` for the
+# HTTPS call, so the binary itself stays static with no TLS stack to cross-compile.
 [dependencies]
 worker-common = { path = "../worker-common" }
+serde_json = "1"
 
 [[bin]]
 name = "worker-llm-summary"

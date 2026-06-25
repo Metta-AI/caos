@@ -1445,6 +1445,7 @@ dependencies = [
 name = "worker-llm-summary"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "worker-common",
 ]
 
