@@ -52,10 +52,14 @@ fn run(args: &[String]) -> Result<(), String> {
             _ => Err(usage(args)),
         },
         // `run <image> <output> -- [--name=value | --name:@=path ...]`. The `--` separates the
-        // fixed arguments from the (possibly empty) list of key/value args.
+        // fixed arguments from the (possibly empty) list of key/value args. `<image>`
+        // may be `/cas/std/<name>` to run a builtin from the published library —
+        // the same path workers use — resolved to its hash here.
         Some("run") => match &args[2..] {
             [image, output, sep, kvs @ ..] if sep == "--" => {
-                caos::caos_run(&transport()?, image, output, kvs)
+                let t = transport()?;
+                let image = caos::resolve_cli_image(&t, image)?;
+                caos::caos_run(&t, &image, output, kvs)
             }
             _ => Err(usage(args)),
         },
@@ -82,7 +86,7 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} import-image <docker-archive> <cas-path>\n  \
          {prog} resolve <ref>\n  \
-         {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
+         {prog} run <image | /cas/std/<name>> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]"
     )
 }

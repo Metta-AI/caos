@@ -1466,6 +1466,51 @@ fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
     ))
 }
 
+/// Map a `caos-cli run` image argument that names a std builtin to its git hash,
+/// leaving every other form (`docker://…`, a hash, a CAS path) untouched.
+///
+/// `<DEFAULT_CAS_DIR>/std/<name>` (i.e. `/cas/std/<name>`) is the path a *worker*
+/// uses to reach a builtin — the server materializes the std library at
+/// `/cas/std` inside the container. The CLI has no such directory, so it resolves
+/// the same path directly against the published library, so one vocabulary works
+/// in both places.
+pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
+    let prefix = format!("{DEFAULT_CAS_DIR}/std/");
+    match image.strip_prefix(&prefix) {
+        Some(name) => resolve_std_image(t, name),
+        None => Ok(image.to_string()),
+    }
+}
+
+/// Resolve a std builtin `<name>` to its git-docker image hash by looking it up in
+/// the published library (`refs/caos/std`).
+fn resolve_std_image(t: &dyn Transport, name: &str) -> Result<String, String> {
+    if name.is_empty() || name.contains('/') {
+        return Err(format!(
+            "a std image is {DEFAULT_CAS_DIR}/std/<name> (a single builtin name), got: {name:?}"
+        ));
+    }
+    let std = std_tree()?;
+    let entries = fetch_tree_entries(t, &std)?.ok_or_else(|| format!("std {std} is not a tree"))?;
+    entries
+        .iter()
+        .find(|e| entry_name(e) == name.as_bytes())
+        .map(|e| e.oid.to_string())
+        .ok_or_else(|| format!("no builtin {name:?} in {DEFAULT_STD_REF}"))
+}
+
+/// The std library tree hash from `refs/caos/std`, fetched from the `caos` remote
+/// if it isn't in the local repo yet (the CLI may never have pulled it).
+fn std_tree() -> Result<String, String> {
+    if let Ok(hash) = resolve_ref(DEFAULT_STD_REF) {
+        return Ok(hash);
+    }
+    let refspec = format!("{DEFAULT_STD_REF}:{DEFAULT_STD_REF}");
+    run_git(&["fetch", "--quiet", CAOS_REMOTE, &refspec])
+        .map_err(|e| format!("fetching {DEFAULT_STD_REF} from {CAOS_REMOTE}: {e}"))?;
+    resolve_ref(DEFAULT_STD_REF)
+}
+
 /// `curry <image> -- [--name=value ...]` — bind arguments to `<image>`, printing
 /// a ref (a git hash) to the resulting curried image. The ref can be `run` —
 /// which supplies the rest of the args — or `curry`'d again, exactly like any
