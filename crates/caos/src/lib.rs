@@ -144,6 +144,12 @@ pub trait Transport {
     ) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, String> {
         Ok(None)
     }
+
+    /// Base URL of the caos server for compute (`/run`). HTTP transport: the
+    /// configured server (the worker's injected [`SERVER_ENV`]). Git transport:
+    /// the `caos` remote's URL — the same place the CLI already points, so a
+    /// person never sets [`SERVER_ENV`] themselves.
+    fn server_url(&self) -> Result<String, String>;
 }
 
 /// Transport over the server's HTTP object API (`GET`/`POST /object`). Used by
@@ -189,6 +195,10 @@ impl Transport for HttpTransport {
         let serialized = http_get(&url)?;
         let (kind, content) = parse_object(&serialized)?;
         Ok((kind.to_string(), content.to_vec()))
+    }
+
+    fn server_url(&self) -> Result<String, String> {
+        Ok(self.base.clone())
     }
 }
 
@@ -287,6 +297,22 @@ impl Transport for GitTransport {
             return Err(format!("path not found: {value}"));
         }
         self.git_ingest(path).map(Some)
+    }
+
+    fn server_url(&self) -> Result<String, String> {
+        // The `caos` remote's URL *is* the server: the CLI already pushes/fetches
+        // objects there, and /run lives at the same host. So a person configures
+        // the server once (`git remote add caos <url>`) and never sets an env var.
+        let remote = self.repo.find_remote(CAOS_REMOTE).map_err(|e| {
+            format!(
+                "no `{CAOS_REMOTE}` git remote (add it with \
+                 `git remote add {CAOS_REMOTE} <server-url>`): {e}"
+            )
+        })?;
+        let url = remote
+            .url(gix::remote::Direction::Fetch)
+            .ok_or_else(|| format!("`{CAOS_REMOTE}` remote has no fetch URL"))?;
+        Ok(url.to_bstring().to_string())
     }
 }
 
@@ -1339,7 +1365,7 @@ pub fn caos_run(
 
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    let (kind, result) = request_compute(&req.to_string())?;
+    let (kind, result) = request_compute(&t.server_url()?, &req.to_string())?;
 
     // Record the result as a typed, tagged placeholder — fetch nothing. The result
     // stays on the server; `caos get <output>` loads it on demand if wanted.
@@ -1634,8 +1660,7 @@ fn merge_entries(
 /// Trigger compute for request `req` and return the result's `(type, hash)`. The
 /// server runs the container and replies `"<type> <hash>"`. `&stack=` rides along
 /// for cycle detection — it's threaded state, not part of the request's identity.
-fn request_compute(req: &str) -> Result<(String, String), String> {
-    let base = server_url()?;
+fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
     let mut url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
     if let Ok(stack) = std::env::var(RUN_STACK_ENV) {
         if !stack.is_empty() {

@@ -27,13 +27,13 @@
       #   caos-cli   — drive workers (run/get/curry/…)
       # caosd honors CAOS_DATA (default ./.caos-data) for the server's repo;
       # caos-cli must run inside a git working tree (this one) that has the
-      # server as its `caos` remote:
-      #   git remote add caos "$CAOS_SERVER_URL"
-      #   caos-cli run docker://... -- --arg:@=path
+      # server as its `caos` remote — that remote URL *is* the server, so
+      # there's no CAOS_SERVER_URL to set:
+      #   git remote add caos http://localhost:9090
+      #   caos-cli run /cas/std/hello out -- --greeting=hi
       devShells.${system}.default = pkgs.mkShell {
         # One package, both commands (caos-cli + caosd) on PATH.
         packages = [ caosPkgs.caos-tools ];
-        CAOS_SERVER_URL = "http://localhost:9090";
       };
     };
 }
