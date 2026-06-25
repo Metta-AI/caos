@@ -21,13 +21,18 @@
 //! *determinism by memoization* even over a nondeterministic model: an unchanged
 //! node is returned from cache (byte-identical), never re-sampled.
 //!
-//! The summarize step calls a real model (the Anthropic Messages API) when
-//! `ANTHROPIC_API_KEY` is present in the worker's environment — the server
-//! forwards it via `CAOS_WORKER_ENV` (env, never the args tree, so the key stays
-//! out of the request hash / cache key). With no key it falls back to a
-//! deterministic local stand-in, so the demo still runs anywhere. The model id
-//! and prompts are baked into THIS image (consts below), so they ride in the
-//! request's cache key — changing either correctly invalidates every summary.
+//! The summarize step calls a real model (the Anthropic Messages API) when an
+//! API key is supplied as the `--key` argument; the worker copies it into
+//! `ANTHROPIC_API_KEY` for the call. With no key it falls back to a deterministic
+//! local stand-in, so the demo still runs anywhere. The driver curries `--key`
+//! into `post`, so every summarize invocation receives it.
+//!
+//! NOTE: because `--key` is an *argument*, it rides in the content-addressed
+//! request — it's stored in the CAS and folded into the cache key (so rotating
+//! the key re-summarizes everything). That's a deliberate "for now" choice: the
+//! worker owns its credential rather than the server forwarding ambient env. The
+//! model id and prompts are baked into THIS image (consts below), so they ride in
+//! the cache key too — changing either correctly invalidates every summary.
 
 use std::fs;
 use std::path::Path;
@@ -90,7 +95,14 @@ fn run() -> Result<(), String> {
 /// are its own entries and a file is a leaf, which is the fold's structural
 /// default.
 fn drive() -> Result<(), String> {
-    let post = caos_curry(&me(), &[("mode", Arg::Lit("summarize"))])?;
+    // Curry the optional --key into `post` so every summarize invocation (the only
+    // place the API call happens) receives it. No key -> the local stand-in.
+    let key = read_arg_opt("key")?;
+    let mut post_args = vec![("mode", Arg::Lit("summarize"))];
+    if let Some(key) = &key {
+        post_args.push(("key", Arg::Lit(key.as_str())));
+    }
+    let post = caos_curry(&me(), &post_args)?;
     let in_path = arg("in");
     caos_run(
         &fold_image(),
@@ -107,6 +119,11 @@ fn drive() -> Result<(), String> {
 /// a node tree `{ summary, <children…> }`: the node's own `summary` blob plus,
 /// for a directory, each child's result subtree carried through by hash.
 fn summarize() -> Result<(), String> {
+    // The key (if any) was curried in as --key; copy it into the environment so
+    // the API call reads it like any ANTHROPIC_API_KEY.
+    if let Some(key) = read_arg_opt("key")? {
+        std::env::set_var("ANTHROPIC_API_KEY", key);
+    }
     let in_path = arg("in");
     let node = scratch("node")?;
 
@@ -140,8 +157,9 @@ fn summarize() -> Result<(), String> {
 
 // ---- the "model": real Anthropic call, or a deterministic stand-in ------------
 
-/// The API key forwarded into this worker, if any (see the module doc). Empty or
-/// unset means run the local stand-in instead of calling the API.
+/// The API key for the call, read from the environment (the worker copies the
+/// `--key` argument into `ANTHROPIC_API_KEY` in `summarize`). Empty/unset means
+/// run the local stand-in instead of calling the API.
 fn anthropic_key() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY")
         .ok()

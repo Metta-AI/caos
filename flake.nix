@@ -642,13 +642,6 @@
               ports: ["9090:80"]
               environment:
                 CAOS_DOCKER_NETWORK: caos-net
-                # Forward the host's ANTHROPIC_API_KEY (if any) into the worker
-                # containers the server spawns, so the llm-summary worker can call
-                # the real API. Empty when unset — the worker then uses its local
-                # stand-in. The key rides in env, never the args tree, so it stays
-                # out of the request hash / result cache key.
-                CAOS_WORKER_ENV: ANTHROPIC_API_KEY
-                ANTHROPIC_API_KEY: "''${ANTHROPIC_API_KEY:-}"
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - "''${CAOS_DATA:?set CAOS_DATA to an absolute data dir}/server-repo.git:/git"

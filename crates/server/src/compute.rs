@@ -126,8 +126,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // pushed to the registry, and referenced by digest.
     let docker_ref = resolve_image(config, &image)?;
 
-    let mut command = Command::new(&config.docker_bin);
-    command
+    let output = Command::new(&config.docker_bin)
         .arg("run")
         .arg("--rm")
         .args(["--network", &config.network])
@@ -139,17 +138,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         // The cache-busting salt, re-passed by nested runs so the whole tree
         // shares it (empty = none).
         .args(["-e", &format!("CAOS_SALT={salt}")])
-        .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")]);
-    // Forward the configured host env vars (e.g. ANTHROPIC_API_KEY) into the
-    // worker, if set in the server's own environment. Via env, never the args
-    // tree, so a forwarded secret stays out of the request hash / result cache
-    // key. Empty allowlist (the default) forwards nothing.
-    for name in &config.worker_env {
-        if let Ok(value) = std::env::var(name) {
-            command.args(["-e", &format!("{name}={value}")]);
-        }
-    }
-    let output = command
+        .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&docker_ref)
         .arg("entrypoint")

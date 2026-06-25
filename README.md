@@ -145,11 +145,7 @@ Environment overrides: `SERVER_ADDR` (`0.0.0.0:80`), `CAOS_GIT_DIR` (`/git`),
 `CAOS_DOCKER_NETWORK` (`caos-net`), `CAOS_SERVER_URL` (`http://caos-server`,
 injected into each worker), `CAOS_REGISTRY_PUSH_URL`
 (`http://caos-registry:5000`), `CAOS_REGISTRY_PULL_HOST` (`localhost:5000`),
-`CAOS_DOCKER_BIN` (`docker`), `CAOS_REDIS_ADDR` (`caos-redis:6379`),
-`CAOS_WORKER_ENV` (empty) — a comma-separated allowlist of the server's own env
-vars to forward into each worker (e.g. `ANTHROPIC_API_KEY` for the `llm-summary`
-worker); forwarded via env, never the args tree, so a secret stays out of the
-request hash and result cache key.
+`CAOS_DOCKER_BIN` (`docker`), `CAOS_REDIS_ADDR` (`caos-redis:6379`).
 
 ### Compute
 

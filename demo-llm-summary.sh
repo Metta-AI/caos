@@ -5,12 +5,12 @@
 # summary and the directory summaries on the path to the root; every sibling is
 # a cache hit.
 #
-# Summaries are REAL Anthropic calls when the caos *server* has an
-# ANTHROPIC_API_KEY to forward to workers (see "Real summaries" below); with no
-# key the worker uses a deterministic local stand-in, so this demo runs anywhere
-# — no key, no egress. The incrementality is identical either way — and caching
-# even makes a nondeterministic model byte-reproducible here: an unchanged node
-# is a cache hit, never re-sampled.
+# Summaries are REAL Anthropic calls when ANTHROPIC_API_KEY is set in *this
+# script's* environment — it's passed to the worker as the --key argument (see
+# "Real summaries" below). With no key the worker uses a deterministic local
+# stand-in, so this demo runs anywhere — no key, no egress. The incrementality is
+# identical either way — and caching even makes a nondeterministic model
+# byte-reproducible here: an unchanged node is a cache hit, never re-sampled.
 #
 # The result mirrors the input tree: every node is `{ summary, <children…> }`,
 # so `<out>/summary` summarizes the whole tree and `<out>/guide/intro.md/summary`
@@ -27,10 +27,11 @@
 # Requires the dev daemons running (`tilt up`, or `nix run .#caosd`): the caos
 # server :9090, redis, registry — and a docker the server can reach.
 #
-# Real summaries: export your key before bringing the stack up, so the server
-# forwards it to workers (both stacks set CAOS_WORKER_ENV=ANTHROPIC_API_KEY):
+# Real summaries: export your key before running this script; it's passed to the
+# worker as `--key` (which then rides in the content-addressed request — stored
+# in the CAS and folded into the cache key):
 #   export ANTHROPIC_API_KEY=sk-ant-...
-#   tilt up            # or: nix run .#caosd
+#   ./demo-llm-summary.sh
 # The worker container also needs outbound HTTPS to api.anthropic.com.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -88,12 +89,17 @@ printf '# Setup\n\nInstall Nix and Docker, then run tilt up.\n'              > "
 printf '# Reference\n\nThe object, run, and git endpoints.\n'                > "$DOCS/api/reference.md"
 printf '# Errors\n\n400 malformed, 404 absent, 500 internal.\n'             > "$DOCS/api/errors.md"
 
+# Pass the API key to the worker as --key when one is set, else run keyless (the
+# worker's local stand-in). A key makes every summary a real Anthropic call.
+KEY_ARG=()
+[ -n "${ANTHROPIC_API_KEY:-}" ] && KEY_ARG=(--key="$ANTHROPIC_API_KEY")
+
 # Summarize the whole tree and materialize the result. ELAPSED is whole seconds
 # (portable: bash's SECONDS, so no GNU `date +%N` dependency on macOS).
 run() {
   rm -rf "$CAS/out"
   SECONDS=0
-  caos-cli run "$IMG" "$CAS/out" -- --in:@="$DOCS" >/dev/null
+  caos-cli run "$IMG" "$CAS/out" -- --in:@="$DOCS" "${KEY_ARG[@]}" >/dev/null
   ELAPSED=$SECONDS
   caos-cli get -r "$CAS/out" >/dev/null
 }
