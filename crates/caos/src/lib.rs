@@ -601,6 +601,72 @@ pub fn fetch_and_materialize(t: &dyn Transport, target: &Path, hash: &str) -> Re
     }
 }
 
+/// Fetch object `hash` and check it out at `target` as an ordinary, faithful
+/// on-disk node for use on the host, dispatched on its git tree-entry `kind`:
+/// a tree → a `0755` directory whose entries are checked out the same way,
+/// recursively; a symlink → a real symlink to the recorded target; a blob → a
+/// `0644` file holding its bytes, or `0755` for git's executable blob.
+///
+/// Unlike [`fetch_and_materialize`] — the worker's CAS form, which leaves
+/// owner-only placeholders and read-only, hash-tagged content and collapses every
+/// non-tree to a plain file — this is a plain `git checkout`-style tree: no
+/// placeholders, no xattrs, normal rw modes, symlinks and the exec bit preserved.
+/// It's what `caos-cli run` uses so the result is readable and editable on disk.
+fn checkout(
+    t: &dyn Transport,
+    target: &Path,
+    hash: &str,
+    kind: gix::objs::tree::EntryKind,
+) -> Result<(), String> {
+    use gix::objs::tree::EntryKind;
+    match kind {
+        EntryKind::Tree => {
+            let (_, content) = t.get_object(hash)?;
+            let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+                .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+            atomically(target, |tmp| {
+                std::fs::create_dir(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+                for entry in &tree.entries {
+                    let child = tmp.join(OsStr::from_bytes(entry.filename));
+                    checkout(t, &child, &entry.oid.to_string(), entry.mode.kind())?;
+                }
+                // Normal traversable/writable directory.
+                set_mode(tmp, 0o755)
+            })
+        }
+        EntryKind::Link => {
+            // A git symlink is a blob holding the link target; recreate the symlink.
+            let (_, content) = t.get_object(hash)?;
+            let dest = PathBuf::from(OsStr::from_bytes(&content));
+            atomically(target, |tmp| {
+                std::os::unix::fs::symlink(&dest, tmp)
+                    .map_err(|e| format!("linking {} -> {}: {e}", tmp.display(), dest.display()))
+            })
+        }
+        EntryKind::Blob | EntryKind::BlobExecutable => {
+            let (_, content) = t.get_object(hash)?;
+            atomically(target, |tmp| {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)
+                    .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+                file.write_all(&content)
+                    .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+                // Normal rw file, preserving git's executable bit.
+                let mode = if kind == EntryKind::BlobExecutable {
+                    0o755
+                } else {
+                    0o644
+                };
+                set_mode(tmp, mode)
+            })
+        }
+        // Gitlinks (submodule commits) never appear in trees caos builds.
+        EntryKind::Commit => Err(format!("cannot check out a gitlink ({hash}) to disk")),
+    }
+}
+
 /// Fetch object `hash`; if it's a tree, return its entries as owned values, else
 /// `None`.
 fn fetch_tree_entries(
@@ -1339,13 +1405,20 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
 }
 
 /// `run <image> <output> -- [--name=value ...]` — assemble the args into a git
-/// tree, ask the server to run `<image>` over that tree, and materialize the
-/// result at `<output>` (a direct child of the CAS directory).
+/// tree, ask the server to run `<image>` over that tree, and record the result at
+/// `<output>` (a direct child of the CAS directory).
+///
+/// `materialize` controls how the result is recorded. A worker passes `false`:
+/// the result stays on the server and `<output>` is just a typed, tagged
+/// placeholder it can `caos put`/`caos get` later. The user-facing CLI passes
+/// `true`: the whole result tree is fetched and written out so it's readable on
+/// the host directly, no placeholders left behind.
 pub fn caos_run(
     t: &dyn Transport,
     image: &str,
     output: &str,
     kvs: &[String],
+    materialize: bool,
 ) -> Result<(), String> {
     let cas = cas_dir();
     let target = validate_target(&cas, output)?;
@@ -1387,9 +1460,21 @@ pub fn caos_run(
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
     let (kind, result) = request_compute(&t.server_url()?, &req.to_string())?;
 
-    // Record the result as a typed, tagged placeholder — fetch nothing. The result
-    // stays on the server; `caos get <output>` loads it on demand if wanted.
-    write_placeholder(&target, &kind, &result)
+    if materialize {
+        // CLI: check the result out in full as ordinary rw files (the object and,
+        // for a tree, every descendant) so it's readable and editable on the host
+        // — no placeholders, no read-only CAS modes.
+        let root = if kind == "tree" {
+            gix::objs::tree::EntryKind::Tree
+        } else {
+            gix::objs::tree::EntryKind::Blob
+        };
+        checkout(t, &target, &result, root)
+    } else {
+        // Worker: record the result as a typed, tagged placeholder — fetch
+        // nothing. It stays on the server; `caos get <output>` loads it on demand.
+        write_placeholder(&target, &kind, &result)
+    }
 }
 
 /// Bundle a run request as a content-addressed object: a tree `{image, args,

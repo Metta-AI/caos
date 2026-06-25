@@ -59,7 +59,7 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, output, sep, kvs @ ..] if sep == "--" => {
                 let t = transport()?;
                 let image = caos::resolve_cli_image(&t, image)?;
-                caos::caos_run(&t, &image, output, kvs)
+                caos::caos_run(&t, &image, output, kvs, true)
             }
             _ => Err(usage(args)),
         },

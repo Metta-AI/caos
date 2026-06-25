@@ -247,14 +247,20 @@ modes are vestigial bookkeeping.
    `git push` to `refs/caos/req/<reqHash>`, plus a git image's own objects);
    the worker `caos` had POSTed it via `/object`;
 4. calls `/run?req=<reqHash>`;
-5. records the result at `<output>` as a **typed, tagged placeholder** — and
-   **fetches nothing**. The result stays on the server; `caos get <output>`
-   pulls the bytes on demand if you want them.
+5. records the result at `<output>`. Here `caos-cli` and the worker `caos`
+   differ: `caos-cli` **checks the result out in full** — fetching the object and
+   (for a tree) every descendant as ordinary rw files (`0644`/`0755`, git's
+   executable bit preserved), so it's readable and editable on the host directly.
+   A worker records a **typed, tagged placeholder** instead and **fetches
+   nothing**: the result stays on the server (read-only CAS modes), and `caos get
+   <output>` pulls the bytes on demand if it wants them.
 
-So a result never comes back to the caller automatically. A deep fold propagates
+So a result never comes back to a *worker* automatically. A deep fold propagates
 hashes up the tree, materializing only the leaves a worker actually reads. The
 worker, recursing, references child results by hash (it `link`s the placeholder
-and `caos put` reuses the recorded hash — no content needed).
+and `caos put` reuses the recorded hash — no content needed). Only at the top,
+where `caos-cli` returns the final result to the user, is the whole tree pulled
+down.
 
 `<image>` is a **git image by default** (a `/cas` path resolved to its recorded
 hash, or a bare git hash — e.g. a `caos curry` ref); an **ordinary docker image**
