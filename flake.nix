@@ -549,7 +549,7 @@
         stdImportLines = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
           (name: img: ''
             echo "  importing builtin: ${name}" >&2
-            hash="$(cd "$BARE" && caos-cli import-image "${img}" "$CAOS_CAS_DIR/${name}")"
+            hash="$(cd "$BARE" && caos-cli import-image "${img}")"
             printf '040000 tree %s\t%s\n' "$hash" "${name}" >> "$scratch/tree.txt"'')
           builtinImages);
 
@@ -617,11 +617,9 @@
             git -C "$BARE" config uploadpack.allowAnySHA1InWant true
 
             # caos-cli's git transport discovers the repo from the cwd, so the
-            # imports below `cd "$BARE"`; the CAS is throwaway scratch.
+            # imports below `cd "$BARE"`; scratch just collects the mktree lines.
             scratch="$(mktemp -d)"
             trap 'rm -rf "$scratch"' EXIT
-            export CAOS_CAS_DIR="$scratch/cas"
-            mkdir -p "$CAOS_CAS_DIR"
             : > "$scratch/tree.txt"
 
             ${stdImportLines}
