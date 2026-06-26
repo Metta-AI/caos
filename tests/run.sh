@@ -23,7 +23,7 @@ cd "$PROJECT"
 [ -f "$DIR/test.sh" ] || { echo "no test.sh in $DIR" >&2; exit 2; }
 
 echo "building caos client..." >&2
-nix build .#caos -o result-caos
+nix build .#caos-cli -o result-caos
 caosbin=$PROJECT/result-caos/bin/caos-cli
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 
