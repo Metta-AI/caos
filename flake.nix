@@ -28,17 +28,50 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
+        # The Linux system whose binaries the Docker images carry. We build for
+        # the host's architecture (no arch-cross), so on Linux this is just the
+        # host; on macOS it's the matching Linux system, whose general-purpose
+        # packages (git, tar, the docker client in the server image) are
+        # substituted prebuilt from the binary cache — no local Linux build, no VM.
+        linuxSystem = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64-linux" else "x86_64-linux";
+        linuxPkgs = import nixpkgs { system = linuxSystem; inherit overlays; };
+
         # Toolchain is pinned via ./rust-toolchain.toml + the flake.lock'd
         # rust-overlay revision, so every build uses the same compiler.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        # A Linux copy of the same toolchain, for worker images that bake a Rust
+        # compiler into the container (e.g. the rustc builder). On Linux this is
+        # the same as rustToolchain; on macOS it's a substituted Linux build.
+        linuxRustToolchain = linuxPkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         src = craneLib.cleanCargoSource ./.;
 
         # Build for musl so the binary is fully static (crt-static is on by
         # default for musl targets) — its runtime closure is just itself.
-        # Keep this in sync with the target in ./rust-toolchain.toml.
-        muslTarget = "x86_64-unknown-linux-musl";
+        # Target the build host's architecture, no arch-cross: aarch64 on Apple
+        # Silicon / aarch64 Linux, x86_64 otherwise. rust-toolchain.toml carries
+        # the std for both musl targets so either resolves.
+        muslTarget =
+          if pkgs.stdenv.hostPlatform.isAarch64 then
+            "aarch64-unknown-linux-musl"
+          else
+            "x86_64-unknown-linux-musl";
+        muslEnvTarget = pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] muslTarget);
+
+        # On macOS the default linker is Apple ld, which can't link Linux ELF (it
+        # rejects GNU flags like --as-needed). rust-lld ships inside the toolchain
+        # and links musl ELF cross-platform, so we need no C cross-toolchain.
+        # Linux hosts link musl with their native toolchain, so this override is
+        # Darwin-only — keeping Linux/CI builds byte-identical.
+        muslCrossLinker = pkgs.writeShellScript "caos-rust-lld" ''
+          sysroot="$(${rustToolchain}/bin/rustc --print sysroot)"
+          exec "$(echo "$sysroot"/lib/rustlib/*/bin/rust-lld)" "$@"
+        '';
+        crossLinkerEnv = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          "CARGO_TARGET_${muslEnvTarget}_LINKER" = "${muslCrossLinker}";
+          "CARGO_TARGET_${muslEnvTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes";
+        };
 
         commonArgs = {
           inherit src;
@@ -57,7 +90,8 @@
           # uses default-features = false, so it stays pure-Rust / static.)
           # buildInputs = [ ];
           # nativeBuildInputs = [ ];
-        };
+        }
+        // crossLinkerEnv;
 
         # Build all workspace dependencies once and cache them separately from
         # the crates — this is crane's key win for fast incremental rebuilds,
@@ -93,8 +127,10 @@
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
         # the published image names carry a `caos-` prefix.
-        # NOTE: Docker images are Linux-only; build these on Linux (or via a
-        # remote/linux builder on macOS).
+        # The images are Linux, but build on macOS too (no VM): the Rust binaries
+        # cross-compile for the host arch via rust-lld (see muslCrossLinker), and
+        # the server image's tools come from linuxPkgs — substituted prebuilt from
+        # the binary cache.
 
         # Worker images carry the `caos` binary (the worker-side client) at
         # `/bin/caos`. The `/cas` directory is *not* baked in — `caos entrypoint`
@@ -188,11 +224,11 @@
         workerBashContents = [
           workerBaseRoot
           workerBashScript
-          pkgs.bash
-          pkgs.coreutils
-          pkgs.diffutils
-          pkgs.gnugrep
-          pkgs.findutils
+          linuxPkgs.bash
+          linuxPkgs.coreutils
+          linuxPkgs.diffutils
+          linuxPkgs.gnugrep
+          linuxPkgs.findutils
         ];
         workerBashConfig = {
           Entrypoint = [
@@ -374,16 +410,16 @@
         '';
         # One merged root tree: the worker bits plus the build toolchain, so a
         # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc.
-        workerRustcRootEnv = pkgs.buildEnv {
+        workerRustcRootEnv = linuxPkgs.buildEnv {
           name = "caos-worker-rustc-root";
           paths = [
             workerBaseRoot
             workerRustcRoot
             workerCommonVendor
-            rustToolchain
-            pkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
-            pkgs.coreutils
-            pkgs.bash # cc-wrapper and cargo shell out to these
+            linuxRustToolchain
+            linuxPkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
+            linuxPkgs.coreutils
+            linuxPkgs.bash # cc-wrapper and cargo shell out to these
           ];
         };
         workerRustcContents = [ workerRustcRootEnv ];
@@ -419,15 +455,19 @@
         #     caos-server
         serverContents = [
           server
+          # General-purpose Linux tools the server shells out to. Pulled from a
+          # Linux nixpkgs (see linuxPkgs) so they're real ELF binaries — on macOS
+          # they're substituted prebuilt from the cache rather than built.
+          #
           # The server only ever shells out to `docker run`; it never builds or
           # composes, so drop the buildx + compose CLI plugins (~116 MiB).
-          (pkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
-          pkgs.gnutar
+          (linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
+          linuxPkgs.gnutar
           # `git http-backend` (and the `git` it dispatches): the smart-HTTP
           # transport the caos client uses as its `caos` remote. gitMinimal still
           # ships http-backend + core plumbing but drops git's python3/perl/docs
           # (~200 MiB) that the server never touches.
-          pkgs.gitMinimal
+          linuxPkgs.gitMinimal
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];
@@ -515,13 +555,32 @@
         # user-facing CLI on its PATH, bring the dev stack up, and publish the
         # builtin worker library — without the caos source tree or `tilt`.
 
-        # Just the user-facing CLI. The `caos` package carries *both* binaries
-        # (the worker-side `caos` baked into images and `caos-cli`); a consumer
-        # wants only `caos-cli` in its devShell.
-        caos-cli = pkgs.runCommand "caos-cli" { } ''
-          mkdir -p $out/bin
-          cp ${caos}/bin/caos-cli $out/bin/caos-cli
-        '';
+        # Just the user-facing CLI (a consumer wants only `caos-cli`, not the
+        # worker-side `caos`, in its devShell) — and it runs on the *host*. On
+        # Linux the musl `caos-cli` already runs on the host, so copy it straight
+        # out of the `caos` package; on macOS that's a Linux binary, so build a
+        # native `caos-cli` for the host instead.
+        nativeArgs = {
+          inherit src;
+          strictDeps = true;
+          pname = "caos-cli";
+          version = "0.1.0";
+        };
+        caos-cli =
+          if pkgs.stdenv.hostPlatform.isLinux then
+            pkgs.runCommand "caos-cli" { } ''
+              mkdir -p $out/bin
+              cp ${caos}/bin/caos-cli $out/bin/caos-cli
+            ''
+          else
+            craneLib.buildPackage (
+              nativeArgs
+              // {
+                cargoArtifacts = craneLib.buildDepsOnly nativeArgs;
+                cargoExtraArgs = "--package caos --bin caos-cli";
+                doCheck = false;
+              }
+            );
 
         # All the host-facing caos commands in one package, so a consumer lists
         # *this* in its devShell and gets `caos-cli` and `caosd` on PATH together
@@ -764,7 +823,11 @@
           );
 
           fmt = craneLib.cargoFmt { inherit src; };
-
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # cargoTest builds *and runs* the test binaries, which are musl/Linux —
+          # they can't execute on a macOS host, so this check is Linux-only.
+          # On macOS, run tests in the dev shell with `cargo test` (native target).
           test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
         };
 
