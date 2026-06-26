@@ -458,11 +458,16 @@
           # General-purpose Linux tools the server shells out to. Pulled from a
           # Linux nixpkgs (see linuxPkgs) so they're real ELF binaries — on macOS
           # they're substituted prebuilt from the cache rather than built.
-          linuxPkgs.docker-client
+          #
+          # The server only ever shells out to `docker run`; it never builds or
+          # composes, so drop the buildx + compose CLI plugins (~116 MiB).
+          (linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
           linuxPkgs.gnutar
           # `git http-backend` (and the `git` it dispatches): the smart-HTTP
-          # transport the caos client uses as its `caos` remote.
-          linuxPkgs.git
+          # transport the caos client uses as its `caos` remote. gitMinimal still
+          # ships http-backend + core plumbing but drops git's python3/perl/docs
+          # (~200 MiB) that the server never touches.
+          linuxPkgs.gitMinimal
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];
@@ -606,8 +611,24 @@
         # bare repo and appends its `git mktree` line (name -> image tree).
         stdImportLines = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
           (name: img: ''
-            echo "  importing builtin: ${name}" >&2
-            hash="$(cd "$BARE" && caos-cli import-image "${img}")"
+            # Reuse a prior import of this exact image rather than re-unpacking and
+            # re-hashing it on every startup (multi-second for a big image like
+            # rustc, even when every resulting git object already exists). The
+            # image's nix store path is immutable and content-addressed, so we pin
+            # a marker ref refs/caos/src/<storepath-hash> at the imported tree: its
+            # presence means "already imported", and it also keeps those objects
+            # from gc. Robust both ways — wipe the repo and the ref goes with it
+            # (re-import); change an image and its store path changes, so it's a new
+            # ref (re-import).
+            src_ref="refs/caos/src/$(printf '%s' "${img}" | sha1sum | cut -c1-40)"
+            hash="$(git -C "$BARE" rev-parse --verify --quiet "$src_ref^{tree}" || true)"
+            if [ -n "$hash" ]; then
+              echo "  builtin ${name}: reusing import $hash" >&2
+            else
+              echo "  builtin ${name}: importing..." >&2
+              hash="$(cd "$BARE" && caos-cli import-image "${img}")"
+              git -C "$BARE" update-ref "$src_ref" "$hash"
+            fi
             printf '040000 tree %s\t%s\n' "$hash" "${name}" >> "$scratch/tree.txt"'')
           builtinImages);
 
@@ -702,8 +723,21 @@
             export CAOS_DATA
             mkdir -p "$CAOS_DATA"
 
-            echo "==> loading caos-server image into docker" >&2
-            docker load -i ${serverImage}
+            # Load the server image only when this exact build isn't already in
+            # docker. We tag the loaded image with a hash of its (immutable) nix
+            # store path; the tag's presence means "this build is loaded", so an
+            # unchanged restart skips the multi-second `docker load`. Same idea as
+            # the stdlib import marker, on the docker side: remove the image and the
+            # tag goes with it (reload); change the image and its store path — hence
+            # the tag — changes (reload).
+            src_tag="caos-server-src:$(printf '%s' "${serverImage}" | sha1sum | cut -c1-12)"
+            if docker image inspect "$src_tag" >/dev/null 2>&1; then
+              echo "==> caos-server image already loaded — skipping docker load" >&2
+            else
+              echo "==> loading caos-server image into docker" >&2
+              docker load -i ${serverImage}
+              docker tag caos-server:latest "$src_tag"
+            fi
 
             echo "==> publishing stdlib into $CAOS_DATA/server-repo.git" >&2
             set-stdlib
