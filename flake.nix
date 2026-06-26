@@ -419,11 +419,15 @@
         #     caos-server
         serverContents = [
           server
-          pkgs.docker-client
+          # The server only ever shells out to `docker run`; it never builds or
+          # composes, so drop the buildx + compose CLI plugins (~116 MiB).
+          (pkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
           pkgs.gnutar
           # `git http-backend` (and the `git` it dispatches): the smart-HTTP
-          # transport the caos client uses as its `caos` remote.
-          pkgs.git
+          # transport the caos client uses as its `caos` remote. gitMinimal still
+          # ships http-backend + core plumbing but drops git's python3/perl/docs
+          # (~200 MiB) that the server never touches.
+          pkgs.gitMinimal
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];
