@@ -34,11 +34,15 @@
         # packages (git, tar, the docker client in the server image) are
         # substituted prebuilt from the binary cache — no local Linux build, no VM.
         linuxSystem = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64-linux" else "x86_64-linux";
-        linuxPkgs = import nixpkgs { system = linuxSystem; };
+        linuxPkgs = import nixpkgs { system = linuxSystem; inherit overlays; };
 
         # Toolchain is pinned via ./rust-toolchain.toml + the flake.lock'd
         # rust-overlay revision, so every build uses the same compiler.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        # A Linux copy of the same toolchain, for worker images that bake a Rust
+        # compiler into the container (e.g. the rustc builder). On Linux this is
+        # the same as rustToolchain; on macOS it's a substituted Linux build.
+        linuxRustToolchain = linuxPkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         src = craneLib.cleanCargoSource ./.;
@@ -220,11 +224,11 @@
         workerBashContents = [
           workerBaseRoot
           workerBashScript
-          pkgs.bash
-          pkgs.coreutils
-          pkgs.diffutils
-          pkgs.gnugrep
-          pkgs.findutils
+          linuxPkgs.bash
+          linuxPkgs.coreutils
+          linuxPkgs.diffutils
+          linuxPkgs.gnugrep
+          linuxPkgs.findutils
         ];
         workerBashConfig = {
           Entrypoint = [
@@ -406,16 +410,16 @@
         '';
         # One merged root tree: the worker bits plus the build toolchain, so a
         # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc.
-        workerRustcRootEnv = pkgs.buildEnv {
+        workerRustcRootEnv = linuxPkgs.buildEnv {
           name = "caos-worker-rustc-root";
           paths = [
             workerBaseRoot
             workerRustcRoot
             workerCommonVendor
-            rustToolchain
-            pkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
-            pkgs.coreutils
-            pkgs.bash # cc-wrapper and cargo shell out to these
+            linuxRustToolchain
+            linuxPkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
+            linuxPkgs.coreutils
+            linuxPkgs.bash # cc-wrapper and cargo shell out to these
           ];
         };
         workerRustcContents = [ workerRustcRootEnv ];

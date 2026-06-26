@@ -26,7 +26,13 @@ use worker_common::{arg, caos, entries, file_name, link, path, run_worker, scrat
 const VENDOR_WORKER_COMMON: &str = "/vendor/worker-common";
 
 /// Static target, so the produced `/worker` needs no libc in its image.
-const TARGET: &str = "x86_64-unknown-linux-musl";
+/// Detected at compile time so the rustc worker image targets the
+/// architecture it was built for.
+const TARGET: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64-unknown-linux-musl"
+} else {
+    "x86_64-unknown-linux-musl"
+};
 
 fn main() -> ExitCode {
     run_worker("rustc", run)
@@ -128,8 +134,14 @@ fn cargo_toml() -> String {
 /// converts the image, so we leave them empty. `Env` carries `PATH` so the
 /// worker can find the setuid `caos` at `/bin`.
 fn image_config() -> String {
-    r#"{"architecture":"amd64","os":"linux",
-       "config":{"Entrypoint":["/bin/caos","entrypoint"],"Env":["PATH=/bin"]},
-       "rootfs":{"type":"layers","diff_ids":[]}}"#
-        .to_string()
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    format!(
+        r#"{{"architecture":"{arch}","os":"linux",
+       "config":{{"Entrypoint":["/bin/caos","entrypoint"],"Env":["PATH=/bin"]}},
+       "rootfs":{{"type":"layers","diff_ids":[]}}}}"#
+    )
 }
