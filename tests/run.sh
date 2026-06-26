@@ -39,18 +39,18 @@ echo "publishing std: ${builtins[*]:-<all>}..." >&2
 ./build-builtins.sh "${builtins[@]}" >/dev/null
 
 # A throwaway client repo with the server as its `caos` remote (the host CLI
-# pushes the run request from here) and a CAS for the materialized result.
+# pushes the run request from here). The result (the test's exit status is what
+# matters) is checked out to a plain host path.
 CLIENT=$PROJECT/.caos-dev/test-client
 rm -rf "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
-CAS=$PROJECT/.caos-dev/test-cas
-rm -rf "$CAS"; mkdir -p "$CAS"
-export CAOS_CAS_DIR=$CAS
-trap 'rm -rf "$CLIENT" "$CAS"' EXIT
+OUT=$PROJECT/.caos-dev/test-out
+rm -rf "$OUT"
+trap 'rm -rf "$CLIENT" "$OUT"' EXIT
 
 # Run the test inside a bash worker: test.sh is the script; the whole directory
 # rides along as `test` (materialized at /cas/args/test).
 echo "running $1 inside a bash worker..." >&2
-( cd "$CLIENT" && "$caosbin" run /cas/std/bash "$CAS/out" -- \
+( cd "$CLIENT" && "$caosbin" run /cas/std/bash "$OUT" -- \
     --script:@="$DIR/test.sh" --test:@="$DIR" ) >/dev/null
 echo "PASS: $1" >&2

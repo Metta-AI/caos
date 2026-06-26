@@ -60,7 +60,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // fixed arguments from the (possibly empty) list of key/value args.
         Some("run") => match &args[2..] {
             [image, output, sep, kvs @ ..] if sep == "--" => {
-                caos::caos_run(&http()?, image, output, kvs, false)
+                caos::caos_run(&http()?, image, output, kvs)
             }
             _ => Err(usage(args)),
         },

@@ -202,8 +202,9 @@ logic — the difference is the **transport** and the privilege model.
   `entrypoint`.
 - **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
   builds objects in the local working repo and exchanges them by negotiated
-  push/fetch. Subcommands: `get-hash`, `get`, `put`, `import-image`, `resolve`,
-  `run`, `curry`. No `entrypoint`.
+  push/fetch. It has no `/cas` and no object-level commands — just two:
+  - `run` — compute, with the result checked out to any host path;
+  - `import-image` — get a docker image into caos, printing its hash.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote, and `CAOS_SERVER_URL` set (used for `/run` and to fetch results):
@@ -211,13 +212,12 @@ remote, and `CAOS_SERVER_URL` set (used for `/run` and to fetch results):
 ```bash
 git remote add caos http://localhost:9090
 export CAOS_SERVER_URL=http://localhost:9090
-export CAOS_CAS_DIR=$PWD/.caos-cas      # a local working CAS (see below)
 ```
 
 ### The CAS and `/cas`
 
-Objects are materialized under a CAS directory (`/cas`, or `$CAOS_CAS_DIR`).
-`get-hash`/`get`/`put`/`run` all operate there, and every materialized path is
+`/cas` is a **worker** thing — there's no CAS on the host. Inside a worker the
+`caos` binary materializes objects under `/cas`, and every materialized path is
 tagged with the git hash it came from in the `user.caos.hash` xattr — the
 on-disk, per-path mapping from a path back to its hash. Writes are atomic (build
 in a temp sibling, set the xattr, `rename` into place), so concurrent runs never
@@ -228,12 +228,12 @@ xattrs.
 the CAS): a **blob** becomes a file; a **tree** becomes a directory of one-level
 **placeholders** (empty, hash-tagged — a dir for subtrees, a file otherwise).
 `get [-r|--recursive[=<n>]] <path>` expands a placeholder in place: one level by
-default, `<n>` levels, or the whole subtree with `-r`. So you drill down a tree
-lazily, one level at a time, and `get -r` is idempotent/resumable.
+default, `<n>` levels, or the whole subtree with `-r`. So a worker drills down a
+tree lazily, one level at a time, and `get -r` is idempotent/resumable.
 
-On a worker, `/cas` is genuinely protected (see [permissions](#permissions-load-before-read-and-no-tampering));
-under `caos-cli` it's just a local working directory you own, and the permission
-modes are vestigial bookkeeping.
+`/cas` is genuinely protected (see [permissions](#permissions-load-before-read-and-no-tampering)):
+everything is root-owned, and the unprivileged worker reaches it only through the
+setuid `caos`.
 
 ### Requests and results
 
@@ -262,9 +262,11 @@ and `caos put` reuses the recorded hash — no content needed). Only at the top,
 where `caos-cli` returns the final result to the user, is the whole tree pulled
 down.
 
-`<image>` is a **git image by default** (a `/cas` path resolved to its recorded
-hash, or a bare git hash — e.g. a `caos curry` ref); an **ordinary docker image**
-is written `docker://<ref>`.
+`<image>` is a **git image by default**: a bare git hash (e.g. an `import-image`
+output or, in a worker, a `caos curry` ref), or — on `caos-cli` — a
+`/cas/std/<name>` builtin resolved against the published library. Inside a worker
+it can also be any `/cas` path, resolved to the hash recorded on it. An **ordinary
+docker image** is written `docker://<ref>`.
 
 ### Arguments: literals and paths
 
@@ -275,7 +277,7 @@ escaping):
 - `--name=value` → a literal string, stored as a blob;
 - `--name:@=path` → a path (the `@` nods to curl/HTTPie). It's resolved doing as
   little work as possible:
-  - inside `$CAOS_CAS_DIR` → reference the hash recorded on it (no read);
+  - a `/cas` path (worker) → reference the hash recorded on it (no read);
   - a host path (caos-cli) → ingest via git, reusing git's own objects:
     - **clean + tracked** → reuse the committed hash from `git ls-tree HEAD` — no
       read at all, so a large unchanged directory is effectively free;
@@ -293,22 +295,22 @@ today, leaving room for more. The worker `caos` has no host filesystem (only
 
 ### Other subcommands
 
-- `put <src-path> <cas-path>` — store an outside path into the CAS and record it
-  at a `/cas` path. Files become blobs, directories trees; a symlink into the CAS
-  reuses the recorded hash. (`caos-cli` writes objects to the local repo; the
-  worker POSTs them.)
-- `import-image <docker-archive> <cas-path>` (`caos-cli`) — store a docker-archive
-  image (`nix build .#caos-*-docker` output) as a git-docker tree, printing its
-  hash. Used to ingest images into the CAS so they can be `run`.
-- `resolve <ref>` (`caos-cli`) — print the tree hash a local git ref points at
-  (peeling commits/tags), e.g. `caos resolve refs/caos/std`. Ref name → hash; it
-  does **not** hash filesystem paths.
-- `curry <image> -- [--name=value | --name:@=path …]` — bind some args to an
-  image, printing a ref to the curried image. It's a small content-addressed tree
-  (`base`, `args`, a `.caos-curry` marker); `run`/`curry` expand it client-side
-  (call args win), so the server only ever sees a plain image + args. Currying
-  flattens, so it's canonical.
-- `entrypoint [--args=<hash>]` (`caos` only) — the container entrypoint; see below.
+`import-image` is the only other `caos-cli` command; the rest are **worker** (`caos`)
+commands, operating on `/cas`.
+
+- `import-image <docker-archive>` (`caos-cli`) — store a docker-archive image
+  (`nix build .#caos-*-docker` output) as a git-docker tree on the server,
+  printing its hash. Used to ingest images into caos so they can be `run` (and to
+  assemble the std library — see `build-builtins.sh`).
+- `put <src-path> <cas-path>` (`caos`) — store an outside path into the CAS and
+  record it at a `/cas` path. Files become blobs, directories trees; a symlink
+  into the CAS reuses the recorded hash.
+- `curry <image> -- [--name=value | --name:@=path …]` (`caos`) — bind some args to
+  an image, printing a ref to the curried image. It's a small content-addressed
+  tree (`base`, `args`, a `.caos-curry` marker); `run`/`curry` expand it
+  client-side (call args win), so the server only ever sees a plain image + args.
+  Currying flattens, so it's canonical.
+- `entrypoint [--args=<hash>]` (`caos`) — the container entrypoint; see below.
 
 ### `entrypoint`
 
@@ -341,8 +343,9 @@ file modes:
   `/cas` only through `caos`, which is **setuid-root** in the image (and static,
   so no dynamic-linker attack surface).
 
-Outside a container (`caos-cli`, `CAOS_CAS_DIR` a directory you own) the rules
-relax — you own everything, so the modes are just bookkeeping.
+There's no `/cas` outside a container: `caos-cli` never materializes objects
+locally — it pushes/fetches git objects and checks a `run` result out as ordinary
+files.
 
 ## Workers
 
@@ -376,9 +379,10 @@ curry` wrappers, result staging).
 The standard library is a `{name: git-docker-image}` tree reached by workers as
 `/cas/std/<name>`. It's published to the server under `refs/caos/std` by
 `./build-builtins.sh` (which imports each worker image into a client repo and
-`git push`es the assembled tree — one push uploads every referenced image). A
-client `git fetch`es `refs/caos/std`, `caos-cli resolve`s it locally to a tree
-hash, and `caos run` threads that hash through as the request's `std`.
+`git push`es the assembled tree — one push uploads every referenced image).
+`caos-cli run` resolves a `/cas/std/<name>` image against this library (fetching
+`refs/caos/std` from the server if needed) and threads its tree hash through as
+the request's `std`.
 
 Because `std` is part of every request (hence every cache key), bumping the
 built-ins recomputes everything that could reach them — coarse but correct. The

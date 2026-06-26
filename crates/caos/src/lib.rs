@@ -349,7 +349,7 @@ impl GitTransport {
         // A file (anywhere) hashes directly; a directory outside the worktree we
         // read in full (`store` walks it and writes objects via `put_object`).
         if abs.is_dir() {
-            store(self, &PathBuf::from("/\0"), &abs)
+            store(self, None, &abs)
         } else {
             let oid = self.hash_file(&abs)?;
             let exec = std::fs::metadata(&abs)
@@ -1021,15 +1021,17 @@ pub fn put(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
 
-    let (_, oid) = store(t, &cas_real, Path::new(src))?;
+    let (_, oid) = store(t, Some(&cas_real), Path::new(src))?;
     fetch_and_materialize(t, &target, &oid.to_string())
 }
 
 /// Recursively store `path` via the transport, returning the git tree entry
-/// (mode + oid) that refers to it.
+/// (mode + oid) that refers to it. `cas_real` is the canonical CAS root, used to
+/// reuse the recorded hash of a symlink that resolves into the CAS; pass `None`
+/// (e.g. `import-image`) to always store symlinks as git symlinks.
 fn store(
     t: &dyn Transport,
-    cas_real: &Path,
+    cas_real: Option<&Path>,
     path: &Path,
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
     use gix::objs::tree::EntryKind;
@@ -1040,9 +1042,11 @@ fn store(
     if ft.is_symlink() {
         // A symlink that resolves into the CAS: reuse the hash recorded there
         // instead of re-reading the target.
-        if let Ok(canon) = path.canonicalize() {
-            if canon != cas_real && canon.starts_with(cas_real) {
-                return cas_entry(&canon);
+        if let Some(cas_real) = cas_real {
+            if let Ok(canon) = path.canonicalize() {
+                if canon != cas_real && canon.starts_with(cas_real) {
+                    return cas_entry(&canon);
+                }
             }
         }
         // Otherwise store it as a git symlink: a blob holding the link target.
@@ -1095,25 +1099,19 @@ fn cas_entry(canon: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId)
     Ok((kind.into(), parse_oid(&read_hash(canon)?)?))
 }
 
-/// `import-image <docker-archive> <cas-path>` — store a docker-archive image (the
-/// kind `nix build .#caos-*-docker` / `docker save` produce) into the CAS in
-/// git-docker form: a tree holding `config.json` (the image config, verbatim) and
-/// one `layer<NN>` subtree per layer (the layer tar's extracted filesystem),
-/// materialized at `<cas-path>`. `run <cas-path>` then has the server convert it
-/// back into a real image. Prints the stored git-docker tree's hash.
+/// `import-image <docker-archive>` — store a docker-archive image (the kind `nix
+/// build .#caos-*-docker` / `docker save` produce) into caos in git-docker form:
+/// a tree holding `config.json` (the image config, verbatim) and one `layer<NN>`
+/// subtree per layer (the layer tar's extracted filesystem). Prints the stored
+/// git-docker tree's hash, which a caller can `run` (the server converts it back
+/// into a real image) or assemble into a larger tree (the built-ins library
+/// does this). Nothing is materialized locally — there is no `/cas` on the host.
 ///
 /// Only the layer *contents* are captured (files, the exec bit, and symlinks);
 /// mtimes/owners are dropped, which is fine — the server re-tars the trees
 /// deterministically and generates the diff_ids itself.
-pub fn import_image(t: &dyn Transport, archive: &str, dst: &str) -> Result<(), String> {
+pub fn import_image(t: &dyn Transport, archive: &str) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
-
-    let cas = cas_dir();
-    let target = validate_target(&cas, dst)?;
-    probe_xattr(&cas)?;
-    let cas_real = cas
-        .canonicalize()
-        .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
 
     let work = scratch_dir()?;
     let outcome = (|| {
@@ -1162,7 +1160,7 @@ pub fn import_image(t: &dyn Transport, archive: &str, dst: &str) -> Result<(), S
             // Record perms/ownership a git tree can't carry, as sidecars beside
             // each entry, before storing the layer as a tree.
             write_layer_metadata(&layer_bytes, &layer_dir)?;
-            let (_, oid) = store(t, &cas_real, &layer_dir)?;
+            let (_, oid) = store(t, None, &layer_dir)?;
             entries.push(Entry {
                 mode: EntryKind::Tree.into(),
                 filename: format!("layer{i:02}").into_bytes().into(),
@@ -1172,9 +1170,7 @@ pub fn import_image(t: &dyn Transport, archive: &str, dst: &str) -> Result<(), S
         }
 
         let image_oid = post_tree(t, entries)?;
-        fetch_and_materialize(t, &target, &image_oid.to_string())?;
-        // Print the stored git-docker tree's hash, e.g. so a script can assemble
-        // it into a larger tree (the built-ins library does this).
+        // Print the stored git-docker tree's hash — the caller's handle to it.
         println!("{image_oid}");
         Ok(())
     })();
@@ -1310,19 +1306,17 @@ fn scratch_dir() -> Result<PathBuf, String> {
 /// Each `--name[:type]=value` becomes a tree entry `name` (see [`parse_kv`]):
 /// * `--name=value` — a literal, stored verbatim as a blob;
 /// * `--name:@=path` inside the CAS — references the object that path was
-///   materialized from (its recorded hash);
+///   materialized from (its recorded hash). Only when `cas` is `Some` (the
+///   worker); the CLI passes `None`, so every path is a host path;
 /// * `--name:@=path` elsewhere — a host path, ingested via the transport (the git
 ///   transport reuses git's recorded objects — see [`GitTransport::ingest_path`]);
 ///   a worker has no host filesystem, so this is an error there.
 fn build_arg_entries(
     t: &dyn Transport,
-    cas: &Path,
+    cas: Option<&Path>,
     kvs: &[String],
 ) -> Result<Vec<gix::objs::tree::Entry>, String> {
     use gix::objs::tree::{Entry, EntryKind};
-
-    // Canonical CAS root, resolved lazily — only needed if a CAS path appears.
-    let cas_real = cas.canonicalize();
 
     let mut entries = Vec::new();
     for kv in kvs {
@@ -1335,14 +1329,15 @@ fn build_arg_entries(
                 post_object(t, "blob", v.as_bytes())?,
             ),
             // `--name:@=path` under the CAS — reference whatever it was made from.
-            ArgValue::Path(p) if Path::new(p).starts_with(cas) => {
+            ArgValue::Path(p) if cas.is_some_and(|c| Path::new(p).starts_with(c)) => {
+                let cas = cas.expect("checked is_some_and above");
                 let canon = Path::new(p)
                     .canonicalize()
                     .map_err(|e| format!("{p}: {e}"))?;
-                let cas_real = cas_real
-                    .as_ref()
+                let cas_real = cas
+                    .canonicalize()
                     .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
-                if !canon.starts_with(cas_real) {
+                if !canon.starts_with(&cas_real) {
                     return Err(format!("{p} resolves outside {}", cas.display()));
                 }
                 cas_entry(&canon)?
@@ -1404,38 +1399,23 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
     Ok((name, value))
 }
 
-/// `run <image> <output> -- [--name=value ...]` — assemble the args into a git
-/// tree, ask the server to run `<image>` over that tree, and record the result at
-/// `<output>` (a direct child of the CAS directory).
-///
-/// `materialize` controls how the result is recorded. A worker passes `false`:
-/// the result stays on the server and `<output>` is just a typed, tagged
-/// placeholder it can `caos put`/`caos get` later. The user-facing CLI passes
-/// `true`: the whole result tree is fetched and written out so it's readable on
-/// the host directly, no placeholders left behind.
-pub fn caos_run(
+/// Resolve curry layers, build the args tree, bundle + push the request, and run
+/// it — the part of `run` shared by the worker and the CLI. Returns the server's
+/// `(kind, result-hash)`. `cas` is the CAS root, used to resolve `/cas`-path args
+/// (the worker); pass `None` to treat every path arg as a host path to ingest
+/// (the CLI).
+fn run_request(
     t: &dyn Transport,
     image: &str,
-    output: &str,
+    cas: Option<&Path>,
     kvs: &[String],
-    materialize: bool,
-) -> Result<(), String> {
-    let cas = cas_dir();
-    let target = validate_target(&cas, output)?;
-    probe_xattr(&cas)?;
-
-    // Resolve the image: a CAS path becomes the git hash recorded on it, so the
-    // server converts it from our git-docker form; a `docker://` ref or a
-    // bare hash is sent through unchanged.
-    let image = resolve_run_image(&cas, image)?;
-
+) -> Result<(String, String), String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it, so the server only ever sees a plain image + args.
-    let (image, bound) = unwrap_curry(t, &image)?;
+    let (image, bound) = unwrap_curry(t, image)?;
 
     // Build the call's args, then merge them over the bound ones (call wins).
-    // Nothing is written under /cas — the worker materializes the tree itself.
-    let call = build_arg_entries(t, &cas, kvs)?;
+    let call = build_arg_entries(t, cas, kvs)?;
     let args_tree = post_tree(t, merge_entries(bound, call))?;
 
     // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
@@ -1458,23 +1438,50 @@ pub fn caos_run(
 
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    let (kind, result) = request_compute(&t.server_url()?, &req.to_string())?;
+    request_compute(&t.server_url()?, &req.to_string())
+}
 
-    if materialize {
-        // CLI: check the result out in full as ordinary rw files (the object and,
-        // for a tree, every descendant) so it's readable and editable on the host
-        // — no placeholders, no read-only CAS modes.
-        let root = if kind == "tree" {
-            gix::objs::tree::EntryKind::Tree
-        } else {
-            gix::objs::tree::EntryKind::Blob
-        };
-        checkout(t, &target, &result, root)
+/// `run <image> <output> -- [--name=value ...]` — the *worker* form: assemble the
+/// args (paths under `/cas` reference recorded objects), run `<image>`, and record
+/// the result at `<output>` (a direct child of the CAS) as a typed, tagged
+/// placeholder — fetching nothing. It stays on the server; `caos get <output>`
+/// loads it on demand. (The user-facing CLI uses [`cli_run`] instead.)
+pub fn caos_run(
+    t: &dyn Transport,
+    image: &str,
+    output: &str,
+    kvs: &[String],
+) -> Result<(), String> {
+    let cas = cas_dir();
+    let target = validate_target(&cas, output)?;
+    probe_xattr(&cas)?;
+
+    // A CAS path becomes the git hash recorded on it; a `docker://` ref or a bare
+    // hash is sent through unchanged.
+    let image = resolve_run_image(&cas, image)?;
+    let (kind, result) = run_request(t, &image, Some(&cas), kvs)?;
+    write_placeholder(&target, &kind, &result)
+}
+
+/// `run <image | /cas/std/<name>> <output> -- [--name=value | --name:@=path ...]`
+/// — the *CLI* form. `<output>` is any path on the host; the whole result tree is
+/// checked out there in full as ordinary rw files. There is no `/cas` here:
+/// path-valued args are host paths the transport ingests, and `<image>` is a
+/// `docker://` ref, a bare hash, or a `/cas/std/<name>` builtin (resolved against
+/// the published library).
+pub fn cli_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
+    let target = PathBuf::from(output);
+    let image = resolve_cli_image(t, image)?;
+    let (kind, result) = run_request(t, &image, None, kvs)?;
+
+    // Check the result out in full as ordinary rw files — the object and, for a
+    // tree, every descendant — so it's readable and editable on the host.
+    let root = if kind == "tree" {
+        gix::objs::tree::EntryKind::Tree
     } else {
-        // Worker: record the result as a typed, tagged placeholder — fetch
-        // nothing. It stays on the server; `caos get <output>` loads it on demand.
-        write_placeholder(&target, &kind, &result)
-    }
+        gix::objs::tree::EntryKind::Blob
+    };
+    checkout(t, &target, &result, root)
 }
 
 /// Bundle a run request as a content-addressed object: a tree `{image, args,
@@ -1676,7 +1683,7 @@ pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), 
     let (image, bound) = unwrap_curry(t, &image)?;
 
     // New bindings override any already bound to the same name.
-    let args = merge_entries(bound, build_arg_entries(t, &cas, kvs)?);
+    let args = merge_entries(bound, build_arg_entries(t, Some(&cas), kvs)?);
     let args_tree = post_tree(t, args)?;
 
     let entries = vec![

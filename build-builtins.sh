@@ -32,22 +32,17 @@ git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
   || git -C "$CLIENT" remote set-url caos "$SERVER_URL"
 
-CAS=$PROJECT/.caos-dev/builtins-cas
-rm -rf "$CAS"; mkdir -p "$CAS"
-export CAOS_CAS_DIR=$CAS
-trap 'rm -rf "$CAS"' EXIT
-
 image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
 
 # Build + import each builtin, collecting `git mktree` lines (name -> tree hash).
 # `import-image` (run inside the client repo, so its git transport finds it)
-# writes the git-docker tree locally and prints its hash.
+# stores the git-docker tree on the server and prints its hash.
 entries=""
 for name in "${names[@]}"; do
   attr=$(image_attr "$name")
   echo "building + importing $name ($attr)..." >&2
   nix build ".#$attr" -o "result-builtin-$name"
-  hash=$(cd "$CLIENT" && "$caos" import-image "$PROJECT/result-builtin-$name" "$CAS/$name")
+  hash=$(cd "$CLIENT" && "$caos" import-image "$PROJECT/result-builtin-$name")
   entries+="040000 tree $hash"$'\t'"$name"$'\n'
 done
 
