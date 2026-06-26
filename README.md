@@ -262,6 +262,13 @@ and `caos put` reuses the recorded hash — no content needed). Only at the top,
 where `caos-cli` returns the final result to the user, is the whole tree pulled
 down.
 
+**Failures propagate.** If a worker exits non-zero, `entrypoint` makes the
+container fail, the server answers `/run` with `500` carrying the worker's stderr,
+and the caller's `run` returns that as an error — so `caos run`/`caos-cli run`
+fails (non-zero exit) with the worker's message. This holds at any depth: a
+failure deep in a fold travels up through each parent's `caos run` to the
+top-level `caos-cli run`. (The run-cycle error is one such case.)
+
 `<image>` is a **git image by default**: a bare git hash (e.g. an `import-image`
 output or, in a worker, a `caos curry` ref), or — on `caos-cli` — a
 `/cas/std/<name>` builtin resolved against the published library. Inside a worker
