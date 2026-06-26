@@ -237,7 +237,8 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos run <image> <output> -- [--name=value | --name:@=path …]`:
+`caos run <image> <output> -- [--name=value | --name:@=path …]` (on `caos-cli`,
+`<output>` may be omitted — see step 5):
 
 1. assembles the args into a git **tree** (see [arguments](#arguments-literals-and-paths));
 2. bundles `{image, args, std, salt}` into a content-addressed **request object**
@@ -251,9 +252,12 @@ setuid `caos`.
    differ: `caos-cli` **checks the result out in full** — fetching the object and
    (for a tree) every descendant as ordinary rw files (`0644`/`0755`, git's
    executable bit preserved), so it's readable and editable on the host directly.
-   A worker records a **typed, tagged placeholder** instead and **fetches
-   nothing**: the result stays on the server (read-only CAS modes), and `caos get
-   <output>` pulls the bytes on demand if it wants them.
+   `<output>` is optional on `caos-cli`: with it omitted, a **file** result is
+   streamed to **stdout** (handy for `| less` or `> file`); a **tree** result has
+   no single stream, so it still needs an `<output>` path. A worker records a
+   **typed, tagged placeholder** instead and **fetches nothing**: the result
+   stays on the server (read-only CAS modes), and `caos get <output>` pulls the
+   bytes on demand if it wants them.
 
 So a result never comes back to a *worker* automatically. A deep fold propagates
 hashes up the tree, materializing only the leaves a worker actually reads. The

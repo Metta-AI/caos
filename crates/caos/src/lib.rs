@@ -23,7 +23,7 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1463,19 +1463,48 @@ pub fn caos_run(
     write_placeholder(&target, &kind, &result)
 }
 
-/// `run <image | /cas/std/<name>> <output> -- [--name=value | --name:@=path ...]`
-/// — the *CLI* form. `<output>` is any path on the host; the whole result tree is
-/// checked out there in full as ordinary rw files. There is no `/cas` here:
-/// path-valued args are host paths the transport ingests, and `<image>` is a
-/// `docker://` ref, a bare hash, or a `/cas/std/<name>` builtin (resolved against
-/// the published library).
-pub fn cli_run(t: &dyn Transport, image: &str, output: &str, kvs: &[String]) -> Result<(), String> {
-    let target = PathBuf::from(output);
+/// `run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]`
+/// — the *CLI* form. `<output>`, if given, is any path on the host; the whole
+/// result tree is checked out there in full as ordinary rw files. If `<output>`
+/// is omitted and the result is a file, its bytes are written to stdout — with a
+/// trailing newline added when stdout is a terminal and the bytes don't already
+/// end in one, so the shell prompt lands on its own line without corrupting a
+/// pipe or redirect. A tree has no single stream to print, so an output path is
+/// required for one. There
+/// is no `/cas` here: path-valued args are host paths the transport ingests, and
+/// `<image>` is a `docker://` ref, a bare hash, or a `/cas/std/<name>` builtin
+/// (resolved against the published library).
+pub fn cli_run(
+    t: &dyn Transport,
+    image: &str,
+    output: Option<&str>,
+    kvs: &[String],
+) -> Result<(), String> {
     let image = resolve_cli_image(t, image)?;
     let (kind, result) = run_request(t, &image, None, kvs)?;
 
+    let Some(output) = output else {
+        // No output path: stream a file result to stdout. A tree has no single
+        // stream to print, so it needs an explicit path to check out to.
+        if kind == "tree" {
+            return Err("result is a tree; pass an <output> path to check it out".to_string());
+        }
+        let (_, content) = t.get_object(&result)?;
+        let mut out = std::io::stdout();
+        out.write_all(&content)
+            .map_err(|e| format!("writing to stdout: {e}"))?;
+        // On a terminal, end on a newline so the prompt doesn't collide with the
+        // output; when piped or redirected, leave the bytes exactly as produced.
+        if out.is_terminal() && !content.ends_with(b"\n") {
+            out.write_all(b"\n")
+                .map_err(|e| format!("writing to stdout: {e}"))?;
+        }
+        return Ok(());
+    };
+
     // Check the result out in full as ordinary rw files — the object and, for a
     // tree, every descendant — so it's readable and editable on the host.
+    let target = PathBuf::from(output);
     let root = if kind == "tree" {
         gix::objs::tree::EntryKind::Tree
     } else {
