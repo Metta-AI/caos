@@ -121,6 +121,7 @@
         worker-hello = crateBin "worker-hello";
         worker-fold = crateBin "worker-fold";
         worker-file-count = crateBin "worker-file-count";
+        worker-dirs-only = crateBin "worker-dirs-only";
         worker-deep-deps = crateBin "worker-deep-deps";
         worker-rustc = crateBin "worker-rustc";
 
@@ -338,6 +339,35 @@
           fakeRootCommands = installWorkerFiles;
         };
 
+        # A "dirs-only" worker: a `pre` algebra for fold that keeps only a node's
+        # directory children, dropping file (and other non-directory) children. It
+        # gets the node as `--in` and leaves the filtered children tree at
+        # /cas/out (one entry per surviving directory child, under its original
+        # name). Used as `fold --pre=dirs-only`, it makes the fold recurse into
+        # subdirectories only — files are never folded as leaves. It only touches
+        # the server (no `caos run`); the server injects that URL at runtime. This
+        # is the `worker-dirs-only` crate, a static binary at /worker — so the
+        # image needs no shell or coreutils.
+        workerDirsOnlyRoot = workerRoot "worker-dirs-only" worker-dirs-only;
+        workerDirsOnlyContents = [
+          workerBaseRoot
+          workerDirsOnlyRoot
+        ];
+        workerDirsOnlyConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [ "PATH=/bin" ];
+        };
+        workerDirsOnlyImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-dirs-only";
+          tag = "latest";
+          contents = workerDirsOnlyContents;
+          config = workerDirsOnlyConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
+
         # A "deep-deps" worker: turns a flat, name-keyed package map into a DAG of
         # deepened nodes. The input `packages` tree holds one subtree per
         # package, each with a `DEPS` blob (dependency names, one per line). The
@@ -537,6 +567,12 @@
           config = workerFileCountConfig;
           fakeRootCommands = installWorkerFiles;
         };
+        loadWorkerDirsOnly = loadImage {
+          name = "caos-worker-dirs-only";
+          contents = workerDirsOnlyContents;
+          config = workerDirsOnlyConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
         loadWorkerDeepDeps = loadImage {
           name = "caos-worker-deep-deps";
           contents = workerDeepDepsContents;
@@ -602,6 +638,7 @@
           hello = workerHelloImage;
           fold = workerFoldImage;
           file-count = workerFileCountImage;
+          dirs-only = workerDirsOnlyImage;
           deep-deps = workerDeepDepsImage;
           rustc = workerRustcImage;
         };
@@ -765,6 +802,7 @@
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-fold-docker = workerFoldImage;
           caos-worker-file-count-docker = workerFileCountImage;
+          caos-worker-dirs-only-docker = workerDirsOnlyImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-rustc-docker = workerRustcImage;
         };
@@ -800,6 +838,10 @@
           load-caos-worker-file-count = {
             type = "app";
             program = "${loadWorkerFileCount}/bin/load-caos-worker-file-count";
+          };
+          load-caos-worker-dirs-only = {
+            type = "app";
+            program = "${loadWorkerDirsOnly}/bin/load-caos-worker-dirs-only";
           };
           load-caos-worker-deep-deps = {
             type = "app";

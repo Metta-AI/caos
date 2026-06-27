@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count hello deep-deps rustc)
+[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count dirs-only hello deep-deps rustc)
 
 nix build .#caos-cli -o result-caos
 caos=$PROJECT/result-caos/bin/caos-cli

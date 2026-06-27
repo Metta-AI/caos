@@ -17,7 +17,7 @@ it's reproducible across machines.
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
-| `worker-hello`, `worker-fold`, `worker-file-count`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
+| `worker-hello`, `worker-fold`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
 
 ## Prerequisites
 
@@ -377,6 +377,9 @@ curry` wrappers, result staging).
   Identical subtrees are memoized, so a fold is incremental in the changed nodes.
 - **`worker-file-count`** — a `post` algebra: a file counts as `1`, a directory
   sums its children's counts.
+- **`worker-dirs-only`** — a `pre` algebra: keeps only a node's directory
+  children, dropping files. As `fold --pre=dirs-only` it makes the fold recurse
+  into subdirectories only — files are never folded as leaves.
 - **`worker-deep-deps`** — computes transitive dependencies, implemented as a
   curried fold (`pre` resolves a package's deps against a package map; `post`
   assembles the deep-deps tree).

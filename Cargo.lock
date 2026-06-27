@@ -1421,6 +1421,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "worker-dirs-only"
+version = "0.1.0"
+dependencies = [
+ "worker-common",
+]
+
+[[package]]
 name = "worker-file-count"
 version = "0.1.0"
 dependencies = [
