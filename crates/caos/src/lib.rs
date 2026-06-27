@@ -595,7 +595,7 @@ pub fn fetch_and_materialize(t: &dyn Transport, target: &Path, hash: &str) -> Re
     if kind == "tree" {
         let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
             .map_err(|e| format!("malformed tree {hash}: {e}"))?;
-        write_tree(target, hash, &tree)
+        write_tree(t, target, hash, &tree)
     } else {
         write_file(target, hash, &content)
     }
@@ -799,12 +799,36 @@ fn write_file(target: &Path, hash: &str, data: &[u8]) -> Result<(), String> {
 /// Tree → atomically create `target` as a directory tagged with `hash`, holding
 /// one empty placeholder per entry (a directory for subtrees, a file otherwise),
 /// each tagged with that entry's oid so it can later be expanded with `get`.
-fn write_tree(target: &Path, hash: &str, tree: &gix::objs::TreeRef) -> Result<(), String> {
+///
+/// Symlink entries are the exception: a git symlink is a blob holding its target
+/// path, so there is nothing to lazily load — its content *is* the link. We fetch
+/// that tiny blob now and recreate the real symlink, so the worker sees a link as
+/// a link (a symlink can't carry the placeholder/loaded mode or a hash xattr
+/// anyway — the OS fixes its mode and xattr ops would follow it to the target).
+fn write_tree(
+    t: &dyn Transport,
+    target: &Path,
+    hash: &str,
+    tree: &gix::objs::TreeRef,
+) -> Result<(), String> {
+    use gix::objs::tree::EntryKind;
     atomically(target, |tmp| {
         std::fs::create_dir(tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
         set_hash(tmp, hash.as_bytes())?;
         for entry in &tree.entries {
             let child = tmp.join(OsStr::from_bytes(entry.filename));
+            // A symlink is fully materialized here, not left as a placeholder.
+            if entry.mode.kind() == EntryKind::Link {
+                let (_, dest) = t.get_object(&entry.oid.to_string())?;
+                std::os::unix::fs::symlink(OsStr::from_bytes(&dest), &child).map_err(|e| {
+                    format!(
+                        "linking {} -> {}: {e}",
+                        child.display(),
+                        String::from_utf8_lossy(&dest)
+                    )
+                })?;
+                continue;
+            }
             // Each child is a placeholder: it records its hash but holds no
             // content until expanded with `get`, so it stays owner-only — the
             // worker mustn't read what it hasn't fetched.
@@ -913,6 +937,16 @@ pub fn env_u32(key: &str) -> Option<u32> {
 /// loads the whole subtree. (A git object graph is a finite DAG, so unbounded
 /// recursion always terminates at the blobs.)
 fn expand(t: &dyn Transport, target: &Path, depth: Option<u32>) -> Result<(), String> {
+    // A symlink is materialized in full the moment its tree is written (its
+    // target path is its only content), so there is nothing to load and nothing
+    // to descend into — and we must not follow it, since `is_dir`/`read_dir`
+    // below would otherwise traverse the link's destination.
+    if std::fs::symlink_metadata(target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     // Fetch only an unexpanded placeholder. An already-loaded node is left as is
     // and we just descend into it, so `get -r` is idempotent and can finish
     // loading a tree that was already partially expanded (e.g. after `get-hash`).
