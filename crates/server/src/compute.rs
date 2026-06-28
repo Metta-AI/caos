@@ -7,6 +7,7 @@
 //! A top-level run also pins `refs/caos/res/<req>` at the result. Results,
 //! converted images, and built layers are all cached in Redis (best-effort).
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
@@ -14,6 +15,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -126,46 +128,26 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // pushed to the registry, and referenced by digest.
     let docker_ref = resolve_image(config, &image)?;
 
-    let output = Command::new(&config.docker_bin)
-        .arg("run")
-        .arg("--rm")
-        .args(["--network", &config.network])
-        // One server, so the worker gets one URL for `caos get`/`put`/`run`.
-        .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
-        // The built-in tree, materialized at /cas/std and re-passed by nested
-        // `caos run`s so it threads down the whole tree (empty = none).
-        .args(["-e", &format!("CAOS_STD={std}")])
-        // The cache-busting salt, re-passed by nested runs so the whole tree
-        // shares it (empty = none).
-        .args(["-e", &format!("CAOS_SALT={salt}")])
-        .args(["-e", &format!("{RUN_STACK_ENV}={child_stack}")])
-        .args(["--entrypoint", CAOS_BIN])
-        .arg(&docker_ref)
-        .arg("entrypoint")
-        .arg(format!("--args={args}"))
-        .output()
-        .map_err(|e| HttpError::new(500, format!("running {}: {e}", config.docker_bin)))?;
+    // Run the worker. `Docker` spawns a fresh container per request (the
+    // default); `Serve` POSTs to a long-lived `caos serve` container (the local
+    // stand-in for the fly warm pool). Both return the worker's "<type> <hash>".
+    let result = match config_backend() {
+        Backend::Serve => {
+            dispatch_serve(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
+        }
+        Backend::Docker => {
+            dispatch_docker(config, &docker_ref, &args, &std, &salt, &child_stack)?
+        }
+        Backend::Fly => {
+            dispatch_fly(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
+        }
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "worker failed: req={req} ({}):\n{}",
-            output.status,
-            stderr.trim_end()
-        );
-        return Err(HttpError::new(
-            500,
-            format!("worker container failed ({}):\n{stderr}", output.status),
-        ));
-    }
-
-    // The container's stdout is "<type> <hash>" printed by `caos entrypoint`.
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: req={req}");
         return Err(HttpError::new(
             500,
-            "worker container produced no result on stdout",
+            "worker produced no result on stdout",
         ));
     }
 
@@ -182,6 +164,527 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     }
 
     Ok(format!("{result}\n").into_bytes())
+}
+
+/// Worker execution backend. `Docker` runs a fresh container per request (the
+/// default — local/tilt dev). `Serve` keeps a long-lived `caos serve` container
+/// per image and POSTs jobs to it: the local stand-in for the fly warm pool, so
+/// the serve / dispatch / cleanup path is exercisable under tilt.
+#[derive(Clone, Copy, PartialEq)]
+enum Backend {
+    Docker,
+    Serve,
+    Fly,
+}
+
+fn config_backend() -> Backend {
+    match std::env::var("CAOS_BACKEND").as_deref() {
+        Ok("serve") | Ok("localserve") => Backend::Serve,
+        Ok("fly") => Backend::Fly,
+        _ => Backend::Docker,
+    }
+}
+
+/// Today's path: a fresh `--rm` container per request. Returns the worker's
+/// stdout, `"<type> <hash>"`.
+fn dispatch_docker(
+    config: &Config,
+    docker_ref: &str,
+    args: &str,
+    std: &str,
+    salt: &str,
+    stack: &str,
+) -> Result<String, HttpError> {
+    let output = Command::new(&config.docker_bin)
+        .arg("run")
+        .arg("--rm")
+        .args(["--network", &config.network])
+        .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
+        .args(["-e", &format!("CAOS_STD={std}")])
+        .args(["-e", &format!("CAOS_SALT={salt}")])
+        .args(["-e", &format!("{RUN_STACK_ENV}={stack}")])
+        .args(["--entrypoint", CAOS_BIN])
+        .arg(docker_ref)
+        .arg("entrypoint")
+        .arg(format!("--args={args}"))
+        .output()
+        .map_err(|e| HttpError::new(500, format!("running {}: {e}", config.docker_bin)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(HttpError::new(
+            500,
+            format!("worker container failed ({}):\n{stderr}", output.status),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Names of the `caos serve` containers we've already started, keyed by image —
+/// so we start each at most once. The container name doubles as its hostname on
+/// the docker network's embedded DNS.
+fn serve_registry() -> &'static Mutex<HashSet<String>> {
+    static REG: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Warm-pool path: ensure a `caos serve` container for this image is running,
+/// then POST the job to it. The local stand-in for the fly `HttpWorker` dispatch.
+fn dispatch_serve(
+    config: &Config,
+    docker_ref: &str,
+    image: &str,
+    args: &str,
+    std: &str,
+    salt: &str,
+    stack: &str,
+) -> Result<String, HttpError> {
+    let key: String = image.chars().take(16).collect();
+    let name = format!("caos-serve-{key}");
+    ensure_serve_container(config, docker_ref, &name)?;
+
+    let url = format!("http://{name}:8080/run");
+    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
+        .to_string();
+    serve_post(&url, &body)
+}
+
+/// Start the named `caos serve` container if we haven't already. Holds the
+/// registry lock across `docker run` so two threads can't double-start it.
+fn ensure_serve_container(config: &Config, docker_ref: &str, name: &str) -> Result<(), HttpError> {
+    let mut started = serve_registry().lock().unwrap_or_else(|p| p.into_inner());
+    if started.contains(name) {
+        return Ok(());
+    }
+    let output = Command::new(&config.docker_bin)
+        .args(["run", "-d", "--rm", "--name", name])
+        .args(["--network", &config.network])
+        .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
+        .args(["--entrypoint", CAOS_BIN])
+        .arg(docker_ref)
+        .arg("serve")
+        .output()
+        .map_err(|e| HttpError::new(500, format!("starting serve container {name}: {e}")))?;
+    // A leftover container from a prior server run is fine — treat "name in use"
+    // as already-started.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("already in use") {
+            return Err(HttpError::new(
+                500,
+                format!("starting serve container {name}: {stderr}"),
+            ));
+        }
+    }
+    started.insert(name.to_string());
+    Ok(())
+}
+
+/// POST a job to a serve container's `/run`. Retries while the container is still
+/// binding its port (connection refused), and on a busy (503) reply re-sends the
+/// job marked as replayed (`fly-replay-src`) so the worker blocks instead of
+/// bouncing — the local equivalent of the fly proxy re-dispatching.
+fn serve_post(url: &str, body: &str) -> Result<String, HttpError> {
+    let send = |replayed: bool| {
+        let mut req = minreq::post(url)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string());
+        if replayed {
+            req = req.with_header("fly-replay-src", "local");
+        }
+        req.send()
+    };
+
+    // Wait out container warm-up (connection refused) for up to ~3s.
+    let mut resp = None;
+    for _ in 0..60 {
+        match send(false) {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let mut resp =
+        resp.ok_or_else(|| HttpError::new(500, format!("serve worker {url} unreachable")))?;
+
+    if resp.status_code == 503 {
+        // Busy: re-send marked as replayed so the worker blocks until free.
+        resp = send(true).map_err(|e| HttpError::new(500, format!("serve retry failed: {e}")))?;
+    }
+
+    if resp.status_code != 200 {
+        let msg = resp.as_str().unwrap_or("<unreadable>").to_string();
+        return Err(HttpError::new(
+            500,
+            format!("serve worker failed ({}): {msg}", resp.status_code),
+        ));
+    }
+    let out = resp
+        .as_str()
+        .map_err(|e| HttpError::new(500, format!("reading serve reply: {e}")))?;
+    Ok(out.trim().to_string())
+}
+
+// ---- Fly backend -----------------------------------------------------------
+//
+// Distributed warm pool: one fly app + N machines per worker version, each
+// running `caos serve`. caosd runs ON fly and talks to the Machines API over the
+// internal plain-HTTP endpoint (no TLS, so it fits the server's TLS-free
+// minreq). The request shapes below were validated live against api.machines.dev.
+//
+// Dispatch is direct over 6PN: caosd lists the app's machines, starts a stopped
+// one, and POSTs the job to `http://[<private_ip>]:8080/run` — the machine's
+// internal port, reached without the proxy (so no flycast IP, which would need
+// an HTTPS/GraphQL call minreq can't make). The worker still runs jobs exactly
+// as the container model does (one at a time via its SLOT mutex); a busy worker
+// answers 503, so caosd just tries the next machine, blocking only if all are
+// busy. This is the "block until available" half of the approved dispatch
+// design — load never changes how a worker executes a job.
+
+/// Fly backend config, from `CAOS_FLY_*` env. `token` must be an *org* deploy
+/// token — the personal `fly auth token` can't create apps (403).
+struct Fly {
+    org: String,
+    region: String,
+    token: String,
+    pool: u32,
+    api: String,
+    registry: String,
+    server_url: String,
+    /// Prefix for this stack's worker app names, so multiple caos stacks can
+    /// share one fly org without colliding on `caos-worker-<hash16>`. Each stack
+    /// sets its own (e.g. `caos-foo-worker-`); the default keeps the original
+    /// single-stack name.
+    worker_prefix: String,
+}
+
+impl Fly {
+    fn from_env(config: &Config) -> Result<Fly, HttpError> {
+        let token = std::env::var("CAOS_FLY_TOKEN")
+            .map_err(|_| HttpError::new(500, "CAOS_BACKEND=fly but CAOS_FLY_TOKEN is unset"))?;
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        Ok(Fly {
+            org: env("CAOS_FLY_ORG", "personal"),
+            region: env("CAOS_FLY_REGION", "sjc"),
+            token,
+            pool: env("CAOS_FLY_POOL", "3").parse().unwrap_or(3),
+            // Internal Machines API endpoint (plain HTTP over 6PN). Override with
+            // https://api.machines.dev/v1 only from a TLS-capable build.
+            api: env("CAOS_FLY_API", "http://_api.internal:4280/v1"),
+            registry: env("CAOS_FLY_REGISTRY", "registry.fly.io"),
+            // caosd's own address, passed to workers as CAOS_SERVER_URL: the
+            // content store they reach for `caos get`/`put` (and nested `run`)
+            // during a job. Not how completion is reported — that's the reply to
+            // the dispatch request. Threaded so workers find caosd wherever its
+            // app is named.
+            server_url: config.server_url.clone(),
+            worker_prefix: env("CAOS_FLY_WORKER_PREFIX", "caos-worker-"),
+        })
+    }
+}
+
+/// `<worker_prefix><hash16>` — the fly app + registry repo for a worker version.
+/// The prefix namespaces a stack's workers (default `caos-worker-`).
+fn fly_app_name(fly: &Fly, image: &str) -> String {
+    format!("{}{}", fly.worker_prefix, &image[..image.len().min(16)])
+}
+
+/// Provision (once per version, gated by a Redis marker), then dispatch the job
+/// directly to a free worker machine over 6PN.
+fn dispatch_fly(
+    config: &Config,
+    docker_ref: &str,
+    image: &str,
+    args: &str,
+    std: &str,
+    salt: &str,
+    stack: &str,
+) -> Result<String, HttpError> {
+    let fly = Fly::from_env(config)?;
+    ensure_worker_app(config, &fly, docker_ref, image)?;
+    let app = fly_app_name(&fly, image);
+    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
+        .to_string();
+    dispatch_to_pool(&fly, &app, &body)
+}
+
+/// One worker machine: its id and current state. Addressed over 6PN by its fly
+/// DNS name `{id}.vm.{app}.internal` (not the raw IPv6 literal, which the minimal
+/// HTTP client mishandles in a URL).
+struct Machine {
+    id: String,
+    state: String,
+}
+
+/// Send the job to whichever machine in the pool is free, starting stopped ones
+/// on the way. A machine that's busy (its SLOT is held) answers 503, so we move
+/// on to the next; if every machine is busy we wait briefly and sweep again,
+/// since a worker runs strictly one job at a time. This is caosd doing the
+/// "block until available" the proxy would otherwise do — without changing how
+/// the worker executes the job.
+fn dispatch_to_pool(fly: &Fly, app: &str, body: &str) -> Result<String, HttpError> {
+    // ~60s of sweeps (the pool may be cold; starting a machine takes a few
+    // seconds, and a long job can hold every SLOT meanwhile).
+    const SWEEPS: u32 = 40;
+    for attempt in 0..SWEEPS {
+        let machines = fly_list_machines(fly, app)?;
+        if machines.is_empty() {
+            return Err(HttpError::new(500, format!("worker app {app} has no machines")));
+        }
+        for m in &machines {
+            if m.state != "started" {
+                // Best-effort: a racing start ("already started") is fine — the
+                // POST below is the real readiness check.
+                eprintln!("dispatch {app}: starting machine {} (state {})", m.id, m.state);
+                let _ = fly_start_machine(fly, app, &m.id);
+            }
+            let url = format!("http://{}.vm.{app}.internal:8080/run", m.id);
+            match post_job(&url, body) {
+                Outcome::Done(result) => {
+                    eprintln!("dispatch {app}: machine {} accepted (sweep {attempt})", m.id);
+                    return Ok(result);
+                }
+                Outcome::Busy => {
+                    eprintln!("dispatch {app}: machine {} busy", m.id);
+                    continue;
+                }
+                Outcome::Unreachable(e) => {
+                    eprintln!("dispatch {app}: machine {} unreachable: {e}", m.id);
+                    continue;
+                }
+                Outcome::Failed(e) => return Err(e),
+            }
+        }
+        // Every machine was busy (or still starting); pause, then sweep again.
+        if attempt + 1 < SWEEPS {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    Err(HttpError::new(
+        503,
+        format!("no worker machine for {app} became available"),
+    ))
+}
+
+/// The result of a single dispatch POST to one worker machine.
+enum Outcome {
+    /// Worker ran the job and returned `"<type> <hash>"`.
+    Done(String),
+    /// Worker is busy (503 — its SLOT is held): try another machine.
+    Busy,
+    /// Couldn't reach the worker this sweep (still booting / DNS lag): retry.
+    Unreachable(String),
+    /// A hard failure that should abort the whole run.
+    Failed(HttpError),
+}
+
+/// POST a job to a worker's `/run`, classifying the result. Retries briefly while
+/// the machine is still binding its port (a just-started machine), surfacing the
+/// last connect error as `Unreachable` so dispatch can log why and move on.
+fn post_job(url: &str, body: &str) -> Outcome {
+    let mut last_err = String::new();
+    for _ in 0..20 {
+        match minreq::post(url)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .send()
+        {
+            Ok(resp) => {
+                return match resp.status_code {
+                    200 => match resp.as_str() {
+                        Ok(out) => Outcome::Done(out.trim().to_string()),
+                        Err(e) => Outcome::Failed(HttpError::new(
+                            500,
+                            format!("reading worker reply: {e}"),
+                        )),
+                    },
+                    503 => Outcome::Busy,
+                    code => {
+                        let msg = resp.as_str().unwrap_or("<unreadable>").to_string();
+                        Outcome::Failed(HttpError::new(500, format!("worker failed ({code}): {msg}")))
+                    }
+                };
+            }
+            // Not up yet (still booting / binding the port / DNS lag): wait, retry.
+            Err(e) => {
+                last_err = e.to_string();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+    Outcome::Unreachable(last_err)
+}
+
+/// List the worker app's machines (`GET /apps/{app}/machines`), returning each
+/// one's id, 6PN private IP, and state.
+fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
+    let resp = fly_api(fly, "GET", &format!("/apps/{app}/machines"), None)?;
+    if resp.status_code != 200 {
+        return Err(HttpError::new(
+            500,
+            format!("fly list machines ({}): {}", resp.status_code, resp.as_str().unwrap_or("")),
+        ));
+    }
+    let body = resp
+        .as_str()
+        .map_err(|e| HttpError::new(500, format!("reading machine list: {e}")))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
+    let mut machines = Vec::new();
+    for m in parsed.as_array().into_iter().flatten() {
+        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let state = m.get("state").and_then(|v| v.as_str()).unwrap_or_default();
+        if !id.is_empty() {
+            machines.push(Machine {
+                id: id.to_string(),
+                state: state.to_string(),
+            });
+        }
+    }
+    Ok(machines)
+}
+
+/// Start a stopped machine (`POST /apps/{app}/machines/{id}/start`). Idempotent
+/// enough for our use: a 200 or an already-started reply are both fine.
+fn fly_start_machine(fly: &Fly, app: &str, id: &str) -> Result<(), HttpError> {
+    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines/{id}/start"), None)?;
+    match resp.status_code {
+        200 | 201 => Ok(()),
+        code => Err(HttpError::new(
+            500,
+            format!("fly start machine {id} ({code}): {}", resp.as_str().unwrap_or("")),
+        )),
+    }
+}
+
+/// Create the app, push the image to registry.fly.io, and create N machines
+/// running `caos serve`. Skipped on a warm Redis marker.
+fn ensure_worker_app(
+    config: &Config,
+    fly: &Fly,
+    docker_ref: &str,
+    image: &str,
+) -> Result<(), HttpError> {
+    let marker = format!("caos:fly:{image}");
+    if let Ok(Some(_)) = cache_get(&config.redis_addr, &marker) {
+        return Ok(());
+    }
+    let app = fly_app_name(fly, image);
+    fly_create_app(fly, &app)?;
+    let fly_image = push_image_to_fly(fly, docker_ref, &app, image)?;
+    for _ in 0..fly.pool {
+        fly_create_machine(fly, &app, &fly_image)?;
+    }
+    let _ = cache_set(&config.redis_addr, &marker, "provisioned");
+    eprintln!("provisioned fly app {app} ({} machines)", fly.pool);
+    Ok(())
+}
+
+/// `POST /v1/apps` — idempotent. A fresh app is 201; an existing one comes back
+/// either as 409 or as 422 "Name has already been taken" (the Machines API uses
+/// the latter), both of which mean "already provisioned" for us.
+fn fly_create_app(fly: &Fly, app: &str) -> Result<(), HttpError> {
+    let body = serde_json::json!({ "app_name": app, "org_slug": fly.org }).to_string();
+    let resp = fly_api(fly, "POST", "/apps", Some(&body))?;
+    match resp.status_code {
+        200 | 201 | 409 => Ok(()),
+        422 => {
+            let msg = resp.as_str().unwrap_or("");
+            if msg.contains("already been taken") {
+                Ok(())
+            } else {
+                Err(HttpError::new(500, format!("fly create app {app} (422): {msg}")))
+            }
+        }
+        code => Err(HttpError::new(
+            500,
+            format!("fly create app {app} ({code}): {}", resp.as_str().unwrap_or("")),
+        )),
+    }
+}
+
+/// `POST /v1/apps/{app}/machines` — one machine running `caos serve`, addressed
+/// directly over 6PN at `[private_ip]:8080`. No `services` block: caosd dispatches
+/// to the machine's internal port without the proxy and manages start/stop
+/// itself, so a proxy autostop monitor can't stop a worker mid-job. The worker's
+/// own SLOT mutex enforces one-job-at-a-time. This config was validated live.
+fn fly_create_machine(fly: &Fly, app: &str, fly_image: &str) -> Result<(), HttpError> {
+    let machine = serde_json::json!({
+        "region": fly.region,
+        "config": {
+            "image": fly_image,
+            "init": { "exec": ["/bin/caos", "serve"] },
+            "env": { "CAOS_SERVER_URL": fly.server_url },
+            "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": 256 }
+        }
+    })
+    .to_string();
+    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines"), Some(&machine))?;
+    match resp.status_code {
+        200 | 201 => Ok(()),
+        code => Err(HttpError::new(
+            500,
+            format!("fly create machine ({code}): {}", resp.as_str().unwrap_or("")),
+        )),
+    }
+}
+
+/// Copy the converted image from the local registry to registry.fly.io/<app>.
+/// Shelled out to skopeo: the fly registry is HTTPS + token-auth, which the
+/// server's TLS-free in-process push can't do. Returns the fly image ref.
+fn push_image_to_fly(
+    fly: &Fly,
+    docker_ref: &str,
+    app: &str,
+    image: &str,
+) -> Result<String, HttpError> {
+    let tag: String = image.chars().take(40).collect();
+    let dest = format!("{}/{app}:{tag}", fly.registry);
+    // `--insecure-policy`: skip the containers trust-policy lookup. The slim
+    // server image ships no `/etc/containers/policy.json`, and we trust both ends
+    // (our own registry → fly's), so there's no signature policy to enforce.
+    // `--dest-tls-verify=false`: the slim image ships no CA bundle, so skopeo
+    // can't verify registry.fly.io's cert. The push is still over TLS and
+    // token-authenticated to fly's own registry; we just skip chain verification
+    // (the mirror of `--src-tls-verify=false` for our plain-HTTP local registry).
+    let status = Command::new("skopeo")
+        .args(["--insecure-policy", "copy", "--src-tls-verify=false", "--dest-tls-verify=false"])
+        .arg(format!("--dest-creds=x:{}", fly.token))
+        .arg(format!("docker://{docker_ref}"))
+        .arg(format!("docker://{dest}"))
+        .status()
+        .map_err(|e| HttpError::new(500, format!("skopeo copy: {e}")))?;
+    if !status.success() {
+        return Err(HttpError::new(
+            500,
+            format!("skopeo copy to {dest} failed ({status})"),
+        ));
+    }
+    Ok(dest)
+}
+
+/// A Machines API call with bearer auth, `path` appended to the configured base.
+fn fly_api(
+    fly: &Fly,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<minreq::Response, HttpError> {
+    let url = format!("{}{path}", fly.api.trim_end_matches('/'));
+    let mut req = match method {
+        "POST" => minreq::post(&url),
+        "GET" => minreq::get(&url),
+        _ => return Err(HttpError::new(500, format!("unsupported method {method}"))),
+    }
+    .with_header("Authorization", format!("Bearer {}", fly.token))
+    .with_header("Content-Type", "application/json");
+    if let Some(b) = body {
+        req = req.with_body(b.to_string());
+    }
+    req.send()
+        .map_err(|e| HttpError::new(500, format!("fly api {method} {path}: {e}")))
 }
 
 /// Unpack a request object (a tree `{image, args, std, salt}`) into its parts:

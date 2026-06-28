@@ -29,7 +29,7 @@
 //! `http.receivepack=true`; the current mounted repo doesn't, so push is rejected
 //! for now — fetch round-trips work, which is all this slice validates.
 
-use std::io::Write;
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 use tiny_http::{Header, Request, Response, StatusCode};
@@ -66,11 +66,6 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         }
     }
 
-    // The request body: empty for the GET advertisements, the negotiation/packfile
-    // for the POSTs.
-    let mut body = Vec::new();
-    request.as_reader().read_to_end(&mut body)?;
-
     // GIT_PROJECT_ROOT is the repo itself: with PATH_INFO carrying only the
     // service suffix (`/info/refs`, …), the repo path before it is empty, so
     // http-backend resolves the repo to GIT_PROJECT_ROOT directly.
@@ -89,18 +84,29 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Write stdin from a separate thread: http-backend streams stdout as it reads
-    // stdin (a large clone fills stdout long before we'd finish a serial write),
-    // so feeding the body and draining stdout must run concurrently or deadlock.
+    // Drain stdout on a separate thread while we feed stdin: http-backend streams
+    // its stdout as it consumes stdin, so the two must run concurrently or the
+    // pipes deadlock. The response (report-status for a push, the packfile for a
+    // fetch) is buffered here.
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&body);
-        // Dropping stdin closes the pipe, signalling EOF to http-backend.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
     });
-    let output = child.wait_with_output()?;
-    let _ = writer.join();
 
-    let response = cgi_to_response(&output.stdout);
+    // Stream the request body straight into http-backend's stdin in constant
+    // memory. A large push (e.g. the multi-hundred-MB `rustc` builtin image) must
+    // never be buffered whole here, or it OOM-kills the server. Dropping stdin
+    // afterwards signals EOF.
+    let _ = std::io::copy(request.as_reader(), &mut stdin);
+    drop(stdin);
+
+    let output = reader.join().unwrap_or_default();
+    let _ = child.wait();
+
+    let response = cgi_to_response(&output);
     request.respond(response)
 }
 

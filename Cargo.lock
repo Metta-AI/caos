@@ -76,6 +76,7 @@ dependencies = [
  "minreq",
  "serde_json",
  "tar",
+ "tiny_http",
  "xattr",
 ]
 

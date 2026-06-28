@@ -428,6 +428,11 @@
           # ships http-backend + core plumbing but drops git's python3/perl/docs
           # (~200 MiB) that the server never touches.
           pkgs.gitMinimal
+          # `skopeo`: the fly backend copies a converted worker image from the
+          # local registry to the HTTPS, token-authed registry.fly.io (which the
+          # server's TLS-free in-process push can't reach). Only used when
+          # CAOS_BACKEND=fly.
+          pkgs.skopeo
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];
@@ -776,6 +781,10 @@
             pkgs.rust-analyzer
             # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
             pkgs.tilt
+            # `fly` CLI: auth (`fly auth token`), org/region lookup, and operating
+            # the fly backend (apps, machines, logs). caosd itself talks to the
+            # Machines API + registry over HTTP and does not need this.
+            pkgs.flyctl
           ];
         };
       }

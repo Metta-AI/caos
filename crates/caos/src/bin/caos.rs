@@ -14,8 +14,10 @@
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use caos::{prog_name, HttpTransport};
+use tiny_http::{Header, Request, Response, Server};
 
 /// The program `entrypoint` always runs. Images that build off the
 /// `caos-worker-base` image supply this binary.
@@ -79,6 +81,8 @@ fn run(args: &[String]) -> Result<(), String> {
             },
             _ => Err(usage(args)),
         },
+        // `serve` — long-lived HTTP worker (warm-pool mode); see `serve()`.
+        Some("serve") => serve(),
         _ => Err(usage(args)),
     }
 }
@@ -86,6 +90,184 @@ fn run(args: &[String]) -> Result<(), String> {
 /// The worker talks to the server over HTTP.
 fn http() -> Result<HttpTransport, String> {
     HttpTransport::from_env()
+}
+
+/// One job at a time. Held across a job *and* its cleanup, so the slot never
+/// frees until the VM is clean for the next job.
+static SLOT: Mutex<()> = Mutex::new(());
+
+/// A dispatched job: which args tree to run, plus the std/salt/run-stack the
+/// server used to thread through the container env. The worker is reused across
+/// jobs, so these arrive per-request rather than as process env.
+struct Job {
+    args: String,
+    std: String,
+    salt: String,
+    stack: String,
+}
+
+/// `serve` — run as a long-lived HTTP worker instead of a one-shot container.
+/// Per `POST /run` it runs the *unchanged* `entrypoint` once, one at a time, so
+/// each job's `/cas` lifecycle is identical to the container model. A busy worker
+/// bounces the request to another instance (once, via `fly-replay`) or blocks.
+fn serve() -> Result<(), String> {
+    let server = Server::http("[::]:8080").map_err(|e| format!("binding :8080: {e}"))?;
+    eprintln!("caos serve: listening on :8080");
+    for request in server.incoming_requests() {
+        // One thread per connection only so a busy worker can answer "replay"
+        // (or hold a blocked conn) without stalling accept(). Job concurrency is
+        // still 1 — enforced by SLOT, not by the thread count.
+        std::thread::spawn(move || handle(request));
+    }
+    Ok(())
+}
+
+fn handle(mut request: Request) {
+    if request.url().split('?').next() != Some("/run") {
+        return respond(request, 404, "not found");
+    }
+    // The proxy stamps replayed requests with `fly-replay-src`; we bounce at most
+    // once, then block, so a saturated pool can't loop.
+    let already_replayed = request
+        .headers()
+        .iter()
+        .any(|h| h.field.to_string().eq_ignore_ascii_case("fly-replay-src"));
+
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        return respond(request, 400, "unreadable body");
+    }
+    let job = match parse_job(&body) {
+        Ok(job) => job,
+        Err(e) => return respond(request, 400, &e),
+    };
+
+    match SLOT.try_lock() {
+        Ok(guard) => run_and_reply(request, &job, &guard),
+        // Busy, first touch: ask the proxy to replay on a different instance.
+        Err(_) if !already_replayed => {
+            let hdr = Header::from_bytes(&b"fly-replay"[..], &b"elsewhere=true"[..])
+                .expect("static header");
+            let _ = request.respond(Response::empty(503).with_header(hdr));
+        }
+        // Busy, already bounced once: wait our turn here instead of bouncing again.
+        Err(_) => {
+            let guard = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+            run_and_reply(request, &job, &guard);
+        }
+    }
+}
+
+/// Run the job (fork+exec the unchanged `entrypoint`), reply, then reset the VM —
+/// all while holding the slot, so the next job starts clean regardless of which
+/// branch above we took.
+fn run_and_reply(request: Request, job: &Job, _slot: &std::sync::MutexGuard<'_, ()>) {
+    let out = std::process::Command::new("/proc/self/exe")
+        .arg("entrypoint")
+        .arg(format!("--args={}", job.args))
+        .env(caos::STD_ENV, &job.std)
+        .env(caos::SALT_ENV, &job.salt)
+        .env(caos::RUN_STACK_ENV, &job.stack)
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => respond(request, 200, &String::from_utf8_lossy(&o.stdout)),
+        Ok(o) => respond(
+            request,
+            500,
+            &format!("worker failed ({}):\n{}", o.status, String::from_utf8_lossy(&o.stderr)),
+        ),
+        Err(e) => respond(request, 500, &format!("spawning entrypoint: {e}")),
+    }
+
+    reset_after_job();
+}
+
+fn respond(request: Request, status: u16, body: &str) {
+    let resp = Response::from_string(body).with_status_code(status);
+    let _ = request.respond(resp);
+}
+
+fn parse_job(body: &str) -> Result<Job, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid job json: {e}"))?;
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let args = field("args");
+    if args.is_empty() {
+        return Err("job missing 'args'".to_string());
+    }
+    Ok(Job {
+        args,
+        std: field("std"),
+        salt: field("salt"),
+        stack: field("stack"),
+    })
+}
+
+/// Reset the worker-writable surface between jobs — the guarantees the disposable
+/// container used to give for free. `entrypoint` already wipes `/cas` on each run;
+/// here we reap any strays and clear the scratch dirs (`scratch()` writes /tmp).
+fn reset_after_job() {
+    let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
+    reap_uid(uid);
+    for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+        wipe_dir_contents(dir);
+    }
+}
+
+/// SIGKILL every process owned by `uid`. The slot means one job at a time and the
+/// worker uid is dedicated, so this only reaps strays the just-finished worker
+/// left behind (the container teardown used to kill these implicitly).
+fn reap_uid(uid: u32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let me = std::process::id() as i32;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let owned = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|u| u.parse::<u32>().ok())
+            == Some(uid);
+        if owned {
+            unsafe { kill(pid, 9) };
+        }
+    }
+}
+
+/// Remove the children of `dir` (keeping it as a mount point). On tmpfs this is
+/// fast and complete.
+fn wipe_dir_contents(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        let _ = removed;
+    }
 }
 
 fn usage(args: &[String]) -> String {
@@ -96,7 +278,8 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
-         {prog} entrypoint [--args=<hash>]"
+         {prog} entrypoint [--args=<hash>]\n  \
+         {prog} serve"
     )
 }
 
