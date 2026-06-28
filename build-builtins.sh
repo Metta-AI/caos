@@ -53,42 +53,62 @@ for name in "${names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done
 
-# Import the images into git in PARALLEL. `import-image` only writes objects into
-# its *local* repo — it does no network I/O — so each runs in its own throwaway
-# repo with zero contention (the parallel win is the per-layer materialize/hash).
-# We then union every repo's objects into the one CLIENT repo and push ONCE below:
-# concurrent pushes to the same server repo race and corrupt it, so the network
-# step stays serial.
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
-pids=()
-for name in "${names[@]}"; do
-  echo "importing $name..." >&2
-  (
-    repo="$WORK/repo-$name"
-    git init -q "$repo"
-    git -C "$repo" remote add caos "$SERVER_URL"
-    hash=$(cd "$repo" && "$caos" import-image "${img_path[$name]}")
-    printf '%s' "$hash" >"$WORK/$name.hash"
-  ) &
-  pids+=("$!")
-done
-rc=0
-for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
-[ "$rc" -eq 0 ] || { echo "build-builtins: an import failed" >&2; exit 1; }
+# Import cache: refs/caos/src/<sha1(image store path)> in CLIENT pins each image's
+# imported tree. The store path is immutable + content-addressed, so the ref's
+# presence means "already imported this exact image" — we reuse the hash and skip
+# the multi-second re-unpack/re-hash (rustc especially). The ref also keeps the
+# objects from gc. (Same scheme as the flake's set-stdlib, flake.nix.) Wipe CLIENT
+# and the cache goes with it; change an image and its store path -> a new ref.
+src_ref_of() { echo "refs/caos/src/$(printf '%s' "$1" | sha1sum | cut -c1-40)"; }
 
-# Union each import's objects into CLIENT (objects are content-addressed, so this
-# is a safe merge) so the single publish push below carries everything.
+declare -A hash_of
+to_import=()
 for name in "${names[@]}"; do
-  cp -rn "$WORK/repo-$name/.git/objects/." "$CLIENT/.git/objects/"
+  cached=$(git -C "$CLIENT" rev-parse --verify --quiet "$(src_ref_of "${img_path[$name]}")^{tree}" || true)
+  if [ -n "$cached" ]; then
+    echo "$name: reusing import $cached" >&2
+    hash_of[$name]=$cached
+  else
+    to_import+=("$name")
+  fi
 done
+
+# Import the cache-misses in PARALLEL. `import-image` only writes objects into its
+# *local* repo (no network I/O), so each runs in its own throwaway repo with zero
+# contention (the parallel win is the per-layer materialize/hash). We then union
+# every repo's objects into CLIENT, pin each src_ref, and push ONCE below —
+# concurrent pushes to one server repo race and corrupt it, so the push stays serial.
+if [ "${#to_import[@]}" -gt 0 ]; then
+  WORK=$(mktemp -d)
+  trap 'rm -rf "$WORK"' EXIT
+  pids=()
+  for name in "${to_import[@]}"; do
+    echo "$name: importing..." >&2
+    (
+      repo="$WORK/repo-$name"
+      git init -q "$repo"
+      git -C "$repo" remote add caos "$SERVER_URL"
+      hash=$(cd "$repo" && "$caos" import-image "${img_path[$name]}")
+      printf '%s' "$hash" >"$WORK/$name.hash"
+    ) &
+    pids+=("$!")
+  done
+  rc=0
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ "$rc" -eq 0 ] || { echo "build-builtins: an import failed" >&2; exit 1; }
+  for name in "${to_import[@]}"; do
+    cp -rn "$WORK/repo-$name/.git/objects/." "$CLIENT/.git/objects/"
+    hash_of[$name]=$(cat "$WORK/$name.hash")
+    git -C "$CLIENT" update-ref "$(src_ref_of "${img_path[$name]}")" "${hash_of[$name]}"
+  done
+fi
 
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so
 # there's no commit to wrap it) and publish it to the server under refs/caos/std
-# in one push, which uploads every builtin image it references.
+# in one push, which uploads every builtin image the server doesn't already have.
 entries=""
 for name in "${names[@]}"; do
-  entries+="040000 tree $(cat "$WORK/$name.hash")"$'\t'"$name"$'\n'
+  entries+="040000 tree ${hash_of[$name]}"$'\t'"$name"$'\n'
 done
 tree=$(printf '%s' "$entries" | git -C "$CLIENT" mktree)
 # --force: refs/caos/std points at a tree, and git refuses to update a non-commit
