@@ -79,30 +79,40 @@ for app in "$SERVER" "$REGISTRY" "$REDIS"; do
   fi
 done
 
-# 2. redis + registry: plain images, reached over 6PN by name, no public service.
-if has_machine "$REDIS"; then say "redis machine exists"; else
-  say "starting redis"; flyctl machine run redis:7 -a "$REDIS" -r "$REGION" \
-    --name redis --vm-memory 256
-fi
-if has_machine "$REGISTRY"; then say "registry machine exists"; else
-  say "starting registry"; flyctl machine run registry:2 -a "$REGISTRY" -r "$REGION" \
-    --name registry --vm-memory 256
-fi
+# 2-4. Start redis + registry and build/push caosd + create its volume — all in
+# parallel. redis/registry are plain images reached over 6PN by name (no public
+# service); they're independent of caosd. The caosd machine (step 5) only needs
+# its image pushed and volume present, so we wait for just that job before it.
+start_redis() {
+  has_machine "$REDIS" && { say "redis machine exists"; return; }
+  say "starting redis"
+  flyctl machine run redis:7 -a "$REDIS" -r "$REGION" --name redis --vm-memory 256
+}
+start_registry() {
+  has_machine "$REGISTRY" && { say "registry machine exists"; return; }
+  say "starting registry"
+  flyctl machine run registry:2 -a "$REGISTRY" -r "$REGION" --name registry --vm-memory 256
+}
+prep_caosd() {  # build + push the image (app must exist for registry.fly.io), then volume
+  say "building caosd image (nix)"
+  nix build .#caos-server-docker -o "$PROJECT/result-caos-server"
+  say "pushing caosd image to registry.fly.io/$SERVER:latest"
+  nix shell nixpkgs#skopeo -c skopeo --insecure-policy copy \
+    --dest-creds "x:$CAOS_FLY_TOKEN" \
+    "docker-archive:$(readlink -f "$PROJECT/result-caos-server")" \
+    "docker://registry.fly.io/$SERVER:latest"
+  if has_volume "$SERVER"; then say "/git volume exists"; else
+    say "creating /git volume (${VOL_GB}GB)"
+    flyctl volumes create caos_git -a "$SERVER" -r "$REGION" -s "$VOL_GB" --yes
+  fi
+}
 
-# 3. Build + push the caosd image (the app must exist first for registry.fly.io).
-say "building caosd image (nix)"
-nix build .#caos-server-docker -o "$PROJECT/result-caos-server"
-IMG=$(readlink -f "$PROJECT/result-caos-server")
-say "pushing caosd image to registry.fly.io/$SERVER:latest"
-nix shell nixpkgs#skopeo -c skopeo --insecure-policy copy \
-  --dest-creds "x:$CAOS_FLY_TOKEN" \
-  "docker-archive:$IMG" "docker://registry.fly.io/$SERVER:latest"
-
-# 4. caosd's /git Volume.
-if has_volume "$SERVER"; then say "/git volume exists"; else
-  say "creating /git volume (${VOL_GB}GB)"
-  flyctl volumes create caos_git -a "$SERVER" -r "$REGION" -s "$VOL_GB" --yes
-fi
+say "starting redis, registry, and building caosd — in parallel..."
+start_redis    & p_redis=$!
+start_registry & p_reg=$!
+prep_caosd     & p_caosd=$!
+# The caosd machine needs its image + volume; wait for that job (surface errors).
+wait "$p_caosd" || { echo "caosd image/volume prep failed" >&2; exit 1; }
 
 # 5. caosd machine: public ingress (80/443 -> internal 80), the volume, env, and
 #    scale-to-zero. caosd binds [::]:80 and self-bootstraps /git on first boot.
@@ -125,6 +135,10 @@ else
     -e "CAOS_FLY_WORKER_PREFIX=$WORKER_PREFIX" \
     -e "CAOS_FLY_TOKEN=$CAOS_FLY_TOKEN"
 fi
+
+# redis/registry don't block caosd boot, but surface any failure before we go on.
+wait "$p_redis" || { echo "redis start failed" >&2; exit 1; }
+wait "$p_reg"   || { echo "registry start failed" >&2; exit 1; }
 
 # 6. Public IPs so the CLI can reach caosd at https://$SERVER.fly.dev.
 if has_ip "$SERVER"; then say "public IP exists"; else
