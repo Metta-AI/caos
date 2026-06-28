@@ -79,10 +79,30 @@ for app in "$SERVER" "$REGISTRY" "$REDIS"; do
   fi
 done
 
-# 2-4. Start redis + registry and build/push caosd + create its volume — all in
-# parallel. redis/registry are plain images reached over 6PN by name (no public
-# service); they're independent of caosd. The caosd machine (step 5) only needs
-# its image pushed and volume present, so we wait for just that job before it.
+# Build the caosd image (cheap when cached) and decide whether anything actually
+# changed. The image is content-addressed by its nix store path, so we sign
+# (store path + the env we bake into the machine) and compare to a per-stack
+# marker. An unchanged signature + a running machine means the deployed caosd is
+# already this exact image+config — so we can skip the slow re-push and the
+# machine restart entirely (the dominant cost of a no-op redeploy).
+say "building caosd image (nix)"
+if ! server_sp=$(nix build .#caos-server-docker --no-link --print-out-paths); then
+  echo "caosd image build failed" >&2; exit 1
+fi
+marker=".caos-dev/deploy-cache/$STACK-server"
+deploy_sig=$(printf '%s|%s|%s|%s|%s|%s|%s' \
+  "$server_sp" "$RAM_MB" "$POOL" "$ORG" "$REGION" "$WORKER_PREFIX" "$CAOS_FLY_TOKEN" \
+  | sha1sum | cut -c1-40)
+caosd_unchanged=0
+if [ "$(cat "$marker" 2>/dev/null)" = "$deploy_sig" ] && has_machine "$SERVER"; then
+  caosd_unchanged=1
+  say "caosd unchanged — skipping image push and machine update"
+fi
+
+# 2-4. Start redis + registry and (push caosd image unless unchanged) + ensure the
+# volume — all in parallel. redis/registry are plain images reached over 6PN by
+# name (no public service); independent of caosd. The caosd machine (step 5) only
+# needs its image pushed and volume present, so we wait for just that job before it.
 start_redis() {
   has_machine "$REDIS" && { say "redis machine exists"; return; }
   say "starting redis"
@@ -93,21 +113,20 @@ start_registry() {
   say "starting registry"
   flyctl machine run registry:2 -a "$REGISTRY" -r "$REGION" --name registry --vm-memory 256
 }
-prep_caosd() {  # build + push the image (app must exist for registry.fly.io), then volume
-  say "building caosd image (nix)"
-  nix build .#caos-server-docker -o "$PROJECT/result-caos-server"
-  say "pushing caosd image to registry.fly.io/$SERVER:latest"
-  nix shell nixpkgs#skopeo -c skopeo --insecure-policy copy \
-    --dest-creds "x:$CAOS_FLY_TOKEN" \
-    "docker-archive:$(readlink -f "$PROJECT/result-caos-server")" \
-    "docker://registry.fly.io/$SERVER:latest"
+prep_caosd() {
+  if [ "$caosd_unchanged" -eq 0 ]; then
+    say "pushing caosd image to registry.fly.io/$SERVER:latest"
+    nix shell nixpkgs#skopeo -c skopeo --insecure-policy copy \
+      --dest-creds "x:$CAOS_FLY_TOKEN" \
+      "docker-archive:$server_sp" "docker://registry.fly.io/$SERVER:latest"
+  fi
   if has_volume "$SERVER"; then say "/git volume exists"; else
     say "creating /git volume (${VOL_GB}GB)"
     flyctl volumes create caos_git -a "$SERVER" -r "$REGION" -s "$VOL_GB" --yes
   fi
 }
 
-say "starting redis, registry, and building caosd — in parallel..."
+say "starting redis, registry, and prepping caosd — in parallel..."
 start_redis    & p_redis=$!
 start_registry & p_reg=$!
 prep_caosd     & p_caosd=$!
@@ -116,7 +135,9 @@ wait "$p_caosd" || { echo "caosd image/volume prep failed" >&2; exit 1; }
 
 # 5. caosd machine: public ingress (80/443 -> internal 80), the volume, env, and
 #    scale-to-zero. caosd binds [::]:80 and self-bootstraps /git on first boot.
-if has_machine "$SERVER"; then
+if [ "$caosd_unchanged" -eq 1 ]; then
+  say "caosd machine already current"
+elif has_machine "$SERVER"; then
   say "updating caosd machine to the fresh image"
   flyctl machine update "$(machine_id "$SERVER")" -a "$SERVER" \
     --image "registry.fly.io/$SERVER:latest" --yes
@@ -135,6 +156,8 @@ else
     -e "CAOS_FLY_WORKER_PREFIX=$WORKER_PREFIX" \
     -e "CAOS_FLY_TOKEN=$CAOS_FLY_TOKEN"
 fi
+# Record the deployed signature so the next unchanged redeploy skips the above.
+mkdir -p "$(dirname "$marker")" && printf '%s' "$deploy_sig" >"$marker"
 
 # redis/registry don't block caosd boot, but surface any failure before we go on.
 wait "$p_redis" || { echo "redis start failed" >&2; exit 1; }
