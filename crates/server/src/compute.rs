@@ -123,24 +123,24 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     child_stack.push(&req);
     let child_stack = child_stack.join("\n");
 
-    // Resolve to a reference the host's docker daemon can run: a `docker://`
-    // image is used directly; one of our git images is converted to a real image,
-    // pushed to the registry, and referenced by digest.
-    let docker_ref = resolve_image(config, &image)?;
-
-    // Run the worker. `Docker` spawns a fresh container per request (the
-    // default); `Serve` POSTs to a long-lived `caos serve` container (the local
-    // stand-in for the fly warm pool). Both return the worker's "<type> <hash>".
+    // Run the worker. `Docker` spawns a fresh container per request (the default);
+    // `Serve` POSTs to a long-lived `caos serve` container (the local stand-in for
+    // the fly warm pool); `Fly` provisions a fly app + machine pool. Each returns
+    // the worker's "<type> <hash>".
+    //
+    // Image resolution differs by backend: Docker/Serve convert a git image into
+    // the local registry and run it by digest; Fly converts it straight into the
+    // stack's shared fly repo (no local registry), so it resolves the image itself.
     let result = match config_backend() {
         Backend::Serve => {
+            let docker_ref = resolve_image(config, &image)?;
             dispatch_serve(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
         }
         Backend::Docker => {
+            let docker_ref = resolve_image(config, &image)?;
             dispatch_docker(config, &docker_ref, &args, &std, &salt, &child_stack)?
         }
-        Backend::Fly => {
-            dispatch_fly(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
-        }
+        Backend::Fly => dispatch_fly(config, &image, &args, &std, &salt, &child_stack)?,
     };
 
     if result_hash(&result).is_empty() {
@@ -351,13 +351,17 @@ struct Fly {
     token: String,
     pool: u32,
     api: String,
-    registry: String,
     server_url: String,
     /// Prefix for this stack's worker app names, so multiple caos stacks can
     /// share one fly org without colliding on `caos-worker-<hash16>`. Each stack
     /// sets its own (e.g. `caos-foo-worker-`); the default keeps the original
     /// single-stack name.
     worker_prefix: String,
+    /// The one fly repo this stack pushes every worker image into, e.g.
+    /// `registry.fly.io/<stack>-caos-server`. A single repo means fly dedups
+    /// shared layers across all workers — each layer uploads once per stack, not
+    /// once per worker. Workers pull from it cross-app (`:w-<hash>` tags).
+    image_repo: String,
 }
 
 impl Fly {
@@ -365,6 +369,16 @@ impl Fly {
         let token = std::env::var("CAOS_FLY_TOKEN")
             .map_err(|_| HttpError::new(500, "CAOS_BACKEND=fly but CAOS_FLY_TOKEN is unset"))?;
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        // Default the shared repo from our own server URL (http://<app>.internal
+        // -> registry.fly.io/<app>); deploy-fly sets CAOS_FLY_IMAGE_REPO explicitly.
+        let default_repo = {
+            let host = config
+                .server_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            let app = host.split(['.', ':']).next().unwrap_or("caos-server");
+            format!("registry.fly.io/{app}")
+        };
         Ok(Fly {
             org: env("CAOS_FLY_ORG", "personal"),
             region: env("CAOS_FLY_REGION", "sjc"),
@@ -373,7 +387,6 @@ impl Fly {
             // Internal Machines API endpoint (plain HTTP over 6PN). Override with
             // https://api.machines.dev/v1 only from a TLS-capable build.
             api: env("CAOS_FLY_API", "http://_api.internal:4280/v1"),
-            registry: env("CAOS_FLY_REGISTRY", "registry.fly.io"),
             // caosd's own address, passed to workers as CAOS_SERVER_URL: the
             // content store they reach for `caos get`/`put` (and nested `run`)
             // during a job. Not how completion is reported — that's the reply to
@@ -381,6 +394,7 @@ impl Fly {
             // app is named.
             server_url: config.server_url.clone(),
             worker_prefix: env("CAOS_FLY_WORKER_PREFIX", "caos-worker-"),
+            image_repo: env("CAOS_FLY_IMAGE_REPO", &default_repo),
         })
     }
 }
@@ -395,7 +409,6 @@ fn fly_app_name(fly: &Fly, image: &str) -> String {
 /// directly to a free worker machine over 6PN.
 fn dispatch_fly(
     config: &Config,
-    docker_ref: &str,
     image: &str,
     args: &str,
     std: &str,
@@ -403,7 +416,7 @@ fn dispatch_fly(
     stack: &str,
 ) -> Result<String, HttpError> {
     let fly = Fly::from_env(config)?;
-    ensure_worker_app(config, &fly, docker_ref, image)?;
+    ensure_worker_app(config, &fly, image)?;
     let app = fly_app_name(&fly, image);
     let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
         .to_string();
@@ -559,27 +572,42 @@ fn fly_start_machine(fly: &Fly, app: &str, id: &str) -> Result<(), HttpError> {
     }
 }
 
-/// Create the app, push the image to registry.fly.io, and create N machines
-/// running `caos serve`. Skipped on a warm Redis marker.
-fn ensure_worker_app(
-    config: &Config,
-    fly: &Fly,
-    docker_ref: &str,
-    image: &str,
-) -> Result<(), HttpError> {
+/// Create the app, get the image onto fly (its shared repo), and create N
+/// machines running `caos serve`. Skipped on a warm Redis marker.
+fn ensure_worker_app(config: &Config, fly: &Fly, image: &str) -> Result<(), HttpError> {
     let marker = format!("caos:fly:{image}");
     if let Ok(Some(_)) = cache_get(&config.redis_addr, &marker) {
         return Ok(());
     }
     let app = fly_app_name(fly, image);
     fly_create_app(fly, &app)?;
-    let fly_image = push_image_to_fly(fly, docker_ref, &app, image)?;
+    let fly_image = resolve_fly_image(config, fly, image)?;
     for _ in 0..fly.pool {
         fly_create_machine(fly, &app, &fly_image)?;
     }
     let _ = cache_set(&config.redis_addr, &marker, "provisioned");
     eprintln!("provisioned fly app {app} ({} machines)", fly.pool);
     Ok(())
+}
+
+/// The image reference a worker machine should pull. A `docker://` image is used
+/// directly (workers pull it from its public registry). A git image is converted
+/// to an OCI layout and pushed straight to the stack's shared fly repo, returning
+/// `<image_repo>:w-<hash>`.
+fn resolve_fly_image(config: &Config, fly: &Fly, image: &str) -> Result<String, HttpError> {
+    if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
+        if reference.is_empty() || reference.starts_with('-') {
+            return Err(HttpError::new(400, format!("invalid docker image: {reference:?}")));
+        }
+        return Ok(reference.to_string());
+    }
+    if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(HttpError::new(
+            400,
+            format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
+        ));
+    }
+    push_image_to_fly(fly, config, image)
 }
 
 /// `POST /v1/apps` — idempotent. A fresh app is 201; an existing one comes back
@@ -631,38 +659,183 @@ fn fly_create_machine(fly: &Fly, app: &str, fly_image: &str) -> Result<(), HttpE
     }
 }
 
-/// Copy the converted image from the local registry to registry.fly.io/<app>.
-/// Shelled out to skopeo: the fly registry is HTTPS + token-auth, which the
-/// server's TLS-free in-process push can't do. Returns the fly image ref.
-fn push_image_to_fly(
-    fly: &Fly,
-    docker_ref: &str,
-    app: &str,
-    image: &str,
-) -> Result<String, HttpError> {
-    let tag: String = image.chars().take(40).collect();
-    let dest = format!("{}/{app}:{tag}", fly.registry);
-    // `--insecure-policy`: skip the containers trust-policy lookup. The slim
-    // server image ships no `/etc/containers/policy.json`, and we trust both ends
-    // (our own registry → fly's), so there's no signature policy to enforce.
-    // `--dest-tls-verify=false`: the slim image ships no CA bundle, so skopeo
-    // can't verify registry.fly.io's cert. The push is still over TLS and
-    // token-authenticated to fly's own registry; we just skip chain verification
-    // (the mirror of `--src-tls-verify=false` for our plain-HTTP local registry).
-    let status = Command::new("skopeo")
-        .args(["--insecure-policy", "copy", "--src-tls-verify=false", "--dest-tls-verify=false"])
-        .arg(format!("--dest-creds=x:{}", fly.token))
-        .arg(format!("docker://{docker_ref}"))
-        .arg(format!("docker://{dest}"))
-        .status()
-        .map_err(|e| HttpError::new(500, format!("skopeo copy: {e}")))?;
-    if !status.success() {
-        return Err(HttpError::new(
-            500,
-            format!("skopeo copy to {dest} failed ({status})"),
-        ));
+/// Convert the git image to an OCI layout and skopeo-copy it straight into the
+/// stack's shared fly repo as `<image_repo>:w-<hash>`. No local registry: the
+/// layout's blobs come from the per-stack on-disk store ([`oci_store`]), and
+/// skopeo uploads only the blobs fly's registry lacks — so a layer shared across
+/// workers lands once per stack. Returns the ref the worker machines pull.
+fn push_image_to_fly(fly: &Fly, config: &Config, git_hash: &str) -> Result<String, HttpError> {
+    // The layout dir sits on the same (volume) filesystem as the blob store, so
+    // its blobs are hardlinked in rather than copied; removed after the push.
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let oci_dir = oci_store(config)
+        .join("layout")
+        .join(format!("{}-{n}", std::process::id()));
+    let result = (|| {
+        build_oci_image(config, git_hash, &oci_dir)
+            .map_err(|e| HttpError::new(500, format!("building OCI image {git_hash}: {e}")))?;
+        let tag = format!("w-{}", &git_hash[..git_hash.len().min(40)]);
+        let dest = format!("{}:{tag}", fly.image_repo);
+        // `--insecure-policy`: the slim server image ships no policy.json.
+        // `--dest-tls-verify=false`: it ships no CA bundle either, so skopeo can't
+        // verify registry.fly.io's cert (the push is still TLS + token-auth).
+        let status = Command::new("skopeo")
+            .args(["--insecure-policy", "copy", "--dest-tls-verify=false"])
+            .arg(format!("--dest-creds=x:{}", fly.token))
+            .arg(format!("oci:{}:image", oci_dir.display()))
+            .arg(format!("docker://{dest}"))
+            .status()
+            .map_err(|e| HttpError::new(500, format!("skopeo copy: {e}")))?;
+        if !status.success() {
+            return Err(HttpError::new(500, format!("skopeo copy to {dest} failed ({status})")));
+        }
+        eprintln!("pushed image {git_hash} -> {dest}");
+        Ok(dest)
+    })();
+    let _ = std::fs::remove_dir_all(&oci_dir);
+    result
+}
+
+/// Per-stack content-addressed blob store on the caosd volume — the byte store
+/// for the fly image pipeline, replacing the (removed) local registry. A layer
+/// tarred once here is reused for every worker's OCI layout (no re-tar). Lives
+/// under the git volume (the only persistent storage); content-addressed, so it
+/// never needs invalidation and is safe to share across concurrent conversions.
+fn oci_store(config: &Config) -> PathBuf {
+    Path::new(config.git_dir.trim_end_matches('/')).join("oci-blobs")
+}
+
+/// Write `bytes` into the blob store under `hex` (a bare sha256, no prefix),
+/// atomically and idempotently — it's content-addressed, so an existing blob is
+/// already correct.
+fn store_blob(config: &Config, hex: &str, bytes: &[u8]) -> Result<(), String> {
+    let dir = oci_store(config).join("sha256");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let path = dir.join(hex);
+    if path.exists() {
+        return Ok(());
     }
-    Ok(dest)
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{hex}.{}.{n}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("renaming into {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Like [`ensure_layer`] but for the fly pipeline: build (or reuse) the layer and
+/// ensure its tar bytes live in the blob store, returning `(digest, size)`. A
+/// Redis hit short-circuits only when the bytes are actually present on disk (a
+/// fresh volume re-tars), so the cache never claims a layer we can't produce.
+fn ensure_layer_blob(config: &Config, layer_oid: &str) -> Result<(String, u64), String> {
+    let key = format!("caos:layer:{layer_oid}");
+    if let Ok(Some(value)) = cache_get(&config.redis_addr, &key) {
+        if let Some((digest, size)) = value.split_once(' ') {
+            if let Ok(size) = size.parse::<u64>() {
+                let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+                if oci_store(config).join("sha256").join(hex).exists() {
+                    eprintln!("layer cache hit: {layer_oid} -> {digest}");
+                    return Ok((digest.to_string(), size));
+                }
+            }
+        }
+    }
+    let tar = build_layer_tar(config, layer_oid)?;
+    let hex = sha256_hex(&tar);
+    let size = tar.len() as u64;
+    store_blob(config, &hex, &tar)?;
+    let digest = format!("sha256:{hex}");
+    let _ = cache_set(&config.redis_addr, &key, &format!("{digest} {size}"));
+    eprintln!("built layer {layer_oid} -> {digest} ({size} bytes)");
+    Ok((digest, size))
+}
+
+/// Convert the git-docker image `git_hash` into an OCI layout directory at
+/// `oci_dir`: build (or reuse from the store) the layer/config/manifest blobs,
+/// then assemble `oci-layout`, `index.json`, and `blobs/sha256/*` (hardlinked
+/// from the store). The fly pipeline's replacement for [`convert_git_image`]'s
+/// registry push; the resulting layout is what skopeo copies to fly.
+fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<(), String> {
+    // Image tree: `config.json` (a blob) + `layer<NN>` subtrees (same shape as
+    // convert_git_image).
+    let mut config_oid: Option<String> = None;
+    let mut layers: Vec<(u64, String)> = Vec::new();
+    for entry in fetch_tree(config, git_hash)? {
+        if entry.name == "config.json" {
+            config_oid = Some(entry.oid.to_string());
+        } else if let Some(suffix) = entry.name.strip_prefix("layer") {
+            if let Ok(num) = suffix.parse::<u64>() {
+                if !entry.mode.is_tree() {
+                    return Err(format!("layer entry {} is not a directory", entry.name));
+                }
+                layers.push((num, entry.oid.to_string()));
+            }
+        }
+    }
+    let config_oid = config_oid.ok_or("image tree has no config.json")?;
+    if layers.is_empty() {
+        return Err("image tree has no layer<NN> entries".to_string());
+    }
+    layers.sort_by_key(|(num, _)| *num);
+
+    // Each layer (uncompressed tar) → its blob digest is also its diff_id.
+    let mut layer_descs: Vec<(String, u64)> = Vec::new();
+    let mut diff_ids: Vec<String> = Vec::new();
+    for (_, oid) in &layers {
+        let (digest, size) = ensure_layer_blob(config, oid)?;
+        diff_ids.push(digest.clone());
+        layer_descs.push((digest, size));
+    }
+
+    let config_bytes = fetch_blob(config, &config_oid)?;
+    let new_config = set_config_diff_ids(&config_bytes, &diff_ids)?;
+    let config_hex = sha256_hex(&new_config);
+    let config_digest = format!("sha256:{config_hex}");
+    store_blob(config, &config_hex, &new_config)?;
+
+    let manifest = build_manifest(&config_digest, new_config.len() as u64, &layer_descs);
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).map_err(|e| format!("serializing manifest: {e}"))?;
+    let manifest_hex = sha256_hex(&manifest_bytes);
+    let manifest_digest = format!("sha256:{manifest_hex}");
+    store_blob(config, &manifest_hex, &manifest_bytes)?;
+
+    // Assemble the OCI layout, hardlinking each blob from the store (same fs).
+    let blobs = oci_dir.join("blobs").join("sha256");
+    std::fs::create_dir_all(&blobs).map_err(|e| format!("creating {}: {e}", blobs.display()))?;
+    let store_sha = oci_store(config).join("sha256");
+    let mut digests: Vec<&str> = layer_descs.iter().map(|(d, _)| d.as_str()).collect();
+    digests.push(&config_digest);
+    digests.push(&manifest_digest);
+    for d in digests {
+        let hex = d.strip_prefix("sha256:").unwrap_or(d);
+        let dst = blobs.join(hex);
+        if dst.exists() {
+            continue;
+        }
+        let src = store_sha.join(hex);
+        std::fs::hard_link(&src, &dst)
+            .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
+            .map_err(|e| format!("linking blob {hex} into layout: {e}"))?;
+    }
+    std::fs::write(oci_dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)
+        .map_err(|e| format!("writing oci-layout: {e}"))?;
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": manifest_digest,
+            "size": manifest_bytes.len(),
+            "annotations": { "org.opencontainers.image.ref.name": "image" },
+        }],
+    });
+    std::fs::write(
+        oci_dir.join("index.json"),
+        serde_json::to_vec(&index).map_err(|e| format!("serializing index.json: {e}"))?,
+    )
+    .map_err(|e| format!("writing index.json: {e}"))?;
+    eprintln!("built OCI image {git_hash} -> {manifest_digest}");
+    Ok(())
 }
 
 /// A Machines API call with bearer auth, `path` appended to the configured base.

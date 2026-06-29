@@ -4,10 +4,11 @@
 # One stack = three long-lived apps plus on-demand per-worker apps, all named
 # with the stack as the leading component (`<stack>-caos-...`):
 #   <stack>-caos-server            caosd (compute + storage), a /git Volume,
-#                                  public ingress at https://<stack>-caos-server.fly.dev
-#   <stack>-caos-registry          registry:2 — converted-image cache (6PN-only)
+#                                  public ingress at https://<stack>-caos-server.fly.dev;
+#                                  its registry repo doubles as the shared worker-image repo
 #   <stack>-caos-redis             redis:7 — result/image cache (6PN-only)
 #   <stack>-caos-worker-<hash16>   one app per worker version, created by caosd
+#                                  (machines pull from the server's shared repo, :w-<hash>)
 #
 # Multiple stacks coexist in one fly org because every app name leads with the
 # stack: caosd passes its own worker prefix to the provisioner via
@@ -58,7 +59,6 @@ STD=${CAOS_FLY_STD:-all}
 export FLY_API_TOKEN=$CAOS_FLY_TOKEN
 
 SERVER=$STACK-caos-server
-REGISTRY=$STACK-caos-registry
 REDIS=$STACK-caos-redis
 WORKER_PREFIX=$STACK-caos-worker-
 
@@ -73,7 +73,7 @@ has_volume()  { flyctl volumes list -a "$1" 2>/dev/null | grep -q 'caos_git'; }
 has_ip()      { flyctl ips list -a "$1" 2>/dev/null | grep -qiE '[[:space:]]v[46][[:space:]]'; }
 
 # 1. The three apps.
-for app in "$SERVER" "$REGISTRY" "$REDIS"; do
+for app in "$SERVER" "$REDIS"; do
   if app_exists "$app"; then say "app $app exists"; else
     say "creating app $app (org $ORG)"; flyctl apps create "$app" --org "$ORG"
   fi
@@ -99,19 +99,15 @@ if [ "$(cat "$marker" 2>/dev/null)" = "$deploy_sig" ] && has_machine "$SERVER"; 
   say "caosd unchanged — skipping image push and machine update"
 fi
 
-# 2-4. Start redis + registry and (push caosd image unless unchanged) + ensure the
-# volume — all in parallel. redis/registry are plain images reached over 6PN by
-# name (no public service); independent of caosd. The caosd machine (step 5) only
-# needs its image pushed and volume present, so we wait for just that job before it.
+# 2-4. Start redis and (push caosd image unless unchanged) + ensure the volume —
+# in parallel. redis is a plain image reached over 6PN by name (no public
+# service); independent of caosd. The caosd machine (step 5) only needs its image
+# pushed and volume present, so we wait for just that job before it. (No separate
+# registry app: worker images go straight into the server's own fly repo.)
 start_redis() {
   has_machine "$REDIS" && { say "redis machine exists"; return; }
   say "starting redis"
   flyctl machine run redis:7 -a "$REDIS" -r "$REGION" --name redis --vm-memory 256
-}
-start_registry() {
-  has_machine "$REGISTRY" && { say "registry machine exists"; return; }
-  say "starting registry"
-  flyctl machine run registry:2 -a "$REGISTRY" -r "$REGION" --name registry --vm-memory 256
 }
 prep_caosd() {
   if [ "$caosd_unchanged" -eq 0 ]; then
@@ -126,10 +122,9 @@ prep_caosd() {
   fi
 }
 
-say "starting redis, registry, and prepping caosd — in parallel..."
-start_redis    & p_redis=$!
-start_registry & p_reg=$!
-prep_caosd     & p_caosd=$!
+say "starting redis and prepping caosd — in parallel..."
+start_redis & p_redis=$!
+prep_caosd  & p_caosd=$!
 # The caosd machine needs its image + volume; wait for that job (surface errors).
 wait "$p_caosd" || { echo "caosd image/volume prep failed" >&2; exit 1; }
 
@@ -149,8 +144,7 @@ else
     --autostop=stop --autostart \
     -e CAOS_BACKEND=fly \
     -e "CAOS_SERVER_URL=http://$SERVER.internal" \
-    -e "CAOS_REGISTRY_PUSH_URL=http://$REGISTRY.internal:5000" \
-    -e "CAOS_REGISTRY_PULL_HOST=$REGISTRY.internal:5000" \
+    -e "CAOS_FLY_IMAGE_REPO=registry.fly.io/$SERVER" \
     -e "CAOS_REDIS_ADDR=$REDIS.internal:6379" \
     -e "CAOS_FLY_ORG=$ORG" -e "CAOS_FLY_REGION=$REGION" -e "CAOS_FLY_POOL=$POOL" \
     -e "CAOS_FLY_WORKER_PREFIX=$WORKER_PREFIX" \
@@ -159,9 +153,8 @@ fi
 # Record the deployed signature so the next unchanged redeploy skips the above.
 mkdir -p "$(dirname "$marker")" && printf '%s' "$deploy_sig" >"$marker"
 
-# redis/registry don't block caosd boot, but surface any failure before we go on.
+# redis doesn't block caosd boot, but surface any failure before we go on.
 wait "$p_redis" || { echo "redis start failed" >&2; exit 1; }
-wait "$p_reg"   || { echo "registry start failed" >&2; exit 1; }
 
 # 6. Public IPs so the CLI can reach caosd at https://$SERVER.fly.dev.
 if has_ip "$SERVER"; then say "public IP exists"; else
