@@ -362,6 +362,9 @@ struct Fly {
     /// shared layers across all workers — each layer uploads once per stack, not
     /// once per worker. Workers pull from it cross-app (`:w-<hash>` tags).
     image_repo: String,
+    /// RAM (MB) for each worker machine. 256 suits trivial workers (hello, bash);
+    /// heavier ones (the rustc builder) need more — `CAOS_FLY_WORKER_MEMORY`.
+    worker_memory: u32,
 }
 
 impl Fly {
@@ -395,6 +398,7 @@ impl Fly {
             server_url: config.server_url.clone(),
             worker_prefix: env("CAOS_FLY_WORKER_PREFIX", "caos-worker-"),
             image_repo: env("CAOS_FLY_IMAGE_REPO", &default_repo),
+            worker_memory: env("CAOS_FLY_WORKER_MEMORY", "256").parse().unwrap_or(256),
         })
     }
 }
@@ -645,7 +649,7 @@ fn fly_create_machine(fly: &Fly, app: &str, fly_image: &str) -> Result<(), HttpE
             "image": fly_image,
             "init": { "exec": ["/bin/caos", "serve"] },
             "env": { "CAOS_SERVER_URL": fly.server_url },
-            "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": 256 }
+            "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": fly.worker_memory }
         }
     })
     .to_string();

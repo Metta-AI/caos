@@ -39,18 +39,20 @@ echo "publishing std: ${builtins[*]:-<all>}..." >&2
 ./build-builtins.sh "${builtins[@]}" >/dev/null
 
 # A throwaway client repo with the server as its `caos` remote (the host CLI
-# pushes the run request from here). The result (the test's exit status is what
-# matters) is checked out to a plain host path.
+# pushes the run request from here). A failing assertion exits the worker
+# non-zero, which fails the run; a passing test's result is a single file (e.g.
+# perf numbers) that we print below.
 CLIENT=$PROJECT/.caos-dev/test-client
 rm -rf "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
-OUT=$PROJECT/.caos-dev/test-out
-rm -rf "$OUT"
-trap 'rm -rf "$CLIENT" "$OUT"' EXIT
+trap 'rm -rf "$CLIENT"' EXIT
 
 # Run the test inside a bash worker: test.sh is the script; the whole directory
-# rides along as `test` (materialized at /cas/args/test).
+# rides along as `test` (materialized at /cas/args/test). No output path is
+# passed, so a single-file result is written to stdout (a worker's stderr only
+# reaches us on failure, so a passing test reports via its /cas/out file).
 echo "running $1 inside a bash worker..." >&2
-( cd "$CLIENT" && "$caosbin" run /cas/std/bash "$OUT" -- \
-    --script:@="$DIR/test.sh" --test:@="$DIR" ) >/dev/null
+result=$( cd "$CLIENT" && "$caosbin" run /cas/std/bash -- \
+    --script:@="$DIR/test.sh" --test:@="$DIR" )
 echo "PASS: $1" >&2
+[ -n "$result" ] && printf '%s\n' "$result"

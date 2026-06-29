@@ -27,8 +27,10 @@
 #
 # Tunables (env or .caos-dev/fly.env): CAOS_FLY_POOL (worker pool size),
 # CAOS_FLY_VOL_GB (/git size, default 10), CAOS_FLY_RAM_MB (caosd RAM, default
-# 2048 — big enough for the rustc builtin's git push), CAOS_FLY_STD (which
-# builtins to host: `all` (default), `none`, or a list like `hello bash`).
+# 2048 — big enough for the rustc builtin's git push), CAOS_FLY_WORKER_MEMORY (RAM
+# per worker machine, default 256 — bump for heavy workers like the rustc
+# builder), CAOS_FLY_STD (which builtins to host: `all` (default), `none`, or a
+# list like `hello bash`).
 #
 # Hosting the std library (build-builtins.sh -> sets refs/caos/std + loads the
 # builtin image trees into caosd's CAS) lets clients resolve `/cas/std/<name>`.
@@ -53,6 +55,7 @@ REGION=${2:-${CAOS_FLY_REGION:-sjc}}
 POOL=${CAOS_FLY_POOL:-1}
 VOL_GB=${CAOS_FLY_VOL_GB:-10}
 RAM_MB=${CAOS_FLY_RAM_MB:-2048}
+WORKER_MEM=${CAOS_FLY_WORKER_MEMORY:-256}
 STD=${CAOS_FLY_STD:-all}
 # Make flyctl act as the org token (not whatever interactive login is present),
 # so apps land in the right org and this works headless.
@@ -90,8 +93,8 @@ if ! server_sp=$(nix build .#caos-server-docker --no-link --print-out-paths); th
   echo "caosd image build failed" >&2; exit 1
 fi
 marker=".caos-dev/deploy-cache/$STACK-server"
-deploy_sig=$(printf '%s|%s|%s|%s|%s|%s|%s' \
-  "$server_sp" "$RAM_MB" "$POOL" "$ORG" "$REGION" "$WORKER_PREFIX" "$CAOS_FLY_TOKEN" \
+deploy_sig=$(printf '%s|%s|%s|%s|%s|%s|%s|%s' \
+  "$server_sp" "$RAM_MB" "$POOL" "$ORG" "$REGION" "$WORKER_PREFIX" "$WORKER_MEM" "$CAOS_FLY_TOKEN" \
   | sha1sum | cut -c1-40)
 caosd_unchanged=0
 if [ "$(cat "$marker" 2>/dev/null)" = "$deploy_sig" ] && has_machine "$SERVER"; then
@@ -148,6 +151,7 @@ else
     -e "CAOS_REDIS_ADDR=$REDIS.internal:6379" \
     -e "CAOS_FLY_ORG=$ORG" -e "CAOS_FLY_REGION=$REGION" -e "CAOS_FLY_POOL=$POOL" \
     -e "CAOS_FLY_WORKER_PREFIX=$WORKER_PREFIX" \
+    -e "CAOS_FLY_WORKER_MEMORY=$WORKER_MEM" \
     -e "CAOS_FLY_TOKEN=$CAOS_FLY_TOKEN"
 fi
 # Record the deployed signature so the next unchanged redeploy skips the above.
