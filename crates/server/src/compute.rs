@@ -8,7 +8,7 @@
 //! converted images, and built layers are all cached in Redis (best-effort).
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -345,6 +345,7 @@ fn serve_post(url: &str, body: &str) -> Result<String, HttpError> {
 
 /// Fly backend config, from `CAOS_FLY_*` env. `token` must be an *org* deploy
 /// token — the personal `fly auth token` can't create apps (403).
+#[derive(Clone)]
 struct Fly {
     org: String,
     region: String,
@@ -433,6 +434,10 @@ fn dispatch_fly(
 struct Machine {
     id: String,
     state: String,
+    /// 6PN private IPv6, assigned at create (before boot). We dispatch straight to
+    /// it rather than the `<id>.vm.<app>.internal` DNS name — a brand-new
+    /// machine's DNS takes ~10s to propagate, but its IP is usable immediately.
+    private_ip: String,
 }
 
 /// Send the job to whichever machine in the pool is free, starting stopped ones
@@ -457,8 +462,7 @@ fn dispatch_to_pool(fly: &Fly, app: &str, body: &str) -> Result<String, HttpErro
                 eprintln!("dispatch {app}: starting machine {} (state {})", m.id, m.state);
                 let _ = fly_start_machine(fly, app, &m.id);
             }
-            let url = format!("http://{}.vm.{app}.internal:8080/run", m.id);
-            match post_job(&url, body) {
+            match post_job(&m.private_ip, body) {
                 Outcome::Done(result) => {
                     eprintln!("dispatch {app}: machine {} accepted (sweep {attempt})", m.id);
                     return Ok(result);
@@ -497,34 +501,19 @@ enum Outcome {
     Failed(HttpError),
 }
 
-/// POST a job to a worker's `/run`, classifying the result. Retries briefly while
-/// the machine is still binding its port (a just-started machine), surfacing the
-/// last connect error as `Unreachable` so dispatch can log why and move on.
-fn post_job(url: &str, body: &str) -> Outcome {
+/// POST a job to a worker over 6PN at `ip:8080`, classifying the result. Retries
+/// briefly while a just-started machine is still binding its port (connection
+/// refused), surfacing the last error as `Unreachable` so dispatch logs it and
+/// moves on.
+fn post_job(ip: &str, body: &str) -> Outcome {
     let mut last_err = String::new();
-    for _ in 0..20 {
-        match minreq::post(url)
-            .with_header("content-type", "application/json")
-            .with_body(body.to_string())
-            .send()
-        {
-            Ok(resp) => {
-                return match resp.status_code {
-                    200 => match resp.as_str() {
-                        Ok(out) => Outcome::Done(out.trim().to_string()),
-                        Err(e) => Outcome::Failed(HttpError::new(
-                            500,
-                            format!("reading worker reply: {e}"),
-                        )),
-                    },
-                    503 => Outcome::Busy,
-                    code => {
-                        let msg = resp.as_str().unwrap_or("<unreadable>").to_string();
-                        Outcome::Failed(HttpError::new(500, format!("worker failed ({code}): {msg}")))
-                    }
-                };
+    for _ in 0..40 {
+        match raw_post(ip, 8080, "/run", body) {
+            Ok((200, out)) => return Outcome::Done(out.trim().to_string()),
+            Ok((503, _)) => return Outcome::Busy,
+            Ok((code, msg)) => {
+                return Outcome::Failed(HttpError::new(500, format!("worker failed ({code}): {msg}")))
             }
-            // Not up yet (still booting / binding the port / DNS lag): wait, retry.
             Err(e) => {
                 last_err = e.to_string();
                 std::thread::sleep(Duration::from_millis(150));
@@ -532,6 +521,33 @@ fn post_job(url: &str, body: &str) -> Outcome {
         }
     }
     Outcome::Unreachable(last_err)
+}
+
+/// One raw HTTP/1.1 POST over a fresh TCP connection to `ip:port`, returning
+/// `(status, body)`. Raw rather than `minreq` so we connect straight to the
+/// worker's 6PN IPv6 — `(ip, port)` resolves a bare IPv6 string without the
+/// bracketed-URL parsing minreq trips over. `Connection: close` lets us read the
+/// body to EOF.
+fn raw_post(ip: &str, port: u16, path: &str, body: &str) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect((ip, port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: worker\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes())?;
+    stream.flush()?;
+    let mut raw = String::new();
+    BufReader::new(stream).read_to_string(&mut raw)?;
+    let status = raw
+        .split_once("\r\n")
+        .and_then(|(line, _)| line.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line"))?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    Ok((status, body))
 }
 
 /// List the worker app's machines (`GET /apps/{app}/machines`), returning each
@@ -553,10 +569,12 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
     for m in parsed.as_array().into_iter().flatten() {
         let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default();
         let state = m.get("state").and_then(|v| v.as_str()).unwrap_or_default();
-        if !id.is_empty() {
+        let private_ip = m.get("private_ip").and_then(|v| v.as_str()).unwrap_or_default();
+        if !id.is_empty() && !private_ip.is_empty() {
             machines.push(Machine {
                 id: id.to_string(),
                 state: state.to_string(),
+                private_ip: private_ip.to_string(),
             });
         }
     }
@@ -586,11 +604,22 @@ fn ensure_worker_app(config: &Config, fly: &Fly, image: &str) -> Result<(), Http
     let app = fly_app_name(fly, image);
     fly_create_app(fly, &app)?;
     let fly_image = resolve_fly_image(config, fly, image)?;
-    for _ in 0..fly.pool {
-        fly_create_machine(fly, &app, &fly_image)?;
+    // Create just the first machine synchronously so the dispatch can proceed; the
+    // rest of the pool fills in the background, off the cold-start path. (Creating
+    // N machines serially up front added seconds for no benefit on the first run.)
+    fly_create_machine(fly, &app, &fly_image)?;
+    if fly.pool > 1 {
+        let (fly, app, fly_image) = (fly.clone(), app.clone(), fly_image.clone());
+        std::thread::spawn(move || {
+            for _ in 1..fly.pool {
+                if fly_create_machine(&fly, &app, &fly_image).is_err() {
+                    eprintln!("background pool fill: a {app} machine create failed");
+                }
+            }
+        });
     }
     let _ = cache_set(&config.redis_addr, &marker, "provisioned");
-    eprintln!("provisioned fly app {app} ({} machines)", fly.pool);
+    eprintln!("provisioned fly app {app} (1 machine now, {} total)", fly.pool);
     Ok(())
 }
 
