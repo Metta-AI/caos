@@ -363,12 +363,13 @@
           cp -r ${./crates/worker-common} $out/vendor/worker-common
         '';
         # One merged root tree: the worker bits plus the build toolchain, so a
-        # single PATH=/bin reaches caos (from the base layer), /worker, cargo,
-        # rustc, and cc. workerBaseRoot is omitted here — it comes from the shared
-        # base via fromImage.
+        # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc. Includes
+        # workerBaseRoot because rustc keeps its own base (buildLayeredImage below,
+        # not the shared fromImage base — see there).
         workerRustcRootEnv = pkgs.buildEnv {
           name = "caos-worker-rustc-root";
           paths = [
+            workerBaseRoot
             workerRustcRoot
             workerCommonVendor
             rustToolchain
@@ -388,12 +389,19 @@
             "CARGO_HOME=/tmp/cargo"
           ];
         };
-        workerRustcImage = pkgs.dockerTools.buildImage {
+        # rustc stays multi-layered (its own base, not the shared fromImage one):
+        # its ~1.5GB toolchain as a single squashed copyToRoot layer would OOM the
+        # git->OCI conversion (caosd materializes + tars a layer in memory).
+        # buildLayeredImage splits it into many manageable layers. rustc barely
+        # benefits from base-sharing anyway — the toolchain dwarfs the base — and
+        # source-built workers still share the canonical base by reusing
+        # /cas/std/base's layers by hash.
+        workerRustcImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-rustc";
           tag = "latest";
-          fromImage = workerBaseImage;
-          copyToRoot = workerRustcRootEnv;
+          contents = [ workerRustcRootEnv ];
           config = workerRustcConfig;
+          fakeRootCommands = installWorkerFiles;
         };
 
         # The caos server: storage *and* compute in one process (it serves
@@ -500,7 +508,7 @@
         };
         loadWorkerRustc = loadImage {
           name = "caos-worker-rustc";
-          contents = [ workerBaseRoot workerRustcRootEnv ];
+          contents = [ workerRustcRootEnv ];
           config = workerRustcConfig;
           fakeRootCommands = installWorkerFiles;
         };
