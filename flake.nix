@@ -185,15 +185,21 @@
             fi
           '';
         };
-        workerBashContents = [
-          workerBaseRoot
-          workerBashScript
-          pkgs.bash
-          pkgs.coreutils
-          pkgs.diffutils
-          pkgs.gnugrep
-          pkgs.findutils
-        ];
+        # bash's own files, merged into one root so they land as a single layer
+        # atop the shared workerBaseImage (which already carries the setuid caos,
+        # /tmp, and the user db). Sharing that base means a worker provisioned
+        # after any other only uploads this layer, not the caos binary again.
+        workerBashRoot = pkgs.buildEnv {
+          name = "caos-worker-bash-root";
+          paths = [
+            workerBashScript
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.diffutils
+            pkgs.gnugrep
+            pkgs.findutils
+          ];
+        };
         workerBashConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -201,12 +207,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerBashImage = pkgs.dockerTools.buildLayeredImage {
+        workerBashImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-bash";
           tag = "latest";
-          contents = workerBashContents;
+          fromImage = workerBaseImage;
+          copyToRoot = workerBashRoot;
           config = workerBashConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
 
@@ -217,10 +223,6 @@
         # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
         # static binary at /worker — so the image needs no shell or coreutils.
         workerHelloRoot = workerRoot "worker-hello" worker-hello;
-        workerHelloContents = [
-          workerBaseRoot
-          workerHelloRoot
-        ];
         workerHelloConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -228,12 +230,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerHelloImage = pkgs.dockerTools.buildLayeredImage {
+        workerHelloImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-hello";
           tag = "latest";
-          contents = workerHelloContents;
+          fromImage = workerBaseImage;
+          copyToRoot = workerHelloRoot;
           config = workerHelloConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A recursive "fold" worker — a catamorphism over a CAS tree. Args:
@@ -254,10 +256,6 @@
         # This is the `worker-fold` crate, a static binary at /worker — so the
         # image needs no shell or coreutils.
         workerFoldRoot = workerRoot "worker-fold" worker-fold;
-        workerFoldContents = [
-          workerBaseRoot
-          workerFoldRoot
-        ];
         workerFoldConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -265,12 +263,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerFoldImage = pkgs.dockerTools.buildLayeredImage {
+        workerFoldImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-fold";
           tag = "latest";
-          contents = workerFoldContents;
+          fromImage = workerBaseImage;
+          copyToRoot = workerFoldRoot;
           config = workerFoldConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A "file-count" worker: a leaf algebra meant to drive fold as its
@@ -283,10 +281,6 @@
         # that URL at runtime. This is the `worker-file-count` crate, a static
         # binary at /worker — so the image needs no shell or coreutils.
         workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
-        workerFileCountContents = [
-          workerBaseRoot
-          workerFileCountRoot
-        ];
         workerFileCountConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -294,12 +288,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerFileCountImage = pkgs.dockerTools.buildLayeredImage {
+        workerFileCountImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-file-count";
           tag = "latest";
-          contents = workerFileCountContents;
+          fromImage = workerBaseImage;
+          copyToRoot = workerFileCountRoot;
           config = workerFileCountConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A "deep-deps" worker: turns a flat, name-keyed package map into a DAG of
@@ -337,10 +331,6 @@
         # /worker — so, like the other Rust workers, its image needs no shell or
         # coreutils, just caos (installed setuid by installWorkerFiles).
         workerDeepDepsRoot = workerRoot "worker-deep-deps" worker-deep-deps;
-        workerDeepDepsContents = [
-          workerBaseRoot
-          workerDeepDepsRoot
-        ];
         workerDeepDepsConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -348,12 +338,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerDeepDepsImage = pkgs.dockerTools.buildLayeredImage {
+        workerDeepDepsImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-deep-deps";
           tag = "latest";
-          contents = workerDeepDepsContents;
+          fromImage = workerBaseImage;
+          copyToRoot = workerDeepDepsRoot;
           config = workerDeepDepsConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A "rustc" worker: it *builds other workers*. Given a Rust source file as
@@ -373,11 +363,12 @@
           cp -r ${./crates/worker-common} $out/vendor/worker-common
         '';
         # One merged root tree: the worker bits plus the build toolchain, so a
-        # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc.
+        # single PATH=/bin reaches caos (from the base layer), /worker, cargo,
+        # rustc, and cc. workerBaseRoot is omitted here — it comes from the shared
+        # base via fromImage.
         workerRustcRootEnv = pkgs.buildEnv {
           name = "caos-worker-rustc-root";
           paths = [
-            workerBaseRoot
             workerRustcRoot
             workerCommonVendor
             rustToolchain
@@ -386,7 +377,6 @@
             pkgs.bash # cc-wrapper and cargo shell out to these
           ];
         };
-        workerRustcContents = [ workerRustcRootEnv ];
         workerRustcConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -398,12 +388,12 @@
             "CARGO_HOME=/tmp/cargo"
           ];
         };
-        workerRustcImage = pkgs.dockerTools.buildLayeredImage {
+        workerRustcImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-rustc";
           tag = "latest";
-          contents = workerRustcContents;
+          fromImage = workerBaseImage;
+          copyToRoot = workerRustcRootEnv;
           config = workerRustcConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # The caos server: storage *and* compute in one process (it serves
@@ -475,7 +465,7 @@
         };
         loadWorkerBash = loadImage {
           name = "caos-worker-bash";
-          contents = workerBashContents;
+          contents = [ workerBaseRoot workerBashRoot ];
           config = workerBashConfig;
           fakeRootCommands = installWorkerFiles;
         };
@@ -486,31 +476,31 @@
         };
         loadWorkerHello = loadImage {
           name = "caos-worker-hello";
-          contents = workerHelloContents;
+          contents = [ workerBaseRoot workerHelloRoot ];
           config = workerHelloConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerFold = loadImage {
           name = "caos-worker-fold";
-          contents = workerFoldContents;
+          contents = [ workerBaseRoot workerFoldRoot ];
           config = workerFoldConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerFileCount = loadImage {
           name = "caos-worker-file-count";
-          contents = workerFileCountContents;
+          contents = [ workerBaseRoot workerFileCountRoot ];
           config = workerFileCountConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerDeepDeps = loadImage {
           name = "caos-worker-deep-deps";
-          contents = workerDeepDepsContents;
+          contents = [ workerBaseRoot workerDeepDepsRoot ];
           config = workerDeepDepsConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerRustc = loadImage {
           name = "caos-worker-rustc";
-          contents = workerRustcContents;
+          contents = [ workerBaseRoot workerRustcRootEnv ];
           config = workerRustcConfig;
           fakeRootCommands = installWorkerFiles;
         };
