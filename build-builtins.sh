@@ -42,6 +42,7 @@ image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image at
 # self-contained.
 import_base() { # std name -> docker:// base ref, or empty for self-contained
   case "$1" in
+    base) echo "docker://debian:stable-slim" ;;
     rustc) echo "docker://rust:1-bookworm" ;;
     *) echo "" ;;
   esac

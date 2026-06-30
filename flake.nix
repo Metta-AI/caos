@@ -153,21 +153,31 @@
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
         # print the hash of /cas/out. The server URL a worker needs is injected at
         # runtime by the server for the containers it spawns — so none are baked
-        # into the images.
+        # into the images. PATH is Debian's default (the base is a stock Debian
+        # image; /bin -> /usr/bin, where caos lives).
         workerBaseConfig = {
           Entrypoint = [
             "/bin/caos"
             "entrypoint"
           ];
+          Env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          ];
         };
-        # Layered (not buildImage) so we can use fakeRootCommands to install the
-        # setuid-root caos — see installWorkerFiles.
+        # The worker base is a thin delta on a stock glibc base
+        # (docker://debian:stable-slim — see build-builtins.sh). It carries only the
+        # setuid caos (installed at /usr/bin via installWorkerFilesBaseStacked); the
+        # glibc/coreutils come from the Debian base. It exists so workers built from
+        # source (worker-rustc, which compiles glibc-dynamic) can stack their
+        # /worker on a base that actually provides glibc — and they inherit this
+        # setuid caos layer by hash, so the unprivileged builder never has to
+        # synthesize a setuid-root binary itself.
         workerBaseImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-base";
           tag = "latest";
-          contents = [ workerBaseRoot ];
+          contents = [ ];
           config = workerBaseConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
         # A "bash" worker: it runs a shell script you hand it. `caos entrypoint`
@@ -493,9 +503,9 @@
 
         loadWorkerBase = loadImage {
           name = "caos-worker-base";
-          contents = [ workerBaseRoot ];
+          contents = [ ];
           config = workerBaseConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
         loadWorkerBash = loadImage {
           name = "caos-worker-bash";
