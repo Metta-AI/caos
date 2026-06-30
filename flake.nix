@@ -428,6 +428,12 @@
           # ships http-backend + core plumbing but drops git's python3/perl/docs
           # (~200 MiB) that the server never touches.
           pkgs.gitMinimal
+          # skopeo: copy a base image's blobs from its source registry into our
+          # own repo, so a git image that references `base = docker://<ref>` can be
+          # converted by stacking only its delta layers on top (no toolchain in
+          # git). `cacert` gives it a CA bundle for the TLS pull from the source.
+          pkgs.skopeo
+          pkgs.cacert
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];

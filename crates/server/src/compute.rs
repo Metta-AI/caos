@@ -29,6 +29,10 @@ const REGISTRY_REPO: &str = "caos";
 /// than one of our git images (the default).
 const DOCKER_SCHEME: &str = "docker://";
 
+/// Media type for the uncompressed-tar layers we build from git trees. Base
+/// layers pulled from another registry keep their own (often gzipped) media type.
+const OCI_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+
 /// How long to wait on Redis before giving up and running uncached.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -275,12 +279,18 @@ fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> 
         return Ok(image_ref(config, &manifest_digest));
     }
 
-    // The image tree holds `config.json` (a blob) and `layer<NN>` subtrees.
+    // The image tree holds `config.json` (a blob), `layer<NN>` subtrees, and an
+    // optional `base` blob naming a `docker://<ref>` to stack our layers on top
+    // of — so a heavy toolchain rides as registry layers pulled from its source,
+    // never as git objects.
     let mut config_oid: Option<String> = None;
+    let mut base_oid: Option<String> = None;
     let mut layers: Vec<(u64, String)> = Vec::new();
     for entry in fetch_tree(config, git_hash)? {
         if entry.name == "config.json" {
             config_oid = Some(entry.oid.to_string());
+        } else if entry.name == "base" {
+            base_oid = Some(entry.oid.to_string());
         } else if let Some(suffix) = entry.name.strip_prefix("layer") {
             // layer<NN>: number it for ordering (matches config.rootfs.diff_ids).
             if let Ok(num) = suffix.parse::<u64>() {
@@ -292,30 +302,47 @@ fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> 
         }
     }
     let config_oid = config_oid.ok_or("image tree has no config.json")?;
-    if layers.is_empty() {
-        return Err("image tree has no layer<NN> entries".to_string());
+    let has_base = base_oid.is_some();
+    if !has_base && layers.is_empty() {
+        return Err("image tree has no base and no layer<NN> entries".to_string());
     }
     layers.sort_by_key(|(num, _)| *num);
 
-    // Each layer becomes an uncompressed tar; since it's uncompressed, the blob
-    // digest and the config's diff_id are the same sha256.
-    let mut layer_descs: Vec<(String, u64)> = Vec::new();
+    // A manifest layer is (mediaType, digest, size); a diff_id is the layer's
+    // *uncompressed* sha256. A `base`'s layers and diff_ids come from the copied
+    // base image (its layers are usually gzipped, so digest != diff_id). Our own
+    // layers are uncompressed tar, so digest == diff_id. Base layers go on the
+    // bottom; ours stack on top.
+    let mut manifest_layers: Vec<(String, String, u64)> = Vec::new();
     let mut diff_ids: Vec<String> = Vec::new();
+    if let Some(base_oid) = base_oid {
+        let base_ref = String::from_utf8(fetch_blob(config, &base_oid)?)
+            .map_err(|e| format!("base ref not UTF-8: {e}"))?;
+        let base_ref = base_ref.trim();
+        let base_ref = base_ref.strip_prefix(DOCKER_SCHEME).unwrap_or(base_ref);
+        if base_ref.is_empty() {
+            return Err("base blob is empty".to_string());
+        }
+        let (base_layers, base_diff_ids) = fetch_base(config, base_ref)?;
+        diff_ids.extend(base_diff_ids);
+        manifest_layers.extend(base_layers);
+    }
     for (_, oid) in &layers {
         let (digest, size) = ensure_layer(config, oid)?;
         diff_ids.push(digest.clone());
-        layer_descs.push((digest, size));
+        manifest_layers.push((OCI_LAYER_MEDIA_TYPE.to_string(), digest, size));
     }
 
-    // Set the config's diff_ids to the layers we just built, so the image is
+    // Set the config's diff_ids to the full stack (base ++ ours) so the image is
     // self-consistent. We generate them outright — the stored config needn't
-    // carry diff_ids (the producer can't know them without tarring).
+    // carry diff_ids (the producer can't know them without tarring / resolving
+    // the base).
     let config_bytes = fetch_blob(config, &config_oid)?;
     let new_config = set_config_diff_ids(&config_bytes, &diff_ids)?;
     let config_digest = format!("sha256:{}", sha256_hex(&new_config));
     push_blob(config, &config_digest, &new_config)?;
 
-    let manifest = build_manifest(&config_digest, new_config.len() as u64, &layer_descs);
+    let manifest = build_manifest(&config_digest, new_config.len() as u64, &manifest_layers);
     let manifest_bytes =
         serde_json::to_vec(&manifest).map_err(|e| format!("serializing manifest: {e}"))?;
     let manifest_digest = format!("sha256:{}", sha256_hex(&manifest_bytes));
@@ -332,6 +359,111 @@ fn image_ref(config: &Config, manifest_digest: &str) -> String {
         "{}/{REGISTRY_REPO}@{manifest_digest}",
         config.registry_pull_host.trim_end_matches('/')
     )
+}
+
+/// Copy a base image (`base_ref`, a bare docker reference) from its source
+/// registry into our own repo with skopeo, so its blobs are available for a
+/// converted git image to reference. Returns the base's manifest layers
+/// `(media_type, digest, size)` and its config `diff_id`s (uncompressed digests)
+/// — the lower part of the stack our delta layers sit on. `--format oci` rewrites
+/// the manifest to OCI media types so it composes cleanly with our OCI layers;
+/// the layer *blobs* (and their digests) are untouched.
+fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+    let push = config.registry_push_url.trim_end_matches('/');
+    let host = push
+        .strip_prefix("http://")
+        .or_else(|| push.strip_prefix("https://"))
+        .unwrap_or(push);
+    // A deterministic tag per base ref: re-converting reuses the same copy.
+    let tag = format!("base-{}", sha256_hex(base_ref.as_bytes()));
+    let dest = format!("docker://{host}/{REGISTRY_REPO}:{tag}");
+    let status = Command::new("skopeo")
+        .args([
+            "--insecure-policy",
+            "copy",
+            "--format",
+            "oci",
+            "--dest-tls-verify=false",
+            "--override-os",
+            "linux",
+            "--override-arch",
+            "amd64",
+        ])
+        .arg(format!("docker://{base_ref}"))
+        .arg(&dest)
+        // The slim server image runs as uid 0 with no /etc/passwd entry, so
+        // skopeo can't resolve $HOME (it wants one for its auth/config dirs).
+        // Point it at a writable dir so the anonymous pull works.
+        .env("HOME", "/tmp")
+        .status()
+        .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
+    if !status.success() {
+        return Err(format!("skopeo copy {base_ref} -> {dest} failed ({status})"));
+    }
+
+    // Read the manifest we just wrote: the base layers' media types/digests/sizes.
+    let man_url = format!("{push}/v2/{REGISTRY_REPO}/manifests/{tag}");
+    let resp = minreq::get(&man_url)
+        .with_header(
+            "Accept",
+            "application/vnd.oci.image.manifest.v1+json, \
+             application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .map_err(|e| format!("GET {man_url}: {e}"))?;
+    if !(200..300).contains(&resp.status_code) {
+        return Err(format!(
+            "reading base manifest {tag}: {} {}",
+            resp.status_code, resp.reason_phrase
+        ));
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(resp.as_bytes()).map_err(|e| format!("parsing base manifest: {e}"))?;
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or("base manifest has no layers")?
+        .iter()
+        .map(|l| {
+            let media = l["mediaType"]
+                .as_str()
+                .unwrap_or(OCI_LAYER_MEDIA_TYPE)
+                .to_string();
+            let digest = l["digest"].as_str().unwrap_or_default().to_string();
+            let size = l["size"].as_u64().unwrap_or_default();
+            (media, digest, size)
+        })
+        .collect::<Vec<_>>();
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .ok_or("base manifest has no config digest")?;
+
+    // Read the base config blob for its uncompressed diff_ids.
+    let cfg_url = format!("{push}/v2/{REGISTRY_REPO}/blobs/{config_digest}");
+    let resp = minreq::get(&cfg_url)
+        .send()
+        .map_err(|e| format!("GET {cfg_url}: {e}"))?;
+    if !(200..300).contains(&resp.status_code) {
+        return Err(format!(
+            "reading base config {config_digest}: {} {}",
+            resp.status_code, resp.reason_phrase
+        ));
+    }
+    let cfg: serde_json::Value =
+        serde_json::from_slice(resp.as_bytes()).map_err(|e| format!("parsing base config: {e}"))?;
+    let diff_ids = cfg["rootfs"]["diff_ids"]
+        .as_array()
+        .ok_or("base config has no rootfs.diff_ids")?
+        .iter()
+        .map(|d| d.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    if layers.len() != diff_ids.len() {
+        return Err(format!(
+            "base layer/diff_id count mismatch: {} layers vs {} diff_ids",
+            layers.len(),
+            diff_ids.len()
+        ));
+    }
+    Ok((layers, diff_ids))
 }
 
 /// Build (if not cached) and push the layer whose git tree is `layer_oid`,
@@ -528,7 +660,7 @@ fn set_config_diff_ids(config_bytes: &[u8], diff_ids: &[String]) -> Result<Vec<u
 fn build_manifest(
     config_digest: &str,
     config_size: u64,
-    layers: &[(String, u64)],
+    layers: &[(String, String, u64)],
 ) -> serde_json::Value {
     serde_json::json!({
         "schemaVersion": 2,
@@ -538,8 +670,8 @@ fn build_manifest(
             "digest": config_digest,
             "size": config_size,
         },
-        "layers": layers.iter().map(|(digest, size)| serde_json::json!({
-            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+        "layers": layers.iter().map(|(media_type, digest, size)| serde_json::json!({
+            "mediaType": media_type,
             "digest": digest,
             "size": size,
         })).collect::<Vec<_>>(),
