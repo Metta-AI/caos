@@ -28,8 +28,13 @@ const VENDOR_WORKER_COMMON: &str = "/vendor/worker-common";
 /// We build for glibc (gnu), not musl: the stock `rust:1-bookworm` base this
 /// worker runs on ships only the gnu target and gcc (no musl target / musl-gcc),
 /// so gnu is what compiles out of the box. The produced binary is glibc-dynamic
-/// and runs in the glibc (debian-slim) runner.
-const TARGET: &str = "x86_64-unknown-linux-gnu";
+/// and runs in the glibc (debian-slim) runner. Detected at compile time so the
+/// rustc worker targets the architecture it was built for (e.g. Apple Silicon).
+const TARGET: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64-unknown-linux-gnu"
+} else {
+    "x86_64-unknown-linux-gnu"
+};
 
 fn main() -> ExitCode {
     run_worker("rustc", run)

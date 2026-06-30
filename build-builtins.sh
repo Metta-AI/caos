@@ -17,9 +17,9 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count hello deep-deps rustc runner)
+[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count dirs-only hello deep-deps rustc runner)
 
-nix build .#caos -o result-caos
+nix build .#caos-cli -o result-caos
 caos=$PROJECT/result-caos/bin/caos-cli
 SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 export CAOS_SERVER_URL=$SERVER_URL

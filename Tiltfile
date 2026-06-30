@@ -53,6 +53,7 @@ nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/caos'])
 nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/caos'])
 nix_image('img-worker-fold', 'load-caos-worker-fold', ['crates/caos'])
 nix_image('img-worker-file-count', 'load-caos-worker-file-count', ['crates/caos'])
+nix_image('img-worker-dirs-only', 'load-caos-worker-dirs-only', ['crates/caos'])
 nix_image('img-worker-deep-deps', 'load-caos-worker-deep-deps', ['crates/caos'])
 
 # One-time infra: the docker network the daemons and the worker containers the
