@@ -792,20 +792,16 @@ fn ensure_layer_blob(config: &Config, layer_oid: &str) -> Result<(String, u64), 
 /// from the store). The fly pipeline's replacement for [`convert_git_image`]'s
 /// registry push; the resulting layout is what skopeo copies to fly.
 fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<(), String> {
-    // Image tree: `config.json` (a blob) + `layer<NN>` subtrees (same shape as
-    // convert_git_image).
+    // Image tree: `config.json` (a blob), optional `base` (a docker:// ref blob),
+    // and `layer<NN>` subtrees (same shape as convert_git_image).
     let mut config_oid: Option<String> = None;
+    let mut base_oid: Option<String> = None;
     let mut layers: Vec<(u64, String)> = Vec::new();
     for entry in fetch_tree(config, git_hash)? {
         if entry.name == "config.json" {
             config_oid = Some(entry.oid.to_string());
         } else if entry.name == "base" {
-            // This image is a delta on a stock docker:// base. The fly OCI-layout
-            // path doesn't yet pull + stack the base (that's the Docker/Serve
-            // fetch_base path). Fail loudly rather than push a base-less image.
-            return Err(
-                "fly backend does not yet support `base = docker://<ref>` images".to_string(),
-            );
+            base_oid = Some(entry.oid.to_string());
         } else if let Some(suffix) = entry.name.strip_prefix("layer") {
             if let Ok(num) = suffix.parse::<u64>() {
                 if !entry.mode.is_tree() {
@@ -816,19 +812,40 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
         }
     }
     let config_oid = config_oid.ok_or("image tree has no config.json")?;
-    if layers.is_empty() {
-        return Err("image tree has no layer<NN> entries".to_string());
+    let has_base = base_oid.is_some();
+    if !has_base && layers.is_empty() {
+        return Err("image tree has no base and no layer<NN> entries".to_string());
     }
     layers.sort_by_key(|(num, _)| *num);
 
-    // Each layer (uncompressed tar) → its blob digest is also its diff_id. All
-    // layers here are uncompressed delta tars, so they carry the OCI tar media type.
-    let mut layer_descs: Vec<(String, String, u64)> = Vec::new();
+    // A manifest layer is (mediaType, digest, size); a diff_id is the layer's
+    // *uncompressed* sha256. If there's a `base`, skopeo copies it straight into
+    // this layout (its blobs land in oci_dir, NOT our store) and we read back its
+    // layers + diff_ids; base layers go on the bottom, ours stack on top. Our own
+    // layers are uncompressed tar (digest == diff_id) and are hardlinked from the
+    // store below (the base blobs are already in the layout).
+    let mut manifest_layers: Vec<(String, String, u64)> = Vec::new();
     let mut diff_ids: Vec<String> = Vec::new();
+    if let Some(base_oid) = base_oid {
+        let base_ref = String::from_utf8(fetch_blob(config, &base_oid)?)
+            .map_err(|e| format!("base ref not UTF-8: {e}"))?;
+        let base_ref = base_ref.trim();
+        let base_ref = base_ref.strip_prefix(DOCKER_SCHEME).unwrap_or(base_ref);
+        if base_ref.is_empty() {
+            return Err("base blob is empty".to_string());
+        }
+        let (base_layers, base_diff_ids) = fetch_base_oci(base_ref, oci_dir)?;
+        diff_ids.extend(base_diff_ids);
+        manifest_layers.extend(base_layers);
+    }
+    // Our delta layers; remember their digests so we hardlink only ours (not the
+    // base's, which skopeo already placed) into the layout.
+    let mut our_digests: Vec<String> = Vec::new();
     for (_, oid) in &layers {
         let (digest, size) = ensure_layer_blob(config, oid)?;
         diff_ids.push(digest.clone());
-        layer_descs.push((OCI_LAYER_MEDIA_TYPE.to_string(), digest, size));
+        manifest_layers.push((OCI_LAYER_MEDIA_TYPE.to_string(), digest.clone(), size));
+        our_digests.push(digest);
     }
 
     let config_bytes = fetch_blob(config, &config_oid)?;
@@ -837,18 +854,20 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
     let config_digest = format!("sha256:{config_hex}");
     store_blob(config, &config_hex, &new_config)?;
 
-    let manifest = build_manifest(&config_digest, new_config.len() as u64, &layer_descs);
+    let manifest = build_manifest(&config_digest, new_config.len() as u64, &manifest_layers);
     let manifest_bytes =
         serde_json::to_vec(&manifest).map_err(|e| format!("serializing manifest: {e}"))?;
     let manifest_hex = sha256_hex(&manifest_bytes);
     let manifest_digest = format!("sha256:{manifest_hex}");
     store_blob(config, &manifest_hex, &manifest_bytes)?;
 
-    // Assemble the OCI layout, hardlinking each blob from the store (same fs).
+    // Assemble the OCI layout. Base blobs (if any) were already copied in by
+    // skopeo; hardlink only OUR blobs — the delta layers, config, and manifest —
+    // from the store (same fs).
     let blobs = oci_dir.join("blobs").join("sha256");
     std::fs::create_dir_all(&blobs).map_err(|e| format!("creating {}: {e}", blobs.display()))?;
     let store_sha = oci_store(config).join("sha256");
-    let mut digests: Vec<&str> = layer_descs.iter().map(|(_, d, _)| d.as_str()).collect();
+    let mut digests: Vec<&str> = our_digests.iter().map(|d| d.as_str()).collect();
     digests.push(&config_digest);
     digests.push(&manifest_digest);
     for d in digests {
@@ -881,6 +900,103 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
     .map_err(|e| format!("writing index.json: {e}"))?;
     eprintln!("built OCI image {git_hash} -> {manifest_digest}");
     Ok(())
+}
+
+/// The fly-path counterpart of [`fetch_base`]: copy a stock base image straight
+/// into the OCI layout at `oci_dir` (there's no local registry on fly), so its
+/// blobs are available for our combined manifest to reference. skopeo writes the
+/// base's blobs under `oci_dir/blobs/sha256/` and an `index.json` we read back for
+/// the base's layers `(media_type, digest, size)` and config `diff_id`s — the
+/// lower part of the stack. We later overwrite `index.json` with our combined
+/// image, leaving the base's own manifest blob unreferenced (so the push skips
+/// it). `--format oci` rewrites media types to OCI; the layer blobs are untouched.
+fn fetch_base_oci(
+    base_ref: &str,
+    oci_dir: &Path,
+) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+    let status = Command::new("skopeo")
+        .args([
+            "--insecure-policy",
+            "copy",
+            "--format",
+            "oci",
+            "--override-os",
+            "linux",
+            "--override-arch",
+            "amd64",
+        ])
+        .arg(format!("docker://{base_ref}"))
+        .arg(format!("oci:{}:base", oci_dir.display()))
+        // uid 0 with no /etc/passwd entry: give skopeo a writable HOME for its
+        // config/auth dirs so the anonymous pull works (see fetch_base).
+        .env("HOME", "/tmp")
+        .status()
+        .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
+    if !status.success() {
+        return Err(format!("skopeo copy {base_ref} into layout failed ({status})"));
+    }
+
+    // Read the layout's index → the base manifest → its layers + config diff_ids.
+    let index: serde_json::Value = read_oci_json(&oci_dir.join("index.json"))?;
+    let manifests = index["manifests"]
+        .as_array()
+        .ok_or("base layout index has no manifests")?;
+    let man_desc = manifests
+        .iter()
+        .find(|m| {
+            m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base")
+        })
+        .or_else(|| manifests.first())
+        .ok_or("base layout index is empty")?;
+    let man_digest = man_desc["digest"]
+        .as_str()
+        .ok_or("base manifest descriptor has no digest")?;
+    let manifest: serde_json::Value = read_oci_json(&oci_blob_path(oci_dir, man_digest))?;
+
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or("base manifest has no layers")?
+        .iter()
+        .map(|l| {
+            let media = l["mediaType"]
+                .as_str()
+                .unwrap_or(OCI_LAYER_MEDIA_TYPE)
+                .to_string();
+            let digest = l["digest"].as_str().unwrap_or_default().to_string();
+            let size = l["size"].as_u64().unwrap_or_default();
+            (media, digest, size)
+        })
+        .collect::<Vec<_>>();
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .ok_or("base manifest has no config digest")?;
+    let cfg: serde_json::Value = read_oci_json(&oci_blob_path(oci_dir, config_digest))?;
+    let diff_ids = cfg["rootfs"]["diff_ids"]
+        .as_array()
+        .ok_or("base config has no rootfs.diff_ids")?
+        .iter()
+        .map(|d| d.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    if layers.len() != diff_ids.len() {
+        return Err(format!(
+            "base manifest layer count {} != diff_id count {}",
+            layers.len(),
+            diff_ids.len()
+        ));
+    }
+    Ok((layers, diff_ids))
+}
+
+/// Path to a blob in an OCI layout by digest (`sha256:<hex>` → `blobs/sha256/<hex>`).
+fn oci_blob_path(oci_dir: &Path, digest: &str) -> PathBuf {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    oci_dir.join("blobs").join("sha256").join(hex)
+}
+
+/// Read and parse a JSON file (an OCI index/manifest/config blob).
+fn read_oci_json(path: &Path) -> Result<serde_json::Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
 /// A Machines API call with bearer auth, `path` appended to the configured base.
