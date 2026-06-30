@@ -38,9 +38,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // `/cas/std/<name>` to run a builtin from the published library, a
         // `docker://<ref>`, or a git hash.
         Some("run") => match &args[2..] {
-            [image, sep, kvs @ ..] if sep == "--" => {
-                caos::cli_run(&transport()?, image, None, kvs)
-            }
+            [image, sep, kvs @ ..] if sep == "--" => caos::cli_run(&transport()?, image, None, kvs),
             [image, output, sep, kvs @ ..] if sep == "--" => {
                 caos::cli_run(&transport()?, image, Some(output), kvs)
             }
