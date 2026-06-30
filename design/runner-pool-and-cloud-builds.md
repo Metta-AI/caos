@@ -1,7 +1,12 @@
 # Worker runner pool + cloud image builds — design note
 
-**Status:** design, agreed shape, not yet built. Committing to **debian-slim /
-gnu** for phase 1; musl + a flake-built toolchain are the phase-2 follow-on.
+**Status:** phase 1 (the runner) **built and validated on the dev stack**.
+debian-slim / gnu. The flake-worker (phase 2 below) is **deferred and NOT on the
+critical path**: the cold-start / build+run-time win comes entirely from the
+runner decomposition — the existing stock-`rust:1-bookworm` rustc worker emitting
+a binary and currying it into the runner is enough. The flake-worker stays a
+possible future capability (musl toolchain, custom/pinned images built on fly),
+not a requirement for fast rust workers.
 
 **Branch:** `runner-pool`, off `main` (which has the docker-base-layers feature:
 git-docker images that stack on a stock `docker://` base). NOTE: the fly backend
