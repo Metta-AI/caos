@@ -52,8 +52,11 @@ use std::sync::Arc;
 
 use tiny_http::{Method, Request, Response, Server};
 
-/// Listen address; overridable for local runs outside the container.
-const DEFAULT_ADDR: &str = "0.0.0.0:80";
+/// Listen address; overridable for local runs outside the container. Binds the
+/// IPv6 wildcard (dual-stack: also accepts IPv4) so workers can reach storage and
+/// nested compute over fly's 6PN private network, which is IPv6-only — a worker
+/// calls back to `caos-server.internal`, whose DNS is an AAAA (IPv6) record.
+const DEFAULT_ADDR: &str = "[::]:80";
 
 /// Docker network the worker container joins, so it resolves the server by name.
 /// Override with `CAOS_DOCKER_NETWORK`.
@@ -130,6 +133,19 @@ fn main() {
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
+
+    // Self-bootstrap the bare repo on first run (e.g. a fresh fly Volume), the
+    // same setup the dev Tiltfile does by hand: `http.receivepack` lets clients
+    // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
+    // `git init --bare` is idempotent, so this is a no-op once seeded.
+    if gix::open(&git_dir).is_err() {
+        let git = |args: &[&str]| {
+            let _ = std::process::Command::new("git").args(args).status();
+        };
+        git(&["init", "-q", "--bare", &git_dir]);
+        git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
+        git(&["-C", &git_dir, "config", "uploadpack.allowAnySHA1InWant", "true"]);
+    }
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).

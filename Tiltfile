@@ -7,6 +7,11 @@
 
 NET = 'caos-net'
 
+# Worker backend the server uses: 'docker' (a fresh container per run — the
+# default) or 'serve' (the warm-pool stand-in: a long-lived `caos serve`
+# container per image, POSTed jobs). Opt in with `CAOS_BACKEND=serve tilt up`.
+BACKEND = os.getenv('CAOS_BACKEND', 'docker')
+
 # The caos server owns a *dedicated* bare repo — not the project's own `.git`.
 # Clients never touch it directly; they reach it only through the server, using
 # it as the `caos` git remote: `git push` objects up, `git fetch` refs/results
@@ -128,6 +133,7 @@ daemon(
     [
         '-p 9090:80',
         '-e CAOS_DOCKER_NETWORK=%s' % NET,
+        '-e CAOS_BACKEND=%s' % BACKEND,
         '-v /var/run/docker.sock:/var/run/docker.sock',
         '-v "%s:/git"' % SERVER_REPO,
     ],

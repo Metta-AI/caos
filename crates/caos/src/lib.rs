@@ -1568,15 +1568,18 @@ fn build_request(
 }
 
 /// The built-in tree hash (`std`) for a run. Inside a worker the server sets
-/// [`STD_ENV`], so reuse it (threading). At the top, resolve the built-ins ref
-/// ([`STD_REF_ENV`], default `refs/caos/std`) from the local repo; tolerate its
-/// absence (no built-ins published) — a worker that needs them will fail clearly.
+/// [`STD_ENV`], so reuse it (threading). At the top, resolve the built-ins via
+/// [`std_tree`] — the *same* path image resolution uses, so the request's `std`
+/// always matches the builtins the CLI just resolved `/cas/std/<name>` against.
+/// That matters because `std_tree` resolves a not-yet-local ref over `ls-remote`
+/// (it never fetches the tree's closure); a local-only lookup here would leave
+/// `std` empty and the worker with no `/cas/std`. Tolerate absence (no built-ins
+/// published) — a worker that needs them will fail clearly.
 fn run_std() -> Result<String, String> {
     if let Ok(std) = std::env::var(STD_ENV) {
         return Ok(std);
     }
-    let refname = std::env::var(STD_REF_ENV).unwrap_or_else(|_| DEFAULT_STD_REF.to_string());
-    Ok(resolve_ref(&refname).unwrap_or_default())
+    Ok(std_tree().unwrap_or_default())
 }
 
 /// The cache-busting salt for this run (see [`SALT_ENV`]): read from `CAOS_SALT`,
@@ -1682,30 +1685,33 @@ fn resolve_std_image(t: &dyn Transport, name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no builtin {name:?} in {DEFAULT_STD_REF}"))
 }
 
-/// The std library tree hash from `refs/caos/std`, fetched from the `caos` remote
-/// if it isn't in the local repo yet (the CLI may never have pulled it).
+/// The std library tree hash from the built-ins ref ([`STD_REF_ENV`], default
+/// `refs/caos/std`), fetched from the `caos` remote if it isn't in the local repo
+/// yet (the CLI may never have pulled it). This is the single resolution path for
+/// both running a `/cas/std/<name>` builtin and threading `std` into a run (see
+/// [`run_std`]), so the two never disagree.
 fn std_tree() -> Result<String, String> {
-    if let Ok(hash) = resolve_ref(DEFAULT_STD_REF) {
+    let refname = std::env::var(STD_REF_ENV).unwrap_or_else(|_| DEFAULT_STD_REF.to_string());
+    if let Ok(hash) = resolve_ref(&refname) {
         return Ok(hash);
     }
-    // Not local yet — pull it from the server. We can't `git fetch <ref>` here:
-    // refs/caos/std points at a *tree*, and fetching a non-commit ref over
-    // smart-HTTP does a commit-style negotiation that hangs up. So read the hash
-    // from the remote's advertisement (`ls-remote` — no pack negotiation, works
-    // for any object type) and fetch the object *by hash*: the same path results
-    // take, which the server allows via uploadpack.allowAnySHA1InWant.
-    let advertised = git_capture(&["ls-remote", CAOS_REMOTE, DEFAULT_STD_REF], None)?;
+    // Not local yet — read just the root hash from the remote's advertisement
+    // (`ls-remote` — no pack negotiation, works for any object type). We
+    // deliberately do NOT `git fetch` the tree: fetching a tree pulls its entire
+    // reachable closure — every builtin, including the ~1.5GB `rustc` image — to
+    // resolve a single name, which both wastes the network and OOM-kills the
+    // server buffering that pack. Resolution needs only the std *root* tree, which
+    // the HTTP transport fetches by hash on demand ([`fetch_tree_entries`]), and
+    // then only the chosen builtin's subtree — so a `bash` run never pulls
+    // `rustc`. We don't record the ref locally: `resolve_ref` peels by reading the
+    // object, so a ref pointing at an un-fetched tree would just fail back here.
+    let advertised = git_capture(&["ls-remote", CAOS_REMOTE, &refname], None)?;
     let hash = advertised
         .split_whitespace()
         .next()
         .filter(|h| !h.is_empty())
-        .ok_or_else(|| format!("{DEFAULT_STD_REF} not found on the `{CAOS_REMOTE}` remote"))?
+        .ok_or_else(|| format!("{refname} not found on the `{CAOS_REMOTE}` remote"))?
         .to_string();
-    fetch_object(&hash)?;
-    // Record it locally so the next run resolves with no network round-trip.
-    // Plain update-ref (unlike fetch/push) happily points a ref at a tree.
-    run_git(&["update-ref", DEFAULT_STD_REF, &hash])
-        .map_err(|e| format!("recording {DEFAULT_STD_REF} locally: {e}"))?;
     Ok(hash)
 }
 
