@@ -41,6 +41,15 @@ const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 /// The caos binary inside every compute image, forced as the entrypoint.
 const CAOS_BIN: &str = "/bin/caos";
 
+/// A worker image declares the RAM (MB) its machine needs via this OCI config
+/// label (`config.config.Labels`), so the requirement rides with the image and is
+/// the same on every stack — rather than a stack-wide knob. Heavy workers (the
+/// rustc builder) set it; light ones omit it and get [`DEFAULT_WORKER_MEMORY_MB`].
+const MEMORY_LABEL: &str = "caos.fly.memory-mb";
+/// RAM (MB) for a worker machine whose image declares no [`MEMORY_LABEL`]. Suits
+/// trivial workers (hello, bash, a typical produced worker).
+const DEFAULT_WORKER_MEMORY_MB: u32 = 256;
+
 /// Env var carrying the run stack — the newline-separated `(image, args)`
 /// computations currently in progress. We set it on each spawned worker (this
 /// computation appended); `caos run` echoes it back via the `stack` query param
@@ -367,9 +376,6 @@ struct Fly {
     /// shared layers across all workers — each layer uploads once per stack, not
     /// once per worker. Workers pull from it cross-app (`:w-<hash>` tags).
     image_repo: String,
-    /// RAM (MB) for each worker machine. 256 suits trivial workers (hello, bash);
-    /// heavier ones (the rustc builder) need more — `CAOS_FLY_WORKER_MEMORY`.
-    worker_memory: u32,
 }
 
 impl Fly {
@@ -403,7 +409,6 @@ impl Fly {
             server_url: config.server_url.clone(),
             worker_prefix: env("CAOS_FLY_WORKER_PREFIX", "caos-worker-"),
             image_repo: env("CAOS_FLY_IMAGE_REPO", &default_repo),
-            worker_memory: env("CAOS_FLY_WORKER_MEMORY", "256").parse().unwrap_or(256),
         })
     }
 }
@@ -608,22 +613,28 @@ fn ensure_worker_app(config: &Config, fly: &Fly, image: &str) -> Result<(), Http
     let app = fly_app_name(fly, image);
     fly_create_app(fly, &app)?;
     let fly_image = resolve_fly_image(config, fly, image)?;
+    // RAM rides with the image (its MEMORY_LABEL), not the stack — so the same
+    // worker gets the same machine size everywhere.
+    let memory_mb = worker_memory_for(config, image);
     // Create just the first machine synchronously so the dispatch can proceed; the
     // rest of the pool fills in the background, off the cold-start path. (Creating
     // N machines serially up front added seconds for no benefit on the first run.)
-    fly_create_machine(fly, &app, &fly_image)?;
+    fly_create_machine(fly, &app, &fly_image, memory_mb)?;
     if fly.pool > 1 {
         let (fly, app, fly_image) = (fly.clone(), app.clone(), fly_image.clone());
         std::thread::spawn(move || {
             for _ in 1..fly.pool {
-                if fly_create_machine(&fly, &app, &fly_image).is_err() {
+                if fly_create_machine(&fly, &app, &fly_image, memory_mb).is_err() {
                     eprintln!("background pool fill: a {app} machine create failed");
                 }
             }
         });
     }
     let _ = cache_set(&config.redis_addr, &marker, "provisioned");
-    eprintln!("provisioned fly app {app} (1 machine now, {} total)", fly.pool);
+    eprintln!(
+        "provisioned fly app {app} ({memory_mb}MB; 1 machine now, {} total)",
+        fly.pool
+    );
     Ok(())
 }
 
@@ -675,14 +686,19 @@ fn fly_create_app(fly: &Fly, app: &str) -> Result<(), HttpError> {
 /// to the machine's internal port without the proxy and manages start/stop
 /// itself, so a proxy autostop monitor can't stop a worker mid-job. The worker's
 /// own SLOT mutex enforces one-job-at-a-time. This config was validated live.
-fn fly_create_machine(fly: &Fly, app: &str, fly_image: &str) -> Result<(), HttpError> {
+fn fly_create_machine(
+    fly: &Fly,
+    app: &str,
+    fly_image: &str,
+    memory_mb: u32,
+) -> Result<(), HttpError> {
     let machine = serde_json::json!({
         "region": fly.region,
         "config": {
             "image": fly_image,
             "init": { "exec": ["/bin/caos", "serve"] },
             "env": { "CAOS_SERVER_URL": fly.server_url },
-            "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": fly.worker_memory }
+            "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": memory_mb }
         }
     })
     .to_string();
@@ -694,6 +710,30 @@ fn fly_create_machine(fly: &Fly, app: &str, fly_image: &str) -> Result<(), HttpE
             format!("fly create machine ({code}): {}", resp.as_str().unwrap_or("")),
         )),
     }
+}
+
+/// The RAM (MB) a worker machine should get, read from the image's own config:
+/// `config.config.Labels["caos.fly.memory-mb"]` ([`MEMORY_LABEL`]). The
+/// requirement rides with the image, so it's identical on every stack. A
+/// `docker://` image (whose config we don't author) or any image without the
+/// label gets [`DEFAULT_WORKER_MEMORY_MB`]. Best-effort: any read/parse failure
+/// falls back to the default rather than blocking the dispatch.
+fn worker_memory_for(config: &Config, image: &str) -> u32 {
+    if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return DEFAULT_WORKER_MEMORY_MB; // docker:// ref or non-git image
+    }
+    let labelled = (|| -> Option<u32> {
+        let config_oid = fetch_tree(config, image)
+            .ok()?
+            .into_iter()
+            .find(|e| e.name == "config.json")?
+            .oid
+            .to_string();
+        let bytes = fetch_blob(config, &config_oid).ok()?;
+        let cfg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        cfg["config"]["Labels"][MEMORY_LABEL].as_str()?.parse().ok()
+    })();
+    labelled.unwrap_or(DEFAULT_WORKER_MEMORY_MB)
 }
 
 /// Convert the git image to an OCI layout and skopeo-copy it straight into the

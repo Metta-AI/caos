@@ -443,6 +443,14 @@
             "RUSTUP_HOME=/usr/local/rustup"
             "CARGO_HOME=/usr/local/cargo"
           ];
+          # This worker compiles Rust in release mode (rustc + LLVM + linker), so
+          # it needs real RAM: at the 256MB default a build thrashes (~25s on fly);
+          # at 2GB it's ~1s. caosd reads this label (caos.fly.memory-mb) when it
+          # creates the worker machine, so the requirement rides with the image and
+          # is the same on every stack — no stack-wide knob.
+          Labels = {
+            "caos.fly.memory-mb" = "2048";
+          };
         };
         # buildLayeredImage so fakeRootCommands can install the setuid caos. With
         # the toolchain now in the stock rust base (not in git), this image is the
