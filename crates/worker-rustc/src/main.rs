@@ -1,11 +1,16 @@
 //! caos-worker-rustc: build a caos worker image from Rust source.
 //!
 //! Given a Rust source file as `--src` and a worker-base git-docker image as
-//! `--base` (typically curried in), it compiles the source — statically, for
-//! musl, linking the vendored `worker-common` — and emits a new worker image at
+//! `--base` (typically curried in), it compiles the source for glibc (gnu),
+//! linking the vendored `worker-common`, and emits a new worker image at
 //! `/cas/out`: the base's layers with one more layer carrying the compiled
 //! `/worker` on top, plus a generated `config.json`. The result is an ordinary
 //! worker image: `caos run` it like any other.
+//!
+//! NOTE: the produced `/worker` is now glibc-dynamic, so the `--base` it stacks
+//! on must provide glibc (a stock glibc base via the `docker://` base mechanism).
+//! Wiring that base through is the remaining "#2" work; until then the produced
+//! image stacks on whatever git-docker base is passed.
 //!
 //! So building a worker is itself a worker — and because the run is memoized on
 //! `(this image, src, base)`, recompiling unchanged source is a cache hit.
@@ -25,8 +30,11 @@ use worker_common::{arg, caos, entries, file_name, link, path, run_worker, scrat
 /// depend on.
 const VENDOR_WORKER_COMMON: &str = "/vendor/worker-common";
 
-/// Static target, so the produced `/worker` needs no libc in its image.
-const TARGET: &str = "x86_64-unknown-linux-musl";
+/// We build for glibc (gnu), not musl: the stock `rust:1-bookworm` base this
+/// worker runs on ships only the gnu target and gcc (no musl target / musl-gcc),
+/// so gnu is what compiles out of the box. The produced `/worker` is therefore
+/// glibc-dynamic and rides on a stock glibc base (see [`assemble_image`]).
+const TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn main() -> ExitCode {
     run_worker("rustc", run)
@@ -45,7 +53,7 @@ fn run() -> Result<(), String> {
 }
 
 /// Lay out a cargo project around the user's source (as `src/main.rs`), depending
-/// on the vendored `worker-common`, and build it static for musl. Returns the
+/// on the vendored `worker-common`, and build it for glibc (gnu). Returns the
 /// path to the compiled `worker` binary.
 fn compile(src: &str) -> Result<String, String> {
     let proj = scratch("proj")?;
@@ -81,13 +89,18 @@ fn stage_layer(binary: &str) -> Result<String, String> {
 }
 
 /// Build the output image tree: a generated `config.json`, the base image's
-/// `layer<NN>` subtrees (reused by hash), and our new layer stacked on top.
+/// `layer<NN>` subtrees (reused by hash), and our new layer stacked on top. If the
+/// base is itself a delta on a stock docker image (it carries a `base` blob naming
+/// a `docker://<ref>`), that blob is carried through too, so the produced image
+/// stacks on the same stock base — which is how the produced glibc-dynamic /worker
+/// gets a glibc runtime (the base layers alone don't provide one).
 fn assemble_image(base: &str, layer: &str) -> Result<(), String> {
     let out = scratch("out")?;
     fs::write(out.join("config.json"), image_config())
         .map_err(|e| format!("writing config.json: {e}"))?;
 
-    // Carry the base's layers through unchanged and number ours just above them.
+    // Carry the base's layers (and its stock `base` ref, if any) through unchanged
+    // and number ours just above them.
     let mut top = 0u64;
     for entry in entries(base)? {
         let name = file_name(&entry);
@@ -97,6 +110,8 @@ fn assemble_image(base: &str, layer: &str) -> Result<(), String> {
         {
             link(&entry, out.join(&name))?;
             top = top.max(num + 1);
+        } else if name == "base" {
+            link(&entry, out.join("base"))?;
         }
     }
     link(layer, out.join(format!("layer{top:02}")))?;
@@ -125,11 +140,14 @@ fn cargo_toml() -> String {
 }
 
 /// A minimal OCI image config. The server fills `rootfs.diff_ids` when it
-/// converts the image, so we leave them empty. `Env` carries `PATH` so the
-/// worker can find the setuid `caos` at `/bin`.
+/// converts the image, so we leave them empty. `Env` carries Debian's default
+/// `PATH` (the base is a stock Debian image; `/bin -> /usr/bin`, where the setuid
+/// `caos` lives), so the worker finds `caos` whether invoked as `/bin/caos` or by
+/// name.
 fn image_config() -> String {
     r#"{"architecture":"amd64","os":"linux",
-       "config":{"Entrypoint":["/bin/caos","entrypoint"],"Env":["PATH=/bin"]},
+       "config":{"Entrypoint":["/bin/caos","entrypoint"],
+                 "Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]},
        "rootfs":{"type":"layers","diff_ids":[]}}"#
         .to_string()
 }

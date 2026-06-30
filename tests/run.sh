@@ -55,4 +55,6 @@ echo "running $1 inside a bash worker..." >&2
 result=$( cd "$CLIENT" && "$caosbin" run /cas/std/bash -- \
     --script:@="$DIR/test.sh" --test:@="$DIR" )
 echo "PASS: $1" >&2
-[ -n "$result" ] && printf '%s\n' "$result"
+# A test that reports a result (e.g. perf numbers) prints it; one that doesn't
+# still passed — don't let the empty-result check poison the exit code.
+if [ -n "$result" ]; then printf '%s\n' "$result"; fi

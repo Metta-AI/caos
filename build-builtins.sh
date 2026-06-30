@@ -34,6 +34,20 @@ git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
 
 image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
 
+# Some builtins ship as a thin delta on a stock docker base instead of a
+# self-contained image: the nix image holds only our bits, and `import-image
+# --base docker://<ref>` records the stock base so the heavy toolchain rides as
+# stock registry layers (pulled server-side at convert time) rather than in git.
+# rustc bases on the stock rust image (cargo/rustc/gcc/glibc); the worker base on
+# stock debian (glibc, for source-built workers); the rest are self-contained.
+import_base() { # std name -> docker:// base ref, or empty for self-contained
+  case "$1" in
+    base) echo "docker://debian:stable-slim" ;;
+    rustc) echo "docker://rust:1-bookworm" ;;
+    *) echo "" ;;
+  esac
+}
+
 # Build every image in ONE nix invocation: the builds run in parallel under a
 # single (low-memory) evaluation. Map each resulting store path back to its
 # builtin via the image name baked into it (<hash>-caos-worker-<name>.tar.gz).
@@ -88,7 +102,12 @@ if [ "${#to_import[@]}" -gt 0 ]; then
       repo="$WORK/repo-$name"
       git init -q "$repo"
       git -C "$repo" remote add caos "$SERVER_URL"
-      hash=$(cd "$repo" && "$caos" import-image "${img_path[$name]}")
+      base=$(import_base "$name")
+      if [ -n "$base" ]; then
+        hash=$(cd "$repo" && "$caos" import-image --base "$base" "${img_path[$name]}")
+      else
+        hash=$(cd "$repo" && "$caos" import-image "${img_path[$name]}")
+      fi
       printf '%s' "$hash" >"$WORK/$name.hash"
     ) &
     pids+=("$!")
