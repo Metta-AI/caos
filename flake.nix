@@ -89,6 +89,7 @@
         worker-file-count = crateBin "worker-file-count";
         worker-deep-deps = crateBin "worker-deep-deps";
         worker-rustc = crateBin "worker-rustc";
+        worker-runner = crateBin "worker-runner";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
@@ -464,6 +465,35 @@
           fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
+        # The "runner": one warm, pooled image that runs a compiled worker binary
+        # passed as the `bin` arg (see crates/worker-runner). Workers built from
+        # source (by rustc) are produced as just a binary and curried into this
+        # image, so they need no image of their own — no per-worker convert /
+        # registry push / app provision, which is the cold-start cost. A thin delta
+        # on the stock glibc base (debian:stable-slim, via build-builtins' --base),
+        # carrying only the /worker trampoline; caos comes from
+        # installWorkerFilesBaseStacked, libc + the rest from the base.
+        workerRunnerRootEnv = pkgs.runCommand "caos-worker-runner-root" { } ''
+          mkdir -p $out
+          cp ${workerRoot "worker-runner" worker-runner}/worker $out/worker
+        '';
+        workerRunnerConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          ];
+        };
+        workerRunnerImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-runner";
+          tag = "latest";
+          contents = [ workerRunnerRootEnv ];
+          config = workerRunnerConfig;
+          fakeRootCommands = installWorkerFilesBaseStacked;
+        };
+
         # The caos server: storage *and* compute in one process (it serves
         # /object from a git repo and /run by spawning worker containers). It runs
         # those containers by shelling out to the `docker` CLI, so — unlike the
@@ -574,6 +604,12 @@
           name = "caos-worker-rustc";
           contents = [ workerRustcRootEnv ];
           config = workerRustcConfig;
+          fakeRootCommands = installWorkerFilesBaseStacked;
+        };
+        loadWorkerRunner = loadImage {
+          name = "caos-worker-runner";
+          contents = [ workerRunnerRootEnv ];
+          config = workerRunnerConfig;
           fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
@@ -719,6 +755,7 @@
           caos-worker-file-count-docker = workerFileCountImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-rustc-docker = workerRustcImage;
+          caos-worker-runner-docker = workerRunnerImage;
         };
 
         apps = {
@@ -760,6 +797,10 @@
           load-caos-worker-rustc = {
             type = "app";
             program = "${loadWorkerRustc}/bin/load-caos-worker-rustc";
+          };
+          load-caos-worker-runner = {
+            type = "app";
+            program = "${loadWorkerRunner}/bin/load-caos-worker-runner";
           };
         };
 
