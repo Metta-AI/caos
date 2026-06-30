@@ -1110,7 +1110,7 @@ fn cas_entry(canon: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId)
 /// Only the layer *contents* are captured (files, the exec bit, and symlinks);
 /// mtimes/owners are dropped, which is fine — the server re-tars the trees
 /// deterministically and generates the diff_ids itself.
-pub fn import_image(t: &dyn Transport, archive: &str) -> Result<(), String> {
+pub fn import_image(t: &dyn Transport, archive: &str, base: Option<&str>) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let work = scratch_dir()?;
@@ -1135,6 +1135,22 @@ pub fn import_image(t: &dyn Transport, archive: &str) -> Result<(), String> {
             .ok_or("manifest.json: missing Layers array")?;
 
         let mut entries: Vec<Entry> = Vec::new();
+
+        // Optional `base`: a `docker://<ref>` the server stacks these (delta)
+        // layers on top of at convert time, pulling the base from its source
+        // registry. So a heavy stock base (e.g. a toolchain) never enters git —
+        // only this archive's own layers do.
+        if let Some(base) = base {
+            let base = base.trim();
+            if base.is_empty() {
+                return Err("--base ref is empty".to_string());
+            }
+            entries.push(Entry {
+                mode: EntryKind::Blob.into(),
+                filename: "base".as_bytes().to_vec().into(),
+                oid: post_object(t, "blob", base.as_bytes())?,
+            });
+        }
 
         // config.json, stored verbatim.
         let config_bytes = std::fs::read(work.join(config_name))
