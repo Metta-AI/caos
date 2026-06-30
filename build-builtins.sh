@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count hello deep-deps rustc)
+[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count hello deep-deps rustc runner)
 
 nix build .#caos -o result-caos
 caos=$PROJECT/result-caos/bin/caos-cli
@@ -42,7 +42,7 @@ image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image at
 # self-contained.
 import_base() { # std name -> docker:// base ref, or empty for self-contained
   case "$1" in
-    base) echo "docker://debian:stable-slim" ;;
+    base | runner) echo "docker://debian:stable-slim" ;;
     rustc) echo "docker://rust:1-bookworm" ;;
     *) echo "" ;;
   esac

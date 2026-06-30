@@ -3,19 +3,21 @@
 # /cas/args/test and builtins are at /cas/std/<name>, all in a real /cas.
 #
 # Proves the rustc builder loop: a Rust source file -> the builder compiles it
-# (static musl, linking the vendored worker-common) and emits a git-docker worker
-# image -> that image runs as an ordinary worker. Then it edits the source and
-# rebuilds to confirm a distinct, independently-working worker.
+# (glibc/gnu, linking the vendored worker-common) and emits a ready-to-run worker
+# = curry(runner, bin=<compiled binary>) -> that runs as an ordinary worker in the
+# shared runner. Then it edits the source and rebuilds to confirm a distinct,
+# independently-working worker.
 set -euo pipefail
 T=/cas/args/test
 caos get -r "$T"   # make the fixture sources readable and referenceable
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# Curry the worker-base into the rustc builder so each build call only passes src.
-builder=$(caos curry /cas/std/rustc -- --base:@=/cas/std/base)
+# Curry the runner into the rustc builder so each build call only passes src; the
+# builder compiles src and curries the result into this runner.
+builder=$(caos curry /cas/std/rustc -- --runner:@=/cas/std/runner)
 
-echo "build greeter.rs -> worker image -> run" >&2
+echo "build greeter.rs -> runnable worker -> run" >&2
 caos run "$builder" /cas/img -- --src:@="$T/greeter.rs"
 caos run /cas/img /cas/a --
 caos get -r /cas/a

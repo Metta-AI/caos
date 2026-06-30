@@ -1442,6 +1442,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "worker-runner"
+version = "0.1.0"
+dependencies = [
+ "worker-common",
+]
+
+[[package]]
 name = "worker-rustc"
 version = "0.1.0"
 dependencies = [
