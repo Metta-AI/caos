@@ -1,1 +1,1 @@
-bash base rustc
+bash runner rustc

@@ -46,10 +46,15 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
-        // `import-image <docker-archive>` — store a docker-archive image into caos
-        // and print the git hash of the resulting git-docker image.
-        Some("import-image") => match (args.get(2), args.get(3)) {
-            (Some(archive), None) => caos::import_image(&transport()?, archive),
+        // `import-image [--base docker://<ref>] <docker-archive>` — store a
+        // docker-archive image into caos and print the git hash of the resulting
+        // git-docker image. With `--base`, the archive's layers are stored as a
+        // delta to stack on that stock base (which stays out of git).
+        Some("import-image") => match &args[2..] {
+            [archive] => caos::import_image(&transport()?, archive, None),
+            [flag, base, archive] if flag == "--base" => {
+                caos::import_image(&transport()?, archive, Some(base))
+            }
             _ => Err(usage(args)),
         },
         _ => Err(usage(args)),
@@ -66,6 +71,6 @@ fn usage(args: &[String]) -> String {
     format!(
         "usage:\n  \
          {prog} run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
-         {prog} import-image <docker-archive>"
+         {prog} import-image [--base docker://<ref>] <docker-archive>"
     )
 }

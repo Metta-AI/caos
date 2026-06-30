@@ -76,6 +76,7 @@ dependencies = [
  "minreq",
  "serde_json",
  "tar",
+ "tiny_http",
  "xattr",
 ]
 
@@ -1443,6 +1444,13 @@ dependencies = [
 
 [[package]]
 name = "worker-hello"
+version = "0.1.0"
+dependencies = [
+ "worker-common",
+]
+
+[[package]]
+name = "worker-runner"
 version = "0.1.0"
 dependencies = [
  "worker-common",

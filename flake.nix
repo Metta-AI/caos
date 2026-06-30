@@ -124,6 +124,7 @@
         worker-dirs-only = crateBin "worker-dirs-only";
         worker-deep-deps = crateBin "worker-deep-deps";
         worker-rustc = crateBin "worker-rustc";
+        worker-runner = crateBin "worker-runner";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
@@ -173,23 +174,70 @@
           mkdir -p tmp
           chmod 1777 tmp
         '';
+        # The same, but for images that stack on a stock docker base (e.g. rustc on
+        # rust:1-bookworm). There we must NOT create a real /bin or /tmp: on Debian
+        # /bin is a symlink to /usr/bin, and a real /bin in our layer would shadow
+        # that symlink (hiding cc, sh, …); /tmp already exists. Install caos into
+        # /usr/bin (a real dir on the base — our layer MERGES with it, leaving the
+        # base's binaries intact) so it's reachable both via PATH and as `/bin/caos`
+        # (which the base's /bin -> usr/bin symlink resolves) — the latter matters
+        # because the server forces `--entrypoint /bin/caos` (CAOS_BIN) on every
+        # worker, regardless of the image's own Entrypoint.
+        installWorkerFilesBaseStacked = ''
+          mkdir -p usr/bin
+          cp ${caos}/bin/caos usr/bin/caos
+          chmod 4755 usr/bin/caos
+        '';
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
         # print the hash of /cas/out. The server URL a worker needs is injected at
         # runtime by the server for the containers it spawns — so none are baked
-        # into the images.
+        # into the images. PATH is Debian's default (the base is a stock Debian
+        # image; /bin -> /usr/bin, where caos lives).
         workerBaseConfig = {
           Entrypoint = [
             "/bin/caos"
             "entrypoint"
           ];
+          Env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          ];
         };
-        # Layered (not buildImage) so we can use fakeRootCommands to install the
-        # setuid-root caos — see installWorkerFiles.
+        # The worker base is a thin delta on a stock glibc base
+        # (docker://debian:stable-slim — see build-builtins.sh). It carries only the
+        # setuid caos (installed at /usr/bin via installWorkerFilesBaseStacked); the
+        # glibc/coreutils come from the Debian base. It exists so workers built from
+        # source (worker-rustc, which compiles glibc-dynamic) can stack their
+        # /worker on a base that actually provides glibc — and they inherit this
+        # setuid caos layer by hash, so the unprivileged builder never has to
+        # synthesize a setuid-root binary itself.
         workerBaseImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-base";
           tag = "latest";
-          contents = [ workerBaseRoot ];
+          contents = [ ];
           config = workerBaseConfig;
+          fakeRootCommands = installWorkerFilesBaseStacked;
+        };
+
+        # A self-contained (musl) base layer shared by the non-source-built workers
+        # (bash/hello/fold/file-count/deep-deps) via `fromImage` below. Distinct
+        # from workerBaseImage (the stock-glibc `base` builtin): these workers are
+        # self-contained musl images — they don't stack on a docker:// base — so
+        # they need the setuid caos at the real /bin/caos and the user db, exactly
+        # the old base. Sharing this one layer means a worker provisioned after any
+        # other only uploads its own delta, not the caos binary again (the registry
+        # dedups the identical base blob). It is NOT a builtin — just a fromImage.
+        workerSharedBaseConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [ "PATH=/bin" ];
+        };
+        workerSharedBaseImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-shared-base";
+          tag = "latest";
+          contents = [ workerBaseRoot ];
+          config = workerSharedBaseConfig;
           fakeRootCommands = installWorkerFiles;
         };
 
@@ -222,15 +270,23 @@
             fi
           '';
         };
-        workerBashContents = [
-          workerBaseRoot
-          workerBashScript
-          linuxPkgs.bash
-          linuxPkgs.coreutils
-          linuxPkgs.diffutils
-          linuxPkgs.gnugrep
-          linuxPkgs.findutils
-        ];
+        # bash's own files, merged into one root so they land as a single layer
+        # atop the shared workerSharedBaseImage (which already carries the setuid
+        # caos, /tmp, and the user db). Sharing that base means a worker provisioned
+        # after any other only uploads this layer, not the caos binary again. The
+        # binaries come from linuxPkgs so they're real Linux ELF even when the flake
+        # is evaluated on macOS (see linuxPkgs).
+        workerBashRoot = linuxPkgs.buildEnv {
+          name = "caos-worker-bash-root";
+          paths = [
+            workerBashScript
+            linuxPkgs.bash
+            linuxPkgs.coreutils
+            linuxPkgs.diffutils
+            linuxPkgs.gnugrep
+            linuxPkgs.findutils
+          ];
+        };
         workerBashConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -238,12 +294,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerBashImage = pkgs.dockerTools.buildLayeredImage {
+        workerBashImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-bash";
           tag = "latest";
-          contents = workerBashContents;
+          fromImage = workerSharedBaseImage;
+          copyToRoot = workerBashRoot;
           config = workerBashConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
 
@@ -254,10 +310,6 @@
         # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
         # static binary at /worker — so the image needs no shell or coreutils.
         workerHelloRoot = workerRoot "worker-hello" worker-hello;
-        workerHelloContents = [
-          workerBaseRoot
-          workerHelloRoot
-        ];
         workerHelloConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -265,12 +317,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerHelloImage = pkgs.dockerTools.buildLayeredImage {
+        workerHelloImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-hello";
           tag = "latest";
-          contents = workerHelloContents;
+          fromImage = workerSharedBaseImage;
+          copyToRoot = workerHelloRoot;
           config = workerHelloConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A recursive "fold" worker — a catamorphism over a CAS tree. Args:
@@ -291,10 +343,6 @@
         # This is the `worker-fold` crate, a static binary at /worker — so the
         # image needs no shell or coreutils.
         workerFoldRoot = workerRoot "worker-fold" worker-fold;
-        workerFoldContents = [
-          workerBaseRoot
-          workerFoldRoot
-        ];
         workerFoldConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -302,12 +350,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerFoldImage = pkgs.dockerTools.buildLayeredImage {
+        workerFoldImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-fold";
           tag = "latest";
-          contents = workerFoldContents;
+          fromImage = workerSharedBaseImage;
+          copyToRoot = workerFoldRoot;
           config = workerFoldConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A "file-count" worker: a leaf algebra meant to drive fold as its
@@ -320,10 +368,6 @@
         # that URL at runtime. This is the `worker-file-count` crate, a static
         # binary at /worker — so the image needs no shell or coreutils.
         workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
-        workerFileCountContents = [
-          workerBaseRoot
-          workerFileCountRoot
-        ];
         workerFileCountConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -331,12 +375,12 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerFileCountImage = pkgs.dockerTools.buildLayeredImage {
+        workerFileCountImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-file-count";
           tag = "latest";
-          contents = workerFileCountContents;
+          fromImage = workerSharedBaseImage;
+          copyToRoot = workerFileCountRoot;
           config = workerFileCountConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A "dirs-only" worker: a `pre` algebra for fold that keeps only a node's
@@ -403,10 +447,6 @@
         # /worker — so, like the other Rust workers, its image needs no shell or
         # coreutils, just caos (installed setuid by installWorkerFiles).
         workerDeepDepsRoot = workerRoot "worker-deep-deps" worker-deep-deps;
-        workerDeepDepsContents = [
-          workerBaseRoot
-          workerDeepDepsRoot
-        ];
         workerDeepDepsConfig = {
           Entrypoint = [
             "/bin/caos"
@@ -414,23 +454,23 @@
           ];
           Env = [ "PATH=/bin" ];
         };
-        workerDeepDepsImage = pkgs.dockerTools.buildLayeredImage {
+        workerDeepDepsImage = pkgs.dockerTools.buildImage {
           name = "caos-worker-deep-deps";
           tag = "latest";
-          contents = workerDeepDepsContents;
+          fromImage = workerSharedBaseImage;
+          copyToRoot = workerDeepDepsRoot;
           config = workerDeepDepsConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # A "rustc" worker: it *builds other workers*. Given a Rust source file as
         # `--src` and a worker-base git-docker image as `--base` (curried in), it
-        # compiles the source (static, musl, linking the vendored worker-common)
-        # and emits a new worker image at /cas/out — the base's layers plus one
-        # carrying the compiled /worker. So this image is far from minimal: it
-        # bakes a whole Rust + C toolchain, merged with the worker root via
-        # buildEnv so cargo/rustc/cc all land on PATH=/bin. The worker-common
-        # source is vendored at /vendor/worker-common for user code to depend on.
-        # This is the `worker-rustc` crate at /worker.
+        # compiles the source (glibc/gnu, linking the vendored worker-common) and
+        # emits a new worker image at /cas/out — the base's layers plus one carrying
+        # the compiled /worker. The Rust + C toolchain is NOT baked in: it comes from
+        # the stock rust base this image stacks on (see workerRustcRootEnv below).
+        # This is the `worker-rustc` crate's binary at /worker; the worker-common
+        # source is vendored at /vendor/worker-common for the in-image build's user
+        # code to depend on.
         workerRustcRoot = workerRoot "worker-rustc" worker-rustc;
         # The worker-common crate source, for the in-image `cargo build` to link
         # user code against (it has no deps, so no registry/network is needed).
@@ -438,38 +478,88 @@
           mkdir -p $out/vendor
           cp -r ${./crates/worker-common} $out/vendor/worker-common
         '';
-        # One merged root tree: the worker bits plus the build toolchain, so a
-        # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc.
-        workerRustcRootEnv = linuxPkgs.buildEnv {
-          name = "caos-worker-rustc-root";
-          paths = [
-            workerBaseRoot
-            workerRustcRoot
-            workerCommonVendor
-            linuxRustToolchain
-            linuxPkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
-            linuxPkgs.coreutils
-            linuxPkgs.bash # cc-wrapper and cargo shell out to these
-          ];
-        };
+        # The rustc worker's *delta*: only our bits — the /worker binary and the
+        # vendored worker-common (caos is added setuid by installWorkerFilesBaseStacked).
+        # The toolchain (cargo, rustc, gcc, glibc, coreutils, bash) comes from the
+        # stock `rust:1-bookworm` base this stacks on (build-builtins.sh imports it
+        # with `--base docker://rust:1-bookworm`), so none of it rides in git. Our
+        # caos and /worker are musl-static, so they run unchanged on the glibc base.
+        #
+        # Built as a plain tree of *real* directories (not buildEnv, which would
+        # symlink /worker etc. into /nix/store and, worse, make /etc a symlink that
+        # shadows the base's real /etc). Real dirs overlay-MERGE with the base, so
+        # the base keeps its /etc, /usr, … intact. We ship no /etc: the worker runs
+        # as a numeric uid (caos drops to 1000 by setuid(2), no passwd entry needed)
+        # and the base's own /etc (nsswitch, ssl certs, alternatives → cc) is kept.
+        workerRustcRootEnv = pkgs.runCommand "caos-worker-rustc-root" { } ''
+          mkdir -p $out/vendor
+          cp ${workerRustcRoot}/worker $out/worker
+          cp -r ${workerCommonVendor}/vendor/worker-common $out/vendor/worker-common
+        '';
         workerRustcContents = [ workerRustcRootEnv ];
+        # Env replicates the stock rust image's: /usr/local/cargo/bin (cargo/rustc)
+        # first, then the usual debian dirs (/usr/local/bin holds our caos). The
+        # server's convert uses this config verbatim, so it must be self-sufficient.
+        # worker-rustc overrides CARGO_HOME per-build to /tmp/cargo (the only
+        # world-writable spot), but a sane default doesn't hurt.
         workerRustcConfig = {
           Entrypoint = [
             "/bin/caos"
             "entrypoint"
           ];
           Env = [
-            "PATH=/bin"
-            # cargo writes here; /tmp is the only world-writable dir for the worker.
-            "CARGO_HOME=/tmp/cargo"
+            "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            "RUSTUP_HOME=/usr/local/rustup"
+            "CARGO_HOME=/usr/local/cargo"
           ];
+          # This worker compiles Rust in release mode (rustc + LLVM + linker), so
+          # it needs real RAM: at the 256MB default a build thrashes (~25s on fly);
+          # at 2GB it's ~1s. caosd reads this label (caos.fly.memory-mb) when it
+          # creates the worker machine, so the requirement rides with the image and
+          # is the same on every stack — no stack-wide knob.
+          Labels = {
+            "caos.fly.memory-mb" = "2048";
+          };
         };
+        # buildLayeredImage so fakeRootCommands can install the setuid caos. With
+        # the toolchain now in the stock rust base (not in git), this image is the
+        # thin delta only — the published git-docker tree carries
+        # `base = docker://rust:1-bookworm` plus these layers (build-builtins.sh).
         workerRustcImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-rustc";
           tag = "latest";
-          contents = workerRustcContents;
+          contents = [ workerRustcRootEnv ];
           config = workerRustcConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
+        };
+
+        # The "runner": one warm, pooled image that runs a compiled worker binary
+        # passed as the `bin` arg (see crates/worker-runner). Workers built from
+        # source (by rustc) are produced as just a binary and curried into this
+        # image, so they need no image of their own — no per-worker convert /
+        # registry push / app provision, which is the cold-start cost. A thin delta
+        # on the stock glibc base (debian:stable-slim, via build-builtins' --base),
+        # carrying only the /worker trampoline; caos comes from
+        # installWorkerFilesBaseStacked, libc + the rest from the base.
+        workerRunnerRootEnv = pkgs.runCommand "caos-worker-runner-root" { } ''
+          mkdir -p $out
+          cp ${workerRoot "worker-runner" worker-runner}/worker $out/worker
+        '';
+        workerRunnerConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "entrypoint"
+          ];
+          Env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          ];
+        };
+        workerRunnerImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-runner";
+          tag = "latest";
+          contents = [ workerRunnerRootEnv ];
+          config = workerRunnerConfig;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
         # The caos server: storage *and* compute in one process (it serves
@@ -498,6 +588,15 @@
           # ships http-backend + core plumbing but drops git's python3/perl/docs
           # (~200 MiB) that the server never touches.
           linuxPkgs.gitMinimal
+          # skopeo, used two ways: (1) copy a base image's blobs from its source
+          # registry into our own repo, so a git image that references
+          # `base = docker://<ref>` converts by stacking only its delta layers on
+          # top (no toolchain in git); (2) under CAOS_BACKEND=fly, copy a converted
+          # worker image from the local registry to the HTTPS, token-authed
+          # registry.fly.io (which the server's TLS-free in-process push can't
+          # reach). `cacert` gives skopeo a CA bundle for the TLS pulls.
+          linuxPkgs.skopeo
+          linuxPkgs.cacert
         ];
         serverConfig = {
           Cmd = [ "/bin/server" ];
@@ -534,13 +633,13 @@
 
         loadWorkerBase = loadImage {
           name = "caos-worker-base";
-          contents = [ workerBaseRoot ];
+          contents = [ ];
           config = workerBaseConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
         loadWorkerBash = loadImage {
           name = "caos-worker-bash";
-          contents = workerBashContents;
+          contents = [ workerBaseRoot workerBashRoot ];
           config = workerBashConfig;
           fakeRootCommands = installWorkerFiles;
         };
@@ -551,19 +650,19 @@
         };
         loadWorkerHello = loadImage {
           name = "caos-worker-hello";
-          contents = workerHelloContents;
+          contents = [ workerBaseRoot workerHelloRoot ];
           config = workerHelloConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerFold = loadImage {
           name = "caos-worker-fold";
-          contents = workerFoldContents;
+          contents = [ workerBaseRoot workerFoldRoot ];
           config = workerFoldConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerFileCount = loadImage {
           name = "caos-worker-file-count";
-          contents = workerFileCountContents;
+          contents = [ workerBaseRoot workerFileCountRoot ];
           config = workerFileCountConfig;
           fakeRootCommands = installWorkerFiles;
         };
@@ -575,15 +674,21 @@
         };
         loadWorkerDeepDeps = loadImage {
           name = "caos-worker-deep-deps";
-          contents = workerDeepDepsContents;
+          contents = [ workerBaseRoot workerDeepDepsRoot ];
           config = workerDeepDepsConfig;
           fakeRootCommands = installWorkerFiles;
         };
         loadWorkerRustc = loadImage {
           name = "caos-worker-rustc";
-          contents = workerRustcContents;
+          contents = [ workerRustcRootEnv ];
           config = workerRustcConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
+        };
+        loadWorkerRunner = loadImage {
+          name = "caos-worker-runner";
+          contents = [ workerRunnerRootEnv ];
+          config = workerRunnerConfig;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
@@ -630,45 +735,6 @@
           ];
         };
 
-        # The single source of truth for "what's in std" — the builtin worker
-        # images by their library name (clients reach them as `/cas/std/<name>`).
-        builtinImages = {
-          base = workerBaseImage;
-          bash = workerBashImage;
-          hello = workerHelloImage;
-          fold = workerFoldImage;
-          file-count = workerFileCountImage;
-          dirs-only = workerDirsOnlyImage;
-          deep-deps = workerDeepDepsImage;
-          rustc = workerRustcImage;
-        };
-
-        # One import per builtin, baked at eval time (image store paths inlined —
-        # no runtime `nix build`). Each writes the image's git objects into the
-        # bare repo and appends its `git mktree` line (name -> image tree).
-        stdImportLines = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
-          (name: img: ''
-            # Reuse a prior import of this exact image rather than re-unpacking and
-            # re-hashing it on every startup (multi-second for a big image like
-            # rustc, even when every resulting git object already exists). The
-            # image's nix store path is immutable and content-addressed, so we pin
-            # a marker ref refs/caos/src/<storepath-hash> at the imported tree: its
-            # presence means "already imported", and it also keeps those objects
-            # from gc. Robust both ways — wipe the repo and the ref goes with it
-            # (re-import); change an image and its store path changes, so it's a new
-            # ref (re-import).
-            src_ref="refs/caos/src/$(printf '%s' "${img}" | sha1sum | cut -c1-40)"
-            hash="$(git -C "$BARE" rev-parse --verify --quiet "$src_ref^{tree}" || true)"
-            if [ -n "$hash" ]; then
-              echo "  builtin ${name}: reusing import $hash" >&2
-            else
-              echo "  builtin ${name}: importing..." >&2
-              hash="$(cd "$BARE" && caos-cli import-image "${img}")"
-              git -C "$BARE" update-ref "$src_ref" "$hash"
-            fi
-            printf '040000 tree %s\t%s\n' "$hash" "${name}" >> "$scratch/tree.txt"'')
-          builtinImages);
-
         # The dev stack as docker compose: redis + registry + the caos server,
         # mirroring the Tiltfile's wiring. The network and container names are
         # *pinned* (not compose's project-prefixed defaults) so the worker
@@ -678,9 +744,10 @@
         # (pull_policy: never), and CAOS_DATA (absolute) holds its bare repo.
         composeFile = pkgs.writeText "docker-compose.yml" ''
           # caos dev stack — generated by the caos flake. Driven by `caosd`,
-          # which sets CAOS_DATA, loads the server image, and inits the repo +
-          # stdlib before running this file. A bare `docker compose up` works
-          # only once those prerequisites are in place.
+          # which sets CAOS_DATA + loads the server image, then `up`s this file and
+          # seeds the stdlib over HTTP (the server self-bootstraps its bare repo on
+          # first boot). A bare `docker compose up` works once CAOS_DATA is set and
+          # the server image is loaded.
           name: caos
           networks:
             caos-net:
@@ -710,63 +777,33 @@
               depends_on: [caos-redis, caos-registry]
         '';
 
-        # Publish the builtin library into the server's *own* bare repo. Not a
-        # public output — caosd runs it on every startup. Pure
-        # local git plumbing — no server round-trip, no `git push`: import each
-        # image's objects straight into the repo, then point refs/caos/std at the
-        # assembled {name: image} tree. Safe to run against a live server: objects
-        # are only added, and the ref swaps atomically (update-ref renames), so an
-        # in-flight client fetch sees either the whole old or the whole new lib.
-        set-stdlib = pkgs.writeShellApplication {
-          name = "set-stdlib";
-          runtimeInputs = [ pkgs.git pkgs.coreutils caos ];
-          text = ''
-            : "''${CAOS_DATA:=$PWD/.caos-data}"
-            CAOS_DATA="$(readlink -m "$CAOS_DATA")"
-            BARE="$CAOS_DATA/server-repo.git"
-
-            # The server's bare repo + the smart-HTTP transport bits clients use
-            # (push objects up, fetch results by bare hash back). Idempotent, so
-            # re-running — or running after caosd already made it — is fine.
-            git init -q --bare "$BARE"
-            git -C "$BARE" config http.receivepack true
-            git -C "$BARE" config uploadpack.allowAnySHA1InWant true
-
-            # caos-cli's git transport discovers the repo from the cwd, so the
-            # imports below `cd "$BARE"`; scratch just collects the mktree lines.
-            scratch="$(mktemp -d)"
-            trap 'rm -rf "$scratch"' EXIT
-            : > "$scratch/tree.txt"
-
-            ${stdImportLines}
-
-            tree="$(git -C "$BARE" mktree < "$scratch/tree.txt")"
-            git -C "$BARE" update-ref refs/caos/std "$tree"
-            echo "refs/caos/std -> $tree (in $BARE)" >&2
-          '';
-        };
-
-        # Bring the stack up in the foreground (Ctrl-C tears it down). Builds (or
-        # cache-hits) and loads the server image, inits the bare repo, publishes
-        # the stdlib into it, then `docker compose up`. Uses the host's docker /
-        # `docker compose` — they must target the same daemon the server's socket
-        # mount points at. CAOS_DATA (made absolute) persists the repo across runs.
+        # Bring the dev stack up (Ctrl-C tears it down). Loads the server image,
+        # `docker compose up -d`, waits for the server (which self-bootstraps its
+        # bare repo on first boot), then seeds the stdlib over HTTP with
+        # `build-builtins.sh` — the SAME publish path fly and the tests use, so
+        # there's one implementation. Because build-builtins.sh runs `nix build`
+        # and resolves the flake, caosd must be run from the repo root. Uses the
+        # host's docker / `docker compose`; CAOS_DATA (absolute) persists the repo.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          runtimeInputs = [ pkgs.coreutils set-stdlib ];
+          runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
             export CAOS_DATA
             mkdir -p "$CAOS_DATA"
 
+            if [ ! -x ./build-builtins.sh ]; then
+              echo "caosd: run me from the caos repo root (./build-builtins.sh not found)" >&2
+              exit 1
+            fi
+
             # Load the server image only when this exact build isn't already in
             # docker. We tag the loaded image with a hash of its (immutable) nix
             # store path; the tag's presence means "this build is loaded", so an
-            # unchanged restart skips the multi-second `docker load`. Same idea as
-            # the stdlib import marker, on the docker side: remove the image and the
-            # tag goes with it (reload); change the image and its store path — hence
-            # the tag — changes (reload).
+            # unchanged restart skips the multi-second `docker load`. Remove the
+            # image and the tag goes with it (reload); change the image and its
+            # store path — hence the tag — changes (reload).
             src_tag="caos-server-src:$(printf '%s' "${serverImage}" | sha1sum | cut -c1-12)"
             if docker image inspect "$src_tag" >/dev/null 2>&1; then
               echo "==> caos-server image already loaded — skipping docker load" >&2
@@ -776,12 +813,23 @@
               docker tag caos-server:latest "$src_tag"
             fi
 
-            echo "==> publishing stdlib into $CAOS_DATA/server-repo.git" >&2
-            set-stdlib
-
-            echo "==> starting stack (redis, registry, server) — Ctrl-C to stop" >&2
+            echo "==> starting stack (redis, registry, server)" >&2
             trap 'docker compose -f ${composeFile} down' EXIT
-            docker compose -f ${composeFile} up
+            docker compose -f ${composeFile} up -d
+
+            # The server self-bootstraps an empty /git on first boot; wait for it,
+            # then publish the stdlib over HTTP (build-builtins caches imports under
+            # refs/caos/src, so a restart re-seeds in ~seconds).
+            echo "==> waiting for caos-server on :9090 ..." >&2
+            for _ in $(seq 1 60); do
+              curl -s -o /dev/null --max-time 2 http://localhost:9090/ && break
+              sleep 1
+            done
+            echo "==> publishing stdlib (build-builtins.sh)" >&2
+            CAOS_SERVER_URL=http://localhost:9090 ./build-builtins.sh >/dev/null
+
+            echo "==> stack up — Ctrl-C to stop. Following logs:" >&2
+            docker compose -f ${composeFile} logs -f
           '';
         };
       in
@@ -805,6 +853,7 @@
           caos-worker-dirs-only-docker = workerDirsOnlyImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-rustc-docker = workerRustcImage;
+          caos-worker-runner-docker = workerRunnerImage;
         };
 
         apps = {
@@ -851,6 +900,10 @@
             type = "app";
             program = "${loadWorkerRustc}/bin/load-caos-worker-rustc";
           };
+          load-caos-worker-runner = {
+            type = "app";
+            program = "${loadWorkerRunner}/bin/load-caos-worker-runner";
+          };
         };
 
         checks = {
@@ -881,6 +934,10 @@
             pkgs.rust-analyzer
             # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
             pkgs.tilt
+            # `fly` CLI: auth (`fly auth token`), org/region lookup, and operating
+            # the fly backend (apps, machines, logs). caosd itself talks to the
+            # Machines API + registry over HTTP and does not need this.
+            pkgs.flyctl
           ];
         };
       }

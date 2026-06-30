@@ -10,6 +10,7 @@ members = [
     "crates/worker-dirs-only",
     "crates/worker-deep-deps",
     "crates/worker-rustc",
+    "crates/worker-runner",
 ]
 
 # Name for crane's workspace-level derivations (fmt/test) so it doesn't warn

@@ -29,7 +29,7 @@
 //! `http.receivepack=true`; the current mounted repo doesn't, so push is rejected
 //! for now — fetch round-trips work, which is all this slice validates.
 
-use std::io::Write;
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 use tiny_http::{Header, Request, Response, StatusCode};
@@ -66,11 +66,6 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         }
     }
 
-    // The request body: empty for the GET advertisements, the negotiation/packfile
-    // for the POSTs.
-    let mut body = Vec::new();
-    request.as_reader().read_to_end(&mut body)?;
-
     // GIT_PROJECT_ROOT is the repo itself: with PATH_INFO carrying only the
     // service suffix (`/info/refs`, …), the repo path before it is empty, so
     // http-backend resolves the repo to GIT_PROJECT_ROOT directly.
@@ -89,28 +84,67 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Write stdin from a separate thread: http-backend streams stdout as it reads
-    // stdin (a large clone fills stdout long before we'd finish a serial write),
-    // so feeding the body and draining stdout must run concurrently or deadlock.
+    // Feed the request body into http-backend's stdin in constant memory, then
+    // signal EOF by dropping stdin. git's smart-HTTP services consume their whole
+    // input before producing output (upload-pack reads the wants, then writes the
+    // pack; receive-pack reads the pack, then writes a short report), so feeding
+    // stdin fully before we read stdout can't deadlock.
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&body);
-        // Dropping stdin closes the pipe, signalling EOF to http-backend.
-    });
-    let output = child.wait_with_output()?;
-    let _ = writer.join();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let _ = std::io::copy(request.as_reader(), &mut stdin);
+    drop(stdin);
 
-    let response = cgi_to_response(&output.stdout);
-    request.respond(response)
+    // Parse only the CGI header block off the front of stdout; everything past the
+    // blank line is the response body, which we hand to tiny_http as a *reader* so
+    // it streams straight to the client. A fetch's packfile can be multiple GB
+    // (e.g. the `rustc` image's std closure) — buffering it whole here OOM-killed
+    // the server. `data_length = None` makes tiny_http chunk the response, which
+    // git's HTTP clients accept.
+    let (status, headers, leftover) = read_cgi_headers(&mut stdout)?;
+    let body = std::io::Cursor::new(leftover).chain(stdout);
+    let result = request.respond(Response::new(StatusCode(status), headers, body, None, None));
+    let _ = child.wait();
+    result
 }
 
-/// Parse a CGI response (`Header: value` lines, a blank line, then the body) into
-/// an HTTP [`Response`]. The `Status:` header sets the status code (default 200);
-/// every other header is forwarded as-is.
-fn cgi_to_response(out: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
-    let (head, body) = split_headers(out);
-    let head = String::from_utf8_lossy(head);
+/// Read just the CGI header block from the front of `stdout` — up to the first
+/// blank line (`\r\n\r\n` or `\n\n`) — returning the status code, the forwarded
+/// headers, and any bytes already read past the separator (the start of the
+/// response body). Reads in small chunks so the multi-GB body that follows is
+/// never pulled into memory here. A header block over 64 KiB (or EOF with no
+/// separator) is treated as the whole response, with an empty body.
+fn read_cgi_headers(stdout: &mut impl Read) -> std::io::Result<(u16, Vec<Header>, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let split = loop {
+        if let Some(pos) = find(&buf, b"\r\n\r\n") {
+            break Some((pos, 4));
+        }
+        if let Some(pos) = find(&buf, b"\n\n") {
+            break Some((pos, 2));
+        }
+        if buf.len() > 64 * 1024 {
+            break None;
+        }
+        let n = stdout.read(&mut chunk)?;
+        if n == 0 {
+            break None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let (head, leftover) = match split {
+        Some((pos, len)) => (&buf[..pos], buf[pos + len..].to_vec()),
+        None => (&buf[..], Vec::new()),
+    };
+    let (status, headers) = parse_cgi_head(head);
+    Ok((status, headers, leftover))
+}
 
+/// Parse a CGI header block (`Header: value` lines). `Status:` sets the HTTP
+/// status (default 200); `Content-Length` is dropped (we stream with chunked
+/// encoding, so a stale length would conflict); every other header is forwarded.
+fn parse_cgi_head(head: &[u8]) -> (u16, Vec<Header>) {
+    let head = String::from_utf8_lossy(head);
     let mut status = 200u16;
     let mut headers = Vec::new();
     for line in head.split('\n') {
@@ -129,29 +163,13 @@ fn cgi_to_response(out: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
                 .next()
                 .and_then(|c| c.parse().ok())
                 .unwrap_or(200);
+        } else if name.eq_ignore_ascii_case("content-length") {
+            continue;
         } else if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
             headers.push(header);
         }
     }
-
-    let mut response = Response::from_data(body.to_vec()).with_status_code(StatusCode(status));
-    for header in headers {
-        response.add_header(header);
-    }
-    response
-}
-
-/// Split a CGI payload into its header block and body at the first blank line,
-/// accepting either `\r\n\r\n` or `\n\n` as the separator. If there's no blank
-/// line at all, treat the whole thing as headers (an empty body).
-fn split_headers(out: &[u8]) -> (&[u8], &[u8]) {
-    if let Some(pos) = find(out, b"\r\n\r\n") {
-        (&out[..pos], &out[pos + 4..])
-    } else if let Some(pos) = find(out, b"\n\n") {
-        (&out[..pos], &out[pos + 2..])
-    } else {
-        (out, &[])
-    }
+    (status, headers)
 }
 
 /// First index of `needle` in `haystack`, if present.
