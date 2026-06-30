@@ -136,6 +136,20 @@
           mkdir -p tmp
           chmod 1777 tmp
         '';
+        # The same, but for images that stack on a stock docker base (e.g. rustc on
+        # rust:1-bookworm). There we must NOT create a real /bin or /tmp: on Debian
+        # /bin is a symlink to /usr/bin, and a real /bin in our layer would shadow
+        # that symlink (hiding cc, sh, …); /tmp already exists. Install caos into
+        # /usr/bin (a real dir on the base — our layer MERGES with it, leaving the
+        # base's binaries intact) so it's reachable both via PATH and as `/bin/caos`
+        # (which the base's /bin -> usr/bin symlink resolves) — the latter matters
+        # because the server forces `--entrypoint /bin/caos` (CAOS_BIN) on every
+        # worker, regardless of the image's own Entrypoint.
+        installWorkerFilesBaseStacked = ''
+          mkdir -p usr/bin
+          cp ${caos}/bin/caos usr/bin/caos
+          chmod 4755 usr/bin/caos
+        '';
         # The container runs `caos entrypoint`: set up /cas, run /worker, then
         # print the hash of /cas/out. The server URL a worker needs is injected at
         # runtime by the server for the containers it spawns — so none are baked
@@ -362,9 +376,9 @@
         # and emits a new worker image at /cas/out — the base's layers plus one
         # carrying the compiled /worker. So this image is far from minimal: it
         # bakes a whole Rust + C toolchain, merged with the worker root via
-        # buildEnv so cargo/rustc/cc all land on PATH=/bin. The worker-common
-        # source is vendored at /vendor/worker-common for user code to depend on.
-        # This is the `worker-rustc` crate at /worker.
+        # The `worker-rustc` crate's binary at /worker. The worker-common source is
+        # vendored at /vendor/worker-common for the in-image build's user code to
+        # depend on; cargo/rustc/cc come from the stock rust base, not from here.
         workerRustcRoot = workerRoot "worker-rustc" worker-rustc;
         # The worker-common crate source, for the in-image `cargo build` to link
         # user code against (it has no deps, so no registry/network is needed).
@@ -372,30 +386,39 @@
           mkdir -p $out/vendor
           cp -r ${./crates/worker-common} $out/vendor/worker-common
         '';
-        # One merged root tree: the worker bits plus the build toolchain, so a
-        # single PATH=/bin reaches caos, /worker, cargo, rustc, and cc.
-        workerRustcRootEnv = pkgs.buildEnv {
-          name = "caos-worker-rustc-root";
-          paths = [
-            workerBaseRoot
-            workerRustcRoot
-            workerCommonVendor
-            rustToolchain
-            pkgs.stdenv.cc # cc/gcc + binutils, the linker rustc drives for musl
-            pkgs.coreutils
-            pkgs.bash # cc-wrapper and cargo shell out to these
-          ];
-        };
+        # The rustc worker's *delta*: only our bits — the /worker binary and the
+        # vendored worker-common (caos is added setuid by installWorkerFilesBaseStacked).
+        # The toolchain (cargo, rustc, gcc, glibc, coreutils, bash) comes from the
+        # stock `rust:1-bookworm` base this stacks on (build-builtins.sh imports it
+        # with `--base docker://rust:1-bookworm`), so none of it rides in git. Our
+        # caos and /worker are musl-static, so they run unchanged on the glibc base.
+        #
+        # Built as a plain tree of *real* directories (not buildEnv, which would
+        # symlink /worker etc. into /nix/store and, worse, make /etc a symlink that
+        # shadows the base's real /etc). Real dirs overlay-MERGE with the base, so
+        # the base keeps its /etc, /usr, … intact. We ship no /etc: the worker runs
+        # as a numeric uid (caos drops to 1000 by setuid(2), no passwd entry needed)
+        # and the base's own /etc (nsswitch, ssl certs, alternatives → cc) is kept.
+        workerRustcRootEnv = pkgs.runCommand "caos-worker-rustc-root" { } ''
+          mkdir -p $out/vendor
+          cp ${workerRustcRoot}/worker $out/worker
+          cp -r ${workerCommonVendor}/vendor/worker-common $out/vendor/worker-common
+        '';
         workerRustcContents = [ workerRustcRootEnv ];
+        # Env replicates the stock rust image's: /usr/local/cargo/bin (cargo/rustc)
+        # first, then the usual debian dirs (/usr/local/bin holds our caos). The
+        # server's convert uses this config verbatim, so it must be self-sufficient.
+        # worker-rustc overrides CARGO_HOME per-build to /tmp/cargo (the only
+        # world-writable spot), but a sane default doesn't hurt.
         workerRustcConfig = {
           Entrypoint = [
             "/bin/caos"
             "entrypoint"
           ];
           Env = [
-            "PATH=/bin"
-            # cargo writes here; /tmp is the only world-writable dir for the worker.
-            "CARGO_HOME=/tmp/cargo"
+            "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            "RUSTUP_HOME=/usr/local/rustup"
+            "CARGO_HOME=/usr/local/cargo"
           ];
         };
         workerRustcImage = pkgs.dockerTools.buildLayeredImage {
@@ -403,7 +426,7 @@
           tag = "latest";
           contents = workerRustcContents;
           config = workerRustcConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
         # The caos server: storage *and* compute in one process (it serves
@@ -513,7 +536,7 @@
           name = "caos-worker-rustc";
           contents = workerRustcContents;
           config = workerRustcConfig;
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----

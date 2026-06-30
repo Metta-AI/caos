@@ -1,11 +1,16 @@
 //! caos-worker-rustc: build a caos worker image from Rust source.
 //!
 //! Given a Rust source file as `--src` and a worker-base git-docker image as
-//! `--base` (typically curried in), it compiles the source — statically, for
-//! musl, linking the vendored `worker-common` — and emits a new worker image at
+//! `--base` (typically curried in), it compiles the source for glibc (gnu),
+//! linking the vendored `worker-common`, and emits a new worker image at
 //! `/cas/out`: the base's layers with one more layer carrying the compiled
 //! `/worker` on top, plus a generated `config.json`. The result is an ordinary
 //! worker image: `caos run` it like any other.
+//!
+//! NOTE: the produced `/worker` is now glibc-dynamic, so the `--base` it stacks
+//! on must provide glibc (a stock glibc base via the `docker://` base mechanism).
+//! Wiring that base through is the remaining "#2" work; until then the produced
+//! image stacks on whatever git-docker base is passed.
 //!
 //! So building a worker is itself a worker — and because the run is memoized on
 //! `(this image, src, base)`, recompiling unchanged source is a cache hit.
@@ -25,8 +30,11 @@ use worker_common::{arg, caos, entries, file_name, link, path, run_worker, scrat
 /// depend on.
 const VENDOR_WORKER_COMMON: &str = "/vendor/worker-common";
 
-/// Static target, so the produced `/worker` needs no libc in its image.
-const TARGET: &str = "x86_64-unknown-linux-musl";
+/// We build for glibc (gnu), not musl: the stock `rust:1-bookworm` base this
+/// worker runs on ships only the gnu target and gcc (no musl target / musl-gcc),
+/// so gnu is what compiles out of the box. The produced `/worker` is therefore
+/// glibc-dynamic and rides on a stock glibc base (see [`assemble_image`]).
+const TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn main() -> ExitCode {
     run_worker("rustc", run)
@@ -45,7 +53,7 @@ fn run() -> Result<(), String> {
 }
 
 /// Lay out a cargo project around the user's source (as `src/main.rs`), depending
-/// on the vendored `worker-common`, and build it static for musl. Returns the
+/// on the vendored `worker-common`, and build it for glibc (gnu). Returns the
 /// path to the compiled `worker` binary.
 fn compile(src: &str) -> Result<String, String> {
     let proj = scratch("proj")?;

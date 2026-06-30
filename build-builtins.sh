@@ -34,6 +34,19 @@ git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
 
 image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
 
+# Some builtins ship as a thin delta on a stock docker base instead of a
+# self-contained image: the nix image holds only our bits, and `import-image
+# --base docker://<ref>` records the stock base so the heavy toolchain rides as
+# stock registry layers (pulled server-side at convert time) rather than in git.
+# rustc bases on the stock rust image (cargo/rustc/gcc/glibc); the rest are
+# self-contained.
+import_base() { # std name -> docker:// base ref, or empty for self-contained
+  case "$1" in
+    rustc) echo "docker://rust:1-bookworm" ;;
+    *) echo "" ;;
+  esac
+}
+
 # Build + import each builtin, collecting `git mktree` lines (name -> tree hash).
 # `import-image` (run inside the client repo, so its git transport finds it)
 # stores the git-docker tree on the server and prints its hash.
@@ -42,7 +55,13 @@ for name in "${names[@]}"; do
   attr=$(image_attr "$name")
   echo "building + importing $name ($attr)..." >&2
   nix build ".#$attr" -o "result-builtin-$name"
-  hash=$(cd "$CLIENT" && "$caos" import-image "$PROJECT/result-builtin-$name")
+  base=$(import_base "$name")
+  if [ -n "$base" ]; then
+    hash=$(cd "$CLIENT" \
+      && "$caos" import-image --base "$base" "$PROJECT/result-builtin-$name")
+  else
+    hash=$(cd "$CLIENT" && "$caos" import-image "$PROJECT/result-builtin-$name")
+  fi
   entries+="040000 tree $hash"$'\t'"$name"$'\n'
 done
 

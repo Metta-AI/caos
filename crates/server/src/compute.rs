@@ -377,38 +377,49 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
     // A deterministic tag per base ref: re-converting reuses the same copy.
     let tag = format!("base-{}", sha256_hex(base_ref.as_bytes()));
     let dest = format!("docker://{host}/{REGISTRY_REPO}:{tag}");
-    let status = Command::new("skopeo")
-        .args([
-            "--insecure-policy",
-            "copy",
-            "--format",
-            "oci",
-            "--dest-tls-verify=false",
-            "--override-os",
-            "linux",
-            "--override-arch",
-            "amd64",
-        ])
-        .arg(format!("docker://{base_ref}"))
-        .arg(&dest)
-        // The slim server image runs as uid 0 with no /etc/passwd entry, so
-        // skopeo can't resolve $HOME (it wants one for its auth/config dirs).
-        // Point it at a writable dir so the anonymous pull works.
-        .env("HOME", "/tmp")
-        .status()
-        .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
-    if !status.success() {
-        return Err(format!("skopeo copy {base_ref} -> {dest} failed ({status})"));
+    let man_url = format!("{push}/v2/{REGISTRY_REPO}/manifests/{tag}");
+    let accept = "application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.v2+json";
+
+    // Skip the (slow, network-bound) skopeo pull if this base is already in the
+    // registry from an earlier convert — the tag is deterministic per ref, so a
+    // resolvable manifest means the blobs are present. This makes the stock base a
+    // once-per-registry cost, not once-per-convert.
+    let cached = minreq::get(&man_url)
+        .with_header("Accept", accept)
+        .send()
+        .map(|r| (200..300).contains(&r.status_code))
+        .unwrap_or(false);
+    if !cached {
+        let status = Command::new("skopeo")
+            .args([
+                "--insecure-policy",
+                "copy",
+                "--format",
+                "oci",
+                "--dest-tls-verify=false",
+                "--override-os",
+                "linux",
+                "--override-arch",
+                "amd64",
+            ])
+            .arg(format!("docker://{base_ref}"))
+            .arg(&dest)
+            // The slim server image runs as uid 0 with no /etc/passwd entry, so
+            // skopeo can't resolve $HOME (it wants one for its auth/config dirs).
+            // Point it at a writable dir so the anonymous pull works.
+            .env("HOME", "/tmp")
+            .status()
+            .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
+        if !status.success() {
+            return Err(format!("skopeo copy {base_ref} -> {dest} failed ({status})"));
+        }
     }
 
-    // Read the manifest we just wrote: the base layers' media types/digests/sizes.
-    let man_url = format!("{push}/v2/{REGISTRY_REPO}/manifests/{tag}");
+    // Read the manifest (just copied, or already cached): the base layers' media
+    // types/digests/sizes.
     let resp = minreq::get(&man_url)
-        .with_header(
-            "Accept",
-            "application/vnd.oci.image.manifest.v1+json, \
-             application/vnd.docker.distribution.manifest.v2+json",
-        )
+        .with_header("Accept", accept)
         .send()
         .map_err(|e| format!("GET {man_url}: {e}"))?;
     if !(200..300).contains(&resp.status_code) {
