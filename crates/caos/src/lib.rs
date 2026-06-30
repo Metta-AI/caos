@@ -317,11 +317,14 @@ impl Transport for GitTransport {
 
 impl GitTransport {
     /// Hash a filesystem path into the local repo, reusing git's recorded objects.
-    /// A clean, tracked path keeps its committed hash with no read at all; a dirty
-    /// or untracked one is hashed now — and for a directory only its *changed*
-    /// files are re-read, the rest reusing their cached hash via a throwaway copy
-    /// of the index (the same trick `git stash`/`commit` use). A path outside the
-    /// worktree has no index to diff against, so it's read in full.
+    /// Only git-tracked paths inside the worktree can be ingested (the nix-flakes
+    /// rule: a build sees only what git knows about). A clean, tracked path keeps
+    /// its committed hash with no read at all; a tracked path with uncommitted
+    /// edits is hashed now from the working tree — and for a directory only its
+    /// *changed* tracked files are re-read, the rest reusing their cached hash via
+    /// a throwaway copy of the index (the same trick `git stash`/`commit` use),
+    /// while untracked files inside it are excluded. A path outside the worktree,
+    /// or one git doesn't track, is an error.
     fn git_ingest(
         &self,
         path: &Path,
@@ -330,38 +333,52 @@ impl GitTransport {
         let abs = path
             .canonicalize()
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let rel = self
+        // Canonicalize the worktree root too before comparing: `gix::discover(".")`
+        // records a cwd-relative, symlink-unresolved workdir, whereas `abs` is
+        // fully resolved — so a raw `strip_prefix` would miss a path that really is
+        // inside the tree.
+        let workdir = self
             .repo
             .workdir()
+            .map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()));
+        let rel = workdir
+            .as_deref()
             .and_then(|w| abs.strip_prefix(w).ok())
-            .map(Path::to_path_buf);
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                format!(
+                    "{}: outside the git worktree; caos only ingests git-tracked paths",
+                    path.display()
+                )
+            })?;
 
-        if let Some(rel) = &rel {
-            // Inside the worktree: reuse git's objects where we can.
-            if self.is_clean(&abs)? {
-                return self.tracked_entry(&abs); // committed hash, no read
-            }
-            if abs.is_dir() {
-                return self.hash_dir(&abs, rel); // incremental: only changed files
-            }
+        // Inside the worktree: reuse git's objects where we can.
+        if self.is_clean(&abs)? {
+            return self.tracked_entry(&abs); // committed hash, no read
         }
-
-        // A file (anywhere) hashes directly; a directory outside the worktree we
-        // read in full (`store` walks it and writes objects via `put_object`).
+        // Dirty or untracked. Refuse anything git doesn't track — untracked files
+        // are invisible to a build, just as they are to a nix flake.
+        if !self.is_tracked(&abs)? {
+            return Err(format!(
+                "{}: not tracked by git; caos only ingests git-tracked paths \
+                 (add it with `git add`)",
+                path.display()
+            ));
+        }
         if abs.is_dir() {
-            store(self, None, &abs)
-        } else {
-            let oid = self.hash_file(&abs)?;
-            let exec = std::fs::metadata(&abs)
-                .map(|m| m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false);
-            let kind = if exec {
-                EntryKind::BlobExecutable
-            } else {
-                EntryKind::Blob
-            };
-            Ok((kind.into(), oid))
+            return self.hash_dir(&abs, &rel); // incremental: only changed tracked files
         }
+        // A tracked file with uncommitted edits: hash its working-tree bytes.
+        let oid = self.hash_file(&abs)?;
+        let exec = std::fs::metadata(&abs)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        let kind = if exec {
+            EntryKind::BlobExecutable
+        } else {
+            EntryKind::Blob
+        };
+        Ok((kind.into(), oid))
     }
 
     /// Whether `abs` (inside the worktree) is clean and tracked — `git status`
@@ -372,6 +389,15 @@ impl GitTransport {
             None,
         )?;
         Ok(out.trim().is_empty())
+    }
+
+    /// Whether git tracks `abs` (or, for a directory, anything under it) —
+    /// `git ls-files` lists a path only if it's in the index (staged or committed),
+    /// so an empty result means untracked. Used to reject untracked paths a clean
+    /// check can't catch (a path with uncommitted changes is "dirty" either way).
+    fn is_tracked(&self, abs: &Path) -> Result<bool, String> {
+        let out = git_capture(&["ls-files", "--", &abs.to_string_lossy()], None)?;
+        Ok(!out.trim().is_empty())
     }
 
     /// The `(mode, oid)` git records for a clean tracked path, read from `HEAD`
@@ -399,10 +425,13 @@ impl GitTransport {
         parse_oid(out.trim())
     }
 
-    /// Hash a dirty/untracked directory `abs` (worktree-relative `rel`) into the
-    /// repo, re-reading only its changed files. We copy the real index to a
-    /// throwaway one (inheriting its stat-cache), `git add` the directory there,
-    /// then `write-tree --prefix` to read back just that subtree.
+    /// Hash a tracked directory `abs` (worktree-relative `rel`) with uncommitted
+    /// edits into the repo, re-reading only its changed files. We copy the real
+    /// index to a throwaway one (inheriting its stat-cache), `git add -u` the
+    /// directory there, then `write-tree --prefix` to read back just that subtree.
+    /// `-u` restages only already-tracked files (picking up edits and deletions)
+    /// and skips untracked ones, so the result tree holds exactly what git knows —
+    /// the nix-flakes rule (see [`git_ingest`]).
     fn hash_dir(
         &self,
         abs: &Path,
@@ -415,7 +444,7 @@ impl GitTransport {
             std::fs::copy(&real_index, &tmp).map_err(|e| format!("copying index: {e}"))?;
         }
         let oid = (|| {
-            git_capture(&["add", "--", &abs.to_string_lossy()], Some(&tmp))?;
+            git_capture(&["add", "-u", "--", &abs.to_string_lossy()], Some(&tmp))?;
             let prefix = format!("--prefix={}/", rel.to_string_lossy());
             let tree = git_capture(&["write-tree", &prefix], Some(&tmp))?;
             parse_oid(tree.trim())
@@ -1343,8 +1372,9 @@ fn scratch_dir() -> Result<PathBuf, String> {
 ///   materialized from (its recorded hash). Only when `cas` is `Some` (the
 ///   worker); the CLI passes `None`, so every path is a host path;
 /// * `--name:@=path` elsewhere — a host path, ingested via the transport (the git
-///   transport reuses git's recorded objects — see [`GitTransport::ingest_path`]);
-///   a worker has no host filesystem, so this is an error there.
+///   transport ingests it from the working repo, and only if git tracks it — see
+///   [`GitTransport::ingest_path`]); a worker has no host filesystem, so this is
+///   an error there.
 fn build_arg_entries(
     t: &dyn Transport,
     cas: Option<&Path>,

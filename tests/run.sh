@@ -10,7 +10,9 @@
 # assertion exits test.sh non-zero, which fails the run and surfaces its stderr.
 #
 # Each test reaches builtins as /cas/std/<name>; <dir>/builtins (optional) lists
-# which to publish, one or more per line (default: all of them).
+# which to publish, one or more per line (default: all of them). A test may also
+# include <dir>/host.sh (optional), a hook that runs on the host before the
+# worker — see below.
 #
 # Usage: tests/run.sh <test-dir>
 # Requires the dev daemons running (`tilt up` / `caosd`): the caos server :9090,
@@ -48,9 +50,26 @@ OUT=$PROJECT/.caos-dev/test-out
 rm -rf "$OUT"
 trap 'rm -rf "$CLIENT" "$OUT"' EXIT
 
+# caos-cli only ingests git-tracked paths (like a nix flake), so copy the test
+# directory into the client repo and commit it. The committed `test/` is then a
+# clean, tracked path the CLI hashes straight from `HEAD`.
+cp -R "$DIR" "$CLIENT/test"
+git -C "$CLIENT" add -A
+git -C "$CLIENT" -c user.email=test@caos -c user.name=caos commit -qm 'test tree'
+
+# A test may include a `host.sh` hook: it runs on the host, in the committed test
+# copy ($CLIENT/test), *after* the commit and *before* the worker. Anything it
+# creates therefore stays untracked — e.g. to prove caos-cli excludes untracked
+# files when it ingests `test/` (the nix-flakes rule), which the worker-side
+# test.sh then asserts.
+if [ -f "$CLIENT/test/host.sh" ]; then
+  echo "running $1 host.sh hook..." >&2
+  ( cd "$CLIENT/test" && bash host.sh )
+fi
+
 # Run the test inside a bash worker: test.sh is the script; the whole directory
 # rides along as `test` (materialized at /cas/args/test).
 echo "running $1 inside a bash worker..." >&2
 ( cd "$CLIENT" && "$caosbin" run /cas/std/bash "$OUT" -- \
-    --script:@="$DIR/test.sh" --test:@="$DIR" ) >/dev/null
+    --script:@="test/test.sh" --test:@="test" ) >/dev/null
 echo "PASS: $1" >&2
