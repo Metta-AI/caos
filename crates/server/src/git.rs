@@ -56,12 +56,22 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     };
     let method = request.method().as_str().to_string();
 
-    // Forward the two headers http-backend needs as CGI meta-variables.
-    let (mut content_type, mut content_length) = (String::new(), String::new());
+    // Forward the headers http-backend needs as CGI meta-variables. Content-Type
+    // and Content-Length are the obvious two; Content-Encoding matters because git
+    // gzip-compresses a large request body (e.g. the many `have` lines a big repo
+    // sends during fetch negotiation, or a sizeable push) and sets
+    // `Content-Encoding: gzip`. http-backend only inflates such a body when it sees
+    // the `HTTP_CONTENT_ENCODING` CGI variable — without it, it reads the gzip
+    // bytes as pkt-lines and dies with "bad line length character", which the
+    // client sees as "the remote end hung up unexpectedly". A small repo's request
+    // is never gzipped, so this stayed latent until a real (large) repo hit it.
+    let (mut content_type, mut content_length, mut content_encoding) =
+        (String::new(), String::new(), String::new());
     for header in request.headers() {
         match header.field.as_str().as_str().to_ascii_lowercase().as_str() {
             "content-type" => content_type = header.value.as_str().to_string(),
             "content-length" => content_length = header.value.as_str().to_string(),
+            "content-encoding" => content_encoding = header.value.as_str().to_string(),
             _ => {}
         }
     }
@@ -79,6 +89,7 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         .env("QUERY_STRING", &query)
         .env("CONTENT_TYPE", &content_type)
         .env("CONTENT_LENGTH", &content_length)
+        .env("HTTP_CONTENT_ENCODING", &content_encoding)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
