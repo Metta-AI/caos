@@ -354,7 +354,7 @@ impl GitTransport {
 
         // Inside the worktree: reuse git's objects where we can.
         if self.is_clean(&abs)? {
-            return self.tracked_entry(&abs); // committed hash, no read
+            return self.tracked_entry(&abs, &rel); // committed hash, no read
         }
         // Dirty or untracked. Refuse anything git doesn't track — untracked files
         // are invisible to a build, just as they are to a nix flake.
@@ -405,7 +405,15 @@ impl GitTransport {
     fn tracked_entry(
         &self,
         abs: &Path,
+        rel: &Path,
     ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+        use gix::objs::tree::EntryKind;
+
+        if rel.as_os_str().is_empty() {
+            let out = git_capture(&["rev-parse", "HEAD^{tree}"], None)?;
+            return Ok((EntryKind::Tree.into(), parse_oid(out.trim())?));
+        }
+
         let out = git_capture(&["ls-tree", "HEAD", "--", &abs.to_string_lossy()], None)?;
         let line = out
             .lines()
@@ -445,8 +453,12 @@ impl GitTransport {
         }
         let oid = (|| {
             git_capture(&["add", "-u", "--", &abs.to_string_lossy()], Some(&tmp))?;
-            let prefix = format!("--prefix={}/", rel.to_string_lossy());
-            let tree = git_capture(&["write-tree", &prefix], Some(&tmp))?;
+            let tree = if rel.as_os_str().is_empty() {
+                git_capture(&["write-tree"], Some(&tmp))?
+            } else {
+                let prefix = format!("--prefix={}/", rel.to_string_lossy());
+                git_capture(&["write-tree", &prefix], Some(&tmp))?
+            };
             parse_oid(tree.trim())
         })();
         let _ = std::fs::remove_file(&tmp);
