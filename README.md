@@ -289,15 +289,19 @@ escaping):
 - `--name:@=path` → a path (the `@` nods to curl/HTTPie). It's resolved doing as
   little work as possible:
   - a `/cas` path (worker) → reference the hash recorded on it (no read);
-  - a host path (caos-cli) → ingest via git, reusing git's own objects:
+  - a host path (caos-cli) → ingest via git, reusing git's own objects. Only
+    **git-tracked** paths are visible — like a nix flake, a build sees only what
+    git knows about, so an untracked file is never shipped:
     - **clean + tracked** → reuse the committed hash from `git ls-tree HEAD` — no
       read at all, so a large unchanged directory is effectively free;
-    - **dirty file** → `git hash-object -w`;
-    - **dirty directory** → copy `.git/index` to a throwaway index and `git add`
-      + `write-tree --prefix` there, so only the **changed** files are re-read
-      (the stat-cache covers the rest) and your real index is untouched — the
-      trick `git stash`/`commit` use;
-    - **outside the worktree** → read in full;
+    - **tracked file, uncommitted edits** → `git hash-object -w` on the working
+      tree bytes;
+    - **tracked directory, uncommitted edits** → copy `.git/index` to a throwaway
+      index and `git add -u` + `write-tree --prefix` there, so only the
+      **changed** tracked files are re-read (the stat-cache covers the rest),
+      untracked files are excluded, and your real index is untouched — the trick
+      `git stash`/`commit` use;
+    - **untracked, or outside the worktree** → an error;
   - a **missing** path is an error, not silently a literal.
 
 The grammar is `--name[:type]=value` and extensible: `@` (path) is the only type
