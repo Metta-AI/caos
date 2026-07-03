@@ -17,7 +17,22 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count dirs-only hello deep-deps rustc runner)
+[ ${#names[@]} -eq 0 ] && names=(base bash fold file-count dirs-only hello deep-deps rustc runner isolate-host fold-wasm)
+
+# fold-wasm is not an image: it's a runtime node referencing the isolate-host
+# image (see below), so publishing it requires isolate-host in the same run.
+case " ${names[*]} " in
+  *" fold-wasm "*) case " ${names[*]} " in
+    *" isolate-host "*) ;;
+    *) names+=(isolate-host) ;;
+  esac ;;
+esac
+
+# The image builtins (everything except the runtime nodes assembled at the end).
+image_names=()
+for name in "${names[@]}"; do
+  [ "$name" = "fold-wasm" ] || image_names+=("$name")
+done
 
 nix build .#caos-cli -o result-caos
 caos=$PROJECT/result-caos/bin/caos-cli
@@ -32,7 +47,16 @@ git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
   || git -C "$CLIENT" remote set-url caos "$SERVER_URL"
 
-image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
+# std name -> the image's base name (nix attr is <basename>-docker; the built
+# tarball is <hash>-<basename>.tar.gz). Workers carry the caos-worker- prefix;
+# the isolate host is a service image, prefixed caos- only.
+image_basename() {
+  case "$1" in
+    isolate-host) echo "caos-isolate-host" ;;
+    *) echo "caos-worker-$1" ;;
+  esac
+}
+image_attr() { echo "$(image_basename "$1")-docker"; } # std name -> nix docker image attr
 
 # Some builtins ship as a thin delta on a stock docker base instead of a
 # self-contained image: the nix image holds only our bits, and `import-image
@@ -52,18 +76,18 @@ import_base() { # std name -> docker:// base ref, or empty for self-contained
 # single (low-memory) evaluation. Map each resulting store path back to its
 # builtin via the image name baked into it (<hash>-caos-worker-<name>.tar.gz).
 attrs=()
-for name in "${names[@]}"; do attrs+=(".#$(image_attr "$name")"); done
-echo "building ${#names[@]} images in parallel..." >&2
+for name in "${image_names[@]}"; do attrs+=(".#$(image_attr "$name")"); done
+echo "building ${#image_names[@]} images in parallel..." >&2
 if ! built_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
   echo "build-builtins: nix build failed" >&2; exit 1
 fi
 declare -A img_path
 while IFS= read -r p; do
-  for name in "${names[@]}"; do
-    case "$p" in *-caos-worker-"$name".tar.gz) img_path[$name]=$p ;; esac
+  for name in "${image_names[@]}"; do
+    case "$p" in *-"$(image_basename "$name")".tar.gz) img_path[$name]=$p ;; esac
   done
 done <<<"$built_paths"
-for name in "${names[@]}"; do
+for name in "${image_names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done
 
@@ -77,7 +101,7 @@ src_ref_of() { echo "refs/caos/src/$(printf '%s' "$1" | sha1sum | cut -c1-40)"; 
 
 declare -A hash_of
 to_import=()
-for name in "${names[@]}"; do
+for name in "${image_names[@]}"; do
   cached=$(git -C "$CLIENT" rev-parse --verify --quiet "$(src_ref_of "${img_path[$name]}")^{tree}" || true)
   if [ -n "$cached" ]; then
     echo "$name: reusing import $cached" >&2
@@ -121,6 +145,24 @@ if [ "${#to_import[@]}" -gt 0 ]; then
     git -C "$CLIENT" update-ref "$(src_ref_of "${img_path[$name]}")" "${hash_of[$name]}"
   done
 fi
+
+# Isolate-class builtins: fold-wasm is not an image but a runtime node — a tree
+# `{.caos-runtime: <blob: isolate-host image ref>, module: <blob: the wasm>}`
+# the server routes to the isolate host (see compute.rs runtime_node). The
+# marker blob only *names* the host image, which is not a git reference — the
+# host image's objects reach the server because isolate-host is itself a std
+# entry in the same push.
+case " ${names[*]} " in *" fold-wasm "*)
+  echo "fold-wasm: building wasm module..." >&2
+  nix build .#fold-wasm -o result-fold-wasm
+  wasm=$(echo "$PROJECT"/result-fold-wasm/lib/*.wasm)
+  [ -f "$wasm" ] || { echo "build-builtins: no .wasm in result-fold-wasm/lib" >&2; exit 1; }
+  module=$(git -C "$CLIENT" hash-object -w "$wasm")
+  marker=$(printf '%s' "${hash_of[isolate-host]}" | git -C "$CLIENT" hash-object -w --stdin)
+  hash_of[fold-wasm]=$(printf '100644 blob %s\t.caos-runtime\n100644 blob %s\tmodule\n' \
+    "$marker" "$module" | git -C "$CLIENT" mktree)
+  ;;
+esac
 
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so
 # there's no commit to wrap it) and publish it to the server under refs/caos/std

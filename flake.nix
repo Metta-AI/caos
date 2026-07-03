@@ -118,6 +118,34 @@
         # the output's /bin; consumers pick the one they need.
         caos = crateBin "caos";
         server = crateBin "server";
+        isolate-host = crateBin "isolate-host";
+
+        # Isolate-class worker modules build for wasm, not musl: their own
+        # dep-build (scoped to the guest package — the server's native deps
+        # don't compile for wasm) and an install that keeps the cdylib. The
+        # module is content, not a program: build-builtins.sh hashes it into a
+        # `{.caos-runtime, module}` runtime node the server routes to the
+        # isolate host.
+        wasmArgs = {
+          inherit src;
+          strictDeps = true;
+          pname = "fold-wasm";
+          version = "0.1.0";
+          CARGO_BUILD_TARGET = "wasm32-wasip1";
+          cargoExtraArgs = "--package fold-wasm";
+          doCheck = false;
+        };
+        fold-wasm = craneLib.buildPackage (
+          wasmArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly wasmArgs;
+            installPhaseCommand = ''
+              mkdir -p $out/lib
+              cp target/wasm32-wasip1/release/fold_wasm.wasm $out/lib/fold-wasm.wasm
+            '';
+          }
+        );
+
         worker-hello = crateBin "worker-hello";
         worker-fold = crateBin "worker-fold";
         worker-file-count = crateBin "worker-file-count";
@@ -612,6 +640,25 @@
           config = serverConfig;
         };
 
+        # The isolate runtime host: a service image (like the server, not a
+        # worker) holding one static binary. No setuid caos, no /cas, no user
+        # db — a job is a wasm isolate whose only world is the caos_abi_v1 host
+        # ABI, so the whole worker-sandbox apparatus doesn't apply. The server
+        # dispatches to it by the `.caos-runtime` marker (see compute.rs).
+        isolateHostConfig = {
+          Entrypoint = [ "/bin/isolate-host" ];
+          Env = [ "PATH=/bin" ];
+          ExposedPorts = {
+            "8080/tcp" = { };
+          };
+        };
+        isolateHostImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-isolate-host";
+          tag = "latest";
+          contents = [ isolate-host ];
+          config = isolateHostConfig;
+        };
+
         # `nix run .#load-<name>` builds the image and pipes it straight into the
         # local docker daemon — build + `docker load` in one go. Uses
         # streamLayeredImage so nothing big is written to the Nix store; the
@@ -836,7 +883,7 @@
       {
         packages = {
           default = caos;
-          inherit caos server caos-cli caosd caos-tools;
+          inherit caos server caos-cli caosd caos-tools isolate-host fold-wasm;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)
@@ -847,6 +894,7 @@
           caos-worker-base-docker = workerBaseImage;
           caos-worker-bash-docker = workerBashImage;
           caos-server-docker = serverImage;
+          caos-isolate-host-docker = isolateHostImage;
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-fold-docker = workerFoldImage;
           caos-worker-file-count-docker = workerFileCountImage;

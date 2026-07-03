@@ -175,7 +175,11 @@ fn run_and_reply(request: Request, job: &Job, _slot: &std::sync::MutexGuard<'_, 
         Ok(o) => respond(
             request,
             500,
-            &format!("worker failed ({}):\n{}", o.status, String::from_utf8_lossy(&o.stderr)),
+            &format!(
+                "worker failed ({}):\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            ),
         ),
         Err(e) => respond(request, 500, &format!("spawning entrypoint: {e}")),
     }
@@ -232,7 +236,11 @@ fn reap_uid(uid: u32) {
         return;
     };
     for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
             continue;
         };
         if pid == me {

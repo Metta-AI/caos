@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -26,6 +26,10 @@ use crate::{Config, HttpError};
 /// Repository name converted images are pushed under. They're addressed by
 /// digest, so the name is arbitrary and fixed.
 const REGISTRY_REPO: &str = "caos";
+
+/// A base image's manifest layers `(media_type, digest, size)` and its config
+/// `diff_id`s — the lower part of the stack delta layers sit on.
+type BaseLayers = (Vec<(String, String, u64)>, Vec<String>);
 
 /// Prefix marking the `image` parameter as an ordinary docker reference rather
 /// than one of our git images (the default).
@@ -71,6 +75,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// also pins `refs/caos/res/<reqHash>` at the result, so a client can fetch it by
 /// ref. Workers POST the request via `/object` and call this; the CLI pushes it.
 pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
+    let t_start = Instant::now();
     let req = query_param(query, "req")
         .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
     if req.is_empty() || !req.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -105,9 +110,13 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // the result "<type> <hash>". A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
     let key = format!("caos:result:{req}");
-    match cache_get(&config.redis_addr, &key) {
+    let t_cache = Instant::now();
+    let cached = cache_get(&config.redis_addr, &key);
+    let cache_ms = t_cache.elapsed().as_millis();
+    match cached {
         Ok(Some(result)) => {
             eprintln!("cache hit: req={req} -> {result}");
+            trace_run(&req, &stack, "hit", cache_ms, 0, 0, t_start);
             if top_level {
                 pin_result(config, &req, &result);
             }
@@ -144,28 +153,98 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // Image resolution differs by backend: Docker/Serve convert a git image into
     // the local registry and run it by digest; Fly converts it straight into the
     // stack's shared fly repo (no local registry), so it resolves the image itself.
-    let result = match config_backend() {
+    // Isolate-class workers dispatch to a warm runtime host, not a container of
+    // their own: an image tree `{".caos-runtime": <blob: host image ref>,
+    // "module": <blob>}` is routed to the host named by the marker, which runs
+    // the module as a wasm isolate. Detected here — before `resolve_image`, which
+    // only understands git-docker image trees — so memoization, cycle detection,
+    // and result pinning above/below stay shared with container workers.
+    if let Some((host_ref, module)) = runtime_node(config, &image)? {
+        let t_resolve = Instant::now();
+        let docker_ref = resolve_image(config, &host_ref)?;
+        let resolve_ms = t_resolve.elapsed().as_millis();
+        let t_dispatch = Instant::now();
+        let result = dispatch_runtime(
+            config,
+            &docker_ref,
+            (&host_ref, &module),
+            &args,
+            &std,
+            &salt,
+            &child_stack,
+        )?;
+        trace_run(
+            &req,
+            &stack,
+            "isolate",
+            cache_ms,
+            resolve_ms,
+            t_dispatch.elapsed().as_millis(),
+            t_start,
+        );
+        return finish_run(config, &req, &key, top_level, result);
+    }
+
+    let backend = config_backend();
+    let t_resolve = Instant::now();
+    let mut resolve_ms = 0;
+    let t_dispatch;
+    let result = match backend {
         Backend::Serve => {
             let docker_ref = resolve_image(config, &image)?;
-            dispatch_serve(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
+            resolve_ms = t_resolve.elapsed().as_millis();
+            t_dispatch = Instant::now();
+            dispatch_serve(
+                config,
+                &docker_ref,
+                &image,
+                &args,
+                &std,
+                &salt,
+                &child_stack,
+            )?
         }
         Backend::Docker => {
             let docker_ref = resolve_image(config, &image)?;
+            resolve_ms = t_resolve.elapsed().as_millis();
+            t_dispatch = Instant::now();
             dispatch_docker(config, &docker_ref, &args, &std, &salt, &child_stack)?
         }
-        Backend::Fly => dispatch_fly(config, &image, &args, &std, &salt, &child_stack)?,
+        Backend::Fly => {
+            t_dispatch = Instant::now();
+            dispatch_fly(config, &image, &args, &std, &salt, &child_stack)?
+        }
     };
+    let dispatch_ms = t_dispatch.elapsed().as_millis();
+    trace_run(
+        &req,
+        &stack,
+        backend_name(backend),
+        cache_ms,
+        resolve_ms,
+        dispatch_ms,
+        t_start,
+    );
 
+    finish_run(config, &req, &key, top_level, result)
+}
+
+/// Shared tail of `/run` for every dispatch path: validate the worker's
+/// `"<type> <hash>"`, cache it (best-effort), pin a top-level run's result ref.
+fn finish_run(
+    config: &Config,
+    req: &str,
+    key: &str,
+    top_level: bool,
+    result: String,
+) -> Result<Vec<u8>, HttpError> {
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: req={req}");
-        return Err(HttpError::new(
-            500,
-            "worker produced no result on stdout",
-        ));
+        return Err(HttpError::new(500, "worker produced no result on stdout"));
     }
 
     // Cache the result for next time (best-effort).
-    match cache_set(&config.redis_addr, &key, &result) {
+    match cache_set(&config.redis_addr, key, &result) {
         Ok(()) => eprintln!("ran worker: req={req} -> {result} (cached)"),
         Err(e) => eprintln!("ran worker: req={req} -> {result} (cache store failed: {e})"),
     }
@@ -173,10 +252,46 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // Pin a top-level (external) run's result so a client can fetch it by ref and
     // it survives gc; nested runs set no ref (they'd flood the namespace).
     if top_level {
-        pin_result(config, &req, &result);
+        pin_result(config, req, &result);
     }
 
     Ok(format!("{result}\n").into_bytes())
+}
+
+/// One machine-parseable timing line per `/run`, on stderr. `parent` (the
+/// nearest enclosing request, from the run stack) plus `req` let a report
+/// reconstruct the full call tree; `t` is the emit time (unix ms), so with
+/// `total_ms` a report can also place each run on a wall-clock waterfall.
+/// `outcome` is a backend name for a ran worker, or `hit` for a cache hit.
+fn trace_run(
+    req: &str,
+    stack: &[&str],
+    outcome: &str,
+    cache_ms: u128,
+    resolve_ms: u128,
+    dispatch_ms: u128,
+    t_start: Instant,
+) {
+    let parent = stack.last().copied().unwrap_or("-");
+    let depth = stack.len();
+    let total_ms = t_start.elapsed().as_millis();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!(
+        "caos-trace req={req} parent={parent} depth={depth} outcome={outcome} \
+         cache_ms={cache_ms} resolve_ms={resolve_ms} dispatch_ms={dispatch_ms} \
+         total_ms={total_ms} t={t}"
+    );
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Docker => "docker",
+        Backend::Serve => "serve",
+        Backend::Fly => "fly",
+    }
 }
 
 /// Worker execution backend. `Docker` runs a fresh container per request (the
@@ -241,6 +356,65 @@ fn serve_registry() -> &'static Mutex<HashSet<String>> {
     REG.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Marker entry naming an isolate worker's runtime host. Its blob content is
+/// the host's image ref (like a curry node's `base`); the sibling `module`
+/// entry is the payload the host executes. Detected server-side — unlike
+/// curries, which clients unwrap, the server itself must route these.
+const RUNTIME_MARKER: &str = ".caos-runtime";
+
+/// Entrypoint inside runtime-host images.
+const ISOLATE_HOST_BIN: &str = "/bin/isolate-host";
+
+/// If `image` is an isolate-worker tree (carries `.caos-runtime`), return
+/// `(host image ref, module hash)`. A `docker://` ref, a non-tree, or a tree
+/// without the marker (i.e. a git-docker image) falls through to `None`.
+fn runtime_node(config: &Config, image: &str) -> Result<Option<(String, String)>, HttpError> {
+    if image.starts_with(DOCKER_SCHEME) || !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let Ok(entries) = fetch_tree(config, image) else {
+        return Ok(None);
+    };
+    let Some(marker) = entries.iter().find(|e| e.name == RUNTIME_MARKER) else {
+        return Ok(None);
+    };
+    let host_ref = fetch_blob(config, &marker.oid.to_string())
+        .map_err(|e| HttpError::new(500, format!("reading {RUNTIME_MARKER}: {e}")))?;
+    let host_ref = String::from_utf8_lossy(&host_ref).trim().to_string();
+    let module = entries
+        .iter()
+        .find(|e| e.name == "module")
+        .ok_or_else(|| HttpError::new(400, format!("isolate image {image} has no module entry")))?
+        .oid
+        .to_string();
+    Ok(Some((host_ref, module)))
+}
+
+/// Isolate path: ensure the warm runtime-host container for `host_ref` is up
+/// (one host serves every module of its runtime — jobs carry the module hash),
+/// then POST the job. No busy/replay dance: the host runs isolates, so it is
+/// never busy the way a single-slot `caos serve` worker is.
+fn dispatch_runtime(
+    config: &Config,
+    docker_ref: &str,
+    (host_ref, module): (&str, &str),
+    args: &str,
+    std: &str,
+    salt: &str,
+    stack: &str,
+) -> Result<String, HttpError> {
+    let key: String = host_ref.chars().take(16).collect();
+    let name = format!("caos-isolate-host-{key}");
+    ensure_host_container(config, docker_ref, &name, ISOLATE_HOST_BIN, &[])?;
+
+    let url = format!("http://{name}:8080/run");
+    let body = serde_json::json!({
+        "module": module, "args": args, "std": std, "salt": salt, "stack": stack
+    })
+    .to_string();
+    serve_post(&url, &body)
+}
+
 /// Warm-pool path: ensure a `caos serve` container for this image is running,
 /// then POST the job to it. The local stand-in for the fly `HttpWorker` dispatch.
 fn dispatch_serve(
@@ -254,17 +428,24 @@ fn dispatch_serve(
 ) -> Result<String, HttpError> {
     let key: String = image.chars().take(16).collect();
     let name = format!("caos-serve-{key}");
-    ensure_serve_container(config, docker_ref, &name)?;
+    ensure_host_container(config, docker_ref, &name, CAOS_BIN, &["serve"])?;
 
     let url = format!("http://{name}:8080/run");
-    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
-        .to_string();
+    let body =
+        serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack }).to_string();
     serve_post(&url, &body)
 }
 
-/// Start the named `caos serve` container if we haven't already. Holds the
-/// registry lock across `docker run` so two threads can't double-start it.
-fn ensure_serve_container(config: &Config, docker_ref: &str, name: &str) -> Result<(), HttpError> {
+/// Start a named long-lived worker-host container (`caos serve`, or a runtime
+/// host like isolate-host) if we haven't already. Holds the registry lock
+/// across `docker run` so two threads can't double-start it.
+fn ensure_host_container(
+    config: &Config,
+    docker_ref: &str,
+    name: &str,
+    entrypoint: &str,
+    args: &[&str],
+) -> Result<(), HttpError> {
     let mut started = serve_registry().lock().unwrap_or_else(|p| p.into_inner());
     if started.contains(name) {
         return Ok(());
@@ -273,9 +454,9 @@ fn ensure_serve_container(config: &Config, docker_ref: &str, name: &str) -> Resu
         .args(["run", "-d", "--rm", "--name", name])
         .args(["--network", &config.network])
         .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
-        .args(["--entrypoint", CAOS_BIN])
+        .args(["--entrypoint", entrypoint])
         .arg(docker_ref)
-        .arg("serve")
+        .args(args)
         .output()
         .map_err(|e| HttpError::new(500, format!("starting serve container {name}: {e}")))?;
     // A leftover container from a prior server run is fine — treat "name in use"
@@ -432,8 +613,8 @@ fn dispatch_fly(
     let fly = Fly::from_env(config)?;
     ensure_worker_app(config, &fly, image)?;
     let app = fly_app_name(&fly, image);
-    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
-        .to_string();
+    let body =
+        serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack }).to_string();
     dispatch_to_pool(&fly, &app, &body)
 }
 
@@ -462,18 +643,27 @@ fn dispatch_to_pool(fly: &Fly, app: &str, body: &str) -> Result<String, HttpErro
     for attempt in 0..SWEEPS {
         let machines = fly_list_machines(fly, app)?;
         if machines.is_empty() {
-            return Err(HttpError::new(500, format!("worker app {app} has no machines")));
+            return Err(HttpError::new(
+                500,
+                format!("worker app {app} has no machines"),
+            ));
         }
         for m in &machines {
             if m.state != "started" {
                 // Best-effort: a racing start ("already started") is fine — the
                 // POST below is the real readiness check.
-                eprintln!("dispatch {app}: starting machine {} (state {})", m.id, m.state);
+                eprintln!(
+                    "dispatch {app}: starting machine {} (state {})",
+                    m.id, m.state
+                );
                 let _ = fly_start_machine(fly, app, &m.id);
             }
             match post_job(&m.private_ip, body) {
                 Outcome::Done(result) => {
-                    eprintln!("dispatch {app}: machine {} accepted (sweep {attempt})", m.id);
+                    eprintln!(
+                        "dispatch {app}: machine {} accepted (sweep {attempt})",
+                        m.id
+                    );
                     return Ok(result);
                 }
                 Outcome::Busy => {
@@ -521,7 +711,10 @@ fn post_job(ip: &str, body: &str) -> Outcome {
             Ok((200, out)) => return Outcome::Done(out.trim().to_string()),
             Ok((503, _)) => return Outcome::Busy,
             Ok((code, msg)) => {
-                return Outcome::Failed(HttpError::new(500, format!("worker failed ({code}): {msg}")))
+                return Outcome::Failed(HttpError::new(
+                    500,
+                    format!("worker failed ({code}): {msg}"),
+                ))
             }
             Err(e) => {
                 last_err = e.to_string();
@@ -554,8 +747,13 @@ fn raw_post(ip: &str, port: u16, path: &str, body: &str) -> std::io::Result<(u16
         .split_once("\r\n")
         .and_then(|(line, _)| line.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line"))?;
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line")
+        })?;
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
     Ok((status, body))
 }
 
@@ -566,19 +764,26 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
     if resp.status_code != 200 {
         return Err(HttpError::new(
             500,
-            format!("fly list machines ({}): {}", resp.status_code, resp.as_str().unwrap_or("")),
+            format!(
+                "fly list machines ({}): {}",
+                resp.status_code,
+                resp.as_str().unwrap_or("")
+            ),
         ));
     }
     let body = resp
         .as_str()
         .map_err(|e| HttpError::new(500, format!("reading machine list: {e}")))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
     let mut machines = Vec::new();
     for m in parsed.as_array().into_iter().flatten() {
         let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default();
         let state = m.get("state").and_then(|v| v.as_str()).unwrap_or_default();
-        let private_ip = m.get("private_ip").and_then(|v| v.as_str()).unwrap_or_default();
+        let private_ip = m
+            .get("private_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !id.is_empty() && !private_ip.is_empty() {
             machines.push(Machine {
                 id: id.to_string(),
@@ -593,12 +798,20 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
 /// Start a stopped machine (`POST /apps/{app}/machines/{id}/start`). Idempotent
 /// enough for our use: a 200 or an already-started reply are both fine.
 fn fly_start_machine(fly: &Fly, app: &str, id: &str) -> Result<(), HttpError> {
-    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines/{id}/start"), None)?;
+    let resp = fly_api(
+        fly,
+        "POST",
+        &format!("/apps/{app}/machines/{id}/start"),
+        None,
+    )?;
     match resp.status_code {
         200 | 201 => Ok(()),
         code => Err(HttpError::new(
             500,
-            format!("fly start machine {id} ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly start machine {id} ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -645,7 +858,10 @@ fn ensure_worker_app(config: &Config, fly: &Fly, image: &str) -> Result<(), Http
 fn resolve_fly_image(config: &Config, fly: &Fly, image: &str) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         if reference.is_empty() || reference.starts_with('-') {
-            return Err(HttpError::new(400, format!("invalid docker image: {reference:?}")));
+            return Err(HttpError::new(
+                400,
+                format!("invalid docker image: {reference:?}"),
+            ));
         }
         return Ok(reference.to_string());
     }
@@ -671,12 +887,18 @@ fn fly_create_app(fly: &Fly, app: &str) -> Result<(), HttpError> {
             if msg.contains("already been taken") {
                 Ok(())
             } else {
-                Err(HttpError::new(500, format!("fly create app {app} (422): {msg}")))
+                Err(HttpError::new(
+                    500,
+                    format!("fly create app {app} (422): {msg}"),
+                ))
             }
         }
         code => Err(HttpError::new(
             500,
-            format!("fly create app {app} ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly create app {app} ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -702,12 +924,20 @@ fn fly_create_machine(
         }
     })
     .to_string();
-    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines"), Some(&machine))?;
+    let resp = fly_api(
+        fly,
+        "POST",
+        &format!("/apps/{app}/machines"),
+        Some(&machine),
+    )?;
     match resp.status_code {
         200 | 201 => Ok(()),
         code => Err(HttpError::new(
             500,
-            format!("fly create machine ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly create machine ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -764,7 +994,10 @@ fn push_image_to_fly(fly: &Fly, config: &Config, git_hash: &str) -> Result<Strin
             .status()
             .map_err(|e| HttpError::new(500, format!("skopeo copy: {e}")))?;
         if !status.success() {
-            return Err(HttpError::new(500, format!("skopeo copy to {dest} failed ({status})")));
+            return Err(HttpError::new(
+                500,
+                format!("skopeo copy to {dest} failed ({status})"),
+            ));
         }
         eprintln!("pushed image {git_hash} -> {dest}");
         Ok(dest)
@@ -921,8 +1154,11 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
             .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
             .map_err(|e| format!("linking blob {hex} into layout: {e}"))?;
     }
-    std::fs::write(oci_dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)
-        .map_err(|e| format!("writing oci-layout: {e}"))?;
+    std::fs::write(
+        oci_dir.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .map_err(|e| format!("writing oci-layout: {e}"))?;
     let index = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -950,10 +1186,7 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
 /// lower part of the stack. We later overwrite `index.json` with our combined
 /// image, leaving the base's own manifest blob unreferenced (so the push skips
 /// it). `--format oci` rewrites media types to OCI; the layer blobs are untouched.
-fn fetch_base_oci(
-    base_ref: &str,
-    oci_dir: &Path,
-) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+fn fetch_base_oci(base_ref: &str, oci_dir: &Path) -> Result<BaseLayers, String> {
     let status = Command::new("skopeo")
         .args([
             "--insecure-policy",
@@ -973,7 +1206,9 @@ fn fetch_base_oci(
         .status()
         .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
     if !status.success() {
-        return Err(format!("skopeo copy {base_ref} into layout failed ({status})"));
+        return Err(format!(
+            "skopeo copy {base_ref} into layout failed ({status})"
+        ));
     }
 
     // Read the layout's index → the base manifest → its layers + config diff_ids.
@@ -983,9 +1218,7 @@ fn fetch_base_oci(
         .ok_or("base layout index has no manifests")?;
     let man_desc = manifests
         .iter()
-        .find(|m| {
-            m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base")
-        })
+        .find(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base"))
         .or_else(|| manifests.first())
         .ok_or("base layout index is empty")?;
     let man_digest = man_desc["digest"]
@@ -1241,7 +1474,7 @@ fn image_ref(config: &Config, manifest_digest: &str) -> String {
 /// — the lower part of the stack our delta layers sit on. `--format oci` rewrites
 /// the manifest to OCI media types so it composes cleanly with our OCI layers;
 /// the layer *blobs* (and their digests) are untouched.
-fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
     let push = config.registry_push_url.trim_end_matches('/');
     let host = push
         .strip_prefix("http://")
@@ -1285,7 +1518,9 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
             .status()
             .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
         if !status.success() {
-            return Err(format!("skopeo copy {base_ref} -> {dest} failed ({status})"));
+            return Err(format!(
+                "skopeo copy {base_ref} -> {dest} failed ({status})"
+            ));
         }
     }
 
@@ -1301,8 +1536,8 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
             resp.status_code, resp.reason_phrase
         ));
     }
-    let manifest: serde_json::Value =
-        serde_json::from_slice(resp.as_bytes()).map_err(|e| format!("parsing base manifest: {e}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(resp.as_bytes())
+        .map_err(|e| format!("parsing base manifest: {e}"))?;
     let layers = manifest["layers"]
         .as_array()
         .ok_or("base manifest has no layers")?

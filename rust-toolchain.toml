@@ -7,4 +7,6 @@ components = [ "rustfmt", "clippy", "rust-src" ]
 # Both arches are carried so the flake can build for the host's architecture
 # (aarch64 on Apple Silicon / aarch64 Linux, x86_64 otherwise) without an
 # arch-cross; see muslTarget in flake.nix.
-targets = [ "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl" ]
+# wasm32-wasip1 is the isolate-class worker target: guest modules (fold-wasm
+# etc.) run inside the wasmtime-embedding isolate-host, not in containers.
+targets = [ "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "wasm32-wasip1" ]
