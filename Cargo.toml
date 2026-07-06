@@ -5,7 +5,6 @@ members = [
     "crates/server",
     "crates/worker-common",
     "crates/worker-hello",
-    "crates/worker-fold",
     "crates/worker-file-count",
     "crates/worker-dirs-only",
     "crates/worker-deep-deps",

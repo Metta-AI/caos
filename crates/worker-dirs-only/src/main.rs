@@ -23,8 +23,8 @@ fn run() -> Result<(), String> {
     let in_path = arg("in");
     let work = scratch("dirs-only")?;
 
-    // Only a directory has children to filter; anything else (a file leaf) folds
-    // with no children, so its child tree is empty.
+    // Only a directory has children to filter; anything else (a file leaf) has
+    // none, so its child tree is empty.
     if Path::new(&in_path).is_dir() {
         caos(["get", &in_path])?; // one level: a placeholder per child
         for child in entries(&in_path)? {

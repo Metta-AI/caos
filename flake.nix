@@ -119,7 +119,6 @@
         caos = crateBin "caos";
         server = crateBin "server";
         worker-hello = crateBin "worker-hello";
-        worker-fold = crateBin "worker-fold";
         worker-file-count = crateBin "worker-file-count";
         worker-dirs-only = crateBin "worker-dirs-only";
         worker-deep-deps = crateBin "worker-deep-deps";
@@ -219,7 +218,7 @@
         };
 
         # A self-contained (musl) base layer shared by the non-source-built workers
-        # (bash/hello/fold/file-count/deep-deps) via `fromImage` below. Distinct
+        # (bash/hello/file-count/deep-deps) via `fromImage` below. Distinct
         # from workerBaseImage (the stock-glibc `base` builtin): these workers are
         # self-contained musl images — they don't stack on a docker:// base — so
         # they need the setuid caos at the real /bin/caos and the user db, exactly
@@ -325,47 +324,13 @@
           config = workerHelloConfig;
         };
 
-        # A recursive "fold" worker — a catamorphism over a CAS tree. Args:
-        #   pre  — (optional) image applied to `in` to produce the tree of
-        #          children to fold; omitted means the structural default (a
-        #          tree's own children; a file is a childless leaf).
-        #   post — image applied to `in` plus `--children` (the folded child
-        #          results, by name) to combine them into this node's result.
-        #   in   — the file or tree to fold over, a CAS path.
-        # So fold decides a node's children (via pre, or structurally), folds
-        # each child with itself (the same pre/post), then combines them with
-        # post. pre/post are image refs — often curried with the context they
-        # need — and the applied images take their input as `--in`; the result
-        # is left at /cas/out. Unlike the other workers it drives the server via
-        # `caos run` — both to apply pre/post and to recurse — so it relies on
-        # CAOS_SERVER_URL (injected by the server) and reaches its own image, for
-        # the recursive call, as the built-in /cas/std/fold.
-        # This is the `worker-fold` crate, a static binary at /worker — so the
-        # image needs no shell or coreutils.
-        workerFoldRoot = workerRoot "worker-fold" worker-fold;
-        workerFoldConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "entrypoint"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerFoldImage = pkgs.dockerTools.buildImage {
-          name = "caos-worker-fold";
-          tag = "latest";
-          fromImage = workerSharedBaseImage;
-          copyToRoot = workerFoldRoot;
-          config = workerFoldConfig;
-        };
-
-        # A "file-count" worker: a leaf algebra meant to drive fold as its
-        # `post`. It gets the node as `--in` and the folded child results as
-        # `--children`. A file (a leaf) counts as 1; otherwise it returns the sum
-        # of its child counts (each `--children` entry holds a number). The
-        # result, a blob holding the count, is left at /cas/out. So
-        # `fold --post=file-count` over a tree totals its leaf files. It only
-        # touches the server (no `caos run`); the server injects
-        # that URL at runtime. This is the `worker-file-count` crate, a static
+        # A "file-count" worker: counts the leaf files under `--in`, recursing
+        # with itself through map-then. A tree (no `--children` yet) records the
+        # continuation {in, map: file-count, then: file-count} and exits; called
+        # back with `--children` (the then position) it sums the child counts; a
+        # file counts as 1. The result, a blob holding the count, is left at
+        # /cas/out. It reaches its own image as the built-in
+        # /cas/std/file-count. This is the `worker-file-count` crate, a static
         # binary at /worker — so the image needs no shell or coreutils.
         workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
         workerFileCountConfig = {
@@ -383,12 +348,11 @@
           config = workerFileCountConfig;
         };
 
-        # A "dirs-only" worker: a `pre` algebra for fold that keeps only a node's
-        # directory children, dropping file (and other non-directory) children. It
-        # gets the node as `--in` and leaves the filtered children tree at
-        # /cas/out (one entry per surviving directory child, under its original
-        # name). Used as `fold --pre=dirs-only`, it makes the fold recurse into
-        # subdirectories only — files are never folded as leaves. It only touches
+        # A "dirs-only" worker: keeps only a node's directory children, dropping
+        # file (and other non-directory) children. It gets the node as `--in`
+        # and leaves the filtered children tree at /cas/out (one entry per
+        # surviving directory child, under its original name). Compose by
+        # filtering first and recursing over the result. It only touches
         # the server (no `caos run`); the server injects that URL at runtime. This
         # is the `worker-dirs-only` crate, a static binary at /worker — so the
         # image needs no shell or coreutils.
@@ -418,30 +382,27 @@
         # output mirrors it, but each node carries a `DEEP-DEPS` subtree of its
         # recursively-deepened direct deps (which themselves carry DEEP-DEPS).
         #
-        # It's written as a fold (caos-worker-fold) over the dependency graph,
-        # with this same image — curried so fold sees plain images — supplying
-        # the fold's two functions. `--mode` is optional; omitting it is the
-        # simple public API:
-        #   (no mode) — deepen one package (`--name`): run fold over it.
-        #   all       — top-level convenience: deepen every package.
+        # It recurses through map-then, with this same image on both sides of
+        # the continuation. `--mode` is optional; omitting it is the simple
+        # public API:
+        #   (no mode) — deepen one package (`--name`).
+        #   all       — top-level convenience: deepen every package (a pure map).
         # The internal modes, reached only via curry by the driver:
-        #   resolve — fold's `pre`, curried with `--packages` (the whole map):
-        #             given a package as `--in`, resolve its `DEPS` names to the
-        #             dep subtrees to recurse into.
-        #   finish  — fold's `post`: given a package as `--in` and its deepened
-        #             deps as `--children`, build the node (the package's files,
-        #             minus DEPS, plus a DEEP-DEPS of the children).
-        # Incrementality comes entirely from CAOS call memoization. The driver
-        # and resolve carry the whole map, so they re-run on any edit — cheap
-        # orchestration. But finish (curried with nothing) is keyed only on a
-        # package and its deepened subgraph, so real recompute is O(changed
-        # package + its dependents). A cycle re-enters the same fold (image,
+        #   deepen — curried with `--packages` (the whole map): given a package
+        #            as `--in`, resolve its `DEPS` names to the dep subtrees
+        #            (pure CAS linking) and map-then itself over them.
+        #   finish — given the package (curried as `--pkg`) and its deepened
+        #            deps as `--children`, build the node (the package's files,
+        #            minus DEPS, plus a DEEP-DEPS of the children).
+        # Incrementality comes entirely from CAOS call memoization. deepen
+        # carries the whole map, so it re-runs on any edit — cheap
+        # orchestration. But finish (curried with only the package) is keyed on
+        # a package and its deepened subgraph, so real recompute is O(changed
+        # package + its dependents). A cycle re-enters the same deepen (image,
         # args) and is caught by the server's run-cycle detection.
         #
-        # Like fold it drives the server via `caos run`, so it relies on
-        # CAOS_SERVER_URL (injected) and reaches its own image (to curry
-        # resolve/finish) and fold's as the built-ins /cas/std/deep-deps and
-        # /cas/std/fold.
+        # It reaches its own image (to curry deepen/finish) as the built-in
+        # /cas/std/deep-deps.
         #
         # This worker is the `worker-deep-deps` crate, a static binary placed at
         # /worker — so, like the other Rust workers, its image needs no shell or
@@ -654,12 +615,6 @@
           config = workerHelloConfig;
           fakeRootCommands = installWorkerFiles;
         };
-        loadWorkerFold = loadImage {
-          name = "caos-worker-fold";
-          contents = [ workerBaseRoot workerFoldRoot ];
-          config = workerFoldConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
         loadWorkerFileCount = loadImage {
           name = "caos-worker-file-count";
           contents = [ workerBaseRoot workerFileCountRoot ];
@@ -848,7 +803,6 @@
           caos-worker-bash-docker = workerBashImage;
           caos-server-docker = serverImage;
           caos-worker-hello-docker = workerHelloImage;
-          caos-worker-fold-docker = workerFoldImage;
           caos-worker-file-count-docker = workerFileCountImage;
           caos-worker-dirs-only-docker = workerDirsOnlyImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
@@ -879,10 +833,6 @@
           load-caos-worker-hello = {
             type = "app";
             program = "${loadWorkerHello}/bin/load-caos-worker-hello";
-          };
-          load-caos-worker-fold = {
-            type = "app";
-            program = "${loadWorkerFold}/bin/load-caos-worker-fold";
           };
           load-caos-worker-file-count = {
             type = "app";

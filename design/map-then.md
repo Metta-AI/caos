@@ -1,14 +1,16 @@
 # Map-then: promises instead of a worker call stack — design note
 
-**Status:** in progress on branch `map-then`, staged:
+**Status:** implemented on branch `map-then`, in three commits:
 
 1. `worker_common::map_then` with the target signature, implemented in terms
-   of the existing blocking `caos run`; fold/deep-deps ported onto it (and
-   `pre` dropped everywhere). Everything behaves as before, minus fold's
-   `pre`.
-2. Move the implementation into `caos run` itself (the worker records a
-   continuation; the server resolves it with promises) and remove the
-   blocking form.
+   of the then-existing blocking `caos run`; fold/deep-deps ported onto it
+   (and `pre` dropped everywhere).
+2. The implementation moved into `caos run` itself (the worker records a
+   continuation; the server resolves it with promises); the blocking form
+   removed.
+3. `worker-fold` removed: with map-then as the primitive, a worker recurses
+   with *itself* (file-count is the model), so a generic fold driver adds
+   nothing.
 
 ## Problem
 
@@ -72,11 +74,11 @@ a node's own children are what gets mapped. A worker that wants a different
 recursion set builds it *locally* (CAS links are cheap and involve no
 sub-runs) and points `in` at what it built.
 
-- **fold(post, in)** — the structural fold no longer iterates children; it
-  emits one continuation and exits: `{in, map: curry(fold, {post}), then:
-  post}`. The server runs the curried fold on each child in parallel and hands
-  `post` exactly the `--in`/`--children` pair it always took — `post` algebra
-  workers (file-count) are unchanged. Fold's old `pre` parameter is gone.
+- **a structural fold** is a worker recursing with itself — no generic fold
+  driver exists (or is needed). file-count is the model: a tree emits
+  `{in, map: file-count, then: file-count}` and exits; invoked with
+  `--children` (the `then` position) it combines; a blob is the leaf case. One
+  image, three positions, told apart by the arguments present.
 - **deep-deps** — no longer built on fold (its `pre` was the point). Its
   `resolve` step was always pure CAS linking, so the worker does it inline:
   `deepen` reads the package's `DEPS`, links the dep subtrees into a local

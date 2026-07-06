@@ -1436,13 +1436,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "worker-fold"
-version = "0.1.0"
-dependencies = [
- "worker-common",
-]
-
-[[package]]
 name = "worker-hello"
 version = "0.1.0"
 dependencies = [

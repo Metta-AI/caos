@@ -17,7 +17,7 @@ it's reproducible across machines.
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
-| `worker-hello`, `worker-fold`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
+| `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
 
 ## Prerequisites
 
@@ -68,7 +68,7 @@ Docker images (crates are unprefixed; images carry a `caos-` prefix):
 ```bash
 nix build .#caos-server-docker            # image tarball at ./result
 nix build .#caos-worker-base-docker
-nix build .#caos-worker-hello-docker      # ...-fold, -file-count, -deep-deps, -rustc, -bash
+nix build .#caos-worker-hello-docker      # ...-file-count, -deep-deps, -rustc, -bash
 
 docker load < result
 ```
@@ -78,7 +78,7 @@ large written to the Nix store):
 
 ```bash
 nix run .#load-caos-server
-nix run .#load-caos-worker-hello          # load-caos-worker-{base,fold,...}
+nix run .#load-caos-worker-hello          # load-caos-worker-{base,file-count,...}
 ```
 
 Worker images contain **only** their static `/worker` binary plus a setuid-root
@@ -408,15 +408,14 @@ curry` wrappers, result staging).
 
 - **`worker-hello`** — a leaf example: gathers its `/cas/args` entries into a
   result tree.
-- **`worker-fold`** — a structural fold (catamorphism) over a CAS tree: one
-  `map_then` whose `map` is fold itself (curried with `post`) and whose `then`
-  is `post` — applied to `--in` plus `--children` (the folded child results) to
-  produce each node's result. Identical subtrees are memoized, so a fold is
-  incremental in the changed nodes; siblings fold in parallel.
-- **`worker-file-count`** — a `post` algebra: a file counts as `1`, a directory
-  sums its children's counts.
+- **`worker-file-count`** — counts the leaf files under `--in`, recursing with
+  itself through map-then: a tree records `{in, map: file-count, then:
+  file-count}` and exits; called back with `--children` it sums the counts; a
+  file counts as `1`. One image, three positions — the shape any structural
+  fold takes here. Identical subtrees are memoized, so a count is incremental
+  in the changed nodes; siblings count in parallel.
 - **`worker-dirs-only`** — keeps only a node's directory children, dropping
-  files. Compose by filtering first and folding the result.
+  files. Compose by filtering first and recursing over the result.
 - **`worker-deep-deps`** — computes transitive dependencies by self-recursion:
   `deepen` resolves a package's `DEPS` against the map (pure CAS linking) and
   map-thens *itself* over the resolved deps, finishing with a node builder
@@ -444,7 +443,7 @@ the cache key, never hidden inside a memoized computation.
 
 ```bash
 ./build-builtins.sh                 # publish all built-ins to refs/caos/std
-./build-builtins.sh fold deep-deps  # publish a subset
+./build-builtins.sh file-count deep-deps  # publish a subset
 ```
 
 ## Local testing
@@ -471,8 +470,8 @@ Integration tests (require `tilt up` running):
 ```bash
 tests/run.sh tests/deep-deps    # promise recursion: correctness, DAG sharing,
                                 # incrementality, cycle detection
-tests/run.sh tests/file-count   # fold + post algebra over map-then
-tests/run.sh tests/dirs-only    # filter worker; filter-then-fold composition
+tests/run.sh tests/file-count   # self-recursive count over map-then
+tests/run.sh tests/dirs-only    # filter worker; filter-then-count composition
 tests/run.sh tests/rust-worker  # rustc builder: source -> worker image -> run
 tests/run.sh tests/symlinks     # symlinks survive the round trip into /cas
 tests/run.sh tests/untracked    # only git-tracked paths are ingested

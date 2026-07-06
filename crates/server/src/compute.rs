@@ -294,7 +294,7 @@ fn resolve_promise(
                 });
             // Every child ran to completion (or failure) before we got here; the
             // first failure fails the whole map, exactly like a failing child in
-            // the old recursive fold.
+            // the old blocking recursion.
             results.into_iter().collect::<Result<Vec<_>, _>>()?
         }
         _ => Vec::new(),
@@ -303,7 +303,7 @@ fn resolve_promise(
     match &then {
         Some(img) => {
             // `then` gets the original `in`, plus the mapped children when a map
-            // ran — the (`--in`, `--children`) pair a fold's `post` always took.
+            // ran — the (`--in`, `--children`) pair a combining step takes.
             let mut args = vec![input];
             if map.is_some() {
                 let children_tree = store_git_tree(config, children)
