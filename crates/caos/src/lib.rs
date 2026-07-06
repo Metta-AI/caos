@@ -750,7 +750,11 @@ pub fn cas_dir() -> PathBuf {
 }
 
 /// Resolve `<path>` and require it to be a direct child of the CAS directory
-/// (`/cas/foo`, never `/cas/foo/bar` or a path outside `/cas`).
+/// (`/cas/foo`, never `/cas/foo/bar` or a path outside `/cas`) that doesn't
+/// exist yet. A CAS path is **single-assignment**: it's recorded once
+/// (`get-hash`/`put`/`map-then`) and referenced thereafter — without this
+/// check, `rename(2)` would silently replace an existing file (clobbering,
+/// e.g., the promise placeholder a `map-then` sealed at `/cas/out`).
 fn validate_target(cas: &Path, path: &str) -> Result<PathBuf, String> {
     let target = PathBuf::from(path);
 
@@ -759,6 +763,12 @@ fn validate_target(cas: &Path, path: &str) -> Result<PathBuf, String> {
             "path must be a direct child of {} (e.g. {}/foo), got: {path}",
             cas.display(),
             cas.display()
+        ));
+    }
+    // symlink_metadata so a dangling symlink counts as occupied too.
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return Err(format!(
+            "{path} already exists; a CAS path is recorded once — write to a fresh path"
         ));
     }
     Ok(target)

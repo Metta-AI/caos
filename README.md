@@ -259,6 +259,10 @@ in a temp sibling, set the xattr, `rename` into place), so concurrent runs never
 see a half-written path; startup probes that the filesystem supports `user.*`
 xattrs.
 
+A `/cas` path is **single-assignment**: `get-hash`/`put`/`map-then` refuse a
+path that already exists, so a recorded result — in particular the promise
+placeholder `map-then` seals at `/cas/out` — can never be silently replaced.
+
 `get-hash <hash> <path>` materializes an object at `<path>` (a direct child of
 the CAS): a **blob** becomes a file; a **tree** becomes a directory of one-level
 **placeholders** (empty, hash-tagged — a dir for subtrees, a file otherwise).
