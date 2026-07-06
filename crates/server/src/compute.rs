@@ -1,6 +1,7 @@
 //! Compute: the `/run` pipeline.
 //!
-//! A request is a content-addressed tree `{image, args, std, salt}`; `/run?req=<hash>`
+//! A request is a content-addressed tree `{args, std, salt}` — the worker image
+//! rides inside `args` under a reserved `image` entry; `/run?req=<hash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
 //! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
 //! the registry) → the worker container run, whose stdout is `"<type> <hash>"`.
@@ -50,7 +51,7 @@ const MEMORY_LABEL: &str = "caos.fly.memory-mb";
 /// trivial workers (hello, bash, a typical produced worker).
 const DEFAULT_WORKER_MEMORY_MB: u32 = 256;
 
-/// Env var carrying the run stack — the newline-separated `(image, args)`
+/// Env var carrying the run stack — the newline-separated request hashes of the
 /// computations currently in progress. We set it on each spawned worker (this
 /// computation appended); `caos run` echoes it back via the `stack` query param
 /// so we can catch a run that re-enters a computation already on the stack.
@@ -64,10 +65,11 @@ const META_SUFFIX: &str = ".caosmeta";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `GET /run?req=<reqHash>[&stack=...]` — run the request object `<reqHash>` (a
-/// tree `{image, args, std, salt}`) and return its result as `"<type> <hash>"`.
+/// tree `{args, std, salt}`, the worker image inside `args`) and return its result
+/// as `"<type> <hash>"`.
 ///
 /// The request being a content-addressed object means `reqHash` *is* the cache
-/// key (it captures image + args + std) and the rendezvous id: a top-level run
+/// key (it captures args — hence the image — plus std and salt) and the rendezvous id: a top-level run
 /// also pins `refs/caos/res/<reqHash>` at the result, so a client can fetch it by
 /// ref. Workers POST the request via `/object` and call this; the CLI pushes it.
 pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
@@ -77,10 +79,11 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         return Err(HttpError::new(400, format!("invalid req hash: {req:?}")));
     }
 
-    // Unpack the request: image (a ref blob), args (a tree), std (a ref blob),
-    // salt (an opaque blob). `std` names the standard library, materialized at
-    // `/cas/std` in the worker; `salt` is a cache-buster. Both are part of the
-    // request (hence the key) and threaded into the worker.
+    // Unpack the request: args (a tree; the worker image is its reserved `image`
+    // entry — an embedded tree for a git image, a ref blob for `docker://`), std
+    // (a ref blob), salt (an opaque blob). `std` names the standard library,
+    // materialized at `/cas/std` in the worker; `salt` is a cache-buster. Both are
+    // part of the request (hence the key) and threaded into the worker.
     let (image, args, std, salt) = read_request(config, &req)?;
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
@@ -101,7 +104,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let stack: Vec<&str> = incoming.lines().filter(|l| !l.is_empty()).collect();
     let top_level = stack.is_empty();
 
-    // The request hash is the cache key (it captures image+args+std); the value is
+    // The request hash is the cache key (it captures args+std+salt); the value is
     // the result "<type> <hash>". A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
     let key = format!("caos:result:{req}");
@@ -1061,28 +1064,47 @@ fn fly_api(
         .map_err(|e| HttpError::new(500, format!("fly api {method} {path}: {e}")))
 }
 
-/// Unpack a request object (a tree `{image, args, std, salt}`) into its parts:
-/// the image ref, the args-tree hash, the std-tree hash (empty if none), and the
-/// salt (empty if none).
+/// Unpack a request object (a tree `{args, std, salt}`) into its parts: the image
+/// ref (read from the args tree's reserved `image` entry), the args-tree hash, the
+/// std-tree hash (empty if none), and the salt (empty if none).
 fn read_request(config: &Config, req: &str) -> Result<(String, String, String, String), HttpError> {
     let entries = fetch_tree(config, req)
         .map_err(|e| HttpError::new(400, format!("reading request: {e}")))?;
-    let mut image = None;
     let mut args = None;
     let mut std = String::new();
     let mut salt = String::new();
     for entry in entries {
         match entry.name.as_str() {
-            "image" => image = Some(blob_string(config, &entry.oid.to_string())?),
             "args" => args = Some(entry.oid.to_string()),
             "std" => std = blob_string(config, &entry.oid.to_string())?,
             "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }
     }
-    let image = image.ok_or_else(|| HttpError::new(400, "request missing 'image'"))?;
     let args = args.ok_or_else(|| HttpError::new(400, "request missing 'args'"))?;
+    // The worker image rides in the args tree under the reserved `image` entry.
+    let image = read_args_image(config, &args)?;
     Ok((image, args, std, salt))
+}
+
+/// Read the worker image ref out of an args tree — its reserved `image` entry. A
+/// git-docker image *is* a git tree, so it rides embedded: the entry is a tree and
+/// its oid is the image hash (the image thus travels inside the request graph). A
+/// `docker://` image has no git object, so it rides as a blob naming the registry
+/// ref.
+fn read_args_image(config: &Config, args: &str) -> Result<String, HttpError> {
+    let entries = fetch_tree(config, args)
+        .map_err(|e| HttpError::new(400, format!("reading args tree: {e}")))?;
+    for entry in entries {
+        if entry.name == "image" {
+            return if entry.mode.is_tree() {
+                Ok(entry.oid.to_string())
+            } else {
+                blob_string(config, &entry.oid.to_string())
+            };
+        }
+    }
+    Err(HttpError::new(400, "request args missing 'image'"))
 }
 
 /// Fetch a blob and return its content as a trimmed string.
