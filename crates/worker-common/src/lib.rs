@@ -76,6 +76,63 @@ pub fn caos_curry(image: &str, args: &[(&str, Arg)]) -> Result<String, String> {
     caos_capture(&str_refs(&argv))
 }
 
+/// Map-then: run `map` over each child of `input` (a CAS path), assemble the
+/// results into a `children` tree under the original names, then record
+/// `then(--in=<input>, --children=<children>)` as this worker's result at
+/// `/cas/out`. A blob `input` has no children (a leaf), so `then` gets an empty
+/// `children` tree. With no `then`, the children tree itself is the result;
+/// with no `map`, `then(--in=<input>)` is a plain tail call. `map`/`then` are
+/// image refs (a `/cas` path, a git/curry hash, or `docker://…`), usually
+/// curried with whatever else they need.
+///
+/// This is a worker's *final act*: it produces `/cas/out`, so call it once, in
+/// tail position. For now it is implemented in terms of blocking `caos run`
+/// (children run one at a time, holding this worker's slot); the implementation
+/// is moving into `caos run` itself, which will record the continuation for the
+/// server to resolve — in parallel, with no worker held — after this worker
+/// exits (see `design/map-then.md`).
+pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<(), String> {
+    if map.is_none() && then.is_none() {
+        return Err("map_then needs a map or a then image".to_string());
+    }
+
+    // Map phase: one folded child per entry of `input`, staged under its name.
+    let children = if let Some(map) = map {
+        let work = scratch("map-then")?;
+        if Path::new(input).is_dir() {
+            caos(["get", input])?; // one level: a placeholder per child
+            for (i, child) in entries(input)?.iter().enumerate() {
+                let node = format!("/cas/mt{i}");
+                caos_run(map, &node, &[("in", Arg::Path(path(child)))])?;
+                link(&node, work.join(file_name(child)))?;
+            }
+        }
+        Some(work)
+    } else {
+        None
+    };
+
+    match (then, children) {
+        // Combine: `then` over the original input and the mapped children.
+        (Some(then), Some(work)) => {
+            caos(["put", path(&work), "/cas/mt-children"])?;
+            caos_run(
+                then,
+                "/cas/out",
+                &[
+                    ("in", Arg::Path(input)),
+                    ("children", Arg::Path("/cas/mt-children")),
+                ],
+            )
+        }
+        // Tail call: no map ran, so no children argument.
+        (Some(then), None) => caos_run(then, "/cas/out", &[("in", Arg::Path(input))]),
+        // Pure map: the children tree is the result.
+        (None, Some(work)) => caos(["put", path(&work), "/cas/out"]),
+        (None, None) => unreachable!("checked above"),
+    }
+}
+
 /// Build a `caos <verb> <image> [<out>] -- …` argument vector, serializing each
 /// arg per its kind (literal `--k=v`, path `--k:@=v`).
 fn verb_argv(verb: &str, image: &str, out: Option<&str>, args: &[(&str, Arg)]) -> Vec<String> {

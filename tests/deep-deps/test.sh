@@ -60,7 +60,7 @@ done
 echo "  ok: a,b,c,d all recomputed; d now reaches x" >&2
 
 echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
-# Close a loop: d -> a, so a -> b -> d -> a. The fold recursion re-enters the
+# Close a loop: d -> a, so a -> b -> d -> a. The deepen recursion re-enters the
 # same request and the server's run-cycle detection catches it.
 printf 'a\n' > /tmp/pkgs/d/DEPS
 caos put /tmp/pkgs /cas/pkgsD

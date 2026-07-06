@@ -1,11 +1,5 @@
-//! caos-worker-dirs-only: a `pre` algebra for fold that keeps only a node's
-//! directory children, dropping file (and any other non-directory) children.
-//!
-//! fold's `pre` turns a node into the tree of children to fold over (the default,
-//! structural `pre` is "a tree's own children; a file has none"). Used as
-//! `fold --pre=dirs-only`, this worker narrows that to subdirectories only — a
-//! file is never treated as a child, so the fold recurses into directories and
-//! never folds a file as a leaf.
+//! caos-worker-dirs-only: keeps only a node's directory children, dropping file
+//! (and any other non-directory) children.
 //!
 //! It receives the node as `--in` and leaves the filtered children tree at
 //! /cas/out: one entry per surviving directory child, under its original name and
@@ -35,8 +29,8 @@ fn run() -> Result<(), String> {
         caos(["get", &in_path])?; // one level: a placeholder per child
         for child in entries(&in_path)? {
             // Keep directory children; drop files (and other non-directory
-            // entries) so fold recurses into subdirectories only. symlink_metadata,
-            // not is_dir(), so a symlink to a directory isn't followed and kept.
+            // entries). symlink_metadata, not is_dir(), so a symlink to a
+            // directory isn't followed and kept.
             let is_dir = fs::symlink_metadata(&child)
                 .map(|m| m.is_dir())
                 .map_err(|e| format!("stat {}: {e}", child.display()))?;
