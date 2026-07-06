@@ -27,11 +27,21 @@ pub fn arg(name: &str) -> String {
 
 /// A built-in's image, referenced as a path into the standard-library tree the
 /// server materialized at `/cas/std`. Pass the result to `caos map-then`/`caos curry`
-/// like any image ref — `caos` resolves the recorded hash. Workers reach their
-/// own image and other built-ins this way, so the binding rides in `std` (and
-/// thus the cache key), not in env.
+/// like any image ref — `caos` resolves the recorded hash. The binding rides in
+/// `std` (and thus the cache key), not in env.
 pub fn std_image(name: &str) -> String {
     format!("/cas/std/{name}")
+}
+
+/// This worker's *own* image — the request's reserved `image` args entry, which
+/// a git image materializes as a tree at `/cas/args/image`. Pass it to `caos
+/// map-then`/`caos curry` to recurse with yourself: it's the exact image
+/// running, so recursion needs no std lookup and works for any git image (a
+/// rustc-built worker as much as a builtin). Not for `docker://` workers —
+/// there the entry is a blob naming the registry ref, and a path resolves to
+/// the recorded hash, not the ref.
+pub fn own_image() -> String {
+    arg("image")
 }
 
 /// A worker's `main`: run `run`, map its `Result` to an exit code, and prefix any

@@ -11,13 +11,14 @@
 //!   * `--in` a file — a leaf: it counts as 1.
 //!
 //! The result, a blob holding the count, is left at `/cas/out`. It reaches its
-//! own image as the built-in `/cas/std/file-count`.
+//! own image at `/cas/args/image` — the request's reserved `image` entry — so
+//! recursion needs no std lookup.
 
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use worker_common::{arg, caos, entries, map_then, path, run_worker, scratch, std_image};
+use worker_common::{arg, caos, entries, map_then, own_image, path, run_worker, scratch};
 
 fn main() -> ExitCode {
     run_worker("file-count", run)
@@ -36,7 +37,7 @@ fn run() -> Result<(), String> {
         // A tree with no counted children yet: recurse. Tail call — the
         // continuation is this worker's result.
         eprintln!("file-count: recursing over the tree's children");
-        let me = std_image("file-count");
+        let me = own_image();
         return map_then(&arg("in"), Some(&me), Some(&me));
     };
 

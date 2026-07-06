@@ -23,8 +23,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, caos_curry, entries, file_name, link, map_then, path, read_arg_opt, run_worker,
-    scratch, std_image, Arg, ARGS,
+    arg, caos, caos_curry, entries, file_name, link, map_then, own_image, path, read_arg_opt,
+    run_worker, scratch, Arg, ARGS,
 };
 
 fn main() -> ExitCode {
@@ -137,7 +137,8 @@ fn deepen_image() -> Result<String, String> {
     )
 }
 
-/// This image, for currying `deepen`/`finish` — the built-in `/cas/std/deep-deps`.
+/// This image, for currying `deepen`/`finish` — its own image from the
+/// request's reserved `image` args entry, so recursion needs no std lookup.
 fn me() -> String {
-    std_image("deep-deps")
+    own_image()
 }

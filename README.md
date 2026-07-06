@@ -191,8 +191,10 @@ node, `map`/`then` blobs naming images — as the worker's own result at
    if `then` is given (`children` only when `map` ran), else the `children`
    tree itself. With no `map`, `then(--in)` is a plain tail call.
 
-Recursion ties the knot through `map`: a worker curries *its own image* as the
-mapper, so each child gets the same treatment — and each child may itself
+Recursion ties the knot through `map`: a worker curries *its own image* — read
+straight from `/cas/args/image`, the request's reserved entry — as the mapper,
+so each child gets the same treatment, with no std lookup and for any git
+image (a rustc-built worker as much as a builtin) — and each child may itself
 promise. Because a worker either computes a value or *describes* the remaining
 work, only server threads ever wait; a bounded worker pool
 (`CAOS_MAX_WORKERS`) always drains. See `design/map-then.md` for the full

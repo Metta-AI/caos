@@ -329,8 +329,8 @@
         # continuation {in, map: file-count, then: file-count} and exits; called
         # back with `--children` (the then position) it sums the child counts; a
         # file counts as 1. The result, a blob holding the count, is left at
-        # /cas/out. It reaches its own image as the built-in
-        # /cas/std/file-count. This is the `worker-file-count` crate, a static
+        # /cas/out. It reaches its own image at /cas/args/image (the request's
+        # reserved entry). This is the `worker-file-count` crate, a static
         # binary at /worker — so the image needs no shell or coreutils.
         workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
         workerFileCountConfig = {
@@ -401,8 +401,8 @@
         # package + its dependents). A cycle re-enters the same deepen (image,
         # args) and is caught by the server's run-cycle detection.
         #
-        # It reaches its own image (to curry deepen/finish) as the built-in
-        # /cas/std/deep-deps.
+        # It reaches its own image (to curry deepen/finish) at /cas/args/image
+        # (the request's reserved entry).
         #
         # This worker is the `worker-deep-deps` crate, a static binary placed at
         # /worker — so, like the other Rust workers, its image needs no shell or
