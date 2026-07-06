@@ -479,10 +479,10 @@ tests/run.sh tests/untracked    # only git-tracked paths are ingested
 
 `tests/run.sh` builds `.#caos-cli`, publishes the builtins the test asks for,
 and sets up a throwaway client repo with the server as its `caos` remote. A
-test is either a `cli.sh` (runs on the host, driving computations through
-`caos-cli` — the one place blocking runs still exist) or a `test.sh` (runs
-*inside* a bash worker with the test directory at `/cas/args/test`, for
-asserting what a worker sees in a real `/cas`).
+test is a `cli.sh` run on the host in that repo, driving computations through
+`caos-cli` (the one place blocking runs still exist). A test whose assertions
+are about what a *worker* sees in a real `/cas` (symlinks, untracked) launches
+a bash worker itself, with the worker-side checks in a `check.sh`.
 
 ## Notes
 

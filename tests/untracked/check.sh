@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Runs *inside* a bash worker (launched by tests/run.sh). The test directory is at
+# Runs *inside* a bash worker (launched by this test's cli.sh). The test directory is at
 # /cas/args/test, in a real /cas.
 #
 # Proves caos-cli ingests only git-tracked files (the nix-flakes rule). The
-# fixture tree/ holds one committed file, tracked.txt. The harness's host.sh hook
-# drops an untracked tree/untracked.txt into the client repo *after* the commit,
+# fixture tree/ holds one committed file, tracked.txt. cli.sh
+# dropped an untracked tree/untracked.txt into the client repo *after* the commit,
 # so caos-cli sees `test/` as a dirty-but-tracked directory and must exclude the
 # untracked file. The worker therefore gets tracked.txt but never untracked.txt.
 set -euo pipefail
