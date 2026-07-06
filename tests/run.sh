@@ -6,7 +6,7 @@
 # itself is <dir>/cli.sh: it runs on the HOST, cwd'd into that repo with
 # $CAOS_CLI pointing at the caos-cli binary, and drives computations through
 # the CLI (whose top-level run blocks — the one place blocking still exists; a
-# worker's `caos run` records a continuation instead). A test whose assertions
+# worker's `map-then` records a continuation instead). A test whose assertions
 # are about what a *worker* sees in a real /cas launches a bash worker itself
 # (`"$CAOS_CLI" run /cas/std/bash -- --script:@=... --test:@=test`) with the
 # worker-side checks in a second script.

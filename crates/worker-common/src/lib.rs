@@ -1,7 +1,7 @@
 //! Shared helpers for the Rust caos workers.
 //!
 //! A worker is a `/worker` program: `caos entrypoint` materializes the run's
-//! arguments under `/cas/args` (one entry per `--name=value` arg `caos run`
+//! arguments under `/cas/args` (one entry per `--name=value` arg the run request
 //! passed), runs the worker, and on exit reads the hash of `/cas/out`. Every CAS
 //! operation is a shell-out to the `caos` CLI — these helpers wrap the handful of
 //! calls every worker repeats: fetching args, reading blobs, staging a result in
@@ -26,7 +26,7 @@ pub fn arg(name: &str) -> String {
 }
 
 /// A built-in's image, referenced as a path into the standard-library tree the
-/// server materialized at `/cas/std`. Pass the result to `caos run`/`caos curry`
+/// server materialized at `/cas/std`. Pass the result to `caos map-then`/`caos curry`
 /// like any image ref — `caos` resolves the recorded hash. Workers reach their
 /// own image and other built-ins this way, so the binding rides in `std` (and
 /// thus the cache key), not in env.
@@ -70,7 +70,7 @@ pub fn caos_curry(image: &str, args: &[(&str, Arg)]) -> Result<String, String> {
 }
 
 /// Map-then: record a continuation over `input` (a CAS path) as this worker's
-/// result at `/cas/out` — `caos run <input> -- --map=<map> --then=<then>`. The
+/// result at `/cas/out` — `caos map-then <input> -- --map=<map> --then=<then>`. The
 /// *server* resolves it after this worker exits: `map` runs over each child of
 /// `input` in parallel, the results are assembled into a `children` tree under
 /// the original names, and `then(--in=<input>, --children=<children>)` produces
@@ -87,7 +87,7 @@ pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<()
     if map.is_none() && then.is_none() {
         return Err("map_then needs a map or a then image".to_string());
     }
-    let mut argv: Vec<String> = vec!["run".into(), input.into(), "--".into()];
+    let mut argv: Vec<String> = vec!["map-then".into(), input.into(), "--".into()];
     if let Some(map) = map {
         argv.push(format!("--map={map}"));
     }

@@ -4,12 +4,12 @@
 //! It speaks HTTP to the server (`/object`, for storage) via
 //! [`caos::HttpTransport`], and provides the container `entrypoint` — which sets
 //! up the root-owned `/cas`, runs `/worker` as an unprivileged user, and prints
-//! the kind + hash recorded at `/cas/out`. It never triggers compute: its `run`
+//! the kind + hash recorded at `/cas/out`. It never triggers compute: its `map-then`
 //! records a map-then continuation the server resolves after the worker exits.
 //! The shared command logic lives in the `caos` library; this binary is the
 //! worker's CLI surface plus the privileged entrypoint.
 //!
-//! Subcommands: `get-hash`, `get`, `put`, `run`, `curry`, and `entrypoint`.
+//! Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`, and `entrypoint`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::fd::AsFd;
@@ -59,11 +59,11 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(src), Some(dst), None) => caos::put(&http()?, src, dst),
             _ => Err(usage(args)),
         },
-        // `run <in> -- [--map=<image>] [--then=<image>]` — record a map-then
+        // `map-then <in> -- [--map=<image>] [--then=<image>]` — record a map-then
         // continuation over the CAS path `<in>` as this worker's result at
         // /cas/out (a tail call; the server resolves it after the worker exits).
-        Some("run") => match &args[2..] {
-            [input, sep, kvs @ ..] if sep == "--" => caos::caos_run(&http()?, input, kvs),
+        Some("map-then") => match &args[2..] {
+            [input, sep, kvs @ ..] if sep == "--" => caos::caos_map_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
         // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an image, printing
@@ -281,7 +281,7 @@ fn usage(args: &[String]) -> String {
         "usage:\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
-         {prog} run <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
+         {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
          {prog} entrypoint [--args=<hash>]\n  \
          {prog} serve"
@@ -354,7 +354,7 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     // its hash, so /cas/out already knows its hash — read it (and its type) back
     // before teardown. The server returns this `"<type> <hash>"` to the caller so
     // it can record a correctly-typed result placeholder without fetching — or,
-    // for a `promise` (a map-then continuation `caos run` recorded), resolves it
+    // for a `promise` (a map-then continuation `caos map-then` recorded), resolves it
     // now that this container is exiting and its slot is free.
     let out = cas.join("out");
     let hash = caos::read_hash(&out)?;

@@ -1,5 +1,5 @@
 //! caos-worker-hello: a minimal demonstration worker. It reads every argument
-//! `caos run` passed (one entry per `--name=value` under `/cas/args`), assembles
+//! the run request passed (one entry per `--name=value` under `/cas/args`), assembles
 //! a result tree holding each argument's content under its name plus a small
 //! `receipt`, and stores that at `/cas/out`.
 //!

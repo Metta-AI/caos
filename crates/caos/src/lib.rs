@@ -4,7 +4,7 @@
 //!
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
 //!   It talks to the server over HTTP (`/object`) and runs the container
-//!   `entrypoint`. It never triggers compute — its `run` records a map-then
+//!   `entrypoint`. It never triggers compute — its `map-then` records a map-then
 //!   continuation the server resolves after the worker exits.
 //! * **`caos-cli`** — the user-facing client. It uses the server as a `caos` git
 //!   remote, building objects in the local working repo and exchanging them with
@@ -73,7 +73,7 @@ pub const DEFAULT_CAS_DIR: &str = "/cas";
 /// xattr recording the git hash a materialized path came from.
 const HASH_XATTR: &str = "user.caos.hash";
 /// xattr recording a placeholder's result *kind* when it isn't implied by the
-/// node's shape — only `promise` today (a `caos run` continuation, recorded as a
+/// node's shape — only `promise` today (a `caos map-then` continuation, recorded as a
 /// file). Absent on ordinary placeholders: a directory is a tree, a file a blob.
 const KIND_XATTR: &str = "user.caos.kind";
 /// xattr used only by the startup support probe.
@@ -892,7 +892,7 @@ fn write_tree(
 
 /// Record a result as a typed, tagged placeholder at `target`, fetching nothing:
 /// an empty directory for a tree, an empty file for a blob, tagged with `hash` and
-/// owner-only (the placeholder mode). A `promise` — the continuation `caos run`
+/// owner-only (the placeholder mode). A `promise` — the continuation `caos map-then`
 /// records at `/cas/out` — is a file placeholder additionally tagged with its
 /// kind ([`KIND_XATTR`]), since a promise's shape can't imply it.
 fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String> {
@@ -1558,17 +1558,17 @@ fn run_request(
     request_compute(&t.server_url()?, &req.to_string())
 }
 
-/// `run <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a
+/// `map-then <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a
 /// map-then continuation `{in, map?, then?}` as this worker's result at
 /// `/cas/out`, fetching and running nothing. The worker then exits, and the
 /// *server* resolves the continuation — `map` over each child of `in` in
 /// parallel, then `then(--in, --children)` — with no worker slot held (see
-/// `design/map-then.md`). So `caos run` is a tail call: it produces `/cas/out`
+/// `design/map-then.md`). So `caos map-then` is a tail call: it produces `/cas/out`
 /// itself and must be the worker's final act. At least one of `--map`/`--then`
 /// is required; each names an image (a `/cas` path, resolved to the hash
 /// recorded on it, or a git/curry hash or `docker://` ref, passed through).
 /// (The user-facing CLI's blocking run is [`cli_run`].)
-pub fn caos_run(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
+pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let cas = cas_dir();
@@ -1576,7 +1576,7 @@ pub fn caos_run(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), St
     let out = cas.join("out");
     if std::fs::symlink_metadata(&out).is_ok() {
         return Err(format!(
-            "{} already exists; `caos run` records the worker's result, so it must \
+            "{} already exists; `caos map-then` records the worker's result, so it must \
              be the worker's final act",
             out.display()
         ));
@@ -1597,7 +1597,7 @@ pub fn caos_run(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), St
         let (name, value) = parse_kv(kv)?;
         if name != "map" && name != "then" {
             return Err(format!(
-                "`run` takes only --map and --then (each an image ref), got --{name}"
+                "`map-then` takes only --map and --then (each an image ref), got --{name}"
             ));
         }
         if entries.iter().any(|e| entry_name(e) == name.as_bytes()) {
@@ -1617,7 +1617,7 @@ pub fn caos_run(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), St
         });
     }
     if entries.len() == 1 {
-        return Err("`run` needs --map and/or --then".to_string());
+        return Err("`map-then` needs --map and/or --then".to_string());
     }
 
     let continuation = post_tree(t, entries)?;
@@ -1678,7 +1678,7 @@ pub fn cli_run(
 /// std, salt}` — `image`/`std`/`salt` as blobs, `args` as the args subtree. Its
 /// hash is the request id: the server's cache key and the result-ref rendezvous.
 /// (The git-docker image's own objects aren't reachable from here — `image` is a
-/// blob naming it by hash — so `caos run` pushes them separately.)
+/// blob naming it by hash — so the CLI pushes them separately.)
 fn build_request(
     t: &dyn Transport,
     image: &str,
@@ -1728,8 +1728,8 @@ fn run_std() -> Result<String, String> {
 }
 
 /// The cache-busting salt for this run (see [`SALT_ENV`]): read from `CAOS_SALT`,
-/// empty if unset. Threaded — the server injects it into each worker, whose
-/// nested `caos run` reads it back here — so a whole run tree shares one salt.
+/// empty if unset. Read at the top of a run (the CLI); the server threads it
+/// into each worker and every promise sub-run — so a whole run tree shares one.
 fn run_salt() -> String {
     std::env::var(SALT_ENV).unwrap_or_default()
 }
@@ -1763,7 +1763,7 @@ pub fn resolve_ref(name: &str) -> Result<String, String> {
     Ok(tree.to_string())
 }
 
-/// Resolve the `<image>` argument of `caos run` into what the server
+/// Resolve an image argument of `caos map-then`/`caos curry` into what the server
 /// expects. A git image is given as a path inside the CAS, which resolves to the
 /// git hash recorded on it; a `docker://<ref>` value is an ordinary docker image
 /// and passes through unchanged. Anything else is rejected.

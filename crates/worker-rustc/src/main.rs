@@ -6,7 +6,7 @@
 //! `curry(runner, bin=<the compiled binary>)`. So the worker is *not* its own
 //! image — it's the shared, warm-pooled runner ([`crates/worker-runner`]) bound
 //! to this binary, which is what avoids a per-worker image (no convert / registry
-//! push / app provision). `caos run` the result like any other image.
+//! push / app provision). run the result like any other image.
 //!
 //! So building a worker is itself a worker — and because the run is memoized on
 //! `(this image, src, runner)`, recompiling unchanged source is a cache hit.

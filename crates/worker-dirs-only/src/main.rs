@@ -5,7 +5,7 @@
 //! /cas/out: one entry per surviving directory child, under its original name and
 //! pointing at that child's unchanged subtree. A non-directory `--in` (e.g. a file
 //! leaf) has no children, so the output is an empty tree. It only touches the
-//! server (no `caos run`); the server injects that URL at runtime. This is the
+//! server (no sub-runs); the server injects that URL at runtime. This is the
 //! `worker-dirs-only` crate, a static binary at /worker — so the image needs no
 //! shell or coreutils.
 

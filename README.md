@@ -175,7 +175,7 @@ Results stay on the server. The caller gets back the hash and a type; it does
 
 ### Map-then: sub-computations without blocking
 
-A worker never blocks on another worker. Its `caos run` is a **tail call**: it
+A worker never blocks on another worker. Its `caos map-then` is a **tail call**: it
 records a continuation `{in, map?, then?}` — `in` a tree entry for the data
 node, `map`/`then` blobs naming images — as the worker's own result at
 `/cas/out`, and the worker exits, freeing its slot. The server then:
@@ -229,8 +229,8 @@ logic — the difference is the **transport** and the privilege model.
 - **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
   provides the container `entrypoint`. It's installed **setuid-root** in
   worker images so an unprivileged worker can reach the root-owned `/cas` only
-  through it. Subcommands: `get-hash`, `get`, `put`, `run`, `curry`,
-  `entrypoint`. Its `run` is a *tail call* — it records a map-then continuation
+  through it. Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`,
+  `entrypoint`. Its `map-then` is a *tail call* — it records a map-then continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
 - **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
@@ -290,7 +290,7 @@ blocking, user-facing run):
    **file** result is streamed to **stdout** (handy for `| less` or `> file`);
    a **tree** result has no single stream, so it still needs an `<output>` path.
 
-The worker-side `caos run <in> -- [--map=<image>] [--then=<image>]` is a
+The worker-side `caos map-then <in> -- [--map=<image>] [--then=<image>]` is a
 different thing entirely: a **tail call**. It records the continuation
 `{in, map?, then?}` as the worker's own result at `/cas/out` (a `promise`
 placeholder) and fetches and runs nothing; the worker exits and the server
@@ -376,7 +376,7 @@ today, leaving room for more. The worker `caos` has no host filesystem (only
    stdout stays clean;
 4. **report** — print `"<type> <hash>"` for `/cas/out` (a fast xattr read plus
    an `is_dir` check — no re-hashing). `blob`/`tree` results go back to the
-   caller as-is; a `promise` (a `caos run` continuation) is resolved by the
+   caller as-is; a `promise` (a `caos map-then` continuation) is resolved by the
    server after this container exits;
 5. **tear down** — delete `/cas`.
 

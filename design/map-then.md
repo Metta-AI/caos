@@ -5,9 +5,9 @@
 1. `worker_common::map_then` with the target signature, implemented in terms
    of the then-existing blocking `caos run`; fold/deep-deps ported onto it
    (and `pre` dropped everywhere).
-2. The implementation moved into `caos run` itself (the worker records a
-   continuation; the server resolves it with promises); the blocking form
-   removed.
+2. The implementation moved into the worker client (now `caos map-then`): the
+   worker records a continuation, the server resolves it with promises; the
+   blocking form removed.
 3. `worker-fold` removed: with map-then as the primitive, a worker recurses
    with *itself* (file-count is the model), so a generic fold driver adds
    nothing.
@@ -31,7 +31,7 @@ that records a *map-then continuation* as the worker's own result, and the
 worker exits. The server resolves the continuation *after* the container is
 gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 
-- **`caos run <in> -- [--map=<img>] [--then=<img>]`** (worker form) writes
+- **`caos map-then <in> -- [--map=<img>] [--then=<img>]`** (worker form) writes
   `/cas/out` as a **promise placeholder** naming a continuation object;
   `entrypoint` reports `promise <hash>` instead of `blob/tree <hash>`.
 - The **continuation** is a content-addressed tree `{in, map?, then?}`: `in`

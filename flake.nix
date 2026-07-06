@@ -303,7 +303,7 @@
 
 
         # A real, runnable worker image, with a /worker that reads its inputs from
-        # /cas/args (one entry per `--name=value` arg `caos run` passed), assembles
+        # /cas/args (one entry per `--name=value` arg the run request carries), assembles
         # them into a result tree along with a small receipt, and stores that at
         # /cas/out. The server runs it via `caos entrypoint`, which
         # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
@@ -353,7 +353,7 @@
         # and leaves the filtered children tree at /cas/out (one entry per
         # surviving directory child, under its original name). Compose by
         # filtering first and recursing over the result. It only touches
-        # the server (no `caos run`); the server injects that URL at runtime. This
+        # the server (no sub-runs); the server injects that URL at runtime. This
         # is the `worker-dirs-only` crate, a static binary at /worker — so the
         # image needs no shell or coreutils.
         workerDirsOnlyRoot = workerRoot "worker-dirs-only" worker-dirs-only;
