@@ -16,7 +16,7 @@
 //! the whole map, so it re-runs on any edit — cheap orchestration. But `finish`
 //! is keyed only on a package and its deepened subgraph, so real recompute is
 //! O(changed package + its dependents). A cycle re-enters the same `deepen`
-//! `(image, args)` and is caught by the server's run-cycle detection.
+//! request and is caught by the server's run-cycle detection.
 
 use std::fs;
 use std::path::Path;

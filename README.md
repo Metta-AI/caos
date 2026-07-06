@@ -144,10 +144,14 @@ containers, safe at any setting ≥ 1).
 ### Compute
 
 A run **request** is itself a content-addressed git object: a tree
-`{image, args, std, salt}` whose hash, `reqHash`, *is* the cache key and the
-rendezvous id. `GET /run?req=<reqHash>`:
+`{args, std, salt}` whose hash, `reqHash`, *is* the cache key and the
+rendezvous id. The worker image rides *inside* `args`, under a reserved `image`
+entry — so a computation is identified entirely by its args (an executor can
+match on the worker alongside the rest, and a worker, seeing its args at
+`/cas/args`, can read its own image to call itself). `GET /run?req=<reqHash>`:
 
-1. **read** the request tree (`image` ref, `args` tree, `std` tree, `salt`);
+1. **read** the request tree (`args` tree — whose `image` entry is the worker
+   ref — plus the `std` tree and `salt`);
 2. **cache** lookup in Redis keyed on `reqHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
 3. **cycle check** — the server threads the chain of in-progress `reqHash`es
@@ -279,12 +283,14 @@ setuid `caos`.
 `caos-cli run <image> [output] -- [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
-1. assembles the args into a git **tree** (see [arguments](#arguments-literals-and-paths));
-2. bundles `{image, args, std, salt}` into a content-addressed **request object**
+1. assembles the args into a git **tree** — including the `<image>` under a
+   reserved `image` entry (see [arguments](#arguments-literals-and-paths));
+2. bundles `{args, std, salt}` into a content-addressed **request object**
    (`reqHash`), where `std` is the standard library in effect (resolved from
    `refs/caos/std`, see [built-ins](#built-ins-casstd));
 3. gets the request onto the server — one negotiated `git push` to
-   `refs/caos/req/<reqHash>`, plus a git image's own objects;
+   `refs/caos/req/<reqHash>`, whose reachable graph includes any embedded
+   git-image tree, so the image needs no separate push;
 4. calls `/run?req=<reqHash>`; the server resolves any promises before
    answering, so the reply is always a final value;
 5. records the result at `<output>`: it **checks the result out in full** —
@@ -361,10 +367,11 @@ today, leaving room for more. The worker `caos` has no host filesystem (only
 - `curry <image> -- [--name=value | --name:@=path …]` (both clients) — bind some
   args to an image, printing a ref to the curried image. It's a small
   content-addressed tree (`base`, `args`, a `.caos-curry` marker); `run`/`curry`
-  expand it — the client for its own calls, the server when a curried
-  `map`/`then` runs (call args win) — so a container only ever runs as a plain
-  image + args. Currying flattens, so it's canonical. On `caos-cli`, path args
-  are host paths to ingest, or `/cas/std/<name>` builtin refs.
+  expand it — the CLI for its own calls, the server when a curried `map`/`then`
+  runs (call args win, and the base is folded into the args tree as its
+  `image` entry) — so a request only ever carries a plain args tree. Currying
+  flattens, so it's canonical. On `caos-cli`, path args are host paths to
+  ingest, or `/cas/std/<name>` builtin refs.
 - `entrypoint [--args=<hash>]` (`caos`) — the container entrypoint; see below.
 
 ### `entrypoint`

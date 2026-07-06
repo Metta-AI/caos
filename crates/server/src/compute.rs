@@ -1,6 +1,7 @@
 //! Compute: the `/run` pipeline.
 //!
-//! A request is a content-addressed tree `{image, args, std, salt}`; `/run?req=<hash>`
+//! A request is a content-addressed tree `{args, std, salt}` — the worker image
+//! rides inside `args` under a reserved `image` entry; `/run?req=<hash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
 //! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
 //! the registry) → the worker container run, whose stdout is `"<type> <hash>"` —
@@ -43,6 +44,14 @@ const DOCKER_SCHEME: &str = "docker://";
 /// layers pulled from another registry keep their own (often gzipped) media type.
 const OCI_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 
+/// A manifest layer descriptor: `(media_type, digest, size)`.
+type ManifestLayer = (String, String, u64);
+
+/// A base image's contribution to a stacked image: its manifest layers and its
+/// config `diff_id`s (the uncompressed layer digests) — the lower part of the
+/// stack our delta layers sit on. Returned by [`fetch_base`]/[`fetch_base_oci`].
+type BaseLayers = (Vec<ManifestLayer>, Vec<String>);
+
 /// How long to wait on Redis before giving up and running uncached.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -64,7 +73,7 @@ const PROMISE_KIND: &str = "promise";
 
 /// Marker entry naming a curry node — a tree pairing a `base` image ref with an
 /// `args` subtree of bound arguments (mirrors the client's `CURRY_MARKER`).
-/// Promise resolution unwraps these server-side so `pre`/`map`/`then` can be
+/// Promise resolution unwraps these server-side so `map`/`then` can be
 /// curried images.
 const CURRY_MARKER: &str = ".caos-curry";
 
@@ -81,14 +90,16 @@ const META_SUFFIX: &str = ".caosmeta";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `GET /run?req=<reqHash>` — run the request object `<reqHash>` (a tree
-/// `{image, args, std, salt}`) and return its result as `"<type> <hash>"`.
+/// `{args, std, salt}`, the worker image inside `args`) and return its result
+/// as `"<type> <hash>"`.
 ///
 /// The request being a content-addressed object means `reqHash` *is* the cache
-/// key (it captures image + args + std) and the rendezvous id: an external run
-/// also pins `refs/caos/res/<reqHash>` at the result, so a client can fetch it
-/// by ref. Only external callers reach this endpoint now (the CLI, which pushed
-/// the request): workers never call back into `/run` — a worker's sub-runs are
-/// promise resolutions the server performs itself ([`run_req`] recursion).
+/// key (it captures args — hence the image — plus std and salt) and the
+/// rendezvous id: an external run also pins `refs/caos/res/<reqHash>` at the
+/// result, so a client can fetch it by ref. Only external callers reach this
+/// endpoint now (the CLI, which pushed the request): workers never call back
+/// into `/run` — a worker's sub-runs are promise resolutions the server
+/// performs itself ([`run_req`] recursion).
 pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let req = query_param(query, "req")
         .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
@@ -109,11 +120,12 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
 /// pipeline behind both `GET /run` and promise sub-runs: cache lookup →
 /// run-cycle detection → the container run → promise resolution → cache store.
 fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpError> {
-    // Unpack the request: image (a ref blob), args (a tree), std (a ref blob),
-    // salt (an opaque blob). `std` names the standard library, materialized at
-    // `/cas/std` in the worker; `salt` is a cache-buster. Both are part of the
-    // request (hence the key), threaded into the worker, and inherited by any
-    // promise sub-runs this request leaves behind.
+    // Unpack the request: args (a tree; the worker image is its reserved `image`
+    // entry — an embedded tree for a git image, a ref blob for `docker://`), std
+    // (a ref blob), salt (an opaque blob). `std` names the standard library,
+    // materialized at `/cas/std` in the worker; `salt` is a cache-buster. Both
+    // are part of the request (hence the key), threaded into the worker, and
+    // inherited by any promise sub-runs this request leaves behind.
     let (image, args, std, salt) = read_request(config, req)?;
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
@@ -126,7 +138,7 @@ fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpE
         return Err(HttpError::new(400, format!("invalid std hash: {std:?}")));
     }
 
-    // The request hash is the cache key (it captures image+args+std); the value is
+    // The request hash is the cache key (it captures args+std+salt); the value is
     // the final result "<type> <hash>" — a promise is resolved before it's cached,
     // so a hit never re-resolves. A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
@@ -187,10 +199,7 @@ fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpE
 
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: req={req}");
-        return Err(HttpError::new(
-            500,
-            "worker produced no result on stdout",
-        ));
+        return Err(HttpError::new(500, "worker produced no result on stdout"));
     }
 
     // A promise is not a value: the worker exited leaving a map-then continuation
@@ -252,8 +261,8 @@ fn resolve_promise(
             }
         }
     }
-    let input = input
-        .ok_or_else(|| HttpError::new(500, format!("continuation {cont} missing 'in'")))?;
+    let input =
+        input.ok_or_else(|| HttpError::new(500, format!("continuation {cont} missing 'in'")))?;
     if map.is_none() && then.is_none() {
         return Err(HttpError::new(
             500,
@@ -277,8 +286,7 @@ fn resolve_promise(
                             let img = img.as_str();
                             scope.spawn(move || {
                                 let arg = named_entry("in", kid.mode, kid.oid);
-                                let result =
-                                    run_image(config, img, vec![arg], std, salt, stack)?;
+                                let result = run_image(config, img, vec![arg], std, salt, stack)?;
                                 result_entry(&kid.name, &result)
                             })
                         })
@@ -326,10 +334,11 @@ fn resolve_promise(
 }
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
-/// any curry layers, build the args tree and the request object `{image, args,
-/// std, salt}` server-side — byte-identical to what a client would build, so the
-/// request hash (and cache key) is the same no matter who assembles it — and
-/// send it through [`run_req`]. Returns `"<type> <hash>"`.
+/// any curry layers, build the args tree (worker image folded in under its
+/// reserved `image` entry) and the request object `{args, std, salt}`
+/// server-side — byte-identical to what a client would build, so the request
+/// hash (and cache key) is the same no matter who assembles it — and send it
+/// through [`run_req`]. Returns `"<type> <hash>"`.
 fn run_image(
     config: &Config,
     image_ref: &str,
@@ -341,15 +350,27 @@ fn run_image(
     use gix::objs::tree::EntryKind;
 
     let (image, bound) = unwrap_curry(config, image_ref)?;
-    let args = merge_entries(bound, call_args);
     let store_err = |e: String| HttpError::new(500, format!("building sub-request: {e}"));
-    let args_tree = store_git_tree(config, args).map_err(store_err)?;
-    let entries = vec![
+
+    // The worker image rides *in* the args tree under the reserved `image` entry
+    // (embedded as the image's own tree for a git image, a ref blob for
+    // `docker://`) — the same shape the client builds, merged last so the
+    // reserved name wins over any like-named user arg.
+    let image_entry = if image.len() == 40 && image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let oid = gix::ObjectId::from_hex(image.as_bytes())
+            .map_err(|e| HttpError::new(500, format!("invalid image hash: {e}")))?;
+        named_entry("image", EntryKind::Tree.into(), oid)
+    } else {
         named_entry(
             "image",
             EntryKind::Blob.into(),
             store_git_blob(config, image.as_bytes()).map_err(store_err)?,
-        ),
+        )
+    };
+    let args = merge_entries(merge_entries(bound, call_args), vec![image_entry]);
+    let args_tree = store_git_tree(config, args).map_err(store_err)?;
+
+    let entries = vec![
         named_entry("args", EntryKind::Tree.into(), args_tree),
         named_entry(
             "std",
@@ -391,9 +412,7 @@ fn unwrap_curry(
                 .iter()
                 .find(|e| e.name == name)
                 .map(|e| e.oid.to_string())
-                .ok_or_else(|| {
-                    HttpError::new(500, format!("curry node {image} missing {name:?}"))
-                })
+                .ok_or_else(|| HttpError::new(500, format!("curry node {image} missing {name:?}")))
         };
         let base = blob_string(config, &find("base")?)?;
         let args = fetch_tree(config, &find("args")?)
@@ -778,18 +797,27 @@ fn dispatch_to_pool(fly: &Fly, app: &str, body: &str) -> Result<String, HttpErro
     for attempt in 0..SWEEPS {
         let machines = fly_list_machines(fly, app)?;
         if machines.is_empty() {
-            return Err(HttpError::new(500, format!("worker app {app} has no machines")));
+            return Err(HttpError::new(
+                500,
+                format!("worker app {app} has no machines"),
+            ));
         }
         for m in &machines {
             if m.state != "started" {
                 // Best-effort: a racing start ("already started") is fine — the
                 // POST below is the real readiness check.
-                eprintln!("dispatch {app}: starting machine {} (state {})", m.id, m.state);
+                eprintln!(
+                    "dispatch {app}: starting machine {} (state {})",
+                    m.id, m.state
+                );
                 let _ = fly_start_machine(fly, app, &m.id);
             }
             match post_job(&m.private_ip, body) {
                 Outcome::Done(result) => {
-                    eprintln!("dispatch {app}: machine {} accepted (sweep {attempt})", m.id);
+                    eprintln!(
+                        "dispatch {app}: machine {} accepted (sweep {attempt})",
+                        m.id
+                    );
                     return Ok(result);
                 }
                 Outcome::Busy => {
@@ -837,7 +865,10 @@ fn post_job(ip: &str, body: &str) -> Outcome {
             Ok((200, out)) => return Outcome::Done(out.trim().to_string()),
             Ok((503, _)) => return Outcome::Busy,
             Ok((code, msg)) => {
-                return Outcome::Failed(HttpError::new(500, format!("worker failed ({code}): {msg}")))
+                return Outcome::Failed(HttpError::new(
+                    500,
+                    format!("worker failed ({code}): {msg}"),
+                ))
             }
             Err(e) => {
                 last_err = e.to_string();
@@ -870,8 +901,13 @@ fn raw_post(ip: &str, port: u16, path: &str, body: &str) -> std::io::Result<(u16
         .split_once("\r\n")
         .and_then(|(line, _)| line.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line"))?;
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line")
+        })?;
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
     Ok((status, body))
 }
 
@@ -882,19 +918,26 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
     if resp.status_code != 200 {
         return Err(HttpError::new(
             500,
-            format!("fly list machines ({}): {}", resp.status_code, resp.as_str().unwrap_or("")),
+            format!(
+                "fly list machines ({}): {}",
+                resp.status_code,
+                resp.as_str().unwrap_or("")
+            ),
         ));
     }
     let body = resp
         .as_str()
         .map_err(|e| HttpError::new(500, format!("reading machine list: {e}")))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
     let mut machines = Vec::new();
     for m in parsed.as_array().into_iter().flatten() {
         let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default();
         let state = m.get("state").and_then(|v| v.as_str()).unwrap_or_default();
-        let private_ip = m.get("private_ip").and_then(|v| v.as_str()).unwrap_or_default();
+        let private_ip = m
+            .get("private_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !id.is_empty() && !private_ip.is_empty() {
             machines.push(Machine {
                 id: id.to_string(),
@@ -909,12 +952,20 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
 /// Start a stopped machine (`POST /apps/{app}/machines/{id}/start`). Idempotent
 /// enough for our use: a 200 or an already-started reply are both fine.
 fn fly_start_machine(fly: &Fly, app: &str, id: &str) -> Result<(), HttpError> {
-    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines/{id}/start"), None)?;
+    let resp = fly_api(
+        fly,
+        "POST",
+        &format!("/apps/{app}/machines/{id}/start"),
+        None,
+    )?;
     match resp.status_code {
         200 | 201 => Ok(()),
         code => Err(HttpError::new(
             500,
-            format!("fly start machine {id} ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly start machine {id} ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -961,7 +1012,10 @@ fn ensure_worker_app(config: &Config, fly: &Fly, image: &str) -> Result<(), Http
 fn resolve_fly_image(config: &Config, fly: &Fly, image: &str) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         if reference.is_empty() || reference.starts_with('-') {
-            return Err(HttpError::new(400, format!("invalid docker image: {reference:?}")));
+            return Err(HttpError::new(
+                400,
+                format!("invalid docker image: {reference:?}"),
+            ));
         }
         return Ok(reference.to_string());
     }
@@ -987,12 +1041,18 @@ fn fly_create_app(fly: &Fly, app: &str) -> Result<(), HttpError> {
             if msg.contains("already been taken") {
                 Ok(())
             } else {
-                Err(HttpError::new(500, format!("fly create app {app} (422): {msg}")))
+                Err(HttpError::new(
+                    500,
+                    format!("fly create app {app} (422): {msg}"),
+                ))
             }
         }
         code => Err(HttpError::new(
             500,
-            format!("fly create app {app} ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly create app {app} ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -1018,12 +1078,20 @@ fn fly_create_machine(
         }
     })
     .to_string();
-    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines"), Some(&machine))?;
+    let resp = fly_api(
+        fly,
+        "POST",
+        &format!("/apps/{app}/machines"),
+        Some(&machine),
+    )?;
     match resp.status_code {
         200 | 201 => Ok(()),
         code => Err(HttpError::new(
             500,
-            format!("fly create machine ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly create machine ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -1080,7 +1148,10 @@ fn push_image_to_fly(fly: &Fly, config: &Config, git_hash: &str) -> Result<Strin
             .status()
             .map_err(|e| HttpError::new(500, format!("skopeo copy: {e}")))?;
         if !status.success() {
-            return Err(HttpError::new(500, format!("skopeo copy to {dest} failed ({status})")));
+            return Err(HttpError::new(
+                500,
+                format!("skopeo copy to {dest} failed ({status})"),
+            ));
         }
         eprintln!("pushed image {git_hash} -> {dest}");
         Ok(dest)
@@ -1237,8 +1308,11 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
             .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
             .map_err(|e| format!("linking blob {hex} into layout: {e}"))?;
     }
-    std::fs::write(oci_dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)
-        .map_err(|e| format!("writing oci-layout: {e}"))?;
+    std::fs::write(
+        oci_dir.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .map_err(|e| format!("writing oci-layout: {e}"))?;
     let index = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -1266,10 +1340,7 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
 /// lower part of the stack. We later overwrite `index.json` with our combined
 /// image, leaving the base's own manifest blob unreferenced (so the push skips
 /// it). `--format oci` rewrites media types to OCI; the layer blobs are untouched.
-fn fetch_base_oci(
-    base_ref: &str,
-    oci_dir: &Path,
-) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+fn fetch_base_oci(base_ref: &str, oci_dir: &Path) -> Result<BaseLayers, String> {
     let status = Command::new("skopeo")
         .args([
             "--insecure-policy",
@@ -1289,7 +1360,9 @@ fn fetch_base_oci(
         .status()
         .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
     if !status.success() {
-        return Err(format!("skopeo copy {base_ref} into layout failed ({status})"));
+        return Err(format!(
+            "skopeo copy {base_ref} into layout failed ({status})"
+        ));
     }
 
     // Read the layout's index → the base manifest → its layers + config diff_ids.
@@ -1299,9 +1372,7 @@ fn fetch_base_oci(
         .ok_or("base layout index has no manifests")?;
     let man_desc = manifests
         .iter()
-        .find(|m| {
-            m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base")
-        })
+        .find(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base"))
         .or_else(|| manifests.first())
         .ok_or("base layout index is empty")?;
     let man_digest = man_desc["digest"]
@@ -1377,28 +1448,47 @@ fn fly_api(
         .map_err(|e| HttpError::new(500, format!("fly api {method} {path}: {e}")))
 }
 
-/// Unpack a request object (a tree `{image, args, std, salt}`) into its parts:
-/// the image ref, the args-tree hash, the std-tree hash (empty if none), and the
-/// salt (empty if none).
+/// Unpack a request object (a tree `{args, std, salt}`) into its parts: the image
+/// ref (read from the args tree's reserved `image` entry), the args-tree hash, the
+/// std-tree hash (empty if none), and the salt (empty if none).
 fn read_request(config: &Config, req: &str) -> Result<(String, String, String, String), HttpError> {
     let entries = fetch_tree(config, req)
         .map_err(|e| HttpError::new(400, format!("reading request: {e}")))?;
-    let mut image = None;
     let mut args = None;
     let mut std = String::new();
     let mut salt = String::new();
     for entry in entries {
         match entry.name.as_str() {
-            "image" => image = Some(blob_string(config, &entry.oid.to_string())?),
             "args" => args = Some(entry.oid.to_string()),
             "std" => std = blob_string(config, &entry.oid.to_string())?,
             "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }
     }
-    let image = image.ok_or_else(|| HttpError::new(400, "request missing 'image'"))?;
     let args = args.ok_or_else(|| HttpError::new(400, "request missing 'args'"))?;
+    // The worker image rides in the args tree under the reserved `image` entry.
+    let image = read_args_image(config, &args)?;
     Ok((image, args, std, salt))
+}
+
+/// Read the worker image ref out of an args tree — its reserved `image` entry. A
+/// git-docker image *is* a git tree, so it rides embedded: the entry is a tree and
+/// its oid is the image hash (the image thus travels inside the request graph). A
+/// `docker://` image has no git object, so it rides as a blob naming the registry
+/// ref.
+fn read_args_image(config: &Config, args: &str) -> Result<String, HttpError> {
+    let entries = fetch_tree(config, args)
+        .map_err(|e| HttpError::new(400, format!("reading args tree: {e}")))?;
+    for entry in entries {
+        if entry.name == "image" {
+            return if entry.mode.is_tree() {
+                Ok(entry.oid.to_string())
+            } else {
+                blob_string(config, &entry.oid.to_string())
+            };
+        }
+    }
+    Err(HttpError::new(400, "request args missing 'image'"))
 }
 
 /// Fetch a blob and return its content as a trimmed string.
@@ -1557,7 +1647,7 @@ fn image_ref(config: &Config, manifest_digest: &str) -> String {
 /// — the lower part of the stack our delta layers sit on. `--format oci` rewrites
 /// the manifest to OCI media types so it composes cleanly with our OCI layers;
 /// the layer *blobs* (and their digests) are untouched.
-fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
     let push = config.registry_push_url.trim_end_matches('/');
     let host = push
         .strip_prefix("http://")
@@ -1601,7 +1691,9 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
             .status()
             .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
         if !status.success() {
-            return Err(format!("skopeo copy {base_ref} -> {dest} failed ({status})"));
+            return Err(format!(
+                "skopeo copy {base_ref} -> {dest} failed ({status})"
+            ));
         }
     }
 
@@ -1617,8 +1709,8 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
             resp.status_code, resp.reason_phrase
         ));
     }
-    let manifest: serde_json::Value =
-        serde_json::from_slice(resp.as_bytes()).map_err(|e| format!("parsing base manifest: {e}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(resp.as_bytes())
+        .map_err(|e| format!("parsing base manifest: {e}"))?;
     let layers = manifest["layers"]
         .as_array()
         .ok_or("base manifest has no layers")?

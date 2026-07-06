@@ -60,8 +60,9 @@ pub const DOCKER_SCHEME: &str = "docker://";
 
 /// Marker entry naming a curry node: a CAS tree that pairs a `base` image ref
 /// with an `args` subtree of bound arguments. `run`/`curry` expand it client-side
-/// (merging the bound args under the call's args) so the server only ever
-/// sees an ordinary image + args hash. The marker lets it be told apart from a
+/// (merging the bound args under the call's args, then folding the base in as the
+/// args' `image` entry) so the server only ever sees an ordinary args tree. The
+/// marker lets it be told apart from a
 /// git-docker image tree, which it otherwise resembles. See [`unwrap_curry`].
 pub const CURRY_MARKER: &str = ".caos-curry";
 
@@ -1538,12 +1539,30 @@ fn run_request(
     kvs: &[String],
 ) -> Result<(String, String), String> {
     // Expand any curry layers: pull the underlying image out and collect the args
-    // bound into it, so the server only ever sees a plain image + args.
+    // bound into it. The image is folded into the args tree below, so the server
+    // only ever sees a plain args tree.
     let (image, bound) = unwrap_curry(t, image)?;
 
     // Build the call's args, then merge them over the bound ones (call wins).
     let call = build_arg_entries(t, cas, kvs)?;
-    let args_tree = post_tree(t, merge_entries(bound, call))?;
+    // The worker (image) rides *in* the args tree under the reserved `image`
+    // entry, rather than as a sibling of `args` in the request. So a computation
+    // is identified entirely by its args (an executor can match on the worker
+    // alongside the rest), and a worker — which sees its args at `/cas/args` —
+    // reaches its own image at `/cas/args/image` to call itself. Merged last so
+    // the reserved name wins over any like-named user arg.
+    //
+    // A git-docker image *is* a git tree, so we reference it by that tree (the
+    // entry's oid is the image tree): the image then travels inside the request's
+    // own object graph — no separate push — and materializes at `/cas/args/image`
+    // as a real directory whose recorded hash is the image, so recursion can pass
+    // that path straight to `caos run`. A `docker://` ref has no git object to
+    // embed, so it rides as a blob naming the registry ref.
+    let image_entry = image_arg_entry(t, &image)?;
+    let args_tree = post_tree(
+        t,
+        merge_entries(merge_entries(bound, call), vec![image_entry]),
+    )?;
 
     // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
     // resolved from the `refs/caos/std` ref at the top. Part of the request so the
@@ -1552,16 +1571,14 @@ fn run_request(
     // The cache-busting salt (empty by default), threaded like std.
     let salt = run_salt();
 
-    // Bundle the request as a content-addressed object {image, args, std, salt};
-    // its hash is the request id (and the server's cache key). Get it onto the
-    // server — a no-op POST-as-you-go for the HTTP transport, a push for the git
-    // one — plus a git image's own objects (referenced by hash in a blob, so not
-    // carried by the request tree).
-    let req = build_request(t, &image, &args_tree, &std, &salt)?;
+    // Bundle the request as a content-addressed object {args, std, salt} (the
+    // worker image is inside `args`); its hash is the request id (and the server's
+    // cache key). Get it onto the server — a no-op POST-as-you-go for the HTTP
+    // transport, a push for the git one. The push carries the whole graph
+    // reachable from the request, which now includes any embedded git-image tree,
+    // so the image lands on the server without a separate push.
+    let req = build_request(t, &args_tree, &std, &salt)?;
     t.ensure_pushed(&req.to_string())?;
-    if is_hex_hash(&image) {
-        t.ensure_pushed(&image)?;
-    }
 
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
@@ -1684,25 +1701,38 @@ pub fn cli_run(
     checkout(t, &target, &result, root)
 }
 
-/// Bundle a run request as a content-addressed object: a tree `{image, args,
-/// std, salt}` — `image`/`std`/`salt` as blobs, `args` as the args subtree. Its
+/// The reserved `image` entry for an args tree, carrying the worker image `image`
+/// (a resolved ref: `docker://…` or a git-image hash). A git-docker image *is* a
+/// git tree, so it rides embedded — the entry references that tree directly, so
+/// the image travels inside the request's object graph and materializes as a real
+/// directory at `/cas/args/image`. A `docker://` ref has no git object to embed,
+/// so it rides as a blob naming the registry ref.
+fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::Entry, String> {
+    use gix::objs::tree::{Entry, EntryKind};
+    let (mode, oid) = if is_hex_hash(image) {
+        (EntryKind::Tree, parse_oid(image)?)
+    } else {
+        (EntryKind::Blob, post_object(t, "blob", image.as_bytes())?)
+    };
+    Ok(Entry {
+        mode: mode.into(),
+        filename: b"image".to_vec().into(),
+        oid,
+    })
+}
+
+/// Bundle a run request as a content-addressed object: a tree `{args, std,
+/// salt}` — `std`/`salt` as blobs, `args` as the args subtree (which carries the
+/// worker image under its reserved `image` entry — see [`image_arg_entry`]). Its
 /// hash is the request id: the server's cache key and the result-ref rendezvous.
-/// (The git-docker image's own objects aren't reachable from here — `image` is a
-/// blob naming it by hash — so the CLI pushes them separately.)
 fn build_request(
     t: &dyn Transport,
-    image: &str,
     args_tree: &gix::ObjectId,
     std: &str,
     salt: &str,
 ) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
     let entries = vec![
-        Entry {
-            mode: EntryKind::Blob.into(),
-            filename: b"image".to_vec().into(),
-            oid: post_object(t, "blob", image.as_bytes())?,
-        },
         Entry {
             mode: EntryKind::Tree.into(),
             filename: b"args".to_vec().into(),

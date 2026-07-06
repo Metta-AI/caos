@@ -31,7 +31,8 @@
 //! so it must be the same network the server runs on (default `caos-net`).
 //!
 //! Compute results are cached in Redis (`CAOS_REDIS_ADDR`, default
-//! `caos-redis:6379`): the key is the image + args-tree hash, the value the
+//! `caos-redis:6379`): the key is the request hash (the args tree — which carries
+//! the worker image — plus std and salt), the value the
 //! result hash. A hit skips the container entirely. Redis is best-effort — if
 //! it's unreachable we log and run uncached.
 //!
@@ -145,7 +146,13 @@ fn main() {
         };
         git(&["init", "-q", "--bare", &git_dir]);
         git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
-        git(&["-C", &git_dir, "config", "uploadpack.allowAnySHA1InWant", "true"]);
+        git(&[
+            "-C",
+            &git_dir,
+            "config",
+            "uploadpack.allowAnySHA1InWant",
+            "true",
+        ]);
     }
 
     // Open the object database once as a thread-safe handle; each request thread

@@ -54,8 +54,8 @@ fn sum_children() -> Result<u64, String> {
     let mut total = 0u64;
     for child in entries(&children)? {
         caos(["get", path(&child)])?; // expand the placeholder to its bytes
-        let text = fs::read_to_string(&child)
-            .map_err(|e| format!("reading {}: {e}", child.display()))?;
+        let text =
+            fs::read_to_string(&child).map_err(|e| format!("reading {}: {e}", child.display()))?;
         total += text
             .trim()
             .parse::<u64>()
