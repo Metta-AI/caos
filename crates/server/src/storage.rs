@@ -84,6 +84,30 @@ fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpEr
     Ok((kind, content))
 }
 
+/// Store a blob in the object database, returning its id. Compute uses this to
+/// build the args/request objects for promise sub-runs (see `compute`); the
+/// shape matches what a client would POST, so the hashes — and therefore the
+/// cache keys — are identical no matter who builds the request.
+pub(crate) fn store_git_blob(config: &Config, content: &[u8]) -> Result<gix::ObjectId, String> {
+    let repo = config.repo.to_thread_local();
+    repo.write_blob(content)
+        .map(|id| id.detach())
+        .map_err(|e| format!("writing blob: {e}"))
+}
+
+/// Encode `entries` as a git tree (sorted into git's required order) and store
+/// it, returning its id. The server-side counterpart of the client's `post_tree`.
+pub(crate) fn store_git_tree(
+    config: &Config,
+    mut entries: Vec<gix::objs::tree::Entry>,
+) -> Result<gix::ObjectId, String> {
+    entries.sort();
+    let repo = config.repo.to_thread_local();
+    repo.write_object(&gix::objs::Tree { entries })
+        .map(|id| id.detach())
+        .map_err(|e| format!("writing tree: {e}"))
+}
+
 /// Fetch and parse a git tree from the in-process object database.
 pub(crate) fn fetch_tree(config: &Config, hash: &str) -> Result<Vec<TreeEntry>, String> {
     let (kind, content) = fetch_object(config, hash)?;

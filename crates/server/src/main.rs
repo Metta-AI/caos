@@ -22,12 +22,13 @@
 //! entrypoint/command. `caos entrypoint` populates `/cas/args` from `<hash>`,
 //! runs `/worker`, and prints the hash recorded at `/cas/out` on its stdout —
 //! which `docker run` forwards to ours, so the container's stdout *is* the
-//! result hash. We return it as the response body.
+//! result hash (or a `promise` the compute half resolves after the container
+//! exits — see `design/map-then.md`). We return the final result as the
+//! response body.
 //!
 //! The server's own URL (`CAOS_SERVER_URL`) is injected so the worker can reach
-//! storage and — for a worker that itself calls `caos run`, like the fold worker
-//! — call back into compute. The container reaches us over the Docker network, so
-//! it must be the same network the server runs on (default `caos-net`).
+//! storage (`caos get`/`put`). The container reaches us over the Docker network,
+//! so it must be the same network the server runs on (default `caos-net`).
 //!
 //! Compute results are cached in Redis (`CAOS_REDIS_ADDR`, default
 //! `caos-redis:6379`): the key is the image + args-tree hash, the value the
@@ -63,9 +64,9 @@ const DEFAULT_ADDR: &str = "[::]:80";
 const DEFAULT_NETWORK: &str = "caos-net";
 
 /// This server's URL as seen from inside the Docker network, passed into each
-/// worker container — for both storage (`caos get`/`put`) and compute (a worker
-/// that calls `caos run`, e.g. the fold worker, which recurses). Override with
-/// `CAOS_SERVER_URL`.
+/// worker container for storage (`caos get`/`put` — workers never call back
+/// into compute; their sub-runs are promises the server resolves). Override
+/// with `CAOS_SERVER_URL`.
 const DEFAULT_SERVER_URL: &str = "http://caos-server";
 
 /// Where the git object database lives (the storage half, now in-process).
@@ -187,12 +188,11 @@ fn main() {
         config.redis_addr,
     );
 
-    // One thread per request, not a serial loop: a worker can itself call back
-    // into us (the fold worker recurses via `caos run`), and that nested request
-    // must be served while its parent's request is still blocked waiting on the
-    // `docker run` it spawned. A serial loop — or any pool smaller than the tree
-    // is deep — would deadlock. Threads are cheap here: each just blocks in
-    // `docker run`'s `waitpid`.
+    // One thread per request, not a serial loop: a worker fetches its inputs
+    // from `/object` while its own `/run` request is still being served, and
+    // several top-level runs may be in flight at once. Threads are cheap here:
+    // each mostly blocks in `docker run`'s `waitpid` (compute fans out its own
+    // threads for parallel promise maps — see compute::resolve_promise).
     for request in server.incoming_requests() {
         let config = Arc::clone(&config);
         std::thread::spawn(move || {

@@ -3,8 +3,9 @@
 //! There are two clients (see the crate's `bin/`):
 //!
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
-//!   It talks to the server over HTTP (`/object`, `/run`) and runs the container
-//!   `entrypoint`.
+//!   It talks to the server over HTTP (`/object`) and runs the container
+//!   `entrypoint`. It never triggers compute — its `run` records a map-then
+//!   continuation the server resolves after the worker exits.
 //! * **`caos-cli`** — the user-facing client. It uses the server as a `caos` git
 //!   remote, building objects in the local working repo and exchanging them with
 //!   the server by negotiated push/fetch.
@@ -35,18 +36,11 @@ use gix::objs::WriteTo;
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
-/// The chain of `(image, args)` computations currently in progress, set by the
-/// server on each worker it spawns. `caos run` echoes it back so the
-/// server can detect a run that re-enters a computation already on the stack
-/// (an unresolvable cycle). It rides in env, never the args tree, so the result
-/// cache key (image + args) is unaffected.
-pub const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
-
 /// The built-in tree hash (`std`) in effect for this run. The server sets it on
-/// each worker it spawns (materialized at `/cas/std`); `caos run` echoes it back
-/// so it threads down the whole tree. At the top it's unset, and the ref named by
-/// [`STD_REF_ENV`] is resolved instead. Unlike the run stack, `std` *is* part of
-/// the result cache key (it names the standard library a worker can reach).
+/// each worker it spawns (materialized at `/cas/std`) and threads it into every
+/// promise sub-run, so it rides down the whole tree. At the top it's unset, and
+/// the ref named by [`STD_REF_ENV`] is resolved instead. `std` *is* part of the
+/// result cache key (it names the standard library a worker can reach).
 pub const STD_ENV: &str = "CAOS_STD";
 /// Ref resolved to `std` at the top of a run (overridable). Default
 /// `refs/caos/std`, read from the local repo.
@@ -55,10 +49,10 @@ pub const DEFAULT_STD_REF: &str = "refs/caos/std";
 
 /// An opaque cache-busting value mixed into every run's request — and so into its
 /// `reqHash` and cache key. Empty by default, so runs are cached purely by their
-/// inputs. Like `std` and the run stack it's threaded: the server injects it into
-/// each worker, whose nested `caos run` reads it back, so a whole run tree shares
-/// one salt. Tests set it to a per-run random value, making their cache entries
-/// collision-free across runs without ever touching Redis.
+/// inputs. Like `std` it's threaded: the server injects it into each worker and
+/// into every promise sub-run, so a whole run tree shares one salt. Tests set it
+/// to a per-run random value, making their cache entries collision-free across
+/// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
 
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
@@ -78,6 +72,10 @@ pub const DEFAULT_CAS_DIR: &str = "/cas";
 
 /// xattr recording the git hash a materialized path came from.
 const HASH_XATTR: &str = "user.caos.hash";
+/// xattr recording a placeholder's result *kind* when it isn't implied by the
+/// node's shape — only `promise` today (a `caos run` continuation, recorded as a
+/// file). Absent on ordinary placeholders: a directory is a tree, a file a blob.
+const KIND_XATTR: &str = "user.caos.kind";
 /// xattr used only by the startup support probe.
 const PROBE_XATTR: &str = "user.caos.probe";
 
@@ -894,9 +892,9 @@ fn write_tree(
 
 /// Record a result as a typed, tagged placeholder at `target`, fetching nothing:
 /// an empty directory for a tree, an empty file for a blob, tagged with `hash` and
-/// owner-only (the placeholder mode). It's an unloaded handle — `caos put`
-/// references it by its recorded hash (no content needed) and `caos get` expands
-/// it on demand — so a `caos run` result never has to come back to the caller.
+/// owner-only (the placeholder mode). A `promise` — the continuation `caos run`
+/// records at `/cas/out` — is a file placeholder additionally tagged with its
+/// kind ([`KIND_XATTR`]), since a promise's shape can't imply it.
 fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String> {
     atomically(target, |tmp| {
         let mode = match kind {
@@ -909,11 +907,29 @@ fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String
                     .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
                 MODE_PLACEHOLDER_FILE
             }
+            "promise" => {
+                std::fs::File::create(tmp)
+                    .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+                xattr::set(tmp, KIND_XATTR, b"promise")
+                    .map_err(|e| format!("setting {KIND_XATTR} on {}: {e}", tmp.display()))?;
+                MODE_PLACEHOLDER_FILE
+            }
             other => return Err(format!("unknown result type {other:?}")),
         };
         set_hash(tmp, hash.as_bytes())?;
         set_mode(tmp, mode)
     })
+}
+
+/// The result kind recorded at `path`: its [`KIND_XATTR`] if present (a promise
+/// placeholder), else implied by shape — a directory is a tree, a file a blob.
+/// What `entrypoint` reports for `/cas/out`.
+pub fn result_kind(path: &Path) -> Result<String, String> {
+    if let Ok(Some(kind)) = xattr::get(path, KIND_XATTR) {
+        return String::from_utf8(kind)
+            .map_err(|e| format!("invalid {KIND_XATTR} on {}: {e}", path.display()));
+    }
+    Ok(if path.is_dir() { "tree" } else { "blob" }.to_string())
 }
 
 /// Build content at a unique temp sibling of `target` via `build`, then rename
@@ -1434,6 +1450,15 @@ fn build_arg_entries(
                 }
                 cas_entry(&canon)?
             }
+            // `--name:@=/cas/std/<name>` off-worker — the CLI has no `/cas`, but
+            // a builtin ref is meaningful there too (e.g. currying the runner
+            // image into the rustc builder): resolve it against the published
+            // library, the same vocabulary the image argument uses.
+            ArgValue::Path(p) if cas.is_none() && p.starts_with(&std_arg_prefix()) => {
+                let name = &p[std_arg_prefix().len()..];
+                let hash = resolve_std_image(t, name)?;
+                (EntryKind::Tree.into(), parse_oid(&hash)?)
+            }
             // `--name:@=path` elsewhere — ingest a host path (git transport only;
             // the worker has no host filesystem, so it errors clearly).
             ArgValue::Path(p) => t.ingest_path(p)?.ok_or_else(|| {
@@ -1492,10 +1517,10 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
 }
 
 /// Resolve curry layers, build the args tree, bundle + push the request, and run
-/// it — the part of `run` shared by the worker and the CLI. Returns the server's
-/// `(kind, result-hash)`. `cas` is the CAS root, used to resolve `/cas`-path args
-/// (the worker); pass `None` to treat every path arg as a host path to ingest
-/// (the CLI).
+/// it — the CLI's blocking run (the worker never triggers compute; its sub-runs
+/// are continuations the server resolves). Returns the server's
+/// `(kind, result-hash)`. `cas` is `None` here: every path arg is a host path to
+/// ingest.
 fn run_request(
     t: &dyn Transport,
     image: &str,
@@ -1533,26 +1558,70 @@ fn run_request(
     request_compute(&t.server_url()?, &req.to_string())
 }
 
-/// `run <image> <output> -- [--name=value ...]` — the *worker* form: assemble the
-/// args (paths under `/cas` reference recorded objects), run `<image>`, and record
-/// the result at `<output>` (a direct child of the CAS) as a typed, tagged
-/// placeholder — fetching nothing. It stays on the server; `caos get <output>`
-/// loads it on demand. (The user-facing CLI uses [`cli_run`] instead.)
-pub fn caos_run(
-    t: &dyn Transport,
-    image: &str,
-    output: &str,
-    kvs: &[String],
-) -> Result<(), String> {
-    let cas = cas_dir();
-    let target = validate_target(&cas, output)?;
-    probe_xattr(&cas)?;
+/// `run <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a
+/// map-then continuation `{in, map?, then?}` as this worker's result at
+/// `/cas/out`, fetching and running nothing. The worker then exits, and the
+/// *server* resolves the continuation — `map` over each child of `in` in
+/// parallel, then `then(--in, --children)` — with no worker slot held (see
+/// `design/map-then.md`). So `caos run` is a tail call: it produces `/cas/out`
+/// itself and must be the worker's final act. At least one of `--map`/`--then`
+/// is required; each names an image (a `/cas` path, resolved to the hash
+/// recorded on it, or a git/curry hash or `docker://` ref, passed through).
+/// (The user-facing CLI's blocking run is [`cli_run`].)
+pub fn caos_run(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
+    use gix::objs::tree::{Entry, EntryKind};
 
-    // A CAS path becomes the git hash recorded on it; a `docker://` ref or a bare
-    // hash is sent through unchanged.
-    let image = resolve_run_image(&cas, image)?;
-    let (kind, result) = run_request(t, &image, Some(&cas), kvs)?;
-    write_placeholder(&target, &kind, &result)
+    let cas = cas_dir();
+    probe_xattr(&cas)?;
+    let out = cas.join("out");
+    if std::fs::symlink_metadata(&out).is_ok() {
+        return Err(format!(
+            "{} already exists; `caos run` records the worker's result, so it must \
+             be the worker's final act",
+            out.display()
+        ));
+    }
+
+    // `in` is the data node the continuation is over: an existing CAS path,
+    // referenced as a real tree entry (mode + recorded hash) so the server knows
+    // its shape without fetching anything.
+    let in_path = validate_descendant(&cas, input)?;
+    let (in_mode, in_oid) = cas_entry(&in_path)?;
+    let mut entries = vec![Entry {
+        mode: in_mode,
+        filename: b"in".to_vec().into(),
+        oid: in_oid,
+    }];
+
+    for kv in kvs {
+        let (name, value) = parse_kv(kv)?;
+        if name != "map" && name != "then" {
+            return Err(format!(
+                "`run` takes only --map and --then (each an image ref), got --{name}"
+            ));
+        }
+        if entries.iter().any(|e| entry_name(e) == name.as_bytes()) {
+            return Err(format!("--{name} given twice"));
+        }
+        // Literal or path form, the value names an image; resolve_run_image
+        // handles all the shapes (a /cas path, a bare hash, docker://).
+        let image = match value {
+            ArgValue::Literal(v) => v,
+            ArgValue::Path(p) => p,
+        };
+        let resolved = resolve_run_image(&cas, image)?;
+        entries.push(Entry {
+            mode: EntryKind::Blob.into(),
+            filename: name.as_bytes().to_vec().into(),
+            oid: post_object(t, "blob", resolved.as_bytes())?,
+        });
+    }
+    if entries.len() == 1 {
+        return Err("`run` needs --map and/or --then".to_string());
+    }
+
+    let continuation = post_tree(t, entries)?;
+    write_placeholder(&out, "promise", &continuation.to_string())
 }
 
 /// `run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]`
@@ -1737,11 +1806,15 @@ fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
 /// the same path directly against the published library, so one vocabulary works
 /// in both places.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    let prefix = format!("{DEFAULT_CAS_DIR}/std/");
-    match image.strip_prefix(&prefix) {
+    match image.strip_prefix(&std_arg_prefix()) {
         Some(name) => resolve_std_image(t, name),
         None => Ok(image.to_string()),
     }
+}
+
+/// The path prefix that names a builtin off-worker (`/cas/std/`).
+fn std_arg_prefix() -> String {
+    format!("{DEFAULT_CAS_DIR}/std/")
 }
 
 /// Resolve a std builtin `<name>` to its git-docker image hash by looking it up in
@@ -1795,6 +1868,8 @@ fn std_tree() -> Result<String, String> {
 /// a ref (a git hash) to the resulting curried image. The ref can be `run` —
 /// which supplies the rest of the args — or `curry`'d again, exactly like any
 /// image; the binding is partial application, not a rebuilt container image.
+/// This is the *worker* form: path args resolve against `/cas`. (The CLI's is
+/// [`cli_curry`].)
 ///
 /// The curried image is a small CAS tree: a `base` blob (the underlying image
 /// ref), an `args` subtree (the bound args, in `build_arg_entries` shape), and a
@@ -1802,15 +1877,42 @@ fn std_tree() -> Result<String, String> {
 /// bindings are folded in and `base` stays a plain (docker/git) image, so the
 /// result is canonical (`curry (curry img a) b` == `curry img a b`).
 pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+    let cas = cas_dir();
+    let image = resolve_run_image(&cas, image)?;
+    println!("{}", curry_object(t, &image, Some(&cas), kvs)?);
+    Ok(())
+}
+
+/// `curry <image> -- [--name=value ...]` — the *CLI* form of [`caos_curry`]:
+/// `<image>` may be a `/cas/std/<name>` builtin, path args are host paths to
+/// ingest (or `/cas/std/<name>` builtin refs), and the curried image is pushed
+/// so a later `run` can use the printed ref directly.
+pub fn cli_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+    let image = resolve_cli_image(t, image)?;
+    let curried = curry_object(t, &image, None, kvs)?;
+    t.ensure_pushed(&curried.to_string())?;
+    if is_hex_hash(&image) {
+        t.ensure_pushed(&image)?;
+    }
+    println!("{curried}");
+    Ok(())
+}
+
+/// Build (and store) a curry node over the resolved `image`: the shared body of
+/// [`caos_curry`] / [`cli_curry`]. `cas` decides how path args resolve, exactly
+/// as in [`run_request`].
+fn curry_object(
+    t: &dyn Transport,
+    image: &str,
+    cas: Option<&Path>,
+    kvs: &[String],
+) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
 
-    let cas = cas_dir();
-
-    let image = resolve_run_image(&cas, image)?;
-    let (image, bound) = unwrap_curry(t, &image)?;
+    let (image, bound) = unwrap_curry(t, image)?;
 
     // New bindings override any already bound to the same name.
-    let args = merge_entries(bound, build_arg_entries(t, Some(&cas), kvs)?);
+    let args = merge_entries(bound, build_arg_entries(t, cas, kvs)?);
     let args_tree = post_tree(t, args)?;
 
     let entries = vec![
@@ -1830,8 +1932,7 @@ pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), 
             oid: post_object(t, "blob", b"1")?,
         },
     ];
-    println!("{}", post_tree(t, entries)?);
-    Ok(())
+    post_tree(t, entries)
 }
 
 /// Peel any curry layers off `image` (a resolved ref: `docker://…` or a git
@@ -1912,16 +2013,10 @@ fn merge_entries(
 }
 
 /// Trigger compute for request `req` and return the result's `(type, hash)`. The
-/// server runs the container and replies `"<type> <hash>"`. `&stack=` rides along
-/// for cycle detection — it's threaded state, not part of the request's identity.
+/// server runs the container (resolving any promise it leaves behind) and
+/// replies with the final `"<type> <hash>"`.
 fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
-    let mut url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
-    if let Ok(stack) = std::env::var(RUN_STACK_ENV) {
-        if !stack.is_empty() {
-            url.push_str("&stack=");
-            url.push_str(&percent_encode(&stack));
-        }
-    }
+    let url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
     let body = http_get(&url)?;
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
@@ -1933,21 +2028,6 @@ fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
-}
-
-/// Percent-encode a string for use as a URL query value: unreserved characters
-/// pass through, everything else becomes `%XX`.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),

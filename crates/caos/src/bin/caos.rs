@@ -1,12 +1,13 @@
 //! caos: the worker-side client, baked setuid-root into worker images as
 //! `/bin/caos`.
 //!
-//! It speaks HTTP to the server (`/object` for storage, `/run` for compute) via
+//! It speaks HTTP to the server (`/object`, for storage) via
 //! [`caos::HttpTransport`], and provides the container `entrypoint` — which sets
 //! up the root-owned `/cas`, runs `/worker` as an unprivileged user, and prints
-//! the hash recorded at `/cas/out`. The shared command logic lives in the `caos`
-//! library; this binary is the worker's CLI surface plus the privileged
-//! entrypoint.
+//! the kind + hash recorded at `/cas/out`. It never triggers compute: its `run`
+//! records a map-then continuation the server resolves after the worker exits.
+//! The shared command logic lives in the `caos` library; this binary is the
+//! worker's CLI surface plus the privileged entrypoint.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `run`, `curry`, and `entrypoint`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
@@ -58,12 +59,11 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(src), Some(dst), None) => caos::put(&http()?, src, dst),
             _ => Err(usage(args)),
         },
-        // `run <image> <output> -- [--name=value | --name:@=path ...]`. The `--` separates the
-        // fixed arguments from the (possibly empty) list of key/value args.
+        // `run <in> -- [--map=<image>] [--then=<image>]` — record a map-then
+        // continuation over the CAS path `<in>` as this worker's result at
+        // /cas/out (a tail call; the server resolves it after the worker exits).
         Some("run") => match &args[2..] {
-            [image, output, sep, kvs @ ..] if sep == "--" => {
-                caos::caos_run(&http()?, image, output, kvs)
-            }
+            [input, sep, kvs @ ..] if sep == "--" => caos::caos_run(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
         // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an image, printing
@@ -96,14 +96,13 @@ fn http() -> Result<HttpTransport, String> {
 /// frees until the VM is clean for the next job.
 static SLOT: Mutex<()> = Mutex::new(());
 
-/// A dispatched job: which args tree to run, plus the std/salt/run-stack the
-/// server used to thread through the container env. The worker is reused across
-/// jobs, so these arrive per-request rather than as process env.
+/// A dispatched job: which args tree to run, plus the std/salt the server used
+/// to thread through the container env. The worker is reused across jobs, so
+/// these arrive per-request rather than as process env.
 struct Job {
     args: String,
     std: String,
     salt: String,
-    stack: String,
 }
 
 /// `serve` — run as a long-lived HTTP worker instead of a one-shot container.
@@ -167,7 +166,6 @@ fn run_and_reply(request: Request, job: &Job, _slot: &std::sync::MutexGuard<'_, 
         .arg(format!("--args={}", job.args))
         .env(caos::STD_ENV, &job.std)
         .env(caos::SALT_ENV, &job.salt)
-        .env(caos::RUN_STACK_ENV, &job.stack)
         .output();
 
     match out {
@@ -175,7 +173,11 @@ fn run_and_reply(request: Request, job: &Job, _slot: &std::sync::MutexGuard<'_, 
         Ok(o) => respond(
             request,
             500,
-            &format!("worker failed ({}):\n{}", o.status, String::from_utf8_lossy(&o.stderr)),
+            &format!(
+                "worker failed ({}):\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            ),
         ),
         Err(e) => respond(request, 500, &format!("spawning entrypoint: {e}")),
     }
@@ -205,7 +207,6 @@ fn parse_job(body: &str) -> Result<Job, String> {
         args,
         std: field("std"),
         salt: field("salt"),
-        stack: field("stack"),
     })
 }
 
@@ -232,7 +233,11 @@ fn reap_uid(uid: u32) {
         return;
     };
     for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
             continue;
         };
         if pid == me {
@@ -276,7 +281,7 @@ fn usage(args: &[String]) -> String {
         "usage:\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
-         {prog} run <image> <output-cas-path> -- [--name=value | --name:@=path ...]\n  \
+         {prog} run <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
          {prog} entrypoint [--args=<hash>]\n  \
          {prog} serve"
@@ -348,10 +353,12 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
     // Everything under /cas got there via get/put/run, which tag each path with
     // its hash, so /cas/out already knows its hash — read it (and its type) back
     // before teardown. The server returns this `"<type> <hash>"` to the caller so
-    // it can record a correctly-typed result placeholder without fetching.
+    // it can record a correctly-typed result placeholder without fetching — or,
+    // for a `promise` (a map-then continuation `caos run` recorded), resolves it
+    // now that this container is exiting and its slot is free.
     let out = cas.join("out");
     let hash = caos::read_hash(&out)?;
-    let kind = if out.is_dir() { "tree" } else { "blob" };
+    let kind = caos::result_kind(&out)?;
 
     // Tear down.
     remove_cas(&cas)?;

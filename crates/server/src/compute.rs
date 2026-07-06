@@ -3,9 +3,17 @@
 //! A request is a content-addressed tree `{image, args, std, salt}`; `/run?req=<hash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
 //! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
-//! the registry) → the worker container run, whose stdout is `"<type> <hash>"`.
-//! A top-level run also pins `refs/caos/res/<req>` at the result. Results,
-//! converted images, and built layers are all cached in Redis (best-effort).
+//! the registry) → the worker container run, whose stdout is `"<type> <hash>"` —
+//! or `"promise <hash>"`, a map-then continuation the worker left behind instead
+//! of a value, which [`resolve_promise`] resolves *after* the container has
+//! exited (see `design/map-then.md`). A top-level run also pins
+//! `refs/caos/res/<req>` at the (fully resolved) result. Results, converted
+//! images, and built layers are all cached in Redis (best-effort).
+//!
+//! Workers never wait on other workers: a container either computes a value or
+//! describes the remaining work (its promise) and exits. Only server threads
+//! block, so the `CAOS_MAX_WORKERS` bound on concurrent containers (see
+//! [`acquire_worker_slot`]) cannot deadlock.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,12 +23,12 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::storage::{fetch_blob, fetch_tree};
+use crate::storage::{fetch_blob, fetch_tree, store_git_blob, store_git_tree};
 use crate::{Config, HttpError};
 
 /// Repository name converted images are pushed under. They're addressed by
@@ -50,12 +58,21 @@ const MEMORY_LABEL: &str = "caos.fly.memory-mb";
 /// trivial workers (hello, bash, a typical produced worker).
 const DEFAULT_WORKER_MEMORY_MB: u32 = 256;
 
-/// Env var carrying the run stack — the newline-separated `(image, args)`
-/// computations currently in progress. We set it on each spawned worker (this
-/// computation appended); `caos run` echoes it back via the `stack` query param
-/// so we can catch a run that re-enters a computation already on the stack.
-/// Threaded through env, never the args tree, so it doesn't affect the cache key.
-const RUN_STACK_ENV: &str = "CAOS_RUN_STACK";
+/// Result type a worker reports when its output is a map-then continuation to
+/// resolve rather than a final value (the hash names the continuation tree).
+const PROMISE_KIND: &str = "promise";
+
+/// Marker entry naming a curry node — a tree pairing a `base` image ref with an
+/// `args` subtree of bound arguments (mirrors the client's `CURRY_MARKER`).
+/// Promise resolution unwraps these server-side so `pre`/`map`/`then` can be
+/// curried images.
+const CURRY_MARKER: &str = ".caos-curry";
+
+/// Env var bounding concurrent worker containers across the whole server
+/// (`0` = unlimited). Safe at any setting ≥ 1: a worker never waits on another
+/// worker, so a slot always frees (see `design/map-then.md`).
+const MAX_WORKERS_ENV: &str = "CAOS_MAX_WORKERS";
+const DEFAULT_MAX_WORKERS: u32 = 8;
 
 /// Reserved suffix for the per-entry permission sidecars `import-image` writes.
 const META_SUFFIX: &str = ".caosmeta";
@@ -63,25 +80,41 @@ const META_SUFFIX: &str = ".caosmeta";
 /// Disambiguates temp dirs created across handler threads.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// `GET /run?req=<reqHash>[&stack=...]` — run the request object `<reqHash>` (a
-/// tree `{image, args, std, salt}`) and return its result as `"<type> <hash>"`.
+/// `GET /run?req=<reqHash>` — run the request object `<reqHash>` (a tree
+/// `{image, args, std, salt}`) and return its result as `"<type> <hash>"`.
 ///
 /// The request being a content-addressed object means `reqHash` *is* the cache
-/// key (it captures image + args + std) and the rendezvous id: a top-level run
-/// also pins `refs/caos/res/<reqHash>` at the result, so a client can fetch it by
-/// ref. Workers POST the request via `/object` and call this; the CLI pushes it.
+/// key (it captures image + args + std) and the rendezvous id: an external run
+/// also pins `refs/caos/res/<reqHash>` at the result, so a client can fetch it
+/// by ref. Only external callers reach this endpoint now (the CLI, which pushed
+/// the request): workers never call back into `/run` — a worker's sub-runs are
+/// promise resolutions the server performs itself ([`run_req`] recursion).
 pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let req = query_param(query, "req")
         .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
     if req.is_empty() || !req.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid req hash: {req:?}")));
     }
+    // An HTTP run is by definition top-level: the run stack (cycle detection)
+    // exists only inside the server, threaded through promise sub-runs.
+    let result = run_req(config, &req, &[])?;
+    // Pin an external run's result so a client can fetch it by ref and it
+    // survives gc; sub-runs set no ref (they'd flood the namespace).
+    pin_result(config, &req, &result);
+    Ok(format!("{result}\n").into_bytes())
+}
 
+/// Run request `req` with `stack` the chain of ancestor request hashes (empty =
+/// top-level), returning the fully-resolved `"<type> <hash>"`. The whole
+/// pipeline behind both `GET /run` and promise sub-runs: cache lookup →
+/// run-cycle detection → the container run → promise resolution → cache store.
+fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpError> {
     // Unpack the request: image (a ref blob), args (a tree), std (a ref blob),
     // salt (an opaque blob). `std` names the standard library, materialized at
     // `/cas/std` in the worker; `salt` is a cache-buster. Both are part of the
-    // request (hence the key) and threaded into the worker.
-    let (image, args, std, salt) = read_request(config, &req)?;
+    // request (hence the key), threaded into the worker, and inherited by any
+    // promise sub-runs this request leaves behind.
+    let (image, args, std, salt) = read_request(config, req)?;
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
     }
@@ -93,25 +126,15 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         return Err(HttpError::new(400, format!("invalid std hash: {std:?}")));
     }
 
-    // The run stack (cycle detection) is the chain of request hashes in progress,
-    // threaded through nested runs via CAOS_RUN_STACK (echoed back as `stack`). An
-    // empty stack means this is a top-level (external) run — the one we pin a
-    // result ref for; nested runs are transient.
-    let incoming = query_param(query, "stack").unwrap_or_default();
-    let stack: Vec<&str> = incoming.lines().filter(|l| !l.is_empty()).collect();
-    let top_level = stack.is_empty();
-
     // The request hash is the cache key (it captures image+args+std); the value is
-    // the result "<type> <hash>". A hit skips image conversion and the container
+    // the final result "<type> <hash>" — a promise is resolved before it's cached,
+    // so a hit never re-resolves. A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
     let key = format!("caos:result:{req}");
     match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
             eprintln!("cache hit: req={req} -> {result}");
-            if top_level {
-                pin_result(config, &req, &result);
-            }
-            return Ok(format!("{result}\n").into_bytes());
+            return Ok(result);
         }
         Ok(None) => eprintln!("cache miss: req={req} (image={image} args={args}); running worker"),
         Err(e) => eprintln!("cache lookup failed ({e}); running worker: req={req}"),
@@ -121,9 +144,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // the cycle. (A cache hit can't be on the stack: a cyclic computation never
     // completes, so it never caches, which is why checking only on a miss is
     // sound.) The request hash is exactly this frame's identity.
-    if let Some(pos) = stack.iter().position(|&f| f == req) {
-        let mut cycle: Vec<&str> = stack[pos..].to_vec();
-        cycle.push(&req);
+    if let Some(pos) = stack.iter().position(|f| f == req) {
+        let mut cycle: Vec<&str> = stack[pos..].iter().map(String::as_str).collect();
+        cycle.push(req);
         let listing = cycle.join("\n  -> ");
         eprintln!("run cycle detected:\n  {listing}");
         return Err(HttpError::new(
@@ -131,10 +154,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
             format!("run cycle detected:\n  {listing}"),
         ));
     }
-    // Child runs see this computation as an ancestor.
-    let mut child_stack: Vec<&str> = stack.clone();
-    child_stack.push(&req);
-    let child_stack = child_stack.join("\n");
+    // Promise sub-runs see this computation as an ancestor.
+    let mut child_stack: Vec<String> = stack.to_vec();
+    child_stack.push(req.to_string());
 
     // Run the worker. `Docker` spawns a fresh container per request (the default);
     // `Serve` POSTs to a long-lived `caos serve` container (the local stand-in for
@@ -144,16 +166,23 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     // Image resolution differs by backend: Docker/Serve convert a git image into
     // the local registry and run it by digest; Fly converts it straight into the
     // stack's shared fly repo (no local registry), so it resolves the image itself.
-    let result = match config_backend() {
-        Backend::Serve => {
-            let docker_ref = resolve_image(config, &image)?;
-            dispatch_serve(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
+    //
+    // The worker-slot guard bounds concurrent containers; it's held only for the
+    // container's own lifetime — never across promise resolution below — so a
+    // full pool always drains.
+    let result = {
+        let _slot = acquire_worker_slot();
+        match config_backend() {
+            Backend::Serve => {
+                let docker_ref = resolve_image(config, &image)?;
+                dispatch_serve(config, &docker_ref, &image, &args, &std, &salt)?
+            }
+            Backend::Docker => {
+                let docker_ref = resolve_image(config, &image)?;
+                dispatch_docker(config, &docker_ref, &args, &std, &salt)?
+            }
+            Backend::Fly => dispatch_fly(config, &image, &args, &std, &salt)?,
         }
-        Backend::Docker => {
-            let docker_ref = resolve_image(config, &image)?;
-            dispatch_docker(config, &docker_ref, &args, &std, &salt, &child_stack)?
-        }
-        Backend::Fly => dispatch_fly(config, &image, &args, &std, &salt, &child_stack)?,
     };
 
     if result_hash(&result).is_empty() {
@@ -164,19 +193,312 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         ));
     }
 
-    // Cache the result for next time (best-effort).
+    // A promise is not a value: the worker exited leaving a map-then continuation
+    // behind. Resolve it — the container (and its slot) are already gone.
+    let result = match result.split_once(' ') {
+        Some((PROMISE_KIND, cont)) => {
+            eprintln!("resolving promise: req={req} -> continuation {cont}");
+            resolve_promise(config, cont, &std, &salt, &child_stack)?
+        }
+        _ => result,
+    };
+
+    // Cache the (resolved) result for next time (best-effort).
     match cache_set(&config.redis_addr, &key, &result) {
         Ok(()) => eprintln!("ran worker: req={req} -> {result} (cached)"),
         Err(e) => eprintln!("ran worker: req={req} -> {result} (cache store failed: {e})"),
     }
 
-    // Pin a top-level (external) run's result so a client can fetch it by ref and
-    // it survives gc; nested runs set no ref (they'd flood the namespace).
-    if top_level {
-        pin_result(config, &req, &result);
+    Ok(result)
+}
+
+// ---- Promise resolution ------------------------------------------------------
+
+/// Resolve a map-then continuation — a tree `{in, map?, then?}` where `in` is a
+/// real tree entry (the data node) and `map`/`then` are blobs naming images (see
+/// `design/map-then.md`):
+///
+/// 1. if `map` is given: run `map --in=<child>` for each child of `in` in
+///    parallel (a blob `in` is a leaf — no children), assembling the results
+///    into a `children` tree under the original names;
+/// 2. the result is `then(--in=<in>[, --children=<children>])` if `then` is
+///    given (`children` only when `map` ran), else the `children` tree itself.
+///
+/// Every sub-run goes through [`run_req`], so promises nest arbitrarily and each
+/// sub-run gets its own memoization and cycle detection (via `stack`).
+fn resolve_promise(
+    config: &Config,
+    cont: &str,
+    std: &str,
+    salt: &str,
+    stack: &[String],
+) -> Result<String, HttpError> {
+    use gix::objs::tree::EntryKind;
+
+    let mut input: Option<gix::objs::tree::Entry> = None;
+    let (mut map, mut then) = (None, None);
+    for entry in fetch_tree(config, cont)
+        .map_err(|e| HttpError::new(500, format!("reading continuation {cont}: {e}")))?
+    {
+        match entry.name.as_str() {
+            "in" => input = Some(named_entry("in", entry.mode, entry.oid)),
+            "map" => map = Some(blob_string(config, &entry.oid.to_string())?),
+            "then" => then = Some(blob_string(config, &entry.oid.to_string())?),
+            other => {
+                return Err(HttpError::new(
+                    500,
+                    format!("continuation {cont} has unknown entry {other:?}"),
+                ))
+            }
+        }
+    }
+    let input = input
+        .ok_or_else(|| HttpError::new(500, format!("continuation {cont} missing 'in'")))?;
+    if map.is_none() && then.is_none() {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has neither 'map' nor 'then'"),
+        ));
     }
 
-    Ok(format!("{result}\n").into_bytes())
+    // Map the children in parallel — one thread per child, each a full [`run_req`]
+    // (so a child may itself promise). Concurrency is bounded by the worker-slot
+    // semaphore, not the thread count; threads are cheap and mostly blocked. A
+    // blob `in` is a leaf: nothing to map, an empty children tree.
+    let children: Vec<gix::objs::tree::Entry> = match &map {
+        Some(img) if input.mode.is_tree() => {
+            let kids = fetch_tree(config, &input.oid.to_string())
+                .map_err(|e| HttpError::new(500, format!("reading map source: {e}")))?;
+            let results: Vec<Result<gix::objs::tree::Entry, HttpError>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = kids
+                        .iter()
+                        .map(|kid| {
+                            let img = img.as_str();
+                            scope.spawn(move || {
+                                let arg = named_entry("in", kid.mode, kid.oid);
+                                let result =
+                                    run_image(config, img, vec![arg], std, salt, stack)?;
+                                result_entry(&kid.name, &result)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                Err(HttpError::new(500, "a map worker thread panicked"))
+                            })
+                        })
+                        .collect()
+                });
+            // Every child ran to completion (or failure) before we got here; the
+            // first failure fails the whole map, exactly like a failing child in
+            // the old recursive fold.
+            results.into_iter().collect::<Result<Vec<_>, _>>()?
+        }
+        _ => Vec::new(),
+    };
+
+    match &then {
+        Some(img) => {
+            // `then` gets the original `in`, plus the mapped children when a map
+            // ran — the (`--in`, `--children`) pair a fold's `post` always took.
+            let mut args = vec![input];
+            if map.is_some() {
+                let children_tree = store_git_tree(config, children)
+                    .map_err(|e| HttpError::new(500, format!("storing children tree: {e}")))?;
+                args.push(named_entry(
+                    "children",
+                    EntryKind::Tree.into(),
+                    children_tree,
+                ));
+            }
+            run_image(config, img, args, std, salt, stack)
+        }
+        // A pure map: the children tree is the result.
+        None => {
+            let children_tree = store_git_tree(config, children)
+                .map_err(|e| HttpError::new(500, format!("storing children tree: {e}")))?;
+            Ok(format!("tree {children_tree}"))
+        }
+    }
+}
+
+/// Run image `image_ref` over the given call args as a promise sub-run: unwrap
+/// any curry layers, build the args tree and the request object `{image, args,
+/// std, salt}` server-side — byte-identical to what a client would build, so the
+/// request hash (and cache key) is the same no matter who assembles it — and
+/// send it through [`run_req`]. Returns `"<type> <hash>"`.
+fn run_image(
+    config: &Config,
+    image_ref: &str,
+    call_args: Vec<gix::objs::tree::Entry>,
+    std: &str,
+    salt: &str,
+    stack: &[String],
+) -> Result<String, HttpError> {
+    use gix::objs::tree::EntryKind;
+
+    let (image, bound) = unwrap_curry(config, image_ref)?;
+    let args = merge_entries(bound, call_args);
+    let store_err = |e: String| HttpError::new(500, format!("building sub-request: {e}"));
+    let args_tree = store_git_tree(config, args).map_err(store_err)?;
+    let entries = vec![
+        named_entry(
+            "image",
+            EntryKind::Blob.into(),
+            store_git_blob(config, image.as_bytes()).map_err(store_err)?,
+        ),
+        named_entry("args", EntryKind::Tree.into(), args_tree),
+        named_entry(
+            "std",
+            EntryKind::Blob.into(),
+            store_git_blob(config, std.as_bytes()).map_err(store_err)?,
+        ),
+        named_entry(
+            "salt",
+            EntryKind::Blob.into(),
+            store_git_blob(config, salt.as_bytes()).map_err(store_err)?,
+        ),
+    ];
+    let req = store_git_tree(config, entries).map_err(store_err)?;
+    run_req(config, &req.to_string(), stack)
+}
+
+/// Peel any curry layers off `image_ref`, returning the underlying plain image
+/// and the args bound into it (outer layers win). The server-side counterpart of
+/// the client's `unwrap_curry`, reading straight from the object database. A
+/// hash that isn't a curry node (a git image, or any other object) passes
+/// through unchanged.
+fn unwrap_curry(
+    config: &Config,
+    image_ref: &str,
+) -> Result<(String, Vec<gix::objs::tree::Entry>), HttpError> {
+    let mut image = image_ref.to_string();
+    let mut bound: Vec<gix::objs::tree::Entry> = Vec::new();
+    while image.len() == 40 && image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Not a tree at all → not a curry node; let image resolution complain if
+        // it isn't an image either.
+        let Ok(entries) = fetch_tree(config, &image) else {
+            break;
+        };
+        if !entries.iter().any(|e| e.name == CURRY_MARKER) {
+            break;
+        }
+        let find = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.oid.to_string())
+                .ok_or_else(|| {
+                    HttpError::new(500, format!("curry node {image} missing {name:?}"))
+                })
+        };
+        let base = blob_string(config, &find("base")?)?;
+        let args = fetch_tree(config, &find("args")?)
+            .map_err(|e| HttpError::new(500, format!("curry node {image} args: {e}")))?
+            .into_iter()
+            .map(|e| named_entry(&e.name, e.mode, e.oid))
+            .collect();
+        // `bound` holds outer layers, which win over this deeper one.
+        bound = merge_entries(args, bound);
+        image = base;
+    }
+    Ok((image, bound))
+}
+
+/// Merge two sets of tree entries by filename; entries in `high` override those
+/// in `low`. Order is irrelevant — `store_tree` sorts before encoding.
+fn merge_entries(
+    low: Vec<gix::objs::tree::Entry>,
+    high: Vec<gix::objs::tree::Entry>,
+) -> Vec<gix::objs::tree::Entry> {
+    let mut by_name = std::collections::BTreeMap::new();
+    for e in low.into_iter().chain(high) {
+        by_name.insert(e.filename.to_vec(), e);
+    }
+    by_name.into_values().collect()
+}
+
+/// A gix tree entry with the given name.
+fn named_entry(
+    name: &str,
+    mode: gix::objs::tree::EntryMode,
+    oid: gix::ObjectId,
+) -> gix::objs::tree::Entry {
+    gix::objs::tree::Entry {
+        mode,
+        filename: name.as_bytes().to_vec().into(),
+        oid,
+    }
+}
+
+/// Turn a sub-run result `"<type> <hash>"` into a tree entry named `name`.
+fn result_entry(name: &str, result: &str) -> Result<gix::objs::tree::Entry, HttpError> {
+    use gix::objs::tree::EntryKind;
+    let (kind, hash) = result
+        .split_once(' ')
+        .ok_or_else(|| HttpError::new(500, format!("malformed sub-run result: {result:?}")))?;
+    let mode = match kind {
+        "tree" => EntryKind::Tree,
+        "blob" => EntryKind::Blob,
+        other => {
+            return Err(HttpError::new(
+                500,
+                format!("sub-run returned unexpected type {other:?}"),
+            ))
+        }
+    };
+    let oid = gix::ObjectId::from_hex(hash.trim().as_bytes())
+        .map_err(|e| HttpError::new(500, format!("sub-run returned invalid hash: {e}")))?;
+    Ok(named_entry(name, mode.into(), oid))
+}
+
+// ---- Worker slots --------------------------------------------------------------
+
+/// Counting semaphore bounding concurrent worker containers ([`MAX_WORKERS_ENV`]).
+struct WorkerSlots {
+    max: u32,
+    used: Mutex<u32>,
+    available: Condvar,
+}
+
+/// A held worker slot; freed (and a waiter woken) on drop.
+struct WorkerSlot(&'static WorkerSlots);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        let mut used = self.0.used.lock().unwrap_or_else(|p| p.into_inner());
+        *used -= 1;
+        self.0.available.notify_one();
+    }
+}
+
+/// Block until a worker slot is free and take it; `None` when unbounded
+/// (`CAOS_MAX_WORKERS=0`). Deadlock-free because a slot is only ever held for
+/// one container's lifetime — a worker computes or promises, it never waits.
+fn acquire_worker_slot() -> Option<WorkerSlot> {
+    static SLOTS: OnceLock<Option<WorkerSlots>> = OnceLock::new();
+    let slots = SLOTS.get_or_init(|| {
+        let max = std::env::var(MAX_WORKERS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_MAX_WORKERS);
+        (max > 0).then_some(WorkerSlots {
+            max,
+            used: Mutex::new(0),
+            available: Condvar::new(),
+        })
+    });
+    slots.as_ref().map(|s| {
+        let mut used = s.used.lock().unwrap_or_else(|p| p.into_inner());
+        while *used >= s.max {
+            used = s.available.wait(used).unwrap_or_else(|p| p.into_inner());
+        }
+        *used += 1;
+        WorkerSlot(s)
+    })
 }
 
 /// Worker execution backend. `Docker` runs a fresh container per request (the
@@ -206,7 +528,6 @@ fn dispatch_docker(
     args: &str,
     std: &str,
     salt: &str,
-    stack: &str,
 ) -> Result<String, HttpError> {
     let output = Command::new(&config.docker_bin)
         .arg("run")
@@ -215,7 +536,6 @@ fn dispatch_docker(
         .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
         .args(["-e", &format!("CAOS_STD={std}")])
         .args(["-e", &format!("CAOS_SALT={salt}")])
-        .args(["-e", &format!("{RUN_STACK_ENV}={stack}")])
         .args(["--entrypoint", CAOS_BIN])
         .arg(docker_ref)
         .arg("entrypoint")
@@ -250,15 +570,13 @@ fn dispatch_serve(
     args: &str,
     std: &str,
     salt: &str,
-    stack: &str,
 ) -> Result<String, HttpError> {
     let key: String = image.chars().take(16).collect();
     let name = format!("caos-serve-{key}");
     ensure_serve_container(config, docker_ref, &name)?;
 
     let url = format!("http://{name}:8080/run");
-    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
-        .to_string();
+    let body = serde_json::json!({ "args": args, "std": std, "salt": salt }).to_string();
     serve_post(&url, &body)
 }
 
@@ -427,13 +745,11 @@ fn dispatch_fly(
     args: &str,
     std: &str,
     salt: &str,
-    stack: &str,
 ) -> Result<String, HttpError> {
     let fly = Fly::from_env(config)?;
     ensure_worker_app(config, &fly, image)?;
     let app = fly_app_name(&fly, image);
-    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
-        .to_string();
+    let body = serde_json::json!({ "args": args, "std": std, "salt": salt }).to_string();
     dispatch_to_pool(&fly, &app, &body)
 }
 

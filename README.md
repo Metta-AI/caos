@@ -111,17 +111,19 @@ One daemon (`crates/server`), image `caos-server`, serving everything over a
 single URL. It backs onto a git repository it **owns** (mounted at `/git`); in
 dev, Tilt creates a dedicated bare repo for it (see [local testing](#local-testing)).
 
-It serves requests **concurrently — one thread per request** — which is
-required, not just an optimization: a worker can call back into `/run` (the fold
-worker recurses), and that nested request must be served while the parent's is
-still blocked on the `docker run` it spawned. A serial loop, or a pool shallower
-than the deepest tree, would deadlock.
+It serves requests **concurrently — one thread per request** — so a worker can
+fetch objects while its own `/run` is in flight, and several top-level runs can
+proceed at once. Workers never call back into `/run`: a worker that needs
+sub-computations records a **map-then continuation** as its result and exits,
+and the server resolves it (see [compute](#compute)) — so no worker ever waits
+on another worker, and `CAOS_MAX_WORKERS` can bound concurrent containers
+without any risk of deadlock.
 
 | Request | Behaviour |
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
-| `GET /run?req=<reqHash>[&stack=…]` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the result). See [compute](#compute). |
+| `GET /run?req=<reqHash>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). See [compute](#compute). |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
 
 The git transport is what makes the server a `caos` remote: `git http-backend`
@@ -135,7 +137,9 @@ Environment overrides: `SERVER_ADDR` (`0.0.0.0:80`), `CAOS_GIT_DIR` (`/git`),
 `CAOS_DOCKER_NETWORK` (`caos-net`), `CAOS_SERVER_URL` (`http://caos-server`,
 injected into each worker), `CAOS_REGISTRY_PUSH_URL`
 (`http://caos-registry:5000`), `CAOS_REGISTRY_PULL_HOST` (`localhost:5000`),
-`CAOS_DOCKER_BIN` (`docker`), `CAOS_REDIS_ADDR` (`caos-redis:6379`).
+`CAOS_DOCKER_BIN` (`docker`), `CAOS_REDIS_ADDR` (`caos-redis:6379`),
+`CAOS_MAX_WORKERS` (`8`; `0` = unlimited — the bound on concurrent worker
+containers, safe at any setting ≥ 1).
 
 ### Compute
 
@@ -146,22 +150,49 @@ rendezvous id. `GET /run?req=<reqHash>`:
 1. **read** the request tree (`image` ref, `args` tree, `std` tree, `salt`);
 2. **cache** lookup in Redis keyed on `reqHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
-3. **cycle check** — `&stack=` carries the chain of in-progress `reqHash`es
-   (threaded through nested runs via `CAOS_RUN_STACK`); re-entering one on the
-   stack has no fixpoint, so the run fails listing the cycle;
+3. **cycle check** — the server threads the chain of in-progress `reqHash`es
+   through its promise sub-runs (below); re-entering one on the stack has no
+   fixpoint, so the run fails listing the cycle;
 4. **resolve the image** — a `docker://<ref>` is used directly; one of our git
    images is converted to a real image, pushed to the registry, and run by
    digest (see [git images](#git-images));
 5. **run the container**, forcing `/bin/caos entrypoint --args=<args>` with
-   `CAOS_SERVER_URL`, `CAOS_STD`, `CAOS_SALT`, and the child `CAOS_RUN_STACK`
-   injected (so `std`/`salt`/stack thread into nested runs);
-6. its stdout — `"<type> <hash>"` printed by `entrypoint` — is the result;
-7. **cache** it, and for a **top-level** run (empty stack) pin
-   `refs/caos/res/<reqHash>` at the result, for durability and as a fetch/watch
-   point. Nested runs set no ref.
+   `CAOS_SERVER_URL`, `CAOS_STD`, and `CAOS_SALT` injected (`std`/`salt` also
+   thread into promise sub-runs);
+6. its stdout — printed by `entrypoint` — is either the result,
+   `"<type> <hash>"`, or a **promise**, `"promise <hash>"`: a map-then
+   continuation the worker recorded instead of a value (see
+   [map-then](#map-then-sub-computations-without-blocking)). The container is
+   already gone; the server **resolves** the promise — running `map` over the
+   children in parallel, then `then` — through this same pipeline, so sub-runs
+   are cached, cycle-checked, and may themselves promise;
+7. **cache** the resolved result, and for an **external** run (one that arrived
+   over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
+   fetch/watch point. Sub-runs set no ref.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
+
+### Map-then: sub-computations without blocking
+
+A worker never blocks on another worker. Its `caos run` is a **tail call**: it
+records a continuation `{in, map?, then?}` — `in` a tree entry for the data
+node, `map`/`then` blobs naming images — as the worker's own result at
+`/cas/out`, and the worker exits, freeing its slot. The server then:
+
+1. if `map` is given and `in` is a tree: runs `map --in=<child>` for **each
+   child of `in`, in parallel** (a blob `in` is a leaf — no children), and
+   assembles the results into a `children` tree under the original names;
+2. produces the request's result: `then(--in=<in>[, --children=<children>])`
+   if `then` is given (`children` only when `map` ran), else the `children`
+   tree itself. With no `map`, `then(--in)` is a plain tail call.
+
+Recursion ties the knot through `map`: a worker curries *its own image* as the
+mapper, so each child gets the same treatment — and each child may itself
+promise. Because a worker either computes a value or *describes* the remaining
+work, only server threads ever wait; a bounded worker pool
+(`CAOS_MAX_WORKERS`) always drains. See `design/map-then.md` for the full
+argument.
 
 ### Caching
 
@@ -195,15 +226,19 @@ published port (`CAOS_REGISTRY_PULL_HOST`, insecure, no TLS).
 `crates/caos` is one library with two binaries. They share all the object
 logic — the difference is the **transport** and the privilege model.
 
-- **`caos`** (worker-side) talks to the server over **HTTP** (`/object`, `/run`),
-  and provides the container `entrypoint`. It's installed **setuid-root** in
+- **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
+  provides the container `entrypoint`. It's installed **setuid-root** in
   worker images so an unprivileged worker can reach the root-owned `/cas` only
   through it. Subcommands: `get-hash`, `get`, `put`, `run`, `curry`,
-  `entrypoint`.
+  `entrypoint`. Its `run` is a *tail call* — it records a map-then continuation
+  as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
+  it never triggers compute itself.
 - **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
   builds objects in the local working repo and exchanges them by negotiated
-  push/fetch. It has no `/cas` and no object-level commands — just two:
-  - `run` — compute, with the result checked out to any host path;
+  push/fetch. It has no `/cas` and no object-level commands — just three:
+  - `run` — compute (blocking, as before), with the result checked out to any
+    host path;
+  - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
@@ -237,47 +272,46 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos run <image> <output> -- [--name=value | --name:@=path …]` (on `caos-cli`,
-`<output>` may be omitted — see step 5):
+`caos-cli run <image> [output] -- [--name=value | --name:@=path …]` (the
+blocking, user-facing run):
 
 1. assembles the args into a git **tree** (see [arguments](#arguments-literals-and-paths));
 2. bundles `{image, args, std, salt}` into a content-addressed **request object**
    (`reqHash`), where `std` is the standard library in effect (resolved from
    `refs/caos/std`, see [built-ins](#built-ins-casstd));
-3. gets the request onto the server — `caos-cli` **pushes** it (one negotiated
-   `git push` to `refs/caos/req/<reqHash>`, plus a git image's own objects);
-   the worker `caos` had POSTed it via `/object`;
-4. calls `/run?req=<reqHash>`;
-5. records the result at `<output>`. Here `caos-cli` and the worker `caos`
-   differ: `caos-cli` **checks the result out in full** — fetching the object and
-   (for a tree) every descendant as ordinary rw files (`0644`/`0755`, git's
-   executable bit preserved), so it's readable and editable on the host directly.
-   `<output>` is optional on `caos-cli`: with it omitted, a **file** result is
-   streamed to **stdout** (handy for `| less` or `> file`); a **tree** result has
-   no single stream, so it still needs an `<output>` path. A worker records a
-   **typed, tagged placeholder** instead and **fetches nothing**: the result
-   stays on the server (read-only CAS modes), and `caos get <output>` pulls the
-   bytes on demand if it wants them.
+3. gets the request onto the server — one negotiated `git push` to
+   `refs/caos/req/<reqHash>`, plus a git image's own objects;
+4. calls `/run?req=<reqHash>`; the server resolves any promises before
+   answering, so the reply is always a final value;
+5. records the result at `<output>`: it **checks the result out in full** —
+   fetching the object and (for a tree) every descendant as ordinary rw files
+   (`0644`/`0755`, git's executable bit preserved), so it's readable and
+   editable on the host directly. `<output>` is optional: with it omitted, a
+   **file** result is streamed to **stdout** (handy for `| less` or `> file`);
+   a **tree** result has no single stream, so it still needs an `<output>` path.
 
-So a result never comes back to a *worker* automatically. A deep fold propagates
-hashes up the tree, materializing only the leaves a worker actually reads. The
-worker, recursing, references child results by hash (it `link`s the placeholder
-and `caos put` reuses the recorded hash — no content needed). Only at the top,
+The worker-side `caos run <in> -- [--map=<image>] [--then=<image>]` is a
+different thing entirely: a **tail call**. It records the continuation
+`{in, map?, then?}` as the worker's own result at `/cas/out` (a `promise`
+placeholder) and fetches and runs nothing; the worker exits and the server
+takes over (see [map-then](#map-then-sub-computations-without-blocking)). So a
+worker's sub-results never come back to it at all — child results are wired
+into `then`'s `--children` tree by the server, by hash, and only at the top,
 where `caos-cli` returns the final result to the user, is the whole tree pulled
 down.
 
 **Failures propagate.** If a worker exits non-zero, `entrypoint` makes the
-container fail, the server answers `/run` with `500` carrying the worker's stderr,
-and the caller's `run` returns that as an error — so `caos run`/`caos-cli run`
-fails (non-zero exit) with the worker's message. This holds at any depth: a
-failure deep in a fold travels up through each parent's `caos run` to the
-top-level `caos-cli run`. (The run-cycle error is one such case.)
+container fail, the server answers `/run` with an error carrying the worker's
+stderr — and a failure anywhere in a promise tree (a `map` child, a `then`,
+any depth) fails the requests above it the same way, up to the top-level
+`caos-cli run`, which exits non-zero with the message. (The run-cycle error is
+one such case.)
 
-`<image>` is a **git image by default**: a bare git hash (e.g. an `import-image`
-output or, in a worker, a `caos curry` ref), or — on `caos-cli` — a
-`/cas/std/<name>` builtin resolved against the published library. Inside a worker
-it can also be any `/cas` path, resolved to the hash recorded on it. An **ordinary
-docker image** is written `docker://<ref>`.
+`<image>` (and a `--map`/`--then` value) is a **git image by default**: a bare
+git hash (e.g. an `import-image` output or a `caos curry` ref), or — on
+`caos-cli` — a `/cas/std/<name>` builtin resolved against the published
+library. Inside a worker it can also be any `/cas` path, resolved to the hash
+recorded on it. An **ordinary docker image** is written `docker://<ref>`.
 
 ### Arguments: literals and paths
 
@@ -310,8 +344,8 @@ today, leaving room for more. The worker `caos` has no host filesystem (only
 
 ### Other subcommands
 
-`import-image` is the only other `caos-cli` command; the rest are **worker** (`caos`)
-commands, operating on `/cas`.
+`curry` and `import-image` are the other `caos-cli` commands; the rest are
+**worker** (`caos`) commands, operating on `/cas`.
 
 - `import-image <docker-archive>` (`caos-cli`) — store a docker-archive image
   (`nix build .#caos-*-docker` output) as a git-docker tree on the server,
@@ -320,11 +354,13 @@ commands, operating on `/cas`.
 - `put <src-path> <cas-path>` (`caos`) — store an outside path into the CAS and
   record it at a `/cas` path. Files become blobs, directories trees; a symlink
   into the CAS reuses the recorded hash.
-- `curry <image> -- [--name=value | --name:@=path …]` (`caos`) — bind some args to
-  an image, printing a ref to the curried image. It's a small content-addressed
-  tree (`base`, `args`, a `.caos-curry` marker); `run`/`curry` expand it
-  client-side (call args win), so the server only ever sees a plain image + args.
-  Currying flattens, so it's canonical.
+- `curry <image> -- [--name=value | --name:@=path …]` (both clients) — bind some
+  args to an image, printing a ref to the curried image. It's a small
+  content-addressed tree (`base`, `args`, a `.caos-curry` marker); `run`/`curry`
+  expand it — the client for its own calls, the server when a curried
+  `map`/`then` runs (call args win) — so a container only ever runs as a plain
+  image + args. Currying flattens, so it's canonical. On `caos-cli`, path args
+  are host paths to ingest, or `/cas/std/<name>` builtin refs.
 - `entrypoint [--args=<hash>]` (`caos`) — the container entrypoint; see below.
 
 ### `entrypoint`
@@ -338,9 +374,10 @@ commands, operating on `/cas`.
    touch the root-owned `/cas` except through setuid `caos`; `entrypoint` stays
    root to tear down. The worker's stdout is sent to stderr so the container's
    stdout stays clean;
-4. **report** — print `"<type> <hash>"` for `/cas/out` (a fast xattr read plus an
-   `is_dir` check — no re-hashing). The server returns this to the caller, which
-   uses the type to make a correctly-typed result placeholder without fetching;
+4. **report** — print `"<type> <hash>"` for `/cas/out` (a fast xattr read plus
+   an `is_dir` check — no re-hashing). `blob`/`tree` results go back to the
+   caller as-is; a `promise` (a `caos run` continuation) is resolved by the
+   server after this container exits;
 5. **tear down** — delete `/cas`.
 
 So a `/worker` reads inputs from `/cas/args`, reaches built-ins at `/cas/std`,
@@ -366,27 +403,25 @@ files.
 
 A worker image is built `FROM` `caos-worker-base` (keeping `/bin/caos` as the
 entrypoint) and adds a `/worker` that reads `/cas/args` and writes `/cas/out`.
-The Rust workers share `worker-common` (arg helpers, `caos`/`caos run`/`caos
+The Rust workers share `worker-common` (arg helpers, `caos`/`map_then`/`caos
 curry` wrappers, result staging).
 
 - **`worker-hello`** — a leaf example: gathers its `/cas/args` entries into a
   result tree.
-- **`worker-fold`** — a recursive fold (catamorphism) over a CAS tree, driving
-  `caos run` to recurse and to apply two image "functions":
-  - `pre` (optional) — applied to `--in` to produce the tree of children to fold
-    (default: a tree's own children; a file is a leaf);
-  - `post` — applied to `--in` plus `--children` (the folded child results) to
-    produce this node's result.
-
-  Identical subtrees are memoized, so a fold is incremental in the changed nodes.
+- **`worker-fold`** — a structural fold (catamorphism) over a CAS tree: one
+  `map_then` whose `map` is fold itself (curried with `post`) and whose `then`
+  is `post` — applied to `--in` plus `--children` (the folded child results) to
+  produce each node's result. Identical subtrees are memoized, so a fold is
+  incremental in the changed nodes; siblings fold in parallel.
 - **`worker-file-count`** — a `post` algebra: a file counts as `1`, a directory
   sums its children's counts.
-- **`worker-dirs-only`** — a `pre` algebra: keeps only a node's directory
-  children, dropping files. As `fold --pre=dirs-only` it makes the fold recurse
-  into subdirectories only — files are never folded as leaves.
-- **`worker-deep-deps`** — computes transitive dependencies, implemented as a
-  curried fold (`pre` resolves a package's deps against a package map; `post`
-  assembles the deep-deps tree).
+- **`worker-dirs-only`** — keeps only a node's directory children, dropping
+  files. Compose by filtering first and folding the result.
+- **`worker-deep-deps`** — computes transitive dependencies by self-recursion:
+  `deepen` resolves a package's `DEPS` against the map (pure CAS linking) and
+  map-thens *itself* over the resolved deps, finishing with a node builder
+  keyed only on the package and its subgraph — so recompute is O(changed
+  package + its dependents).
 - **`worker-rustc`** — compiles a Rust source file into a new worker image:
   given `--src` and a base worker image (`--base`, usually curried in), it builds
   static-musl, linking the vendored `worker-common`, and emits a git-docker
@@ -434,15 +469,21 @@ daemon handles `SIGINT`/`SIGTERM`, so it exits and `--rm` removes it.
 Integration tests (require `tilt up` running):
 
 ```bash
-./test-deep-deps.sh      # deep-deps via /cas/std: correctness, caching, Merkle
-                         # incrementality, std-key invalidation, cycle detection
-./test-rust-worker.sh    # rustc builder: source -> worker image -> run, memoized
-./test-host-path.sh      # a host path passed to `caos run`: content delivered,
-                         # clean tracked tree reused, dirty tree hashed incrementally
+tests/run.sh tests/deep-deps    # promise recursion: correctness, DAG sharing,
+                                # incrementality, cycle detection
+tests/run.sh tests/file-count   # fold + post algebra over map-then
+tests/run.sh tests/dirs-only    # filter worker; filter-then-fold composition
+tests/run.sh tests/rust-worker  # rustc builder: source -> worker image -> run
+tests/run.sh tests/symlinks     # symlinks survive the round trip into /cas
+tests/run.sh tests/untracked    # only git-tracked paths are ingested
 ```
 
-Both build `.#caos`, set up a throwaway client repo with the server as its `caos`
-remote, and drive everything through `caos-cli`.
+`tests/run.sh` builds `.#caos-cli`, publishes the builtins the test asks for,
+and sets up a throwaway client repo with the server as its `caos` remote. A
+test is either a `cli.sh` (runs on the host, driving computations through
+`caos-cli` — the one place blocking runs still exist) or a `test.sh` (runs
+*inside* a bash worker with the test directory at `/cas/args/test`, for
+asserting what a worker sees in a real `/cas`).
 
 ## Notes
 

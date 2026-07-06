@@ -2,17 +2,25 @@
 # Run a caos integration test that lives in a directory.
 #
 # All boilerplate lives here: build the CLI, publish the std library, set up a
-# throwaway client repo + CAS. The test itself is <dir>/test.sh, which runs
-# *inside* a bash worker (via /cas/std/bash) with the whole test directory
-# available at /cas/args/test. So a test does real caos work — running other
-# workers, put/get, curry — in a real /cas, and makes its own assertions (the
-# bash worker carries coreutils/diff/grep). No host-side log scraping: a failing
-# assertion exits test.sh non-zero, which fails the run and surfaces its stderr.
+# throwaway client repo + CAS. A test comes in one of two forms:
+#
+#  * <dir>/test.sh — runs *inside* a bash worker (via /cas/std/bash) with the
+#    whole test directory available at /cas/args/test. For tests about what a
+#    worker sees in a real /cas (materialization, symlinks, permissions). A
+#    worker can't run sub-computations synchronously (its `caos run` records a
+#    continuation), so orchestration doesn't belong here.
+#  * <dir>/cli.sh — runs on the HOST, cwd'd into the throwaway client repo with
+#    the test directory committed at ./test and $CAOS_CLI pointing at the
+#    caos-cli binary. For tests that drive computations and assert on results:
+#    the CLI's blocking run is the one place blocking still exists.
+#
+# Either way, no host-side log scraping: a failing assertion exits non-zero,
+# which fails the test and surfaces its stderr.
 #
 # Each test reaches builtins as /cas/std/<name>; <dir>/builtins (optional) lists
 # which to publish, one or more per line (default: all of them). A test may also
 # include <dir>/host.sh (optional), a hook that runs on the host before the
-# worker — see below.
+# test — see below.
 #
 # Usage: tests/run.sh <test-dir>
 # Requires the dev daemons running (`tilt up` / `caosd`): the caos server :9090,
@@ -22,7 +30,7 @@ set -euo pipefail
 DIR=$(cd "$1" && pwd)
 PROJECT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$PROJECT"
-[ -f "$DIR/test.sh" ] || { echo "no test.sh in $DIR" >&2; exit 2; }
+[ -f "$DIR/test.sh" ] || [ -f "$DIR/cli.sh" ] || { echo "no test.sh or cli.sh in $DIR" >&2; exit 2; }
 
 echo "building caos client..." >&2
 nix build .#caos-cli -o result-caos
@@ -47,7 +55,11 @@ echo "publishing std: ${builtins[*]:-<all>}..." >&2
 CLIENT=$PROJECT/.caos-dev/test-client
 rm -rf "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$CAOS_SERVER_URL"
-trap 'rm -rf "$CLIENT"' EXIT
+# No detached auto-gc: a host-driven test commits repeatedly, and a background
+# gc would race the cleanup rm below (and can outlive the test).
+git -C "$CLIENT" config gc.auto 0
+git -C "$CLIENT" config maintenance.auto false
+trap 'rm -rf "$CLIENT" 2>/dev/null || rm -rf "$CLIENT"' EXIT
 
 # caos-cli only ingests git-tracked paths (like a nix flake), so copy the test
 # directory into the client repo and commit it. The committed `test/` is then a
@@ -57,23 +69,31 @@ git -C "$CLIENT" add -A
 git -C "$CLIENT" -c user.email=test@caos -c user.name=caos commit -qm 'test tree'
 
 # A test may include a `host.sh` hook: it runs on the host, in the committed test
-# copy ($CLIENT/test), *after* the commit and *before* the worker. Anything it
+# copy ($CLIENT/test), *after* the commit and *before* the test. Anything it
 # creates therefore stays untracked — e.g. to prove caos-cli excludes untracked
-# files when it ingests `test/` (the nix-flakes rule), which the worker-side
-# test.sh then asserts.
+# files when it ingests `test/` (the nix-flakes rule), which the test
+# then asserts.
 if [ -f "$CLIENT/test/host.sh" ]; then
   echo "running $1 host.sh hook..." >&2
   ( cd "$CLIENT/test" && bash host.sh )
 fi
 
-# Run the test inside a bash worker: test.sh is the script; the whole directory
-# rides along as `test` (materialized at /cas/args/test). No output path is
-# passed, so a single-file result is written to stdout (a worker's stderr only
-# reaches us on failure, so a passing test reports via its /cas/out file).
-echo "running $1 inside a bash worker..." >&2
-result=$( cd "$CLIENT" && "$caosbin" run /cas/std/bash -- \
-    --script:@="test/test.sh" --test:@="test" )
-echo "PASS: $1" >&2
-# A test that reports a result (e.g. perf numbers) prints it; one that doesn't
-# still passed — don't let the empty-result check poison the exit code.
-if [ -n "$result" ]; then printf '%s\n' "$result"; fi
+if [ -f "$CLIENT/test/cli.sh" ]; then
+  # Host-driven test: cli.sh runs in the client repo, driving computations
+  # through caos-cli (whose top-level run blocks; it holds no worker slot).
+  echo "running $1 on the host with caos-cli..." >&2
+  ( cd "$CLIENT" && CAOS_CLI=$caosbin bash test/cli.sh )
+  echo "PASS: $1" >&2
+else
+  # Run the test inside a bash worker: test.sh is the script; the whole directory
+  # rides along as `test` (materialized at /cas/args/test). No output path is
+  # passed, so a single-file result is written to stdout (a worker's stderr only
+  # reaches us on failure, so a passing test reports via its /cas/out file).
+  echo "running $1 inside a bash worker..." >&2
+  result=$( cd "$CLIENT" && "$caosbin" run /cas/std/bash -- \
+      --script:@="test/test.sh" --test:@="test" )
+  echo "PASS: $1" >&2
+  # A test that reports a result (e.g. perf numbers) prints it; one that doesn't
+  # still passed — don't let the empty-result check poison the exit code.
+  if [ -n "$result" ]; then printf '%s\n' "$result"; fi
+fi
