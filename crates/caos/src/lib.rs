@@ -1525,7 +1525,10 @@ fn run_request(
     // that path straight to `caos run`. A `docker://` ref has no git object to
     // embed, so it rides as a blob naming the registry ref.
     let image_entry = image_arg_entry(t, &image)?;
-    let args_tree = post_tree(t, merge_entries(merge_entries(bound, call), vec![image_entry]))?;
+    let args_tree = post_tree(
+        t,
+        merge_entries(merge_entries(bound, call), vec![image_entry]),
+    )?;
 
     // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
     // resolved from the `refs/caos/std` ref at the top. Part of the request so the

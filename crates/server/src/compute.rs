@@ -36,6 +36,14 @@ const DOCKER_SCHEME: &str = "docker://";
 /// layers pulled from another registry keep their own (often gzipped) media type.
 const OCI_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 
+/// A manifest layer descriptor: `(media_type, digest, size)`.
+type ManifestLayer = (String, String, u64);
+
+/// A base image's contribution to a stacked image: its manifest layers and its
+/// config `diff_id`s (the uncompressed layer digests) — the lower part of the
+/// stack our delta layers sit on. Returned by [`fetch_base`]/[`fetch_base_oci`].
+type BaseLayers = (Vec<ManifestLayer>, Vec<String>);
+
 /// How long to wait on Redis before giving up and running uncached.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -150,7 +158,15 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     let result = match config_backend() {
         Backend::Serve => {
             let docker_ref = resolve_image(config, &image)?;
-            dispatch_serve(config, &docker_ref, &image, &args, &std, &salt, &child_stack)?
+            dispatch_serve(
+                config,
+                &docker_ref,
+                &image,
+                &args,
+                &std,
+                &salt,
+                &child_stack,
+            )?
         }
         Backend::Docker => {
             let docker_ref = resolve_image(config, &image)?;
@@ -161,10 +177,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
 
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: req={req}");
-        return Err(HttpError::new(
-            500,
-            "worker produced no result on stdout",
-        ));
+        return Err(HttpError::new(500, "worker produced no result on stdout"));
     }
 
     // Cache the result for next time (best-effort).
@@ -260,8 +273,8 @@ fn dispatch_serve(
     ensure_serve_container(config, docker_ref, &name)?;
 
     let url = format!("http://{name}:8080/run");
-    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
-        .to_string();
+    let body =
+        serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack }).to_string();
     serve_post(&url, &body)
 }
 
@@ -435,8 +448,8 @@ fn dispatch_fly(
     let fly = Fly::from_env(config)?;
     ensure_worker_app(config, &fly, image)?;
     let app = fly_app_name(&fly, image);
-    let body = serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack })
-        .to_string();
+    let body =
+        serde_json::json!({ "args": args, "std": std, "salt": salt, "stack": stack }).to_string();
     dispatch_to_pool(&fly, &app, &body)
 }
 
@@ -465,18 +478,27 @@ fn dispatch_to_pool(fly: &Fly, app: &str, body: &str) -> Result<String, HttpErro
     for attempt in 0..SWEEPS {
         let machines = fly_list_machines(fly, app)?;
         if machines.is_empty() {
-            return Err(HttpError::new(500, format!("worker app {app} has no machines")));
+            return Err(HttpError::new(
+                500,
+                format!("worker app {app} has no machines"),
+            ));
         }
         for m in &machines {
             if m.state != "started" {
                 // Best-effort: a racing start ("already started") is fine — the
                 // POST below is the real readiness check.
-                eprintln!("dispatch {app}: starting machine {} (state {})", m.id, m.state);
+                eprintln!(
+                    "dispatch {app}: starting machine {} (state {})",
+                    m.id, m.state
+                );
                 let _ = fly_start_machine(fly, app, &m.id);
             }
             match post_job(&m.private_ip, body) {
                 Outcome::Done(result) => {
-                    eprintln!("dispatch {app}: machine {} accepted (sweep {attempt})", m.id);
+                    eprintln!(
+                        "dispatch {app}: machine {} accepted (sweep {attempt})",
+                        m.id
+                    );
                     return Ok(result);
                 }
                 Outcome::Busy => {
@@ -524,7 +546,10 @@ fn post_job(ip: &str, body: &str) -> Outcome {
             Ok((200, out)) => return Outcome::Done(out.trim().to_string()),
             Ok((503, _)) => return Outcome::Busy,
             Ok((code, msg)) => {
-                return Outcome::Failed(HttpError::new(500, format!("worker failed ({code}): {msg}")))
+                return Outcome::Failed(HttpError::new(
+                    500,
+                    format!("worker failed ({code}): {msg}"),
+                ))
             }
             Err(e) => {
                 last_err = e.to_string();
@@ -557,8 +582,13 @@ fn raw_post(ip: &str, port: u16, path: &str, body: &str) -> std::io::Result<(u16
         .split_once("\r\n")
         .and_then(|(line, _)| line.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line"))?;
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP status line")
+        })?;
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
     Ok((status, body))
 }
 
@@ -569,19 +599,26 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
     if resp.status_code != 200 {
         return Err(HttpError::new(
             500,
-            format!("fly list machines ({}): {}", resp.status_code, resp.as_str().unwrap_or("")),
+            format!(
+                "fly list machines ({}): {}",
+                resp.status_code,
+                resp.as_str().unwrap_or("")
+            ),
         ));
     }
     let body = resp
         .as_str()
         .map_err(|e| HttpError::new(500, format!("reading machine list: {e}")))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| HttpError::new(500, format!("parsing machine list: {e}")))?;
     let mut machines = Vec::new();
     for m in parsed.as_array().into_iter().flatten() {
         let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default();
         let state = m.get("state").and_then(|v| v.as_str()).unwrap_or_default();
-        let private_ip = m.get("private_ip").and_then(|v| v.as_str()).unwrap_or_default();
+        let private_ip = m
+            .get("private_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if !id.is_empty() && !private_ip.is_empty() {
             machines.push(Machine {
                 id: id.to_string(),
@@ -596,12 +633,20 @@ fn fly_list_machines(fly: &Fly, app: &str) -> Result<Vec<Machine>, HttpError> {
 /// Start a stopped machine (`POST /apps/{app}/machines/{id}/start`). Idempotent
 /// enough for our use: a 200 or an already-started reply are both fine.
 fn fly_start_machine(fly: &Fly, app: &str, id: &str) -> Result<(), HttpError> {
-    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines/{id}/start"), None)?;
+    let resp = fly_api(
+        fly,
+        "POST",
+        &format!("/apps/{app}/machines/{id}/start"),
+        None,
+    )?;
     match resp.status_code {
         200 | 201 => Ok(()),
         code => Err(HttpError::new(
             500,
-            format!("fly start machine {id} ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly start machine {id} ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -648,7 +693,10 @@ fn ensure_worker_app(config: &Config, fly: &Fly, image: &str) -> Result<(), Http
 fn resolve_fly_image(config: &Config, fly: &Fly, image: &str) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         if reference.is_empty() || reference.starts_with('-') {
-            return Err(HttpError::new(400, format!("invalid docker image: {reference:?}")));
+            return Err(HttpError::new(
+                400,
+                format!("invalid docker image: {reference:?}"),
+            ));
         }
         return Ok(reference.to_string());
     }
@@ -674,12 +722,18 @@ fn fly_create_app(fly: &Fly, app: &str) -> Result<(), HttpError> {
             if msg.contains("already been taken") {
                 Ok(())
             } else {
-                Err(HttpError::new(500, format!("fly create app {app} (422): {msg}")))
+                Err(HttpError::new(
+                    500,
+                    format!("fly create app {app} (422): {msg}"),
+                ))
             }
         }
         code => Err(HttpError::new(
             500,
-            format!("fly create app {app} ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly create app {app} ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -705,12 +759,20 @@ fn fly_create_machine(
         }
     })
     .to_string();
-    let resp = fly_api(fly, "POST", &format!("/apps/{app}/machines"), Some(&machine))?;
+    let resp = fly_api(
+        fly,
+        "POST",
+        &format!("/apps/{app}/machines"),
+        Some(&machine),
+    )?;
     match resp.status_code {
         200 | 201 => Ok(()),
         code => Err(HttpError::new(
             500,
-            format!("fly create machine ({code}): {}", resp.as_str().unwrap_or("")),
+            format!(
+                "fly create machine ({code}): {}",
+                resp.as_str().unwrap_or("")
+            ),
         )),
     }
 }
@@ -767,7 +829,10 @@ fn push_image_to_fly(fly: &Fly, config: &Config, git_hash: &str) -> Result<Strin
             .status()
             .map_err(|e| HttpError::new(500, format!("skopeo copy: {e}")))?;
         if !status.success() {
-            return Err(HttpError::new(500, format!("skopeo copy to {dest} failed ({status})")));
+            return Err(HttpError::new(
+                500,
+                format!("skopeo copy to {dest} failed ({status})"),
+            ));
         }
         eprintln!("pushed image {git_hash} -> {dest}");
         Ok(dest)
@@ -924,8 +989,11 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
             .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
             .map_err(|e| format!("linking blob {hex} into layout: {e}"))?;
     }
-    std::fs::write(oci_dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)
-        .map_err(|e| format!("writing oci-layout: {e}"))?;
+    std::fs::write(
+        oci_dir.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .map_err(|e| format!("writing oci-layout: {e}"))?;
     let index = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -953,10 +1021,7 @@ fn build_oci_image(config: &Config, git_hash: &str, oci_dir: &Path) -> Result<()
 /// lower part of the stack. We later overwrite `index.json` with our combined
 /// image, leaving the base's own manifest blob unreferenced (so the push skips
 /// it). `--format oci` rewrites media types to OCI; the layer blobs are untouched.
-fn fetch_base_oci(
-    base_ref: &str,
-    oci_dir: &Path,
-) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+fn fetch_base_oci(base_ref: &str, oci_dir: &Path) -> Result<BaseLayers, String> {
     let status = Command::new("skopeo")
         .args([
             "--insecure-policy",
@@ -976,7 +1041,9 @@ fn fetch_base_oci(
         .status()
         .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
     if !status.success() {
-        return Err(format!("skopeo copy {base_ref} into layout failed ({status})"));
+        return Err(format!(
+            "skopeo copy {base_ref} into layout failed ({status})"
+        ));
     }
 
     // Read the layout's index → the base manifest → its layers + config diff_ids.
@@ -986,9 +1053,7 @@ fn fetch_base_oci(
         .ok_or("base layout index has no manifests")?;
     let man_desc = manifests
         .iter()
-        .find(|m| {
-            m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base")
-        })
+        .find(|m| m["annotations"]["org.opencontainers.image.ref.name"].as_str() == Some("base"))
         .or_else(|| manifests.first())
         .ok_or("base layout index is empty")?;
     let man_digest = man_desc["digest"]
@@ -1263,7 +1328,7 @@ fn image_ref(config: &Config, manifest_digest: &str) -> String {
 /// — the lower part of the stack our delta layers sit on. `--format oci` rewrites
 /// the manifest to OCI media types so it composes cleanly with our OCI layers;
 /// the layer *blobs* (and their digests) are untouched.
-fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u64)>, Vec<String>), String> {
+fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
     let push = config.registry_push_url.trim_end_matches('/');
     let host = push
         .strip_prefix("http://")
@@ -1307,7 +1372,9 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
             .status()
             .map_err(|e| format!("skopeo copy {base_ref}: {e}"))?;
         if !status.success() {
-            return Err(format!("skopeo copy {base_ref} -> {dest} failed ({status})"));
+            return Err(format!(
+                "skopeo copy {base_ref} -> {dest} failed ({status})"
+            ));
         }
     }
 
@@ -1323,8 +1390,8 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<(Vec<(String, String, u
             resp.status_code, resp.reason_phrase
         ));
     }
-    let manifest: serde_json::Value =
-        serde_json::from_slice(resp.as_bytes()).map_err(|e| format!("parsing base manifest: {e}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(resp.as_bytes())
+        .map_err(|e| format!("parsing base manifest: {e}"))?;
     let layers = manifest["layers"]
         .as_array()
         .ok_or("base manifest has no layers")?

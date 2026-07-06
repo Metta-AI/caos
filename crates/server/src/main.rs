@@ -145,7 +145,13 @@ fn main() {
         };
         git(&["init", "-q", "--bare", &git_dir]);
         git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
-        git(&["-C", &git_dir, "config", "uploadpack.allowAnySHA1InWant", "true"]);
+        git(&[
+            "-C",
+            &git_dir,
+            "config",
+            "uploadpack.allowAnySHA1InWant",
+            "true",
+        ]);
     }
 
     // Open the object database once as a thread-safe handle; each request thread
