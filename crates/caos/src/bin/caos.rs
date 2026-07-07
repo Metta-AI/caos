@@ -106,9 +106,10 @@ struct Job {
 }
 
 /// `serve` — run as a long-lived HTTP worker instead of a one-shot container.
-/// Per `POST /run` it runs the *unchanged* `entrypoint` once, one at a time, so
-/// each job's `/cas` lifecycle is identical to the container model. A busy worker
-/// bounces the request to another instance (once, via `fly-replay`) or blocks.
+/// Per `POST /run` it runs the same staged job lifecycle as `entrypoint`,
+/// in-process and one at a time, so each job's `/cas` lifecycle is identical to
+/// the container model. A busy worker bounces the request to another instance
+/// (once, via `fly-replay`) or blocks.
 fn serve() -> Result<(), String> {
     let server = Server::http("[::]:8080").map_err(|e| format!("binding :8080: {e}"))?;
     eprintln!("caos serve: listening on :8080");
@@ -157,32 +158,32 @@ fn handle(mut request: Request) {
     }
 }
 
-/// Run the job (fork+exec the unchanged `entrypoint`), reply, then reset the VM —
-/// all while holding the slot, so the next job starts clean regardless of which
-/// branch above we took.
+/// Run the job (the same staged lifecycle `entrypoint` composes, in-process),
+/// reply, then reset the VM — all while holding the slot, so the next job starts
+/// clean regardless of which branch above we took.
 fn run_and_reply(request: Request, job: &Job, _slot: &std::sync::MutexGuard<'_, ()>) {
-    let out = std::process::Command::new("/proc/self/exe")
-        .arg("entrypoint")
-        .arg(format!("--args={}", job.args))
-        .env(caos::STD_ENV, &job.std)
-        .env(caos::SALT_ENV, &job.salt)
-        .output();
-
-    match out {
-        Ok(o) if o.status.success() => respond(request, 200, &String::from_utf8_lossy(&o.stdout)),
-        Ok(o) => respond(
-            request,
-            500,
-            &format!(
-                "worker failed ({}):\n{}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            ),
-        ),
-        Err(e) => respond(request, 500, &format!("spawning entrypoint: {e}")),
+    match run_job(job) {
+        Ok(result) => respond(request, 200, &result),
+        Err(e) => respond(request, 500, &format!("worker failed: {e}")),
     }
-
     reset_after_job();
+}
+
+/// One job through the staged lifecycle. The process is reused across jobs, so
+/// std/salt arrive with the job rather than in our env: `/cas/std` is
+/// materialized from the job's value, and the worker child gets both as env
+/// vars — `caos map-then`/`curry` running under it read them from there.
+fn run_job(job: &Job) -> Result<String, String> {
+    let std = (!job.std.is_empty()).then_some(job.std.as_str());
+    let cas = cas_setup(Some(&job.args), std)?;
+    let envs = [
+        (caos::STD_ENV, job.std.as_str()),
+        (caos::SALT_ENV, job.salt.as_str()),
+    ];
+    run_worker(&envs, WorkerOutput::Capture)?;
+    let result = read_result(&cas)?;
+    remove_cas(&cas)?;
+    Ok(result)
 }
 
 fn respond(request: Request, status: u16, body: &str) {
@@ -288,48 +289,65 @@ fn usage(args: &[String]) -> String {
     )
 }
 
-/// `entrypoint [--args=<hash>]` — the container entrypoint. Wipes the CAS
-/// directory, optionally populates `/cas/args` from `--args=<hash>` and `/cas/std`
-/// from `$CAOS_STD`, runs `/worker`, prints the hash recorded at `/cas/out`, then
-/// removes the CAS directory.
+/// `entrypoint [--args=<hash>]` — the container entrypoint: the staged job
+/// lifecycle (`cas_setup` → `run_worker` → `read_result` → `remove_cas`) run
+/// back to back, with `/cas/std` taken from `$CAOS_STD` and the result printed
+/// on stdout. `serve` runs the same stages in-process per job.
 fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
-    let cas = caos::cas_dir();
+    let std = std::env::var(caos::STD_ENV).ok().filter(|s| !s.is_empty());
+    let cas = cas_setup(args_hash, std.as_deref())?;
+    run_worker(&[], WorkerOutput::Stream)?;
+    let result = read_result(&cas)?;
+    remove_cas(&cas)?;
+    println!("{result}");
+    Ok(())
+}
 
-    // Start clean: delete the CAS directory and recreate it empty (fail if we
-    // can't), then verify it supports the xattrs we rely on.
+/// Set up a fresh `/cas` for one job: wipe whatever a prior job left, recreate
+/// it empty (fail if we can't), verify it supports the xattrs we rely on, then
+/// populate `/cas/args` from `args_hash` and `/cas/std` from `std_hash` (each
+/// one level, like `get-hash`), so the worker can read its inputs there.
+fn cas_setup(
+    args_hash: Option<&str>,
+    std_hash: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let cas = caos::cas_dir();
     remove_cas(&cas)?;
     std::fs::create_dir_all(&cas).map_err(|e| format!("creating {}: {e}", cas.display()))?;
     // Root-owned and only root-writable: the worker reaches `/cas` solely through
     // this setuid-root binary, never by writing here directly.
     caos::set_mode(&cas, caos::MODE_FETCHED_DIR)?;
     caos::probe_xattr(&cas)?;
-
-    // Populate /cas/args from the given hash, like `get-hash <hash> /cas/args`,
-    // so the worker can read its inputs there.
     if let Some(hash) = args_hash {
         caos::fetch_and_materialize(&http()?, &cas.join("args"), hash)?;
     }
-
-    // Populate /cas/std (one level) from the built-in tree the server threaded in,
-    // so the worker can reach builtins as `/cas/std/<name>`.
-    if let Ok(std) = std::env::var(caos::STD_ENV) {
-        if !std.is_empty() {
-            caos::fetch_and_materialize(&http()?, &cas.join("std"), &std)?;
-        }
+    if let Some(std) = std_hash {
+        caos::fetch_and_materialize(&http()?, &cas.join("std"), std)?;
     }
+    Ok(cas)
+}
 
-    // Run the worker, sending its stdout to our stderr so that our own stdout
-    // carries only the resulting hash. We stay root (to tear down `/cas` after),
-    // but drop the *worker* to an unprivileged user so it can't tamper with the
-    // root-owned `/cas` — only the setuid-root `caos` it invokes can.
-    let stdout = std::io::stderr()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|e| format!("duplicating stderr: {e}"))?;
+/// Where a job's worker output goes.
+enum WorkerOutput {
+    /// Stream to this process's stderr (the one-shot container: our stdout must
+    /// carry only the result line, and the container's stderr is the job log).
+    Stream,
+    /// Capture, surfacing it in the error on failure (serve: the process's own
+    /// streams outlive the job, so the caller wants the log with the failure).
+    Capture,
+}
+
+/// Run `/worker` with `envs` added to its environment. We stay root (to tear
+/// down `/cas` after), but drop the worker to an unprivileged user so it can't
+/// tamper with the root-owned `/cas` — only the setuid-root `caos` it invokes
+/// can.
+fn run_worker(envs: &[(&str, &str)], output: WorkerOutput) -> Result<(), String> {
     let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
     let gid = caos::env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
     let mut command = std::process::Command::new(DEFAULT_WORKER);
-    command.stdout(std::process::Stdio::from(stdout));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
     // SAFETY: the closure runs in the forked child before exec and only makes
     // async-signal-safe syscalls. We drop privileges by hand (rather than
     // `Command::uid`/`gid`) so we can also clear supplementary groups — `groups`
@@ -343,28 +361,47 @@ fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
             Ok(())
         });
     }
-    let status = command
-        .status()
-        .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
-    if !status.success() {
-        return Err(format!("{DEFAULT_WORKER} exited with {status}"));
+    match output {
+        WorkerOutput::Stream => {
+            let stdout = std::io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| format!("duplicating stderr: {e}"))?;
+            command.stdout(std::process::Stdio::from(stdout));
+            let status = command
+                .status()
+                .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
+            if !status.success() {
+                return Err(format!("{DEFAULT_WORKER} exited with {status}"));
+            }
+        }
+        WorkerOutput::Capture => {
+            let out = command
+                .output()
+                .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{DEFAULT_WORKER} exited with {}:\n{}{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
     }
+    Ok(())
+}
 
-    // Everything under /cas got there via get/put/run, which tag each path with
-    // its hash, so /cas/out already knows its hash — read it (and its type) back
-    // before teardown. The server returns this `"<type> <hash>"` to the caller so
-    // it can record a correctly-typed result placeholder without fetching — or,
-    // for a `promise` (a map-then continuation `caos map-then` recorded), resolves it
-    // now that this container is exiting and its slot is free.
+/// Read back the result the worker recorded at `/cas/out`, as `"<type> <hash>"`.
+/// Everything under /cas got there via get/put, which tag each path with its
+/// hash, so no re-hashing — the caller can record a correctly-typed result
+/// placeholder without fetching, or resolve a `promise` (a map-then continuation
+/// `caos map-then` recorded) once this job's slot is free.
+fn read_result(cas: &std::path::Path) -> Result<String, String> {
     let out = cas.join("out");
     let hash = caos::read_hash(&out)?;
     let kind = caos::result_kind(&out)?;
-
-    // Tear down.
-    remove_cas(&cas)?;
-
-    println!("{kind} {hash}");
-    Ok(())
+    Ok(format!("{kind} {hash}"))
 }
 
 /// Delete the CAS directory and everything in it. Succeeds if it's already gone.
