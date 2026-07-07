@@ -1,6 +1,6 @@
 //! Shared helpers for the Rust caos workers.
 //!
-//! A worker is a `/worker` program: `caos entrypoint` materializes the run's
+//! A worker is a `/worker` program: the `caos` runner materializes the run's
 //! arguments under `/cas/args` (one entry per `--name=value` arg the run request
 //! passed), runs the worker, and on exit reads the hash of `/cas/out`. Every CAS
 //! operation is a shell-out to the `caos` CLI — these helpers wrap the handful of
@@ -17,7 +17,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Where `caos entrypoint` materializes this run's arguments.
+/// Where the `caos` runner materializes this run's arguments.
 pub const ARGS: &str = "/cas/args";
 
 /// Absolute path of an argument under `/cas/args`.

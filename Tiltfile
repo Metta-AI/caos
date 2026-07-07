@@ -7,11 +7,6 @@
 
 NET = 'caos-net'
 
-# Worker backend the server uses: 'docker' (a fresh container per run — the
-# default) or 'serve' (the warm-pool stand-in: a long-lived `caos serve`
-# container per image, POSTed jobs). Opt in with `CAOS_BACKEND=serve tilt up`.
-BACKEND = os.getenv('CAOS_BACKEND', 'docker')
-
 # The caos server owns a *dedicated* bare repo — not the project's own `.git`.
 # Clients never touch it directly; they reach it only through the server, using
 # it as the `caos` git remote: `git push` objects up, `git fetch` refs/results
@@ -48,6 +43,7 @@ def nix_image(res, app, srcs):
     )
 
 nix_image('img-server', 'load-caos-server', ['crates/server'])
+nix_image('img-runnerd', 'load-caos-runnerd', ['crates/runnerd'])
 nix_image('img-worker-base', 'load-caos-worker-base', ['crates/caos'])
 nix_image('img-worker-bash', 'load-caos-worker-bash', ['crates/caos'])
 nix_image('img-worker-hello', 'load-caos-worker-hello', ['crates/caos'])
@@ -126,19 +122,29 @@ local_resource(
 
 # The one caos server: storage + compute in a single process. It serves /object
 # and the git smart-HTTP transport from its own bare repo (mounted at /git), and
-# /run by spawning worker containers (hence the docker socket), so it needs all
-# of: the repo mount, the docker socket, the network, the cache, and the registry.
+# /run by matching jobs to polling runners — it runs no containers itself, so no
+# docker socket. It needs the repo mount, the network, the cache, and the
+# registry.
 daemon(
     'caos-server',
     [
         '-p 9090:80',
-        '-e CAOS_DOCKER_NETWORK=%s' % NET,
-        '-e CAOS_BACKEND=%s' % BACKEND,
-        '-v /var/run/docker.sock:/var/run/docker.sock',
         '-v "%s:/git"' % SERVER_REPO,
     ],
     # Uses the cache and pushes converted images to the registry; start it after
     # both. (It degrades gracefully if Redis is down; the registry is only needed
     # when running a git image.)
     extra_deps=['caos-redis', 'caos-registry'],
+)
+
+# The generic runner: long-polls the server for jobs and runs each one as a
+# worker container over the host docker socket, attached to caos-net so the
+# worker can reach caos-server. Without it, nothing runs jobs.
+daemon(
+    'caos-runnerd',
+    [
+        '-e CAOS_DOCKER_NETWORK=%s' % NET,
+        '-v /var/run/docker.sock:/var/run/docker.sock',
+    ],
+    extra_deps=['caos-server'],
 )

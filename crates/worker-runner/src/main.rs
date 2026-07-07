@@ -7,7 +7,7 @@
 //! `/cas/args` and writes its result to `/cas/out`, exactly as a baked-in
 //! `/worker` would.
 //!
-//! We `exec` (replace this process) rather than spawn: `caos entrypoint` forked
+//! We `exec` (replace this process) rather than spawn: the `caos` runner forked
 //! us and waits, then reads `/cas/out` — so the binary inherits our place as the
 //! child, and *its* `/cas/out` is what the run returns. The binary inherits our
 //! environment too (so `PATH` still finds the setuid `caos`).

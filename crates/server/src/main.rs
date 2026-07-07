@@ -7,33 +7,21 @@
 //!
 //! Compute:
 //!
-//! * `GET /run?image=<image>&args=<hash>` — run `<image>` over the args tree
-//!   `<hash>` and return the hash of its result.
+//! * `GET /run?req=<hash>` — run the request tree `<hash>` and return the hash
+//!   of its result.
 //!
-//! `/run` shells out to the `docker` CLI:
-//!
-//! ```text
-//! docker run --rm --network <net> -e CAOS_SERVER_URL=<url> \
-//!     --entrypoint /bin/caos <image> entrypoint --args=<hash>
-//! ```
-//!
-//! Forcing `--entrypoint /bin/caos` means any image carrying the `caos` binary
-//! and a `/worker` works as a compute image, regardless of its own configured
-//! entrypoint/command. `caos entrypoint` populates `/cas/args` from `<hash>`,
-//! runs `/worker`, and prints the hash recorded at `/cas/out` on its stdout —
-//! which `docker run` forwards to ours, so the container's stdout *is* the
-//! result hash (or a `promise` the compute half resolves after the container
-//! exits — see `design/map-then.md`). We return the final result as the
-//! response body.
-//!
-//! The server's own URL (`CAOS_SERVER_URL`) is injected so the worker can reach
-//! storage (`caos get`/`put`). The container reaches us over the Docker network,
-//! so it must be the same network the server runs on (default `caos-net`).
+//! The server runs no workers itself. Dispatch is pull-based (see
+//! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
+//! their required args, the server matches pending `/run` jobs against the
+//! parked polls, and the runner posts the job's `"<type> <hash>"` back via
+//! `POST /runner/result` (or a `promise` the compute half resolves — see
+//! `design/map-then.md`). The generic runner minting fresh worker containers is
+//! `caos-runnerd`, an ordinary poller with no required args.
 //!
 //! Compute results are cached in Redis (`CAOS_REDIS_ADDR`, default
 //! `caos-redis:6379`): the key is the request hash (the args tree — which carries
 //! the worker image — plus std and salt), the value the
-//! result hash. A hit skips the container entirely. Redis is best-effort — if
+//! result hash. A hit skips the worker entirely. Redis is best-effort — if
 //! it's unreachable we log and run uncached.
 //!
 //! Git transport:
@@ -43,11 +31,13 @@
 //!   a `caos` git remote (push objects up, fetch refs/results down). See
 //!   [`mod git`]; it delegates to `git http-backend`.
 //!
-//! The halves live in [`mod storage`], [`mod compute`], and [`mod git`]; this file
-//! is the entry point, the shared [`Config`]/[`HttpError`], and the request router.
+//! The halves live in [`mod storage`], [`mod compute`], [`mod runner`], and
+//! [`mod git`]; this file is the entry point, the shared [`Config`]/[`HttpError`],
+//! and the request router.
 
 mod compute;
 mod git;
+mod runner;
 mod storage;
 
 use std::sync::Arc;
@@ -55,20 +45,9 @@ use std::sync::Arc;
 use tiny_http::{Method, Request, Response, Server};
 
 /// Listen address; overridable for local runs outside the container. Binds the
-/// IPv6 wildcard (dual-stack: also accepts IPv4) so workers can reach storage and
-/// nested compute over fly's 6PN private network, which is IPv6-only — a worker
-/// calls back to `caos-server.internal`, whose DNS is an AAAA (IPv6) record.
+/// IPv6 wildcard (dual-stack: also accepts IPv4) so runners can reach us over
+/// IPv6-only networks too.
 const DEFAULT_ADDR: &str = "[::]:80";
-
-/// Docker network the worker container joins, so it resolves the server by name.
-/// Override with `CAOS_DOCKER_NETWORK`.
-const DEFAULT_NETWORK: &str = "caos-net";
-
-/// This server's URL as seen from inside the Docker network, passed into each
-/// worker container for storage (`caos get`/`put` — workers never call back
-/// into compute; their sub-runs are promises the server resolves). Override
-/// with `CAOS_SERVER_URL`.
-const DEFAULT_SERVER_URL: &str = "http://caos-server";
 
 /// Where the git object database lives (the storage half, now in-process).
 /// Override with `CAOS_GIT_DIR` (useful for local runs outside the container).
@@ -79,25 +58,19 @@ const DEFAULT_GIT_DIR: &str = "/git";
 /// `CAOS_REGISTRY_PUSH_URL`.
 const DEFAULT_REGISTRY_PUSH_URL: &str = "http://caos-registry:5000";
 
-/// How the host's docker daemon (which actually runs the worker) refers to that
+/// How the docker daemon that actually runs workers (runnerd's) refers to that
 /// same registry — a published port on localhost, which docker treats as an
 /// insecure registry, so no TLS/daemon config is needed. Override with
 /// `CAOS_REGISTRY_PULL_HOST`.
 const DEFAULT_REGISTRY_PULL_HOST: &str = "localhost:5000";
-
-/// `docker` binary to invoke. Override with `CAOS_DOCKER_BIN`.
-const DEFAULT_DOCKER_BIN: &str = "docker";
 
 /// Redis (host:port) used to cache results. Override with `CAOS_REDIS_ADDR`.
 const DEFAULT_REDIS_ADDR: &str = "caos-redis:6379";
 
 /// Runtime configuration, read once from the environment at startup.
 struct Config {
-    network: String,
-    server_url: String,
     registry_push_url: String,
     registry_pull_host: String,
-    docker_bin: String,
     redis_addr: String,
     /// Filesystem path to the git object database, passed to `git http-backend`
     /// as `GIT_PROJECT_ROOT` for the smart-HTTP transport (see [`mod git`]).
@@ -167,11 +140,8 @@ fn main() {
 
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
-        network: env_or("CAOS_DOCKER_NETWORK", DEFAULT_NETWORK),
-        server_url: env_or("CAOS_SERVER_URL", DEFAULT_SERVER_URL),
         registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
         registry_pull_host: env_or("CAOS_REGISTRY_PULL_HOST", DEFAULT_REGISTRY_PULL_HOST),
-        docker_bin: env_or("CAOS_DOCKER_BIN", DEFAULT_DOCKER_BIN),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         git_dir,
         repo,
@@ -185,21 +155,17 @@ fn main() {
         }
     };
     eprintln!(
-        "caos-server listening on http://{addr} (storage + compute), network {}, \
-         git repo {}, url {}, registry push {} / pull {}, redis {}",
-        config.network,
-        config.git_dir,
-        config.server_url,
-        config.registry_push_url,
-        config.registry_pull_host,
-        config.redis_addr,
+        "caos-server listening on http://{addr} (storage + compute), \
+         git repo {}, registry push {} / pull {}, redis {}",
+        config.git_dir, config.registry_push_url, config.registry_pull_host, config.redis_addr,
     );
 
     // One thread per request, not a serial loop: a worker fetches its inputs
-    // from `/object` while its own `/run` request is still being served, and
-    // several top-level runs may be in flight at once. Threads are cheap here:
-    // each mostly blocks in `docker run`'s `waitpid` (compute fans out its own
-    // threads for parallel promise maps — see compute::resolve_promise).
+    // from `/object` while its own `/run` request is still being served, a
+    // runner's poll parks for its whole TTL, and several top-level runs may be
+    // in flight at once. Threads are cheap here: each mostly blocks (compute
+    // fans out its own threads for parallel promise maps — see
+    // compute::resolve_promise).
     for request in server.incoming_requests() {
         let config = Arc::clone(&config);
         std::thread::spawn(move || {
@@ -254,8 +220,9 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
     }
 }
 
-/// Match the request to a handler and produce the response body. Serves both the
-/// storage endpoints (`/object*`) and compute (`/run`).
+/// Match the request to a handler and produce the response body. Serves the
+/// storage endpoints (`/object*`), compute (`/run`), and the runner protocol
+/// (`/runner/poll`, `/runner/result`).
 fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
@@ -273,6 +240,20 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
             let mut body = Vec::new();
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
+        }
+        Method::Post if path == "/runner/poll" || path == "/runner/result" => {
+            let authorization = request
+                .headers()
+                .iter()
+                .find(|h| h.field.to_string().eq_ignore_ascii_case("authorization"))
+                .map(|h| h.value.to_string());
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)?;
+            if path == "/runner/poll" {
+                runner::poll(authorization.as_deref(), &body)
+            } else {
+                runner::result(authorization.as_deref(), &body)
+            }
         }
         _ => Err(HttpError::new(404, "not found")),
     }

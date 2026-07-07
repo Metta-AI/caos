@@ -118,6 +118,7 @@
         # the output's /bin; consumers pick the one they need.
         caos = crateBin "caos";
         server = crateBin "server";
+        runnerd = crateBin "runnerd";
         worker-hello = crateBin "worker-hello";
         worker-file-count = crateBin "worker-file-count";
         worker-dirs-only = crateBin "worker-dirs-only";
@@ -134,7 +135,7 @@
         # the binary cache.
 
         # Worker images carry the `caos` binary (the worker-side client) at
-        # `/bin/caos`. The `/cas` directory is *not* baked in — `caos entrypoint`
+        # `/bin/caos`. The `/cas` directory is *not* baked in — the `caos` runner
         # creates it at runtime (so a mounted, empty /cas volume works too).
         #
         # This store path holds only what needs *no* special permissions: the user
@@ -180,22 +181,23 @@
         # /usr/bin (a real dir on the base — our layer MERGES with it, leaving the
         # base's binaries intact) so it's reachable both via PATH and as `/bin/caos`
         # (which the base's /bin -> usr/bin symlink resolves) — the latter matters
-        # because the server forces `--entrypoint /bin/caos` (CAOS_BIN) on every
+        # because runnerd forces `--entrypoint /bin/caos` on every
         # worker, regardless of the image's own Entrypoint.
         installWorkerFilesBaseStacked = ''
           mkdir -p usr/bin
           cp ${caos}/bin/caos usr/bin/caos
           chmod 4755 usr/bin/caos
         '';
-        # The container runs `caos entrypoint`: set up /cas, run /worker, then
-        # print the hash of /cas/out. The server URL a worker needs is injected at
-        # runtime by the server for the containers it spawns — so none are baked
-        # into the images. PATH is Debian's default (the base is a stock Debian
-        # image; /bin -> /usr/bin, where caos lives).
+        # The container runs `caos runner`: set up /cas, run /worker, post the
+        # hash of /cas/out back to the server, then poll for more work. The
+        # server URL a worker needs is injected at runtime by runnerd for the
+        # containers it spawns — so none are baked into the images. PATH is
+        # Debian's default (the base is a stock Debian image; /bin -> /usr/bin,
+        # where caos lives).
         workerBaseConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -228,7 +230,7 @@
         workerSharedBaseConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [ "PATH=/bin" ];
         };
@@ -240,7 +242,7 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # A "bash" worker: it runs a shell script you hand it. `caos entrypoint`
+        # A "bash" worker: it runs a shell script you hand it. The `caos` runner
         # sets up /cas, materializes the run's args under /cas/args (one per
         # --name=value / --name:@=path), and runs us as /worker; we fetch the
         # `script` arg (a text file) and execute it with bash. The script does its
@@ -256,7 +258,7 @@
           destination = "/worker";
           text = ''
             #!/bin/bash
-            # caos entrypoint runs us as /worker, with /cas set up and the args
+            # The caos runner runs us as /worker, with /cas set up and the args
             # materialized under /cas/args. Fetch the script and run it; on exit
             # caos reads the hash of /cas/out. If the script left no result there,
             # store an empty blob so there's something to read.
@@ -289,7 +291,7 @@
         workerBashConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [ "PATH=/bin" ];
         };
@@ -305,14 +307,14 @@
         # A real, runnable worker image, with a /worker that reads its inputs from
         # /cas/args (one entry per `--name=value` arg the run request carries), assembles
         # them into a result tree along with a small receipt, and stores that at
-        # /cas/out. The server runs it via `caos entrypoint`, which
+        # /cas/out. It runs via `caos runner`, which
         # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
         # static binary at /worker — so the image needs no shell or coreutils.
         workerHelloRoot = workerRoot "worker-hello" worker-hello;
         workerHelloConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [ "PATH=/bin" ];
         };
@@ -336,7 +338,7 @@
         workerFileCountConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [ "PATH=/bin" ];
         };
@@ -364,7 +366,7 @@
         workerDirsOnlyConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [ "PATH=/bin" ];
         };
@@ -411,7 +413,7 @@
         workerDeepDepsConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [ "PATH=/bin" ];
         };
@@ -466,7 +468,7 @@
         workerRustcConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [
             "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -509,7 +511,7 @@
         workerRunnerConfig = {
           Entrypoint = [
             "/bin/caos"
-            "entrypoint"
+            "runner"
           ];
           Env = [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -524,38 +526,28 @@
         };
 
         # The caos server: storage *and* compute in one process (it serves
-        # /object from a git repo and /run by spawning worker containers). It runs
-        # those containers by shelling out to the `docker` CLI, so — unlike the
-        # minimal images — it bundles the docker client and expects the host's
-        # docker socket bind-mounted at /var/run/docker.sock, and it shells out to
-        # GNU `tar` to build layer tarballs when converting a git image. It also
+        # /object from a git repo and /run by matching jobs to polling runners —
+        # it runs no containers itself; that's runnerd's job). It shells out to
+        # GNU `tar` to build layer tarballs when converting a git image, and
         # needs the git object database bind-mounted at /git (override with
         # CAOS_GIT_DIR):
-        #   docker run --rm --network caos-net -p 9090:80 \
-        #     -v /var/run/docker.sock:/var/run/docker.sock -v /repo/.git:/git \
+        #   docker run --rm --network caos-net -p 9090:80 -v /repo/.git:/git \
         #     caos-server
         serverContents = [
           server
           # General-purpose Linux tools the server shells out to. Pulled from a
           # Linux nixpkgs (see linuxPkgs) so they're real ELF binaries — on macOS
           # they're substituted prebuilt from the cache rather than built.
-          #
-          # The server only ever shells out to `docker run`; it never builds or
-          # composes, so drop the buildx + compose CLI plugins (~116 MiB).
-          (linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
           linuxPkgs.gnutar
           # `git http-backend` (and the `git` it dispatches): the smart-HTTP
           # transport the caos client uses as its `caos` remote. gitMinimal still
           # ships http-backend + core plumbing but drops git's python3/perl/docs
           # (~200 MiB) that the server never touches.
           linuxPkgs.gitMinimal
-          # skopeo, used two ways: (1) copy a base image's blobs from its source
-          # registry into our own repo, so a git image that references
-          # `base = docker://<ref>` converts by stacking only its delta layers on
-          # top (no toolchain in git); (2) under CAOS_BACKEND=fly, copy a converted
-          # worker image from the local registry to the HTTPS, token-authed
-          # registry.fly.io (which the server's TLS-free in-process push can't
-          # reach). `cacert` gives skopeo a CA bundle for the TLS pulls.
+          # skopeo: copy a base image's blobs from its source registry into our
+          # own repo, so a git image that references `base = docker://<ref>`
+          # converts by stacking only its delta layers on top (no toolchain in
+          # git). `cacert` gives skopeo a CA bundle for the TLS pulls.
           linuxPkgs.skopeo
           linuxPkgs.cacert
         ];
@@ -571,6 +563,29 @@
           tag = "latest";
           copyToRoot = serverContents;
           config = serverConfig;
+        };
+
+        # caos-runnerd: the generic runner — the one daemon that runs worker
+        # containers. It long-polls the server for jobs and `docker run`s each
+        # one, so it bundles the docker client and expects the host's docker
+        # socket bind-mounted at /var/run/docker.sock:
+        #   docker run --rm --network caos-net \
+        #     -v /var/run/docker.sock:/var/run/docker.sock caos-runnerd
+        runnerdContents = [
+          runnerd
+          # runnerd only ever shells out to `docker run`; it never builds or
+          # composes, so drop the buildx + compose CLI plugins (~116 MiB).
+          (linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
+        ];
+        runnerdConfig = {
+          Cmd = [ "/bin/runnerd" ];
+          Env = [ "PATH=/bin" ];
+        };
+        runnerdImage = pkgs.dockerTools.buildImage {
+          name = "caos-runnerd";
+          tag = "latest";
+          copyToRoot = runnerdContents;
+          config = runnerdConfig;
         };
 
         # `nix run .#load-<name>` builds the image and pipes it straight into the
@@ -608,6 +623,11 @@
           name = "caos-server";
           contents = serverContents;
           config = serverConfig;
+        };
+        loadRunnerd = loadImage {
+          name = "caos-runnerd";
+          contents = runnerdContents;
+          config = runnerdConfig;
         };
         loadWorkerHello = loadImage {
           name = "caos-worker-hello";
@@ -690,19 +710,20 @@
           ];
         };
 
-        # The dev stack as docker compose: redis + registry + the caos server,
-        # mirroring the Tiltfile's wiring. The network and container names are
-        # *pinned* (not compose's project-prefixed defaults) so the worker
-        # containers the server spawns over the docker socket — which it attaches
-        # to CAOS_DOCKER_NETWORK by this literal name — land on caos-net and can
-        # reach caos-registry. The server image is loaded from the Nix store
-        # (pull_policy: never), and CAOS_DATA (absolute) holds its bare repo.
+        # The dev stack as docker compose: redis + registry + the caos server +
+        # runnerd, mirroring the Tiltfile's wiring. The network and container
+        # names are *pinned* (not compose's project-prefixed defaults) so the
+        # worker containers runnerd spawns over the docker socket — which it
+        # attaches to CAOS_DOCKER_NETWORK by this literal name — land on
+        # caos-net and can reach caos-server. The server and runnerd images are
+        # loaded from the Nix store (pull_policy: never), and CAOS_DATA
+        # (absolute) holds the server's bare repo.
         composeFile = pkgs.writeText "docker-compose.yml" ''
           # caos dev stack — generated by the caos flake. Driven by `caosd`,
-          # which sets CAOS_DATA + loads the server image, then `up`s this file and
-          # seeds the stdlib over HTTP (the server self-bootstraps its bare repo on
-          # first boot). A bare `docker compose up` works once CAOS_DATA is set and
-          # the server image is loaded.
+          # which sets CAOS_DATA + loads the server/runnerd images, then `up`s
+          # this file and seeds the stdlib over HTTP (the server self-bootstraps
+          # its bare repo on first boot). A bare `docker compose up` works once
+          # CAOS_DATA is set and the images are loaded.
           name: caos
           networks:
             caos-net:
@@ -724,12 +745,19 @@
               pull_policy: never
               networks: [caos-net]
               ports: ["9090:80"]
+              volumes:
+                - "''${CAOS_DATA:?set CAOS_DATA to an absolute data dir}/server-repo.git:/git"
+              depends_on: [caos-redis, caos-registry]
+            caos-runnerd:
+              image: caos-runnerd:latest
+              container_name: caos-runnerd
+              pull_policy: never
+              networks: [caos-net]
               environment:
                 CAOS_DOCKER_NETWORK: caos-net
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
-                - "''${CAOS_DATA:?set CAOS_DATA to an absolute data dir}/server-repo.git:/git"
-              depends_on: [caos-redis, caos-registry]
+              depends_on: [caos-server]
         '';
 
         # Bring the dev stack up (Ctrl-C tears it down). Loads the server image,
@@ -753,22 +781,27 @@
               exit 1
             fi
 
-            # Load the server image only when this exact build isn't already in
-            # docker. We tag the loaded image with a hash of its (immutable) nix
-            # store path; the tag's presence means "this build is loaded", so an
-            # unchanged restart skips the multi-second `docker load`. Remove the
-            # image and the tag goes with it (reload); change the image and its
-            # store path — hence the tag — changes (reload).
-            src_tag="caos-server-src:$(printf '%s' "${serverImage}" | sha1sum | cut -c1-12)"
-            if docker image inspect "$src_tag" >/dev/null 2>&1; then
-              echo "==> caos-server image already loaded — skipping docker load" >&2
-            else
-              echo "==> loading caos-server image into docker" >&2
-              docker load -i ${serverImage}
-              docker tag caos-server:latest "$src_tag"
-            fi
+            # Load the server/runnerd images only when this exact build isn't
+            # already in docker. We tag the loaded image with a hash of its
+            # (immutable) nix store path; the tag's presence means "this build is
+            # loaded", so an unchanged restart skips the multi-second `docker
+            # load`. Remove the image and the tag goes with it (reload); change
+            # the image and its store path — hence the tag — changes (reload).
+            load_once() {
+              local name="$1" image="$2" src_tag
+              src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
+              if docker image inspect "$src_tag" >/dev/null 2>&1; then
+                echo "==> $name image already loaded — skipping docker load" >&2
+              else
+                echo "==> loading $name image into docker" >&2
+                docker load -i "$image"
+                docker tag "$name:latest" "$src_tag"
+              fi
+            }
+            load_once caos-server ${serverImage}
+            load_once caos-runnerd ${runnerdImage}
 
-            echo "==> starting stack (redis, registry, server)" >&2
+            echo "==> starting stack (redis, registry, server, runnerd)" >&2
             trap 'docker compose -f ${composeFile} down' EXIT
             docker compose -f ${composeFile} up -d
 
@@ -791,7 +824,7 @@
       {
         packages = {
           default = caos;
-          inherit caos server caos-cli caosd caos-tools;
+          inherit caos server runnerd caos-cli caosd caos-tools;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)
@@ -802,6 +835,7 @@
           caos-worker-base-docker = workerBaseImage;
           caos-worker-bash-docker = workerBashImage;
           caos-server-docker = serverImage;
+          caos-runnerd-docker = runnerdImage;
           caos-worker-hello-docker = workerHelloImage;
           caos-worker-file-count-docker = workerFileCountImage;
           caos-worker-dirs-only-docker = workerDirsOnlyImage;
@@ -829,6 +863,10 @@
           load-caos-server = {
             type = "app";
             program = "${loadServer}/bin/load-caos-server";
+          };
+          load-caos-runnerd = {
+            type = "app";
+            program = "${loadRunnerd}/bin/load-caos-runnerd";
           };
           load-caos-worker-hello = {
             type = "app";

@@ -94,9 +94,11 @@ libc, no `/nix/store`. The `caos-server` image is not minimal: it bundles the
 - A **server** holds the canonical CAS and runs compute. It exposes three faces
   over one URL: an HTTP object API (`/object`), an HTTP compute trigger
   (`/run`), and a **git smart-HTTP transport** over its own repo.
-- A **worker** is a container the server runs. It reaches the server over HTTP,
-  reading inputs from and writing results to a per-run `/cas` directory through
-  the setuid `caos` binary.
+- A **worker** is a container run by a **runner** (`caos-runnerd`, the generic
+  host agent — the server itself runs nothing; see
+  `design/runner-protocol.md`). It reaches the server over HTTP, reading inputs
+  from and writing results to a per-job `/cas` directory through the setuid
+  `caos` binary, and may stay warm to take further jobs for its image.
 - A **user** drives it all with `caos-cli` from inside a git working tree that
   has the server configured as a remote named `caos`. Objects are built locally
   and exchanged with the server by **negotiated git push/fetch**, so passing a
@@ -114,16 +116,18 @@ dev, Tilt creates a dedicated bare repo for it (see [local testing](#local-testi
 It serves requests **concurrently — one thread per request** — so a worker can
 fetch objects while its own `/run` is in flight, and several top-level runs can
 proceed at once. Workers never call back into `/run`: a worker that needs
-sub-computations records a **map-then continuation** as its result and exits,
-and the server resolves it (see [compute](#compute)) — so no worker ever waits
-on another worker, and `CAOS_MAX_WORKERS` can bound concurrent containers
-without any risk of deadlock.
+sub-computations records a **map-then continuation** as its result and finishes
+its job, and the server resolves it (see [compute](#compute)) — so no worker
+ever waits on another worker and nothing can deadlock. Capacity lives
+runner-side: the set of hanging `/runner/poll`s *is* the pool.
 
 | Request | Behaviour |
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
 | `GET /run?req=<reqHash>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). See [compute](#compute). |
+| `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
+| `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
 
 The git transport is what makes the server a `caos` remote: `git http-backend`
@@ -134,12 +138,10 @@ is created with `http.receivepack=true` (to accept pushes) and
 its bare hash; `/object` itself never needs that flag).
 
 Environment overrides: `SERVER_ADDR` (`0.0.0.0:80`), `CAOS_GIT_DIR` (`/git`),
-`CAOS_DOCKER_NETWORK` (`caos-net`), `CAOS_SERVER_URL` (`http://caos-server`,
-injected into each worker), `CAOS_REGISTRY_PUSH_URL`
-(`http://caos-registry:5000`), `CAOS_REGISTRY_PULL_HOST` (`localhost:5000`),
-`CAOS_DOCKER_BIN` (`docker`), `CAOS_REDIS_ADDR` (`caos-redis:6379`),
-`CAOS_MAX_WORKERS` (`8`; `0` = unlimited — the bound on concurrent worker
-containers, safe at any setting ≥ 1).
+`CAOS_REGISTRY_PUSH_URL` (`http://caos-registry:5000`),
+`CAOS_REGISTRY_PULL_HOST` (`localhost:5000`), `CAOS_REDIS_ADDR`
+(`caos-redis:6379`), `CAOS_RUNNER_TOKEN` (unset = runner auth disabled).
+Worker-running knobs (network, docker binary, slots) live on `caos-runnerd`.
 
 ### Compute
 
@@ -160,16 +162,18 @@ match on the worker alongside the rest, and a worker, seeing its args at
 4. **resolve the image** — a `docker://<ref>` is used directly; one of our git
    images is converted to a real image, pushed to the registry, and run by
    digest (see [git images](#git-images));
-5. **run the container**, forcing `/bin/caos entrypoint --args=<args>` with
-   `CAOS_SERVER_URL`, `CAOS_STD`, and `CAOS_SALT` injected (`std`/`salt` also
-   thread into promise sub-runs);
-6. its stdout — printed by `entrypoint` — is either the result,
-   `"<type> <hash>"`, or a **promise**, `"promise <hash>"`: a map-then
-   continuation the worker recorded instead of a value (see
-   [map-then](#map-then-sub-computations-without-blocking)). The container is
-   already gone; the server **resolves** the promise — running `map` over the
-   children in parallel, then `then` — through this same pipeline, so sub-runs
-   are cached, cycle-checked, and may themselves promise;
+5. **dispatch to a runner** — the job is matched against the hanging
+   `/runner/poll`s (a runner's required args are name → oid pairs the args
+   tree's top level must equal; most specific match wins, so a warm runner
+   already running this image beats the generic `caos-runnerd`, which starts a
+   fresh container `/bin/caos runner --job=<json>`);
+6. the runner posts back either the result, `"<type> <hash>"`, or a
+   **promise**, `"promise <hash>"`: a map-then continuation the worker recorded
+   instead of a value (see
+   [map-then](#map-then-sub-computations-without-blocking)). The worker has
+   already moved on; the server **resolves** the promise — running `map` over
+   the children in parallel, then `then` — through this same pipeline, so
+   sub-runs are cached, cycle-checked, and may themselves promise;
 7. **cache** the resolved result, and for an **external** run (one that arrived
    over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
    fetch/watch point. Sub-runs set no ref.
@@ -182,7 +186,7 @@ Results stay on the server. The caller gets back the hash and a type; it does
 A worker never blocks on another worker. Its `caos map-then` is a **tail call**: it
 records a continuation `{in, map?, then?}` — `in` a tree entry for the data
 node, `map`/`then` blobs naming images — as the worker's own result at
-`/cas/out`, and the worker exits, freeing its slot. The server then:
+`/cas/out`, and the worker's job is done. The server then:
 
 1. if `map` is given and `in` is a tree: runs `map --in=<child>` for **each
    child of `in`, in parallel** (a blob `in` is a leaf — no children), and
@@ -196,9 +200,8 @@ straight from `/cas/args/image`, the request's reserved entry — as the mapper,
 so each child gets the same treatment, with no std lookup and for any git
 image (a rustc-built worker as much as a builtin) — and each child may itself
 promise. Because a worker either computes a value or *describes* the remaining
-work, only server threads ever wait; a bounded worker pool
-(`CAOS_MAX_WORKERS`) always drains. See `design/map-then.md` for the full
-argument.
+work, only server threads ever wait; a bounded runner pool always drains. See
+`design/map-then.md` for the full argument.
 
 ### Caching
 
@@ -233,10 +236,10 @@ published port (`CAOS_REGISTRY_PULL_HOST`, insecure, no TLS).
 logic — the difference is the **transport** and the privilege model.
 
 - **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
-  provides the container `entrypoint`. It's installed **setuid-root** in
+  provides the container `runner`. It's installed **setuid-root** in
   worker images so an unprivileged worker can reach the root-owned `/cas` only
   through it. Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`,
-  `entrypoint`. Its `map-then` is a *tail call* — it records a map-then continuation
+  `runner`. Its `map-then` is a *tail call* — it records a map-then continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
 - **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
@@ -312,9 +315,9 @@ into `then`'s `--children` tree by the server, by hash, and only at the top,
 where `caos-cli` returns the final result to the user, is the whole tree pulled
 down.
 
-**Failures propagate.** If a worker exits non-zero, `entrypoint` makes the
-container fail, the server answers `/run` with an error carrying the worker's
-stderr — and a failure anywhere in a promise tree (a `map` child, a `then`,
+**Failures propagate.** If a worker exits non-zero, the runner posts a failure
+result carrying the worker's log, and the server answers `/run` with that
+error — and a failure anywhere in a promise tree (a `map` child, a `then`,
 any depth) fails the requests above it the same way, up to the top-level
 `caos-cli run`, which exits non-zero with the message. (The run-cycle error is
 one such case.)
@@ -374,24 +377,29 @@ today, leaving room for more. The worker `caos` has no host filesystem (only
   `image` entry) — so a request only ever carries a plain args tree. Currying
   flattens, so it's canonical. On `caos-cli`, path args are host paths to
   ingest, or `/cas/std/<name>` builtin refs.
-- `entrypoint [--args=<hash>]` (`caos`) — the container entrypoint; see below.
+- `runner --job=<json>` (`caos`) — the container runner; see below.
 
-### `entrypoint`
+### `runner`
 
-`caos entrypoint` ties a single compute step together inside the container:
+`caos runner --job=<json>` runs jobs inside the container until an idle TTL
+passes (see `design/runner-protocol.md`). Per job:
 
-1. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
-2. **load** — if `--args=<hash>`, materialize it at `/cas/args`; if `$CAOS_STD`
-   is set, materialize the standard library at `/cas/std`;
+1. **unpack** — fetch the request tree named by the job's `req` and read its
+   `args`/`std`/`salt`;
+2. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
+   materialize the args at `/cas/args` and the standard library at `/cas/std`;
 3. **run `/worker`** — dropped to the unprivileged `worker` user so it can't
-   touch the root-owned `/cas` except through setuid `caos`; `entrypoint` stays
-   root to tear down. The worker's stdout is sent to stderr so the container's
-   stdout stays clean;
-4. **report** — print `"<type> <hash>"` for `/cas/out` (a fast xattr read plus
-   an `is_dir` check — no re-hashing). `blob`/`tree` results go back to the
-   caller as-is; a `promise` (a `caos map-then` continuation) is resolved by the
-   server after this container exits;
-5. **tear down** — delete `/cas`.
+   touch the root-owned `/cas` except through setuid `caos`; the runner stays
+   root to tear down. The worker's output is relayed to the container log and
+   rides along with a failure report;
+4. **report** — POST `"<type> <hash>"` for `/cas/out` (a fast xattr read plus
+   an `is_dir` check — no re-hashing) to `/runner/result`. `blob`/`tree`
+   results go back to the caller as-is; a `promise` (a `caos map-then`
+   continuation) is resolved by the server once posted;
+5. **tear down** — delete `/cas`, then long-poll `/runner/poll` for another job
+   for this image (`required: {image: <oid>}`). An `idle` or `exit` reply ends
+   the container; a job goes back to step 1 — that's the warm-worker win: no
+   container start between jobs.
 
 So a `/worker` reads inputs from `/cas/args`, reaches built-ins at `/cas/std`,
 and writes its result to `/cas/out`.
@@ -470,9 +478,9 @@ tilt up      # build images + run the daemons; UI at http://localhost:10350
 The `Tiltfile` builds each image with Nix (only when its sources, or the
 flake/lockfiles, change), creates the `caos-net` network and the server's
 **dedicated bare repo** (`.caos-dev/server-repo.git`, with `http.receivepack`
-and `uploadpack.allowAnySHA1InWant`), and runs three daemons: `caos-server`
-(`:9090`, with the docker socket and the repo mounted at `/git`), `caos-redis`,
-and a `caos-registry`.
+and `uploadpack.allowAnySHA1InWant`), and runs four daemons: `caos-server`
+(`:9090`, with the repo mounted at `/git`), `caos-runnerd` (the generic runner,
+with the docker socket), `caos-redis`, and a `caos-registry`.
 
 **Stopping:** Ctrl-C the `tilt up` process — that tears the daemons down. (`tilt
 down` does *not*: the daemons are `local_resource`s, which it ignores.) Each

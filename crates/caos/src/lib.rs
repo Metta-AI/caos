@@ -4,8 +4,9 @@
 //!
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
 //!   It talks to the server over HTTP (`/object`) and runs the container
-//!   `entrypoint`. It never triggers compute — its `map-then` records a map-then
-//!   continuation the server resolves after the worker exits.
+//!   `runner` (jobs arrive by long-poll; see `design/runner-protocol.md`). It
+//!   never triggers compute — its `map-then` records a map-then continuation
+//!   the server resolves after the worker's job finishes.
 //! * **`caos-cli`** — the user-facing client. It uses the server as a `caos` git
 //!   remote, building objects in the local working repo and exchanging them with
 //!   the server by negotiated push/fetch.
@@ -934,7 +935,7 @@ fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String
 
 /// The result kind recorded at `path`: its [`KIND_XATTR`] if present (a promise
 /// placeholder), else implied by shape — a directory is a tree, a file a blob.
-/// What `entrypoint` reports for `/cas/out`.
+/// What the runner reports for `/cas/out`.
 pub fn result_kind(path: &Path) -> Result<String, String> {
     if let Ok(Some(kind)) = xattr::get(path, KIND_XATTR) {
         return String::from_utf8(kind)

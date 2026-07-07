@@ -2,30 +2,29 @@
 //! `/bin/caos`.
 //!
 //! It speaks HTTP to the server (`/object`, for storage) via
-//! [`caos::HttpTransport`], and provides the container `entrypoint` — which sets
-//! up the root-owned `/cas`, runs `/worker` as an unprivileged user, and prints
-//! the kind + hash recorded at `/cas/out`. It never triggers compute: its `map-then`
-//! records a map-then continuation the server resolves after the worker exits.
-//! The shared command logic lives in the `caos` library; this binary is the
-//! worker's CLI surface plus the privileged entrypoint.
+//! [`caos::HttpTransport`], and provides the container `runner` — which runs a
+//! job (set up the root-owned `/cas`, run `/worker` as an unprivileged user,
+//! post the kind + hash recorded at `/cas/out` back to the server), then
+//! long-polls for more work for its image until an idle TTL passes (see
+//! `design/runner-protocol.md`). It never triggers compute: its `map-then`
+//! records a map-then continuation the server resolves after the worker's job
+//! finishes. The shared command logic lives in the `caos` library; this binary
+//! is the worker's CLI surface plus the privileged runner.
 //!
-//! Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`, and `entrypoint`.
+//! Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
-use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
-use std::sync::Mutex;
 
-use caos::{prog_name, HttpTransport};
-use tiny_http::{Header, Request, Response, Server};
+use caos::{prog_name, HttpTransport, Transport};
 
-/// The program `entrypoint` always runs. Images that build off the
+/// The program a job always runs. Images that build off the
 /// `caos-worker-base` image supply this binary.
 const DEFAULT_WORKER: &str = "/worker";
 
-/// The unprivileged user `entrypoint` runs `/worker` as. The container starts as
-/// root so `entrypoint` can set up — and later tear down — the root-owned
+/// The unprivileged user a job runs `/worker` as. The container starts as
+/// root so the runner can set up — and later tear down — the root-owned
 /// `/cas`; it drops to this uid/gid only for the `/worker` child. The worker
 /// therefore can't tamper with `/cas` directly: it must go through `caos`, which
 /// is setuid-root. Override (e.g. for a different image user) with the env vars.
@@ -72,17 +71,15 @@ fn run(args: &[String]) -> Result<(), String> {
             [image, sep, kvs @ ..] if sep == "--" => caos::caos_curry(&http()?, image, kvs),
             _ => Err(usage(args)),
         },
-        // `entrypoint [--args=<hash>]` — takes no command; it always runs /worker.
-        Some("entrypoint") => match &args[2..] {
-            [] => entrypoint(None),
-            [flag] => match flag.strip_prefix("--args=") {
-                Some(hash) => entrypoint(Some(hash)),
+        // `runner --job=<json>` — run the handed-in job, then poll for more; see
+        // `runner()`.
+        Some("runner") => match &args[2..] {
+            [flag] => match flag.strip_prefix("--job=") {
+                Some(json) => runner(json),
                 None => Err(usage(args)),
             },
             _ => Err(usage(args)),
         },
-        // `serve` — long-lived HTTP worker (warm-pool mode); see `serve()`.
-        Some("serve") => serve(),
         _ => Err(usage(args)),
     }
 }
@@ -92,123 +89,206 @@ fn http() -> Result<HttpTransport, String> {
     HttpTransport::from_env()
 }
 
-/// One job at a time. Held across a job *and* its cleanup, so the slot never
-/// frees until the VM is clean for the next job.
-static SLOT: Mutex<()> = Mutex::new(());
+/// The runner's idle budget, in seconds: how long one follow-up poll hangs
+/// before the runner exits. Ski-rental: set it near the cost of restarting a
+/// container for this image. Override with `CAOS_RUNNER_TTL`.
+const RUNNER_TTL_ENV: &str = "CAOS_RUNNER_TTL";
+const DEFAULT_RUNNER_TTL: u32 = 10;
 
-/// A dispatched job: which args tree to run, plus the std/salt the server used
-/// to thread through the container env. The worker is reused across jobs, so
-/// these arrive per-request rather than as process env.
-struct Job {
-    args: String,
-    std: String,
-    salt: String,
+/// A job handed to this runner: the rendezvous ids (the request is fetched and
+/// unpacked from `req` itself), plus the bearer token children present back to
+/// the server. Everything else about the job is derived from `req`.
+struct RunnerJob {
+    req: String,
+    nonce: String,
+    token: Option<String>,
 }
 
-/// `serve` — run as a long-lived HTTP worker instead of a one-shot container.
-/// Per `POST /run` it runs the same staged job lifecycle as `entrypoint`,
-/// in-process and one at a time, so each job's `/cas` lifecycle is identical to
-/// the container model. A busy worker bounces the request to another instance
-/// (once, via `fly-replay`) or blocks.
-fn serve() -> Result<(), String> {
-    let server = Server::http("[::]:8080").map_err(|e| format!("binding :8080: {e}"))?;
-    eprintln!("caos serve: listening on :8080");
-    for request in server.incoming_requests() {
-        // One thread per connection only so a busy worker can answer "replay"
-        // (or hold a blocked conn) without stalling accept(). Job concurrency is
-        // still 1 — enforced by SLOT, not by the thread count.
-        std::thread::spawn(move || handle(request));
+impl RunnerJob {
+    fn parse(json: &str) -> Result<RunnerJob, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("invalid job json: {e}"))?;
+        RunnerJob::from_value(&v)
     }
-    Ok(())
-}
 
-fn handle(mut request: Request) {
-    if request.url().split('?').next() != Some("/run") {
-        return respond(request, 404, "not found");
-    }
-    // The proxy stamps replayed requests with `fly-replay-src`; we bounce at most
-    // once, then block, so a saturated pool can't loop.
-    let already_replayed = request
-        .headers()
-        .iter()
-        .any(|h| h.field.to_string().eq_ignore_ascii_case("fly-replay-src"));
-
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
-        return respond(request, 400, "unreadable body");
-    }
-    let job = match parse_job(&body) {
-        Ok(job) => job,
-        Err(e) => return respond(request, 400, &e),
-    };
-
-    match SLOT.try_lock() {
-        Ok(guard) => run_and_reply(request, &job, &guard),
-        // Busy, first touch: ask the proxy to replay on a different instance.
-        Err(_) if !already_replayed => {
-            let hdr = Header::from_bytes(&b"fly-replay"[..], &b"elsewhere=true"[..])
-                .expect("static header");
-            let _ = request.respond(Response::empty(503).with_header(hdr));
+    fn from_value(v: &serde_json::Value) -> Result<RunnerJob, String> {
+        let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+        let req = field("req").unwrap_or_default().to_string();
+        let nonce = field("nonce").unwrap_or_default().to_string();
+        if req.is_empty() || nonce.is_empty() {
+            return Err("job missing req/nonce".to_string());
         }
-        // Busy, already bounced once: wait our turn here instead of bouncing again.
-        Err(_) => {
-            let guard = SLOT.lock().unwrap_or_else(|p| p.into_inner());
-            run_and_reply(request, &job, &guard);
+        Ok(RunnerJob {
+            req,
+            nonce,
+            token: field("token").map(str::to_string),
+        })
+    }
+}
+
+/// `runner --job=<json>` — the container runner (see
+/// `design/runner-protocol.md`): run the handed-in job through the staged
+/// lifecycle, post its result to the server, then long-poll for more work for
+/// this image — required args `{image: <oid>}`, learned from our own
+/// materialization of the first job's args — until a poll comes back empty
+/// (`idle`), the server evicts us (`exit`), or we never learned the oid.
+fn runner(job_json: &str) -> Result<(), String> {
+    let t = http()?;
+    let mut job = RunnerJob::parse(job_json)?;
+    let mut image_oid: Option<String> = None;
+    loop {
+        let ran = run_runner_job(&t, &job, &mut image_oid);
+        post_result(&t, &job, &ran)?;
+        reset_after_job();
+        // A failed job doesn't kill a warm runner — but never having learned
+        // our image's oid (setup failed before /cas/args existed) means we have
+        // nothing to advertise, so don't linger.
+        let Some(oid) = image_oid.clone() else {
+            return ran.map(|_| ());
+        };
+        match next_job(&t, &oid, &job.token)? {
+            Some(next) => job = next,
+            None => return Ok(()),
         }
     }
 }
 
-/// Run the job (the same staged lifecycle `entrypoint` composes, in-process),
-/// reply, then reset the VM — all while holding the slot, so the next job starts
-/// clean regardless of which branch above we took.
-fn run_and_reply(request: Request, job: &Job, _slot: &std::sync::MutexGuard<'_, ()>) {
-    match run_job(job) {
-        Ok(result) => respond(request, 200, &result),
-        Err(e) => respond(request, 500, &format!("worker failed: {e}")),
+/// One job through the staged lifecycle: unpack the request, set up `/cas`,
+/// run `/worker`, read back `/cas/out`, tear down. The process is reused across
+/// jobs, so std/salt come from the request rather than our env: `/cas/std` is
+/// materialized from the request's value, and the worker child gets both as
+/// env vars — `caos map-then`/`curry` running under it read them from there.
+fn run_runner_job(
+    t: &HttpTransport,
+    job: &RunnerJob,
+    image_oid: &mut Option<String>,
+) -> Result<String, String> {
+    let (args, std, salt) = read_req_tree(t, &job.req)?;
+    let cas = cas_setup(Some(&args), std.as_deref())?;
+    // Our image's CAS-level name, for the follow-up poll's required args — read
+    // off the placeholder cas_setup just materialized (every entry is tagged
+    // with its hash).
+    if image_oid.is_none() {
+        *image_oid = caos::read_hash(&cas.join("args").join("image")).ok();
     }
-    reset_after_job();
-}
-
-/// One job through the staged lifecycle. The process is reused across jobs, so
-/// std/salt arrive with the job rather than in our env: `/cas/std` is
-/// materialized from the job's value, and the worker child gets both as env
-/// vars — `caos map-then`/`curry` running under it read them from there.
-fn run_job(job: &Job) -> Result<String, String> {
-    let std = (!job.std.is_empty()).then_some(job.std.as_str());
-    let cas = cas_setup(Some(&job.args), std)?;
     let envs = [
-        (caos::STD_ENV, job.std.as_str()),
-        (caos::SALT_ENV, job.salt.as_str()),
+        (caos::STD_ENV, std.as_deref().unwrap_or("")),
+        (caos::SALT_ENV, salt.as_str()),
     ];
-    run_worker(&envs, WorkerOutput::Capture)?;
+    run_worker(&envs)?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
     Ok(result)
 }
 
-fn respond(request: Request, status: u16, body: &str) {
-    let resp = Response::from_string(body).with_status_code(status);
-    let _ = request.respond(resp);
+/// Unpack a request tree `{args, std, salt}`: the args-tree hash, the std tree
+/// hash (its entry is a blob *naming* the tree; `None` if empty or absent), and
+/// the salt (empty if absent).
+fn read_req_tree(t: &dyn Transport, req: &str) -> Result<(String, Option<String>, String), String> {
+    let (kind, content) = t.get_object(req)?;
+    if kind != "tree" {
+        return Err(format!("request {req} is a {kind}, not a tree"));
+    }
+    let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+        .map_err(|e| format!("malformed request tree {req}: {e}"))?;
+    let blob = |oid: gix::ObjectId| -> Result<String, String> {
+        let (_, content) = t.get_object(&oid.to_string())?;
+        Ok(String::from_utf8_lossy(&content).trim().to_string())
+    };
+    let (mut args, mut std, mut salt) = (None, None, String::new());
+    for entry in tree.entries {
+        match entry.filename.to_vec().as_slice() {
+            b"args" => args = Some(entry.oid.to_string()),
+            b"std" => std = Some(blob(entry.oid.into())?).filter(|s| !s.is_empty()),
+            b"salt" => salt = blob(entry.oid.into())?,
+            _ => {}
+        }
+    }
+    let args = args.ok_or_else(|| format!("request {req} missing 'args'"))?;
+    Ok((args, std, salt))
 }
 
-fn parse_job(body: &str) -> Result<Job, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("invalid job json: {e}"))?;
-    let field = |k: &str| {
-        v.get(k)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string()
+/// POST the job's outcome to `/runner/result`. A 410 means the nonce was
+/// already consumed (someone else reported) — fine, the job is settled.
+fn post_result(
+    t: &HttpTransport,
+    job: &RunnerJob,
+    ran: &Result<String, String>,
+) -> Result<(), String> {
+    let body = match ran {
+        Ok(result) => serde_json::json!({
+            "req": job.req, "nonce": job.nonce, "ok": true, "result": result,
+        }),
+        Err(error) => serde_json::json!({
+            "req": job.req, "nonce": job.nonce, "ok": false, "error": error,
+        }),
     };
-    let args = field("args");
-    if args.is_empty() {
-        return Err("job missing 'args'".to_string());
+    let url = runner_url(t, "result")?;
+    let resp = runner_post(&url, &body.to_string(), &job.token, 30)?;
+    match resp.status_code {
+        200 | 410 => Ok(()),
+        code => Err(format!(
+            "posting result ({code}): {}",
+            resp.as_str().unwrap_or("")
+        )),
     }
-    Ok(Job {
-        args,
-        std: field("std"),
-        salt: field("salt"),
-    })
+}
+
+/// One follow-up long-poll for more work for our image. `Some(job)` to run it;
+/// `None` on `idle` (our TTL passed) or `exit` (evicted) — either way, quit.
+fn next_job(
+    t: &HttpTransport,
+    image_oid: &str,
+    token: &Option<String>,
+) -> Result<Option<RunnerJob>, String> {
+    let ttl = caos::env_u32(RUNNER_TTL_ENV).unwrap_or(DEFAULT_RUNNER_TTL);
+    let body = serde_json::json!({
+        "required": { "image": image_oid },
+        // Our parent is a generic runner (runnerd) — it polls with no required
+        // args once we die, so a job we can't serve can evict us toward it.
+        "lineage": [ {} ],
+        "ttl_secs": ttl,
+    });
+    let url = runner_url(t, "poll")?;
+    let resp = runner_post(&url, &body.to_string(), token, u64::from(ttl) + 15)?;
+    if resp.status_code != 200 {
+        return Err(format!(
+            "poll failed ({}): {}",
+            resp.status_code,
+            resp.as_str().unwrap_or("")
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_str(resp.as_str().unwrap_or(""))
+        .map_err(|e| format!("invalid poll reply: {e}"))?;
+    match v.get("job") {
+        Some(job) if job.is_object() => Ok(Some(RunnerJob::from_value(job)?)),
+        _ => Ok(None),
+    }
+}
+
+/// The server's runner endpoint `/runner/<leaf>`.
+fn runner_url(t: &HttpTransport, leaf: &str) -> Result<String, String> {
+    Ok(format!(
+        "{}/runner/{leaf}",
+        t.server_url()?.trim_end_matches('/')
+    ))
+}
+
+/// POST a runner-protocol request, presenting the job's bearer token if any.
+fn runner_post(
+    url: &str,
+    body: &str,
+    token: &Option<String>,
+    timeout_secs: u64,
+) -> Result<minreq::Response, String> {
+    let mut req = minreq::post(url)
+        .with_header("content-type", "application/json")
+        .with_timeout(timeout_secs)
+        .with_body(body.to_string());
+    if let Some(token) = token {
+        req = req.with_header("Authorization", format!("Bearer {token}"));
+    }
+    req.send().map_err(|e| format!("POST {url}: {e}"))
 }
 
 /// Reset the worker-writable surface between jobs — the guarantees the disposable
@@ -284,23 +364,8 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
-         {prog} entrypoint [--args=<hash>]\n  \
-         {prog} serve"
+         {prog} runner --job=<json>"
     )
-}
-
-/// `entrypoint [--args=<hash>]` — the container entrypoint: the staged job
-/// lifecycle (`cas_setup` → `run_worker` → `read_result` → `remove_cas`) run
-/// back to back, with `/cas/std` taken from `$CAOS_STD` and the result printed
-/// on stdout. `serve` runs the same stages in-process per job.
-fn entrypoint(args_hash: Option<&str>) -> Result<(), String> {
-    let std = std::env::var(caos::STD_ENV).ok().filter(|s| !s.is_empty());
-    let cas = cas_setup(args_hash, std.as_deref())?;
-    run_worker(&[], WorkerOutput::Stream)?;
-    let result = read_result(&cas)?;
-    remove_cas(&cas)?;
-    println!("{result}");
-    Ok(())
 }
 
 /// Set up a fresh `/cas` for one job: wipe whatever a prior job left, recreate
@@ -327,21 +392,12 @@ fn cas_setup(
     Ok(cas)
 }
 
-/// Where a job's worker output goes.
-enum WorkerOutput {
-    /// Stream to this process's stderr (the one-shot container: our stdout must
-    /// carry only the result line, and the container's stderr is the job log).
-    Stream,
-    /// Capture, surfacing it in the error on failure (serve: the process's own
-    /// streams outlive the job, so the caller wants the log with the failure).
-    Capture,
-}
-
 /// Run `/worker` with `envs` added to its environment. We stay root (to tear
 /// down `/cas` after), but drop the worker to an unprivileged user so it can't
 /// tamper with the root-owned `/cas` — only the setuid-root `caos` it invokes
-/// can.
-fn run_worker(envs: &[(&str, &str)], output: WorkerOutput) -> Result<(), String> {
+/// can. Its output is captured, relayed to our stderr (the container log), and
+/// included in the error on failure so the failure post carries the log.
+fn run_worker(envs: &[(&str, &str)]) -> Result<(), String> {
     let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
     let gid = caos::env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
     let mut command = std::process::Command::new(DEFAULT_WORKER);
@@ -361,33 +417,20 @@ fn run_worker(envs: &[(&str, &str)], output: WorkerOutput) -> Result<(), String>
             Ok(())
         });
     }
-    match output {
-        WorkerOutput::Stream => {
-            let stdout = std::io::stderr()
-                .as_fd()
-                .try_clone_to_owned()
-                .map_err(|e| format!("duplicating stderr: {e}"))?;
-            command.stdout(std::process::Stdio::from(stdout));
-            let status = command
-                .status()
-                .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
-            if !status.success() {
-                return Err(format!("{DEFAULT_WORKER} exited with {status}"));
-            }
-        }
-        WorkerOutput::Capture => {
-            let out = command
-                .output()
-                .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "{DEFAULT_WORKER} exited with {}:\n{}{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-            }
-        }
+    let out = command
+        .output()
+        .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprint!("{log}");
+    if !out.status.success() {
+        return Err(format!(
+            "{DEFAULT_WORKER} exited with {}:\n{log}",
+            out.status
+        ));
     }
     Ok(())
 }

@@ -130,12 +130,12 @@ Details:
 - **Pending deadline**: a job no poll and no lineage can serve waits for new
   capacity, then fails 503 after a dispatch timeout (~60s).
 - **No worker-slot semaphore on this path**: capacity is runner-side.
-  `CAOS_MAX_WORKERS` becomes the host agent's `--slots`.
+  `CAOS_MAX_WORKERS` becomes the host agent's `CAOS_RUNNER_SLOTS`.
 
 ## Runner roles
 
-**Host agent** (`caos runnerd` — the one new daemon; config: server URL,
-token, `--slots=N`, docker bin/network). N independent loops:
+**Host agent** (`caos-runnerd` — the one new daemon; config via env: server
+URL, token, `CAOS_RUNNER_SLOTS`, docker bin/network). N independent loops:
 poll `{}` → `docker run --rm … --entrypoint /bin/caos <image_ref> runner
 --job=<json>` → wait for container exit → post error on nonzero exit. Always
 polls again; generic runners never idle out.

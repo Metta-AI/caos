@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/caos",
+    "crates/runnerd",
     "crates/server",
     "crates/worker-common",
     "crates/worker-hello",
