@@ -125,7 +125,7 @@ fn poll(config: &Config) -> Result<Option<Job>, String> {
     let body = serde_json::json!({
         "required": {},
         "lineage": [],
-        "ttl_secs": POLL_TTL.as_secs(),
+        "ttl_ms": POLL_TTL.as_millis() as u64,
     });
     let url = format!("{}/runner/poll", config.server_url.trim_end_matches('/'));
     let mut req = minreq::post(&url)

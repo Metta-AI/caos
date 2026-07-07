@@ -10,15 +10,20 @@
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+ms() { date +%s%3N; }   # epoch milliseconds
 
 echo "== a whole tree totals its leaf files ==" >&2
-n=$("$CAOS_CLI" run /cas/std/file-count -- --in:@=test/tree)
+t0=$(ms); n=$("$CAOS_CLI" run /cas/std/file-count -- --in:@=test/tree); t1=$(ms)
 [ "$n" = "5" ] || fail "expected 5 leaf files, got: $n"
 echo "  ok: tree -> 5" >&2
 
 echo "== a single file counts as 1 ==" >&2
-n=$("$CAOS_CLI" run /cas/std/file-count -- --in:@=test/tree/a.txt)
+t2=$(ms); n=$("$CAOS_CLI" run /cas/std/file-count -- --in:@=test/tree/a.txt); t3=$(ms)
 [ "$n" = "1" ] || fail "expected 1, got: $n"
 echo "  ok: file -> 1" >&2
 
+# The tree run is 11 cold jobs through the promise pipeline (root + 5 children
+# + then-steps); the file run is 1. Both uncached (fresh salt per tests/run.sh).
+echo "file-count perf (ms):" >&2
+echo "  tree=$((t1 - t0))  file=$((t3 - t2))" >&2
 echo "file-count: ALL PASS" >&2

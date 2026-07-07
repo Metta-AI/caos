@@ -51,7 +51,7 @@ closes "anyone can poll jobs containing curried creds").
 {
   "required": { "image": "<oid>" },   // {} for a generic runner
   "lineage":  [ {} ],                 // ancestors' required sets, outermost first
-  "ttl_secs": 8
+  "ttl_ms": 2000
 }
 ```
 
@@ -72,7 +72,7 @@ The job payload is the rendezvous ids plus only what the runner can't derive:
 {
   "req": "<reqHash>", "nonce": "<hex>",
   "image_ref": "<docker ref>",
-  "deadline_secs": 600,
+  "deadline_ms": 600000,
   "token": "<runner token>"
 }
 ```
@@ -124,7 +124,7 @@ Details:
 
 - **TTL margin**: a poll stops matching in its last ~1s, so a job isn't handed
   to a connection the runner is abandoning.
-- **Job deadline**: no result by `deadline_secs` → requeue under a fresh
+- **Job deadline**: no result by `deadline_ms` → requeue under a fresh
   nonce. Determinism makes a spurious re-run wasteful, never wrong, so the
   deadline can be generous (default ~10 min).
 - **Pending deadline**: a job no poll and no lineage can serve waits for new
@@ -176,7 +176,7 @@ A fly agent is provision-style: it can only ensure a machine for the image is
 up (booting `caos runner` in pure-poll mode), so it **requeues** the job and
 the machine's `{image}` poll claims it. Guard against ping-pong (the agent
 re-claiming the job it just requeued before the machine warms): the requeue
-carries `defer_generic_secs`, during which the job matches only polls with ≥1
+carries `defer_generic_ms`, during which the job matches only polls with ≥1
 required key. Fly support leaves the tree with the other backends (most of it
 lives on `fly-serve-backend` anyway) and returns as this agent; the `requeue`
 verb is specced now so the protocol is stable when it does.

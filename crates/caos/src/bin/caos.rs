@@ -89,11 +89,11 @@ fn http() -> Result<HttpTransport, String> {
     HttpTransport::from_env()
 }
 
-/// The runner's idle budget, in seconds: how long one follow-up poll hangs
-/// before the runner exits. Ski-rental: set it near the cost of restarting a
-/// container for this image. Override with `CAOS_RUNNER_TTL`.
-const RUNNER_TTL_ENV: &str = "CAOS_RUNNER_TTL";
-const DEFAULT_RUNNER_TTL: u32 = 10;
+/// The runner's idle budget, in milliseconds: how long one follow-up poll
+/// hangs before the runner exits. Ski-rental: set it near the cost of
+/// restarting a container for this image. Override with `CAOS_RUNNER_TTL_MS`.
+const RUNNER_TTL_ENV: &str = "CAOS_RUNNER_TTL_MS";
+const DEFAULT_RUNNER_TTL_MS: u32 = 2000;
 
 /// A job handed to this runner: the rendezvous ids (the request is fetched and
 /// unpacked from `req` itself), plus the bearer token children present back to
@@ -241,16 +241,23 @@ fn next_job(
     image_oid: &str,
     token: &Option<String>,
 ) -> Result<Option<RunnerJob>, String> {
-    let ttl = caos::env_u32(RUNNER_TTL_ENV).unwrap_or(DEFAULT_RUNNER_TTL);
+    let ttl_ms = caos::env_u32(RUNNER_TTL_ENV).unwrap_or(DEFAULT_RUNNER_TTL_MS);
     let body = serde_json::json!({
         "required": { "image": image_oid },
         // Our parent is a generic runner (runnerd) — it polls with no required
         // args once we die, so a job we can't serve can evict us toward it.
         "lineage": [ {} ],
-        "ttl_secs": ttl,
+        "ttl_ms": ttl_ms,
     });
     let url = runner_url(t, "poll")?;
-    let resp = runner_post(&url, &body.to_string(), token, u64::from(ttl) + 15)?;
+    // The HTTP timeout only backstops a dead server; the poll itself hangs for
+    // the TTL server-side, so pad well past it (seconds granularity).
+    let resp = runner_post(
+        &url,
+        &body.to_string(),
+        token,
+        u64::from(ttl_ms) / 1000 + 15,
+    )?;
     if resp.status_code != 200 {
         return Err(format!(
             "poll failed ({}): {}",

@@ -39,14 +39,17 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(60);
 const JOB_DEADLINE: Duration = Duration::from_secs(600);
 
 /// A poll stops matching this close to its TTL, so a job isn't handed to a
-/// connection the runner is about to abandon.
-const POLL_MARGIN: Duration = Duration::from_secs(1);
+/// connection the runner is about to abandon. Proportional for short polls
+/// (a fifth of the TTL), capped at this for long ones.
+const MAX_POLL_MARGIN: Duration = Duration::from_secs(1);
 
-/// Upper bound on a poll's TTL (a runner asking for more just re-polls).
+/// Bounds on a poll's TTL (a runner asking for more just re-polls; one asking
+/// for less is effectively an immediate-or-nothing check).
+const MIN_POLL_TTL: Duration = Duration::from_millis(10);
 const MAX_POLL_TTL: Duration = Duration::from_secs(300);
 
 /// After a requeue, how long the job matches only non-generic polls (unless the
-/// requeue names its own `defer_generic_secs`) — so a provision-style runner
+/// requeue names its own `defer_generic_ms`) — so a provision-style runner
 /// doesn't immediately re-claim the job it just requeued.
 const DEFAULT_DEFER_GENERIC: Duration = Duration::from_secs(10);
 
@@ -79,8 +82,9 @@ struct ParkedPoll {
     /// The required sets of the runner's ancestors (outermost first). A pending
     /// job nothing matches kicks the deepest poll whose lineage could serve it.
     lineage: Vec<ArgSet>,
-    /// Stops matching at `expires - POLL_MARGIN`.
-    expires: Instant,
+    /// Stops matching here — the TTL minus a margin, so a job isn't handed to
+    /// a connection the runner is about to abandon.
+    matchable_until: Instant,
     reply: mpsc::Sender<PollReply>,
 }
 
@@ -171,7 +175,7 @@ fn payload(job: &Job) -> String {
         "req": job.req,
         "nonce": job.nonce,
         "image_ref": job.image_ref,
-        "deadline_secs": JOB_DEADLINE.as_secs(),
+        "deadline_ms": JOB_DEADLINE.as_millis() as u64,
     });
     if let Some(token) = token() {
         body["token"] = serde_json::Value::String(token);
@@ -308,7 +312,7 @@ fn offer_job(st: &mut State, id: u64) {
         };
         (job.arg_entries.clone(), defer)
     };
-    let live = |p: &ParkedPoll| now + POLL_MARGIN < p.expires;
+    let live = |p: &ParkedPoll| now < p.matchable_until;
     let best = st
         .parked
         .iter()
@@ -360,7 +364,10 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
         }
         _ => return Err(HttpError::new(400, "lineage must be an array")),
     };
-    let ttl = Duration::from_secs(v["ttl_secs"].as_u64().unwrap_or(10).max(1)).min(MAX_POLL_TTL);
+    let ttl = Duration::from_millis(v["ttl_ms"].as_u64().unwrap_or(10_000))
+        .clamp(MIN_POLL_TTL, MAX_POLL_TTL);
+    // Short polls get a proportional margin; long ones cap out.
+    let margin = (ttl / 5).min(MAX_POLL_MARGIN);
 
     let (reply_tx, reply_rx) = mpsc::channel();
     let poll_id = {
@@ -379,7 +386,7 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
             id,
             required,
             lineage,
-            expires: Instant::now() + ttl,
+            matchable_until: Instant::now() + ttl - margin,
             reply: reply_tx,
         });
         id
@@ -468,10 +475,10 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
     }
 
     if v["requeue"].as_bool() == Some(true) {
-        let defer = Duration::from_secs(
-            v["defer_generic_secs"]
+        let defer = Duration::from_millis(
+            v["defer_generic_ms"]
                 .as_u64()
-                .unwrap_or(DEFAULT_DEFER_GENERIC.as_secs()),
+                .unwrap_or(DEFAULT_DEFER_GENERIC.as_millis() as u64),
         );
         requeue(&mut st, id, Some(defer));
         return Ok(b"{}".to_vec());
