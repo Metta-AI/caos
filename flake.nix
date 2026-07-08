@@ -702,12 +702,26 @@
         # *this* in its devShell and gets `caos-cli` and `caosd` on PATH together
         # (like `pkgs.typescript` giving you tsc + tsserver) — no enumerating the
         # individual tools. symlinkJoin merges their /bin into one output.
+        #
+        # `caos-runnerd` joins them on Linux only. Every workspace crate is built
+        # for musl (see CARGO_BUILD_TARGET), so the runnerd binary is a static
+        # Linux ELF: on a Linux host it runs as-is, on macOS it can't execute and
+        # would just be a dead entry on PATH. Running it on the host — rather than
+        # as the compose stack's containerized runner — is what you want when the
+        # daemon can't be handed a usable docker socket (rootless podman), since
+        # it then inherits the shell's own `docker`/`podman` (CAOS_DOCKER_BIN).
+        # Renamed on the way in: the crate is `runnerd`, but every host command
+        # carries the `caos-` prefix, matching the image name and the README.
         caos-tools = pkgs.symlinkJoin {
           name = "caos-tools";
           paths = [
             caos-cli
             caosd
-          ];
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ runnerd ];
+          postBuild = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            mv "$out/bin/runnerd" "$out/bin/caos-runnerd"
+          '';
         };
 
         # The dev stack as docker compose: redis + registry + the caos server +
@@ -895,7 +909,7 @@
         };
 
         checks = {
-          inherit caos server;
+          inherit caos server runnerd;
 
           clippy = craneLib.cargoClippy (
             commonArgs
