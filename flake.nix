@@ -276,8 +276,10 @@
         # caos, /tmp, and the user db). Sharing that base means a worker provisioned
         # after any other only uploads this layer, not the caos binary again. The
         # binaries come from linuxPkgs so they're real Linux ELF even when the flake
-        # is evaluated on macOS (see linuxPkgs).
-        workerBashRoot = linuxPkgs.buildEnv {
+        # is evaluated on macOS (see linuxPkgs). The env itself is built with the
+        # *host's* buildEnv — it only symlinks store paths, so it needs no Linux
+        # builder even though its contents are Linux binaries.
+        workerBashRoot = pkgs.buildEnv {
           name = "caos-worker-bash-root";
           paths = [
             workerBashScript
@@ -575,7 +577,13 @@
           runnerd
           # runnerd only ever shells out to `docker run`; it never builds or
           # composes, so drop the buildx + compose CLI plugins (~116 MiB).
-          (linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; })
+          # Linux-only slimming: the override changes the drv hash, so the binary
+          # cache can't substitute it — on macOS that would mean compiling docker
+          # for Linux locally. There, ship the stock (cached) client instead.
+          (if pkgs.stdenv.hostPlatform.isLinux then
+            linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
+          else
+            linuxPkgs.docker-client)
         ];
         runnerdConfig = {
           Cmd = [ "/bin/runnerd" ];
