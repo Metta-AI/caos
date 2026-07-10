@@ -852,6 +852,11 @@
               # loaded", so an unchanged restart skips the multi-second `docker
               # load`. Remove the image and the tag goes with it (reload); change
               # the image and its store path — hence the tag — changes (reload).
+              # Load each daemon image unless this exact build is already loaded.
+              # The src tag is content-addressed (sha1 of the image's immutable
+              # store path), so an unchanged build skips the multi-second docker
+              # load; a changed build has a new store path — hence a new tag — and
+              # loads. Either way <svc>:latest ends up pointing at the wanted build.
               load_once() {
                 local name="$1" image="$2" src_tag
                 src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
@@ -863,14 +868,37 @@
                   docker tag "$name:latest" "$src_tag"
                 fi
               }
-              load_once caos-server ${serverImage}
-              load_once caos-runnerd ${runnerdImage}
+
+              # A running container is stale when its image id != the build we just
+              # made <svc>:latest — i.e. the nix package changed under a container
+              # that's still up. `compose up -d` won't catch this (podman-compose
+              # keys "up-to-date" off the container name/config, not its image id),
+              # so compare the hashes ourselves and collect the mismatches. A
+              # container-less service returns early: `compose up -d` creates it
+              # fresh on :latest, so it's never stale.
+              stale=()
+              check_current() {
+                local svc="$1" have want
+                have=$(docker inspect -f '{{.Image}}' "$svc" 2>/dev/null) || return 0
+                want=$(docker image inspect -f '{{.Id}}' "$svc:latest" 2>/dev/null || true)
+                [ -n "$want" ] && [ "$want" != "$have" ] && stale+=("$svc")
+                return 0
+              }
+              load_once caos-server ${serverImage};   check_current caos-server
+              load_once caos-runnerd ${runnerdImage}; check_current caos-runnerd
 
               # up -d is idempotent: a no-op when the stack is already running, and
-              # it recreates only services whose image changed. No teardown trap —
-              # `up` returns with the stack still up (stop it with `caosd down`).
+              # it creates only what's missing. No teardown trap — `up` returns with
+              # the stack still up (stop it with `caosd down`).
               echo "==> starting stack (redis, registry, server, runnerd)" >&2
               compose up -d
+              # Recreate exactly the services running a stale image — nothing else,
+              # so an unchanged `up` (and a freshly-created stack) keeps its
+              # containers in place.
+              if [ "''${#stale[@]}" -gt 0 ]; then
+                echo "==> recreating onto rebuilt image(s): ''${stale[*]}" >&2
+                compose up -d --force-recreate "''${stale[@]}"
+              fi
 
               # The server self-bootstraps an empty /git on first boot; wait for it,
               # then publish the stdlib over HTTP (build-builtins caches imports under
