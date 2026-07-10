@@ -19,15 +19,23 @@ PROJECT=$PWD
 names=("$@")
 [ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps rustc runner)
 
-nix build .#caos-cli -o result-caos
-caos=$PROJECT/result-caos/bin/caos-cli
+# caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
+# runs us from a store copy with no `nix` at runtime), else built from the flake.
+if [ -n "${CAOS_CLI:-}" ]; then
+  caos=$CAOS_CLI
+else
+  nix build .#caos-cli -o result-caos
+  caos=$PROJECT/result-caos/bin/caos-cli
+fi
 SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 export CAOS_SERVER_URL=$SERVER_URL
 
 # A local client working repo with the server as its `caos` remote — the same
 # shape a user has. `caos-cli` builds objects here (in-process via gix); `git
 # push` ships them to the server. Reused across runs (git init is idempotent).
-CLIENT=$PROJECT/.caos-dev/client-repo
+# CAOS_CLIENT_REPO relocates it off PROJECT (which is read-only when caosd runs
+# us from the store); caosd points it at $CAOS_DATA so it persists per-project.
+CLIENT=${CAOS_CLIENT_REPO:-$PROJECT/.caos-dev/client-repo}
 git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
   || git -C "$CLIENT" remote set-url caos "$SERVER_URL"
@@ -48,21 +56,32 @@ import_base() { # std name -> docker:// base ref, or empty for self-contained
   esac
 }
 
-# Build every image in ONE nix invocation: the builds run in parallel under a
-# single (low-memory) evaluation. Map each resulting store path back to its
-# builtin via the image name baked into it (<hash>-caos-worker-<name>.tar.gz).
-attrs=()
-for name in "${names[@]}"; do attrs+=(".#$(image_attr "$name")"); done
-echo "building ${#names[@]} images in parallel..." >&2
-if ! built_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
-  echo "build-builtins: nix build failed" >&2; exit 1
+# The image tarball store paths. If the caller prebuilt them (CAOS_BUILTIN_IMAGES,
+# a whitespace-separated list — how caosd hands us the flake's images with no
+# `nix` at runtime), use those; else build every image in ONE nix invocation (the
+# builds run in parallel under a single, low-memory evaluation). Either way, map
+# each path back to its builtin via the image name baked into it
+# (<hash>-caos-worker-<name>.tar.gz).
+if [ -n "${CAOS_BUILTIN_IMAGES:-}" ]; then
+  built_paths=$CAOS_BUILTIN_IMAGES
+else
+  attrs=()
+  for name in "${names[@]}"; do attrs+=(".#$(image_attr "$name")"); done
+  echo "building ${#names[@]} images in parallel..." >&2
+  if ! built_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
+    echo "build-builtins: nix build failed" >&2; exit 1
+  fi
 fi
 declare -A img_path
-while IFS= read -r p; do
+# Unquoted: word-split on whitespace, covering both nix-build's newline-per-path
+# output and a space-separated CAOS_BUILTIN_IMAGES. Store paths never contain
+# whitespace or glob chars, so this is safe.
+# shellcheck disable=SC2086
+for p in $built_paths; do
   for name in "${names[@]}"; do
     case "$p" in *-caos-worker-"$name".tar.gz) img_path[$name]=$p ;; esac
   done
-done <<<"$built_paths"
+done
 for name in "${names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done

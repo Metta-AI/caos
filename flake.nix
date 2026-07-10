@@ -774,26 +774,39 @@
               depends_on: [caos-server]
         '';
 
+        # The worker images that make up `std`, keyed by the same builtin name
+        # build-builtins.sh maps them back to (via the <name> baked into each
+        # tarball's store path). caosd hands these to build-builtins.sh so it
+        # publishes the flake's own images without a runtime `nix build`.
+        builtinWorkerImages = [
+          workerBaseImage
+          workerBashImage
+          workerFileCountImage
+          workerDirsOnlyImage
+          workerHelloImage
+          workerDeepDepsImage
+          workerRustcImage
+          workerRunnerImage
+        ];
+
         # Bring the dev stack up (Ctrl-C tears it down). Loads the server image,
         # `docker compose up -d`, waits for the server (which self-bootstraps its
         # bare repo on first boot), then seeds the stdlib over HTTP with
         # `build-builtins.sh` — the SAME publish path fly and the tests use, so
-        # there's one implementation. Because build-builtins.sh runs `nix build`
-        # and resolves the flake, caosd must be run from the repo root. Uses the
-        # host's docker / `docker compose`; CAOS_DATA (absolute) persists the repo.
+        # there's one implementation. We hand build-builtins.sh a prebuilt
+        # caos-cli, the flake's worker images, and a writable client repo (all via
+        # env) so it needs neither `nix` nor a writable repo root at runtime —
+        # hence caosd runs from any directory, including a tree that only imports
+        # this flake. Uses the host's docker / `docker compose`; CAOS_DATA
+        # (absolute) persists both the server repo and the publish client repo.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl ];
+          runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl pkgs.bash ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
             export CAOS_DATA
             mkdir -p "$CAOS_DATA"
-
-            if [ ! -x ./build-builtins.sh ]; then
-              echo "caosd: run me from the caos repo root (./build-builtins.sh not found)" >&2
-              exit 1
-            fi
 
             # Load the server/runnerd images only when this exact build isn't
             # already in docker. We tag the loaded image with a hash of its
@@ -828,7 +841,13 @@
               sleep 1
             done
             echo "==> publishing stdlib (build-builtins.sh)" >&2
-            CAOS_SERVER_URL=http://localhost:9090 ./build-builtins.sh >/dev/null
+            CAOS_SERVER_URL=http://localhost:9090 \
+            CAOS_CLI=${caos-cli}/bin/caos-cli \
+            CAOS_CLIENT_REPO="$CAOS_DATA/publish-client-repo" \
+            CAOS_BUILTIN_IMAGES=${
+              pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
+            } \
+              bash ${self}/build-builtins.sh >/dev/null
 
             echo "==> stack up — Ctrl-C to stop. Following logs:" >&2
             docker compose -f ${composeFile} logs -f
