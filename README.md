@@ -469,24 +469,31 @@ the cache key, never hidden inside a memoized computation.
 
 ## Local testing
 
-[Tilt](https://tilt.dev) is pinned in the dev shell. From `nix develop`:
+Run the dev stack with `caosd` (`nix run .#caosd -- <cmd>` in this repo, or just
+`caosd <cmd>` wherever `caos-tools` is on PATH — it works from any directory,
+including a tree that only imports this flake):
 
 ```bash
-tilt up      # build images + run the daemons; UI at http://localhost:10350
+caosd up      # bring the stack up + publish all of std, then return
+caosd logs    # follow the running stack's logs (Ctrl-C returns; stack stays up)
+caosd down    # stop it (Redis + registry volumes and the server repo are kept)
+caosd reset   # stop and wipe those volumes + the server repo for a clean slate
 ```
 
-The `Tiltfile` builds each image with Nix (only when its sources, or the
-flake/lockfiles, change), creates the `caos-net` network and the server's
-**dedicated bare repo** (`.caos-dev/server-repo.git`, with `http.receivepack`
-and `uploadpack.allowAnySHA1InWant`), and runs four daemons: `caos-server`
-(`:9090`, with the repo mounted at `/git`), `caos-runnerd` (the generic runner,
-with the docker socket), `caos-redis`, and a `caos-registry`.
+`caosd up` is idempotent and fast on a warm stack (~3s: images already loaded,
+the std publish is a cache hit), so re-running it just reconverges the stack to
+current. It loads the `caos-server`/`caos-runnerd` images and brings up four
+services via `docker compose`: `caos-server` (`:9090`, its dedicated bare repo
+mounted at `/git`), `caos-runnerd` (the generic runner, with the docker socket),
+`caos-redis`, and `caos-registry`. Redis and the registry persist across restarts
+(named volumes); the server's bare repo persists under `CAOS_DATA`.
 
-**Stopping:** Ctrl-C the `tilt up` process — that tears the daemons down. (`tilt
-down` does *not*: the daemons are `local_resource`s, which it ignores.) Each
-daemon handles `SIGINT`/`SIGTERM`, so it exits and `--rm` removes it.
+[Tilt](https://tilt.dev) is still pinned in the dev shell for its auto-rebuild
+loop (`tilt up` rebuilds an image when its sources change; UI at
+`http://localhost:10350`), but `caosd` is the supported way to run the stack and
+tilt is slated for removal.
 
-Integration tests (require `tilt up` running):
+Integration tests (require the stack up — `caosd up`):
 
 ```bash
 tests/run.sh tests/deep-deps    # promise recursion: correctness, DAG sharing,

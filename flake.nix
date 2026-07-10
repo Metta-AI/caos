@@ -815,16 +815,24 @@
           workerRunnerImage
         ];
 
-        # Bring the dev stack up (Ctrl-C tears it down). Loads the server image,
-        # `docker compose up -d`, waits for the server (which self-bootstraps its
-        # bare repo on first boot), then seeds the stdlib over HTTP with
-        # `build-builtins.sh` — the SAME publish path fly and the tests use, so
-        # there's one implementation. We hand build-builtins.sh a prebuilt
-        # caos-cli, the flake's worker images, and a writable client repo (all via
-        # env) so it needs neither `nix` nor a writable repo root at runtime —
-        # hence caosd runs from any directory, including a tree that only imports
-        # this flake. Uses the host's docker / `docker compose`; CAOS_DATA
-        # (absolute) persists both the server repo and the publish client repo.
+        # The dev stack's control command. Subcommands:
+        #   caosd up     (default) idempotently bring the stack up and publish all
+        #                of std, then RETURN — the stack stays running in the
+        #                background. Fast on a warm stack (~3s: images already
+        #                loaded, the std publish is a cache hit), so callers (the
+        #                tests, a consuming tree) just run it to guarantee a
+        #                current stack — no daemon to babysit, no teardown race.
+        #   caosd down   stop the stack (named volumes + server repo kept).
+        #   caosd reset  stop and wipe the volumes + server repo for a clean slate.
+        #   caosd logs   follow the running stack's logs (Ctrl-C returns; the stack
+        #                keeps running).
+        # `up` hands build-builtins.sh a prebuilt caos-cli, the flake's worker
+        # images, and a writable client repo (all via env) so it needs neither
+        # `nix` nor a writable repo root — hence it runs from any directory,
+        # including a tree that only imports this flake. This is the SAME
+        # std-publish path fly and the tests use, so there's one implementation.
+        # Uses the host's docker / `docker compose`; CAOS_DATA (absolute) persists
+        # the server repo and the publish client repo.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
           runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl pkgs.bash ];
@@ -834,49 +842,74 @@
             export CAOS_DATA
             mkdir -p "$CAOS_DATA"
 
-            # Load the server/runnerd images only when this exact build isn't
-            # already in docker. We tag the loaded image with a hash of its
-            # (immutable) nix store path; the tag's presence means "this build is
-            # loaded", so an unchanged restart skips the multi-second `docker
-            # load`. Remove the image and the tag goes with it (reload); change
-            # the image and its store path — hence the tag — changes (reload).
-            load_once() {
-              local name="$1" image="$2" src_tag
-              src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
-              if docker image inspect "$src_tag" >/dev/null 2>&1; then
-                echo "==> $name image already loaded — skipping docker load" >&2
-              else
-                echo "==> loading $name image into docker" >&2
-                docker load -i "$image"
-                docker tag "$name:latest" "$src_tag"
-              fi
-            }
-            load_once caos-server ${serverImage}
-            load_once caos-runnerd ${runnerdImage}
+            compose() { docker compose -f ${composeFile} "$@"; }
 
-            echo "==> starting stack (redis, registry, server, runnerd)" >&2
-            trap 'docker compose -f ${composeFile} down' EXIT
-            docker compose -f ${composeFile} up -d
+            case "''${1:-up}" in
+            up)
+              # Load the server/runnerd images only when this exact build isn't
+              # already in docker. We tag the loaded image with a hash of its
+              # (immutable) nix store path; the tag's presence means "this build is
+              # loaded", so an unchanged restart skips the multi-second `docker
+              # load`. Remove the image and the tag goes with it (reload); change
+              # the image and its store path — hence the tag — changes (reload).
+              load_once() {
+                local name="$1" image="$2" src_tag
+                src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
+                if docker image inspect "$src_tag" >/dev/null 2>&1; then
+                  echo "==> $name image already loaded — skipping docker load" >&2
+                else
+                  echo "==> loading $name image into docker" >&2
+                  docker load -i "$image"
+                  docker tag "$name:latest" "$src_tag"
+                fi
+              }
+              load_once caos-server ${serverImage}
+              load_once caos-runnerd ${runnerdImage}
 
-            # The server self-bootstraps an empty /git on first boot; wait for it,
-            # then publish the stdlib over HTTP (build-builtins caches imports under
-            # refs/caos/src, so a restart re-seeds in ~seconds).
-            echo "==> waiting for caos-server on :9090 ..." >&2
-            for _ in $(seq 1 60); do
-              curl -s -o /dev/null --max-time 2 http://localhost:9090/ && break
-              sleep 1
-            done
-            echo "==> publishing stdlib (build-builtins.sh)" >&2
-            CAOS_SERVER_URL=http://localhost:9090 \
-            CAOS_CLI=${caos-cli}/bin/caos-cli \
-            CAOS_CLIENT_REPO="$CAOS_DATA/publish-client-repo" \
-            CAOS_BUILTIN_IMAGES="${
-              pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
-            }" \
-              bash ${self}/build-builtins.sh >/dev/null
+              # up -d is idempotent: a no-op when the stack is already running, and
+              # it recreates only services whose image changed. No teardown trap —
+              # `up` returns with the stack still up (stop it with `caosd down`).
+              echo "==> starting stack (redis, registry, server, runnerd)" >&2
+              compose up -d
 
-            echo "==> stack up — Ctrl-C to stop. Following logs:" >&2
-            docker compose -f ${composeFile} logs -f
+              # The server self-bootstraps an empty /git on first boot; wait for it,
+              # then publish the stdlib over HTTP (build-builtins caches imports under
+              # refs/caos/src, so a re-publish is a near-instant cache hit).
+              echo "==> waiting for caos-server on :9090 ..." >&2
+              for _ in $(seq 1 60); do
+                curl -s -o /dev/null --max-time 2 http://localhost:9090/ && break
+                sleep 1
+              done
+
+              echo "==> publishing stdlib (build-builtins.sh)" >&2
+              CAOS_SERVER_URL=http://localhost:9090 \
+              CAOS_CLI=${caos-cli}/bin/caos-cli \
+              CAOS_CLIENT_REPO="$CAOS_DATA/publish-client-repo" \
+              CAOS_BUILTIN_IMAGES="${
+                pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
+              }" \
+                bash ${self}/build-builtins.sh >/dev/null
+
+              echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
+              ;;
+            down)
+              echo "==> stopping stack (volumes kept; 'caosd reset' wipes them)" >&2
+              compose down
+              ;;
+            reset)
+              echo "==> stopping stack and wiping volumes + server repo" >&2
+              compose down -v
+              rm -rf "$CAOS_DATA/server-repo.git" "$CAOS_DATA/publish-client-repo"
+              ;;
+            logs)
+              compose logs -f
+              ;;
+            *)
+              echo "caosd: unknown command '$1'" >&2
+              echo "usage: caosd [up|down|reset|logs]" >&2
+              exit 2
+              ;;
+            esac
           '';
         };
       in
