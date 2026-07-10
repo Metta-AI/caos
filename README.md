@@ -493,9 +493,14 @@ loop (`tilt up` rebuilds an image when its sources change; UI at
 `http://localhost:10350`), but `caosd` is the supported way to run the stack and
 tilt is slated for removal.
 
-Integration tests (require the stack up — `caosd up`):
+Integration tests are self-contained — each `run.sh` does `caosd up` itself
+(bringing the stack up and publishing std), so you don't need a stack running
+first. `run-all.sh` runs the whole suite; the first test cold-starts the stack
+and the rest reuse it warm.
 
 ```bash
+tests/run-all.sh                # every test below, stack brought up once
+
 tests/run.sh tests/deep-deps    # promise recursion: correctness, DAG sharing,
                                 # incrementality, cycle detection
 tests/run.sh tests/file-count   # self-recursive count over map-then

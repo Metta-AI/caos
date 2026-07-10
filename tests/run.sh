@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run a caos integration test that lives in a directory.
 #
-# All boilerplate lives here: build the CLI, publish the std library, set up a
-# throwaway client repo with the test directory committed at ./test. The test
+# All boilerplate lives here: bring the stack up (`caosd up`, which also
+# publishes std), build the CLI, and set up a throwaway client repo with the
+# test directory committed at ./test. The test
 # itself is <dir>/cli.sh: it runs on the HOST, cwd'd into that repo with
 # $CAOS_CLI pointing at the caos-cli binary, and drives computations through
 # the CLI (whose top-level run blocks — the one place blocking still exists; a
@@ -18,9 +19,11 @@
 # it is a cache hit once the stack is warm (the server repo + build-builtins'
 # import cache persist), so there's nothing to gain from per-test subsetting.
 #
-# Usage: tests/run.sh <test-dir>
-# Requires the dev daemons running (`tilt up` / `caosd`): the caos server :9090,
-# redis, registry — and a docker the server can reach.
+# Usage: tests/run.sh <test-dir>   (or tests/run-all.sh for every test)
+# Self-contained: `caosd up` brings the whole stack up (server, the runner,
+# redis, registry) and publishes std, then the test runs against it. Needs only
+# nix and a docker / `docker compose` on PATH. Leaves the stack warm for the
+# next run; stop it with `caosd down`.
 set -euo pipefail
 [ $# -eq 1 ] || { echo "usage: $0 <test-dir>" >&2; exit 2; }
 DIR=$(cd "$1" && pwd)
@@ -37,10 +40,14 @@ export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 # is independent of any other without ever clearing Redis.
 export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
 
-# Publish the whole std library so the test can reach any builtin as
-# /cas/std/<name>. Idempotent and cache-fast on a warm stack.
-echo "publishing std..." >&2
-./build-builtins.sh >/dev/null
+# Bring the whole stack up and publish std (idempotent + warm-fast): starts
+# caos-server, the runner, redis and the registry, and publishes all of std, so
+# the test reaches any builtin as /cas/std/<name>. A repeat `up` (e.g. once per
+# test under run-all.sh) is a no-op bring-up + cache-hit republish; the stack is
+# left running for the next test. CAOS_DATA (gitignored) persists it warm.
+export CAOS_DATA="${CAOS_DATA:-$PROJECT/.caos-data}"
+echo "bringing the stack up (caosd up)..." >&2
+nix run .#caosd -- up >&2
 
 # A throwaway client repo with the server as its `caos` remote (the host CLI
 # pushes the run request from here). A failing assertion exits the worker
