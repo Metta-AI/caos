@@ -750,17 +750,35 @@
           networks:
             caos-net:
               name: caos-net
+          # Named volumes (not bind mounts under CAOS_DATA) so the engine owns
+          # their permissions: redis runs as uid 999 and registry manages its own
+          # tree, both of which fight a host-owned bind dir under rootless podman.
+          # caosd's teardown is a plain `compose down`, which keeps these; a reset
+          # is `compose down -v` (wiped alongside CAOS_DATA/server-repo.git).
+          volumes:
+            caos-redis-data:
+            caos-registry-data:
           services:
             caos-redis:
               image: redis:7
               container_name: caos-redis
               networks: [caos-net]
               ports: ["6379:6379"]
+              # Persist the result cache across restarts so a warm stack reuses
+              # memoized computations. appendonly keeps it durable to a hard kill,
+              # not just a clean SIGTERM shutdown-save.
+              command: ["redis-server", "--appendonly", "yes"]
+              volumes:
+                - "caos-redis-data:/data"
             caos-registry:
               image: registry:2
               container_name: caos-registry
               networks: [caos-net]
               ports: ["5000:5000"]
+              # Persist converted worker images so the first run of each after a
+              # restart is a registry hit, not a re-convert + re-push.
+              volumes:
+                - "caos-registry-data:/var/lib/registry"
             caos-server:
               image: caos-server:latest
               container_name: caos-server

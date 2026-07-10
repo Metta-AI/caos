@@ -14,8 +14,9 @@
 # No host-side log scraping: a failing assertion exits non-zero, which fails
 # the test and surfaces its stderr.
 #
-# Each test reaches builtins as /cas/std/<name>; <dir>/builtins (optional) lists
-# which to publish, one or more per line (default: all of them).
+# Every test reaches the whole std library as /cas/std/<name>: publishing all of
+# it is a cache hit once the stack is warm (the server repo + build-builtins'
+# import cache persist), so there's nothing to gain from per-test subsetting.
 #
 # Usage: tests/run.sh <test-dir>
 # Requires the dev daemons running (`tilt up` / `caosd`): the caos server :9090,
@@ -36,12 +37,10 @@ export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 # is independent of any other without ever clearing Redis.
 export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
 
-# Publish the builtins this test needs (its `builtins` file, or all of them) so it
-# can reach them as /cas/std/<name>.
-builtins=()
-[ -f "$DIR/builtins" ] && read -ra builtins <<<"$(tr '\n' ' ' <"$DIR/builtins")"
-echo "publishing std: ${builtins[*]:-<all>}..." >&2
-./build-builtins.sh "${builtins[@]}" >/dev/null
+# Publish the whole std library so the test can reach any builtin as
+# /cas/std/<name>. Idempotent and cache-fast on a warm stack.
+echo "publishing std..." >&2
+./build-builtins.sh >/dev/null
 
 # A throwaway client repo with the server as its `caos` remote (the host CLI
 # pushes the run request from here). A failing assertion exits the worker
