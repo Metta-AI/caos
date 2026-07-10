@@ -852,9 +852,9 @@
             CAOS_SERVER_URL=http://localhost:9090 \
             CAOS_CLI=${caos-cli}/bin/caos-cli \
             CAOS_CLIENT_REPO="$CAOS_DATA/publish-client-repo" \
-            CAOS_BUILTIN_IMAGES=${
+            CAOS_BUILTIN_IMAGES="${
               pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
-            } \
+            }" \
               bash ${self}/build-builtins.sh >/dev/null
 
             echo "==> stack up — Ctrl-C to stop. Following logs:" >&2
