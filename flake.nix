@@ -912,6 +912,18 @@
             esac
           '';
         };
+
+        # A thin `caosd` for the dev shell. It defers to `nix run` against the
+        # working-tree flake, so caosd's image closure (server/runnerd/worker
+        # images) builds lazily on the first `caosd up` — exactly as running
+        # `nix run .#caosd` by hand would — instead of being dragged onto the
+        # dev-shell's critical path at shell entry. Resolves the flake from the
+        # git top level so it works from any subdirectory, and passes args
+        # through, so up/down/reset/logs all work. Note: it always runs the
+        # *current* checkout (a dirty tree just prints nix's "dirty" warning).
+        caosd-launcher = pkgs.writeShellScriptBin "caosd" ''
+          exec nix run "$(${pkgs.git}/bin/git rev-parse --show-toplevel)#caosd" -- "$@"
+        '';
       in
       {
         packages = {
@@ -1012,6 +1024,10 @@
           packages = [
             pkgs.cargo-watch
             pkgs.rust-analyzer
+            # `caosd` on PATH as a thin launcher (see caosd-launcher): it defers to
+            # `nix run .#caosd`, so the stack's image closure builds lazily on the
+            # first `caosd up`, not at dev-shell entry.
+            caosd-launcher
             # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
             pkgs.tilt
             # `fly` CLI: auth (`fly auth token`), org/region lookup, and operating
