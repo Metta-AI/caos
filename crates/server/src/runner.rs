@@ -31,7 +31,15 @@ type ArgSet = BTreeMap<String, String>;
 
 /// How long a job may sit unclaimed before the dispatch fails 503. New capacity
 /// may register meanwhile (a kicked runner's parent, a fresh runnerd slot).
-const PENDING_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default 60s; a deployment whose pool is deliberately small relative to its
+/// job lengths (e.g. a few slots feeding one local LLM) overrides with
+/// CAOS_PENDING_TIMEOUT_SECS so queued work waits patiently instead of 503ing.
+fn pending_timeout() -> Duration {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_secs(*SECS.get_or_init(|| {
+        std::env::var("CAOS_PENDING_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+    }))
+}
 
 /// How long a claimed job may run before it's requeued under a fresh nonce.
 /// Generous: long compiles are real, and determinism makes a spurious re-run
@@ -205,7 +213,7 @@ pub(crate) fn dispatch(
                 arg_entries,
                 nonce,
                 phase: Phase::Pending {
-                    deadline: Instant::now() + PENDING_TIMEOUT,
+                    deadline: Instant::now() + pending_timeout(),
                     defer_generic_until: None,
                 },
                 enqueued: Instant::now(),
@@ -248,7 +256,8 @@ pub(crate) fn dispatch(
                             503,
                             format!(
                                 "no runner for req {} (waited {:?})",
-                                job.req, PENDING_TIMEOUT
+                                job.req,
+                                pending_timeout()
                             ),
                         ));
                     }
@@ -285,7 +294,7 @@ fn requeue(st: &mut State, id: u64, defer_generic: Option<Duration>) {
         let job = st.jobs.get_mut(&id).expect("job present under lock");
         let old = std::mem::replace(&mut job.nonce, nonce.clone());
         job.phase = Phase::Pending {
-            deadline: Instant::now() + PENDING_TIMEOUT,
+            deadline: Instant::now() + pending_timeout(),
             defer_generic_until: defer_generic.map(|d| Instant::now() + d),
         };
         old
