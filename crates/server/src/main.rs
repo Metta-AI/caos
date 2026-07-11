@@ -113,10 +113,10 @@ fn main() {
     // same setup the dev Tiltfile does by hand: `http.receivepack` lets clients
     // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
     // `git init --bare` is idempotent, so this is a no-op once seeded.
+    let git = |args: &[&str]| {
+        let _ = std::process::Command::new("git").args(args).status();
+    };
     if gix::open(&git_dir).is_err() {
-        let git = |args: &[&str]| {
-            let _ = std::process::Command::new("git").args(args).status();
-        };
         git(&["init", "-q", "--bare", &git_dir]);
         git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
         git(&[
@@ -127,6 +127,16 @@ fn main() {
             "true",
         ]);
     }
+    // Never let git auto-gc this repo. `git-receive-pack` (which http-backend
+    // spawns on every push) forks a background `git gc --auto` once loose
+    // objects cross gc.auto; that repack rewrites the object store while a
+    // concurrent `git-upload-pack` is streaming a fetch from it, which can
+    // truncate the pack and surface on the client as the intermittent
+    // `fetch-pack: invalid index-pack output`. The likelihood grows with
+    // accumulated objects, so a long-lived stack degrades. Client repos already
+    // set `gc.auto 0`; do the same here, unconditionally so an already-seeded
+    // repo is healed on the next restart (not just fresh ones).
+    git(&["-C", &git_dir, "config", "gc.auto", "0"]);
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
