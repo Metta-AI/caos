@@ -34,6 +34,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
+mod chat;
+pub use chat::cli_chat;
+
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
@@ -1693,6 +1696,23 @@ fn run_request(
     cas: Option<&Path>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
+    let req = prepare_request(t, image, cas, kvs)?;
+    // Trigger compute; the server runs the container and returns the result's
+    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
+    request_compute(&t.server_url()?, &req)
+}
+
+/// Everything in [`run_request`] up to (and including) getting the request onto
+/// the server, returning the request id. Split out so a caller can trigger the
+/// blocking compute itself — `chat` runs [`request_compute`] on its own thread
+/// (it needs only the request id and the server URL, both plain strings) while
+/// it watches the turn's progress ref from the main one.
+fn prepare_request(
+    t: &dyn Transport,
+    image: &str,
+    cas: Option<&Path>,
+    kvs: &[String],
+) -> Result<String, String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it. The image is folded into the args tree below, so the server
     // only ever sees a plain args tree.
@@ -1734,10 +1754,7 @@ fn run_request(
     // so the image lands on the server without a separate push.
     let req = build_request(t, &args_tree, &std, &salt)?;
     t.ensure_pushed(&req.to_string())?;
-
-    // Trigger compute; the server runs the container and returns the result's
-    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    request_compute(&t.server_url()?, &req.to_string())
+    Ok(req.to_string())
 }
 
 /// `map-then <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a

@@ -6,11 +6,12 @@
 //! a large unchanged tree is almost free to "upload" and an edit ships only its
 //! delta. Compute is triggered over HTTP (`$CAOS_SERVER_URL`, `/run`).
 //!
-//! There is no `/cas` here — that's the worker's world. The CLI has three
+//! There is no `/cas` here — that's the worker's world. The CLI has four
 //! commands: `run` (compute, with the result checked out to any host path, or
 //! a file result streamed to stdout when no path is given), `curry` (bind args
-//! to an image, printing the curried ref), and `import-image` (get a docker
-//! image into caos, printing its hash). The object-level commands
+//! to an image, printing the curried ref), `import-image` (get a docker
+//! image into caos, printing its hash), and `chat` (one turn of an agent
+//! conversation — see design/agent-harness.md). The object-level commands
 //! (`get`/`put`/…) live only in the worker `caos`, which runs inside a sandbox
 //! with a real `/cas`.
 
@@ -63,6 +64,11 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
+        // `chat <name> [-m <message>] [flags]` — one turn of an agent
+        // conversation: mint the human commit, run llm-step over it, print
+        // progress, advance `refs/caos/conversations/<name>` on success. Flag
+        // parsing (and the chat-specific usage) lives in `caos::cli_chat`.
+        Some("chat") => caos::cli_chat(&transport()?, &args[2..]),
         _ => Err(usage(args)),
     }
 }
@@ -78,6 +84,7 @@ fn usage(args: &[String]) -> String {
         "usage:\n  \
          {prog} run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
-         {prog} import-image [--base docker://<ref>] <docker-archive>"
+         {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
+         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]"
     )
 }
