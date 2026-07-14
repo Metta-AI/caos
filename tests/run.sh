@@ -34,6 +34,9 @@ cd "$PROJECT"
 echo "building caos client..." >&2
 nix build .#caos-cli -o result-caos
 caosbin=$PROJECT/result-caos/bin/caos-cli
+# The project root, for tests that need to build more flake outputs (e.g. the
+# llm-step suite builds its worker binaries and stub server with nix).
+export CAOS_PROJECT=$PROJECT
 export CAOS_SERVER_URL=${CAOS_SERVER_URL:-http://localhost:9090}
 
 # A per-run salt threads into every request (hence every cache key), so this run

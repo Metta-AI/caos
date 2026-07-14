@@ -182,12 +182,16 @@ fn caos_capture(args: &[&str]) -> Result<String, String> {
 }
 
 /// A parsed git commit, as a worker sees one: the tree it snapshots, its
-/// parents, and its message. In caos a commit is a first-class value — e.g. an
-/// agent conversation head, where the message is a turn's text, the tree the
-/// workspace state, and the parent the previous turn.
+/// parents, its author's name, and its message. In caos a commit is a
+/// first-class value — e.g. an agent conversation head, where the message is a
+/// turn's text, the tree the workspace state, and the parent the previous
+/// turn. The author name is how the agent harness tells its own turn commits
+/// (author `caos-agent`) apart from everything else when walking a
+/// conversation (see `design/agent-harness.md`).
 pub struct Commit {
     pub tree: String,
     pub parents: Vec<String>,
+    pub author: String,
     pub message: String,
 }
 
@@ -217,11 +221,30 @@ pub fn write_commit(
     message: &str,
     out: &str,
 ) -> Result<String, String> {
+    write_commit_as(tree, parents, message, None, out)
+}
+
+/// [`write_commit`] with an explicit author: `(name, unix-seconds)` stamps the
+/// commit with a real identity and wall-clock time (the agent harness stamps
+/// step/turn commits `caos-agent` + now, so a retried turn is a *distinct*
+/// commit). `None` keeps the fixed zero-timestamp identity — the pure-value
+/// behavior every other caller wants.
+pub fn write_commit_as(
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    author: Option<(&str, i64)>,
+    out: &str,
+) -> Result<String, String> {
+    let (name, timestamp) = author.unwrap_or(("caos", 0));
     let mut text = format!("tree {tree}\n");
     for parent in parents {
         text += &format!("parent {parent}\n");
     }
-    text += "author caos <caos@caos> 0 +0000\ncommitter caos <caos@caos> 0 +0000\n\n";
+    text += &format!(
+        "author {name} <caos@caos> {timestamp} +0000\n\
+         committer {name} <caos@caos> {timestamp} +0000\n\n"
+    );
     text += message;
     if !message.ends_with('\n') {
         text.push('\n');
@@ -231,24 +254,34 @@ pub fn write_commit(
     caos_capture(&["put-commit", path(&file), out])
 }
 
-/// Parse a raw commit object: header lines (`tree`, `parent`, identity — which
-/// we don't surface) up to the first blank line, then the message.
+/// Parse a raw commit object: header lines (`tree`, `parent`, `author` — the
+/// name only; the email/timestamp aren't surfaced) up to the first blank line,
+/// then the message.
 fn parse_commit(text: &str) -> Result<Commit, String> {
     let (headers, message) = text
         .split_once("\n\n")
         .ok_or_else(|| format!("malformed commit (no blank line): {text:?}"))?;
     let mut tree = None;
     let mut parents = Vec::new();
+    let mut author = String::new();
     for line in headers.lines() {
         if let Some(hash) = line.strip_prefix("tree ") {
             tree = Some(hash.to_string());
         } else if let Some(hash) = line.strip_prefix("parent ") {
             parents.push(hash.to_string());
+        } else if let Some(ident) = line.strip_prefix("author ") {
+            // `author NAME <EMAIL> TS TZ` — keep just the name.
+            author = ident
+                .split_once(" <")
+                .map(|(name, _)| name)
+                .unwrap_or(ident)
+                .to_string();
         }
     }
     Ok(Commit {
         tree: tree.ok_or_else(|| format!("commit has no tree line: {text:?}"))?,
         parents,
+        author,
         message: message.to_string(),
     })
 }
