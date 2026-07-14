@@ -12,6 +12,10 @@
    with *itself* (file-count is the model), so a generic fold driver adds
    nothing.
 
+Since extended with the **single-valued form**, `caos run-then` (the
+continuation gained a `run` entry, mutually exclusive with `map`; see
+[Run-then](#run-then-the-single-valued-form)).
+
 ## Problem
 
 A worker that needed sub-computations used to call `caos run` and **block**
@@ -34,25 +38,52 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 - **`caos map-then <in> -- [--map=<img>] [--then=<img>]`** (worker form) writes
   `/cas/out` as a **promise placeholder** naming a continuation object;
   `entrypoint` reports `promise <hash>` instead of `blob/tree <hash>`.
-- The **continuation** is a content-addressed tree `{in, map?, then?}`: `in`
-  is a real tree entry (the data node, mode + oid); `map`/`then` are blobs
-  naming images (resolved to hashes / `docker://` refs client-side, so the
-  server never sees `/cas` paths).
-- The **server**, on a `promise` result, resolves it:
+- The **continuation** is a content-addressed tree `{in, map?, run?, then?}`:
+  `in` is a real tree entry (the data node, mode + oid); `map`/`run`/`then` are
+  blobs naming images (resolved to hashes / `docker://` refs client-side, so
+  the server never sees `/cas` paths). `map` and `run` are **mutually
+  exclusive** — the worker CLI's two verbs (`map-then` takes only
+  `--map`/`--then`, `run-then` only `--run`/`--then`) enforce that client-side,
+  and the server rejects a continuation carrying both as defense in depth.
+- The **server**, on a `promise` result, resolves it — one path, a *middle
+  step* then `then`:
   1. if `map` is given and `in` is a tree: run `map` with `--in=<child>` for
      **each child of `in`, in parallel**; a blob `in` maps to no children.
      The results are assembled into a `children` tree under the original child
      names;
-  2. if `then` is given: the request's result is `then(--in=<in>
-     [, --children=<children>])` — `children` is passed only when `map` ran;
-  3. with no `then`, the result is the `children` tree itself; with no `map`,
+  2. if `run` is given: **one** sub-run, `run(--in=<in>)`, yielding R — the
+     single-valued form (see below);
+  3. if `then` is given: the request's result is `then(--in=<in>
+     [, --children=<children> | --result=<R>])` — the extra arg only when a
+     middle step ran;
+  4. with no `then`, the middle step's own result is the request's result —
+     the `children` tree after a `map`, R after a `run`. With no middle step,
      `then(--in=<in>)` is a plain tail call.
 
   Every sub-run goes through the same internal pipeline (cache → cycle check →
-  dispatch → promise resolution), so promises nest arbitrarily: a `map` child
-  or a `then` may itself return a promise. The final, fully-resolved
+  dispatch → promise resolution), so promises nest arbitrarily: a `map` child,
+  a `run`, or a `then` may itself return a promise. The final, fully-resolved
   `"<type> <hash>"` is what gets cached under the original request hash and
   returned to the caller.
+
+## Run-then: the single-valued form
+
+`caos run-then <in> -- --run=<img> [--then=<img>]` (helper:
+`worker_common::run_then`) is map-then over a single value instead of a node's
+children: the server runs `run(--in=<in>)` once and threads its result R into
+`then(--in=<in>, --result=<R>)` — symmetric with map-then's
+`--in`/`--children` pair. With no `then`, the request's result is R itself, so
+`run-then --run=X` is a plain tail call to X (just as map-then with no map is a
+plain tail call to `then`); both degenerate forms are the same resolution path,
+not parallel mechanisms.
+
+This is the sub-call shape a sequential caller wants — e.g. an agent step that
+must execute one tool call and be *called back* with the result: it curries its
+own state into `then` (its own image plus whatever it must remember), records
+`{in, run: <tool>, then: <curried self>}`, and exits. No worker ever waits: the
+deadlock argument below is unchanged, since `run` is resolved by a server
+thread exactly like a map child. R may be any result kind — a `commit` (see
+first-class commits) as much as a blob or tree.
 
 `caos-cli run` is **unchanged**: it still blocks at the top level (it holds no
 worker slot), and the server resolves all promises before answering.

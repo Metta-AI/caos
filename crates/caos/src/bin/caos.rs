@@ -11,7 +11,8 @@
 //! finishes. The shared command logic lives in the `caos` library; this binary
 //! is the worker's CLI surface plus the privileged runner.
 //!
-//! Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`, and `runner`.
+//! Subcommands: `get-hash`, `get`, `put`, `map-then`, `run-then`, `curry`, and
+//! `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::process::CommandExt;
@@ -63,6 +64,13 @@ fn run(args: &[String]) -> Result<(), String> {
         // /cas/out (a tail call; the server resolves it after the worker exits).
         Some("map-then") => match &args[2..] {
             [input, sep, kvs @ ..] if sep == "--" => caos::caos_map_then(&http()?, input, kvs),
+            _ => Err(usage(args)),
+        },
+        // `run-then <in> -- --run=<image> [--then=<image>]` — the single-valued
+        // map-then: the server runs `run(--in=<in>)` once, then (optionally)
+        // `then(--in=<in>, --result=<R>)`. The same tail-call contract.
+        Some("run-then") => match &args[2..] {
+            [input, sep, kvs @ ..] if sep == "--" => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
         // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an image, printing
@@ -370,6 +378,7 @@ fn usage(args: &[String]) -> String {
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
+         {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
          {prog} runner --job=<json>"
     )

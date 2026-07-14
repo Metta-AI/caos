@@ -190,18 +190,25 @@ fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpE
 
 // ---- Promise resolution ------------------------------------------------------
 
-/// Resolve a map-then continuation — a tree `{in, map?, then?}` where `in` is a
-/// real tree entry (the data node) and `map`/`then` are blobs naming images (see
-/// `design/map-then.md`):
+/// Resolve a continuation — a tree `{in, map?, run?, then?}` where `in` is a
+/// real tree entry (the data node) and `map`/`run`/`then` are blobs naming
+/// images (see `design/map-then.md`). `map` and `run` are mutually exclusive
+/// (the client already refuses to record both; this is defense in depth). One
+/// resolution path covers both forms — a *middle step*, then `then`:
 ///
 /// 1. if `map` is given: run `map --in=<child>` for each child of `in` in
 ///    parallel (a blob `in` is a leaf — no children), assembling the results
 ///    into a `children` tree under the original names;
-/// 2. the result is `then(--in=<in>[, --children=<children>])` if `then` is
-///    given (`children` only when `map` ran), else the `children` tree itself.
+/// 2. if `run` is given: one sub-run, `run(--in=<in>)` — the single-valued
+///    form. Its result R may be any kind (a commit as much as a blob/tree);
+/// 3. the result is `then(--in=<in>[, --children=<children> | --result=<R>])`
+///    if `then` is given (the extra arg only when a middle step ran), else the
+///    middle step's own result — the `children` tree, or R. With no middle
+///    step, `then(--in=<in>)` is a plain tail call.
 ///
-/// Every sub-run goes through [`run_req`], so promises nest arbitrarily and each
-/// sub-run gets its own memoization and cycle detection (via `stack`).
+/// Every sub-run goes through [`run_req`], so promises nest arbitrarily (a map
+/// child, a `run`, or a `then` may itself promise) and each sub-run gets its
+/// own memoization and cycle detection (via `stack`).
 fn resolve_promise(
     config: &Config,
     cont: &str,
@@ -212,13 +219,14 @@ fn resolve_promise(
     use gix::objs::tree::EntryKind;
 
     let mut input: Option<gix::objs::tree::Entry> = None;
-    let (mut map, mut then) = (None, None);
+    let (mut map, mut run, mut then) = (None, None, None);
     for entry in fetch_tree(config, cont)
         .map_err(|e| HttpError::new(500, format!("reading continuation {cont}: {e}")))?
     {
         match entry.name.as_str() {
             "in" => input = Some(named_entry("in", entry.mode, entry.oid)),
             "map" => map = Some(blob_string(config, &entry.oid.to_string())?),
+            "run" => run = Some(blob_string(config, &entry.oid.to_string())?),
             "then" => then = Some(blob_string(config, &entry.oid.to_string())?),
             other => {
                 return Err(HttpError::new(
@@ -230,19 +238,29 @@ fn resolve_promise(
     }
     let input =
         input.ok_or_else(|| HttpError::new(500, format!("continuation {cont} missing 'in'")))?;
-    if map.is_none() && then.is_none() {
+    if map.is_some() && run.is_some() {
         return Err(HttpError::new(
             500,
-            format!("continuation {cont} has neither 'map' nor 'then'"),
+            format!("continuation {cont} has both 'map' and 'run' (they are mutually exclusive)"),
+        ));
+    }
+    if map.is_none() && run.is_none() && then.is_none() {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has none of 'map', 'run', or 'then'"),
         ));
     }
 
-    // Map the children in parallel — one thread per child, each a full [`run_req`]
-    // (so a child may itself promise). Concurrency is bounded by the worker-slot
-    // semaphore, not the thread count; threads are cheap and mostly blocked. A
-    // blob `in` is a leaf: nothing to map, an empty children tree.
-    let children: Vec<gix::objs::tree::Entry> = match &map {
-        Some(img) if input.mode.is_tree() => {
+    // The middle step, if any: `map` fans out over `in`'s children and yields a
+    // `children` tree; `run` is one sub-run yielding a `result` entry. Either
+    // way we get (the extra arg `then` receives, the result when there is no
+    // `then`).
+    let mid: Option<(gix::objs::tree::Entry, String)> = if let Some(img) = &map {
+        // Map the children in parallel — one thread per child, each a full
+        // [`run_req`] (so a child may itself promise). Concurrency is bounded by
+        // the runner pool, not the thread count; threads are cheap and mostly
+        // blocked. A blob `in` is a leaf: nothing to map, an empty children tree.
+        let children: Vec<gix::objs::tree::Entry> = if input.mode.is_tree() {
             let kids = fetch_tree(config, &input.oid.to_string())
                 .map_err(|e| HttpError::new(500, format!("reading map source: {e}")))?;
             let results: Vec<Result<gix::objs::tree::Entry, HttpError>> =
@@ -271,32 +289,42 @@ fn resolve_promise(
             // first failure fails the whole map, exactly like a failing child in
             // the old blocking recursion.
             results.into_iter().collect::<Result<Vec<_>, _>>()?
-        }
-        _ => Vec::new(),
+        } else {
+            Vec::new()
+        };
+        let children_tree = store_git_tree(config, children)
+            .map_err(|e| HttpError::new(500, format!("storing children tree: {e}")))?;
+        Some((
+            named_entry("children", EntryKind::Tree.into(), children_tree),
+            format!("tree {children_tree}"),
+        ))
+    } else if let Some(img) = &run {
+        // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_req`]
+        // (so a promise R leaves behind is already collapsed to a value here).
+        let result = run_image(config, img, vec![input.clone()], std, salt, stack)?;
+        Some((result_entry("result", &result)?, result))
+    } else {
+        None
     };
 
-    match &then {
-        Some(img) => {
-            // `then` gets the original `in`, plus the mapped children when a map
-            // ran — the (`--in`, `--children`) pair a combining step takes.
+    match (then, mid) {
+        // `then` combines: it gets the original `in`, plus the middle step's
+        // contribution when one ran — (`--in`, `--children`) after a map,
+        // (`--in`, `--result`) after a run, bare `--in` for a plain tail call.
+        (Some(img), mid) => {
             let mut args = vec![input];
-            if map.is_some() {
-                let children_tree = store_git_tree(config, children)
-                    .map_err(|e| HttpError::new(500, format!("storing children tree: {e}")))?;
-                args.push(named_entry(
-                    "children",
-                    EntryKind::Tree.into(),
-                    children_tree,
-                ));
+            if let Some((extra, _)) = mid {
+                args.push(extra);
             }
-            run_image(config, img, args, std, salt, stack)
+            run_image(config, &img, args, std, salt, stack)
         }
-        // A pure map: the children tree is the result.
-        None => {
-            let children_tree = store_git_tree(config, children)
-                .map_err(|e| HttpError::new(500, format!("storing children tree: {e}")))?;
-            Ok(format!("tree {children_tree}"))
-        }
+        // No `then`: the middle step's own result is the request's result.
+        (None, Some((_, result))) => Ok(result),
+        // Unreachable — the presence check above requires some step.
+        (None, None) => Err(HttpError::new(
+            500,
+            format!("continuation {cont} has no step to run"),
+        )),
     }
 }
 

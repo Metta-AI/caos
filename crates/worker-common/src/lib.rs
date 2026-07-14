@@ -107,6 +107,32 @@ pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<()
     caos_argv(&str_refs(&argv))
 }
 
+/// Run-then: the single-valued [`map_then`] — record a continuation over
+/// `input` (a CAS path) as this worker's result at `/cas/out`: `caos run-then
+/// <input> -- --run=<run> [--then=<then>]`. The *server* resolves it after this
+/// worker exits: one sub-run `run(--in=<input>)` yields R, then
+/// `then(--in=<input>, --result=<R>)` produces the final result — or R itself
+/// with no `then`, a plain tail call to `run`. R may itself be a promise; the
+/// server collapses it fully before `then` sees it. `run`/`then` are image refs
+/// exactly as in [`map_then`], usually curried with whatever else they need
+/// (e.g. a worker currying its own state into `then` to be called back with the
+/// sub-run's result).
+///
+/// Like `map_then`, this is a worker's *final act*: it produces `/cas/out`, so
+/// call it once, in tail position.
+pub fn run_then(input: &str, run: &str, then: Option<&str>) -> Result<(), String> {
+    let mut argv: Vec<String> = vec![
+        "run-then".into(),
+        input.into(),
+        "--".into(),
+        format!("--run={run}"),
+    ];
+    if let Some(then) = then {
+        argv.push(format!("--then={then}"));
+    }
+    caos_argv(&str_refs(&argv))
+}
+
 /// Build a `caos <verb> <image> -- …` argument vector, serializing each arg per
 /// its kind (literal `--k=v`, path `--k:@=v`).
 fn verb_argv(verb: &str, image: &str, args: &[(&str, Arg)]) -> Vec<String> {

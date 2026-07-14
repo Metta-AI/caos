@@ -204,16 +204,20 @@ Results stay on the server. The caller gets back the hash and a type; it does
 ### Map-then: sub-computations without blocking
 
 A worker never blocks on another worker. Its `caos map-then` is a **tail call**: it
-records a continuation `{in, map?, then?}` — `in` a tree entry for the data
-node, `map`/`then` blobs naming images — as the worker's own result at
+records a continuation `{in, map?, run?, then?}` — `in` a tree entry for the data
+node, `map`/`run`/`then` blobs naming images (`map` and `run` mutually
+exclusive) — as the worker's own result at
 `/cas/out`, and the worker's job is done. The server then:
 
 1. if `map` is given and `in` is a tree: runs `map --in=<child>` for **each
    child of `in`, in parallel** (a blob `in` is a leaf — no children), and
-   assembles the results into a `children` tree under the original names;
-2. produces the request's result: `then(--in=<in>[, --children=<children>])`
-   if `then` is given (`children` only when `map` ran), else the `children`
-   tree itself. With no `map`, `then(--in)` is a plain tail call.
+   assembles the results into a `children` tree under the original names; if
+   `run` is given (`caos run-then`, the single-valued form): runs
+   `run(--in=<in>)` once, yielding R;
+2. produces the request's result: `then(--in=<in>[, --children=<children> |
+   --result=<R>])` if `then` is given (the extra arg only when a `map`/`run`
+   ran), else the `children` tree / R itself. With neither, `then(--in)` is a
+   plain tail call.
 
 Recursion ties the knot through `map`: a worker curries *its own image* — read
 straight from `/cas/args/image`, the request's reserved entry — as the mapper,
@@ -258,8 +262,9 @@ logic — the difference is the **transport** and the privilege model.
 - **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
   provides the container `runner`. It's installed **setuid-root** in
   worker images so an unprivileged worker can reach the root-owned `/cas` only
-  through it. Subcommands: `get-hash`, `get`, `put`, `map-then`, `curry`,
-  `runner`. Its `map-then` is a *tail call* — it records a map-then continuation
+  through it. Subcommands: `get-hash`, `get`, `put`, `map-then`, `run-then`,
+  `curry`, `runner`. Its `map-then`/`run-then` are *tail calls* — they record a
+  continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
 - **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it

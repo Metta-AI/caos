@@ -1587,7 +1587,7 @@ fn run_request(
 }
 
 /// `map-then <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a
-/// map-then continuation `{in, map?, then?}` as this worker's result at
+/// continuation `{in, map?, then?}` as this worker's result at
 /// `/cas/out`, fetching and running nothing. The worker then exits, and the
 /// *server* resolves the continuation — `map` over each child of `in` in
 /// parallel, then `then(--in, --children)` — with no worker slot held (see
@@ -1595,8 +1595,49 @@ fn run_request(
 /// itself and must be the worker's final act. At least one of `--map`/`--then`
 /// is required; each names an image (a `/cas` path, resolved to the hash
 /// recorded on it, or a git/curry hash or `docker://` ref, passed through).
-/// (The user-facing CLI's blocking run is [`cli_run`].)
+/// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
+/// is [`caos_run_then`].)
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
+    record_continuation(t, "map-then", input, kvs, &["map", "then"], |given| {
+        if given.is_empty() {
+            return Err("`map-then` needs --map and/or --then".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// `run-then <in> -- --run=<image> [--then=<image>]` — the single-valued
+/// [`caos_map_then`]: record a continuation `{in, run, then?}` as this worker's
+/// result at `/cas/out` and exit. The server runs `run(--in=<in>)` once,
+/// yielding R; with `--then` the request's result is `then(--in=<in>,
+/// --result=<R>)` (symmetric with map-then's `--in`/`--children`), else R
+/// itself — so `run` with no `then` is a plain tail call to `run`. `--run` is
+/// required (a bare tail call to one image); `--map` doesn't belong here —
+/// `map` and `run` are mutually exclusive, which this surface enforces
+/// client-side. Image refs resolve exactly as in `map-then`.
+pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
+    record_continuation(t, "run-then", input, kvs, &["run", "then"], |given| {
+        if !given.contains(&"run") {
+            return Err("`run-then` needs --run (with an optional --then)".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// Shared body of [`caos_map_then`] / [`caos_run_then`]: record a continuation
+/// `{in, <images>}` over `input` as this worker's result at `/cas/out` (a
+/// `promise` placeholder the server resolves once the job is posted). `allowed`
+/// names the image-valued entries this verb accepts — the surface split is the
+/// client-side mutual exclusion of `map` and `run` — and `check` validates the
+/// set actually given, before anything is sealed.
+fn record_continuation(
+    t: &dyn Transport,
+    verb: &str,
+    input: &str,
+    kvs: &[String],
+    allowed: &[&'static str],
+    check: impl FnOnce(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let cas = cas_dir();
@@ -1604,7 +1645,7 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     let out = cas.join("out");
     if std::fs::symlink_metadata(&out).is_ok() {
         return Err(format!(
-            "{} already exists; `caos map-then` records the worker's result, so it must \
+            "{} already exists; `caos {verb}` records the worker's result, so it must \
              be the worker's final act",
             out.display()
         ));
@@ -1621,14 +1662,20 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
         oid: in_oid,
     }];
 
+    let mut given: Vec<&str> = Vec::new();
     for kv in kvs {
         let (name, value) = parse_kv(kv)?;
-        if name != "map" && name != "then" {
+        let Some(&name) = allowed.iter().find(|&&a| a == name) else {
+            let flags = allowed
+                .iter()
+                .map(|a| format!("--{a}"))
+                .collect::<Vec<_>>()
+                .join(" and ");
             return Err(format!(
-                "`map-then` takes only --map and --then (each an image ref), got --{name}"
+                "`{verb}` takes only {flags} (each an image ref), got --{name}"
             ));
-        }
-        if entries.iter().any(|e| entry_name(e) == name.as_bytes()) {
+        };
+        if given.contains(&name) {
             return Err(format!("--{name} given twice"));
         }
         // Literal or path form, the value names an image; resolve_run_image
@@ -1643,10 +1690,9 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
             filename: name.as_bytes().to_vec().into(),
             oid: post_object(t, "blob", resolved.as_bytes())?,
         });
+        given.push(name);
     }
-    if entries.len() == 1 {
-        return Err("`map-then` needs --map and/or --then".to_string());
-    }
+    check(&given)?;
 
     let continuation = post_tree(t, entries)?;
     write_placeholder(&out, "promise", &continuation.to_string())
