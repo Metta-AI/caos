@@ -175,12 +175,10 @@ fn is_loaded(meta: &fs::Metadata) -> bool {
 fn mirror(src: &Path, dst: &Path) -> Result<(), String> {
     for entry in entries(path(src))? {
         let target = dst.join(file_name(&entry));
-        let meta =
-            fs::symlink_metadata(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
+        let meta = fs::symlink_metadata(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
         if meta.file_type().is_symlink() {
             let dest = fs::read_link(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
-            symlink(&dest, &target)
-                .map_err(|e| format!("linking {}: {e}", target.display()))?;
+            symlink(&dest, &target).map_err(|e| format!("linking {}: {e}", target.display()))?;
         } else if !is_loaded(&meta) {
             link(&entry, &target)?;
         } else if meta.is_dir() {

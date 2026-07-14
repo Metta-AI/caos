@@ -37,7 +37,10 @@ type ArgSet = BTreeMap<String, String>;
 fn pending_timeout() -> Duration {
     static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_secs(*SECS.get_or_init(|| {
-        std::env::var("CAOS_PENDING_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+        std::env::var("CAOS_PENDING_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60)
     }))
 }
 

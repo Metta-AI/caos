@@ -277,7 +277,9 @@ fn launch(
 ) -> Result<(), String> {
     let name = call["name"].as_str().unwrap_or("");
     if name != "bash" {
-        return Err(format!("model called unknown tool {name:?} (only `bash` is registered)"));
+        return Err(format!(
+            "model called unknown tool {name:?} (only `bash` is registered)"
+        ));
     }
     let id = call["id"]
         .as_str()
@@ -301,7 +303,7 @@ fn launch(
     let in_path = fresh("toolin");
     caos(["put", path(&dir), &in_path])?;
 
-    let me = self_curry(cfg, step_path, pending, results, id)?;
+    let me = self_curry(step_path, pending, results, id)?;
     run_then(&in_path, &cfg.bash_image, Some(&me))
 }
 
@@ -311,13 +313,11 @@ fn launch(
 /// hence identical), plus the state to remember. Commit-valued paths (`head`,
 /// `step`) re-bind as gitlinks (their kind xattr rides the curry).
 fn self_curry(
-    cfg: &Config,
     step_path: &str,
     pending: &[Value],
     results: &[Value],
     current_id: &str,
 ) -> Result<String, String> {
-    let _ = cfg; // config re-binds from our own args below
     let pending_json = Value::Array(pending.to_vec()).to_string();
     let results_json = Value::Array(results.to_vec()).to_string();
 
@@ -368,9 +368,8 @@ fn prior_messages(head: &Commit) -> Result<Vec<Value>, String> {
     // an agent turn merge (author caos-agent) or the conversation's base.
     let mut groups: Vec<Vec<Value>> = Vec::new();
     let mut parents = head.parents.clone();
-    loop {
-        let Some(parent) = parents.first() else { break };
-        let turn = fetch_commit(parent)?;
+    while let Some(parent) = parents.first().cloned() {
+        let turn = fetch_commit(&parent)?;
         if turn.author != AGENT_AUTHOR {
             break; // the base commit — the conversation starts above it
         }
@@ -394,7 +393,10 @@ fn prior_messages(head: &Commit) -> Result<Vec<Value>, String> {
 fn turn_messages(turn: &Commit, human_hash: &str) -> Result<Vec<Value>, String> {
     let steps = step_chain(turn.parents.get(1).map(String::as_str), human_hash)?;
     if steps.is_empty() {
-        return Ok(vec![message("assistant", Value::String(turn.message.clone()))]);
+        return Ok(vec![message(
+            "assistant",
+            Value::String(turn.message.clone()),
+        )]);
     }
     Ok(steps.iter().flat_map(step_messages).collect())
 }
@@ -442,8 +444,7 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
     caos(["get", &format!("{tree}/{STEP_DIR}")])?;
     caos(["get", &file])?;
     let text = fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?;
-    let v: Value =
-        serde_json::from_str(&text).map_err(|e| format!("parsing {STEP_FILE}: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("parsing {STEP_FILE}: {e}"))?;
     let arr = |key: &str| -> Result<Vec<Value>, String> {
         v[key]
             .as_array()
@@ -466,13 +467,13 @@ fn bash_tool() -> Value {
     json!({
         "name": "bash",
         "description": "Run a shell command in the workspace (executed with `sh -c` from the \
-workspace root). The workspace is materialized lazily: ONLY the files and directories you \
-list in `paths` are readable — a command touching any other existing path fails with \
-'Permission denied' (EACCES), and the result names the unmaterialized paths it touched. \
-When that happens, retry the same command with those paths added to `paths`. Creating new \
-files or directories needs no declaration. The result reports the exit code, stdout and \
-stderr (tails), and the workspace carries all changes forward. A non-zero exit is reported \
-back to you, not an error — read stderr and react.",
+    workspace root). The workspace is materialized lazily: ONLY the files and directories you \
+    list in `paths` are readable — a command touching any other existing path fails with \
+    'Permission denied' (EACCES), and the result names the unmaterialized paths it touched. \
+    When that happens, retry the same command with those paths added to `paths`. Creating new \
+    files or directories needs no declaration. The result reports the exit code, stdout and \
+    stderr (tails), and the workspace carries all changes forward. A non-zero exit is reported \
+    back to you, not an error — read stderr and react.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -484,7 +485,7 @@ back to you, not an error — read stderr and react.",
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Workspace-relative paths the command reads or modifies; \
-only these are materialized into the sandbox."
+    only these are materialized into the sandbox."
                 }
             },
             "required": ["cmd"]

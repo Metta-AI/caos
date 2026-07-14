@@ -31,8 +31,8 @@ pub fn push(conversation: &str, new_hash: &str) {
 }
 
 fn try_push(conversation: &str, new_hash: &str) -> Result<(), String> {
-    let base = std::env::var("CAOS_SERVER_URL")
-        .map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
+    let base =
+        std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
     let base = base.trim_end_matches('/');
     let refname = format!("refs/caos/progress/{conversation}");
 
