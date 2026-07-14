@@ -281,10 +281,17 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
 
     // Fetch the turn (and so the whole step chain — it's tree-reachable), then
     // drain any steps a poll didn't catch. The final step's text blocks ARE the
-    // turn message, so they're suppressed and printed once, below.
+    // turn message, so the response is printed exactly once: either a poll
+    // already showed the final step (skip the message), or the drain here
+    // suppresses that step's text and the message is printed below.
     fetch_object(&turn_hash)?;
+    let mut show_message = true;
     if let Some(tail) = rev_parse_opt(&format!("{turn_hash}^2"))? {
-        let _ = drain_steps(&http, &tail, &human, &mut printed, Some(&tail));
+        if printed.contains(&tail) {
+            show_message = false;
+        } else {
+            let _ = drain_steps(&http, &tail, &human, &mut printed, Some(&tail));
+        }
     }
 
     git_capture(&["update-ref", refname, &turn_hash], None)?;
@@ -292,7 +299,9 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
     let short = git_capture(&["rev-parse", "--short", &turn_hash], None)?
         .trim()
         .to_string();
-    println!("{}", text.trim_end());
+    if show_message {
+        println!("{}", text.trim_end());
+    }
     println!("[{} {}]", a.name, short);
     Ok(())
 }
