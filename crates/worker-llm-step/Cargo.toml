@@ -1,0 +1,21 @@
+[package]
+name = "worker-llm-step"
+version = "0.1.0"
+edition = "2021"
+
+# The agent-harness driver (see design/agent-harness.md): one invocation = one
+# LLM API round; tool calls chain through run-then with the worker re-curried
+# as its own continuation. Builds to a static binary that runs as
+# curry(runner, bin) in the shared runner pool.
+[dependencies]
+worker-common = { path = "../worker-common" }
+# Request/response bodies, step.json, and the curried pending/results state.
+serde_json = "1"
+# The raw `POST /v1/messages` (and the progress-ref push). https-rustls keeps
+# TLS pure-Rust so the binary stays static; default-features off as everywhere
+# else in the workspace.
+minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+
+[[bin]]
+name = "worker-llm-step"
+path = "src/main.rs"

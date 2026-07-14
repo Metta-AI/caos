@@ -1,0 +1,14 @@
+[package]
+name = "llm-stub"
+version = "0.1.0"
+edition = "2021"
+
+# Test fixture: a scripted stand-in for the LLM API (`POST /v1/messages`) that
+# the llm-step tests point `base_url` at. Not a worker — it runs on the host.
+[dependencies]
+# The same minimal synchronous HTTP server the caos server uses.
+tiny_http = "0.12"
+
+[[bin]]
+name = "llm-stub"
+path = "src/main.rs"

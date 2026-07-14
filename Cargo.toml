@@ -11,6 +11,9 @@ members = [
     "crates/worker-deep-deps",
     "crates/worker-rustc",
     "crates/worker-runner",
+    "crates/worker-bash-tool",
+    "crates/worker-llm-step",
+    "crates/llm-stub",
 ]
 
 # Name for crane's workspace-level derivations (fmt/test) so it doesn't warn
