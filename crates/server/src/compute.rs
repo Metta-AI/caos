@@ -448,7 +448,10 @@ fn named_entry(
     }
 }
 
-/// Turn a sub-run result `"<type> <hash>"` into a tree entry named `name`.
+/// Turn a sub-run result `"<type> <hash>"` into a tree entry named `name`. A
+/// `commit` result rides as a gitlink entry (mode 160000) — workers fetch
+/// objects by hash explicitly, so git's don't-fetch gitlink semantics never
+/// apply inside caos.
 fn result_entry(name: &str, result: &str) -> Result<gix::objs::tree::Entry, HttpError> {
     use gix::objs::tree::EntryKind;
     let (kind, hash) = result
@@ -457,6 +460,7 @@ fn result_entry(name: &str, result: &str) -> Result<gix::objs::tree::Entry, Http
     let mode = match kind {
         "tree" => EntryKind::Tree,
         "blob" => EntryKind::Blob,
+        "commit" => EntryKind::Commit,
         other => {
             return Err(HttpError::new(
                 500,

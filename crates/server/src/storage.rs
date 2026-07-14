@@ -47,10 +47,19 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
                 .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
                 .detach()
         }
+        gix::object::Kind::Commit => {
+            // Validate the commit encoding, then store the *raw* bytes (rather
+            // than re-encoding the parsed form), so the hash is exactly what the
+            // client computed over the bytes it sent.
+            gix::objs::CommitRef::from_bytes(content, repo.object_hash())
+                .map_err(|err| HttpError::new(400, format!("invalid commit: {err}")))?;
+            gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+                .map_err(|err| HttpError::new(500, format!("failed to write commit: {err}")))?
+        }
         other => {
             return Err(HttpError::new(
                 400,
-                format!("unsupported object type: {other} (expected blob or tree)"),
+                format!("unsupported object type: {other} (expected blob, tree, or commit)"),
             ))
         }
     };
