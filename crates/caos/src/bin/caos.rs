@@ -11,8 +11,8 @@
 //! finishes. The shared command logic lives in the `caos` library; this binary
 //! is the worker's CLI surface plus the privileged runner.
 //!
-//! Subcommands: `get-hash`, `get`, `put`, `map-then`, `run-then`, `curry`, and
-//! `runner`.
+//! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `map-then`,
+//! `run-then`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::process::CommandExt;
@@ -57,6 +57,19 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         Some("put") => match (args.get(2), args.get(3), args.get(4)) {
             (Some(src), Some(dst), None) => caos::put(&http()?, src, dst),
+            _ => Err(usage(args)),
+        },
+        // `put-commit <src-file> <cas-path>` — store the file's bytes as a git
+        // *commit* object, record it (kind-tagged) at the CAS path, and print
+        // its hash. How a worker mints a turn/step commit.
+        Some("put-commit") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(src), Some(dst), None) => caos::put_commit(&http()?, src, dst),
+            _ => Err(usage(args)),
+        },
+        // `hash <cas-path>` — print the git hash recorded on a CAS path (e.g. a
+        // commit-valued arg whose hash becomes the next commit's parent).
+        Some("hash") => match (args.get(2), args.get(3)) {
+            (Some(path), None) => caos::cas_hash(path),
             _ => Err(usage(args)),
         },
         // `map-then <in> -- [--map=<image>] [--then=<image>]` — record a map-then
@@ -377,6 +390,8 @@ fn usage(args: &[String]) -> String {
         "usage:\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
+         {prog} put-commit <src-file> <cas-path>\n  \
+         {prog} hash <cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>]\n  \
          {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \

@@ -74,9 +74,11 @@ pub const DEFAULT_CAS_DIR: &str = "/cas";
 
 /// xattr recording the git hash a materialized path came from.
 const HASH_XATTR: &str = "user.caos.hash";
-/// xattr recording a placeholder's result *kind* when it isn't implied by the
-/// node's shape — only `promise` today (a `caos map-then` continuation, recorded as a
-/// file). Absent on ordinary placeholders: a directory is a tree, a file a blob.
+/// xattr recording a path's object *kind* when it isn't implied by the node's
+/// shape: `promise` (a `caos map-then`/`run-then` continuation, recorded as a
+/// file placeholder) or `commit` (a commit-valued path — as a placeholder, and
+/// still after fetching, since a materialized commit is a file holding the raw
+/// commit object). Absent otherwise: a directory is a tree, a file a blob.
 const KIND_XATTR: &str = "user.caos.kind";
 /// xattr used only by the startup support probe.
 const PROBE_XATTR: &str = "user.caos.probe";
@@ -142,6 +144,15 @@ pub trait Transport {
         &self,
         _value: &str,
     ) -> Result<Option<(gix::objs::tree::EntryMode, gix::ObjectId)>, String> {
+        Ok(None)
+    }
+
+    /// Resolve a revspec (e.g. `HEAD`, a branch name) named by a `:commit=` arg
+    /// to a commit id — or `Ok(None)` if this transport has no repo to resolve
+    /// against. The default is `None`: the worker has no working repo (a commit
+    /// reaches it as a hash or a `/cas` path); the git transport overrides this
+    /// to resolve against the working repo.
+    fn resolve_revspec(&self, _rev: &str) -> Result<Option<gix::ObjectId>, String> {
         Ok(None)
     }
 
@@ -253,6 +264,15 @@ impl Transport for GitTransport {
                     .map(|id| id.detach())
                     .map_err(|e| format!("writing tree: {e}"))
             }
+            "commit" => {
+                // Validate the commit encoding, then store the raw bytes (not a
+                // re-encoding), so the hash matches the bytes exactly — the same
+                // rule the server's `post_object` applies.
+                gix::objs::CommitRef::from_bytes(content, self.repo.object_hash())
+                    .map_err(|e| format!("invalid commit: {e}"))?;
+                gix::objs::Write::write_buf(&self.repo.objects, gix::object::Kind::Commit, content)
+                    .map_err(|e| format!("writing commit: {e}"))
+            }
             other => Err(format!("cannot store object of kind {other}")),
         }
     }
@@ -296,6 +316,17 @@ impl Transport for GitTransport {
             return Err(format!("path not found: {value}"));
         }
         self.git_ingest(path).map(Some)
+    }
+
+    fn resolve_revspec(&self, rev: &str) -> Result<Option<gix::ObjectId>, String> {
+        // `^{commit}` peels annotated tags but *requires* a commit at the end —
+        // a revspec naming a tree/blob is an error, never silently accepted.
+        let out = git_capture(
+            &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+            None,
+        )
+        .map_err(|e| format!("resolving {rev:?} to a commit: {e}"))?;
+        parse_oid(out.trim()).map(Some)
     }
 
     fn server_url(&self) -> Result<String, String> {
@@ -628,7 +659,9 @@ fn post_tree(
     t.put_object("tree", &buf)
 }
 
-/// Fetch object `hash` and write it to `target` (blob → file, tree → directory).
+/// Fetch object `hash` and write it to `target` (blob → file, tree → directory,
+/// commit → a file holding the raw commit object, kind-tagged so the path stays
+/// distinguishable from a blob).
 pub fn fetch_and_materialize(t: &dyn Transport, target: &Path, hash: &str) -> Result<(), String> {
     let (kind, content) = t.get_object(hash)?;
 
@@ -638,7 +671,7 @@ pub fn fetch_and_materialize(t: &dyn Transport, target: &Path, hash: &str) -> Re
             .map_err(|e| format!("malformed tree {hash}: {e}"))?;
         write_tree(t, target, hash, &tree)
     } else {
-        write_file(target, hash, &content)
+        write_file(target, hash, &kind, &content)
     }
 }
 
@@ -831,8 +864,11 @@ fn is_loaded(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Blob → atomically write `data` to `target`, tagged with `hash`.
-fn write_file(target: &Path, hash: &str, data: &[u8]) -> Result<(), String> {
+/// Non-tree object → atomically write `data` to `target`, tagged with `hash`.
+/// A blob's shape implies its kind; a `commit` (its `data` the raw commit
+/// object: headers, blank line, message) is additionally kind-tagged so the
+/// loaded file stays distinguishable from a blob (see [`KIND_XATTR`]).
+fn write_file(target: &Path, hash: &str, kind: &str, data: &[u8]) -> Result<(), String> {
     atomically(target, |tmp| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -842,7 +878,11 @@ fn write_file(target: &Path, hash: &str, data: &[u8]) -> Result<(), String> {
         file.write_all(data)
             .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
         set_hash(tmp, hash.as_bytes())?;
-        // Fetched blob: world-readable, writable by no one.
+        if kind == "commit" {
+            xattr::set(tmp, KIND_XATTR, b"commit")
+                .map_err(|e| format!("setting {KIND_XATTR} on {}: {e}", tmp.display()))?;
+        }
+        // Fetched content: world-readable, writable by no one.
         set_mode(tmp, MODE_FETCHED_FILE)
     })
 }
@@ -882,7 +922,9 @@ fn write_tree(
             }
             // Each child is a placeholder: it records its hash but holds no
             // content until expanded with `get`, so it stays owner-only — the
-            // worker mustn't read what it hasn't fetched.
+            // worker mustn't read what it hasn't fetched. A commit entry (a
+            // gitlink, e.g. a commit-valued arg) is a file placeholder whose
+            // kind can't be implied by shape, so it's kind-tagged.
             let placeholder_mode = if entry.mode.is_tree() {
                 std::fs::create_dir(&child)
                     .map_err(|e| format!("creating {}: {e}", child.display()))?;
@@ -893,6 +935,10 @@ fn write_tree(
                 MODE_PLACEHOLDER_FILE
             };
             set_hash(&child, entry.oid.to_string().as_bytes())?;
+            if entry.mode.kind() == EntryKind::Commit {
+                xattr::set(&child, KIND_XATTR, b"commit")
+                    .map_err(|e| format!("setting {KIND_XATTR} on {}: {e}", child.display()))?;
+            }
             set_mode(&child, placeholder_mode)?;
         }
         // The tree itself *was* fetched (its entries are now visible), so make it
@@ -904,9 +950,10 @@ fn write_tree(
 
 /// Record a result as a typed, tagged placeholder at `target`, fetching nothing:
 /// an empty directory for a tree, an empty file for a blob, tagged with `hash` and
-/// owner-only (the placeholder mode). A `promise` — the continuation `caos map-then`
-/// records at `/cas/out` — is a file placeholder additionally tagged with its
-/// kind ([`KIND_XATTR`]), since a promise's shape can't imply it.
+/// owner-only (the placeholder mode). A `promise` (the continuation
+/// `caos map-then`/`run-then` records at `/cas/out`) or a `commit` (a minted
+/// commit, see [`put_commit`]) is a file placeholder additionally tagged with
+/// its kind ([`KIND_XATTR`]), since neither's shape can imply it.
 fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String> {
     atomically(target, |tmp| {
         let mode = match kind {
@@ -919,10 +966,10 @@ fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String
                     .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
                 MODE_PLACEHOLDER_FILE
             }
-            "promise" => {
+            "promise" | "commit" => {
                 std::fs::File::create(tmp)
                     .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
-                xattr::set(tmp, KIND_XATTR, b"promise")
+                xattr::set(tmp, KIND_XATTR, kind.as_bytes())
                     .map_err(|e| format!("setting {KIND_XATTR} on {}: {e}", tmp.display()))?;
                 MODE_PLACEHOLDER_FILE
             }
@@ -1128,6 +1175,41 @@ pub fn put(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String> {
     fetch_and_materialize(t, &target, &oid.to_string())
 }
 
+/// `put-commit <src-file> <cas-path>` — store `<src-file>`'s bytes as a git
+/// **commit** object and record it at `<cas-path>` (a direct child of the CAS,
+/// kind-tagged `commit`), printing the commit's hash. The file must hold a
+/// valid raw commit — `tree <hash>`, `parent <hash>`*, `author`/`committer`
+/// lines, a blank line, the message — validated here (and again server-side).
+/// This is how a worker *mints* a commit: write one at `/cas/out` to return
+/// `commit <hash>` as the run's result, or at a fresh path to reference from
+/// further calls (it's a commit-typed path, so `--name:@=` and `:commit=` args
+/// both carry it as a gitlink).
+pub fn put_commit(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String> {
+    let cas = cas_dir();
+    let target = validate_target(&cas, dst)?;
+    probe_xattr(&cas)?;
+
+    let bytes = std::fs::read(src).map_err(|e| format!("{src}: {e}"))?;
+    gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
+        .map_err(|e| format!("{src} is not a valid commit: {e}"))?;
+    let oid = post_object(t, "commit", &bytes)?;
+    write_placeholder(&target, "commit", &oid.to_string())?;
+    // The minted commit's hash — the caller's handle (e.g. the next parent).
+    println!("{oid}");
+    Ok(())
+}
+
+/// `hash <path>` — print the git hash recorded on a CAS path. The setuid route
+/// to a path's identity: a worker minting a commit needs its parent's *hash*
+/// (for the `parent` line), and an unfetched placeholder's xattr is unreadable
+/// to the unprivileged worker directly.
+pub fn cas_hash(path: &str) -> Result<(), String> {
+    let cas = cas_dir();
+    let target = validate_descendant(&cas, path)?;
+    println!("{}", read_hash(&target)?);
+    Ok(())
+}
+
 /// Recursively store `path` via the transport, returning the git tree entry
 /// (mode + oid) that refers to it. `cas_real` is the canonical CAS root, used to
 /// reuse the recorded hash of a symlink that resolves into the CAS; pass `None`
@@ -1189,13 +1271,17 @@ fn store(
 
 /// Tree entry referencing an existing CAS object at `canon` (already
 /// canonicalized and known to be inside the CAS root): reuse the hash recorded
-/// there rather than re-reading content, with the mode following whether it's a
-/// directory. Shared by `store` (symlinks into the CAS) and `build_arg_entries`
-/// (CAS-path arg values).
+/// there rather than re-reading content, with the mode following its shape — a
+/// directory is a tree, a file a blob, unless a [`KIND_XATTR`] says otherwise
+/// (a commit-valued path becomes a gitlink entry, so a commit passes through
+/// args without being mistaken for a blob). Shared by `store` (symlinks into
+/// the CAS) and `build_arg_entries` (CAS-path arg values).
 fn cas_entry(canon: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
     use gix::objs::tree::EntryKind;
     let kind = if canon.is_dir() {
         EntryKind::Tree
+    } else if result_kind(canon)? == "commit" {
+        EntryKind::Commit
     } else {
         EntryKind::Blob
     };
@@ -1430,7 +1516,9 @@ fn scratch_dir() -> Result<PathBuf, String> {
 /// * `--name:@=path` elsewhere — a host path, ingested via the transport (the git
 ///   transport ingests it from the working repo, and only if git tracks it — see
 ///   [`GitTransport::ingest_path`]); a worker has no host filesystem, so this is
-///   an error there.
+///   an error there;
+/// * `--name:commit=value` — a commit, passed unpeeled as a gitlink entry (see
+///   [`resolve_commit_arg`]).
 fn build_arg_entries(
     t: &dyn Transport,
     cas: Option<&Path>,
@@ -1476,6 +1564,11 @@ fn build_arg_entries(
             ArgValue::Path(p) => t.ingest_path(p)?.ok_or_else(|| {
                 format!("`{name}`: {p:?} is a host path, but this client only reads /cas paths")
             })?,
+            // `--name:commit=value` — a commit, unpeeled, as a gitlink entry.
+            ArgValue::Commit(v) => (
+                EntryKind::Commit.into(),
+                resolve_commit_arg(t, cas, v).map_err(|e| format!("`{name}`: {e}"))?,
+            ),
         };
 
         entries.push(Entry {
@@ -1488,20 +1581,80 @@ fn build_arg_entries(
     Ok(entries)
 }
 
+/// Resolve a `--name:commit=value` argument to a commit id — the explicit,
+/// **unpeeled** form (the default resolutions peel a commit to its tree, e.g.
+/// [`resolve_ref`], which image refs depend on; a commit-typed arg must stay a
+/// commit). Accepted values:
+///
+/// * a bare commit hash — verified to name a commit (both clients);
+/// * a `/cas` path recorded as a commit (worker) — e.g. a commit-valued arg or
+///   a freshly minted [`put_commit`] result, passed on by reference;
+/// * anything else on the CLI — a revspec (`HEAD`, a branch, …) resolved in the
+///   working repo via [`Transport::resolve_revspec`].
+///
+/// The commit rides in the args tree as a *gitlink* entry (mode 160000), which
+/// git's reachability does **not** traverse — so unlike every other arg it is
+/// not carried by the request's own push. `ensure_pushed` ships the commit's
+/// closure separately (a no-op on the worker's HTTP transport, where the object
+/// is already server-side).
+fn resolve_commit_arg(
+    t: &dyn Transport,
+    cas: Option<&Path>,
+    value: &str,
+) -> Result<gix::ObjectId, String> {
+    let oid = if is_hex_hash(value) {
+        let (kind, _) = t.get_object(value)?;
+        if kind != "commit" {
+            return Err(format!("{value} is a {kind}, not a commit"));
+        }
+        parse_oid(value)?
+    } else if cas.is_some_and(|c| Path::new(value).starts_with(c)) {
+        let cas = cas.expect("checked is_some_and above");
+        let canon = Path::new(value)
+            .canonicalize()
+            .map_err(|e| format!("{value}: {e}"))?;
+        let cas_real = cas
+            .canonicalize()
+            .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+        if !canon.starts_with(&cas_real) {
+            return Err(format!("{value} resolves outside {}", cas.display()));
+        }
+        let kind = result_kind(&canon)?;
+        if kind != "commit" {
+            return Err(format!("{value} is recorded as a {kind}, not a commit"));
+        }
+        parse_oid(&read_hash(&canon)?)?
+    } else {
+        t.resolve_revspec(value)?.ok_or_else(|| {
+            format!("{value:?} is not a commit hash or /cas path (a worker has no repo to resolve a revspec against)")
+        })?
+    };
+    // Gitlinks aren't reachability-traversed, so push the commit's own closure.
+    t.ensure_pushed(&oid.to_string())?;
+    Ok(oid)
+}
+
 /// A parsed `--name[:type]=value` argument value. The type marker lives in the
 /// operator, not the value, so the value is unconstrained (it may start with
-/// anything, no escaping). Bare `=` is a literal; `:@=` marks a path. The grammar
+/// anything, no escaping). Bare `=` is a literal; `:@=` marks a path; `:commit=`
+/// marks a commit. The grammar
 /// is extensible — a new type adds a variant here and a case in [`parse_kv`].
 enum ArgValue<'a> {
     /// `--name=value` — the value verbatim, stored as a blob.
     Literal(&'a str),
     /// `--name:@=path` — the value names a filesystem path to resolve/ingest.
     Path(&'a str),
+    /// `--name:commit=value` — the value names a *commit*, passed **unpeeled**
+    /// as a gitlink entry: a commit hash, a `/cas` path recorded as a commit
+    /// (worker), or a revspec like `HEAD` (CLI). The explicit opt-in exists
+    /// because the default forms peel commits to trees (which image refs rely
+    /// on); see [`resolve_commit_arg`].
+    Commit(&'a str),
 }
 
 /// Split a `--name[:type]=value` argument into its name and typed value,
 /// validating that the name is a single path component (it becomes a tree-entry
-/// filename). The only type is `@` (a path); bare is a literal.
+/// filename). The types are `@` (a path) and `commit`; bare is a literal.
 fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
     let body = kv
         .strip_prefix("--")
@@ -1513,10 +1666,11 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
     let (name, value) = match key.split_once(':') {
         None => (key, ArgValue::Literal(value)),
         Some((name, "@")) => (name, ArgValue::Path(value)),
+        Some((name, "commit")) => (name, ArgValue::Commit(value)),
         Some((_, ty)) => {
             return Err(format!(
-                "unknown argument type {ty:?} in {kv:?}; use --name=value (literal) \
-                 or --name:@=value (path)"
+                "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
+                 --name:@=value (path), or --name:commit=value (commit)"
             ))
         }
     };
@@ -1683,6 +1837,9 @@ fn record_continuation(
         let image = match value {
             ArgValue::Literal(v) => v,
             ArgValue::Path(p) => p,
+            ArgValue::Commit(_) => {
+                return Err(format!("--{name} names an image, not a commit"));
+            }
         };
         let resolved = resolve_run_image(&cas, image)?;
         entries.push(Entry {
@@ -1705,7 +1862,10 @@ fn record_continuation(
 /// trailing newline added when stdout is a terminal and the bytes don't already
 /// end in one, so the shell prompt lands on its own line without corrupting a
 /// pipe or redirect. A tree has no single stream to print, so an output path is
-/// required for one. There
+/// required for one. A `commit` result behaves like a file whose bytes are the
+/// raw commit object (headers, blank line, message) — streamed or written to
+/// `<output>` as such; fetch the real object by hash (`git fetch caos <hash>`)
+/// when you want the commit itself. There
 /// is no `/cas` here: path-valued args are host paths the transport ingests, and
 /// `<image>` is a `docker://` ref, a bare hash, or a `/cas/std/<name>` builtin
 /// (resolved against the published library).

@@ -181,6 +181,78 @@ fn caos_capture(args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("caos {} stdout not UTF-8: {e}", args.join(" ")))
 }
 
+/// A parsed git commit, as a worker sees one: the tree it snapshots, its
+/// parents, and its message. In caos a commit is a first-class value — e.g. an
+/// agent conversation head, where the message is a turn's text, the tree the
+/// workspace state, and the parent the previous turn.
+pub struct Commit {
+    pub tree: String,
+    pub parents: Vec<String>,
+    pub message: String,
+}
+
+/// The git hash recorded on a CAS path (`caos hash`) — e.g. a commit-valued
+/// arg's own id, which becomes the `parent` of the commit minted from it.
+pub fn cas_hash(cas_path: &str) -> Result<String, String> {
+    caos_capture(&["hash", cas_path])
+}
+
+/// Fetch and parse the commit at a CAS path (e.g. a `--name:commit=` arg, which
+/// materializes as a file holding the raw commit object). Walk the history by
+/// hash from here: `caos get-hash <commit.tree> <path>` for the snapshot,
+/// `get-hash` on a parent for the previous commit.
+pub fn read_commit(cas_path: &str) -> Result<Commit, String> {
+    caos(["get", cas_path])?;
+    let text = fs::read_to_string(cas_path).map_err(|e| format!("reading {cas_path}: {e}"))?;
+    parse_commit(&text)
+}
+
+/// Mint a commit — `{tree, parents, message}` — record it at `out` (usually
+/// `/cas/out`, making `commit <hash>` this worker's result), and return its
+/// hash. The author/committer identity and timestamp are fixed, so a commit is
+/// a pure value: its hash depends only on the tree, parents, and message.
+pub fn write_commit(
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    out: &str,
+) -> Result<String, String> {
+    let mut text = format!("tree {tree}\n");
+    for parent in parents {
+        text += &format!("parent {parent}\n");
+    }
+    text += "author caos <caos@caos> 0 +0000\ncommitter caos <caos@caos> 0 +0000\n\n";
+    text += message;
+    if !message.ends_with('\n') {
+        text.push('\n');
+    }
+    let file = scratch("commit")?.join("commit");
+    fs::write(&file, text).map_err(|e| format!("writing {}: {e}", file.display()))?;
+    caos_capture(&["put-commit", path(&file), out])
+}
+
+/// Parse a raw commit object: header lines (`tree`, `parent`, identity — which
+/// we don't surface) up to the first blank line, then the message.
+fn parse_commit(text: &str) -> Result<Commit, String> {
+    let (headers, message) = text
+        .split_once("\n\n")
+        .ok_or_else(|| format!("malformed commit (no blank line): {text:?}"))?;
+    let mut tree = None;
+    let mut parents = Vec::new();
+    for line in headers.lines() {
+        if let Some(hash) = line.strip_prefix("tree ") {
+            tree = Some(hash.to_string());
+        } else if let Some(hash) = line.strip_prefix("parent ") {
+            parents.push(hash.to_string());
+        }
+    }
+    Ok(Commit {
+        tree: tree.ok_or_else(|| format!("commit has no tree line: {text:?}"))?,
+        parents,
+        message: message.to_string(),
+    })
+}
+
 /// Fetch and read a blob argument as a trimmed string.
 pub fn read_arg(name: &str) -> Result<String, String> {
     caos(["get", &arg(name)])?;
