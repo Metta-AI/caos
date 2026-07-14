@@ -262,7 +262,8 @@ logic — the difference is the **transport** and the privilege model.
 - **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
   provides the container `runner`. It's installed **setuid-root** in
   worker images so an unprivileged worker can reach the root-owned `/cas` only
-  through it. Subcommands: `get-hash`, `get`, `put`, `map-then`, `run-then`,
+  through it. Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`,
+  `map-then`, `run-then`,
   `curry`, `runner`. Its `map-then`/`run-then` are *tail calls* — they record a
   continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
@@ -377,10 +378,17 @@ escaping):
       `git stash`/`commit` use;
     - **untracked, or outside the worktree** → an error;
   - a **missing** path is an error, not silently a literal.
+- `--name:commit=value` → a **commit**, passed *unpeeled* as a gitlink entry
+  (the default forms peel commits to trees, which image refs depend on). The
+  value is a bare commit hash, a `/cas` path recorded as a commit (worker), or
+  a revspec like `HEAD` resolved in the working repo (caos-cli). Inside a
+  worker a commit is a file holding the raw commit object; `caos put-commit`
+  mints one (at `/cas/out` it makes `commit <hash>` the run's result). See
+  `design/commits.md`.
 
-The grammar is `--name[:type]=value` and extensible: `@` (path) is the only type
-today, leaving room for more. The worker `caos` has no host filesystem (only
-`/cas`), so a non-`/cas` path there is an error.
+The grammar is `--name[:type]=value` and extensible: `@` (path) and `commit`
+are the types today, leaving room for more. The worker `caos` has no host
+filesystem (only `/cas`), so a non-`/cas` path there is an error.
 
 ### Other subcommands
 
