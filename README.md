@@ -38,6 +38,8 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
 | `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
+| `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, bin)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
+| `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
 
 ## Prerequisites
 
