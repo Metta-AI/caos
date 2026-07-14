@@ -1,11 +1,11 @@
 # Agent harness: conversations as commit chains — design note
 
-**Status:** steps 1–4 implemented — run-then + first-class commits, the
-bounded bash tool (`crates/worker-bash-tool`), and the llm-step driver
-(`crates/worker-llm-step`); `caos-cli chat` (step 5) remains. Builds on
-map-then (`map-then.md`). Where this note and the code diverged during
-implementation, the note has been updated to match the code; the deltas are
-called out inline.
+**Status:** steps 1–5 implemented — run-then + first-class commits, the
+bounded bash tool (`crates/worker-bash-tool`), the llm-step driver
+(`crates/worker-llm-step`), and the chat client (`caos-cli chat`,
+`crates/caos/src/chat.rs`). Builds on map-then (`map-then.md`). Where this
+note and the code diverged during implementation, the note has been updated
+to match the code; the deltas are called out inline.
 
 ## Idea
 
@@ -207,18 +207,37 @@ valid conversation state a future resume could start from.
 
 ## Client
 
-`caos-cli chat <conversation>`: create the human commit → request the run →
-hang, printing progress from the ref → on completion advance
-`refs/caos/conversations/<name>` and print the response. Conversation
-identity is that ref — the only mutable thing, owned by the client.
+`caos-cli chat <name> [-m <message>]` (implemented — `crates/caos/src/chat.rs`,
+tested end-to-end against the stub in `tests/chat`): one turn per invocation.
+It creates the human commit → requests the run → hangs, printing progress from
+the ref → on completion advances `refs/caos/conversations/<name>` (in the
+*local* repo) and prints the response text and short hash. Conversation
+identity is that ref — the only mutable thing, owned by the client. The
+message comes from `-m` or stdin; further flags: `--base <revspec>` (a new
+conversation's base commit, default `HEAD` — refused if its tree carries a
+top-level `.caos`), `--system <text>` / `--system-file <path>` (default: a
+short coding-agent prompt), `--model`, `--base-url`, and `--log` (print the
+conversation so far — the first-parent walk — and run nothing). The API key
+comes only from `$ANTHROPIC_API_KEY` (checked before anything is minted), and
+the worker binaries ride as `--llm-step-bin`/`--bash-tool-bin` (or
+`$CAOS_LLM_STEP_BIN`/`$CAOS_BASH_TOOL_BIN`) — git-tracked paths curried onto
+`/cas/std/runner`, exactly as the tests do.
 
-Notes for the implementation (what the workers already assume): the human
-commit is an ordinary git commit (any author *except* `caos-agent`) whose
-message is the user's text, first parent the previous turn (or the base);
-the run is `llm-step` with `--head:commit=<that commit>` plus the curried
-config above; the run's result is the raw turn-commit bytes (hash it with
-`git hash-object -t commit` and fetch it from the `caos` remote). The tests
-(`tests/llm-step/cli.sh`) are a working reference client.
+Implementation notes (what the workers assume): the human commit is an
+ordinary git commit (any author *except* `caos-agent` — enforced) whose
+message is the user's text, first parent the previous turn (or the base),
+tree the parent's tree (human turns are text-only for now); the run is
+`llm-step` with `--head:commit=<that commit>` plus the curried config above
+(the `:commit=` machinery pushes the commit's closure). While the run blocks
+— on its own thread; `/run` returns `commit <hash>` directly — the client
+polls the progress ref every 2s (`ls-remote` for the tip, the `/object` API
+for the step commits, so nothing mid-turn lands in the local repo) and prints
+each new step's text blocks and `$ <cmd>` tool-call lines; a chain that roots
+at some other human commit is a stale ref and prints nothing. On success the
+turn commit is fetched (bringing the whole step chain — it's tree-reachable)
+and the ref advances; on failure the error prints and the ref is untouched —
+the human commit is harmlessly orphaned. `tests/llm-step/smoke.sh` runs one
+tiny real-API turn (skipped unless `ANTHROPIC_API_KEY` is set).
 
 ## Caching / retry semantics
 
@@ -243,4 +262,6 @@ deadlines are comfortable; the top-level pending timeout
 4. llm-step worker (API call, step commits, run-then chaining, turn merge,
    progress ref push). **Done** (`crates/worker-llm-step`,
    `tests/llm-step` — end-to-end against a scripted stub API).
-5. `caos-cli chat`
+5. `caos-cli chat` (human commits, conversation ref, progress printing).
+   **Done** (`crates/caos/src/chat.rs`, `tests/chat`; real-key smoke:
+   `tests/llm-step/smoke.sh`).
