@@ -1,16 +1,36 @@
 # caos
 
-Content-addressed storage and compute over git objects. A worker is just a
-container that reads inputs from a content-addressed store (CAS), writes a
-result back, and is addressed — inputs, image, and output — entirely by git
-hashes. Computations are pure functions of their inputs, so results are
-memoized; trees are real git objects, so unchanged data is shared and transfers
-are incremental.
+Caos is a Content-Addressable Operating System. It's functional programming with git as the values and docker as the
+functions, cached by redis
 
-It's a Cargo workspace of small static Rust binaries, each packaged into a
-minimal Docker image with Nix, and wired together for local dev with Tilt. The
-whole environment — toolchain, builds, images — is defined by the Nix flake, so
-it's reproducible across machines.
+# Why?
+
+## Security
+
+Every package in your supply chain, and your agent, runs with full access to your computer (by default) and the auth tokens to that allow you to interact with github and many other services
+
+Caos runs all of these pieces in separate containers, with just the permissions that they need
+
+## Performance
+
+Today, when you or an agent make a change, you clone the repo or make a new worktree, then edit a file. You build and test everything. Unless you use bazel, it doesn't matter that the CI server has built and tested most of this already. You do it again, unless (maybe) you have a cache from a different worktree. When you push your code, the CI server checks it all out and builds and tests it all again. Or it copies a large cache file, that often isn't quite the right version, and still builds and tests more than you needed
+
+Caos breaks building and testing into small pieces and caches the results. When you build and test, we never materialize the whole tree
+
+## Location independence
+
+Today, most people run most of their agent workloads on their local machine for convenience. When the work no longer fits, they buy a desktop and try to interact with it over tmux. If the work grows further, they have to split it up between cloud instances. If an agent wants to spin up subagents on other computers, it gets even more annoying
+
+Caos runs work well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers
+
+# What
+
+* Your code is already in git. You already know docker
+* Caos provides to glue to use git as a distributed file system and docker containers as functions. We cache the results in redis
+* Workers (containers) receive their inputs as git objects, and lazily load only as much as they need. They stage their results into git. None of this is committed or clogs your main git repo
+* Workers can call other workers. They can also define other workers in their git return values (similar to functional programming)
+* Once we've run a worker with an input, we cache the mapping to the output value and reuse it for future requests
+
 
 | Crate | Binaries / image | What it is |
 |---|---|---|
