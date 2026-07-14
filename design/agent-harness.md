@@ -1,7 +1,11 @@
 # Agent harness: conversations as commit chains — design note
 
-**Status:** design agreed, prerequisites in progress (run-then + first-class
-commits, on a worktree branch). Builds on map-then (`map-then.md`).
+**Status:** steps 1–4 implemented — run-then + first-class commits, the
+bounded bash tool (`crates/worker-bash-tool`), and the llm-step driver
+(`crates/worker-llm-step`); `caos-cli chat` (step 5) remains. Builds on
+map-then (`map-then.md`). Where this note and the code diverged during
+implementation, the note has been updated to match the code; the deltas are
+called out inline.
 
 ## Idea
 
@@ -28,14 +32,42 @@ Two kinds of commits, one conversation spine:
 
 - **Human turn** — created client-side, no run needed. Parent = conversation
   head; tree = workspace (with any human edits); message = the human's text.
-- **Step commit** (internal) — one LLM API round + its tool results. Chain of
-  steps hangs off the turn. Tree = workspace **plus a reserved top-level
-  `.caos/step.json`** holding the raw API request/response blocks for the
-  round (verbatim — the API requires replaying assistant blocks, including
-  thinking-block signatures, unmodified).
+- **Step commit** (internal) — one LLM API round. The chain of steps hangs
+  off the human turn (step 1's parent is the human commit; each next step's
+  parent the previous step). Tree = workspace **plus a reserved top-level
+  `.caos/step.json`** (format below) holding that round's verbatim response
+  blocks — the API requires replaying assistant blocks, including
+  thinking-block signatures, unmodified — plus the `tool_result` blocks the
+  round's *request* carried.
 - **Turn commit (agent)** — a **merge**: first parent = the human turn,
-  second parent = the last step commit. Tree = final workspace with `.caos/`
-  dropped (pure). Message = the response text.
+  second parent = the last step commit — or, for a turn that used no tools at
+  all, a plain single-parent commit (no steps exist). Tree = final workspace
+  with `.caos/` dropped (pure). Message = the response text.
+
+Step and turn commits are authored **`caos-agent <caos@caos>`** with real
+wall-clock timestamps (so a retried turn is a distinct commit); that author
+name is also how the transcript walk recognizes an agent turn — walking the
+first-parent spine down from a human turn, a `caos-agent` parent is the
+previous turn's merge and anything else is the conversation's base commit.
+
+**`.caos/step.json`** (defined here; the tests pin it):
+
+```json
+{
+  "content": [ ...this round's response content blocks, verbatim... ],
+  "results": [ ...the tool_result blocks this round's REQUEST carried... ],
+  "v": 1
+}
+```
+
+`results` answers the *previous* step's tool calls (`[]` for a turn's first
+round) — a step commit is minted the moment its API round returns, before its
+own calls have run, so their results land in the *next* step. To keep the
+last round's results and final response blocks tree-reachable, the end_turn
+round of a turn that used tools **also mints a (final) step commit**; the
+turn merge's second parent is that step. (A delta from the first draft, which
+minted steps only for tool-call rounds and would have dropped the last
+tool_results from the tree.)
 
 So `git log --first-parent` is the clean conversation; following second
 parents gives the full transcript with stock git tooling. All step data is
@@ -50,20 +82,41 @@ already contains one.
 
 ## The step loop
 
-`llm-step` worker input: conversation head (commit) + curried
-`{api key, model, system prompt, tool registry}`. It fetches the chain lazily,
-rebuilds the API request from the step transcripts, POSTs `/v1/messages`, then:
+`llm-step` worker arguments (as implemented; the worker itself ships as
+`curry(runner, bin=worker-llm-step)` in the shared runner pool, not as its
+own image):
 
-- **No tool calls** → mint the turn merge commit, return `commit <hash>`.
+- `head:commit=` — the human-turn commit to answer (the conversation head);
+- curried config: `api_key`, `system` (the system prompt), `bash_image` (the
+  tool registry — just bash for now, an image ref), and optionally `model`
+  (default `claude-opus-4-8`), `base_url` (default
+  `https://api.anthropic.com`; tests point it at a stub), `conversation`
+  (names the progress ref);
+- continuation state, curried by the worker itself between tool calls:
+  `step:commit=` (the newest step commit), `pending` / `results` (JSON arrays
+  of the remaining `tool_use` blocks and the collected `tool_result` blocks),
+  `current_id` (the in-flight call's id) — plus the `in`/`result` args the
+  run-then resolution itself supplies.
+
+It fetches the chain lazily, rebuilds the API request from the step
+transcripts (each prior agent turn replays as its steps' `results`/`content`
+messages; a toolless turn as its message text), POSTs `/v1/messages`, then:
+
+- **No tool calls** (`stop_reason: end_turn`) → mint the final step commit
+  (only if the turn used tools — see "Commit structure"), then the turn
+  commit; `commit <hash>` is the run's result.
 - **Tool calls** → mint a step commit, then execute the calls **serially
   without re-calling the LLM** via run-then: emit
-  `{in: <call 1 args>, run: <tool image>, then: curry(self,
-  {conversation: <step commit>, pending: [calls 2..N], results: [...]})}`
+  `{in: {tree, cmd, paths}, run: <bash image>, then: curry(self,
+  {step: <step commit>, pending: [calls 2..N], results: [...], …config})}`
   and exit. Each continuation pops the next pending call; when the queue is
   empty, all `tool_result` blocks go back in a single user message (required
-  by the API) and the next LLM round fires. No dispatcher worker — the step
-  worker knows each tool's image. Parallel map-then execution of read-only
-  tools is a later optimization.
+  by the API) and the next LLM round fires. A non-zero exit marks its
+  tool_result `is_error`. No dispatcher worker — the step worker knows each
+  tool's image. Parallel map-then execution of read-only tools is a later
+  optimization.
+- Any other `stop_reason` (`max_tokens`, refusal, …) → the run errors with a
+  clear message; the turn fails (prototype behavior).
 
 Tool classes:
 
@@ -72,20 +125,31 @@ Tool classes:
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
   includes the workspace tree **with `.caos/` stripped** — tools never see
   transcripts, and tool cache keys stay identical to real workspace trees.
-  No network in tool images; only the llm-step image has egress.
+  No network in tool images; only the llm-step image has egress. (Not yet
+  enforced: both workers currently run as `curry(runner, bin)` in the shared
+  runner pool, whose containers all sit on the compute network — a per-image
+  egress fence is future work.)
 
 **The whole tree is never materialized — by any tool, ever.** No FUSE, no
 "fetch everything" escape hatch. Every tool is either *bounded* or
 *decomposed*:
 
-- **bash** (bounded): `{tree, cmd, paths}` → `{stdout tail, exit code,
-  tree}`. The worker recursively fetches only the declared `paths`. A
-  command touching an undeclared path hits a placeholder (owner-only,
-  worker unprivileged) → loud EACCES; the wrapper turns permission-denied
-  paths in stderr into a structured retry hint. Staging the result skips
-  placeholders — untouched subtrees round-trip by their recorded hash.
+- **bash** (bounded, `crates/worker-bash-tool`): input `{tree, cmd, paths}`
+  (one `in` tree from run-then, or direct `--tree`/`--cmd`/`--paths` args;
+  `paths` newline-separated) → a result tree
+  `{exit, stdout, stderr, denied?, tree}`: the exit code (decimal;
+  128+signal), 100KB tails of both streams, and the staged workspace. The
+  worker fetches each declared path's ancestors one level and the leaf
+  recursively, then runs `cmd` via `/bin/sh -c` in a *mirror* of the
+  workspace: loaded content as writable copies, every undeclared entry a
+  symlink to its owner-only `/cas` placeholder (worker unprivileged) → loud
+  EACCES; permission-denied paths found in stderr that resolve through a
+  placeholder come back in `denied`, one per line — the structured "retry
+  with them in `paths`" hint. Staging resolves the placeholder symlinks back
+  to their recorded hashes, so untouched subtrees round-trip without a read.
   (No hard materialization budget for now; enforcement can come later if
-  models abuse `paths`.)
+  models abuse `paths`. Known limitation: CAS blobs materialize without
+  git's exec bit, so declared files round-trip as mode 100644.)
 - **grep** (decomposed): an rgrep worker on the file-count model — on a
   tree, emit `{in, map: curry(self, pattern), then: curry(self, pattern)}`
   and exit; on a blob, fetch just it and grep; in the then position, prefix
@@ -101,9 +165,10 @@ tool surface models are trained on), the EACCES hint, and the budget error —
 all failure modes redirect loudly to the right tool.
 
 **Tool failures are values, not errors.** A failing command (`exit 1`,
-compile error) is a normal result — `{exit, stderr tail, tree}` — returned
-to the model as a tool result so it can react. Only infrastructure failures
-(object fetch failed, container died) error the sub-run and fail the turn.
+compile error) is a normal result — the same `{exit, stdout, stderr, tree}`
+shape — returned to the model as a tool result (marked `is_error`) so it can
+react. Only infrastructure failures (object fetch failed, container died)
+error the sub-run and fail the turn.
 
 ## LLM API
 
@@ -122,10 +187,16 @@ and rides in job payloads; the runner-token auth is the fence.
 
 The step chain grows in real time. The step worker pushes
 `refs/caos/progress/<conversation>` to the server's existing smart-HTTP
-transport after each step; the client watches a turn by polling `git fetch`
-on that ref. No new progress API, no enabling change: the server sets
-`http.receivepack=true` on its repo at startup (`main.rs`), so push over
-smart-HTTP already works. (A stale comment in `git.rs` says otherwise.)
+transport after each step (when a `conversation` arg names one); the client
+watches a turn by polling `git fetch` on that ref. No new progress API, no
+enabling change: the server sets `http.receivepack=true` on its repo at
+startup (`main.rs`), so push over smart-HTTP already works. (A stale comment
+in `git.rs` says otherwise.) The worker image carries no `git`, so llm-step
+speaks the minimal receive-pack dialect itself (`progress.rs`): read the old
+value from the ref advertisement, send one update command plus the constant
+*empty* packfile — every object the ref needs already reached the server via
+`/object` as the worker built it. The push is best-effort: a failure warns
+and the turn continues (observability, not correctness).
 
 The ref is also what makes step commits *discoverable at all*: until the
 turn completes, steps are unreferenced objects known only by hash. And it
@@ -141,6 +212,14 @@ hang, printing progress from the ref → on completion advance
 `refs/caos/conversations/<name>` and print the response. Conversation
 identity is that ref — the only mutable thing, owned by the client.
 
+Notes for the implementation (what the workers already assume): the human
+commit is an ordinary git commit (any author *except* `caos-agent`) whose
+message is the user's text, first parent the previous turn (or the base);
+the run is `llm-step` with `--head:commit=<that commit>` plus the curried
+config above; the run's result is the raw turn-commit bytes (hash it with
+`git hash-object -t commit` and fetch it from the `caos` remote). The tests
+(`tests/llm-step/cli.sh`) are a working reference client.
+
 ## Caching / retry semantics
 
 LLM steps are nondeterministic and effectively never cache-hit (unique
@@ -151,18 +230,17 @@ the cost is accepted for the prototype. A step is one API round, so per-job
 deadlines are comfortable; the top-level pending timeout
 (`CAOS_PENDING_TIMEOUT_SECS`) must be generous for whole-turn runs.
 
-## Prerequisites (in progress)
+## Build order
 
 1. **run-then** — single-valued map-then: continuation `{in, map?, run?,
    then?}` (map/run mutually exclusive); `run(--in)` → R; `then(--in,
-   --result=R)`; no then → R.
+   --result=R)`; no then → R. **Done** (`tests/run-then`).
 2. **First-class commits** — `commit` storage kind, `commit <hash>` result
    kind (gitlink tree entries), opt-in unpeeled commit args, worker helpers
-   to read/write commits.
-
-## Build order after prerequisites
-
-3. bash tool worker
+   to read/write commits. **Done** (`tests/commit`).
+3. bash tool worker. **Done** (`crates/worker-bash-tool`,
+   `tests/bash-tool`).
 4. llm-step worker (API call, step commits, run-then chaining, turn merge,
-   progress ref push)
+   progress ref push). **Done** (`crates/worker-llm-step`,
+   `tests/llm-step` — end-to-end against a scripted stub API).
 5. `caos-cli chat`
