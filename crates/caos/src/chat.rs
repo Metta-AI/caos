@@ -1,20 +1,26 @@
-//! `caos-cli chat` — the user-facing conversation client (see
+//! `caos-cli talk` / `chat` — the user-facing conversation client (see
 //! design/agent-harness.md, "Client").
 //!
-//! One invocation is one turn: mint the human-turn commit (parent = the
-//! conversation head, or the base for a new conversation; tree = the parent's
-//! tree — human turns are text-only for now), hand it to an `llm-step` run,
-//! watch the turn's progress ref while the run blocks, and on success advance
+//! One turn: mint the human-turn commit (parent = the conversation head, or
+//! the base for a new conversation; tree = the parent's tree — human turns
+//! are text-only for now), hand it to an `llm-step` run, watch the turn's
+//! progress ref while the run blocks, and on success advance
 //! `refs/caos/conversations/<name>` to the returned turn commit. Conversation
 //! identity is that ref — the only mutable thing, owned by this client. On a
 //! failed run the ref is untouched; the minted human commit is harmlessly
 //! orphaned.
 //!
-//! The worker binaries (`worker-llm-step`, `worker-bash-tool`) are static
-//! binaries curried onto the shared `/cas/std/runner` pool image, exactly as
-//! the llm-step tests do; `chat` needs their paths (git-tracked, like every
-//! ingested path) via `--llm-step-bin`/`--bash-tool-bin` or the corresponding
-//! env vars.
+//! `talk` is the everyday surface: the positional argument is the prompt, the
+//! conversation defaults to the repo's most recently used one (`--new` starts
+//! another), and with no prompt on a terminal it loops, one turn per line.
+//! `chat <name>` is the explicit, scriptable form of the same turn.
+//!
+//! The workers run as `curry(runner, bin=<static binary>)` on the shared
+//! runner pool. By default both come ready-made from the published library
+//! (`/cas/std/bash-tool`, `/cas/std/llm-step` — see build-builtins.sh), so
+//! there is nothing to build or commit locally; `--llm-step-bin` /
+//! `--bash-tool-bin` (or the env vars) override with a local, git-tracked
+//! binary — the stub tests' path.
 
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
@@ -45,8 +51,17 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const LLM_STEP_BIN_ENV: &str = "CAOS_LLM_STEP_BIN";
 const BASH_TOOL_BIN_ENV: &str = "CAOS_BASH_TOOL_BIN";
 
-/// The std builtin the worker binaries run under (`curry(runner, bin=...)`).
+/// The std builtin the worker binaries run under (`curry(runner, bin=...)`),
+/// used when a `--*-bin` override supplies the binary.
 const RUNNER_IMAGE: &str = "/cas/std/runner";
+
+/// The std-published, ready-to-run worker curries (build-builtins.sh) — the
+/// defaults when no `--*-bin` override is given.
+const BASH_TOOL_IMAGE: &str = "/cas/std/bash-tool";
+const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
+
+/// Auto-named conversations (`talk` with no `-c`): `talk-1`, `talk-2`, …
+const AUTO_NAME_PREFIX: &str = "talk-";
 
 /// Default system prompt when neither `--system` nor `--system-file` is given.
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the bash \
@@ -56,10 +71,22 @@ const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspac
 /// Seconds between progress-ref polls while the run blocks.
 const POLL_SECS: u64 = 2;
 
-/// Parsed `chat` arguments (see [`chat_usage`]).
+/// Which verb is parsing: they share every flag, but the positional argument
+/// is the conversation *name* for `chat` and the *prompt* for `talk`.
+#[derive(PartialEq, Clone, Copy)]
+enum Verb {
+    Chat,
+    Talk,
+}
+
+/// Parsed `chat`/`talk` arguments (see [`usage`]).
 struct ChatArgs {
-    name: String,
+    /// `chat`'s positional / `talk`'s `-c`; `None` (talk only) = sticky pick.
+    name: Option<String>,
+    /// `-m` / `talk`'s positional; `None` = stdin, or the interactive loop.
     message: Option<String>,
+    /// `talk --new`: start a fresh conversation instead of continuing.
+    new_conv: bool,
     base: Option<String>,
     system: Option<String>,
     system_file: Option<String>,
@@ -70,21 +97,33 @@ struct ChatArgs {
     log: bool,
 }
 
-fn chat_usage() -> String {
-    "usage: chat <name> [-m <message>] [--base <revspec>] \
-     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>] \
-     [--llm-step-bin <path>] [--bash-tool-bin <path>] [--log]\n\
-     One turn per invocation; the message is read from stdin without -m. \
-     --log prints the conversation so far and runs nothing."
-        .to_string()
+fn usage(verb: Verb) -> String {
+    let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
+         [--model <model>] [--base-url <url>] [--llm-step-bin <path>] \
+         [--bash-tool-bin <path>] [--log]";
+    match verb {
+        Verb::Chat => format!(
+            "usage: chat <name> [-m <message>] {common}\n\
+             One turn per invocation; the message is read from stdin without -m. \
+             --log prints the conversation so far and runs nothing."
+        ),
+        Verb::Talk => format!(
+            "usage: talk [<prompt>] [-c <name>] [--new] {common}\n\
+             Continues this repo's most recent conversation (-c picks one, --new \
+             starts another). With no <prompt>: interactive on a terminal, one \
+             turn per line; otherwise the prompt is read from stdin. \
+             --log prints the conversation so far and runs nothing."
+        ),
+    }
 }
 
 impl ChatArgs {
-    fn parse(args: &[String]) -> Result<ChatArgs, String> {
+    fn parse(verb: Verb, args: &[String]) -> Result<ChatArgs, String> {
         let mut it = args.iter();
         let mut a = ChatArgs {
-            name: String::new(),
+            name: None,
             message: None,
+            new_conv: false,
             base: None,
             system: None,
             system_file: None,
@@ -94,15 +133,17 @@ impl ChatArgs {
             bash_tool_bin: None,
             log: false,
         };
-        let mut name: Option<String> = None;
+        let mut positional: Option<String> = None;
         while let Some(arg) = it.next() {
             let mut value = |flag: &str| {
                 it.next()
                     .cloned()
-                    .ok_or_else(|| format!("{flag} needs a value\n{}", chat_usage()))
+                    .ok_or_else(|| format!("{flag} needs a value\n{}", usage(verb)))
             };
             match arg.as_str() {
                 "-m" | "--message" => a.message = Some(value(arg)?),
+                "-c" | "--conversation" if verb == Verb::Talk => a.name = Some(value(arg)?),
+                "--new" if verb == Verb::Talk => a.new_conv = true,
                 "--base" => a.base = Some(value(arg)?),
                 "--system" => a.system = Some(value(arg)?),
                 "--system-file" => a.system_file = Some(value(arg)?),
@@ -112,18 +153,31 @@ impl ChatArgs {
                 "--bash-tool-bin" => a.bash_tool_bin = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
-                    return Err(format!("unknown chat option {other}\n{}", chat_usage()))
+                    return Err(format!("unknown option {other}\n{}", usage(verb)))
                 }
-                _ if name.is_none() => name = Some(arg.clone()),
+                _ if positional.is_none() => positional = Some(arg.clone()),
                 other => {
-                    return Err(format!(
-                        "chat takes one <name>, got an extra: {other}\n{}",
-                        chat_usage()
-                    ))
+                    let what = match verb {
+                        Verb::Chat => "chat takes one <name>",
+                        Verb::Talk => "talk takes one <prompt> (quote it)",
+                    };
+                    return Err(format!("{what}, got an extra: {other}\n{}", usage(verb)));
                 }
             }
         }
-        a.name = name.ok_or_else(chat_usage)?;
+        match verb {
+            Verb::Chat => a.name = Some(positional.ok_or_else(|| usage(verb))?),
+            Verb::Talk => match (positional, &a.message) {
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "the prompt was given both positionally and with -m\n{}",
+                        usage(verb)
+                    ))
+                }
+                (Some(p), None) => a.message = Some(p),
+                (None, _) => {}
+            },
+        }
         if a.system.is_some() && a.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
         }
@@ -131,30 +185,137 @@ impl ChatArgs {
     }
 }
 
-/// `chat <name> …` — see the module docs and [`chat_usage`].
+/// `chat <name> …` — the explicit, scriptable one-turn form; see [`usage`].
 pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
-    let a = ChatArgs::parse(args)?;
-    let refname = format!("{CONV_REF_PREFIX}{}", a.name);
-    // The name becomes two ref components (conversation + progress), so let git
-    // validate it up front.
-    git_capture(&["check-ref-format", &refname], None)
-        .map_err(|_| format!("invalid conversation name {:?}", a.name))?;
+    let a = ChatArgs::parse(Verb::Chat, args)?;
+    let name = a.name.clone().expect("chat parse requires a name");
+    let refname = validated_refname(&name)?;
     if a.log {
-        return print_log(&a.name, &refname);
+        return print_log(&name, &refname);
     }
-    turn(t, &a, &refname)
+    let message = read_message(a.message.as_deref())?;
+    turn(t, &a, &name, &refname, &message)
+}
+
+/// `talk [<prompt>] …` — the everyday surface; see [`usage`] and module docs.
+pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
+    let a = ChatArgs::parse(Verb::Talk, args)?;
+    let (name, fresh) = pick_conversation(&a)?;
+    let refname = validated_refname(&name)?;
+    if a.log {
+        return print_log(&name, &refname);
+    }
+    eprintln!(
+        "[conversation {name}{}]",
+        if fresh { " — new" } else { "" }
+    );
+    if let Some(prompt) = &a.message {
+        return turn(t, &a, &name, &refname, prompt);
+    }
+    if !std::io::stdin().is_terminal() {
+        // Piped input: the whole of stdin is one prompt, one turn.
+        let message = read_message(None)?;
+        return turn(t, &a, &name, &refname, &message);
+    }
+    // Interactive: one turn per line, until EOF (ctrl-d). A failed turn is
+    // reported but doesn't end the session — the ref wasn't advanced, so the
+    // next line simply retries from the same head.
+    loop {
+        eprint!("> ");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                eprintln!();
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("reading from the terminal: {e}")),
+        }
+        let message = line.trim();
+        if message.is_empty() {
+            continue;
+        }
+        if let Err(e) = turn(t, &a, &name, &refname, message) {
+            eprintln!("talk: {e}");
+        }
+    }
+}
+
+/// The conversation ref for `name`, validated up front (the name becomes two
+/// ref components — conversation + progress — so let git check it).
+fn validated_refname(name: &str) -> Result<String, String> {
+    let refname = format!("{CONV_REF_PREFIX}{name}");
+    git_capture(&["check-ref-format", &refname], None)
+        .map_err(|_| format!("invalid conversation name {name:?}"))?;
+    Ok(refname)
+}
+
+/// Which conversation a `talk` invocation is about, and whether it's new:
+/// `-c <name>` names one (existing or not); `--new` mints a fresh auto-named
+/// one; with neither, the repo's most recently advanced conversation — or a
+/// fresh one when there is none yet.
+fn pick_conversation(a: &ChatArgs) -> Result<(String, bool), String> {
+    if let Some(name) = &a.name {
+        if a.new_conv && rev_parse_opt(&format!("{CONV_REF_PREFIX}{name}"))?.is_some() {
+            return Err(format!(
+                "--new: conversation {name:?} already exists (drop --new to continue it)"
+            ));
+        }
+        let fresh = rev_parse_opt(&format!("{CONV_REF_PREFIX}{name}"))?.is_none();
+        return Ok((name.clone(), fresh));
+    }
+    if !a.new_conv {
+        if let Some(name) = latest_conversation()? {
+            return Ok((name, false));
+        }
+    }
+    // A fresh auto-named conversation: first free talk-<n>.
+    for n in 1.. {
+        let name = format!("{AUTO_NAME_PREFIX}{n}");
+        if rev_parse_opt(&format!("{CONV_REF_PREFIX}{name}"))?.is_none() {
+            return Ok((name, true));
+        }
+    }
+    unreachable!("some talk-<n> is always free")
+}
+
+/// The most recently advanced conversation in this repo, by the head commit's
+/// committer date (turn commits carry wall-clock timestamps).
+fn latest_conversation() -> Result<Option<String>, String> {
+    let out = git_capture(
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--count=1",
+            "--format=%(refname)",
+            CONV_REF_PREFIX.trim_end_matches('/'),
+        ],
+        None,
+    )?;
+    Ok(out
+        .trim()
+        .strip_prefix(CONV_REF_PREFIX)
+        .map(str::to_string))
 }
 
 /// One turn: mint the human commit, run llm-step over it, stream progress,
 /// advance the conversation ref.
-fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
+fn turn(
+    t: &GitTransport,
+    a: &ChatArgs,
+    name: &str,
+    refname: &str,
+    message: &str,
+) -> Result<(), String> {
     // Everything that can fail cheaply fails *before* the human commit is
     // minted or anything is pushed.
     let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
         format!("{API_KEY_ENV} must be set (it rides, curried, into the llm-step run)")
     })?;
-    let llm_bin = worker_bin(a.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV, "--llm-step-bin")?;
-    let bash_bin = worker_bin(a.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV, "--bash-tool-bin")?;
+    let llm_bin = worker_bin(a.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV);
+    let bash_bin = worker_bin(a.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV);
     let system = match (&a.system, &a.system_file) {
         (Some(text), _) => text.clone(),
         (None, Some(path)) => {
@@ -185,7 +346,6 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
         }
     };
 
-    let message = read_message(a)?;
     // The agent author name is the turn-walk marker; a human commit carrying it
     // would corrupt every future transcript walk.
     let ident = git_capture(&["var", "GIT_AUTHOR_IDENT"], None)
@@ -203,25 +363,37 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
     let tree = git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
         .trim()
         .to_string();
-    let human = git_capture(&["commit-tree", &tree, "-p", &parent, "-m", &message], None)?
+    let human = git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
         .trim()
         .to_string();
 
-    // The workers: static binaries curried onto the shared runner-pool image
-    // (exactly how tests/llm-step builds them). The bash curry's hash is passed
-    // to llm-step as a *literal* (an image ref string), so its closure doesn't
-    // ride in the request graph — push it (and the runner image) explicitly.
-    let runner = resolve_cli_image(t, RUNNER_IMAGE)?;
-    let bash_image = curry_object(t, &runner, None, &[format!("--bin:@={bash_bin}")])?.to_string();
-    t.ensure_pushed(&bash_image)?;
-    t.ensure_pushed(&runner)?;
+    // The workers: by default the std-published curries (`curry(runner, bin)`,
+    // build-builtins.sh) — already server-side under refs/caos/std, nothing to
+    // build or push. An explicit `--*-bin` override (the stub tests' path)
+    // curries that binary onto the runner-pool image here instead; the bash
+    // curry's hash is passed to llm-step as a *literal* (an image ref string),
+    // so its closure doesn't ride in the request graph — push it (and the
+    // runner image) explicitly.
+    let runner = match (&llm_bin, &bash_bin) {
+        (None, None) => None,
+        _ => Some(resolve_cli_image(t, RUNNER_IMAGE)?),
+    };
+    let bash_image = match &bash_bin {
+        Some(bin) => {
+            let runner = runner.as_deref().expect("resolved when a bin is given");
+            let img = curry_object(t, runner, None, &[format!("--bin:@={bin}")])?.to_string();
+            t.ensure_pushed(&img)?;
+            t.ensure_pushed(runner)?;
+            img
+        }
+        None => resolve_cli_image(t, BASH_TOOL_IMAGE)?,
+    };
 
     let mut kvs = vec![
-        format!("--bin:@={llm_bin}"),
         format!("--api_key={api_key}"),
         format!("--system={system}"),
         format!("--bash_image={bash_image}"),
-        format!("--conversation={}", a.name),
+        format!("--conversation={name}"),
     ];
     if let Some(model) = &a.model {
         kvs.push(format!("--model={model}"));
@@ -229,7 +401,17 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
     if let Some(url) = &a.base_url {
         kvs.push(format!("--base_url={url}"));
     }
-    let llm = curry_object(t, &runner, None, &kvs)?.to_string();
+    // Per-turn state currying: onto the std llm-step curry (layers flatten, so
+    // the result is exactly curry(runner, bin, <state>)), or onto the runner
+    // with the override binary.
+    let llm_base = match &llm_bin {
+        Some(bin) => {
+            kvs.push(format!("--bin:@={bin}"));
+            runner.clone().expect("resolved when a bin is given")
+        }
+        None => resolve_cli_image(t, LLM_STEP_IMAGE)?,
+    };
+    let llm = curry_object(t, &llm_base, None, &kvs)?.to_string();
 
     // Build + push the request (this also pushes the human commit's closure —
     // the `:commit=` machinery), then trigger the blocking compute on its own
@@ -245,7 +427,7 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
     // While the run blocks, follow the worker's per-step progress ref and
     // print each new step (assistant text + one-line tool calls).
     let http = HttpTransport { base: server };
-    let progress_ref = format!("{PROGRESS_REF_PREFIX}{}", a.name);
+    let progress_ref = format!("{PROGRESS_REF_PREFIX}{name}");
     let mut printed: HashSet<String> = HashSet::new();
     while !run.is_finished() {
         for _ in 0..(POLL_SECS * 10) {
@@ -302,33 +484,22 @@ fn turn(t: &GitTransport, a: &ChatArgs, refname: &str) -> Result<(), String> {
     if show_message {
         println!("{}", text.trim_end());
     }
-    println!("[{} {}]", a.name, short);
+    println!("[{name} {short}]");
     Ok(())
 }
 
-/// A worker binary's path: the flag, else its env var, else a pointed error.
-fn worker_bin(flag_value: Option<&str>, env: &str, flag: &str) -> Result<String, String> {
-    if let Some(p) = flag_value {
-        return Ok(p.to_string());
-    }
-    std::env::var(env).map_err(|_| {
-        format!(
-            "chat needs the {} worker binary: pass {flag} <path> or set {env} \
-             (a git-tracked path; build it with `nix build .#{}`)",
-            flag.trim_start_matches("--").trim_end_matches("-bin"),
-            if flag == "--llm-step-bin" {
-                "worker-llm-step"
-            } else {
-                "worker-bash-tool"
-            }
-        )
-    })
+/// An explicit worker-binary override: the flag, else its env var, else `None`
+/// — the std-published curry is used.
+fn worker_bin(flag_value: Option<&str>, env: &str) -> Option<String> {
+    flag_value
+        .map(str::to_string)
+        .or_else(|| std::env::var(env).ok())
 }
 
-/// The turn's message: `-m`, or stdin read to EOF.
-fn read_message(a: &ChatArgs) -> Result<String, String> {
-    let raw = match &a.message {
-        Some(m) => m.clone(),
+/// The turn's message: the given one, or stdin read to EOF.
+fn read_message(message: Option<&str>) -> Result<String, String> {
+    let raw = match message {
+        Some(m) => m.to_string(),
         None => {
             if std::io::stdin().is_terminal() {
                 eprintln!("reading the message from stdin — end with EOF (ctrl-d)");

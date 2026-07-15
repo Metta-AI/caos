@@ -146,4 +146,50 @@ grep -qF "$T2_TEXT" log.out || fail "--log misses the second agent turn"
 grep -qx "base" log.out && fail "--log printed the base commit"
 echo "  ok: both turns, no base" >&2
 
+echo "== talk (std worker curries): sticky pick continues $conv ==" >&2
+# No CAOS_*_BIN overrides: the workers must resolve from the published std
+# (refs/caos/std — build-builtins.sh publishes std/bash-tool and std/llm-step).
+T3_TEXT="sticky turn reply"
+printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T3_TEXT" > stub/response-4.json
+env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN \
+  "$CAOS_CLI" talk "still there?" "${opts[@]}" > talk1.out 2>talk1.err
+sed 's/^/  talk1| /' talk1.out >&2
+grep -qF "[conversation $conv]" talk1.err \
+  || fail "talk did not announce the sticky conversation: $(cat talk1.err)"
+turn3=$(git rev-parse "refs/caos/conversations/$conv")
+[ "$turn3" != "$turn2" ] || fail "talk did not advance the sticky conversation"
+[ "$(git rev-parse "$turn3^^")" = "$turn2" ] || fail "talk turn does not chain onto turn 2"
+grep -qF "$T3_TEXT" talk1.out || fail "talk's response text not printed"
+grep -qF '{"content":"still there?","role":"user"}]' stub/request-4.json \
+  || fail "talk's prompt missing from the request"
+grep -qF '{"content":"and now?","role":"user"}' stub/request-4.json \
+  || fail "earlier turns not replayed — talk continued the wrong conversation"
+echo "  ok: std workers, sticky conversation continued and advanced" >&2
+
+echo "== talk --new starts an auto-named conversation ==" >&2
+T4_TEXT="fresh conversation reply"
+printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T4_TEXT" > stub/response-5.json
+env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN \
+  "$CAOS_CLI" talk --new "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
+sed 's/^/  talk2| /' talk2.out >&2
+grep -qF "[conversation talk-1 — new]" talk2.err \
+  || fail "talk --new did not announce a new talk-1: $(cat talk2.err)"
+git rev-parse -q --verify refs/caos/conversations/talk-1 >/dev/null \
+  || fail "talk --new did not create refs/caos/conversations/talk-1"
+grep -qF "$T4_TEXT" talk2.out || fail "talk --new's response text not printed"
+grep -qF '{"content":"and now?","role":"user"}' stub/request-5.json \
+  && fail "old conversation replayed into the new one"
+echo "  ok: talk-1 minted, no history carried over" >&2
+
+echo "== talk argument-shape errors ==" >&2
+if "$CAOS_CLI" talk "one" "two" 2>talk-err; then
+  fail "talk accepted two positional prompts"
+fi
+grep -q "quote" talk-err || fail "extra-positional error not pointed: $(cat talk-err)"
+if "$CAOS_CLI" talk "one" -m "two" 2>talk-err; then
+  fail "talk accepted a positional prompt AND -m"
+fi
+grep -q "positionally" talk-err || fail "prompt-conflict error not pointed: $(cat talk-err)"
+echo "  ok: pointed parse errors" >&2
+
 echo "chat: ALL PASS" >&2

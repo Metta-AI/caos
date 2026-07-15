@@ -698,11 +698,16 @@
           pname = "caos-cli";
           version = "0.1.0";
         };
+        # Installed under both names: `caos` is what a person types (`caos talk`),
+        # `caos-cli` stays for scripts and docs that spell it out. (No collision
+        # with the worker-side `caos` binary — that one is baked into images and
+        # never lands on a host PATH.)
         caos-cli =
           if pkgs.stdenv.hostPlatform.isLinux then
             pkgs.runCommand "caos-cli" { } ''
               mkdir -p $out/bin
               cp ${caos}/bin/caos-cli $out/bin/caos-cli
+              ln -s caos-cli $out/bin/caos
             ''
           else
             craneLib.buildPackage (
@@ -711,6 +716,7 @@
                 cargoArtifacts = craneLib.buildDepsOnly nativeArgs;
                 cargoExtraArgs = "--package caos --bin caos-cli";
                 doCheck = false;
+                postInstall = "ln -s caos-cli $out/bin/caos";
               }
             );
 

@@ -4,16 +4,17 @@
 //! as a `caos` git remote ([`caos::GitTransport`]): objects are built in the
 //! local working repo and exchanged with the server by negotiated push/fetch, so
 //! a large unchanged tree is almost free to "upload" and an edit ships only its
-//! delta. Compute is triggered over HTTP (`$CAOS_SERVER_URL`, `/run`).
+//! delta. Compute is triggered over HTTP against the same server — its URL is
+//! always the `caos` remote's URL, never an env var.
 //!
-//! There is no `/cas` here — that's the worker's world. The CLI has four
-//! commands: `run` (compute, with the result checked out to any host path, or
-//! a file result streamed to stdout when no path is given), `curry` (bind args
-//! to an image, printing the curried ref), `import-image` (get a docker
-//! image into caos, printing its hash), and `chat` (one turn of an agent
-//! conversation — see design/agent-harness.md). The object-level commands
-//! (`get`/`put`/…) live only in the worker `caos`, which runs inside a sandbox
-//! with a real `/cas`.
+//! There is no `/cas` here — that's the worker's world. The commands: `run`
+//! (compute, with the result checked out to any host path, or a file result
+//! streamed to stdout when no path is given), `curry` (bind args to an image,
+//! printing the curried ref), `import-image` (get a docker image into caos,
+//! printing its hash), and `talk`/`chat` (agent conversations — see
+//! design/agent-harness.md; `talk` is the everyday surface, `chat` the
+//! explicit one-turn form). The object-level commands (`get`/`put`/…) live
+//! only in the worker `caos`, which runs inside a sandbox with a real `/cas`.
 
 use std::process::ExitCode;
 
@@ -64,7 +65,12 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err(usage(args)),
         },
-        // `chat <name> [-m <message>] [flags]` — one turn of an agent
+        // `talk [<prompt>] [flags]` — agent conversation, everyday surface:
+        // continues the repo's most recent conversation (`-c` picks one,
+        // `--new` starts another); with no prompt on a terminal it loops, one
+        // turn per line. Flag parsing (and usage) lives in `caos::cli_talk`.
+        Some("talk") => caos::cli_talk(&transport()?, &args[2..]),
+        // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation: mint the human commit, run llm-step over it, print
         // progress, advance `refs/caos/conversations/<name>` on success. Flag
         // parsing (and the chat-specific usage) lives in `caos::cli_chat`.
@@ -85,6 +91,7 @@ fn usage(args: &[String]) -> String {
          {prog} run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
+         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]"
     )
 }

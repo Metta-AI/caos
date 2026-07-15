@@ -270,20 +270,23 @@ logic — the difference is the **transport** and the privilege model.
   continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
-- **`caos-cli`** (user-facing) uses the server as a **`caos` git remote**: it
-  builds objects in the local working repo and exchanges them by negotiated
-  push/fetch. It has no `/cas` and no object-level commands — just three:
+- **`caos-cli`** (user-facing; also installed as plain `caos`) uses the server
+  as a **`caos` git remote**: it builds objects in the local working repo and
+  exchanges them by negotiated push/fetch. It has no `/cas` and no
+  object-level commands:
   - `run` — compute (blocking, as before), with the result checked out to any
     host path;
   - `curry` — bind args to an image, printing the curried ref;
-  - `import-image` — get a docker image into caos, printing its hash.
+  - `import-image` — get a docker image into caos, printing its hash;
+  - `talk` / `chat` — agent conversations over the harness
+    (design/agent-harness.md); `caos talk "<prompt>"` is the everyday form.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
-remote, and `CAOS_SERVER_URL` set (used for `/run` and to fetch results):
+remote — the remote's URL is also where compute is triggered and results are
+fetched, so there is nothing else to configure:
 
 ```bash
 git remote add caos http://localhost:9090
-export CAOS_SERVER_URL=http://localhost:9090
 ```
 
 ### The CAS and `/cas`

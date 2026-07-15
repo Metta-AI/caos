@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::objs::WriteTo;
 
 mod chat;
-pub use chat::cli_chat;
+pub use chat::{cli_chat, cli_talk};
 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";

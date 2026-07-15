@@ -207,21 +207,39 @@ valid conversation state a future resume could start from.
 
 ## Client
 
-`caos-cli chat <name> [-m <message>]` (implemented — `crates/caos/src/chat.rs`,
-tested end-to-end against the stub in `tests/chat`): one turn per invocation.
-It creates the human commit → requests the run → hangs, printing progress from
-the ref → on completion advances `refs/caos/conversations/<name>` (in the
-*local* repo) and prints the response text and short hash. Conversation
-identity is that ref — the only mutable thing, owned by the client. The
-message comes from `-m` or stdin; further flags: `--base <revspec>` (a new
-conversation's base commit, default `HEAD` — refused if its tree carries a
-top-level `.caos`), `--system <text>` / `--system-file <path>` (default: a
-short coding-agent prompt), `--model`, `--base-url`, and `--log` (print the
-conversation so far — the first-parent walk — and run nothing). The API key
-comes only from `$ANTHROPIC_API_KEY` (checked before anything is minted), and
-the worker binaries ride as `--llm-step-bin`/`--bash-tool-bin` (or
-`$CAOS_LLM_STEP_BIN`/`$CAOS_BASH_TOOL_BIN`) — git-tracked paths curried onto
-`/cas/std/runner`, exactly as the tests do.
+Two verbs over one turn engine (implemented — `crates/caos/src/chat.rs`,
+tested end-to-end against the stub in `tests/chat`):
+
+- **`caos talk [<prompt>]`** — the everyday surface. The positional argument
+  is the prompt; the conversation is the repo's most recently advanced one
+  (`refs/caos/conversations/*` by committer date), `-c <name>` picks one, and
+  `--new` mints a fresh auto-named `talk-<n>`. The chosen conversation is
+  announced on stderr. With no prompt on a terminal it loops — one turn per
+  line, ctrl-d ends, a failed turn is reported and the loop continues (the
+  ref didn't advance, so the next line retries from the same head); with
+  piped stdin the whole of it is one prompt.
+- **`caos-cli chat <name> [-m <message>]`** — the explicit, scriptable
+  one-turn form (message from `-m` or stdin).
+
+A turn creates the human commit → requests the run → hangs, printing progress
+from the ref → on completion advances `refs/caos/conversations/<name>` (in
+the *local* repo) and prints the response text and short hash. Conversation
+identity is that ref — the only mutable thing, owned by the client. Shared
+flags: `--base <revspec>` (a new conversation's base commit, default `HEAD` —
+refused if its tree carries a top-level `.caos`), `--system <text>` /
+`--system-file <path>` (default: a short coding-agent prompt), `--model`,
+`--base-url`, and `--log` (print the conversation so far — the first-parent
+walk — and run nothing). The API key comes only from `$ANTHROPIC_API_KEY`
+(checked before anything is minted).
+
+The workers come ready-made from the published library: `/cas/std/bash-tool`
+and `/cas/std/llm-step` are `curry(runner, bin=<static binary>)` nodes
+(published by build-builtins.sh next to the images), so a turn needs nothing
+built or committed locally — the bash curry rides as a literal image ref and
+the per-turn state (key, system, model…) is curried onto the llm-step curry
+(layers flatten). `--llm-step-bin`/`--bash-tool-bin` (or
+`$CAOS_LLM_STEP_BIN`/`$CAOS_BASH_TOOL_BIN`) override with a git-tracked local
+binary curried onto `/cas/std/runner` — the stub tests' path.
 
 Implementation notes (what the workers assume): the human commit is an
 ordinary git commit (any author *except* `caos-agent` — enforced) whose
@@ -265,3 +283,7 @@ deadlines are comfortable; the top-level pending timeout
 5. `caos-cli chat` (human commits, conversation ref, progress printing).
    **Done** (`crates/caos/src/chat.rs`, `tests/chat`; real-key smoke:
    `tests/llm-step/smoke.sh`).
+6. `caos talk` + std-published worker curries — prompt-first surface, sticky
+   conversation, interactive loop; `std/bash-tool` and `std/llm-step`
+   published by build-builtins.sh so a turn needs nothing built or committed
+   locally. **Done** (same files; smoke.sh is the UX spec).
