@@ -141,6 +141,46 @@ if [ "${#to_import[@]}" -gt 0 ]; then
   done
 fi
 
+# Agent-harness worker binaries (design/agent-harness.md): each is published as
+# a ready-to-run curry over the shared runner image — std/<name> =
+# curry(runner, bin=<static binary>) — NOT as a worker image of its own, so its
+# runs ride the warm runner pool (design/runner-protocol.md) and a rebuild
+# ships one small blob, not an image. `caos-cli curry` ingests the binary and
+# pushes the curry; the std ref push below pins both. Prebuilt store paths
+# arrive via CAOS_BUILTIN_BINS (how caosd avoids runtime nix), else they're
+# nix-built here. Skipped when `runner` isn't among the names (a partial,
+# name-scoped run has no image to curry onto).
+bin_names=(bash-tool llm-step)
+if [ -n "${hash_of[runner]:-}" ]; then
+  if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
+    bin_paths=$CAOS_BUILTIN_BINS
+  else
+    attrs=()
+    for b in "${bin_names[@]}"; do attrs+=(".#worker-$b"); done
+    echo "building ${#bin_names[@]} worker binaries..." >&2
+    if ! bin_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
+      echo "build-builtins: nix build failed" >&2; exit 1
+    fi
+  fi
+  declare -A bin_path
+  # shellcheck disable=SC2086
+  for p in $bin_paths; do
+    for b in "${bin_names[@]}"; do
+      case "$p" in *-worker-"$b"*) bin_path[$b]=$p ;; esac
+    done
+  done
+  for b in "${bin_names[@]}"; do
+    [ -n "${bin_path[$b]:-}" ] || { echo "build-builtins: no binary built for worker-$b" >&2; exit 1; }
+    # Ingestion only accepts git-tracked worktree paths, so stage a copy of
+    # the binary in the client repo (overwritten on every publish).
+    install -m 755 "${bin_path[$b]}/bin/worker-$b" "$CLIENT/worker-$b"
+    git -C "$CLIENT" add "worker-$b"
+    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[runner]}" -- "--bin:@=worker-$b")
+    echo "$b: curry ${hash_of[$b]}" >&2
+    names+=("$b")
+  done
+fi
+
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so
 # there's no commit to wrap it) and publish it to the server under refs/caos/std
 # in one push, which uploads every builtin image the server doesn't already have.

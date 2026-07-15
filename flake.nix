@@ -820,6 +820,14 @@
           workerRunnerImage
         ];
 
+        # The agent-harness worker binaries build-builtins.sh publishes as
+        # std curries over the runner image (std/bash-tool, std/llm-step) —
+        # handed over prebuilt for the same no-runtime-nix reason as the images.
+        builtinWorkerBins = [
+          worker-bash-tool
+          worker-llm-step
+        ];
+
         # The dev stack's control command. Subcommands:
         #   caosd up     (default) idempotently bring the stack up and publish all
         #                of std, then RETURN — the stack stays running in the
@@ -920,6 +928,9 @@
               CAOS_CLIENT_REPO="$CAOS_DATA/publish-client-repo" \
               CAOS_BUILTIN_IMAGES="${
                 pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
+              }" \
+              CAOS_BUILTIN_BINS="${
+                pkgs.lib.concatMapStringsSep " " toString builtinWorkerBins
               }" \
                 bash ${self}/build-builtins.sh >/dev/null
 
