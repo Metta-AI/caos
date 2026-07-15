@@ -50,7 +50,9 @@ cd "$CLIENT"
 export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin
 conv="smoke-$(date +%s)"
 echo "smoke: running one real turn (conversation $conv)..." >&2
-"$caosbin" chat "$conv" --model claude-haiku-4-5 \
+# Cheapest model that supports adaptive thinking (the worker always sends
+# thinking:{type:"adaptive"}; haiku-4-5 rejects it with a 400).
+"$caosbin" chat "$conv" --model claude-sonnet-5 \
   -m "Use the bash tool to run \`echo pong\`, then reply with just its output."
 git rev-parse -q --verify "refs/caos/conversations/$conv" >/dev/null \
   || { echo "smoke: FAIL — conversation ref missing" >&2; exit 1; }

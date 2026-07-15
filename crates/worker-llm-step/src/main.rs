@@ -162,6 +162,9 @@ fn llm_round(
     let body = json!({
         "model": cfg.model,
         "max_tokens": 16000,
+        // Constrains model choice: adaptive thinking needs a 4.6+ model
+        // (haiku-4-5 rejects it with a 400). Deliberately unconditional —
+        // sniffing per-model capabilities here would rot.
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
         "system": cfg.system,
