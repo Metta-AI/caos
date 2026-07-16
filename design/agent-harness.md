@@ -159,12 +159,24 @@ Tool classes:
   (No hard materialization budget for now; enforcement can come later if
   models abuse `paths`. Known limitation: CAS blobs materialize without
   git's exec bit, so declared files round-trip as mode 100644.)
-- **grep** (decomposed): an rgrep worker on the file-count model — on a
-  tree, emit `{in, map: curry(self, pattern), then: curry(self, pattern)}`
-  and exit; on a blob, fetch just it and grep; in the then position, prefix
-  each child's match paths with its child name while folding up (path
-  context reassembles level by level). Cached per (subtree hash, pattern):
-  after a one-file edit, re-grepping costs only the spine above the edit.
+- **grep** (decomposed; implemented — `crates/worker-rgrep`, the `grep`
+  tool): an rgrep worker on the file-count model, one job per directory. It
+  greps the files at its own level, map-thens over a synthetic tree of just
+  the subdirectories (map = curry(self, pattern) — the pattern re-curried
+  because curry layers unwrap into args), and the then-combiner links the
+  local match files and each non-empty child result tree into one **sparse
+  result tree**: only matching files appear, each holding `linenum:line`
+  matches, children embedded *by hash* — nothing is copied as results ride
+  up, results are git-diffable, and identical subtrees share one cached job.
+  Cached per (subtree hash, pattern): after a one-file edit, re-grepping
+  costs only the spine above the edit, and a scoped grep of `src/` IS the
+  cached `src/` node of the full grep. Flattening to `path:linenum:line` is
+  the caller's presentation choice — llm-step renders it at the transcript
+  boundary (100KB budget, then matching-file counts + a narrow-the-scope
+  hint); the pattern is validated in llm-step BEFORE the sub-run launches,
+  so a bad regex is an is_error tool_result, never a failed turn. A grep
+  result is not a workspace: the pre-grep workspace rides the continuation
+  curry, and only bash results advance the tree.
 - **ls/listing**: tree objects are names+oids — no content fetch at all.
 - **build/test**: the existing caos-native decompositions (rustc,
   deep-deps), not bash.

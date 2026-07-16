@@ -22,11 +22,13 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
 echo "== build the worker binaries and fixtures ==" >&2
 nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
 nix build "$CAOS_PROJECT#worker-llm-step" -o llm-step-out
+nix build "$CAOS_PROJECT#worker-rgrep" -o rgrep-out
 nix build "$CAOS_PROJECT#llm-stub" -o llm-stub-out
 cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
 cp -L llm-step-out/bin/worker-llm-step llm-step-bin
+cp -L rgrep-out/bin/worker-rgrep rgrep-bin
 stub_bin=$(readlink -f llm-stub-out/bin/llm-stub)
-rm bash-tool-out llm-step-out llm-stub-out
+rm bash-tool-out llm-step-out rgrep-out llm-stub-out
 
 # The conversation's workspace, and the identity chat's human commits use.
 mkdir -p ws/notes
@@ -63,7 +65,7 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 conv="chat-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin
+export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin CAOS_RGREP_BIN=rgrep-bin
 opts=(--model test-model --base-url "http://host.containers.internal:$port")
 
 echo "== missing ANTHROPIC_API_KEY fails before minting anything ==" >&2
@@ -164,7 +166,7 @@ echo "== talk (std worker curries): sticky pick continues $conv ==" >&2
 # (refs/caos/std — build-builtins.sh publishes std/bash-tool and std/llm-step).
 T3_TEXT="sticky turn reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T3_TEXT" > stub/response-4.json
-env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN \
+env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
   "$CAOS_CLI" talk "still there?" "${opts[@]}" > talk1.out 2>talk1.err
 sed 's/^/  talk1| /' talk1.out >&2
 grep -qF "[conversation $conv]" talk1.err \
@@ -182,7 +184,7 @@ echo "  ok: std workers, sticky conversation continued and advanced" >&2
 echo "== talk --new starts an auto-named conversation ==" >&2
 T4_TEXT="fresh conversation reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T4_TEXT" > stub/response-5.json
-env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN \
+env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
   "$CAOS_CLI" talk --new "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
 sed 's/^/  talk2| /' talk2.out >&2
 grep -qF "[conversation talk-1 — new]" talk2.err \
@@ -256,5 +258,30 @@ seq=$(grep -o '"tool_use_id":"tu_m[wbe]"' stub/request-9.json | grep -o 'tu_m[wb
 [ "$seq" = "tu_mw,tu_mb,tu_me" ] || fail "results missing or misordered: $seq"
 [ ! -f stub/request-10.json ] || fail "unexpected extra LLM round"
 echo "  ok: write -> bash -> edit, serial over one queue" >&2
+
+echo "== grep: sparse-tree fold — root, scoped, and invalid pattern ==" >&2
+# Three grep calls in one response: a root grep (fold fans out over the
+# workspace, result rendered path:linenum:line), a scoped grep (input = the
+# subtree, so its cache key is (subtree, pattern)), and an invalid pattern
+# (caught by the precheck: is_error, no sub-run). Serial like bash; the
+# workspace must be untouched by all three.
+GREP_CALLS='[
+ {"id":"tu_g1","input":{"pattern":"hello"},"name":"grep","type":"tool_use"},
+ {"id":"tu_g2","input":{"pattern":"goodbye","path":"notes"},"name":"grep","type":"tool_use"},
+ {"id":"tu_g3","input":{"pattern":"("},"name":"grep","type":"tool_use"}]'
+printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$GREP_CALLS" | tr -d '\n')" > stub/response-10.json
+printf '{"content":[{"text":"grep done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-11.json
+"$CAOS_CLI" chat "$conv" -m "search the workspace" "${opts[@]}" > grep.out
+sed 's/^/  grep| /' grep.out >&2
+turn_grep=$(git rev-parse "refs/caos/conversations/$conv")
+git diff --quiet "$turn_mixed" "$turn_grep" -- || fail "grep changed the workspace tree"
+grep -qF "grep hello" grep.out || fail "root grep progress line missing"
+grep -qF "grep goodbye notes" grep.out || fail "scoped grep progress line missing"
+grep -qF 'notes/todo.txt:1:hello notes' stub/request-11.json || fail "root grep match not sent"
+grep -qF 'notes/new.txt:1:goodbye world' stub/request-11.json || fail "scoped grep match not sent"
+grep -qF '"is_error":true' stub/request-11.json || fail "invalid pattern not marked is_error"
+grep -qF 'invalid pattern' stub/request-11.json || fail "invalid pattern error not explained"
+[ ! -f stub/request-12.json ] || fail "unexpected extra LLM round"
+echo "  ok: fold matches rendered, scope honored, bad pattern as value, tree untouched" >&2
 
 echo "chat-offline: ALL PASS" >&2

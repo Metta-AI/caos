@@ -95,6 +95,135 @@ pub fn declarations() -> Vec<Value> {
     ]
 }
 
+/// The grep tool's registry entry (present only when a `grep_image` is
+/// curried — see `Config`). It runs as the rgrep fold sub-run; this module
+/// contributes the declaration, the pre-launch validation, and the
+/// transcript-boundary rendering of its sparse result tree.
+pub fn grep_declaration() -> Value {
+    json!({
+        "name": "grep",
+        "description": "Search the workspace with a regular expression (Rust regex syntax, \
+    line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or \
+    file) to narrow the search; results are cached per unchanged subtree, so repeated and \
+    scoped greps are cheap. Prefer this over grep/find via bash.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "The regular expression to search for."},
+                "path": {"type": "string", "description": "Workspace-relative directory or file to search; omit for the whole workspace."}
+            },
+            "required": ["pattern"]
+        }
+    })
+}
+
+/// Validate a grep call before its sub-run launches: the pattern must compile
+/// and the scope must exist. Returns the scope's CAS path and its
+/// workspace-relative prefix (`""` for the root) — or, on a user mistake, the
+/// ready-made `is_error` tool_result.
+pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> {
+    let id = call["id"].as_str().unwrap_or("");
+    let fail = |msg: String| Err(block(id, &msg, true));
+    let Some(pattern) = call["input"]["pattern"].as_str() else {
+        return fail("grep needs a string `pattern`".to_string());
+    };
+    if let Err(e) = regex::Regex::new(pattern) {
+        return fail(format!("invalid pattern: {e}"));
+    }
+    match call["input"]["path"].as_str().filter(|p| !p.trim().is_empty()) {
+        None => Ok((ws.to_string(), String::new())),
+        Some(_) => {
+            let comps = match components(call, "path") {
+                Ok(c) => c,
+                Err(User(msg)) => return fail(msg),
+                Err(Infra(e)) => return fail(e),
+            };
+            match materialize(ws, &comps) {
+                Ok(p) => Ok((p.to_string_lossy().into_owned(), comps.join("/"))),
+                Err(User(msg)) => fail(msg),
+                Err(Infra(e)) => fail(e),
+            }
+        }
+    }
+}
+
+/// The tool_result block for a finished grep: walk the sparse result tree and
+/// render classic `path:linenum:line` lines while they fit the transcript
+/// budget; past it, count the remaining matching files and say how to narrow.
+pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, String> {
+    let _ = caos(["get", result]);
+    let p = Path::new(result);
+
+    // A file-scoped grep's result is the match blob itself.
+    if p.is_file() {
+        let text = fs::read_to_string(p).map_err(|e| format!("reading {result}: {e}"))?;
+        if text.is_empty() {
+            return Ok(block(id, "no matches", false));
+        }
+        let rendered: String = text
+            .lines()
+            .map(|l| format!("{scope}:{l}\n"))
+            .collect();
+        return Ok(block(id, rendered.trim_end(), false));
+    }
+
+    let mut render = GrepRender {
+        out: String::new(),
+        overflow_files: 0,
+    };
+    let prefix = if scope.is_empty() {
+        String::new()
+    } else {
+        format!("{scope}/")
+    };
+    render.walk(p, &prefix)?;
+    if render.out.is_empty() && render.overflow_files == 0 {
+        return Ok(block(id, "no matches", false));
+    }
+    let mut text = render.out;
+    if render.overflow_files > 0 {
+        text += &format!(
+            "\n[truncated — {} more matching file(s); narrow the pattern or grep a \
+             subdirectory]",
+            render.overflow_files
+        );
+    }
+    Ok(block(id, text.trim_end(), false))
+}
+
+struct GrepRender {
+    out: String,
+    /// Matching files not rendered once the budget was hit.
+    overflow_files: usize,
+}
+
+impl GrepRender {
+    /// Depth-first over the sparse tree: files are match blobs (`linenum:line`
+    /// per line), subtrees recurse. Past [`MAX_READ_BYTES`] of output, stop
+    /// reading contents and just count matching files.
+    fn walk(&mut self, dir: &Path, prefix: &str) -> Result<(), String> {
+        let _ = caos(["get", path(dir)]);
+        for child in entries(path(dir))? {
+            let name = file_name(&child);
+            if child.is_dir() {
+                self.walk(&child, &format!("{prefix}{name}/"))?;
+                continue;
+            }
+            if self.out.len() >= MAX_READ_BYTES {
+                self.overflow_files += 1;
+                continue;
+            }
+            let _ = caos(["get", path(&child)]);
+            let text = fs::read_to_string(&child)
+                .map_err(|e| format!("reading {}: {e}", child.display()))?;
+            for line in text.lines() {
+                self.out.push_str(&format!("{prefix}{name}:{line}\n"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A tool call's failure mode: `User` becomes an `is_error` tool_result the
 /// model reacts to; `Infra` fails the worker (CAS/transport trouble).
 enum Fail {

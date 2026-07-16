@@ -15,6 +15,9 @@ serde_json = "1"
 # TLS pure-Rust so the binary stays static; default-features off as everywhere
 # else in the workspace.
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+# Validating grep patterns BEFORE launching the rgrep sub-run, so a bad
+# pattern is an is_error tool_result, never a failed turn.
+regex = "1"
 
 [[bin]]
 name = "worker-llm-step"

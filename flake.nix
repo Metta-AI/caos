@@ -130,6 +130,7 @@
         # in the shared runner pool, so only the binaries are exposed.
         worker-bash-tool = crateBin "worker-bash-tool";
         worker-llm-step = crateBin "worker-llm-step";
+        worker-rgrep = crateBin "worker-rgrep";
         # The llm-step tests' scripted LLM API stand-in — a host binary, not a
         # worker (the musl build runs on any Linux host).
         llm-stub = crateBin "llm-stub";
@@ -832,6 +833,7 @@
         builtinWorkerBins = [
           worker-bash-tool
           worker-llm-step
+          worker-rgrep
         ];
 
         # The dev stack's control command. Subcommands:
@@ -987,7 +989,7 @@
           inherit caos server runnerd caos-cli caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
-          inherit worker-bash-tool worker-llm-step llm-stub;
+          inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)

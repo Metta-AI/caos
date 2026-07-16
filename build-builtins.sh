@@ -150,7 +150,7 @@ fi
 # arrive via CAOS_BUILTIN_BINS (how caosd avoids runtime nix), else they're
 # nix-built here. Skipped when `runner` isn't among the names (a partial,
 # name-scoped run has no image to curry onto).
-bin_names=(bash-tool llm-step)
+bin_names=(bash-tool llm-step rgrep)
 if [ -n "${hash_of[runner]:-}" ]; then
   if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
     bin_paths=$CAOS_BUILTIN_BINS

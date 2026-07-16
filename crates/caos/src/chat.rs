@@ -58,6 +58,7 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// Env fallbacks for the worker-binary paths.
 const LLM_STEP_BIN_ENV: &str = "CAOS_LLM_STEP_BIN";
 const BASH_TOOL_BIN_ENV: &str = "CAOS_BASH_TOOL_BIN";
+const RGREP_BIN_ENV: &str = "CAOS_RGREP_BIN";
 
 /// The std builtin the worker binaries run under (`curry(runner, bin=...)`),
 /// used when a `--*-bin` override supplies the binary.
@@ -67,13 +68,14 @@ const RUNNER_IMAGE: &str = "/cas/std/runner";
 /// defaults when no `--*-bin` override is given.
 const BASH_TOOL_IMAGE: &str = "/cas/std/bash-tool";
 const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
+const RGREP_IMAGE: &str = "/cas/std/rgrep";
 
 /// Auto-named conversations (`talk` with no `-c`): `talk-1`, `talk-2`, …
 const AUTO_NAME_PREFIX: &str = "talk-";
 
 /// Default system prompt when neither `--system` nor `--system-file` is given.
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
-     read/ls/write/edit tools for file access — they are immediate. Use the bash tool to run \
+     read/ls/write/edit tools for file access and grep to search. Use the bash tool to run \
      commands (builds, tests, scripts), declaring every path a command reads in `paths`. Keep \
      responses concise.";
 
@@ -105,13 +107,14 @@ struct ChatArgs {
     base_url: Option<String>,
     llm_step_bin: Option<String>,
     bash_tool_bin: Option<String>,
+    rgrep_bin: Option<String>,
     log: bool,
 }
 
 fn usage(verb: Verb) -> String {
     let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
          [--model <model>] [--base-url <url>] [--llm-step-bin <path>] \
-         [--bash-tool-bin <path>] [--log]";
+         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--log]";
     match verb {
         Verb::Chat => format!(
             "usage: chat <name> [-m <message>] {common}\n\
@@ -142,6 +145,7 @@ impl ChatArgs {
             base_url: None,
             llm_step_bin: None,
             bash_tool_bin: None,
+            rgrep_bin: None,
             log: false,
         };
         let mut positional: Option<String> = None;
@@ -162,6 +166,7 @@ impl ChatArgs {
                 "--base-url" => a.base_url = Some(value(arg)?),
                 "--llm-step-bin" => a.llm_step_bin = Some(value(arg)?),
                 "--bash-tool-bin" => a.bash_tool_bin = Some(value(arg)?),
+                "--rgrep-bin" => a.rgrep_bin = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other}\n{}", usage(verb)))
@@ -338,6 +343,7 @@ fn turn(
     })?;
     let llm_bin = worker_bin(a.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV);
     let bash_bin = worker_bin(a.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV);
+    let rgrep_bin = worker_bin(a.rgrep_bin.as_deref(), RGREP_BIN_ENV);
     let system = match (&a.system, &a.system_file) {
         (Some(text), _) => text.clone(),
         (None, Some(path)) => {
@@ -406,8 +412,8 @@ fn turn(
     // so its closure doesn't ride in the request graph — push it (and the
     // runner image) explicitly.
     let phase = std::time::Instant::now();
-    let runner = match (&llm_bin, &bash_bin) {
-        (None, None) => None,
+    let runner = match (&llm_bin, &bash_bin, &rgrep_bin) {
+        (None, None, None) => None,
         _ => Some(resolve_cli_image(t, RUNNER_IMAGE)?),
     };
     let bash_image = match &bash_bin {
@@ -421,10 +427,22 @@ fn turn(
         None => resolve_cli_image(t, BASH_TOOL_IMAGE)?,
     };
 
+    let grep_image = match &rgrep_bin {
+        Some(bin) => {
+            let runner = runner.as_deref().expect("resolved when a bin is given");
+            let img = curry_object(t, runner, None, &[format!("--bin:@={bin}")])?.to_string();
+            t.ensure_pushed(&img)?;
+            t.ensure_pushed(runner)?;
+            img
+        }
+        None => resolve_cli_image(t, RGREP_IMAGE)?,
+    };
+
     let mut kvs = vec![
         format!("--api_key={api_key}"),
         format!("--system={system}"),
         format!("--bash_image={bash_image}"),
+        format!("--grep_image={grep_image}"),
         format!("--conversation={name}"),
     ];
     if let Some(model) = &a.model {
@@ -733,6 +751,13 @@ fn print_step(step: &Value, suppress_text: bool) {
                     println!("{name} {}", block["input"]["file_path"].as_str().unwrap_or("?"))
                 }
                 "ls" => println!("ls {}", block["input"]["path"].as_str().unwrap_or(".")),
+                "grep" => {
+                    let pattern = block["input"]["pattern"].as_str().unwrap_or("?");
+                    match block["input"]["path"].as_str() {
+                        Some(p) => println!("grep {pattern} {p}"),
+                        None => println!("grep {pattern}"),
+                    }
+                }
                 other => println!("[tool call: {other}]"),
             },
             _ => {}

@@ -63,6 +63,9 @@ struct Config {
     api_key: String,
     system: String,
     bash_image: String,
+    /// The rgrep fold worker's image; the `grep` tool is registered only when
+    /// present (older curries without it keep working).
+    grep_image: Option<String>,
     model: String,
     base_url: String,
     conversation: Option<String>,
@@ -74,6 +77,7 @@ impl Config {
             api_key: read_arg("api_key")?,
             system: read_arg("system")?,
             bash_image: read_arg("bash_image")?,
+            grep_image: read_arg_opt("grep_image")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
             base_url: read_arg_opt("base_url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
@@ -129,15 +133,29 @@ fn callback(cfg: &Config) -> Result<(), String> {
     let mut results = parse_blocks(&read_arg("results")?, "results")?;
     let current_id = read_arg("current_id")?;
 
-    // Fold the tool's outcome into a tool_result block the model will see.
-    results.push(tool_result_block(&current_id)?);
-
-    // The workspace after the call is the result's `tree`.
-    let ws = format!("{}/tree", arg("result"));
-    if !Path::new(&ws).exists() {
-        return Err("bash result carries no `tree` entry".to_string());
-    }
-    caos(["get", &ws])?;
+    // Fold the tool's outcome into a tool_result block the model will see,
+    // and establish the workspace the queue continues over: bash results
+    // carry the post-command workspace as `tree`; a grep result is a sparse
+    // match tree, NOT a workspace — the pre-grep workspace rode our curry.
+    let current_tool = read_arg_opt("current_tool")?.unwrap_or_else(|| "bash".to_string());
+    let ws = match current_tool.as_str() {
+        "grep" => {
+            let scope = read_arg_opt("scope")?.unwrap_or_default();
+            results.push(tools::grep_result_block(&current_id, &arg("result"), &scope)?);
+            let ws = arg("ws");
+            caos(["get", &ws])?;
+            ws
+        }
+        _ => {
+            results.push(tool_result_block(&current_id)?);
+            let ws = format!("{}/tree", arg("result"));
+            if !Path::new(&ws).exists() {
+                return Err("bash result carries no `tree` entry".to_string());
+            }
+            caos(["get", &ws])?;
+            ws
+        }
+    };
 
     drive(cfg, ws, &head_hash, &arg("step"), &pending, results)
 }
@@ -161,9 +179,27 @@ fn drive(
         if name == "bash" {
             return launch(cfg, &call, &ws, step_path, &queue[1..], &results);
         }
+        if name == "grep" && cfg.grep_image.is_some() {
+            // Validate before launching: a bad pattern or scope is an
+            // is_error result and the queue continues — only a valid call
+            // exits into the fold sub-run.
+            match tools::grep_precheck(&call, &ws) {
+                Err(block) => {
+                    results.push(block);
+                    queue.remove(0);
+                    continue;
+                }
+                Ok((scope, prefix)) => {
+                    return launch_grep(
+                        cfg, &call, &scope, &prefix, &ws, step_path, &queue[1..], &results,
+                    )
+                }
+            }
+        }
         if !tools::is_inline(name) {
             return Err(format!(
-                "model called unknown tool {name:?} (registered: bash, read, ls, write, edit)"
+                "model called unknown tool {name:?} \
+                 (registered: bash, grep, read, ls, write, edit)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -208,7 +244,7 @@ fn llm_round(
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
         "system": cfg.system,
-        "tools": registry(),
+        "tools": registry(cfg),
         "messages": messages,
     });
     // Bracket the API call with status-ref updates (progress::status): the
@@ -355,8 +391,49 @@ fn launch(
     let in_path = fresh("toolin");
     caos(["put", path(&dir), &in_path])?;
 
-    let me = self_curry(step_path, pending, results, id)?;
+    let me = self_curry(step_path, pending, results, id, &[("current_tool", Arg::Lit("bash"))])?;
     run_then(&in_path, &cfg.bash_image, Some(&me))
+}
+
+/// Launch a grep as a run-then sub-run of the rgrep fold worker: the input is
+/// the scope subtree itself and the pattern rides curried on the image, so
+/// every level of the fold caches on exactly (subtree hash, pattern). The
+/// result is a sparse tree, not a workspace — the current `ws` rides the
+/// continuation so the workspace is unchanged by a grep.
+#[allow(clippy::too_many_arguments)]
+fn launch_grep(
+    cfg: &Config,
+    call: &Value,
+    scope: &str,
+    scope_prefix: &str,
+    ws: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let pattern = call["input"]["pattern"]
+        .as_str()
+        .ok_or("grep call has no string `pattern` (precheck admits only those)")?;
+    let image = cfg
+        .grep_image
+        .as_ref()
+        .ok_or("launch_grep without a grep_image (drive guards this)")?;
+    let curried = caos_curry(image, &[("pattern", Arg::Lit(pattern))])?;
+    let me = self_curry(
+        step_path,
+        pending,
+        results,
+        id,
+        &[
+            ("current_tool", Arg::Lit("grep")),
+            ("ws", Arg::Path(ws)),
+            ("scope", Arg::Lit(scope_prefix)),
+        ],
+    )?;
+    run_then(scope, &curried, Some(&me))
 }
 
 /// Rebuild ourselves as `curry(image, bin, <config>, <loop state>)` — a
@@ -369,6 +446,7 @@ fn self_curry(
     pending: &[Value],
     results: &[Value],
     current_id: &str,
+    extras: &[(&str, Arg)],
 ) -> Result<String, String> {
     let pending_json = Value::Array(pending.to_vec()).to_string();
     let results_json = Value::Array(results.to_vec()).to_string();
@@ -389,13 +467,19 @@ fn self_curry(
         ("results", Arg::Lit(&results_json)),
         ("current_id", Arg::Lit(current_id)),
     ];
-    let optional: Vec<(&str, String)> = ["model", "base_url", "conversation"]
+    let optional: Vec<(&str, String)> = ["model", "base_url", "conversation", "grep_image"]
         .iter()
         .map(|name| (*name, arg(name)))
         .filter(|(_, p)| Path::new(p).exists())
         .collect();
     for (name, p) in &optional {
         kvs.push((name, Arg::Path(p)));
+    }
+    for (name, value) in extras {
+        kvs.push((name, match value {
+            Arg::Lit(s) => Arg::Lit(s),
+            Arg::Path(s) => Arg::Path(s),
+        }));
     }
     caos_curry(&arg("image"), &kvs)
 }
@@ -513,11 +597,14 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
-/// The full tool registry: bash (the one sub-run tool) plus the inline file
-/// tools (`tools.rs`).
-fn registry() -> Vec<Value> {
+/// The full tool registry: bash and grep (the sub-run tools) plus the inline
+/// file tools (`tools.rs`).
+fn registry(cfg: &Config) -> Vec<Value> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
+    if cfg.grep_image.is_some() {
+        tools.push(tools::grep_declaration());
+    }
     tools
 }
 
