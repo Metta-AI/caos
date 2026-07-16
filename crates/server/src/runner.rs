@@ -78,10 +78,15 @@ enum PollReply {
 
 /// What a dispatch is answered with (over its per-dispatch channel).
 enum Outcome {
-    /// The worker's `"<type> <hash>"` (possibly a `promise` the caller resolves).
-    Done(String),
+    /// The worker's result plus privacy-filtered numeric instrumentation.
+    Done(DispatchResult),
     /// The runner reported failure.
     Failed(String),
+}
+
+pub(crate) struct DispatchResult {
+    pub(crate) result: String,
+    pub(crate) stats: Option<serde_json::Value>,
 }
 
 /// A hanging `POST /runner/poll`, parked until matched, kicked, or expired.
@@ -200,7 +205,7 @@ pub(crate) fn dispatch(
     req: &str,
     arg_entries: ArgSet,
     image_ref: &str,
-) -> Result<String, HttpError> {
+) -> Result<DispatchResult, HttpError> {
     let (outcome_tx, outcome_rx) = mpsc::channel();
     let id = {
         let mut st = lock();
@@ -500,7 +505,10 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
     drop(st);
     let outcome = if v["ok"].as_bool() == Some(true) {
         match v["result"].as_str() {
-            Some(result) if !result.trim().is_empty() => Outcome::Done(result.trim().to_string()),
+            Some(result) if !result.trim().is_empty() => Outcome::Done(DispatchResult {
+                result: result.trim().to_string(),
+                stats: v.get("stats").cloned().filter(|value| !value.is_null()),
+            }),
             _ => Outcome::Failed("runner posted ok without a result".to_string()),
         }
     } else {

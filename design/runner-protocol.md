@@ -92,7 +92,7 @@ materialization of the job's args (see "container runner" below).
 ### `POST /runner/result`
 
 ```json
-{ "req": "...", "nonce": "...", "ok": true,  "result": "tree <hash>" }
+{ "req": "...", "nonce": "...", "ok": true,  "result": "tree <hash>", "stats": { "worker_elapsed_ms": 14 } }
 { "req": "...", "nonce": "...", "ok": false, "error": "...", "log": "<stderr tail>" }
 { "req": "...", "nonce": "...", "requeue": true }
 ```
@@ -101,6 +101,10 @@ First post per nonce wins; unknown/consumed nonce → 410, dropped. `requeue`
 returns the job to the pending table under a fresh nonce (for provision-style
 runners, below). A `promise <hash>` result flows through unchanged —
 `resolve_promise` runs in `run_req` after the rendezvous, as today.
+The container runner recognizes a `##worker-stats <json>` line in worker output,
+adds its own `worker_elapsed_ms`, and posts the object as `stats`. Invocation
+traces retain only numeric/boolean values from that object; strings and worker
+logs are excluded.
 
 **Reply responsibility follows the poll, but may be delegated**: the host
 agent polls job 1 and hands it to the container it starts; the *container*
