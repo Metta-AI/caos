@@ -208,7 +208,7 @@ valid conversation state a future resume could start from.
 ## Client
 
 Two verbs over one turn engine (implemented — `crates/caos/src/chat.rs`,
-tested end-to-end against the stub in `tests/chat`):
+tested end-to-end against the stub in `tests/chat-offline`):
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one
@@ -254,7 +254,7 @@ each new step's text blocks and `$ <cmd>` tool-call lines; a chain that roots
 at some other human commit is a stale ref and prints nothing. On success the
 turn commit is fetched (bringing the whole step chain — it's tree-reachable)
 and the ref advances; on failure the error prints and the ref is untouched —
-the human commit is harmlessly orphaned. `tests/smoke` runs one tiny real-API
+the human commit is harmlessly orphaned. `tests/chat-online` runs one tiny real-API
 turn as part of the regular suite (self-skipped unless `ANTHROPIC_API_KEY` is
 set — the only check the scripted stub can't make).
 
@@ -282,9 +282,9 @@ deadlines are comfortable; the top-level pending timeout
    progress ref push). **Done** (`crates/worker-llm-step`,
    `tests/llm-step` — end-to-end against a scripted stub API).
 5. `caos-cli chat` (human commits, conversation ref, progress printing).
-   **Done** (`crates/caos/src/chat.rs`, `tests/chat`; real-key smoke:
-   `tests/smoke`).
+   **Done** (`crates/caos/src/chat.rs`, `tests/chat-offline`; real-API turn:
+   `tests/chat-online`).
 6. `caos talk` + std-published worker curries — prompt-first surface, sticky
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
    published by build-builtins.sh so a turn needs nothing built or committed
-   locally. **Done** (same files; `tests/smoke` is the UX spec).
+   locally. **Done** (same files; `tests/chat-online` is the UX spec).

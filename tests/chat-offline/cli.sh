@@ -192,4 +192,4 @@ fi
 grep -q "positionally" talk-err || fail "prompt-conflict error not pointed: $(cat talk-err)"
 echo "  ok: pointed parse errors" >&2
 
-echo "chat: ALL PASS" >&2
+echo "chat-offline: ALL PASS" >&2

@@ -14,14 +14,14 @@
 set -euo pipefail
 
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "smoke: ANTHROPIC_API_KEY not set — SKIPPED (no real-API turn run)" >&2
+  echo "chat-online: ANTHROPIC_API_KEY not set — SKIPPED (no real-API turn run)" >&2
   exit 0
 fi
 
 # The human commit carries the client's git identity; pin one so the test
 # doesn't depend on host-global config.
-git config user.name smoke
-git config user.email smoke@caos
+git config user.name chat-online-test
+git config user.email chat-online-test@caos
 
 # Cheapest model that supports adaptive thinking (the worker always sends
 # thinking:{type:"adaptive"}; haiku-4-5 rejects it with a 400).
@@ -30,5 +30,5 @@ git config user.email smoke@caos
 
 # A fresh repo has no conversations, so talk auto-named the first one talk-1.
 git rev-parse -q --verify refs/caos/conversations/talk-1 >/dev/null \
-  || { echo "smoke: FAIL — conversation ref missing" >&2; exit 1; }
-echo "smoke: one real turn PASSED (conversation talk-1)" >&2
+  || { echo "chat-online: FAIL — conversation ref missing" >&2; exit 1; }
+echo "chat-online: one real turn PASSED (conversation talk-1)" >&2
