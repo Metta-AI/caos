@@ -41,13 +41,15 @@ const AGENT_AUTHOR: &str = "caos-agent";
 /// The client-owned conversation head ref, in the *local* repo.
 const CONV_REF_PREFIX: &str = "refs/caos/conversations/";
 
-/// The server-side per-step progress ref the worker pushes.
-const PROGRESS_REF_PREFIX: &str = "refs/caos/progress/";
-
-/// The server-side in-round status ref: a blob `"<human hash>\n<text>"` the
-/// worker force-updates around each API attempt (calling / retrying /
-/// answered-in). The hash scopes it to a turn, so a stale one is ignorable.
-const STATUS_REF_PREFIX: &str = "refs/caos/status/";
+/// A conversation's channels all live together under [`CONV_REF_PREFIX`]:
+/// `<name>` (the head, local, client-owned) plus two server-side refs the
+/// worker pushes — `<name>-progress` (the growing step chain) and
+/// `<name>-status` (a blob `"<human hash>\n<text>"` force-updated around each
+/// API attempt: calling / retrying / answered-in; the hash scopes it to a
+/// turn, so a stale one is ignorable). The suffixes are reserved in
+/// [`validated_refname`] so a conversation can't shadow another's channels.
+const PROGRESS_SUFFIX: &str = "-progress";
+const STATUS_SUFFIX: &str = "-status";
 
 /// The LLM API key rides in from the environment, never a flag (it would land
 /// in shell history and process listings).
@@ -74,8 +76,10 @@ const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspac
      tool to inspect and change files, declaring every path a command reads in `paths`. Keep \
      responses concise.";
 
-/// Seconds between progress-ref polls while the run blocks.
-const POLL_SECS: u64 = 2;
+/// Milliseconds between progress/status polls while the run blocks. Each poll
+/// is two `ls-remote`s plus a few object reads — cheap enough to keep short
+/// turns feeling live.
+const POLL_MS: u64 = 500;
 
 /// Which verb is parsing: they share every flag, but the positional argument
 /// is the conversation *name* for `chat` and the *prompt* for `talk`.
@@ -249,9 +253,18 @@ pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     }
 }
 
-/// The conversation ref for `name`, validated up front (the name becomes two
-/// ref components — conversation + progress — so let git check it).
+/// The conversation ref for `name`, validated up front (the name also becomes
+/// the `-progress`/`-status` channel refs, so let git check it — and reserve
+/// those suffixes, or conversation `foo-progress` would shadow `foo`'s
+/// channel).
 fn validated_refname(name: &str) -> Result<String, String> {
+    for suffix in [PROGRESS_SUFFIX, STATUS_SUFFIX] {
+        if name.ends_with(suffix) {
+            return Err(format!(
+                "conversation names ending in {suffix:?} are reserved (channel refs)"
+            ));
+        }
+    }
     let refname = format!("{CONV_REF_PREFIX}{name}");
     git_capture(&["check-ref-format", &refname], None)
         .map_err(|_| format!("invalid conversation name {name:?}"))?;
@@ -288,21 +301,23 @@ fn pick_conversation(a: &ChatArgs) -> Result<(String, bool), String> {
 }
 
 /// The most recently advanced conversation in this repo, by the head commit's
-/// committer date (turn commits carry wall-clock timestamps).
+/// committer date (turn commits carry wall-clock timestamps). Channel refs
+/// (`-progress`/`-status`) are server-side, but skip them defensively in case
+/// a broad fetch ever mirrored them here.
 fn latest_conversation() -> Result<Option<String>, String> {
     let out = git_capture(
         &[
             "for-each-ref",
             "--sort=-committerdate",
-            "--count=1",
             "--format=%(refname)",
             CONV_REF_PREFIX.trim_end_matches('/'),
         ],
         None,
     )?;
     Ok(out
-        .trim()
-        .strip_prefix(CONV_REF_PREFIX)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(CONV_REF_PREFIX))
+        .find(|name| !name.ends_with(PROGRESS_SUFFIX) && !name.ends_with(STATUS_SUFFIX))
         .map(str::to_string))
 }
 
@@ -448,12 +463,12 @@ fn turn(
     // it, the in-round status ref — what the API call is doing right now —
     // goes to stderr (transient meta, not conversation content).
     let http = HttpTransport { base: server };
-    let progress_ref = format!("{PROGRESS_REF_PREFIX}{name}");
-    let status_ref = format!("{STATUS_REF_PREFIX}{name}");
+    let progress_ref = format!("{CONV_REF_PREFIX}{name}{PROGRESS_SUFFIX}");
+    let status_ref = format!("{CONV_REF_PREFIX}{name}{STATUS_SUFFIX}");
     let mut printed: HashSet<String> = HashSet::new();
     let mut last_status: Option<String> = None;
     while !run.is_finished() {
-        for _ in 0..(POLL_SECS * 10) {
+        for _ in 0..(POLL_MS / 100) {
             if run.is_finished() {
                 break;
             }
@@ -557,7 +572,7 @@ fn rev_parse_opt(spec: &str) -> Result<Option<String>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Progress: follow refs/caos/progress/<name> while the run blocks.
+// Progress: follow the conversation's -progress ref while the run blocks.
 // ---------------------------------------------------------------------------
 
 /// One poll: read the progress ref off the server and print any new steps.

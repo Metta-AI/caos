@@ -17,8 +17,8 @@
 //! (the tool registry — just bash for now), and optionally `model` (default
 //! `claude-opus-4-8`), `base_url` (default `https://api.anthropic.com`;
 //! overridable so tests can point it at a stub), and `conversation` (a name;
-//! when present, each minted step pushes `refs/caos/progress/<conversation>`
-//! and each API attempt updates `refs/caos/status/<conversation>` — see
+//! when present, each minted step pushes `refs/caos/conversations/<name>-progress`
+//! and each API attempt updates `refs/caos/conversations/<name>-status` — see
 //! `progress.rs`). Continuation state, curried by ourselves: `step` (the
 //! current step commit), `pending` / `results` (JSON arrays of the remaining
 //! `tool_use` blocks and the collected `tool_result` blocks), and

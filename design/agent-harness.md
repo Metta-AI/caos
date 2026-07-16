@@ -186,7 +186,7 @@ and rides in job payloads; the runner-token auth is the fence.
 ## Progress
 
 The step chain grows in real time. The step worker pushes
-`refs/caos/progress/<conversation>` to the server's existing smart-HTTP
+`refs/caos/conversations/<name>-progress` (next to the conversation head, so a conversation's refs sit together) to the server's existing smart-HTTP
 transport after each step (when a `conversation` arg names one); the client
 watches a turn by polling `git fetch` on that ref. No new progress API, no
 enabling change: the server sets `http.receivepack=true` on its repo at
@@ -208,7 +208,7 @@ valid conversation state a future resume could start from.
 **In-round status** (finer than the step): the API call is the one slow,
 silent part of a turn — a toolless turn mints no step until it's over, and a
 rate-limited round sleeps invisibly. So the worker also force-updates
-`refs/caos/status/<conversation>` around each API attempt with a blob
+`refs/caos/conversations/<name>-status` around each API attempt with a blob
 `"<human hash>\n<text>"` — `calling <model>…`, `<why> — retrying in Ns
 (attempt M/4)`, `<model> answered in X.Xs` — over the same hand-rolled push
 (the blob goes up via `/object` first). The first line scopes the status to

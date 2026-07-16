@@ -136,9 +136,9 @@ grep -qF 'stdout:\nhi' stub/request-3.json || fail "read call's stdout missing"
 echo "  ok: verbatim replay, one user message per round's results" >&2
 
 echo "== progress ref points at the newest step ==" >&2
-adv=$(git ls-remote caos "refs/caos/progress/$conv" | cut -f1)
+adv=$(git ls-remote caos "refs/caos/conversations/$conv-progress" | cut -f1)
 [ "$adv" = "$step3" ] || fail "progress ref is '$adv', want $step3"
-echo "  ok: refs/caos/progress/$conv = step3" >&2
+echo "  ok: refs/caos/conversations/$conv-progress = step3" >&2
 
 echo "== a second turn replays the first from the commit chain ==" >&2
 human2=$(mkcommit "$turn^{tree}" "and now?" "$turn")

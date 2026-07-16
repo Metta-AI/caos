@@ -117,11 +117,11 @@ grep -qF "[$conv " turn1.out || fail "conversation/short-hash line not printed"
 echo "  ok: tool line, step text, response, hash line" >&2
 
 echo "== turn 1 pushed the in-round status ref ==" >&2
-# The worker brackets each API attempt with refs/caos/status/<conv> — a blob
+# The worker brackets each API attempt with refs/caos/conversations/<conv>-status — a blob
 # "<human hash>\n<text>". The stub answers in ms so the client's 2s poll
 # won't have printed it; assert the server-side ref and blob shape instead.
-status_tip=$(git ls-remote caos "refs/caos/status/$conv" | cut -f1)
-[ -n "$status_tip" ] || fail "no refs/caos/status/$conv on the server"
+status_tip=$(git ls-remote caos "refs/caos/conversations/$conv-status" | cut -f1)
+[ -n "$status_tip" ] || fail "no refs/caos/conversations/$conv-status on the server"
 git fetch -q caos "$status_tip"
 [ "$(git cat-file blob "$status_tip" | head -1)" = "$human1" ] \
   || fail "status blob not scoped to turn 1's human commit"

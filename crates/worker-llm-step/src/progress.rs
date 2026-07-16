@@ -1,9 +1,11 @@
-//! The observability refs, pushed server-side as the turn runs:
+//! The observability refs, pushed server-side as the turn runs. They live
+//! next to the conversation head (`refs/caos/conversations/<name>`) as
+//! suffixed siblings, so a conversation's refs all sit together:
 //!
-//! * `refs/caos/progress/<conversation>` — after each step commit, the
+//! * `refs/caos/conversations/<name>-progress` — after each step commit, the
 //!   growing step chain (also makes its commits reachable before the turn
 //!   completes).
-//! * `refs/caos/status/<conversation>` — a blob `"<human hash>\n<text>"`,
+//! * `refs/caos/conversations/<name>-status` — a blob `"<human hash>\n<text>"`,
 //!   force-updated around each API attempt (calling / retrying-in-Ns /
 //!   answered-in-Xs), so a slow round says *why* while nothing else moves.
 //!   The human hash lets a client ignore a previous turn's stale status.
@@ -28,23 +30,23 @@ const EMPTY_PACK: &[u8] = &[
 
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000";
 
-/// Point `refs/caos/progress/<conversation>` at `new_hash`, warning (never
+/// Point the conversation's `-progress` ref at `new_hash`, warning (never
 /// failing) on any error.
 pub fn push(conversation: &str, new_hash: &str) {
-    let refname = format!("refs/caos/progress/{conversation}");
+    let refname = format!("refs/caos/conversations/{conversation}-progress");
     if let Err(e) = try_push(&refname, new_hash) {
         eprintln!("llm-step: progress push for {conversation:?} failed (non-fatal): {e}");
     }
 }
 
-/// Report in-round status `text` under `refs/caos/status/<conversation>` (a
+/// Report in-round status `text` under the conversation's `-status` ref (a
 /// blob `"<head>\n<text>"`), warning (never failing) on any error. A no-op
 /// without a conversation name — nothing would be watching.
 pub fn status(conversation: Option<&str>, head: &str, text: &str) {
     let Some(conversation) = conversation else {
         return;
     };
-    let refname = format!("refs/caos/status/{conversation}");
+    let refname = format!("refs/caos/conversations/{conversation}-status");
     if let Err(e) =
         store_blob(&format!("{head}\n{text}")).and_then(|hash| try_push(&refname, &hash))
     {
