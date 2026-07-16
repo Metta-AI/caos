@@ -92,6 +92,9 @@ fn run() -> Result<(), String> {
 /// Start of a turn: `head` is the human-turn commit to answer.
 fn start(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
+    // First signal of the turn: everything before it is client/dispatch, the
+    // stretch from here to `calling <model>…` is transcript/workspace prep.
+    progress::status(cfg.conversation.as_deref(), &head_hash, "preparing the turn…");
     let head = read_commit(&arg("head"))?;
     let prior = prior_messages(&head)?;
 
@@ -116,6 +119,7 @@ fn start(cfg: &Config) -> Result<(), String> {
 /// the loop state rode our own curry.
 fn callback(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
+    progress::status(cfg.conversation.as_deref(), &head_hash, "folding the tool result in…");
     let step_hash = cas_hash(&arg("step"))?;
     let pending = parse_blocks(&read_arg("pending")?, "pending")?;
     let mut results = parse_blocks(&read_arg("results")?, "results")?;

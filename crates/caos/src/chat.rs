@@ -372,6 +372,15 @@ fn turn(
         .trim()
         .to_string();
 
+    // Client phases are usually sub-second; when one isn't, say so (stderr,
+    // like the worker's status lines) so a slow turn localizes itself.
+    let slow = |label: &str, started: std::time::Instant| {
+        let secs = started.elapsed().as_secs_f64();
+        if secs >= 1.0 {
+            eprintln!("· {label} took {secs:.1}s");
+        }
+    };
+
     // The workers: by default the std-published curries (`curry(runner, bin)`,
     // build-builtins.sh) — already server-side under refs/caos/std, nothing to
     // build or push. An explicit `--*-bin` override (the stub tests' path)
@@ -379,6 +388,7 @@ fn turn(
     // curry's hash is passed to llm-step as a *literal* (an image ref string),
     // so its closure doesn't ride in the request graph — push it (and the
     // runner image) explicitly.
+    let phase = std::time::Instant::now();
     let runner = match (&llm_bin, &bash_bin) {
         (None, None) => None,
         _ => Some(resolve_cli_image(t, RUNNER_IMAGE)?),
@@ -417,12 +427,15 @@ fn turn(
         None => resolve_cli_image(t, LLM_STEP_IMAGE)?,
     };
     let llm = curry_object(t, &llm_base, None, &kvs)?.to_string();
+    slow("resolving the workers", phase);
 
     // Build + push the request (this also pushes the human commit's closure —
     // the `:commit=` machinery), then trigger the blocking compute on its own
     // thread: request_compute needs only two strings, so the transport (and
     // the repo handle) stay on this thread for progress polling.
+    let phase = std::time::Instant::now();
     let req = prepare_request(t, &llm, None, &[format!("--head:commit={human}")])?;
+    slow("pushing the turn", phase);
     let server = t.server_url()?;
     let run = {
         let (server, req) = (server.clone(), req);
@@ -477,7 +490,9 @@ fn turn(
     // turn message, so the response is printed exactly once: either a poll
     // already showed the final step (skip the message), or the drain here
     // suppresses that step's text and the message is printed below.
+    let phase = std::time::Instant::now();
     fetch_object(&turn_hash)?;
+    slow("fetching the turn", phase);
     let mut show_message = true;
     if let Some(tail) = rev_parse_opt(&format!("{turn_hash}^2"))? {
         if printed.contains(&tail) {
