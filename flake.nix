@@ -956,7 +956,9 @@
                      "$CAOS_DATA/redis" "$CAOS_DATA/registry" 2>/dev/null || true
               ;;
             logs)
-              compose logs -f
+              # -t: runtime-recorded per-line timestamps — the daemons don't
+              # stamp their own lines, and a turn timeline needs them.
+              compose logs -f -t
               ;;
             *)
               echo "caosd: unknown command '$1'" >&2
