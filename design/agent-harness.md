@@ -254,8 +254,9 @@ each new step's text blocks and `$ <cmd>` tool-call lines; a chain that roots
 at some other human commit is a stale ref and prints nothing. On success the
 turn commit is fetched (bringing the whole step chain — it's tree-reachable)
 and the ref advances; on failure the error prints and the ref is untouched —
-the human commit is harmlessly orphaned. `tests/llm-step/smoke.sh` runs one
-tiny real-API turn (skipped unless `ANTHROPIC_API_KEY` is set).
+the human commit is harmlessly orphaned. `tests/smoke` runs one tiny real-API
+turn as part of the regular suite (self-skipped unless `ANTHROPIC_API_KEY` is
+set — the only check the scripted stub can't make).
 
 ## Caching / retry semantics
 
@@ -282,8 +283,8 @@ deadlines are comfortable; the top-level pending timeout
    `tests/llm-step` — end-to-end against a scripted stub API).
 5. `caos-cli chat` (human commits, conversation ref, progress printing).
    **Done** (`crates/caos/src/chat.rs`, `tests/chat`; real-key smoke:
-   `tests/llm-step/smoke.sh`).
+   `tests/smoke`).
 6. `caos talk` + std-published worker curries — prompt-first surface, sticky
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
    published by build-builtins.sh so a turn needs nothing built or committed
-   locally. **Done** (same files; smoke.sh is the UX spec).
+   locally. **Done** (same files; `tests/smoke` is the UX spec).
