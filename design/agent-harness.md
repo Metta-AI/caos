@@ -263,8 +263,13 @@ polls the progress ref every 2s (`ls-remote` for the tip, the `/object` API
 for the step commits, so nothing mid-turn lands in the local repo) and prints
 each new step's text blocks and `$ <cmd>` tool-call lines; a chain that roots
 at some other human commit is a stale ref and prints nothing. On success the
-turn commit is fetched (bringing the whole step chain — it's tree-reachable)
-and the ref advances; on failure the error prints and the ref is untouched —
+turn commit is fetched (bringing the whole step chain — it's tree-reachable;
+negotiated with the human commit as the sole tip, so the pack is this turn's
+new objects — a no-negotiation fetch re-downloads the base's entire history
+every turn, ~10s of index-pack CPU on a large repo, while a full multi-ref
+negotiation can go multi-round, which the smart-HTTP delegate has been seen
+to break on) and the ref advances; on failure the error prints and the ref
+is untouched —
 the human commit is harmlessly orphaned. `tests/chat-online` runs one tiny real-API
 turn as part of the regular suite (self-skipped unless `ANTHROPIC_API_KEY` is
 set — the only check the scripted stub can't make).

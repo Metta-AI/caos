@@ -28,7 +28,8 @@ use std::io::{IsTerminal, Read};
 use serde_json::Value;
 
 use super::{
-    curry_object, fetch_object, git_capture, prepare_request, request_compute, resolve_cli_image,
+    curry_object, fetch_object_negotiated, git_capture, prepare_request, request_compute,
+    resolve_cli_image,
     GitTransport, HttpTransport, Transport, CAOS_REMOTE,
 };
 
@@ -490,8 +491,11 @@ fn turn(
     // turn message, so the response is printed exactly once: either a poll
     // already showed the final step (skip the message), or the drain here
     // suppresses that step's text and the message is printed below.
+    // Negotiating with the human commit as the tip keeps the pack to this
+    // turn's new objects — a noop fetch would re-download the workspace
+    // closure (including the base's whole history) every turn.
     let phase = std::time::Instant::now();
-    fetch_object(&turn_hash)?;
+    fetch_object_negotiated(&turn_hash, &human)?;
     slow("fetching the turn", phase);
     let mut show_message = true;
     if let Some(tail) = rev_parse_opt(&format!("{turn_hash}^2"))? {

@@ -527,6 +527,32 @@ fn fetch_object(hash: &str) -> Result<(), String> {
     .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
 }
 
+/// Fetch object `hash` like [`fetch_object`], but negotiating with `tip` (a
+/// commit the server is known to hold — e.g. just pushed) as the only
+/// negotiation tip, so the pack carries only what's new *since* `tip` instead
+/// of `hash`'s entire closure.
+///
+/// Why not plain default negotiation: haves would walk every local ref and can
+/// go multi-round, which the smart-HTTP delegate has been seen to break on
+/// (see [`fetch_object`]'s noop rationale). A single tip the server certainly
+/// has is ACKed in the first round, so the negotiation stays single-round *and*
+/// the pack stays minimal — without it, a turn fetch in a repo with real
+/// history re-downloads the whole workspace closure every turn (measured:
+/// ~10s of index-pack CPU per turn on a large repo).
+pub(crate) fn fetch_object_negotiated(hash: &str, tip: &str) -> Result<(), String> {
+    run_git(&[
+        "-c",
+        "fetch.negotiationAlgorithm=default",
+        "fetch",
+        "--quiet",
+        "--negotiation-tip",
+        tip,
+        CAOS_REMOTE,
+        hash,
+    ])
+    .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+}
+
 /// Run `git` in the working repo and return its stdout; error on failure. With
 /// `index` set, `GIT_INDEX_FILE` points at a throwaway index (so `git add` /
 /// `write-tree` don't touch the real one). Used for both the network steps and
