@@ -1,0 +1,3 @@
+alpha needle one
+plain line
+needle again

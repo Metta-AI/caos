@@ -176,7 +176,9 @@ Tool classes:
   hint); the pattern is validated in llm-step BEFORE the sub-run launches,
   so a bad regex is an is_error tool_result, never a failed turn. A grep
   result is not a workspace: the pre-grep workspace rides the continuation
-  curry, and only bash results advance the tree.
+  curry, and only bash results advance the tree. `tests/rgrep` drives the
+  fold directly (sparse shape, binary skipping, file scope, empty tree,
+  cache hit); the LLM integration is covered in `tests/chat-offline`.
 - **ls/listing**: tree objects are names+oids — no content fetch at all.
 - **build/test**: the existing caos-native decompositions (rustc,
   deep-deps), not bash.
