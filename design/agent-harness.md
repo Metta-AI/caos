@@ -205,6 +205,17 @@ errors), the minted steps are orphaned but still reachable via the progress
 ref; a retry restarts from the human commit today, but the ref head is a
 valid conversation state a future resume could start from.
 
+**In-round status** (finer than the step): the API call is the one slow,
+silent part of a turn — a toolless turn mints no step until it's over, and a
+rate-limited round sleeps invisibly. So the worker also force-updates
+`refs/caos/status/<conversation>` around each API attempt with a blob
+`"<human hash>\n<text>"` — `calling <model>…`, `<why> — retrying in Ns
+(attempt M/4)`, `<model> answered in X.Xs` — over the same hand-rolled push
+(the blob goes up via `/object` first). The first line scopes the status to
+its turn, so a client can ignore a previous turn's leftover. The client polls
+it in the same 2s loop and prints changes to *stderr* (transient meta, not
+conversation content). Same best-effort contract as the progress ref.
+
 ## Client
 
 Two verbs over one turn engine (implemented — `crates/caos/src/chat.rs`,

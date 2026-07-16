@@ -12,7 +12,15 @@ const MAX_ATTEMPTS: u32 = 4;
 const TIMEOUT_SECS: u64 = 600;
 
 /// POST `body` to `{base_url}/v1/messages` and return the parsed response.
-pub fn post_messages(base_url: &str, api_key: &str, body: &Value) -> Result<Value, String> {
+/// `status` receives one line per notable wait (a retry and its delay) — the
+/// caller forwards it to the conversation's status ref so a slow round is
+/// observable, not silent.
+pub fn post_messages(
+    base_url: &str,
+    api_key: &str,
+    body: &Value,
+    status: &dyn Fn(&str),
+) -> Result<Value, String> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
     let payload = body.to_string();
     let mut attempt = 0;
@@ -53,10 +61,10 @@ pub fn post_messages(base_url: &str, api_key: &str, body: &Value) -> Result<Valu
                     Ok(resp) => format!("{} {}", resp.status_code, resp.reason_phrase),
                     Err(e) => e.to_string(),
                 };
-                eprintln!(
-                    "llm-step: POST {url}: {why}; retrying in {wait}s \
-                     (attempt {attempt}/{MAX_ATTEMPTS})"
-                );
+                let line =
+                    format!("{why} — retrying in {wait}s (attempt {attempt}/{MAX_ATTEMPTS})");
+                eprintln!("llm-step: POST {url}: {line}");
+                status(&line);
                 std::thread::sleep(std::time::Duration::from_secs(wait));
             }
             Ok(resp) => {

@@ -1,15 +1,21 @@
-//! The progress ref: after each step commit, push
-//! `refs/caos/progress/<conversation>` to the server so the growing step chain
-//! is observable (and its commits reachable) before the turn completes.
+//! The observability refs, pushed server-side as the turn runs:
+//!
+//! * `refs/caos/progress/<conversation>` — after each step commit, the
+//!   growing step chain (also makes its commits reachable before the turn
+//!   completes).
+//! * `refs/caos/status/<conversation>` — a blob `"<human hash>\n<text>"`,
+//!   force-updated around each API attempt (calling / retrying-in-Ns /
+//!   answered-in-Xs), so a slow round says *why* while nothing else moves.
+//!   The human hash lets a client ignore a previous turn's stale status.
 //!
 //! The worker image has no `git`, so this speaks just enough of the smart-HTTP
 //! receive-pack protocol directly: every object the ref needs is already on
-//! the server (the worker stored them via `/object` as it built them), so the
-//! push is a single ref update plus the well-known *empty* packfile. The old
-//! value comes from the receive-pack ref advertisement, exactly as git's own
-//! push would learn it.
+//! the server (the worker stored them via `/object` as it built them; the
+//! status blob is POSTed here the same way), so the push is a single ref
+//! update plus the well-known *empty* packfile. The old value comes from the
+//! receive-pack ref advertisement, exactly as git's own push would learn it.
 //!
-//! Best-effort by design: progress is observability, not correctness, so a
+//! Best-effort by design: both refs are observability, not correctness, so a
 //! failed push warns and moves on.
 
 /// The empty packfile: header (`PACK`, version 2, zero objects) plus its
@@ -25,16 +31,59 @@ const ZERO_HASH: &str = "0000000000000000000000000000000000000000";
 /// Point `refs/caos/progress/<conversation>` at `new_hash`, warning (never
 /// failing) on any error.
 pub fn push(conversation: &str, new_hash: &str) {
-    if let Err(e) = try_push(conversation, new_hash) {
+    let refname = format!("refs/caos/progress/{conversation}");
+    if let Err(e) = try_push(&refname, new_hash) {
         eprintln!("llm-step: progress push for {conversation:?} failed (non-fatal): {e}");
     }
 }
 
-fn try_push(conversation: &str, new_hash: &str) -> Result<(), String> {
+/// Report in-round status `text` under `refs/caos/status/<conversation>` (a
+/// blob `"<head>\n<text>"`), warning (never failing) on any error. A no-op
+/// without a conversation name — nothing would be watching.
+pub fn status(conversation: Option<&str>, head: &str, text: &str) {
+    let Some(conversation) = conversation else {
+        return;
+    };
+    let refname = format!("refs/caos/status/{conversation}");
+    if let Err(e) =
+        store_blob(&format!("{head}\n{text}")).and_then(|hash| try_push(&refname, &hash))
+    {
+        eprintln!("llm-step: status push for {conversation:?} failed (non-fatal): {e}");
+    }
+}
+
+/// Store `content` as a blob via the server's `/object` API, returning its
+/// hash (the same store the step objects go through).
+fn store_blob(content: &str) -> Result<String, String> {
+    let base = server_base()?;
+    let mut body = format!("blob {}\0", content.len()).into_bytes();
+    body.extend_from_slice(content.as_bytes());
+    let url = format!("{base}/object/");
+    let resp = minreq::post(&url)
+        .with_body(body)
+        .with_timeout(30)
+        .send()
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    if !(200..300).contains(&resp.status_code) {
+        return Err(format!(
+            "POST {url}: {} {}",
+            resp.status_code, resp.reason_phrase
+        ));
+    }
+    resp.as_str()
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("POST {url}: invalid response: {e}"))
+}
+
+fn server_base() -> Result<String, String> {
     let base =
         std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
-    let base = base.trim_end_matches('/');
-    let refname = format!("refs/caos/progress/{conversation}");
+    Ok(base.trim_end_matches('/').to_string())
+}
+
+fn try_push(refname: &str, new_hash: &str) -> Result<(), String> {
+    let base = server_base()?;
+    let base = base.as_str();
 
     // Learn the ref's current value from the receive-pack advertisement — the
     // update must name it as `old` or the server rejects the push.

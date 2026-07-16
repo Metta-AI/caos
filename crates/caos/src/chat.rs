@@ -43,6 +43,11 @@ const CONV_REF_PREFIX: &str = "refs/caos/conversations/";
 /// The server-side per-step progress ref the worker pushes.
 const PROGRESS_REF_PREFIX: &str = "refs/caos/progress/";
 
+/// The server-side in-round status ref: a blob `"<human hash>\n<text>"` the
+/// worker force-updates around each API attempt (calling / retrying /
+/// answered-in). The hash scopes it to a turn, so a stale one is ignorable.
+const STATUS_REF_PREFIX: &str = "refs/caos/status/";
+
 /// The LLM API key rides in from the environment, never a flag (it would land
 /// in shell history and process listings).
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -425,10 +430,14 @@ fn turn(
     };
 
     // While the run blocks, follow the worker's per-step progress ref and
-    // print each new step (assistant text + one-line tool calls).
+    // print each new step (assistant text + one-line tool calls); alongside
+    // it, the in-round status ref — what the API call is doing right now —
+    // goes to stderr (transient meta, not conversation content).
     let http = HttpTransport { base: server };
     let progress_ref = format!("{PROGRESS_REF_PREFIX}{name}");
+    let status_ref = format!("{STATUS_REF_PREFIX}{name}");
     let mut printed: HashSet<String> = HashSet::new();
+    let mut last_status: Option<String> = None;
     while !run.is_finished() {
         for _ in 0..(POLL_SECS * 10) {
             if run.is_finished() {
@@ -442,6 +451,8 @@ fn turn(
         if let Err(e) = poll_progress(&http, &progress_ref, &human, &mut printed) {
             eprintln!("chat: progress poll failed (non-fatal): {e}");
         }
+        // Best-effort by design, like the ref it reads.
+        let _ = poll_status(&http, &status_ref, &human, &mut last_status);
     }
 
     let outcome = run.join().map_err(|_| "the run thread panicked".to_string())?;
@@ -543,6 +554,38 @@ fn poll_progress(
         return Ok(()); // no ref yet
     };
     drain_steps(http, tip, human, printed, None)
+}
+
+/// One poll of the in-round status ref: print this turn's newest status line
+/// to stderr, once. The blob is `"<human hash>\n<text>"` — a first line that
+/// isn't this turn's human commit is a previous turn's stale status. `last`
+/// tracks the printed blob's hash (same hash = same text = already shown).
+fn poll_status(
+    http: &HttpTransport,
+    status_ref: &str,
+    human: &str,
+    last: &mut Option<String>,
+) -> Result<(), String> {
+    let out = git_capture(&["ls-remote", CAOS_REMOTE, status_ref], None)?;
+    let Some(tip) = out.split_whitespace().next().filter(|h| !h.is_empty()) else {
+        return Ok(()); // no ref yet
+    };
+    if last.as_deref() == Some(tip) {
+        return Ok(());
+    }
+    let (kind, content) = http.get_object(tip)?;
+    if kind != "blob" {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&content);
+    let Some((turn_root, line)) = text.split_once('\n') else {
+        return Ok(());
+    };
+    if turn_root == human {
+        eprintln!("· {}", line.trim_end());
+    }
+    *last = Some(tip.to_string());
+    Ok(())
 }
 
 /// Walk the step chain down from `tip` to the first known commit (`human`, or

@@ -18,7 +18,8 @@
 //! `claude-opus-4-8`), `base_url` (default `https://api.anthropic.com`;
 //! overridable so tests can point it at a stub), and `conversation` (a name;
 //! when present, each minted step pushes `refs/caos/progress/<conversation>`
-//! to the server). Continuation state, curried by ourselves: `step` (the
+//! and each API attempt updates `refs/caos/status/<conversation>` — see
+//! `progress.rs`). Continuation state, curried by ourselves: `step` (the
 //! current step commit), `pending` / `results` (JSON arrays of the remaining
 //! `tool_use` blocks and the collected `tool_result` blocks), and
 //! `current_id` (the in-flight call's `tool_use` id).
@@ -171,7 +172,18 @@ fn llm_round(
         "tools": [bash_tool()],
         "messages": messages,
     });
-    let resp = api::post_messages(&cfg.base_url, &cfg.api_key, &body)?;
+    // Bracket the API call with status-ref updates (progress::status): the
+    // call is the one silent, slow part of a turn, so say what it's doing —
+    // and, via the retry callback, why it's waiting.
+    let status = |text: &str| progress::status(cfg.conversation.as_deref(), head_hash, text);
+    status(&format!("calling {}…", cfg.model));
+    let started = std::time::Instant::now();
+    let resp = api::post_messages(&cfg.base_url, &cfg.api_key, &body, &status)?;
+    status(&format!(
+        "{} answered in {:.1}s",
+        cfg.model,
+        started.elapsed().as_secs_f64()
+    ));
     let stop = resp["stop_reason"].as_str().unwrap_or("").to_string();
     let blocks = resp["content"]
         .as_array()
