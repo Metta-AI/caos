@@ -120,8 +120,17 @@ messages; a toolless turn as its message text), POSTs `/v1/messages`, then:
 
 Tool classes:
 
-- **Tree surgery** (write/edit/mkdir): pure CAS linking, applied inline and
-  serially by the step worker. Not sub-runs.
+- **Inline tools** (implemented — `read`, `ls`, `write`, `edit`;
+  `worker-llm-step/src/tools.rs`): hash-level workspace operations the step
+  worker executes in-process — no sub-run, no container. Reads materialize
+  only the path they touch (bounded: 100KB / offset+limit; `ls` reads one
+  tree level); writes/edits rebuild the tree by symlinking every untouched
+  entry and `caos put`ting the result (mkdir is implicit). One call queue
+  drives both classes serially (`drive`): inline calls advance the workspace
+  in-process, a bash call tail-exits into its sub-run, and an
+  inline-tools-only round costs zero containers. Failures (missing file,
+  non-unique `old_string`) are `is_error` tool_results, not errors. Parameter
+  shapes mirror Claude Code's file tools, which models know well.
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
   includes the workspace tree **with `.caos/` stripped** — tools never see
   transcripts, and tool cache keys stay identical to real workspace trees.

@@ -13,8 +13,12 @@
 //!   one the same way; otherwise send all the results back in one user message
 //!   (the next LLM round) and continue as above.
 //!
+//! Tool calls are driven serially through one queue (`drive`): the inline file
+//! tools (read/ls/write/edit — `tools.rs`) execute in-process, advancing the
+//! workspace with no sub-run; only `bash` exits into a run-then sub-run.
+//!
 //! Curried configuration: `api_key`, `system` (the system prompt), `bash_image`
-//! (the tool registry — just bash for now), and optionally `model` (default
+//! (the sub-run tool's image), and optionally `model` (default
 //! `claude-opus-4-8`), `base_url` (default `https://api.anthropic.com`;
 //! overridable so tests can point it at a stub), and `conversation` (a name;
 //! when present, each minted step pushes `refs/caos/conversations/<name>-progress`
@@ -29,6 +33,7 @@
 
 mod api;
 mod progress;
+mod tools;
 
 use std::fs;
 use std::path::Path;
@@ -120,7 +125,6 @@ fn start(cfg: &Config) -> Result<(), String> {
 fn callback(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
     progress::status(cfg.conversation.as_deref(), &head_hash, "folding the tool result in…");
-    let step_hash = cas_hash(&arg("step"))?;
     let pending = parse_blocks(&read_arg("pending")?, "pending")?;
     let mut results = parse_blocks(&read_arg("results")?, "results")?;
     let current_id = read_arg("current_id")?;
@@ -135,21 +139,52 @@ fn callback(cfg: &Config) -> Result<(), String> {
     }
     caos(["get", &ws])?;
 
-    if let Some(call) = pending.first() {
-        // More calls pending: launch the next one, no LLM round in between.
-        launch(cfg, call, &ws, &arg("step"), &pending[1..], &results)
-    } else {
-        // Queue drained: all results go back in ONE user message and the next
-        // round fires.
-        let head = read_commit(&arg("head"))?;
-        let mut messages = prior_messages(&head)?;
-        messages.push(user_text(&head.message));
-        for step in step_chain(Some(&step_hash), &head_hash)? {
-            messages.extend(step_messages(&step));
+    drive(cfg, ws, &head_hash, &arg("step"), &pending, results)
+}
+
+/// Work through the call queue: inline tools (read/ls/write/edit) execute
+/// right here — the workspace advances in-process, no sub-run — while a bash
+/// call exits into its run-then sub-run (the tail call; `callback` re-enters
+/// this loop). A drained queue sends every result back in ONE user message
+/// (the API requires it) and fires the next LLM round.
+fn drive(
+    cfg: &Config,
+    mut ws: String,
+    head_hash: &str,
+    step_path: &str,
+    queue: &[Value],
+    mut results: Vec<Value>,
+) -> Result<(), String> {
+    let mut queue = queue.to_vec();
+    while let Some(call) = queue.first().cloned() {
+        let name = call["name"].as_str().unwrap_or("");
+        if name == "bash" {
+            return launch(cfg, &call, &ws, step_path, &queue[1..], &results);
         }
-        messages.push(message("user", Value::Array(results.clone())));
-        llm_round(cfg, messages, &ws, &head_hash, &step_hash, &results)
+        if !tools::is_inline(name) {
+            return Err(format!(
+                "model called unknown tool {name:?} (registered: bash, read, ls, write, edit)"
+            ));
+        }
+        let (block, new_ws) = tools::execute(&call, &ws)?;
+        results.push(block);
+        if let Some(w) = new_ws {
+            ws = w;
+        }
+        queue.remove(0);
     }
+
+    // Queue drained: rebuild the transcript (prior turns + this turn's step
+    // chain), append the results, next round.
+    let step_hash = cas_hash(step_path)?;
+    let head = read_commit(&arg("head"))?;
+    let mut messages = prior_messages(&head)?;
+    messages.push(user_text(&head.message));
+    for step in step_chain(Some(&step_hash), head_hash)? {
+        messages.extend(step_messages(&step));
+    }
+    messages.push(message("user", Value::Array(results.clone())));
+    llm_round(cfg, messages, &ws, head_hash, &step_hash, &results)
 }
 
 /// One LLM API round over `messages`, with `ws` the workspace CAS path the
@@ -173,7 +208,7 @@ fn llm_round(
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
         "system": cfg.system,
-        "tools": [bash_tool()],
+        "tools": registry(),
         "messages": messages,
     });
     // Bracket the API call with status-ref updates (progress::status): the
@@ -224,11 +259,11 @@ fn llm_round(
             Ok(())
         }
         "tool_use" => {
-            let Some(first) = tool_uses.first() else {
+            if tool_uses.is_empty() {
                 return Err("stop_reason tool_use but no tool_use blocks".to_string());
-            };
+            }
             let (_, step_path) = mint_step(cfg, ws, prev, sent_results, &blocks)?;
-            launch(cfg, first, ws, &step_path, &tool_uses[1..], &[])
+            drive(cfg, ws.to_string(), head_hash, &step_path, &tool_uses, Vec::new())
         }
         other => Err(format!(
             "LLM round ended with stop_reason {other:?} (only end_turn and tool_use \
@@ -296,9 +331,7 @@ fn launch(
 ) -> Result<(), String> {
     let name = call["name"].as_str().unwrap_or("");
     if name != "bash" {
-        return Err(format!(
-            "model called unknown tool {name:?} (only `bash` is registered)"
-        ));
+        return Err(format!("launch got non-bash tool {name:?} (drive routes those inline)"));
     }
     let id = call["id"]
         .as_str()
@@ -480,13 +513,23 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
+/// The full tool registry: bash (the one sub-run tool) plus the inline file
+/// tools (`tools.rs`).
+fn registry() -> Vec<Value> {
+    let mut tools = vec![bash_tool()];
+    tools.extend(tools::declarations());
+    tools
+}
+
 /// The bash tool's registry entry, steering the model into the declared-paths
 /// contract and the EACCES retry loop.
 fn bash_tool() -> Value {
     json!({
         "name": "bash",
         "description": "Run a shell command in the workspace (executed with `sh -c` from the \
-    workspace root). The workspace is materialized lazily: ONLY the files and directories you \
+    workspace root). Use this for COMMANDS (builds, tests, scripts); for plain file access \
+    prefer the read/ls/write/edit tools, which are immediate. The workspace is materialized \
+    lazily: ONLY the files and directories you \
     list in `paths` are readable — a command touching any other existing path fails with \
     'Permission denied' (EACCES), and the result names the unmaterialized paths it touched. \
     When that happens, retry the same command with those paths added to `paths`. Creating new \

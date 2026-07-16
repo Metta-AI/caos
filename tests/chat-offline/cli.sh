@@ -205,4 +205,56 @@ fi
 grep -q "positionally" talk-err || fail "prompt-conflict error not pointed: $(cat talk-err)"
 echo "  ok: pointed parse errors" >&2
 
+echo "== inline file tools: write/read/edit/ls in ONE round trip ==" >&2
+# Five calls in one response — four good, one bad edit — all inline: no bash
+# sub-run, so the whole batch costs exactly one extra API round (request-7
+# carries all five results). The bad edit must come back is_error, not fail
+# the turn.
+INLINE_CALLS='[
+ {"id":"tu_w","input":{"file_path":"notes/new.txt","content":"hello world"},"name":"write","type":"tool_use"},
+ {"id":"tu_r","input":{"file_path":"notes/new.txt"},"name":"read","type":"tool_use"},
+ {"id":"tu_e","input":{"file_path":"notes/new.txt","old_string":"hello","new_string":"goodbye"},"name":"edit","type":"tool_use"},
+ {"id":"tu_x","input":{"file_path":"notes/new.txt","old_string":"never there","new_string":"x"},"name":"edit","type":"tool_use"},
+ {"id":"tu_l","input":{"path":"notes"},"name":"ls","type":"tool_use"}]'
+printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$INLINE_CALLS" | tr -d '\n')" > stub/response-6.json
+printf '{"content":[{"text":"file tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-7.json
+"$CAOS_CLI" chat "$conv" -m "exercise the file tools" "${opts[@]}" > inline.out
+sed 's/^/  inline| /' inline.out >&2
+turn_inline=$(git rev-parse "refs/caos/conversations/$conv")
+[ "$(git show "$turn_inline:notes/new.txt")" = "goodbye world" ] \
+  || fail "write+edit did not land in the turn tree"
+[ "$(git show "$turn_inline:notes/todo.txt")" = "hello notes" ] || fail "sibling file lost"
+grep -qF "write notes/new.txt" inline.out || fail "write progress line missing"
+grep -qF "read notes/new.txt" inline.out || fail "read progress line missing"
+grep -qF "ls notes" inline.out || fail "ls progress line missing"
+grep -qF '"hello world"' stub/request-7.json || fail "read result (pre-edit content) not sent"
+grep -qF 'wrote notes/new.txt (11 bytes)' stub/request-7.json || fail "write result not sent"
+grep -qF 'edited notes/new.txt (1 replacement)' stub/request-7.json || fail "edit result not sent"
+grep -qF 'new.txt\ntodo.txt' stub/request-7.json || fail "ls listing not sent"
+grep -qF '"is_error":true' stub/request-7.json || fail "bad edit not marked is_error"
+grep -qF 'old_string not found' stub/request-7.json || fail "bad edit error not explained"
+[ ! -f stub/request-8.json ] || fail "inline tools cost extra LLM rounds"
+echo "  ok: five calls, one round trip, error as value, tree updated" >&2
+
+echo "== mixed queue: inline write -> bash sub-run -> inline edit ==" >&2
+# Order matters: bash must see the freshly written file, the edit must run on
+# bash's output tree. Exercises drive -> launch -> callback -> drive.
+MIXED_CALLS='[
+ {"id":"tu_mw","input":{"file_path":"mix.txt","content":"hello"},"name":"write","type":"tool_use"},
+ {"id":"tu_mb","input":{"cmd":"tr a-z A-Z < mix.txt > mix3.txt","paths":["mix.txt"]},"name":"bash","type":"tool_use"},
+ {"id":"tu_me","input":{"file_path":"mix.txt","old_string":"hello","new_string":"world"},"name":"edit","type":"tool_use"}]'
+printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > stub/response-8.json
+printf '{"content":[{"text":"mixed done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-9.json
+"$CAOS_CLI" chat "$conv" -m "mix inline and bash" "${opts[@]}" > mixed.out
+sed 's/^/  mixed| /' mixed.out >&2
+turn_mixed=$(git rev-parse "refs/caos/conversations/$conv")
+[ "$(git show "$turn_mixed:mix.txt")" = "world" ] || fail "post-bash edit did not land"
+[ "$(git show "$turn_mixed:mix3.txt")" = "HELLO" ] || fail "bash did not see the inline write"
+# The request also replays earlier turns' tool_results, so assert this
+# round's three results by id, in call order.
+seq=$(grep -o '"tool_use_id":"tu_m[wbe]"' stub/request-9.json | grep -o 'tu_m[wbe]' | paste -sd,)
+[ "$seq" = "tu_mw,tu_mb,tu_me" ] || fail "results missing or misordered: $seq"
+[ ! -f stub/request-10.json ] || fail "unexpected extra LLM round"
+echo "  ok: write -> bash -> edit, serial over one queue" >&2
+
 echo "chat-offline: ALL PASS" >&2

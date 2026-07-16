@@ -72,8 +72,9 @@ const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
 const AUTO_NAME_PREFIX: &str = "talk-";
 
 /// Default system prompt when neither `--system` nor `--system-file` is given.
-const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the bash \
-     tool to inspect and change files, declaring every path a command reads in `paths`. Keep \
+const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
+     read/ls/write/edit tools for file access — they are immediate. Use the bash tool to run \
+     commands (builds, tests, scripts), declaring every path a command reads in `paths`. Keep \
      responses concise.";
 
 /// Milliseconds between progress/status polls while the run blocks. Each poll
@@ -726,13 +727,14 @@ fn print_step(step: &Value, suppress_text: bool) {
                     println!("{text}");
                 }
             }
-            Some("tool_use") => {
-                if block["name"] == "bash" {
-                    println!("$ {}", block["input"]["cmd"].as_str().unwrap_or("?"));
-                } else {
-                    println!("[tool call: {}]", block["name"].as_str().unwrap_or("?"));
+            Some("tool_use") => match block["name"].as_str().unwrap_or("?") {
+                "bash" => println!("$ {}", block["input"]["cmd"].as_str().unwrap_or("?")),
+                name @ ("read" | "write" | "edit") => {
+                    println!("{name} {}", block["input"]["file_path"].as_str().unwrap_or("?"))
                 }
-            }
+                "ls" => println!("ls {}", block["input"]["path"].as_str().unwrap_or(".")),
+                other => println!("[tool call: {other}]"),
+            },
             _ => {}
         }
     }
