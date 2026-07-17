@@ -39,7 +39,7 @@
 
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use worker_common::{
@@ -53,15 +53,31 @@ const STREAM_CAP: usize = 100_000;
 /// bake ran in (fingerprints pin it), holding the pre-compiled `target/`.
 const WS_ROOT_FILE: &str = "/ws-root";
 
+mod decompose;
+
 fn main() -> ExitCode {
     run_worker("cargo", run)
 }
 
+/// `mode` selects flat (absent — today's whole-workspace behavior) or the
+/// per-crate decomposition (`all`, plus its internal `crate`/`job`/`combine`
+/// positions — see `decompose.rs`).
 fn run() -> Result<(), String> {
     let cmd = read_arg("cmd")?;
+    match read_arg_opt("mode")?.as_deref() {
+        None | Some("") => flat(&cmd),
+        Some("all") => decompose::all(&cmd),
+        Some("crate") => decompose::crate_mode(&cmd),
+        Some("job") => decompose::job(&cmd),
+        Some("combine") => decompose::combine(),
+        Some(other) => Err(format!("unknown mode {other:?}")),
+    }
+}
+
+fn flat(cmd: &str) -> Result<(), String> {
     let target = read_arg_opt("target")?;
     let profile = read_arg_opt("profile")?.unwrap_or_else(|| "dev".to_string());
-    let mut argv: Vec<&str> = match cmd.as_str() {
+    let mut argv: Vec<&str> = match cmd {
         "check" => vec!["check", "--workspace", "--all-targets"],
         "build" => vec!["build", "--workspace"],
         "test" => vec!["test", "--workspace"],
@@ -87,28 +103,10 @@ fn run() -> Result<(), String> {
     // target/. Fresh mtimes (fs::copy stamps now) keep cargo honest: newer
     // than every baked fingerprint, so workspace crates always recompile
     // while the deps stay fresh (their vendored sources sit at store epoch).
-    let ws = fs::read_to_string(WS_ROOT_FILE)
-        .map_err(|e| format!("reading {WS_ROOT_FILE}: {e}"))?
-        .trim()
-        .to_string();
+    let ws = ws_root()?;
     materialize(Path::new(&tree), Path::new(&ws))?;
 
-    // Point cargo at the baked vendor dir: the same source-replacement config
-    // the bake used, appended into a writable CARGO_HOME (the image env sets
-    // CARGO_HOME=/tmp/cargo; the vendor config's store path is stable, which
-    // is what keeps the deps fingerprints valid).
-    let cargo_home = scratch("cargo")?;
-    let vendor_config = std::env::var("CAOS_VENDOR_CONFIG")
-        .map_err(|_| "CAOS_VENDOR_CONFIG not set (not the cargo worker image?)".to_string())?;
-    fs::copy(&vendor_config, cargo_home.join("config.toml"))
-        .map_err(|e| format!("copying vendor config: {e}"))?;
-
-    let out = Command::new("cargo")
-        .args(&argv)
-        .arg("--offline")
-        .current_dir(&ws)
-        .output()
-        .map_err(|e| format!("running cargo: {e}"))?;
+    let out = run_cargo(&argv, &ws)?;
     let exit = exit_code(&out.status);
 
     let res = scratch("result")?;
@@ -119,6 +117,41 @@ fn run() -> Result<(), String> {
         stage_binaries(&ws, target.as_deref(), &profile, &res)?;
     }
     caos(["put", path(&res), "/cas/out"])
+}
+
+/// The baked workspace root (recorded by the image build; fingerprints pin it).
+pub(crate) fn ws_root() -> Result<String, String> {
+    Ok(fs::read_to_string(WS_ROOT_FILE)
+        .map_err(|e| format!("reading {WS_ROOT_FILE}: {e}"))?
+        .trim()
+        .to_string())
+}
+
+/// Run cargo with `argv` + `--offline` in `ws`, after pointing a writable
+/// CARGO_HOME at the baked vendor config (idempotent; the vendor's store path
+/// is stable, which is what keeps the deps fingerprints valid).
+pub(crate) fn run_cargo(argv: &[&str], ws: &str) -> Result<std::process::Output, String> {
+    let cargo_home = PathBuf::from("/tmp/cargo");
+    fs::create_dir_all(&cargo_home).map_err(|e| format!("creating cargo home: {e}"))?;
+    let vendor_config = std::env::var("CAOS_VENDOR_CONFIG")
+        .map_err(|_| "CAOS_VENDOR_CONFIG not set (not the cargo worker image?)".to_string())?;
+    // fs::copy preserves the store file's read-only mode, so a second run in
+    // the same container (a dep job checks then builds) must clear the first
+    // copy before overwriting.
+    let config = cargo_home.join("config.toml");
+    if let Err(e) = fs::remove_file(&config) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("clearing vendor config: {e}"));
+        }
+    }
+    fs::copy(&vendor_config, &config).map_err(|e| format!("copying vendor config: {e}"))?;
+
+    Command::new("cargo")
+        .args(argv)
+        .arg("--offline")
+        .current_dir(ws)
+        .output()
+        .map_err(|e| format!("running cargo: {e}"))
 }
 
 /// Stage the build's executables into `res/bin/<name>` — what a
@@ -158,7 +191,7 @@ fn stage_binaries(ws: &str, target: Option<&str>, profile: &str, res: &Path) -> 
 /// baked `target/`); a top-level `target` entry in the input is skipped —
 /// it's build output (gitignored in any sane workspace), and letting it
 /// shadow the baked artifacts would defeat the image.
-fn materialize(src: &Path, ws: &Path) -> Result<(), String> {
+pub(crate) fn materialize(src: &Path, ws: &Path) -> Result<(), String> {
     for entry in entries(path(src))? {
         if file_name(&entry) == "target" {
             continue;
@@ -168,7 +201,7 @@ fn materialize(src: &Path, ws: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_into(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn copy_into(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
     if meta.file_type().is_symlink() {
         let dest = fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
@@ -187,7 +220,7 @@ fn copy_into(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Cargo's exit code — or 128+signal when it died to one.
-fn exit_code(status: &std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
         .code()
@@ -197,7 +230,7 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 
 /// The tail of a captured stream, capped at [`STREAM_CAP`] bytes (with a
 /// marker so a truncated stream is recognizable as such).
-fn tail(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn tail(bytes: &[u8]) -> Vec<u8> {
     if bytes.len() <= STREAM_CAP {
         return bytes.to_vec();
     }

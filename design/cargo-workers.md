@@ -103,30 +103,45 @@ bounded interim violation of the never-materialize rule (the source is small;
 
 ### Phase 2 — per-crate decomposition
 
-deep-deps is the model — it was effectively designed as this prototype:
+deep-deps is the model — it was effectively designed as this prototype. As
+implemented (`worker-cargo/src/decompose.rs`, `mode=all` + internal
+`crate`/`job`/`combine` positions):
 
-- a **plan** step reads the workspace manifests and derives the crate DAG
-  (deep-deps' `DEPS` map, from `Cargo.toml`s instead of files);
-- **`build(crate)`** on the deepen/finish shape: map-then over the crate's
-  workspace deps with itself; `finish` = `cargo build -p <crate>` with dep
-  artifacts assembled from `--children`. Cache key = (crate source subtree,
-  manifests, dep artifacts, toolchain image). Rlibs are MB-scale — fine for
-  CAS;
-- **`test(crate)`** gets the same keying, so unit tests for untouched crates
-  are free.
+- **`all`** maps over the workspace members and combines per-member results
+  into the flat modes' `{exit, stdout, stderr}` — callers (the agent tools)
+  can't tell the difference.
+- **`crate`** is cheap orchestration, whole-tree-keyed *on purpose* (it
+  re-runs on any edit, compiles nothing): parse manifests, compute the
+  member's dep closure, **prune** the workspace to what its build reads —
+  root manifest + lockfile + every member manifest + the closure's sources,
+  all CAS links — and map-then over the direct deps with itself (`cmd=dep`)
+  into a `job`.
+- **`job`** is the compile, keyed on (pruned tree, children, name, cmd) —
+  the narrow key that buys incrementality. Own sources fresh-mtimed,
+  everything else epoch (sound *because* content-addressing guarantees the
+  children artifacts were built from exactly these bytes), non-closure
+  members stubbed via their declared target paths, children's `target/`
+  merged beside the baked crates.io artifacts, then `cargo <cmd> -p X`.
+  A dep job's result is `{target: own delta ∪ children's}`, so parents merge
+  only direct deps; a **failed dep propagates as a value** — its
+  `{exit, stdout, stderr}` becomes the dependent's result uncompiled, so
+  diagnostics bubble to the top attributed to the crate that broke.
 
-Edit `worker-rgrep` → rebuild one crate. Edit `worker-common` → it plus
-dependents, siblings in parallel as map children.
-
-**Spike first:** cargo fingerprint portability — can a target dir assembled
-from cached per-crate pieces convince `cargo -p` not to rebuild? Fallbacks if
-cargo fights us: `--emit=metadata` pipelining, or driving rustc directly
-(bazel-style; heavy; last resort). This is the phase's main technical risk,
-so the spike starts early, alongside phase 1.
+Edit `worker-rgrep` → recompile one crate. Edit `worker-common` → it plus
+dependents, siblings in parallel as map children. Untouched members: cache
+hits on their `job` keys.
 
 The workspace DAG has diamonds (`worker-common`), so map-then's deferred
-**single-flight** open item gets real: without it, concurrent parents each
-recompile shared deps. Pull that fix into this phase.
+**single-flight** open item got real — implemented in the server
+(`compute.rs`): identical concurrent requests share one run; a parked waiter
+that times out falls back to running independently, so a cross-thread cycle
+degrades to duplicate work + a clean stack-based cycle error, never a hang.
+
+Known cost: the orchestration (`crate`) jobs re-run on every edit — roughly
+one container per (member, dep-position) pair, deduped by single-flight.
+That's the deliberate deep-deps trade (narrow compile keys bought with cheap
+whole-tree-keyed coordination); if the container-spawn tax bites, batching
+the deepen positions is the lever.
 
 ### rustc re-layered on cargo
 

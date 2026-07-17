@@ -9,3 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 worker-common = { path = "../worker-common" }
+# Manifest parsing for the per-crate decomposition (members, path deps,
+# explicit target paths). Default features off: we only read.
+toml = { version = "0.8", default-features = false, features = ["parse"] }

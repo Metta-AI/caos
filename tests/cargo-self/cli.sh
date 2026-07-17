@@ -35,3 +35,26 @@ echo "  ok: workspace checks clean (${took}ms)" >&2
 # only the ~15 workspace crates (tens of seconds); a fingerprint regression
 # recompiles ~170 deps and blows well past this. Generous for slow machines.
 [ "$took" -lt 300000 ] || fail "self-check took ${took}ms — baked deps likely not reused"
+
+echo "== per-crate (mode=all): cold, then a one-crate edit ==" >&2
+t2=$(ms)
+"$CAOS_CLI" run /cas/std/cargo r2 -- --tree:@=ws --cmd=check --mode=all
+t3=$(ms)
+[ "$(cat r2/exit)" = "0" ] || fail "mode=all check failed: $(tail -c 2000 r2/stderr)"
+cold=$((t3 - t2))
+echo "  ok: per-crate check clean (${cold}ms cold)" >&2
+
+# Edit one leaf crate: its jobs (and orchestration) re-run; every other
+# member's compile is a cache hit. The tripwire is wall-clock: an edit run
+# far cheaper than the cold one. (The remaining cost is the orchestration
+# jobs, which are whole-tree-keyed by design.)
+echo "// tripwire edit" >> ws/crates/worker-rgrep/src/main.rs
+commit "edit one crate"
+t4=$(ms)
+"$CAOS_CLI" run /cas/std/cargo r3 -- --tree:@=ws --cmd=check --mode=all
+t5=$(ms)
+[ "$(cat r3/exit)" = "0" ] || fail "edited mode=all check failed: $(tail -c 2000 r3/stderr)"
+edit=$((t5 - t4))
+echo "  ok: one-crate edit checked (${edit}ms vs ${cold}ms cold)" >&2
+[ "$edit" -lt $((cold / 2)) ] \
+  || fail "one-crate edit (${edit}ms) not much cheaper than cold (${cold}ms) — per-crate caching regressed"
