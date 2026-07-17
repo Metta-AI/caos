@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base)
+[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv)
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
 # runs us from a store copy with no `nix` at runtime), else built from the flake.

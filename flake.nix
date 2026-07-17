@@ -469,6 +469,52 @@
           fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
+        # The "testenv" worker (design/cargo-workers.md, phase 3): the bash
+        # script worker's sibling, for jobs that run a whole INNER caos stack
+        # — a per-test job starts the edited server + a process-mode runnerd
+        # (chroot slots) inside its own container and drives a test against
+        # them. Differences from `bash`: git rides along (the inner server's
+        # smart-HTTP transport and the inner client repo need it), and the
+        # config grants CAOS_WORKER_UID=0 — the script runs as ROOT, which the
+        # inner stack requires (setuid installs into the slots, chroot). That
+        # grant is per-image containment policy: only jobs run on THIS image
+        # get it; every other worker keeps the uid-1000 fence.
+        workerTestenvRoot = pkgs.buildEnv {
+          name = "caos-worker-testenv-root";
+          paths = [
+            workerBashScript
+            linuxPkgs.bash
+            linuxPkgs.coreutils
+            linuxPkgs.diffutils
+            linuxPkgs.gnugrep
+            linuxPkgs.findutils
+            linuxPkgs.gitMinimal
+          ];
+        };
+        workerTestenvConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "runner"
+          ];
+          Env = [
+            "PATH=/bin"
+            # The root grant (see above): caos runner reads these and skips
+            # the uid-1000 drop for this image's jobs.
+            "CAOS_WORKER_UID=0"
+            "CAOS_WORKER_GID=0"
+          ];
+        };
+        workerTestenvImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-testenv";
+          tag = "latest";
+          contents = [
+            workerTestenvRoot
+            workerBaseRoot
+          ];
+          config = workerTestenvConfig;
+          fakeRootCommands = installWorkerFiles;
+        };
+
         # The cargo toolchain BASE image (design/cargo-workers.md, phases 0–1):
         # the pinned toolchain + the workspace's deps pre-compiled, with the
         # runner trampoline at /worker. The cargo worker itself is published as
@@ -855,6 +901,7 @@
           workerDeepDepsImage
           workerRunnerImage
           cargoBaseImage
+          workerTestenvImage
         ];
 
         # The agent-harness worker binaries build-builtins.sh publishes as
@@ -1050,6 +1097,7 @@
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-runner-docker = workerRunnerImage;
           caos-worker-cargo-base-docker = cargoBaseImage;
+          caos-worker-testenv-docker = workerTestenvImage;
         };
 
         apps = {

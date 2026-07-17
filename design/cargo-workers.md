@@ -205,6 +205,35 @@ worker child to uid 1000 exactly as in a container, so owner-only `/cas`
 placeholders, setuid `caos`, and bash-tool's EACCES/`denied` behavior all
 reproduce without namespaces.
 
+**Caos-in-caos (built):** the `testenv` image — the bash script worker plus
+git, with `CAOS_WORKER_UID=0` in its config: the per-image containment grant
+that lets its jobs run as root, which the inner stack needs (setuid installs
+into the slots, chroot). `tests/test-in-caos` runs the whole inner flow —
+edited server + process runnerd + a recursive fold — *as a caos worker job*
+keyed on (script, built binaries): the first run costs ~17s, the identical
+re-run 61ms. That is the tests-as-jobs contract demonstrated on itself; the
+remaining work is mechanical — a per-test harness script parameterized over
+`tests/<name>`, fixture binaries as args (with a `nix` shim for tests that
+build fixtures), a thin process-mode `std` published inside (each entry
+`curry(dummy, bin=<binary>)`), and a `test-all` map. Two isolation lessons are
+load-bearing, both from the same root cause — a nested stack shares the
+outer's ambient environment:
+
+- The runner hands worker scripts the OUTER run's `CAOS_STD`/`CAOS_SALT`; an
+  inner client that inherits them builds requests naming a std tree the inner
+  server has never seen. Inner harnesses unset both.
+- **A nested stack must not share the outer redis.** The worker's container
+  sits on the outer `caos-net`, where `caos-redis` resolves — but the result
+  cache maps *request-hash → object-hash*, and object presence is per-repo.
+  Request hashes are content-addressed, so an inner computation collides with
+  an outer one and gets a cache hit pointing at an object that lives only in
+  the outer git repo: the pin fails ("nonexistent object"), the fetch fails
+  ("not our ref"). Two stacks may share a redis **only if they share the git
+  repo**. The inner server points `CAOS_REDIS_ADDR` at a dead port — errors
+  read as misses, every result computed in and pinned from the inner repo.
+  (Insidious failure mode: the first run *populates* the poison and passes;
+  every run after it fails.)
+
 Each `tests/<name>` becomes one job keyed on (server bin, cli bin, std
 workers, test tree); a `test-all` worker maps over `tests/` — parallel, and
 a test whose inputs didn't change never re-runs. That's also the CI story.
