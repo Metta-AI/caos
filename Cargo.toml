@@ -11,6 +11,7 @@ members = [
     "crates/worker-deep-deps",
     "crates/worker-rustc",
     "crates/worker-runner",
+    "crates/worker-cargo",
     "crates/worker-bash-tool",
     "crates/worker-llm-step",
     "crates/worker-rgrep",

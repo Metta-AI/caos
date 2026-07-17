@@ -1,0 +1,11 @@
+[package]
+name = "worker-cargo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "worker-cargo"
+path = "src/main.rs"
+
+[dependencies]
+worker-common = { path = "../worker-common" }

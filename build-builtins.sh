@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps rustc runner)
+[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps rustc runner cargo-base)
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
 # runs us from a store copy with no `nix` at runtime), else built from the flake.
@@ -149,8 +149,17 @@ fi
 # pushes the curry; the std ref push below pins both. Prebuilt store paths
 # arrive via CAOS_BUILTIN_BINS (how caosd avoids runtime nix), else they're
 # nix-built here. Skipped when `runner` isn't among the names (a partial,
-# name-scoped run has no image to curry onto).
-bin_names=(bash-tool llm-step rgrep)
+# name-scoped run has no image to curry onto). Most bins curry onto the shared
+# runner; `cargo` curries onto its toolchain base (bin_base — the same move at
+# a different base: the heavy, rarely-changing image is keyed on
+# toolchain+lockfile, and a worker rebuild ships one blob).
+bin_names=(bash-tool llm-step rgrep cargo)
+bin_base() { # worker binary -> the image its std curry binds it into
+  case "$1" in
+    cargo) echo "cargo-base" ;;
+    *) echo "runner" ;;
+  esac
+}
 if [ -n "${hash_of[runner]:-}" ]; then
   if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
     bin_paths=$CAOS_BUILTIN_BINS
@@ -171,11 +180,14 @@ if [ -n "${hash_of[runner]:-}" ]; then
   done
   for b in "${bin_names[@]}"; do
     [ -n "${bin_path[$b]:-}" ] || { echo "build-builtins: no binary built for worker-$b" >&2; exit 1; }
+    base=$(bin_base "$b")
+    # A name-scoped run may not have imported this bin's base image; skip.
+    [ -n "${hash_of[$base]:-}" ] || continue
     # Ingestion only accepts git-tracked worktree paths, so stage a copy of
     # the binary in the client repo (overwritten on every publish).
     install -m 755 "${bin_path[$b]}/bin/worker-$b" "$CLIENT/worker-$b"
     git -C "$CLIENT" add "worker-$b"
-    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[runner]}" -- "--bin:@=worker-$b")
+    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--bin:@=worker-$b")
     echo "$b: curry ${hash_of[$b]}" >&2
     names+=("$b")
   done

@@ -1639,6 +1639,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "worker-cargo"
+version = "0.1.0"
+dependencies = [
+ "worker-common",
+]
+
+[[package]]
 name = "worker-common"
 version = "0.1.0"
 

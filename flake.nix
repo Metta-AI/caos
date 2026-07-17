@@ -125,6 +125,7 @@
         worker-deep-deps = crateBin "worker-deep-deps";
         worker-rustc = crateBin "worker-rustc";
         worker-runner = crateBin "worker-runner";
+        worker-cargo = crateBin "worker-cargo";
         # The agent-harness workers (design/agent-harness.md). They have no
         # image of their own: each runs as curry(runner, bin=<static binary>)
         # in the shared runner pool, so only the binaries are exposed.
@@ -536,6 +537,105 @@
           fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
+        # The cargo toolchain BASE image (design/cargo-workers.md, phases 0–1):
+        # the pinned toolchain + the workspace's deps pre-compiled, with the
+        # runner trampoline at /worker. The cargo worker itself is published as
+        # `curry(cargo-base, bin=worker-cargo)` (build-builtins.sh) — the
+        # runner-pool move — so this image is keyed on (toolchain, lockfile)
+        # only and a caos source change ships one small binary blob, never a
+        # re-import of these layers. Unlike
+        # rustc (thin delta on a stock base), this image is SELF-CONTAINED nix:
+        # cargo fingerprints are keyed on the exact compiler build, and dep
+        # artifacts contain proc-macro dylibs / build-script binaries linked
+        # against the compiling toolchain's glibc — so the toolchain that baked
+        # the deps must be the toolchain that uses them. A stock rust base
+        # can't satisfy that; the pinned nix toolchain can. The cost is a big
+        # image through the git import, paid once per toolchain/lockfile bump.
+        #
+        # `minimal` (rustc+cargo+host std) keeps clippy/rustfmt/rust-src out of
+        # the image; it resolves the same version as rust-toolchain.toml's
+        # `stable` channel because both come from the one flake.lock'd
+        # rust-overlay revision.
+        cargoWorkerToolchain = linuxPkgs.rust-bin.stable.latest.minimal;
+        craneLibCargoWorker = (crane.mkLib linuxPkgs).overrideToolchain cargoWorkerToolchain;
+
+        # The vendored crates.io sources for the workspace's Cargo.lock, plus
+        # crane's source-replacement config pointing at them. A store path —
+        # the same absolute path at bake time and in-container, which the
+        # fingerprints require.
+        cargoWorkerVendor = craneLibCargoWorker.vendorCargoDeps { inherit src; };
+
+        # Every workspace dependency pre-compiled (check + build + test-deps,
+        # dev profile) against crane's DUMMY workspace sources — keyed on
+        # manifests + lockfile only, so source edits never re-bake. The worker
+        # re-materializes real sources at the same absolute root with fresh
+        # mtimes: deps stay fingerprint-fresh, workspace crates always rebuild.
+        cargoWorkerDeps = craneLibCargoWorker.buildDepsOnly {
+          inherit src;
+          pname = "caos-cargo";
+          version = "0.1.0";
+          strictDeps = true;
+          cargoVendorDir = cargoWorkerVendor;
+          # dev profile: what the worker's plain `cargo check/build/test` use.
+          CARGO_PROFILE = "dev";
+          # Smaller debuginfo (file:line in backtraces, no full DWARF). The
+          # image env repeats it: a profile mismatch is a silent full rebuild.
+          CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
+          cargoExtraArgs = "--locked --workspace";
+          # Record the sandbox workspace root: fingerprints are absolute-path
+          # keyed, so the worker must rebuild the workspace at this exact path
+          # (the image inflates target/ there; the worker reads /ws-root).
+          postInstall = ''echo -n "$PWD" > $out/ws-root'';
+        };
+
+        # The image root: the runner trampoline at /worker (the actual cargo
+        # worker binary arrives as the curried `bin` arg) plus the baked
+        # target/ inflated at the exact workspace root the bake used. The
+        # toolchain, cc and vendor ride the image closure via the config
+        # references below.
+        cargoBaseRootEnv =
+          pkgs.runCommand "caos-worker-cargo-base-root" { nativeBuildInputs = [ pkgs.zstd ]; }
+            ''
+              mkdir -p $out
+              cp ${workerRoot "worker-runner" worker-runner}/worker $out/worker
+              wsroot=$(cat ${cargoWorkerDeps}/ws-root)
+              mkdir -p "$out$wsroot"
+              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$wsroot"
+              cp ${cargoWorkerDeps}/ws-root $out/ws-root
+            '';
+        cargoBaseConfig = {
+          Entrypoint = [
+            "/bin/caos"
+            "runner"
+          ];
+          Env = [
+            # The pinned toolchain and a C linker (for build/test binaries; the
+            # same cc-wrapper the bake's build scripts and proc macros linked
+            # under, so everything resolves against one glibc).
+            "PATH=${cargoWorkerToolchain}/bin:${linuxPkgs.stdenv.cc}/bin:/bin"
+            # A writable home; the worker copies the vendor config here.
+            "CARGO_HOME=/tmp/cargo"
+            "CAOS_VENDOR_CONFIG=${cargoWorkerVendor}/config.toml"
+            # Must match the bake (see cargoWorkerDeps).
+            "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
+          ];
+        };
+        cargoBaseImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-cargo-base";
+          tag = "latest";
+          contents = [
+            cargoBaseRootEnv
+            workerBaseRoot
+          ];
+          config = cargoBaseConfig;
+          fakeRootCommands = installWorkerFiles + ''
+            # The workspace root must be writable by the (uid 1000) worker:
+            # it materializes sources there and cargo writes target/.
+            wsroot=$(cat ws-root)
+            chown -R 1000:1000 ".$wsroot"
+          '';
+        };
+
         # The caos server: storage *and* compute in one process (it serves
         # /object from a git repo and /run by matching jobs to polling runners —
         # it runs no containers itself; that's runnerd's job). It shells out to
@@ -825,6 +925,7 @@
           workerDeepDepsImage
           workerRustcImage
           workerRunnerImage
+          cargoBaseImage
         ];
 
         # The agent-harness worker binaries build-builtins.sh publishes as
@@ -834,6 +935,9 @@
           worker-bash-tool
           worker-llm-step
           worker-rgrep
+          # Published as curry(cargo-base, bin) — see bin_base in
+          # build-builtins.sh.
+          worker-cargo
         ];
 
         # The dev stack's control command. Subcommands:
@@ -990,6 +1094,7 @@
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
+          inherit worker-cargo;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)
@@ -1007,6 +1112,7 @@
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-rustc-docker = workerRustcImage;
           caos-worker-runner-docker = workerRunnerImage;
+          caos-worker-cargo-base-docker = cargoBaseImage;
         };
 
         apps = {

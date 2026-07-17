@@ -39,6 +39,7 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `worker-common` | — | Shared library for the Rust workers. |
 | `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
 | `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, bin)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
+| `worker-cargo` | — (run as `curry(cargo-base, bin)`) | Whole-workspace `cargo check/build/test` atop the `caos-worker-cargo-base` toolchain image (pinned toolchain + pre-compiled deps) — the agent's `build`/`test` tools. See `design/cargo-workers.md`. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
 
 ## Prerequisites
