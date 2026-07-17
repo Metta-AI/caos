@@ -508,7 +508,10 @@ fn launch_cargo(
         .cargo_image
         .as_ref()
         .ok_or("launch_cargo without a cargo_image (drive guards this)")?;
-    let curried = caos_curry(image, &[("cmd", Arg::Lit(cmd))])?;
+    // mode=all: the per-crate decomposition (one cached job per workspace
+    // member) rather than the flat whole-workspace run — an edit recompiles
+    // the edited crate and its dependents, everything else is cache hits.
+    let curried = caos_curry(image, &[("cmd", Arg::Lit(cmd)), ("mode", Arg::Lit("all"))])?;
     let me = self_curry(
         step_path,
         pending,
