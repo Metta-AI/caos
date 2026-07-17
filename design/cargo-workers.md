@@ -185,15 +185,25 @@ No docker-in-docker is needed for most of the suite, because the server
 never launches containers — **runners long-poll it** (pull-based dispatch,
 `runner-protocol.md`). Docker enters only at runnerd's exec edge. So the
 process backend is a **process-mode runnerd**: the same poll/claim/result
-loop, but fork/exec the worker binary with a per-run `/cas` dir instead of
-`docker run`. The dispatch protocol — the part worth testing — is exercised
-for real. runnerd is small; keep the shared/docker split in that crate
-clean, because the shared half is tested inside and the docker half isn't.
+loop, but the "container" is a **chroot slot** (built as implemented —
+`CAOS_RUNNER_MODE=process`): each slot carries the setuid `caos` at
+`/bin/caos`, the runner-pool trampoline as `/worker`, a `/tmp`, and a
+`/dev/null` (a plain file — the one thing a bare chroot lacked that docker
+gave for free: Command stdio opens it *before* exec, and its absence
+masquerades as "worker not found"). A job runs `caos runner --job=…`
+chrooted into its slot — the whole existing lifecycle unchanged, warm
+follow-up polling included. Every runnable worker is a `curry(_, bin=…)`;
+the server pairs with `CAOS_IMAGE_RESOLVE=none` (images pass through
+unconverted — no registry, and no redis either, since the cache is
+best-effort). Requires root + `CAP_SYS_CHROOT`: a stock container, even
+rootless-podman, no extra grants — validated end to end by
+`tests/proc-stack` (inner server + process runnerd + a recursive rgrep fold
+through map-then promises, in a stock `debian:stable-slim`).
 
-The uid fence survives: the test container runs as root and process-runnerd
-spawns workers as an unprivileged uid, so owner-only `/cas` placeholders,
-setuid `caos`, and bash-tool's EACCES/`denied` behavior all reproduce without
-namespaces.
+The uid fence survives: the harness runs as root and `caos runner` drops the
+worker child to uid 1000 exactly as in a container, so owner-only `/cas`
+placeholders, setuid `caos`, and bash-tool's EACCES/`denied` behavior all
+reproduce without namespaces.
 
 Each `tests/<name>` becomes one job keyed on (server bin, cli bin, std
 workers, test tree); a `test-all` worker maps over `tests/` — parallel, and

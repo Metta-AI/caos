@@ -1030,6 +1030,9 @@
           # orchestrator (curry(runner, bin)) — build-builtins.sh needs the
           # binaries exposed.
           inherit worker-cargo worker-rustc;
+          # The runner-pool trampoline binary, exposed for the process-mode
+          # backend (it becomes each chroot slot's /worker; tests/proc-stack).
+          inherit worker-runner;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)
