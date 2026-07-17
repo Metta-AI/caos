@@ -31,9 +31,17 @@ PROJECT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$PROJECT"
 [ -f "$DIR/cli.sh" ] || { echo "no cli.sh in $DIR" >&2; exit 2; }
 
-echo "building caos client..." >&2
-nix build .#caos-cli -o result-caos
-caosbin=$PROJECT/result-caos/bin/caos-cli
+# The CLI: a prebuilt binary if the caller injected one (CAOS_CLI — run-all.sh
+# builds it ONCE and exports it, sparing a per-test flake eval; same pattern as
+# build-builtins.sh), else built here so a bare `tests/run.sh <dir>` stays
+# self-contained.
+if [ -n "${CAOS_CLI:-}" ]; then
+  caosbin=$CAOS_CLI
+else
+  echo "building caos client..." >&2
+  nix build .#caos-cli -o result-caos
+  caosbin=$PROJECT/result-caos/bin/caos-cli
+fi
 # The project root, for tests that need to build more flake outputs (e.g. the
 # llm-step suite builds its worker binaries and stub server with nix).
 export CAOS_PROJECT=$PROJECT
@@ -46,11 +54,16 @@ export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
 # Bring the whole stack up and publish std (idempotent + warm-fast): starts
 # caos-server, the runner, redis and the registry, and publishes all of std, so
 # the test reaches any builtin as /cas/std/<name>. A repeat `up` (e.g. once per
-# test under run-all.sh) is a no-op bring-up + cache-hit republish; the stack is
-# left running for the next test. CAOS_DATA (gitignored) persists it warm.
+# test under run-all.sh) is a no-op bring-up + cache-hit republish — but even
+# the no-op costs a flake eval, so a caller that just did it (run-all.sh, or a
+# shell iterating on one test) exports CAOS_STACK_READY=1 to skip it. The skip
+# trusts the caller that the stack matches the tree. CAOS_DATA (gitignored)
+# persists it warm.
 export CAOS_DATA="${CAOS_DATA:-$PROJECT/.caos-data}"
-echo "bringing the stack up (caosd up)..." >&2
-nix run .#caosd -- up >&2
+if [ -z "${CAOS_STACK_READY:-}" ]; then
+  echo "bringing the stack up (caosd up)..." >&2
+  nix run .#caosd -- up >&2
+fi
 
 # A throwaway client repo with the server as its `caos` remote (the host CLI
 # pushes the run request from here). A failing assertion exits the worker

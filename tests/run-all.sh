@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Run every integration test — each tests/<name>/ that has a cli.sh — via run.sh.
 #
-# run.sh is self-contained (it does `caosd up` itself), so this just discovers
-# the test dirs, runs each, and summarizes. The stack is brought up once (cold)
-# by the first test and stays warm for the rest, so the repeated `caosd up`s are
-# near-instant. Per-test CAOS_SALT keeps runs independent, so no reset is needed
-# between them. Leaves the stack running; `caosd down` stops it.
+# The per-test ceremony is hoisted here and done ONCE: build the CLI, bring the
+# stack up (cold the first time, a warm no-op after), then hand both to each
+# run.sh via CAOS_CLI + CAOS_STACK_READY — sparing every test its two flake
+# evals and cache-hit republish. run.sh stays self-contained when invoked bare
+# (it does the ceremony itself when the env is absent). Per-test CAOS_SALT
+# keeps runs independent, so no reset is needed between them. Leaves the stack
+# running; `caosd down` stops it.
 #
 # Usage: tests/run-all.sh
 # Exits non-zero if any test fails.
@@ -14,6 +16,13 @@ cd "$(dirname "$0")/.."
 
 mapfile -t dirs < <(for d in tests/*/; do [ -f "$d/cli.sh" ] && printf '%s\n' "${d%/}"; done)
 [ "${#dirs[@]}" -gt 0 ] || { echo "no tests found under tests/" >&2; exit 2; }
+
+echo "building caos client + bringing the stack up (once for the suite)..." >&2
+nix build .#caos-cli -o result-caos || exit 1
+export CAOS_CLI=$PWD/result-caos/bin/caos-cli
+export CAOS_DATA="${CAOS_DATA:-$PWD/.caos-data}"
+nix run .#caosd -- up >&2 || exit 1
+export CAOS_STACK_READY=1
 
 pass=(); fail=()
 for t in "${dirs[@]}"; do
