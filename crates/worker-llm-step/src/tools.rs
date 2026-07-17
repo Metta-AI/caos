@@ -40,8 +40,8 @@ pub fn declarations() -> Vec<Value> {
         json!({
             "name": "read",
             "description": "Read a file from the workspace. Returns the raw content. Prefer \
-    this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files \
-    are truncated; use `offset`/`limit` (line-based) to page.",
+        this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files \
+        are truncated; use `offset`/`limit` (line-based) to page.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -55,7 +55,7 @@ pub fn declarations() -> Vec<Value> {
         json!({
             "name": "ls",
             "description": "List a workspace directory: one entry per line, directories with a \
-    trailing `/`. Prefer this over `ls` via bash.",
+        trailing `/`. Prefer this over `ls` via bash.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -66,7 +66,7 @@ pub fn declarations() -> Vec<Value> {
         json!({
             "name": "write",
             "description": "Write a file into the workspace (creating parent directories, \
-    overwriting an existing file). Prefer this over heredocs/redirection via bash.",
+        overwriting an existing file). Prefer this over heredocs/redirection via bash.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -79,8 +79,8 @@ pub fn declarations() -> Vec<Value> {
         json!({
             "name": "edit",
             "description": "Replace text in a workspace file. `old_string` must match the file \
-    content exactly and (unless `replace_all`) appear exactly once — include surrounding \
-    context to disambiguate. Prefer this over sed via bash.",
+        content exactly and (unless `replace_all`) appear exactly once — include surrounding \
+        context to disambiguate. Prefer this over sed via bash.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -117,6 +117,65 @@ pub fn grep_declaration() -> Value {
     })
 }
 
+/// The cargo tools' registry entries (present only when a `cargo_image` is
+/// curried — see `Config`): `build` and `test`, whole-workspace cargo runs as
+/// run-then sub-runs of the cargo worker (design/cargo-workers.md). No
+/// parameters: the workspace tree is the input, and identical trees are cache
+/// hits — a no-change rebuild is free.
+pub fn cargo_declarations() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "build",
+            "description": "Compile-check the workspace (`cargo check --workspace --all-targets`, \
+        offline, in a toolchain container with the workspace's dependencies pre-built). Returns \
+        cargo's diagnostics; an unchanged workspace is a cache hit. Prefer this over cargo via bash.",
+            "input_schema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "test",
+            "description": "Build and run the workspace's tests (`cargo test --workspace`, \
+        offline, in a toolchain container with the workspace's dependencies pre-built). Returns \
+        the test report and diagnostics; an unchanged workspace is a cache hit. Prefer this over \
+        cargo via bash.",
+            "input_schema": {"type": "object", "properties": {}}
+        }),
+    ]
+}
+
+/// The tool_result block for a finished cargo run: exit code + the captured
+/// streams (each already tailed to 100KB by the worker), trimmed again to the
+/// transcript budget. Nonzero exit renders `is_error`, so the model treats
+/// diagnostics as something to fix.
+pub fn cargo_result_block(id: &str, result: &str) -> Result<Value, String> {
+    let _ = caos(["get", "-r", result]);
+    let read = |name: &str| -> Result<String, String> {
+        let p = Path::new(result).join(name);
+        if !p.exists() {
+            return Ok(String::new());
+        }
+        fs::read_to_string(&p).map_err(|e| format!("reading {}: {e}", p.display()))
+    };
+    let exit: i32 = read("exit")?.trim().parse().unwrap_or(-1);
+    let stdout = read("stdout")?;
+    let stderr = read("stderr")?;
+
+    let mut text = format!("exit {exit}\n");
+    for (label, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
+        if !stream.trim().is_empty() {
+            text += &format!("── {label} ──\n{}\n", stream.trim_end());
+        }
+    }
+    if text.len() > MAX_READ_BYTES {
+        // Keep the tail: cargo puts the error summary last.
+        let mut cut = text.len() - MAX_READ_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text = format!("[... truncated ...]\n{}", &text[cut..]);
+    }
+    Ok(block(id, text.trim_end(), exit != 0))
+}
+
 /// Validate a grep call before its sub-run launches: the pattern must compile
 /// and the scope must exist. Returns the scope's CAS path and its
 /// workspace-relative prefix (`""` for the root) — or, on a user mistake, the
@@ -130,7 +189,10 @@ pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> 
     if let Err(e) = regex::Regex::new(pattern) {
         return fail(format!("invalid pattern: {e}"));
     }
-    match call["input"]["path"].as_str().filter(|p| !p.trim().is_empty()) {
+    match call["input"]["path"]
+        .as_str()
+        .filter(|p| !p.trim().is_empty())
+    {
         None => Ok((ws.to_string(), String::new())),
         Some(_) => {
             let comps = match components(call, "path") {
@@ -160,10 +222,7 @@ pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, S
         if text.is_empty() {
             return Ok(block(id, "no matches", false));
         }
-        let rendered: String = text
-            .lines()
-            .map(|l| format!("{scope}:{l}\n"))
-            .collect();
+        let rendered: String = text.lines().map(|l| format!("{scope}:{l}\n")).collect();
         return Ok(block(id, rendered.trim_end(), false));
     }
 
@@ -278,10 +337,7 @@ fn read(call: &Value, ws: &str) -> Result<String, Fail> {
     let comps = components(call, "file_path")?;
     let p = materialize(ws, &comps)?;
     if p.is_dir() {
-        return Err(User(format!(
-            "{} is a directory; use ls",
-            comps.join("/")
-        )));
+        return Err(User(format!("{} is a directory; use ls", comps.join("/"))));
     }
     let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
     let total = bytes.len();
@@ -316,7 +372,10 @@ fn read(call: &Value, ws: &str) -> Result<String, Fail> {
 }
 
 fn ls(call: &Value, ws: &str) -> Result<String, Fail> {
-    let dir = match call["input"]["path"].as_str().filter(|p| !p.trim().is_empty()) {
+    let dir = match call["input"]["path"]
+        .as_str()
+        .filter(|p| !p.trim().is_empty())
+    {
         None => PathBuf::from(ws),
         Some(_) => materialize(ws, &components(call, "path")?)?,
     };
@@ -338,7 +397,9 @@ fn ls(call: &Value, ws: &str) -> Result<String, Fail> {
     let total = lines.len();
     if total > MAX_ENTRIES {
         lines.truncate(MAX_ENTRIES);
-        lines.push(format!("[truncated: first {MAX_ENTRIES} of {total} entries]"));
+        lines.push(format!(
+            "[truncated: first {MAX_ENTRIES} of {total} entries]"
+        ));
     }
     if lines.is_empty() {
         return Ok("(empty directory)".to_string());
@@ -378,7 +439,10 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
         .map(|m| m.permissions().mode())
         .map_err(|e| Infra(format!("stat {}: {e}", p.display())))?;
     let text = String::from_utf8(bytes).map_err(|_| {
-        User(format!("{} is not valid UTF-8; edit only text files", comps.join("/")))
+        User(format!(
+            "{} is not valid UTF-8; edit only text files",
+            comps.join("/")
+        ))
     })?;
 
     let count = text.matches(old).count();
@@ -402,7 +466,11 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
     let new_ws = rebuild(ws, &comps, replaced.as_bytes(), Some(mode))?;
     let n = if replace_all { count } else { 1 };
     Ok((
-        format!("edited {} ({n} replacement{})", comps.join("/"), if n == 1 { "" } else { "s" }),
+        format!(
+            "edited {} ({n} replacement{})",
+            comps.join("/"),
+            if n == 1 { "" } else { "s" }
+        ),
         new_ws,
     ))
 }
@@ -466,12 +534,7 @@ fn materialize(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
 /// 0644): at each level every untouched entry is symlinked (staging resolves
 /// links by recorded hash — nothing else materializes) and the target
 /// component is descended into or written. Returns the new workspace CAS path.
-fn rebuild(
-    ws: &str,
-    comps: &[String],
-    content: &[u8],
-    mode: Option<u32>,
-) -> Result<String, Fail> {
+fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
     let dir = scratch(&format!("inline-{}", counter())).map_err(Fail::from_infra)?;
     build_level(Some(Path::new(ws)), &dir, comps, content, mode)?;
     let out = fresh("ws-inline");

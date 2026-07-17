@@ -29,8 +29,7 @@ use serde_json::Value;
 
 use super::{
     curry_object, fetch_object_negotiated, git_capture, prepare_request, request_compute,
-    resolve_cli_image,
-    GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -69,15 +68,20 @@ const RUNNER_IMAGE: &str = "/cas/std/runner";
 const BASH_TOOL_IMAGE: &str = "/cas/std/bash-tool";
 const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
 const RGREP_IMAGE: &str = "/cas/std/rgrep";
+/// The cargo worker's std image (its own toolchain image, not a runner curry;
+/// design/cargo-workers.md) — the `build`/`test` tools. Optional: a stack
+/// whose std predates it just doesn't register them.
+const CARGO_IMAGE: &str = "/cas/std/cargo";
 
 /// Auto-named conversations (`talk` with no `-c`): `talk-1`, `talk-2`, …
 const AUTO_NAME_PREFIX: &str = "talk-";
 
 /// Default system prompt when neither `--system` nor `--system-file` is given.
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
-     read/ls/write/edit tools for file access and grep to search. Use the bash tool to run \
-     commands (builds, tests, scripts), declaring every path a command reads in `paths`. Keep \
-     responses concise.";
+     read/ls/write/edit tools for file access and grep to search. For a cargo workspace, \
+     prefer the build/test tools (cached, offline) over cargo via bash. Use the bash tool to \
+     run other commands (scripts, generators), declaring every path a command reads in \
+     `paths`. Keep responses concise.";
 
 /// Milliseconds between progress/status polls while the run blocks. Each poll
 /// is two `ls-remote`s plus a few object reads — cheap enough to keep short
@@ -221,10 +225,7 @@ pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     if a.log {
         return print_log(&name, &refname);
     }
-    eprintln!(
-        "[conversation {name}{}]",
-        if fresh { " — new" } else { "" }
-    );
+    eprintln!("[conversation {name}{}]", if fresh { " — new" } else { "" });
     if let Some(prompt) = &a.message {
         return turn(t, &a, &name, &refname, prompt);
     }
@@ -366,9 +367,11 @@ fn turn(
             // (step transcripts live there): refuse to start a conversation
             // over a tree that already carries one.
             if rev_parse_opt(&format!("{base}:.caos"))?.is_some() {
-                return Err("the base commit's tree contains a top-level `.caos` entry, which \
+                return Err(
+                    "the base commit's tree contains a top-level `.caos` entry, which \
                      is reserved for the agent harness; start from a tree without one"
-                    .to_string());
+                        .to_string(),
+                );
             }
             base
         }
@@ -438,6 +441,11 @@ fn turn(
         None => resolve_cli_image(t, RGREP_IMAGE)?,
     };
 
+    // Optional: a stack whose std predates the cargo worker simply doesn't
+    // register the build/test tools (llm-step treats a missing cargo_image
+    // that way too).
+    let cargo_image = resolve_cli_image(t, CARGO_IMAGE).ok();
+
     let mut kvs = vec![
         format!("--api_key={api_key}"),
         format!("--system={system}"),
@@ -445,6 +453,9 @@ fn turn(
         format!("--grep_image={grep_image}"),
         format!("--conversation={name}"),
     ];
+    if let Some(cargo) = &cargo_image {
+        kvs.push(format!("--cargo_image={cargo}"));
+    }
     if let Some(model) = &a.model {
         kvs.push(format!("--model={model}"));
     }
@@ -503,7 +514,9 @@ fn turn(
         let _ = poll_status(&http, &status_ref, &human, &mut last_status);
     }
 
-    let outcome = run.join().map_err(|_| "the run thread panicked".to_string())?;
+    let outcome = run
+        .join()
+        .map_err(|_| "the run thread panicked".to_string())?;
     let (kind, turn_hash) = match outcome {
         Ok(result) => result,
         Err(e) => {
@@ -511,9 +524,7 @@ fn turn(
             // conversation ref is untouched (the human commit is harmlessly
             // orphaned — see design/agent-harness.md).
             let _ = poll_progress(&http, &progress_ref, &human, &mut printed);
-            return Err(format!(
-                "turn failed; {refname} was not advanced.\n{e}"
-            ));
+            return Err(format!("turn failed; {refname} was not advanced.\n{e}"));
         }
     };
     if kind != "commit" {
@@ -748,7 +759,10 @@ fn print_step(step: &Value, suppress_text: bool) {
             Some("tool_use") => match block["name"].as_str().unwrap_or("?") {
                 "bash" => println!("$ {}", block["input"]["cmd"].as_str().unwrap_or("?")),
                 name @ ("read" | "write" | "edit") => {
-                    println!("{name} {}", block["input"]["file_path"].as_str().unwrap_or("?"))
+                    println!(
+                        "{name} {}",
+                        block["input"]["file_path"].as_str().unwrap_or("?")
+                    )
                 }
                 "ls" => println!("ls {}", block["input"]["path"].as_str().unwrap_or(".")),
                 "grep" => {

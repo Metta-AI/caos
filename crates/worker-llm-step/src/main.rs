@@ -66,6 +66,9 @@ struct Config {
     /// The rgrep fold worker's image; the `grep` tool is registered only when
     /// present (older curries without it keep working).
     grep_image: Option<String>,
+    /// The cargo worker's image (design/cargo-workers.md); the `build`/`test`
+    /// tools are registered only when present.
+    cargo_image: Option<String>,
     model: String,
     base_url: String,
     conversation: Option<String>,
@@ -78,6 +81,7 @@ impl Config {
             system: read_arg("system")?,
             bash_image: read_arg("bash_image")?,
             grep_image: read_arg_opt("grep_image")?,
+            cargo_image: read_arg_opt("cargo_image")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
             base_url: read_arg_opt("base_url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
@@ -103,7 +107,11 @@ fn start(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
     // First signal of the turn: everything before it is client/dispatch, the
     // stretch from here to `calling <model>…` is transcript/workspace prep.
-    progress::status(cfg.conversation.as_deref(), &head_hash, "preparing the turn…");
+    progress::status(
+        cfg.conversation.as_deref(),
+        &head_hash,
+        "preparing the turn…",
+    );
     let head = read_commit(&arg("head"))?;
     let prior = prior_messages(&head)?;
 
@@ -128,7 +136,11 @@ fn start(cfg: &Config) -> Result<(), String> {
 /// the loop state rode our own curry.
 fn callback(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
-    progress::status(cfg.conversation.as_deref(), &head_hash, "folding the tool result in…");
+    progress::status(
+        cfg.conversation.as_deref(),
+        &head_hash,
+        "folding the tool result in…",
+    );
     let pending = parse_blocks(&read_arg("pending")?, "pending")?;
     let mut results = parse_blocks(&read_arg("results")?, "results")?;
     let current_id = read_arg("current_id")?;
@@ -141,7 +153,20 @@ fn callback(cfg: &Config) -> Result<(), String> {
     let ws = match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
-            results.push(tools::grep_result_block(&current_id, &arg("result"), &scope)?);
+            results.push(tools::grep_result_block(
+                &current_id,
+                &arg("result"),
+                &scope,
+            )?);
+            let ws = arg("ws");
+            caos(["get", &ws])?;
+            ws
+        }
+        // A cargo result ({exit, stdout, stderr}) is diagnostics, not a
+        // workspace: cargo writes only target/, so the pre-run workspace rode
+        // our curry, exactly like grep.
+        "build" | "test" => {
+            results.push(tools::cargo_result_block(&current_id, &arg("result"))?);
             let ws = arg("ws");
             caos(["get", &ws])?;
             ws
@@ -191,15 +216,25 @@ fn drive(
                 }
                 Ok((scope, prefix)) => {
                     return launch_grep(
-                        cfg, &call, &scope, &prefix, &ws, step_path, &queue[1..], &results,
+                        cfg,
+                        &call,
+                        &scope,
+                        &prefix,
+                        &ws,
+                        step_path,
+                        &queue[1..],
+                        &results,
                     )
                 }
             }
         }
+        if matches!(name, "build" | "test") && cfg.cargo_image.is_some() {
+            return launch_cargo(cfg, &call, name, &ws, step_path, &queue[1..], &results);
+        }
         if !tools::is_inline(name) {
             return Err(format!(
                 "model called unknown tool {name:?} \
-                 (registered: bash, grep, read, ls, write, edit)"
+                 (registered: bash, grep, build, test, read, ls, write, edit)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -299,7 +334,14 @@ fn llm_round(
                 return Err("stop_reason tool_use but no tool_use blocks".to_string());
             }
             let (_, step_path) = mint_step(cfg, ws, prev, sent_results, &blocks)?;
-            drive(cfg, ws.to_string(), head_hash, &step_path, &tool_uses, Vec::new())
+            drive(
+                cfg,
+                ws.to_string(),
+                head_hash,
+                &step_path,
+                &tool_uses,
+                Vec::new(),
+            )
         }
         other => Err(format!(
             "LLM round ended with stop_reason {other:?} (only end_turn and tool_use \
@@ -367,7 +409,9 @@ fn launch(
 ) -> Result<(), String> {
     let name = call["name"].as_str().unwrap_or("");
     if name != "bash" {
-        return Err(format!("launch got non-bash tool {name:?} (drive routes those inline)"));
+        return Err(format!(
+            "launch got non-bash tool {name:?} (drive routes those inline)"
+        ));
     }
     let id = call["id"]
         .as_str()
@@ -391,7 +435,13 @@ fn launch(
     let in_path = fresh("toolin");
     caos(["put", path(&dir), &in_path])?;
 
-    let me = self_curry(step_path, pending, results, id, &[("current_tool", Arg::Lit("bash"))])?;
+    let me = self_curry(
+        step_path,
+        pending,
+        results,
+        id,
+        &[("current_tool", Arg::Lit("bash"))],
+    )?;
     run_then(&in_path, &cfg.bash_image, Some(&me))
 }
 
@@ -436,6 +486,39 @@ fn launch_grep(
     run_then(scope, &curried, Some(&me))
 }
 
+/// Launch a cargo run (`build` → check, `test` → test) as a run-then sub-run
+/// of the cargo worker: the input is the workspace tree itself and the cargo
+/// subcommand rides curried on the image, so the run caches on exactly
+/// (workspace tree, subcommand). The result is diagnostics, not a workspace —
+/// the current `ws` rides the continuation, unchanged by the run.
+fn launch_cargo(
+    cfg: &Config,
+    call: &Value,
+    name: &str,
+    ws: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let cmd = if name == "test" { "test" } else { "check" };
+    let image = cfg
+        .cargo_image
+        .as_ref()
+        .ok_or("launch_cargo without a cargo_image (drive guards this)")?;
+    let curried = caos_curry(image, &[("cmd", Arg::Lit(cmd))])?;
+    let me = self_curry(
+        step_path,
+        pending,
+        results,
+        id,
+        &[("current_tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
+    )?;
+    run_then(ws, &curried, Some(&me))
+}
+
 /// Rebuild ourselves as `curry(image, bin, <config>, <loop state>)` — a
 /// source-built worker is curry(runner, bin) and gets unwrapped into args, so
 /// "ourselves" is that same curry rebuilt from our own args (content-addressed,
@@ -467,19 +550,28 @@ fn self_curry(
         ("results", Arg::Lit(&results_json)),
         ("current_id", Arg::Lit(current_id)),
     ];
-    let optional: Vec<(&str, String)> = ["model", "base_url", "conversation", "grep_image"]
-        .iter()
-        .map(|name| (*name, arg(name)))
-        .filter(|(_, p)| Path::new(p).exists())
-        .collect();
+    let optional: Vec<(&str, String)> = [
+        "model",
+        "base_url",
+        "conversation",
+        "grep_image",
+        "cargo_image",
+    ]
+    .iter()
+    .map(|name| (*name, arg(name)))
+    .filter(|(_, p)| Path::new(p).exists())
+    .collect();
     for (name, p) in &optional {
         kvs.push((name, Arg::Path(p)));
     }
     for (name, value) in extras {
-        kvs.push((name, match value {
-            Arg::Lit(s) => Arg::Lit(s),
-            Arg::Path(s) => Arg::Path(s),
-        }));
+        kvs.push((
+            name,
+            match value {
+                Arg::Lit(s) => Arg::Lit(s),
+                Arg::Path(s) => Arg::Path(s),
+            },
+        ));
     }
     caos_curry(&arg("image"), &kvs)
 }
@@ -597,13 +689,16 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
-/// The full tool registry: bash and grep (the sub-run tools) plus the inline
-/// file tools (`tools.rs`).
+/// The full tool registry: bash, grep and the cargo tools (the sub-run tools)
+/// plus the inline file tools (`tools.rs`).
 fn registry(cfg: &Config) -> Vec<Value> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
     if cfg.grep_image.is_some() {
         tools.push(tools::grep_declaration());
+    }
+    if cfg.cargo_image.is_some() {
+        tools.extend(tools::cargo_declarations());
     }
     tools
 }
