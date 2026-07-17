@@ -204,6 +204,16 @@ impl HttpError {
             message: message.into(),
         }
     }
+
+    /// Plain-data accessors, for callers that clone an error across threads
+    /// (single-flight broadcasts one outcome to every waiter).
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl From<std::io::Error> for HttpError {

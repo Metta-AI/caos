@@ -17,6 +17,7 @@
 //! threads block, so any number of concurrent runs cannot deadlock — capacity
 //! lives runner-side (the set of parked polls), not in a server semaphore.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
@@ -24,6 +25,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -147,6 +149,64 @@ fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpE
             format!("run cycle detected:\n  {listing}"),
         ));
     }
+
+    // Single-flight: identical concurrent requests share one run. A diamond
+    // DAG (parallel map children with a shared dependency) otherwise computes
+    // the shared node once per concurrent parent — same result, wasted
+    // containers. The first arrival runs; later ones park on a channel and
+    // get the same final result.
+    //
+    // Parking needs a waits-for check (predicted in design/map-then.md): in a
+    // CYCLIC graph, the in-flight run we'd park on can transitively depend on
+    // one of OUR ancestors — parking then closes a cross-thread wait cycle
+    // the local stack check above cannot see (the old always-duplicate
+    // behavior escaped it by re-running until the repeat landed on one
+    // thread's stack). `park_would_deadlock` walks the parked-waiter graph
+    // for exactly that reachability; an unsafe arrival runs independently —
+    // the duplicate grows its descendants' stacks and the genuine cycle then
+    // errors cleanly. The recv timeout stays as a belt-and-suspenders
+    // backstop (e.g. an owner that dies without broadcasting).
+    match join_flight(req, stack) {
+        Flight::Owner => {}
+        Flight::Unsafe => {
+            eprintln!("single-flight: req={req} parking would deadlock; running independently");
+        }
+        Flight::Waiter(rx, guard) => {
+            let outcome = rx.recv_timeout(SINGLE_FLIGHT_TIMEOUT);
+            drop(guard);
+            match outcome {
+                Ok(outcome) => {
+                    eprintln!("single-flight: req={req} joined an in-flight run");
+                    return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
+                }
+                Err(_) => {
+                    eprintln!("single-flight: req={req} wait expired; running independently");
+                }
+            }
+        }
+    }
+    let outcome = run_dispatch(config, req, &image, &args, &std, &salt, stack, &key);
+    finish_flight(req, &outcome);
+    outcome.map_err(|(status, msg)| HttpError::new(status, msg))
+}
+
+/// The dispatch + promise-resolution + cache-store tail of [`run_req`],
+/// factored out so single-flight can broadcast its outcome. The error type is
+/// `(status, message)` — a plain-data [`HttpError`] that can be cloned to every
+/// waiter.
+#[allow(clippy::too_many_arguments)]
+fn run_dispatch(
+    config: &Config,
+    req: &str,
+    image: &str,
+    args: &str,
+    std: &str,
+    salt: &str,
+    stack: &[String],
+    key: &str,
+) -> Result<String, (u16, String)> {
+    let fail = |e: HttpError| (e.status(), e.message().to_string());
+
     // Promise sub-runs see this computation as an ancestor.
     let mut child_stack: Vec<String> = stack.to_vec();
     child_stack.push(req.to_string());
@@ -159,14 +219,14 @@ fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpE
     // server thread until a runner posts the result; capacity is runner-side
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
-        let image_ref = resolve_image(config, &image)?;
-        let arg_entries = args_entries(config, &args)?;
-        crate::runner::dispatch(req, arg_entries, &image_ref)?
+        let image_ref = resolve_image(config, image).map_err(fail)?;
+        let arg_entries = args_entries(config, args).map_err(fail)?;
+        crate::runner::dispatch(req, arg_entries, &image_ref).map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: req={req}");
-        return Err(HttpError::new(500, "worker produced no result on stdout"));
+        return Err((500, "worker produced no result on stdout".to_string()));
     }
 
     // A promise is not a value: the worker exited leaving a map-then continuation
@@ -174,18 +234,140 @@ fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpE
     let result = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: req={req} -> continuation {cont}");
-            resolve_promise(config, cont, &std, &salt, &child_stack)?
+            resolve_promise(config, cont, std, salt, &child_stack).map_err(fail)?
         }
         _ => result,
     };
 
     // Cache the (resolved) result for next time (best-effort).
-    match cache_set(&config.redis_addr, &key, &result) {
+    match cache_set(&config.redis_addr, key, &result) {
         Ok(()) => eprintln!("ran worker: req={req} -> {result} (cached)"),
         Err(e) => eprintln!("ran worker: req={req} -> {result} (cache store failed: {e})"),
     }
 
     Ok(result)
+}
+
+// ---- Single-flight -----------------------------------------------------------
+
+/// A run's outcome in plain data, so it can be sent to every parked waiter.
+type Outcome = Result<String, (u16, String)>;
+
+/// How long a waiter parks on someone else's in-flight run before giving up
+/// and running the request itself. Generous — the flight covers the whole
+/// promise resolution of a possibly deep DAG — but finite, so a cross-thread
+/// cycle degrades to duplicate work (and a clean stack-based cycle error)
+/// instead of a deadlock.
+const SINGLE_FLIGHT_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// In-flight runs: request hash → the channels of parked waiters.
+fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>>> = OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Every parked waiter, as (its ancestor stack, the request it waits on) —
+/// the edges of the waits-for graph `park_would_deadlock` walks.
+fn parked() -> &'static Mutex<Vec<(Vec<String>, String)>> {
+    static PARKED: OnceLock<Mutex<Vec<(Vec<String>, String)>>> = OnceLock::new();
+    PARKED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Would parking a waiter (ancestry `stack`) on in-flight `req` close a wait
+/// cycle? True iff `req`'s in-progress subtree — reached transitively through
+/// parked waiters (a waiter whose ancestry contains a frontier request
+/// descends from it, so the frontier request's completion awaits the waiter's
+/// target) — contains one of OUR ancestors: that ancestor's completion awaits
+/// us, so waiting on `req` would deadlock.
+fn park_would_deadlock(req: &str, stack: &[String]) -> bool {
+    let parked = parked().lock().expect("parked lock");
+    let mut frontier: Vec<String> = vec![req.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(req.to_string());
+    while let Some(cur) = frontier.pop() {
+        if stack.contains(&cur) {
+            return true;
+        }
+        for (wstack, target) in parked.iter() {
+            if wstack.contains(&cur) && seen.insert(target.clone()) {
+                frontier.push(target.clone());
+            }
+        }
+    }
+    false
+}
+
+enum Flight {
+    /// Nobody is running this request: run it (and `finish_flight` after).
+    Owner,
+    /// Someone is: park here for their outcome. The guard unregisters the
+    /// waits-for edge when the wait ends (either way).
+    Waiter(mpsc::Receiver<Outcome>, ParkGuard),
+    /// Someone is, but parking would deadlock: run independently.
+    Unsafe,
+}
+
+/// Removes this waiter's waits-for edge on drop.
+struct ParkGuard {
+    stack: Vec<String>,
+    target: String,
+}
+
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        let mut parked = parked().lock().expect("parked lock");
+        if let Some(pos) = parked
+            .iter()
+            .position(|(s, t)| *s == self.stack && *t == self.target)
+        {
+            parked.swap_remove(pos);
+        }
+    }
+}
+
+fn join_flight(req: &str, stack: &[String]) -> Flight {
+    let mut table = flights().lock().expect("flights lock");
+    match table.get_mut(req) {
+        Some(waiters) => {
+            // The waits-for check runs under the flights lock, so a
+            // concurrent park can't slip in between the check and the edge
+            // registration.
+            if park_would_deadlock(req, stack) {
+                return Flight::Unsafe;
+            }
+            let (tx, rx) = mpsc::channel();
+            waiters.push(tx);
+            parked()
+                .lock()
+                .expect("parked lock")
+                .push((stack.to_vec(), req.to_string()));
+            Flight::Waiter(
+                rx,
+                ParkGuard {
+                    stack: stack.to_vec(),
+                    target: req.to_string(),
+                },
+            )
+        }
+        None => {
+            table.insert(req.to_string(), Vec::new());
+            Flight::Owner
+        }
+    }
+}
+
+/// Broadcast the outcome to every parked waiter and clear the entry. A
+/// timed-out waiter that ran independently also lands here: whoever finishes
+/// first serves the waiters (a valid result is a valid result) and clears the
+/// entry; later finishers broadcast to nobody.
+fn finish_flight(req: &str, outcome: &Outcome) {
+    let waiters = {
+        let mut table = flights().lock().expect("flights lock");
+        table.remove(req).unwrap_or_default()
+    };
+    for tx in waiters {
+        let _ = tx.send(outcome.clone());
+    }
 }
 
 // ---- Promise resolution ------------------------------------------------------
