@@ -167,8 +167,17 @@ fn run_req_inner(
     // are part of the request (hence the key), threaded into the worker, and
     // inherited by any promise sub-runs this request leaves behind.
     let (image, args, std, salt) = read_request(config, req)?;
-    if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-        config.trace.request(trace_id, span_id, &image, &args);
+    let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
+        Some(args_entries(config, &args)?)
+    } else {
+        None
+    };
+    if let (Some(trace_id), Some(span_id), Some(entries)) =
+        (trace_id, span_id, traced_arg_entries.as_ref())
+    {
+        config
+            .trace
+            .request(trace_id, span_id, &image, &args, entries);
     }
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
@@ -235,12 +244,12 @@ fn run_req_inner(
     // (the set of parked polls), so there's no server-side slot to hold.
     let dispatched = {
         let image_ref = resolve_image(config, &image)?;
-        let arg_entries = args_entries(config, &args)?;
+        let arg_entries = match traced_arg_entries {
+            Some(entries) => entries,
+            None => args_entries(config, &args)?,
+        };
         crate::runner::dispatch(req, arg_entries, &image_ref)?
     };
-    if let (Some(trace_id), Some(span_id), Some(stats)) = (trace_id, span_id, dispatched.stats) {
-        config.trace.stats(trace_id, span_id, stats);
-    }
     let result = dispatched.result;
 
     if result_hash(&result).is_empty() {

@@ -1,10 +1,9 @@
 //! Bounded, in-memory invocation traces for local observability.
 //!
-//! Traces intentionally contain only content hashes, topology, timing, cache
-//! state, and numeric worker statistics. Raw arguments and worker logs never
-//! enter this store.
+//! Traces intentionally contain only content hashes, topology, timing, and
+//! cache state. Raw arguments and worker logs never enter this store.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,11 +19,11 @@ pub(crate) struct Span {
     pub(crate) req: String,
     pub(crate) image: Option<String>,
     pub(crate) args: Option<String>,
+    pub(crate) arg_entries: BTreeMap<String, String>,
     pub(crate) cache_hit: Option<bool>,
     pub(crate) started_ms: u64,
     pub(crate) elapsed_ms: Option<u64>,
     pub(crate) result: Option<String>,
-    pub(crate) worker_stats: Option<serde_json::Value>,
     pub(crate) error: Option<String>,
 }
 
@@ -109,31 +108,33 @@ impl Store {
             req: req.to_string(),
             image: None,
             args: None,
+            arg_entries: BTreeMap::new(),
             cache_hit: None,
             started_ms: now.duration_since(record.started).as_millis() as u64,
             elapsed_ms: None,
             result: None,
-            worker_stats: None,
             error: None,
         });
         Some(id)
     }
 
-    pub(crate) fn request(&self, trace_id: &str, span_id: u64, image: &str, args: &str) {
+    pub(crate) fn request(
+        &self,
+        trace_id: &str,
+        span_id: u64,
+        image: &str,
+        args: &str,
+        arg_entries: &BTreeMap<String, String>,
+    ) {
         self.with_span(trace_id, span_id, |span| {
             span.image = Some(image.to_string());
             span.args = Some(args.to_string());
+            span.arg_entries = arg_entries.clone();
         });
     }
 
     pub(crate) fn cache(&self, trace_id: &str, span_id: u64, hit: bool) {
         self.with_span(trace_id, span_id, |span| span.cache_hit = Some(hit));
-    }
-
-    pub(crate) fn stats(&self, trace_id: &str, span_id: u64, stats: serde_json::Value) {
-        if let Some(stats) = sanitize_stats(stats) {
-            self.with_span(trace_id, span_id, |span| span.worker_stats = Some(stats));
-        }
     }
 
     pub(crate) fn finish_span(
@@ -196,56 +197,20 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Keep stats useful but unable to smuggle document or prompt text into a trace.
-fn sanitize_stats(value: serde_json::Value) -> Option<serde_json::Value> {
-    match value {
-        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
-            Some(value)
-        }
-        serde_json::Value::Object(values) => {
-            let clean = values
-                .into_iter()
-                .filter(|(key, _)| {
-                    !key.is_empty()
-                        && key.len() <= 64
-                        && key
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-                })
-                .filter_map(|(key, value)| sanitize_stats(value).map(|value| (key, value)))
-                .collect();
-            Some(serde_json::Value::Object(clean))
-        }
-        serde_json::Value::Array(values) => Some(serde_json::Value::Array(
-            values.into_iter().filter_map(sanitize_stats).collect(),
-        )),
-        serde_json::Value::String(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strips_strings_from_worker_stats() {
-        let value = serde_json::json!({
-            "llm_calls": 2,
-            "prompt": "private",
-            "nested": {"tokens": 12, "text": "private"}
-        });
-        assert_eq!(
-            sanitize_stats(value),
-            Some(serde_json::json!({"llm_calls": 2, "nested": {"tokens": 12}}))
-        );
-    }
 
     #[test]
     fn records_a_complete_trace() {
         let store = Store::default();
         store.begin("test").unwrap();
         let span = store.start_span("test", None, "root", "abc").unwrap();
-        store.request("test", span, "image", "args");
+        let entries = std::collections::BTreeMap::from([
+            ("bin".to_string(), "bin-hash".to_string()),
+            ("image".to_string(), "image".to_string()),
+        ]);
+        store.request("test", span, "image", "args", &entries);
         store.cache("test", span, false);
         store.finish_span("test", span, Some("blob result"), false);
         store.finish("test", Some("blob result"), false);
@@ -253,5 +218,9 @@ mod tests {
         assert_eq!(trace.status, "completed");
         assert_eq!(trace.spans.len(), 1);
         assert_eq!(trace.spans[0].cache_hit, Some(false));
+        assert_eq!(
+            trace.spans[0].arg_entries.get("bin").map(String::as_str),
+            Some("bin-hash")
+        );
     }
 }

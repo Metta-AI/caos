@@ -17,7 +17,6 @@
 
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
-use std::time::Instant;
 
 use caos::{prog_name, HttpTransport, Transport};
 
@@ -182,7 +181,6 @@ fn runner(job_json: &str) -> Result<(), String> {
 /// env vars — `caos map-then`/`curry` running under it read them from there.
 struct RanJob {
     result: String,
-    stats: Option<serde_json::Value>,
 }
 
 fn run_runner_job(
@@ -202,10 +200,10 @@ fn run_runner_job(
         (caos::STD_ENV, std.as_deref().unwrap_or("")),
         (caos::SALT_ENV, salt.as_str()),
     ];
-    let stats = run_worker(&envs)?;
+    run_worker(&envs)?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
-    Ok(RanJob { result, stats })
+    Ok(RanJob { result })
 }
 
 /// Unpack a request tree `{args, std, salt}`: the args-tree hash, the std tree
@@ -245,7 +243,7 @@ fn post_result(
     let body = match ran {
         Ok(ran) => serde_json::json!({
             "req": job.req, "nonce": job.nonce, "ok": true,
-            "result": &ran.result, "stats": &ran.stats,
+            "result": &ran.result,
         }),
         Err(error) => serde_json::json!({
             "req": job.req, "nonce": job.nonce, "ok": false, "error": error,
@@ -435,7 +433,7 @@ fn cas_setup(
 /// tamper with the root-owned `/cas` — only the setuid-root `caos` it invokes
 /// can. Its output is captured, relayed to our stderr (the container log), and
 /// included in the error on failure so the failure post carries the log.
-fn run_worker(envs: &[(&str, &str)]) -> Result<Option<serde_json::Value>, String> {
+fn run_worker(envs: &[(&str, &str)]) -> Result<(), String> {
     let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
     let gid = caos::env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
     let mut command = std::process::Command::new(DEFAULT_WORKER);
@@ -455,7 +453,6 @@ fn run_worker(envs: &[(&str, &str)]) -> Result<Option<serde_json::Value>, String
             Ok(())
         });
     }
-    let started = Instant::now();
     let out = command
         .output()
         .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
@@ -471,18 +468,7 @@ fn run_worker(envs: &[(&str, &str)]) -> Result<Option<serde_json::Value>, String
             out.status
         ));
     }
-    let mut stats = log.lines().find_map(|line| {
-        line.strip_prefix("##worker-stats ")
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-    });
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match &mut stats {
-        Some(serde_json::Value::Object(values)) => {
-            values.insert("worker_elapsed_ms".to_string(), elapsed_ms.into());
-        }
-        _ => stats = Some(serde_json::json!({"worker_elapsed_ms": elapsed_ms})),
-    }
-    Ok(stats)
+    Ok(())
 }
 
 /// Read back the result the worker recorded at `/cas/out`, as `"<type> <hash>"`.

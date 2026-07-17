@@ -148,7 +148,7 @@ runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
 | `GET /run?req=<reqHash>&trace=<traceId>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). The optional trace id records this invocation without changing the request or cache key. See [compute](#compute). |
-| `GET /trace/<traceId>` | Return the live or completed invocation trace as JSON. Traces are bounded in memory and contain hashes, topology, timings, cache state, and numeric worker stats—never raw args or logs. |
+| `GET /trace/<traceId>` | Return the live or completed invocation trace as JSON. Traces are bounded in memory and contain topology, content hashes (including top-level argument-entry hashes), timings, cache state, results, and failures—never raw argument values or logs. |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |

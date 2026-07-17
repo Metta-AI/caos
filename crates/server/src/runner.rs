@@ -78,7 +78,7 @@ enum PollReply {
 
 /// What a dispatch is answered with (over its per-dispatch channel).
 enum Outcome {
-    /// The worker's result plus privacy-filtered numeric instrumentation.
+    /// The worker's result.
     Done(DispatchResult),
     /// The runner reported failure.
     Failed(String),
@@ -86,7 +86,6 @@ enum Outcome {
 
 pub(crate) struct DispatchResult {
     pub(crate) result: String,
-    pub(crate) stats: Option<serde_json::Value>,
 }
 
 /// A hanging `POST /runner/poll`, parked until matched, kicked, or expired.
@@ -507,7 +506,6 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
         match v["result"].as_str() {
             Some(result) if !result.trim().is_empty() => Outcome::Done(DispatchResult {
                 result: result.trim().to_string(),
-                stats: v.get("stats").cloned().filter(|value| !value.is_null()),
             }),
             _ => Outcome::Failed("runner posted ok without a result".to_string()),
         }
