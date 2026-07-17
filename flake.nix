@@ -39,10 +39,6 @@
         # Toolchain is pinned via ./rust-toolchain.toml + the flake.lock'd
         # rust-overlay revision, so every build uses the same compiler.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        # A Linux copy of the same toolchain, for worker images that bake a Rust
-        # compiler into the container (e.g. the rustc builder). On Linux this is
-        # the same as rustToolchain; on macOS it's a substituted Linux build.
-        linuxRustToolchain = linuxPkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         src = craneLib.cleanCargoSource ./.;
@@ -216,11 +212,9 @@
         # The worker base is a thin delta on a stock glibc base
         # (docker://debian:stable-slim — see build-builtins.sh). It carries only the
         # setuid caos (installed at /usr/bin via installWorkerFilesBaseStacked); the
-        # glibc/coreutils come from the Debian base. It exists so workers built from
-        # source (worker-rustc, which compiles glibc-dynamic) can stack their
-        # /worker on a base that actually provides glibc — and they inherit this
-        # setuid caos layer by hash, so the unprivileged builder never has to
-        # synthesize a setuid-root binary itself.
+        # glibc/coreutils come from the Debian base. Workers stacked on it
+        # inherit this setuid caos layer by hash, so an unprivileged builder
+        # never has to synthesize a setuid-root binary itself.
         workerBaseImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-base";
           tag = "latest";
@@ -437,76 +431,14 @@
           config = workerDeepDepsConfig;
         };
 
-        # A "rustc" worker: it *builds other workers*. Given a Rust source file as
-        # `--src` and a worker-base git-docker image as `--base` (curried in), it
-        # compiles the source (glibc/gnu, linking the vendored worker-common) and
-        # emits a new worker image at /cas/out — the base's layers plus one carrying
-        # the compiled /worker. The Rust + C toolchain is NOT baked in: it comes from
-        # the stock rust base this image stacks on (see workerRustcRootEnv below).
-        # This is the `worker-rustc` crate's binary at /worker; the worker-common
-        # source is vendored at /vendor/worker-common for the in-image build's user
-        # code to depend on.
-        workerRustcRoot = workerRoot "worker-rustc" worker-rustc;
-        # The worker-common crate source, for the in-image `cargo build` to link
-        # user code against (it has no deps, so no registry/network is needed).
-        workerCommonVendor = pkgs.runCommand "caos-worker-common-vendor" { } ''
-          mkdir -p $out/vendor
-          cp -r ${./crates/worker-common} $out/vendor/worker-common
-        '';
-        # The rustc worker's *delta*: only our bits — the /worker binary and the
-        # vendored worker-common (caos is added setuid by installWorkerFilesBaseStacked).
-        # The toolchain (cargo, rustc, gcc, glibc, coreutils, bash) comes from the
-        # stock `rust:1-bookworm` base this stacks on (build-builtins.sh imports it
-        # with `--base docker://rust:1-bookworm`), so none of it rides in git. Our
-        # caos and /worker are musl-static, so they run unchanged on the glibc base.
-        #
-        # Built as a plain tree of *real* directories (not buildEnv, which would
-        # symlink /worker etc. into /nix/store and, worse, make /etc a symlink that
-        # shadows the base's real /etc). Real dirs overlay-MERGE with the base, so
-        # the base keeps its /etc, /usr, … intact. We ship no /etc: the worker runs
-        # as a numeric uid (caos drops to 1000 by setuid(2), no passwd entry needed)
-        # and the base's own /etc (nsswitch, ssl certs, alternatives → cc) is kept.
-        workerRustcRootEnv = pkgs.runCommand "caos-worker-rustc-root" { } ''
-          mkdir -p $out/vendor
-          cp ${workerRustcRoot}/worker $out/worker
-          cp -r ${workerCommonVendor}/vendor/worker-common $out/vendor/worker-common
-        '';
-        workerRustcContents = [ workerRustcRootEnv ];
-        # Env replicates the stock rust image's: /usr/local/cargo/bin (cargo/rustc)
-        # first, then the usual debian dirs (/usr/local/bin holds our caos). The
-        # server's convert uses this config verbatim, so it must be self-sufficient.
-        # worker-rustc overrides CARGO_HOME per-build to /tmp/cargo (the only
-        # world-writable spot), but a sane default doesn't hurt.
-        workerRustcConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [
-            "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            "RUSTUP_HOME=/usr/local/rustup"
-            "CARGO_HOME=/usr/local/cargo"
-          ];
-          # This worker compiles Rust in release mode (rustc + LLVM + linker), so
-          # it needs real RAM: at the 256MB default a build thrashes (~25s on fly);
-          # at 2GB it's ~1s. caosd reads this label (caos.fly.memory-mb) when it
-          # creates the worker machine, so the requirement rides with the image and
-          # is the same on every stack — no stack-wide knob.
-          Labels = {
-            "caos.fly.memory-mb" = "2048";
-          };
-        };
-        # buildLayeredImage so fakeRootCommands can install the setuid caos. With
-        # the toolchain now in the stock rust base (not in git), this image is the
-        # thin delta only — the published git-docker tree carries
-        # `base = docker://rust:1-bookworm` plus these layers (build-builtins.sh).
-        workerRustcImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-rustc";
-          tag = "latest";
-          contents = [ workerRustcRootEnv ];
-          config = workerRustcConfig;
-          fakeRootCommands = installWorkerFilesBaseStacked;
-        };
+        # The "rustc" worker *builds other workers*, but carries no toolchain:
+        # it is pure orchestration over the cargo worker (lay out the project,
+        # run-then into cargo-base, curry the produced binary into the runner
+        # — see crates/worker-rustc and design/cargo-workers.md). It runs as
+        # `curry(runner, bin=worker-rustc)` in the shared pool like the other
+        # source-level workers; build-builtins.sh curries in the cargo worker
+        # and the worker-common source tree. The old rust:1-bookworm-based
+        # rustc image is retired.
 
         # The "runner": one warm, pooled image that runs a compiled worker binary
         # passed as the `bin` arg (see crates/worker-runner). Workers built from
@@ -555,8 +487,12 @@
         # `minimal` (rustc+cargo+host std) keeps clippy/rustfmt/rust-src out of
         # the image; it resolves the same version as rust-toolchain.toml's
         # `stable` channel because both come from the one flake.lock'd
-        # rust-overlay revision.
-        cargoWorkerToolchain = linuxPkgs.rust-bin.stable.latest.minimal;
+        # rust-overlay revision. The musl std rides along so produced binaries
+        # (rustc-built user workers) can be static — they then run on any base
+        # (the debian-slim runner today, scratch eventually).
+        cargoWorkerToolchain = linuxPkgs.rust-bin.stable.latest.minimal.override {
+          targets = [ muslTarget ];
+        };
         craneLibCargoWorker = (crane.mkLib linuxPkgs).overrideToolchain cargoWorkerToolchain;
 
         # The vendored crates.io sources for the workspace's Cargo.lock, plus
@@ -770,12 +706,6 @@
           config = workerDeepDepsConfig;
           fakeRootCommands = installWorkerFiles;
         };
-        loadWorkerRustc = loadImage {
-          name = "caos-worker-rustc";
-          contents = [ workerRustcRootEnv ];
-          config = workerRustcConfig;
-          fakeRootCommands = installWorkerFilesBaseStacked;
-        };
         loadWorkerRunner = loadImage {
           name = "caos-worker-runner";
           contents = [ workerRunnerRootEnv ];
@@ -923,7 +853,6 @@
           workerDirsOnlyImage
           workerHelloImage
           workerDeepDepsImage
-          workerRustcImage
           workerRunnerImage
           cargoBaseImage
         ];
@@ -938,6 +867,9 @@
           # Published as curry(cargo-base, bin) — see bin_base in
           # build-builtins.sh.
           worker-cargo
+          # Published as curry(runner, bin) with the cargo worker and the
+          # worker-common source curried in.
+          worker-rustc
         ];
 
         # The dev stack's control command. Subcommands:
@@ -1094,7 +1026,10 @@
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
-          inherit worker-cargo;
+          # The cargo worker (curry(cargo-base, bin)) and the rustc
+          # orchestrator (curry(runner, bin)) — build-builtins.sh needs the
+          # binaries exposed.
+          inherit worker-cargo worker-rustc;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)
@@ -1110,7 +1045,6 @@
           caos-worker-file-count-docker = workerFileCountImage;
           caos-worker-dirs-only-docker = workerDirsOnlyImage;
           caos-worker-deep-deps-docker = workerDeepDepsImage;
-          caos-worker-rustc-docker = workerRustcImage;
           caos-worker-runner-docker = workerRunnerImage;
           caos-worker-cargo-base-docker = cargoBaseImage;
         };
@@ -1154,10 +1088,6 @@
           load-caos-worker-deep-deps = {
             type = "app";
             program = "${loadWorkerDeepDeps}/bin/load-caos-worker-deep-deps";
-          };
-          load-caos-worker-rustc = {
-            type = "app";
-            program = "${loadWorkerRustc}/bin/load-caos-worker-rustc";
           };
           load-caos-worker-runner = {
             type = "app";

@@ -1,39 +1,40 @@
-//! caos-worker-rustc: build a caos worker from Rust source.
+//! caos-worker-rustc: build a caos worker from Rust source — as pure
+//! orchestration over the cargo worker (design/cargo-workers.md, "rustc
+//! re-layered on cargo"). No toolchain lives here: given `--src` (a single
+//! .rs file) it lays out a cargo project as CAS links — the source as
+//! `src/main.rs`, the `--worker_common` crate tree linked in, a generated
+//! manifest — and tail-calls the cargo worker (`--cargo`, typically the
+//! std/cargo curry) to compile it musl-static in release. The `finish`
+//! continuation takes the built binary and emits at `/cas/out` a ready-to-run
+//! worker: `curry(runner, bin=<the binary>)` — the shared, warm-pooled runner
+//! bound to this binary, so the worker needs no image of its own. Static musl
+//! means the binary runs on any base (the glibc runner today, scratch
+//! eventually).
 //!
-//! Given a Rust source file as `--src` and the runner image as `--runner`
-//! (typically curried in), it compiles the source for glibc (gnu), linking the
-//! vendored `worker-common`, and emits at `/cas/out` a ready-to-run worker:
-//! `curry(runner, bin=<the compiled binary>)`. So the worker is *not* its own
-//! image — it's the shared, warm-pooled runner ([`crates/worker-runner`]) bound
-//! to this binary, which is what avoids a per-worker image (no convert / registry
-//! push / app provision). run the result like any other image.
+//! So building a worker is itself a worker — memoized end to end: this run on
+//! `(src, runner, cargo, worker_common)`, the inner compile on the project
+//! tree. rustc itself runs as `curry(runner, bin=worker-rustc)` in the shared
+//! pool; the old rust:1-bookworm rustc image is retired. User source may use
+//! `std` + `worker_common` only — no crates.io deps.
 //!
-//! So building a worker is itself a worker — and because the run is memoized on
-//! `(this image, src, runner)`, recompiling unchanged source is a cache hit.
-//!
-//! It needs cargo/rustc + a C linker on PATH and the `worker-common` source
-//! vendored at [`VENDOR_WORKER_COMMON`]; its image (`caos-worker-rustc`) bakes
-//! all of that in (from the stock `rust:1-bookworm` base). User source may use
-//! `std` + `worker_common` only — there's no crates.io access in the sandbox.
+//! A failing user compile errors this run (with the cargo diagnostics), same
+//! contract as the old in-image build.
 
 use std::fs;
-use std::process::{Command, ExitCode};
+use std::path::Path;
+use std::process::ExitCode;
 
-use worker_common::{arg, caos, caos_curry, run_worker, scratch, Arg};
+use worker_common::{
+    arg, caos, caos_curry, link, own_image, path, read_arg, read_arg_opt, run_then, run_worker,
+    scratch, Arg,
+};
 
-/// The vendored `worker-common` crate baked into this image, for user source to
-/// depend on.
-const VENDOR_WORKER_COMMON: &str = "/vendor/worker-common";
-
-/// We build for glibc (gnu), not musl: the stock `rust:1-bookworm` base this
-/// worker runs on ships only the gnu target and gcc (no musl target / musl-gcc),
-/// so gnu is what compiles out of the box. The produced binary is glibc-dynamic
-/// and runs in the glibc (debian-slim) runner. Detected at compile time so the
-/// rustc worker targets the architecture it was built for (e.g. Apple Silicon).
+/// Build user workers static (musl): the binary then runs on any base. The
+/// arch follows this worker's own build (e.g. Apple Silicon hosts).
 const TARGET: &str = if cfg!(target_arch = "aarch64") {
-    "aarch64-unknown-linux-gnu"
+    "aarch64-unknown-linux-musl"
 } else {
-    "x86_64-unknown-linux-gnu"
+    "x86_64-unknown-linux-musl"
 };
 
 fn main() -> ExitCode {
@@ -41,59 +42,98 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    // `--src` is the worker's Rust source (a single .rs file); `--runner` is the
-    // runner image to bind the compiled binary into (its hash is enough — we never
-    // read its content here, so no `get`).
-    caos(["get", &arg("src")])?;
+    // `finish` is reached only via our own curry in the run-then continuation.
+    match read_arg_opt("mode")?.as_deref() {
+        None | Some("") => start(),
+        Some("finish") => finish(),
+        Some(other) => Err(format!("unknown mode {other:?}")),
+    }
+}
 
-    let binary = compile(&arg("src"))?;
-    // Stage the compiled binary as a CAS blob, then curry it into the runner. The
-    // result is a runnable worker: `curry(runner, bin=<binary>)`.
-    caos(["put", &binary, "/cas/bin"])?;
-    let curried = caos_curry(&arg("runner"), &[("bin", Arg::Path("/cas/bin"))])?;
-    // Materialize the curried worker at /cas/out — its hash is this run's result.
+/// Lay out the project (pure linking — nothing is fetched) and tail into the
+/// cargo worker; `finish` gets the compile's result.
+fn start() -> Result<(), String> {
+    for required in ["src", "runner", "worker_common"] {
+        if !Path::new(&arg(required)).exists() {
+            return Err(format!("--{required} is required"));
+        }
+    }
+    // The cargo worker's image ref rides as a literal (a hash string, read as
+    // content), unlike `runner`/`worker_common` which ride as tree references.
+    let cargo = read_arg("cargo")?;
+
+    let proj = scratch("proj")?;
+    fs::create_dir(proj.join("src")).map_err(|e| format!("creating src dir: {e}"))?;
+    link(arg("src"), proj.join("src/main.rs"))?;
+    link(arg("worker_common"), proj.join("worker-common"))?;
+    fs::write(proj.join("Cargo.toml"), CARGO_TOML).map_err(|e| format!("writing manifest: {e}"))?;
+    caos(["put", path(&proj), "/cas/proj"])?;
+
+    let build = caos_curry(
+        &cargo,
+        &[
+            ("cmd", Arg::Lit("build")),
+            ("profile", Arg::Lit("release")),
+            ("target", Arg::Lit(TARGET)),
+        ],
+    )?;
+    // Ourselves, in the `finish` position: rebuild our own curry (the runner
+    // image with our bin re-bound) plus what finish needs. `cargo` and
+    // `worker_common` deliberately don't ride — finish's cache key is just
+    // (bin, runner, result).
+    let bin = arg("bin");
+    let runner = arg("runner");
+    let mut kvs: Vec<(&str, Arg)> =
+        vec![("mode", Arg::Lit("finish")), ("runner", Arg::Path(&runner))];
+    if Path::new(&bin).exists() {
+        kvs.insert(0, ("bin", Arg::Path(&bin)));
+    }
+    let me = caos_curry(&own_image(), &kvs)?;
+    run_then("/cas/proj", &build, Some(&me))
+}
+
+/// The compile came back: a failing build errors the run (diagnostics in the
+/// message); a good one becomes `curry(runner, bin=<binary>)` at `/cas/out`.
+fn finish() -> Result<(), String> {
+    let res = arg("result");
+    caos(["get", &res])?; // one level: exit/stderr/bin placeholders appear
+    let exit = read_blob(&format!("{res}/exit"))?;
+    if exit.trim() != "0" {
+        let stderr = read_blob(&format!("{res}/stderr")).unwrap_or_default();
+        return Err(format!(
+            "cargo build failed (exit {}):\n{}",
+            exit.trim(),
+            stderr.trim_end()
+        ));
+    }
+    let bin = format!("{res}/bin/worker");
+    caos(["get", &format!("{res}/bin")])?; // the binary's placeholder
+    if !Path::new(&bin).exists() {
+        return Err("cargo result carries no bin/worker".to_string());
+    }
+    let curried = caos_curry(&arg("runner"), &[("bin", Arg::Path(&bin))])?;
     caos(["get-hash", &curried, "/cas/out"])
 }
 
-/// Lay out a cargo project around the user's source (as `src/main.rs`), depending
-/// on the vendored `worker-common`, and build it for glibc (gnu). Returns the
-/// path to the compiled `worker` binary.
-fn compile(src: &str) -> Result<String, String> {
-    let proj = scratch("proj")?;
-    fs::create_dir_all(proj.join("src")).map_err(|e| format!("creating src dir: {e}"))?;
-    fs::copy(src, proj.join("src/main.rs")).map_err(|e| format!("copying source: {e}"))?;
-    fs::write(proj.join("Cargo.toml"), cargo_toml())
-        .map_err(|e| format!("writing manifest: {e}"))?;
+/// The generated manifest: the user's source as the `worker` binary, with the
+/// linked-in `worker-common` as its one (path) dependency.
+const CARGO_TOML: &str = "[package]\n\
+     name = \"worker\"\n\
+     version = \"0.0.0\"\n\
+     edition = \"2021\"\n\
+     \n\
+     [[bin]]\n\
+     name = \"worker\"\n\
+     path = \"src/main.rs\"\n\
+     \n\
+     [dependencies]\n\
+     worker-common = { path = \"worker-common\" }\n\
+     \n\
+     [profile.release]\n\
+     strip = true\n";
 
-    let status = Command::new("cargo")
-        .args(["build", "--release", "--offline", "--target", TARGET])
-        .current_dir(&proj)
-        .env("CARGO_HOME", "/tmp/cargo")
-        .status()
-        .map_err(|e| format!("running cargo: {e}"))?;
-    if !status.success() {
-        return Err(format!("cargo build failed ({status})"));
-    }
-    Ok(format!("{}/target/{TARGET}/release/worker", proj.display()))
-}
-
-/// The generated Cargo manifest: the user's source as the `worker` binary, with
-/// the vendored `worker-common` as its one dependency.
-fn cargo_toml() -> String {
-    format!(
-        "[package]\n\
-         name = \"worker\"\n\
-         version = \"0.0.0\"\n\
-         edition = \"2021\"\n\
-         \n\
-         [[bin]]\n\
-         name = \"worker\"\n\
-         path = \"src/main.rs\"\n\
-         \n\
-         [dependencies]\n\
-         worker-common = {{ path = \"{VENDOR_WORKER_COMMON}\" }}\n\
-         \n\
-         [profile.release]\n\
-         strip = true\n"
-    )
+/// Fetch and read a blob at a CAS path.
+fn read_blob(cas_path: &str) -> Result<String, String> {
+    caos(["get", cas_path])?;
+    fs::read_to_string(cas_path).map_err(|e| format!("reading {cas_path}: {e}"))
 }

@@ -481,10 +481,12 @@ curry` wrappers, result staging).
   map-thens *itself* over the resolved deps, finishing with a node builder
   keyed only on the package and its subgraph — so recompute is O(changed
   package + its dependents).
-- **`worker-rustc`** — compiles a Rust source file into a new worker image:
-  given `--src` and a base worker image (`--base`, usually curried in), it builds
-  static-musl, linking the vendored `worker-common`, and emits a git-docker
-  worker image. So building a worker is itself a (memoized) worker.
+- **`worker-rustc`** — builds a runnable worker from a Rust source file, as
+  pure orchestration over the cargo worker: it lays out a project (the source
+  plus the curried-in `worker-common` tree), tail-calls the cargo worker to
+  compile it static-musl, and curries the binary into the runner —
+  `curry(runner, bin=<binary>)`. So building a worker is itself a (memoized)
+  worker, and no toolchain image is dedicated to it.
 
 ### Built-ins (`/cas/std`)
 

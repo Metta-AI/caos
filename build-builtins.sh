@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps rustc runner cargo-base)
+[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base)
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
 # runs us from a store copy with no `nix` at runtime), else built from the flake.
@@ -44,14 +44,13 @@ image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image at
 
 # Some builtins ship as a thin delta on a stock docker base instead of a
 # self-contained image: the nix image holds only our bits, and `import-image
-# --base docker://<ref>` records the stock base so the heavy toolchain rides as
-# stock registry layers (pulled server-side at convert time) rather than in git.
-# rustc bases on the stock rust image (cargo/rustc/gcc/glibc); the worker base on
-# stock debian (glibc, for source-built workers); the rest are self-contained.
+# --base docker://<ref>` records the stock base so the heavy layers ride as
+# stock registry layers (pulled server-side at convert time) rather than in
+# git. The worker base and the runner base on stock debian (glibc); the rest
+# are self-contained.
 import_base() { # std name -> docker:// base ref, or empty for self-contained
   case "$1" in
     base | runner) echo "docker://debian:stable-slim" ;;
-    rustc) echo "docker://rust:1-bookworm" ;;
     *) echo "" ;;
   esac
 }
@@ -153,7 +152,9 @@ fi
 # runner; `cargo` curries onto its toolchain base (bin_base — the same move at
 # a different base: the heavy, rarely-changing image is keyed on
 # toolchain+lockfile, and a worker rebuild ships one blob).
-bin_names=(bash-tool llm-step rgrep cargo)
+# Order matters: rustc's curry references the published cargo worker, so
+# cargo precedes it.
+bin_names=(bash-tool llm-step rgrep cargo rustc)
 bin_base() { # worker binary -> the image its std curry binds it into
   case "$1" in
     cargo) echo "cargo-base" ;;
@@ -183,11 +184,25 @@ if [ -n "${hash_of[runner]:-}" ]; then
     base=$(bin_base "$b")
     # A name-scoped run may not have imported this bin's base image; skip.
     [ -n "${hash_of[$base]:-}" ] || continue
+    # rustc is orchestration over the cargo worker: curry in the published
+    # cargo curry (as a literal image ref) and the worker-common source tree
+    # its generated projects link against.
+    extra=()
+    if [ "$b" = rustc ]; then
+      [ -n "${hash_of[cargo]:-}" ] || continue
+      rm -rf "$CLIENT/worker-common"
+      cp -R "$PROJECT/crates/worker-common" "$CLIENT/worker-common"
+      # PROJECT may be a read-only store copy (caosd); writable so the next
+      # publish's rm -rf works.
+      chmod -R u+w "$CLIENT/worker-common"
+      git -C "$CLIENT" add worker-common
+      extra=("--cargo=${hash_of[cargo]}" "--worker_common:@=worker-common")
+    fi
     # Ingestion only accepts git-tracked worktree paths, so stage a copy of
     # the binary in the client repo (overwritten on every publish).
     install -m 755 "${bin_path[$b]}/bin/worker-$b" "$CLIENT/worker-$b"
     git -C "$CLIENT" add "worker-$b"
-    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--bin:@=worker-$b")
+    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--bin:@=worker-$b" "${extra[@]}")
     echo "$b: curry ${hash_of[$b]}" >&2
     names+=("$b")
   done
