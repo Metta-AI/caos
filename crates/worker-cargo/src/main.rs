@@ -9,6 +9,11 @@
 //! mtimes, so workspace crates always rebuild — only the baked deps are
 //! reused) and runs cargo `--offline`.
 //!
+//! Optional args: `--target` (a rustc target triple — e.g. musl, so a
+//! produced binary is static and runs on any base) and `--profile` (default
+//! `dev`; the caos deps bake is dev, other profiles compile from scratch).
+//! Both ride the cache key like any arg.
+//!
 //! **Any cargo outcome is a value, never a worker error** — a compile error or
 //! failing test is something the model must see and react to (and it caches:
 //! same tree, same diagnostics). The result is a tree, the bash tool's shape
@@ -19,6 +24,8 @@
 //! exit    blob  cargo's exit code, decimal (128+signal if killed)
 //! stdout  blob  captured stdout, the last 100KB
 //! stderr  blob  captured stderr, the last 100KB (cargo's diagnostics)
+//! bin     tree  (cmd=build, exit 0) the produced executables, by name —
+//!               what a worker-producing caller (rustc) is after
 //! ```
 //!
 //! Only infrastructure failures (fetch failed, no baked workspace root) error
@@ -35,7 +42,9 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use worker_common::{arg, caos, entries, file_name, path, read_arg, run_worker, scratch};
+use worker_common::{
+    arg, caos, entries, file_name, path, read_arg, read_arg_opt, run_worker, scratch,
+};
 
 /// Keep at most this many bytes (the tail) of each captured stream.
 const STREAM_CAP: usize = 100_000;
@@ -50,12 +59,18 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let cmd = read_arg("cmd")?;
-    let argv: &[&str] = match cmd.as_str() {
-        "check" => &["check", "--workspace", "--all-targets"],
-        "build" => &["build", "--workspace"],
-        "test" => &["test", "--workspace"],
+    let target = read_arg_opt("target")?;
+    let profile = read_arg_opt("profile")?.unwrap_or_else(|| "dev".to_string());
+    let mut argv: Vec<&str> = match cmd.as_str() {
+        "check" => vec!["check", "--workspace", "--all-targets"],
+        "build" => vec!["build", "--workspace"],
+        "test" => vec!["test", "--workspace"],
         other => return Err(format!("unknown cmd {other:?} (want check|build|test)")),
     };
+    argv.extend(["--profile", &profile]);
+    if let Some(t) = &target {
+        argv.extend(["--target", t]);
+    }
 
     // The workspace tree: run-then's `in`, or a direct `--tree` arg.
     let tree = if Path::new(&arg("in")).exists() {
@@ -89,18 +104,53 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("copying vendor config: {e}"))?;
 
     let out = Command::new("cargo")
-        .args(argv)
+        .args(&argv)
         .arg("--offline")
         .current_dir(&ws)
         .output()
         .map_err(|e| format!("running cargo: {e}"))?;
+    let exit = exit_code(&out.status);
 
     let res = scratch("result")?;
-    fs::write(res.join("exit"), format!("{}\n", exit_code(&out.status)))
-        .map_err(|e| format!("writing exit: {e}"))?;
+    fs::write(res.join("exit"), format!("{exit}\n")).map_err(|e| format!("writing exit: {e}"))?;
     fs::write(res.join("stdout"), tail(&out.stdout)).map_err(|e| format!("writing stdout: {e}"))?;
     fs::write(res.join("stderr"), tail(&out.stderr)).map_err(|e| format!("writing stderr: {e}"))?;
+    if cmd == "build" && exit == 0 {
+        stage_binaries(&ws, target.as_deref(), &profile, &res)?;
+    }
     caos(["put", path(&res), "/cas/out"])
+}
+
+/// Stage the build's executables into `res/bin/<name>` — what a
+/// worker-producing caller (rustc) is after. Cargo places a workspace's final
+/// binaries directly in the profile dir (`target[/<triple>]/<debug|release>`);
+/// everything else there (deps/, build/, .fingerprint/, *.d) is intermediate.
+fn stage_binaries(ws: &str, target: Option<&str>, profile: &str, res: &Path) -> Result<(), String> {
+    let mut dir = Path::new(ws).join("target");
+    if let Some(t) = target {
+        dir = dir.join(t);
+    }
+    // Cargo's dir for the `dev` profile is `debug`; other profiles use their
+    // own name.
+    dir = dir.join(if profile == "dev" { "debug" } else { profile });
+
+    let mut bins = Vec::new();
+    for entry in entries(path(&dir))? {
+        let meta = fs::metadata(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+            bins.push(entry);
+        }
+    }
+    if bins.is_empty() {
+        return Ok(());
+    }
+    let bin_dir = res.join("bin");
+    fs::create_dir(&bin_dir).map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
+    for b in bins {
+        fs::copy(&b, bin_dir.join(file_name(&b)))
+            .map_err(|e| format!("staging {}: {e}", b.display()))?;
+    }
+    Ok(())
 }
 
 /// Copy the fetched source tree into the workspace root as real, writable
