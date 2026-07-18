@@ -256,6 +256,22 @@ the correct shape for every worker, and the reason the nix-free process-mode
 publish is possible at all. The nix-building and toolchain-image tests
 (cargo*, chat*, rust-worker, proc-stack, test-in-caos itself) stay host-side.
 
+**Real per-test jobs (built) — `tests/test-all`.** A generic inner
+`run-test.sh` stands up the nested stack, publishes std from the passed
+binaries, and runs the **unmodified `cli.sh`** of whatever test tree it's
+handed; the host driver fires one testenv job per curry-able test
+(file-count, dirs-only, deep-deps, rgrep), each keyed on `(run-test.sh, that
+test's tree, binaries)`. So each `tests/<name>` is now genuinely one caos
+job: the four real suites pass inside nested stacks (~27s cold across four),
+and a second pass is all cache hits (**281ms** — a ~100× memoization), with
+an edit to one test's fixtures re-running only its job. This is the
+tests-as-jobs contract on the real tests, not a proxy. What it does *not* yet
+cover is the same boundary as before — tests needing the bash **script**
+worker (`run-then`, `symlinks`, `untracked`) or a toolchain/other image
+(`commit`, `cargo*`, `rust-worker`) — because process-mode slots run only
+`bin`-workers via the trampoline; an *image*-based worker needs the podman
+backend (phase 4). That's the clean next capability for closing the gap.
+
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is
 tested by *using* the edited caos to run them.
