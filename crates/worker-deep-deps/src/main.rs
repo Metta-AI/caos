@@ -64,10 +64,13 @@ fn deepen(pkg: &str) -> Result<(), String> {
     // Recurse on each dep with this same image as the map; finish with the node
     // builder, which needs the *package* (the mapped-over tree is the deps), so
     // it rides in by curry.
-    let finish = caos_curry(
-        &me(),
-        &[("mode", Arg::Lit("finish")), ("pkg", Arg::Path(pkg))],
-    )?;
+    let bin = arg("bin");
+    let mut finish_kvs: Vec<(&str, Arg)> =
+        vec![("mode", Arg::Lit("finish")), ("pkg", Arg::Path(pkg))];
+    if Path::new(&bin).exists() {
+        finish_kvs.push(("bin", Arg::Path(&bin)));
+    }
+    let finish = caos_curry(&me(), &finish_kvs)?;
     map_then("/cas/deps", Some(&deepen_image()?), Some(&finish))
 }
 
@@ -128,13 +131,18 @@ fn deepen_all() -> Result<(), String> {
 /// Currying the map into `deepen` (not `finish`) is what keeps it out of
 /// `finish`'s cache key.
 fn deepen_image() -> Result<String, String> {
-    caos_curry(
-        &me(),
-        &[
-            ("mode", Arg::Lit("deepen")),
-            ("packages", Arg::Path(&arg("packages"))),
-        ],
-    )
+    let bin = arg("bin");
+    let packages = arg("packages");
+    let mut kvs: Vec<(&str, Arg)> = vec![
+        ("mode", Arg::Lit("deepen")),
+        ("packages", Arg::Path(&packages)),
+    ];
+    // Rebind the runner-pool `bin` so recursion re-execs this binary (own_image
+    // is the unwrapped base). No-op when absent (a baked image). See rgrep.
+    if Path::new(&bin).exists() {
+        kvs.push(("bin", Arg::Path(&bin)));
+    }
+    caos_curry(&me(), &kvs)
 }
 
 /// This image, for currying `deepen`/`finish` — its own image from the

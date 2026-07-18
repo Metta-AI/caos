@@ -1080,6 +1080,9 @@
           # The runner-pool trampoline binary, exposed for the process-mode
           # backend (it becomes each chroot slot's /worker; tests/proc-stack).
           inherit worker-runner;
+          # The pure-Rust example workers' binaries, exposed for the inner
+          # process-mode suite (curry(dummy, bin); tests/suite-in-caos).
+          inherit worker-file-count worker-dirs-only worker-deep-deps;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)

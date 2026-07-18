@@ -12,13 +12,18 @@
 //!
 //! The result, a blob holding the count, is left at `/cas/out`. It reaches its
 //! own image at `/cas/args/image` — the request's reserved `image` entry — so
-//! recursion needs no std lookup.
+//! recursion needs no std lookup. `own_image` is the *unwrapped base*, though,
+//! so when this worker ships as a runner-pool `curry(runner, bin)` the
+//! recursion must rebind `bin` (the rgrep worker documents the same); with the
+//! binding absent (a baked image) it's a no-op.
 
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use worker_common::{arg, caos, entries, map_then, own_image, path, run_worker, scratch};
+use worker_common::{
+    arg, caos, caos_curry, entries, map_then, own_image, path, run_worker, scratch, Arg,
+};
 
 fn main() -> ExitCode {
     run_worker("file-count", run)
@@ -37,13 +42,26 @@ fn run() -> Result<(), String> {
         // A tree with no counted children yet: recurse. Tail call — the
         // continuation is this worker's result.
         eprintln!("file-count: recursing over the tree's children");
-        let me = own_image();
+        let me = recur_image()?;
         return map_then(&arg("in"), Some(&me), Some(&me));
     };
 
     let out = scratch("file-count")?.join("count");
     fs::write(&out, format!("{total}\n")).map_err(|e| format!("writing count: {e}"))?;
     caos(["put", path(&out), "/cas/out"])
+}
+
+/// The image to recurse with: our own (unwrapped) image, rebinding the
+/// runner-pool `bin` when we ship as a curry so children re-exec this binary.
+/// A no-op when there's no `bin` (a baked image already carries `/worker`).
+fn recur_image() -> Result<String, String> {
+    let me = own_image();
+    let bin = arg("bin");
+    if Path::new(&bin).exists() {
+        caos_curry(&me, &[("bin", Arg::Path(&bin))])
+    } else {
+        Ok(me)
+    }
 }
 
 /// Sum the counts in the `--children` tree (one numeric blob per child; an

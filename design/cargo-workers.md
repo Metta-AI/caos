@@ -239,6 +239,23 @@ workers, test tree); a `test-all` worker maps over `tests/` — parallel, and
 a test whose inputs didn't change never re-runs. That's also the CI story.
 `chat-online` (real API key) stays host-side/self-skipped as today.
 
+**Suite-in-caos (built):** `tests/suite-in-caos` generalizes the one-worker
+`test-in-caos` to a multi-worker smoke suite — a file-count fold, the
+deep-deps DAG, an rgrep fold — inside one nested process-mode job, keyed on
+(script, binaries): first run ~18s, identical re-run 65ms. It introduces
+**inner-std publishing without nix**: for each worker binary, `curry(dummy,
+bin=<binary>)`, assemble the `{name: curry}` tree with `git mktree`, push it
+to the inner `refs/caos/std`. This surfaced a real generality gap: a worker
+that self-recurses through `own_image()` — which is the *unwrapped base*, not
+the running curry — must **rebind `bin`** at each recursion, or a
+`curry(_, bin)` deployment loses the binary on the first sub-run. `rgrep`
+already did this; `file-count` and `deep-deps` did not (they only ever ran as
+baked images, where the binding is absent and the rebind a no-op). Teaching
+them the rebind makes them runner-pool-native as well as image-bakeable —
+the correct shape for every worker, and the reason the nix-free process-mode
+publish is possible at all. The nix-building and toolchain-image tests
+(cargo*, chat*, rust-worker, proc-stack, test-in-caos itself) stay host-side.
+
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is
 tested by *using* the edited caos to run them.
