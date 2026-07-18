@@ -362,6 +362,23 @@ a stale copy of the crate being built.
 
 ## Open items
 
+- **flake-build worker (the third build leg; deferred, user-requested).** A
+  stock `nixos/nix`-based worker taking `(flake-ref, attr, curried
+  push-creds)`, running `nix build .#attr` then streaming the result to a
+  registry (`streamLayeredImage | skopeo`); `/cas/out` is the docker digest,
+  memoized on (flake, lock, attr) so repeats never invoke nix. This is the
+  runner-pool note's deferred flake-worker. It is the one build a normal
+  worker structurally *cannot* do — **images** — so it is how the bootstrap
+  finally closes: `build-builtins.sh` becomes caos jobs, nix-on-host shrinks
+  to building the single nix-worker image, and a `Cargo.lock` bump rebuilds
+  the toolchain image in-caos instead of on the host. Complements, does *not*
+  replace, the per-crate cargo path (which stays the fine-grained inner
+  loop). Caveats: a cold `/nix/store` needs a substituter (network — fine per
+  the worker-network stance); the flake.lock must be pinned for the memo to
+  be sound; push creds are curried. The root grant + process backend built in
+  phase 3 (the testenv worker) already provide what it needs. Smallest first
+  step: build one existing image attr, stream it to the dev registry, prove a
+  second run is a caos cache hit with nix never invoked.
 - Phase 2's exact mechanism (merged target dirs at the fixed path looks
   viable per the spike; metadata pipelining and raw rustc stay fallbacks).
 - Single-flight on request hash (map-then's open item) — required before the
