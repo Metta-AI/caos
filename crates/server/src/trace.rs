@@ -1,7 +1,7 @@
-//! Bounded, in-memory invocation traces for local observability.
+//! Bounded, in-memory Chrome traces for compute invocations.
 //!
-//! Traces intentionally contain only content hashes, topology, timing, and
-//! cache state. Raw arguments and worker logs never enter this store.
+//! Events contain only timing, cache outcome, and unnamed input hashes. They
+//! deliberately exclude request shape, argument names, results, and logs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -12,37 +12,51 @@ use serde::Serialize;
 const MAX_TRACES: usize = 100;
 
 #[derive(Clone, Serialize)]
-pub(crate) struct Span {
-    pub(crate) id: u64,
-    pub(crate) parent_id: Option<u64>,
-    pub(crate) edge: String,
-    pub(crate) req: String,
-    pub(crate) image: Option<String>,
-    pub(crate) args: Option<String>,
-    pub(crate) arg_entries: BTreeMap<String, String>,
-    pub(crate) cache_hit: Option<bool>,
-    pub(crate) started_ms: u64,
-    pub(crate) elapsed_ms: Option<u64>,
-    pub(crate) result: Option<String>,
-    pub(crate) error: Option<String>,
+pub(crate) struct Trace {
+    #[serde(rename = "traceEvents")]
+    events: Vec<Event>,
+    #[serde(rename = "displayTimeUnit")]
+    display_time_unit: &'static str,
+    #[serde(rename = "otherData")]
+    metadata: Metadata,
 }
 
 #[derive(Clone, Serialize)]
-pub(crate) struct Snapshot {
-    pub(crate) id: String,
-    pub(crate) status: String,
-    pub(crate) started_unix_ms: u64,
-    pub(crate) elapsed_ms: Option<u64>,
-    pub(crate) result: Option<String>,
-    pub(crate) error: Option<String>,
-    pub(crate) spans: Vec<Span>,
+struct Metadata {
+    complete: bool,
+    event_count: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct Event {
+    name: &'static str,
+    ph: &'static str,
+    ts: u64,
+    dur: u64,
+    pid: u32,
+    tid: u64,
+    args: Args,
+}
+
+#[derive(Clone, Serialize)]
+struct Args {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_hit: Option<bool>,
+    input_hashes: Vec<String>,
+}
+
+struct Span {
+    started: Instant,
+    started_unix_us: u64,
+    input_hashes: Vec<String>,
+    cache_hit: Option<bool>,
 }
 
 struct Record {
-    snapshot: Snapshot,
-    started: Instant,
-    span_started: HashMap<u64, Instant>,
+    spans: HashMap<u64, Span>,
+    events: Vec<Event>,
     next_span: u64,
+    complete: bool,
 }
 
 #[derive(Default)]
@@ -71,65 +85,36 @@ impl Store {
         inner.traces.insert(
             id.to_string(),
             Record {
-                snapshot: Snapshot {
-                    id: id.to_string(),
-                    status: "running".to_string(),
-                    started_unix_ms: unix_ms(),
-                    elapsed_ms: None,
-                    result: None,
-                    error: None,
-                    spans: Vec::new(),
-                },
-                started: Instant::now(),
-                span_started: HashMap::new(),
+                spans: HashMap::new(),
+                events: Vec::new(),
                 next_span: 0,
+                complete: false,
             },
         );
         Ok(())
     }
 
-    pub(crate) fn start_span(
-        &self,
-        trace_id: &str,
-        parent_id: Option<u64>,
-        edge: &str,
-        req: &str,
-    ) -> Option<u64> {
+    pub(crate) fn start(&self, trace_id: &str) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let record = inner.traces.get_mut(trace_id)?;
         let id = record.next_span;
         record.next_span += 1;
-        let now = Instant::now();
-        record.span_started.insert(id, now);
-        record.snapshot.spans.push(Span {
+        record.spans.insert(
             id,
-            parent_id,
-            edge: edge.to_string(),
-            req: req.to_string(),
-            image: None,
-            args: None,
-            arg_entries: BTreeMap::new(),
-            cache_hit: None,
-            started_ms: now.duration_since(record.started).as_millis() as u64,
-            elapsed_ms: None,
-            result: None,
-            error: None,
-        });
+            Span {
+                started: Instant::now(),
+                started_unix_us: unix_us(),
+                input_hashes: Vec::new(),
+                cache_hit: None,
+            },
+        );
         Some(id)
     }
 
-    pub(crate) fn request(
-        &self,
-        trace_id: &str,
-        span_id: u64,
-        image: &str,
-        args: &str,
-        arg_entries: &BTreeMap<String, String>,
-    ) {
+    pub(crate) fn inputs(&self, trace_id: &str, span_id: u64, entries: &BTreeMap<String, String>) {
         self.with_span(trace_id, span_id, |span| {
-            span.image = Some(image.to_string());
-            span.args = Some(args.to_string());
-            span.arg_entries = arg_entries.clone();
+            span.input_hashes = entries.values().cloned().collect();
+            span.input_hashes.sort();
         });
     }
 
@@ -137,64 +122,74 @@ impl Store {
         self.with_span(trace_id, span_id, |span| span.cache_hit = Some(hit));
     }
 
-    pub(crate) fn finish_span(
-        &self,
-        trace_id: &str,
-        span_id: u64,
-        result: Option<&str>,
-        failed: bool,
-    ) {
+    pub(crate) fn finish(&self, trace_id: &str, span_id: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = inner.traces.get_mut(trace_id) else {
             return;
         };
-        let elapsed = record
-            .span_started
-            .remove(&span_id)
-            .map(|start| start.elapsed().as_millis() as u64);
-        if let Some(span) = record.snapshot.spans.iter_mut().find(|s| s.id == span_id) {
-            span.elapsed_ms = elapsed;
-            span.result = result.map(str::to_string);
-            if failed {
-                span.error = Some("run failed".to_string());
-            }
-        }
-    }
-
-    pub(crate) fn finish(&self, trace_id: &str, result: Option<&str>, failed: bool) {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(record) = inner.traces.get_mut(trace_id) else {
+        let Some(span) = record.spans.remove(&span_id) else {
             return;
         };
-        record.snapshot.status = if failed { "failed" } else { "completed" }.to_string();
-        record.snapshot.elapsed_ms = Some(record.started.elapsed().as_millis() as u64);
-        record.snapshot.result = result.map(str::to_string);
-        if failed {
-            record.snapshot.error = Some("run failed".to_string());
+        record.events.push(Event {
+            name: "compute",
+            ph: "X",
+            ts: span.started_unix_us,
+            dur: span.started.elapsed().as_micros() as u64,
+            pid: std::process::id(),
+            tid: span_id,
+            args: Args {
+                cache_hit: span.cache_hit,
+                input_hashes: span.input_hashes,
+            },
+        });
+    }
+
+    pub(crate) fn end(&self, trace_id: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = inner.traces.get_mut(trace_id) {
+            record.complete = true;
         }
     }
 
-    pub(crate) fn get(&self, id: &str) -> Option<Snapshot> {
+    pub(crate) fn get(&self, id: &str, after: usize) -> Option<Trace> {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        inner.traces.get(id).map(|r| r.snapshot.clone())
+        let record = inner.traces.get(id)?;
+        Some(Trace {
+            events: record.events.iter().skip(after).cloned().collect(),
+            display_time_unit: "ms",
+            metadata: Metadata {
+                complete: record.complete,
+                event_count: record.events.len(),
+            },
+        })
     }
 
     fn with_span(&self, trace_id: &str, span_id: u64, f: impl FnOnce(&mut Span)) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(record) = inner.traces.get_mut(trace_id) else {
+        let Some(span) = inner
+            .traces
+            .get_mut(trace_id)
+            .and_then(|record| record.spans.get_mut(&span_id))
+        else {
             return;
         };
-        if let Some(span) = record.snapshot.spans.iter_mut().find(|s| s.id == span_id) {
-            f(span);
-        }
+        f(span);
     }
 }
 
-fn unix_ms() -> u64 {
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn unix_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_micros() as u64
 }
 
 #[cfg(test)]
@@ -202,25 +197,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_a_complete_trace() {
+    fn emits_generic_chrome_events() {
         let store = Store::default();
         store.begin("test").unwrap();
-        let span = store.start_span("test", None, "root", "abc").unwrap();
-        let entries = std::collections::BTreeMap::from([
-            ("bin".to_string(), "bin-hash".to_string()),
-            ("image".to_string(), "image".to_string()),
+        let span = store.start("test").unwrap();
+        let entries = BTreeMap::from([
+            ("first".to_string(), "aaa".to_string()),
+            ("second".to_string(), "bbb".to_string()),
         ]);
-        store.request("test", span, "image", "args", &entries);
+        store.inputs("test", span, &entries);
         store.cache("test", span, false);
-        store.finish_span("test", span, Some("blob result"), false);
-        store.finish("test", Some("blob result"), false);
-        let trace = store.get("test").unwrap();
-        assert_eq!(trace.status, "completed");
-        assert_eq!(trace.spans.len(), 1);
-        assert_eq!(trace.spans[0].cache_hit, Some(false));
+        store.finish("test", span);
+
+        store.end("test");
+        let value = serde_json::to_value(store.get("test", 0).unwrap()).unwrap();
+        let events = value["traceEvents"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "compute");
+        assert_eq!(events[0]["ph"], "X");
+        for field in ["ts", "dur", "pid", "tid"] {
+            assert!(events[0][field].is_number());
+        }
+        assert_eq!(events[0]["args"]["cache_hit"], false);
         assert_eq!(
-            trace.spans[0].arg_entries.get("bin").map(String::as_str),
-            Some("bin-hash")
+            events[0]["args"]["input_hashes"],
+            serde_json::json!(["aaa", "bbb"])
         );
+        assert!(events[0]["args"].get("first").is_none());
+        assert!(events[0].get("result").is_none());
+        assert_eq!(value["otherData"]["complete"], true);
+        assert_eq!(value["otherData"]["event_count"], 1);
+        assert!(store.get("test", 1).unwrap().events.is_empty());
     }
 }

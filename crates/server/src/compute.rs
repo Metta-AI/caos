@@ -67,13 +67,6 @@ const CURRY_MARKER: &str = ".caos-curry";
 /// Reserved suffix for the per-entry permission sidecars `import-image` writes.
 const META_SUFFIX: &str = ".caosmeta";
 
-#[derive(Clone, Copy)]
-struct TraceCall<'a> {
-    id: Option<&'a str>,
-    parent_span: Option<u64>,
-    edge: &'a str,
-}
-
 /// Disambiguates temp dirs created across handler threads.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -96,30 +89,16 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     }
     let trace_id = query_param(query, "trace");
     if let Some(id) = &trace_id {
-        if id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        {
+        if !crate::trace::valid_id(id) {
             return Err(HttpError::new(400, "invalid trace id"));
         }
         config.trace.begin(id).map_err(|e| HttpError::new(409, e))?;
     }
     // An HTTP run is by definition top-level: the run stack (cycle detection)
     // exists only inside the server, threaded through promise sub-runs.
-    let result = run_req(config, &req, &[], trace_id.as_deref(), None, "root");
-    match &result {
-        Ok(result) => {
-            if let Some(id) = &trace_id {
-                config.trace.finish(id, Some(result), false);
-            }
-        }
-        Err(_) => {
-            if let Some(id) = &trace_id {
-                config.trace.finish(id, None, true);
-            }
-        }
+    let result = run_req(config, &req, &[], trace_id.as_deref());
+    if let Some(id) = &trace_id {
+        config.trace.end(id);
     }
     let result = result?;
     // Pin an external run's result so a client can fetch it by ref and it
@@ -137,18 +116,11 @@ fn run_req(
     req: &str,
     stack: &[String],
     trace_id: Option<&str>,
-    parent_span: Option<u64>,
-    edge: &str,
 ) -> Result<String, HttpError> {
-    let span_id = trace_id.and_then(|id| config.trace.start_span(id, parent_span, edge, req));
+    let span_id = trace_id.and_then(|id| config.trace.start(id));
     let result = run_req_inner(config, req, stack, trace_id, span_id);
     if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-        match &result {
-            Ok(result) => config
-                .trace
-                .finish_span(trace_id, span_id, Some(result), false),
-            Err(_) => config.trace.finish_span(trace_id, span_id, None, true),
-        }
+        config.trace.finish(trace_id, span_id);
     }
     result
 }
@@ -175,9 +147,7 @@ fn run_req_inner(
     if let (Some(trace_id), Some(span_id), Some(entries)) =
         (trace_id, span_id, traced_arg_entries.as_ref())
     {
-        config
-            .trace
-            .request(trace_id, span_id, &image, &args, entries);
+        config.trace.inputs(trace_id, span_id, entries);
     }
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
@@ -210,9 +180,6 @@ fn run_req_inner(
             eprintln!("cache miss: req={req} (image={image} args={args}); running worker")
         }
         Err(e) => {
-            if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-                config.trace.cache(trace_id, span_id, false);
-            }
             eprintln!("cache lookup failed ({e}); running worker: req={req}")
         }
     }
@@ -242,7 +209,7 @@ fn run_req_inner(
     // against), and hand the job to a polling runner. The dispatch blocks this
     // server thread until a runner posts the result; capacity is runner-side
     // (the set of parked polls), so there's no server-side slot to hold.
-    let dispatched = {
+    let result = {
         let image_ref = resolve_image(config, &image)?;
         let arg_entries = match traced_arg_entries {
             Some(entries) => entries,
@@ -250,7 +217,6 @@ fn run_req_inner(
         };
         crate::runner::dispatch(req, arg_entries, &image_ref)?
     };
-    let result = dispatched.result;
 
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: req={req}");
@@ -262,7 +228,7 @@ fn run_req_inner(
     let result = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: req={req} -> continuation {cont}");
-            resolve_promise(config, cont, &std, &salt, &child_stack, trace_id, span_id)?
+            resolve_promise(config, cont, &std, &salt, &child_stack, trace_id)?
         }
         _ => result,
     };
@@ -304,7 +270,6 @@ fn resolve_promise(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
-    parent_span: Option<u64>,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -361,19 +326,8 @@ fn resolve_promise(
                             let img = img.as_str();
                             scope.spawn(move || {
                                 let arg = named_entry("in", kid.mode, kid.oid);
-                                let result = run_image(
-                                    config,
-                                    img,
-                                    vec![arg],
-                                    std,
-                                    salt,
-                                    stack,
-                                    TraceCall {
-                                        id: trace_id,
-                                        parent_span,
-                                        edge: "map",
-                                    },
-                                )?;
+                                let result =
+                                    run_image(config, img, vec![arg], std, salt, stack, trace_id)?;
                                 result_entry(&kid.name, &result)
                             })
                         })
@@ -403,7 +357,7 @@ fn resolve_promise(
     } else if let Some(img) = &run {
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_req`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        let result = run_image(config, img, vec![input.clone()], std, salt, stack)?;
+        let result = run_image(config, img, vec![input.clone()], std, salt, stack, trace_id)?;
         Some((result_entry("result", &result)?, result))
     } else {
         None
@@ -418,19 +372,7 @@ fn resolve_promise(
             if let Some((extra, _)) = mid {
                 args.push(extra);
             }
-            run_image(
-                config,
-                &img,
-                args,
-                std,
-                salt,
-                stack,
-                TraceCall {
-                    id: trace_id,
-                    parent_span,
-                    edge: "then",
-                },
-            )
+            run_image(config, &img, args, std, salt, stack, trace_id)
         }
         // No `then`: the middle step's own result is the request's result.
         (None, Some((_, result))) => Ok(result),
@@ -455,7 +397,7 @@ fn run_image(
     std: &str,
     salt: &str,
     stack: &[String],
-    trace: TraceCall<'_>,
+    trace_id: Option<&str>,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -494,14 +436,7 @@ fn run_image(
         ),
     ];
     let req = store_git_tree(config, entries).map_err(store_err)?;
-    run_req(
-        config,
-        &req.to_string(),
-        stack,
-        trace.id,
-        trace.parent_span,
-        trace.edge,
-    )
+    run_req(config, &req.to_string(), stack, trace_id)
 }
 
 /// Peel any curry layers off `image_ref`, returning the underlying plain image
@@ -1286,7 +1221,7 @@ fn read_reply_line(reader: &mut impl BufRead) -> Result<String, String> {
 }
 
 /// Find `name` in an `a=b&c=d` query string and percent-decode its value.
-fn query_param(query: &str, name: &str) -> Option<String> {
+pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == name).then(|| percent_decode(v))

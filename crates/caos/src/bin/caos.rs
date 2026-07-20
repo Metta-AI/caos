@@ -179,15 +179,11 @@ fn runner(job_json: &str) -> Result<(), String> {
 /// jobs, so std/salt come from the request rather than our env: `/cas/std` is
 /// materialized from the request's value, and the worker child gets both as
 /// env vars — `caos map-then`/`curry` running under it read them from there.
-struct RanJob {
-    result: String,
-}
-
 fn run_runner_job(
     t: &HttpTransport,
     job: &RunnerJob,
     image_oid: &mut Option<String>,
-) -> Result<RanJob, String> {
+) -> Result<String, String> {
     let (args, std, salt) = read_req_tree(t, &job.req)?;
     let cas = cas_setup(Some(&args), std.as_deref())?;
     // Our image's CAS-level name, for the follow-up poll's required args — read
@@ -203,7 +199,7 @@ fn run_runner_job(
     run_worker(&envs)?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
-    Ok(RanJob { result })
+    Ok(result)
 }
 
 /// Unpack a request tree `{args, std, salt}`: the args-tree hash, the std tree
@@ -238,12 +234,11 @@ fn read_req_tree(t: &dyn Transport, req: &str) -> Result<(String, Option<String>
 fn post_result(
     t: &HttpTransport,
     job: &RunnerJob,
-    ran: &Result<RanJob, String>,
+    ran: &Result<String, String>,
 ) -> Result<(), String> {
     let body = match ran {
-        Ok(ran) => serde_json::json!({
-            "req": job.req, "nonce": job.nonce, "ok": true,
-            "result": &ran.result,
+        Ok(result) => serde_json::json!({
+            "req": job.req, "nonce": job.nonce, "ok": true, "result": result,
         }),
         Err(error) => serde_json::json!({
             "req": job.req, "nonce": job.nonce, "ok": false, "error": error,

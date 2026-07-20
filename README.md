@@ -148,7 +148,7 @@ runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
 | `GET /run?req=<reqHash>&trace=<traceId>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). The optional trace id records this invocation without changing the request or cache key. See [compute](#compute). |
-| `GET /trace/<traceId>` | Return the live or completed invocation trace as JSON. Traces are bounded in memory and contain topology, content hashes (including top-level argument-entry hashes), timings, cache state, results, and failures—never raw argument values or logs. |
+| `GET /trace/<traceId>?after=<count>` | Return completed compute events in Chrome Trace Event Format, optionally after an event-count cursor. Traces are bounded in memory; each generic event contains only timing, cache hit/miss, and the unnamed hashes offered to runner matching. |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
@@ -201,11 +201,14 @@ match on the worker alongside the rest, and a worker, seeing its args at
    over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
    fetch/watch point. Sub-runs set no ref.
 
-`caos-cli run` always sends an invocation trace id. Set `CAOS_TRACE_ID` to
-choose it and `CAOS_TRACE_FILE` to have the CLI write it before the blocking
-run request begins. This state is deliberately not part of the request tree:
-two invocations of the same computation share a cache key but remain distinct
-attempts in observability. The server retains the latest 100 traces in memory.
+Set `CAOS_TRACE_ID` to trace a `caos-cli run`. Poll `GET /trace/<traceId>` while
+the run is live or save its response and open it in `chrome://tracing`. For
+incremental consumption, pass the prior response's
+`otherData.event_count` as `after`; `otherData.complete` marks the last batch.
+This lets a future `caos-cli` trace view stream batches beside its blocking
+`/run` request without changing the runner protocol. Trace state is not part of
+the request tree: two invocations of the same computation share a cache key but
+remain distinct observations. The server retains the latest 100 traces in memory.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).

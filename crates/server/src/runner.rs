@@ -78,14 +78,10 @@ enum PollReply {
 
 /// What a dispatch is answered with (over its per-dispatch channel).
 enum Outcome {
-    /// The worker's result.
-    Done(DispatchResult),
+    /// The worker's `"<type> <hash>"` (possibly a `promise` the caller resolves).
+    Done(String),
     /// The runner reported failure.
     Failed(String),
-}
-
-pub(crate) struct DispatchResult {
-    pub(crate) result: String,
 }
 
 /// A hanging `POST /runner/poll`, parked until matched, kicked, or expired.
@@ -204,7 +200,7 @@ pub(crate) fn dispatch(
     req: &str,
     arg_entries: ArgSet,
     image_ref: &str,
-) -> Result<DispatchResult, HttpError> {
+) -> Result<String, HttpError> {
     let (outcome_tx, outcome_rx) = mpsc::channel();
     let id = {
         let mut st = lock();
@@ -504,9 +500,7 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
     drop(st);
     let outcome = if v["ok"].as_bool() == Some(true) {
         match v["result"].as_str() {
-            Some(result) if !result.trim().is_empty() => Outcome::Done(DispatchResult {
-                result: result.trim().to_string(),
-            }),
+            Some(result) if !result.trim().is_empty() => Outcome::Done(result.trim().to_string()),
             _ => Outcome::Failed("runner posted ok without a result".to_string()),
         }
     } else {

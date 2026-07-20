@@ -59,13 +59,10 @@ pub const DEFAULT_STD_REF: &str = "refs/caos/std";
 /// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
 
-/// Optional caller-supplied id for the invocation trace recorded by the server.
-/// When absent, the CLI creates one. The id is deliberately outside the request
-/// object: observability must not affect memoization or result identity.
+/// Optional caller-supplied id enabling an invocation trace on the server. The
+/// id is deliberately outside the request object: observability must not affect
+/// memoization or result identity.
 pub const TRACE_ID_ENV: &str = "CAOS_TRACE_ID";
-/// Optional path where `caos-cli run` writes the trace id before it starts the
-/// blocking HTTP request, allowing a supervising process to poll the trace.
-pub const TRACE_FILE_ENV: &str = "CAOS_TRACE_FILE";
 
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
@@ -1733,7 +1730,8 @@ fn run_request(
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    request_compute(&t.server_url()?, &req)
+    let trace_id = trace_id()?;
+    request_compute(&t.server_url()?, &req, trace_id.as_deref())
 }
 
 /// Everything in [`run_request`] up to (and including) getting the request onto
@@ -2313,13 +2311,16 @@ fn merge_entries(
 /// Trigger compute for request `req` and return the result's `(type, hash)`. The
 /// server runs the container (resolving any promise it leaves behind) and
 /// replies with the final `"<type> <hash>"`.
-fn request_compute(base: &str, req: &str, trace_id: &str) -> Result<(String, String), String> {
-    let url = format!(
-        "{}/run?req={}&trace={}",
-        base.trim_end_matches('/'),
-        req,
-        trace_id
-    );
+fn request_compute(
+    base: &str,
+    req: &str,
+    trace_id: Option<&str>,
+) -> Result<(String, String), String> {
+    let mut url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
+    if let Some(id) = trace_id {
+        url.push_str("&trace=");
+        url.push_str(id);
+    }
     let body = http_get(&url)?;
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
@@ -2333,25 +2334,20 @@ fn request_compute(base: &str, req: &str, trace_id: &str) -> Result<(String, Str
     Ok((kind.to_string(), hash.to_string()))
 }
 
-fn trace_id(req: &str) -> Result<String, String> {
-    if let Ok(id) = std::env::var(TRACE_ID_ENV) {
-        if valid_trace_id(&id) {
-            return Ok(id);
-        }
-        return Err(format!(
+fn trace_id() -> Result<Option<String>, String> {
+    let Some(id) = std::env::var_os(TRACE_ID_ENV) else {
+        return Ok(None);
+    };
+    let id = id
+        .into_string()
+        .map_err(|_| format!("{TRACE_ID_ENV} must be valid UTF-8"))?;
+    if valid_trace_id(&id) {
+        Ok(Some(id))
+    } else {
+        Err(format!(
             "{TRACE_ID_ENV} must be 1-128 ASCII letters, digits, '-' or '_'"
-        ));
+        ))
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let serial = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(format!(
-        "{}-{}-{now}-{serial}",
-        &req[..req.len().min(12)],
-        std::process::id()
-    ))
 }
 
 fn valid_trace_id(id: &str) -> bool {
@@ -2360,14 +2356,6 @@ fn valid_trace_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
-fn publish_trace_id(trace_id: &str) -> Result<(), String> {
-    let Ok(path) = std::env::var(TRACE_FILE_ENV) else {
-        return Ok(());
-    };
-    std::fs::write(&path, format!("{trace_id}\n"))
-        .map_err(|e| format!("writing trace id to {path}: {e}"))
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),

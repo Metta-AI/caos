@@ -9,7 +9,8 @@
 //!
 //! * `GET /run?req=<hash>&trace=<id>` — run the request tree `<hash>` and return
 //!   the hash of its result, optionally recording this invocation.
-//! * `GET /trace/<id>` — inspect a live or completed invocation trace.
+//! * `GET /trace/<id>?after=<count>` — inspect a live or completed invocation
+//!   trace, optionally returning only events after a cursor.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
 //! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
@@ -248,17 +249,18 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
         Method::Get if path == "/run" => compute::run(config, &query),
         Method::Get if path.starts_with("/trace/") => {
             let id = path.trim_start_matches("/trace/");
-            if id.is_empty()
-                || id.len() > 128
-                || !id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-            {
+            if !trace::valid_id(id) {
                 return Err(HttpError::new(400, "invalid trace id"));
             }
+            let after = match compute::query_param(&query, "after") {
+                Some(value) => value
+                    .parse::<usize>()
+                    .map_err(|_| HttpError::new(400, "invalid trace cursor"))?,
+                None => 0,
+            };
             let snapshot = config
                 .trace
-                .get(id)
+                .get(id, after)
                 .ok_or_else(|| HttpError::new(404, "trace not found"))?;
             serde_json::to_vec(&snapshot)
                 .map_err(|e| HttpError::new(500, format!("serializing trace: {e}")))
