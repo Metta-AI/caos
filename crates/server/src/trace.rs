@@ -4,7 +4,8 @@
 //! deliberately exclude request shape, argument names, results, and logs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Mutex;
+use std::io::Read;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -56,6 +57,7 @@ struct Record {
     spans: HashMap<u64, Span>,
     events: Vec<Event>,
     next_span: u64,
+    started: bool,
     complete: bool,
 }
 
@@ -66,36 +68,41 @@ struct Inner {
 }
 
 #[derive(Default)]
-pub(crate) struct Store {
+struct Shared {
     inner: Mutex<Inner>,
+    changed: Condvar,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Store {
+    shared: Arc<Shared>,
+}
+
+pub(crate) struct Stream {
+    shared: Arc<Shared>,
+    trace_id: String,
+    cursor: usize,
+    pending: Vec<u8>,
+    offset: usize,
+    done: bool,
 }
 
 impl Store {
     pub(crate) fn begin(&self, id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if inner.traces.contains_key(id) {
-            return Err(format!("trace {id:?} already exists"));
-        }
-        while inner.order.len() >= MAX_TRACES {
-            if let Some(oldest) = inner.order.pop_front() {
-                inner.traces.remove(&oldest);
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = inner.traces.get_mut(id) {
+            if record.started {
+                return Err(format!("trace {id:?} already exists"));
             }
+            record.started = true;
+            return Ok(());
         }
-        inner.order.push_back(id.to_string());
-        inner.traces.insert(
-            id.to_string(),
-            Record {
-                spans: HashMap::new(),
-                events: Vec::new(),
-                next_span: 0,
-                complete: false,
-            },
-        );
+        insert_record(&mut inner, id, true);
         Ok(())
     }
 
     pub(crate) fn start(&self, trace_id: &str) -> Option<u64> {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
         let record = inner.traces.get_mut(trace_id)?;
         let id = record.next_span;
         record.next_span += 1;
@@ -123,7 +130,7 @@ impl Store {
     }
 
     pub(crate) fn finish(&self, trace_id: &str, span_id: u64) {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = inner.traces.get_mut(trace_id) else {
             return;
         };
@@ -142,17 +149,21 @@ impl Store {
                 input_hashes: span.input_hashes,
             },
         });
+        drop(inner);
+        self.shared.changed.notify_all();
     }
 
     pub(crate) fn end(&self, trace_id: &str) {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(record) = inner.traces.get_mut(trace_id) {
             record.complete = true;
         }
+        drop(inner);
+        self.shared.changed.notify_all();
     }
 
     pub(crate) fn get(&self, id: &str, after: usize) -> Option<Trace> {
-        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
         let record = inner.traces.get(id)?;
         Some(Trace {
             events: record.events.iter().skip(after).cloned().collect(),
@@ -164,8 +175,23 @@ impl Store {
         })
     }
 
+    pub(crate) fn stream(&self, id: &str, after: usize) -> Stream {
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !inner.traces.contains_key(id) {
+            insert_record(&mut inner, id, false);
+        }
+        Stream {
+            shared: Arc::clone(&self.shared),
+            trace_id: id.to_string(),
+            cursor: after,
+            pending: Vec::new(),
+            offset: 0,
+            done: false,
+        }
+    }
+
     fn with_span(&self, trace_id: &str, span_id: u64, f: impl FnOnce(&mut Span)) {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(span) = inner
             .traces
             .get_mut(trace_id)
@@ -174,6 +200,74 @@ impl Store {
             return;
         };
         f(span);
+    }
+}
+
+fn insert_record(inner: &mut Inner, id: &str, started: bool) {
+    while inner.order.len() >= MAX_TRACES {
+        if let Some(oldest) = inner.order.pop_front() {
+            inner.traces.remove(&oldest);
+        }
+    }
+    inner.order.push_back(id.to_string());
+    inner.traces.insert(
+        id.to_string(),
+        Record {
+            spans: HashMap::new(),
+            events: Vec::new(),
+            next_span: 0,
+            started,
+            complete: false,
+        },
+    );
+}
+
+impl Stream {
+    fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            let Some(record) = inner.traces.get(&self.trace_id) else {
+                self.done = true;
+                return Ok(None);
+            };
+            if let Some(event) = record.events.get(self.cursor) {
+                let mut line = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+                line.push(b'\n');
+                self.cursor += 1;
+                return Ok(Some(line));
+            }
+            if record.complete {
+                self.done = true;
+                return Ok(Some(b"{\"complete\":true}\n".to_vec()));
+            }
+            inner = self
+                .shared
+                .changed
+                .wait(inner)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.pending.len() {
+            let Some(line) = self.next_line()? else {
+                return Ok(0);
+            };
+            self.pending = line;
+            self.offset = 0;
+        }
+        let len = buf.len().min(self.pending.len() - self.offset);
+        buf[..len].copy_from_slice(&self.pending[self.offset..self.offset + len]);
+        self.offset += len;
+        Ok(len)
     }
 }
 
@@ -228,5 +322,30 @@ mod tests {
         assert_eq!(value["otherData"]["complete"], true);
         assert_eq!(value["otherData"]["event_count"], 1);
         assert!(store.get("test", 1).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn streams_events_from_a_reserved_trace() {
+        let store = Store::default();
+        let mut stream = store.stream("test", 0);
+        let reader = std::thread::spawn(move || {
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            body
+        });
+
+        store.begin("test").unwrap();
+        let span = store.start("test").unwrap();
+        store.cache("test", span, true);
+        store.finish("test", span);
+        store.end("test");
+
+        let body = reader.join().unwrap();
+        let mut lines = body.lines();
+        let event: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(event["name"], "compute");
+        assert_eq!(event["args"]["cache_hit"], true);
+        assert_eq!(lines.next(), Some("{\"complete\":true}"));
+        assert_eq!(lines.next(), None);
     }
 }

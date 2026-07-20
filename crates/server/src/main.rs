@@ -11,6 +11,7 @@
 //!   the hash of its result, optionally recording this invocation.
 //! * `GET /trace/<id>?after=<count>` — inspect a live or completed invocation
 //!   trace, optionally returning only events after a cursor.
+//! * `GET /trace/<id>/stream` — follow an invocation as chunked NDJSON.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
 //! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
@@ -45,7 +46,7 @@ mod trace;
 
 use std::sync::Arc;
 
-use tiny_http::{Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 /// Listen address; overridable for local runs outside the container. Binds the
 /// IPv6 wildcard (dual-stack: also accepts IPv4) so runners can reach us over
@@ -224,6 +225,44 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
     let path = request.url().split('?').next().unwrap_or("").to_string();
     if git::is_git_path(&path) {
         return git::serve(config, request);
+    }
+    if request.method() == &Method::Get {
+        if let Some(id) = path
+            .strip_prefix("/trace/")
+            .and_then(|rest| rest.strip_suffix("/stream"))
+        {
+            if !trace::valid_id(id) {
+                return request.respond(
+                    Response::from_string("invalid trace id\n").with_status_code(StatusCode(400)),
+                );
+            }
+            let query = request.url().split_once('?').map_or("", |(_, query)| query);
+            let after = match compute::query_param(query, "after") {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return request.respond(
+                            Response::from_string("invalid trace cursor\n")
+                                .with_status_code(StatusCode(400)),
+                        )
+                    }
+                },
+                None => 0,
+            };
+            let stream = config.trace.stream(id, after);
+            let content_type = Header::from_bytes(
+                b"Content-Type".as_slice(),
+                b"application/x-ndjson".as_slice(),
+            )
+            .expect("static header is valid");
+            return request.respond(Response::new(
+                StatusCode(200),
+                vec![content_type],
+                stream,
+                None,
+                None,
+            ));
+        }
     }
 
     match route(config, &mut request) {

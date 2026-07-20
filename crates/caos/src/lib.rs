@@ -25,7 +25,7 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1721,6 +1721,7 @@ fn run_request(
     image: &str,
     cas: Option<&Path>,
     trace_id: Option<&str>,
+    trace_output: Option<&mut (dyn Write + Send)>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
     if trace_id.is_some_and(|id| !valid_trace_id(id)) {
@@ -1729,7 +1730,12 @@ fn run_request(
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    request_compute(&t.server_url()?, &req, trace_id)
+    let server = t.server_url()?;
+    match (trace_id, trace_output) {
+        (Some(id), Some(output)) => request_compute_streamed(&server, &req, id, output),
+        (_, None) => request_compute(&server, &req, trace_id),
+        (None, Some(_)) => Err("trace output requires a trace id".to_string()),
+    }
 }
 
 /// Everything in [`run_request`] up to (and including) getting the request onto
@@ -1921,10 +1927,11 @@ pub fn cli_run(
     image: &str,
     output: Option<&str>,
     trace_id: Option<&str>,
+    trace_output: Option<&mut (dyn Write + Send)>,
     kvs: &[String],
 ) -> Result<(), String> {
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, trace_id, kvs)?;
+    let (kind, result) = run_request(t, &image, None, trace_id, trace_output, kvs)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2333,6 +2340,83 @@ fn request_compute(
     Ok((kind.to_string(), hash.to_string()))
 }
 
+fn request_compute_streamed(
+    base: &str,
+    req: &str,
+    trace_id: &str,
+    output: &mut (dyn Write + Send),
+) -> Result<(String, String), String> {
+    let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
+    let mut response = minreq::get(&stream_url)
+        .send_lazy()
+        .map_err(|e| format!("GET {stream_url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let status = response.status_code;
+        let reason = response.reason_phrase.clone();
+        let mut body = String::new();
+        let _ = response.read_to_string(&mut body);
+        return Err(format!(
+            "GET {stream_url}: server returned {status} {reason}: {}",
+            body.trim()
+        ));
+    }
+
+    std::thread::scope(|scope| {
+        let trace = scope.spawn(|| write_chrome_trace(response, output));
+        let result = request_compute(base, req, Some(trace_id));
+        let trace_result = trace
+            .join()
+            .map_err(|_| "the trace stream thread panicked".to_string())?;
+        let result = result?;
+        trace_result?;
+        Ok(result)
+    })
+}
+
+fn write_chrome_trace(response: impl Read, output: &mut dyn Write) -> Result<(), String> {
+    output
+        .write_all(b"{\"traceEvents\":[")
+        .and_then(|()| output.flush())
+        .map_err(|e| format!("writing trace: {e}"))?;
+
+    let mut count = 0usize;
+    let mut complete = false;
+    for line in BufReader::new(response).lines() {
+        let line = line.map_err(|e| format!("reading trace stream: {e}"))?;
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|e| format!("invalid trace event from server: {e}"))?;
+        if value["complete"].as_bool() == Some(true) {
+            complete = true;
+            break;
+        }
+        if count > 0 {
+            output
+                .write_all(b",")
+                .map_err(|e| format!("writing trace: {e}"))?;
+        }
+        output
+            .write_all(line.as_bytes())
+            .and_then(|()| output.flush())
+            .map_err(|e| format!("writing trace: {e}"))?;
+        count += 1;
+    }
+
+    writeln!(
+        output,
+        "],\"displayTimeUnit\":\"ms\",\"otherData\":{{\"complete\":{complete},\"event_count\":{count}}}}}"
+    )
+    .and_then(|()| output.flush())
+    .map_err(|e| format!("writing trace: {e}"))?;
+    if complete {
+        Ok(())
+    } else {
+        Err("trace stream ended before completion".to_string())
+    }
+}
+
 fn valid_trace_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -2349,4 +2433,27 @@ pub fn prog_name(args: &[String]) -> &str {
         .and_then(Path::file_name)
         .and_then(OsStr::to_str)
         .unwrap_or("caos")
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn streamed_events_become_a_chrome_trace() {
+        let input = std::io::Cursor::new(concat!(
+            "{\"name\":\"compute\",\"ph\":\"X\",\"ts\":1,\"dur\":2,",
+            "\"pid\":3,\"tid\":4,\"args\":{\"cache_hit\":true,",
+            "\"input_hashes\":[\"abc\"]}}\n",
+            "{\"complete\":true}\n"
+        ));
+        let mut output = Vec::new();
+        write_chrome_trace(input, &mut output).unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["traceEvents"][0]["name"], "compute");
+        assert_eq!(value["traceEvents"][0]["args"]["cache_hit"], true);
+        assert_eq!(value["otherData"]["complete"], true);
+        assert_eq!(value["otherData"]["event_count"], 1);
+    }
 }
