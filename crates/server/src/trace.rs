@@ -1,34 +1,18 @@
-//! Bounded, in-memory Chrome traces for compute invocations.
+//! Live Chrome trace events for compute invocations.
 //!
 //! Events contain only timing, cache outcome, and unnamed input hashes. They
-//! deliberately exclude request shape, argument names, results, and logs.
+//! deliberately exclude request shape, argument names, results, and logs. A
+//! zero-capacity channel hands each event directly to the active HTTP stream;
+//! completed traces are not retained.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-const MAX_TRACES: usize = 100;
-
-#[derive(Clone, Serialize)]
-pub(crate) struct Trace {
-    #[serde(rename = "traceEvents")]
-    events: Vec<Event>,
-    #[serde(rename = "displayTimeUnit")]
-    display_time_unit: &'static str,
-    #[serde(rename = "otherData")]
-    metadata: Metadata,
-}
-
-#[derive(Clone, Serialize)]
-struct Metadata {
-    complete: bool,
-    event_count: usize,
-}
-
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 struct Event {
     name: &'static str,
     ph: &'static str,
@@ -39,7 +23,7 @@ struct Event {
     args: Args,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 struct Args {
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_hit: Option<bool>,
@@ -53,56 +37,85 @@ struct Span {
     cache_hit: Option<bool>,
 }
 
+enum Message {
+    Event(Event),
+    Complete,
+}
+
 struct Record {
+    token: u64,
+    sender: mpsc::SyncSender<Message>,
     spans: HashMap<u64, Span>,
-    events: Vec<Event>,
     next_span: u64,
     started: bool,
-    complete: bool,
 }
 
 #[derive(Default)]
 struct Inner {
     traces: HashMap<String, Record>,
-    order: VecDeque<String>,
-}
-
-#[derive(Default)]
-struct Shared {
-    inner: Mutex<Inner>,
-    changed: Condvar,
+    next_token: u64,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Store {
-    shared: Arc<Shared>,
+pub(crate) struct Hub {
+    inner: Arc<Mutex<Inner>>,
 }
 
 pub(crate) struct Stream {
-    shared: Arc<Shared>,
+    inner: Arc<Mutex<Inner>>,
     trace_id: String,
-    cursor: usize,
+    token: u64,
+    receiver: mpsc::Receiver<Message>,
     pending: Vec<u8>,
     offset: usize,
     done: bool,
 }
 
-impl Store {
-    pub(crate) fn begin(&self, id: &str) -> Result<(), String> {
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(record) = inner.traces.get_mut(id) {
-            if record.started {
-                return Err(format!("trace {id:?} already exists"));
-            }
-            record.started = true;
-            return Ok(());
+impl Hub {
+    pub(crate) fn stream(&self, id: &str) -> Result<Stream, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.traces.contains_key(id) {
+            return Err(format!("trace {id:?} already exists"));
         }
-        insert_record(&mut inner, id, true);
+        let token = inner.next_token;
+        inner.next_token = inner.next_token.wrapping_add(1);
+        let (sender, receiver) = mpsc::sync_channel(0);
+        inner.traces.insert(
+            id.to_string(),
+            Record {
+                token,
+                sender,
+                spans: HashMap::new(),
+                next_span: 0,
+                started: false,
+            },
+        );
+        Ok(Stream {
+            inner: Arc::clone(&self.inner),
+            trace_id: id.to_string(),
+            token,
+            receiver,
+            pending: Vec::new(),
+            offset: 0,
+            done: false,
+        })
+    }
+
+    pub(crate) fn begin(&self, id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let record = inner
+            .traces
+            .get_mut(id)
+            .ok_or_else(|| format!("trace stream {id:?} is not open"))?;
+        if record.started {
+            return Err(format!("trace {id:?} already started"));
+        }
+        record.started = true;
         Ok(())
     }
 
     pub(crate) fn start(&self, trace_id: &str) -> Option<u64> {
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let record = inner.traces.get_mut(trace_id)?;
         let id = record.next_span;
         record.next_span += 1;
@@ -130,68 +143,45 @@ impl Store {
     }
 
     pub(crate) fn finish(&self, trace_id: &str, span_id: u64) {
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(record) = inner.traces.get_mut(trace_id) else {
-            return;
+        let event = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(record) = inner.traces.get_mut(trace_id) else {
+                return;
+            };
+            let Some(span) = record.spans.remove(&span_id) else {
+                return;
+            };
+            let event = Event {
+                name: "compute",
+                ph: "X",
+                ts: span.started_unix_us,
+                dur: span.started.elapsed().as_micros() as u64,
+                pid: std::process::id(),
+                tid: span_id,
+                args: Args {
+                    cache_hit: span.cache_hit,
+                    input_hashes: span.input_hashes,
+                },
+            };
+            (record.sender.clone(), event)
         };
-        let Some(span) = record.spans.remove(&span_id) else {
-            return;
-        };
-        record.events.push(Event {
-            name: "compute",
-            ph: "X",
-            ts: span.started_unix_us,
-            dur: span.started.elapsed().as_micros() as u64,
-            pid: std::process::id(),
-            tid: span_id,
-            args: Args {
-                cache_hit: span.cache_hit,
-                input_hashes: span.input_hashes,
-            },
-        });
-        drop(inner);
-        self.shared.changed.notify_all();
+        let _ = event.0.send(Message::Event(event.1));
     }
 
     pub(crate) fn end(&self, trace_id: &str) {
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(record) = inner.traces.get_mut(trace_id) {
-            record.complete = true;
-        }
-        drop(inner);
-        self.shared.changed.notify_all();
-    }
-
-    pub(crate) fn get(&self, id: &str, after: usize) -> Option<Trace> {
-        let inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let record = inner.traces.get(id)?;
-        Some(Trace {
-            events: record.events.iter().skip(after).cloned().collect(),
-            display_time_unit: "ms",
-            metadata: Metadata {
-                complete: record.complete,
-                event_count: record.events.len(),
-            },
-        })
-    }
-
-    pub(crate) fn stream(&self, id: &str, after: usize) -> Stream {
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if !inner.traces.contains_key(id) {
-            insert_record(&mut inner, id, false);
-        }
-        Stream {
-            shared: Arc::clone(&self.shared),
-            trace_id: id.to_string(),
-            cursor: after,
-            pending: Vec::new(),
-            offset: 0,
-            done: false,
+        let record = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .traces
+            .remove(trace_id);
+        if let Some(record) = record {
+            let _ = record.sender.send(Message::Complete);
         }
     }
 
     fn with_span(&self, trace_id: &str, span_id: u64, f: impl FnOnce(&mut Span)) {
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(span) = inner
             .traces
             .get_mut(trace_id)
@@ -203,51 +193,25 @@ impl Store {
     }
 }
 
-fn insert_record(inner: &mut Inner, id: &str, started: bool) {
-    while inner.order.len() >= MAX_TRACES {
-        if let Some(oldest) = inner.order.pop_front() {
-            inner.traces.remove(&oldest);
-        }
-    }
-    inner.order.push_back(id.to_string());
-    inner.traces.insert(
-        id.to_string(),
-        Record {
-            spans: HashMap::new(),
-            events: Vec::new(),
-            next_span: 0,
-            started,
-            complete: false,
-        },
-    );
-}
-
 impl Stream {
     fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         if self.done {
             return Ok(None);
         }
-        let mut inner = self.shared.inner.lock().unwrap_or_else(|p| p.into_inner());
-        loop {
-            let Some(record) = inner.traces.get(&self.trace_id) else {
-                self.done = true;
-                return Ok(None);
-            };
-            if let Some(event) = record.events.get(self.cursor) {
-                let mut line = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+        match self.receiver.recv() {
+            Ok(Message::Event(event)) => {
+                let mut line = serde_json::to_vec(&event).map_err(std::io::Error::other)?;
                 line.push(b'\n');
-                self.cursor += 1;
-                return Ok(Some(line));
+                Ok(Some(line))
             }
-            if record.complete {
+            Ok(Message::Complete) => {
                 self.done = true;
-                return Ok(Some(b"{\"complete\":true}\n".to_vec()));
+                Ok(Some(b"{\"complete\":true}\n".to_vec()))
             }
-            inner = self
-                .shared
-                .changed
-                .wait(inner)
-                .unwrap_or_else(|p| p.into_inner());
+            Err(_) => {
+                self.done = true;
+                Ok(None)
+            }
         }
     }
 }
@@ -271,6 +235,19 @@ impl Read for Stream {
     }
 }
 
+impl Drop for Stream {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner
+            .traces
+            .get(&self.trace_id)
+            .is_some_and(|record| record.token == self.token)
+        {
+            inner.traces.remove(&self.trace_id);
+        }
+    }
+}
+
 pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -291,61 +268,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emits_generic_chrome_events() {
-        let store = Store::default();
-        store.begin("test").unwrap();
-        let span = store.start("test").unwrap();
-        let entries = BTreeMap::from([
-            ("first".to_string(), "aaa".to_string()),
-            ("second".to_string(), "bbb".to_string()),
-        ]);
-        store.inputs("test", span, &entries);
-        store.cache("test", span, false);
-        store.finish("test", span);
-
-        store.end("test");
-        let value = serde_json::to_value(store.get("test", 0).unwrap()).unwrap();
-        let events = value["traceEvents"].as_array().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["name"], "compute");
-        assert_eq!(events[0]["ph"], "X");
-        for field in ["ts", "dur", "pid", "tid"] {
-            assert!(events[0][field].is_number());
-        }
-        assert_eq!(events[0]["args"]["cache_hit"], false);
-        assert_eq!(
-            events[0]["args"]["input_hashes"],
-            serde_json::json!(["aaa", "bbb"])
-        );
-        assert!(events[0]["args"].get("first").is_none());
-        assert!(events[0].get("result").is_none());
-        assert_eq!(value["otherData"]["complete"], true);
-        assert_eq!(value["otherData"]["event_count"], 1);
-        assert!(store.get("test", 1).unwrap().events.is_empty());
-    }
-
-    #[test]
-    fn streams_events_from_a_reserved_trace() {
-        let store = Store::default();
-        let mut stream = store.stream("test", 0);
+    fn streams_generic_chrome_events_without_retaining_them() {
+        let hub = Hub::default();
+        let mut stream = hub.stream("test").unwrap();
         let reader = std::thread::spawn(move || {
             let mut body = String::new();
             stream.read_to_string(&mut body).unwrap();
             body
         });
 
-        store.begin("test").unwrap();
-        let span = store.start("test").unwrap();
-        store.cache("test", span, true);
-        store.finish("test", span);
-        store.end("test");
+        hub.begin("test").unwrap();
+        let span = hub.start("test").unwrap();
+        let entries = BTreeMap::from([
+            ("first".to_string(), "aaa".to_string()),
+            ("second".to_string(), "bbb".to_string()),
+        ]);
+        hub.inputs("test", span, &entries);
+        hub.cache("test", span, false);
+        hub.finish("test", span);
+        hub.end("test");
 
         let body = reader.join().unwrap();
         let mut lines = body.lines();
         let event: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(event["name"], "compute");
-        assert_eq!(event["args"]["cache_hit"], true);
+        assert_eq!(event["ph"], "X");
+        for field in ["ts", "dur", "pid", "tid"] {
+            assert!(event[field].is_number());
+        }
+        assert_eq!(event["args"]["cache_hit"], false);
+        assert_eq!(
+            event["args"]["input_hashes"],
+            serde_json::json!(["aaa", "bbb"])
+        );
+        assert!(event["args"].get("first").is_none());
+        assert!(event.get("result").is_none());
         assert_eq!(lines.next(), Some("{\"complete\":true}"));
         assert_eq!(lines.next(), None);
+
+        assert!(hub.begin("test").is_err());
+        assert!(hub.stream("test").is_ok());
+    }
+
+    #[test]
+    fn dropping_a_stream_removes_its_reservation() {
+        let hub = Hub::default();
+        drop(hub.stream("test").unwrap());
+        assert!(hub.stream("test").is_ok());
     }
 }

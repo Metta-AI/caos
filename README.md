@@ -147,9 +147,8 @@ runner-side: the set of hanging `/runner/poll`s *is* the pool.
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
-| `GET /run?req=<reqHash>&trace=<traceId>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). The optional trace id records this invocation without changing the request or cache key. See [compute](#compute). |
-| `GET /trace/<traceId>?after=<count>` | Return completed compute events in Chrome Trace Event Format, optionally after an event-count cursor. Traces are bounded in memory; each generic event contains only timing, cache hit/miss, and the unnamed hashes offered to runner matching. |
-| `GET /trace/<traceId>/stream` | Follow a trace over one chunked NDJSON response. Each line is a Chrome trace event; the final line is `{"complete":true}`. Opening the stream first reserves the trace id for the subsequent run. |
+| `GET /run?req=<reqHash>&trace=<traceId>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). The optional trace id emits this invocation to its already-open live stream without changing the request or cache key. See [compute](#compute). |
+| `GET /trace/<traceId>/stream` | Follow one live trace over a chunked NDJSON response. Each line is a Chrome trace event; the final line is `{"complete":true}`. Events are handed directly to the stream and the server removes the trace when the run ends. |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
@@ -216,12 +215,11 @@ caos-cli run --trace=- <image> <result-path> -- --input=value
 
 The trace file is valid Chrome Trace Event Format when the run completes and
 can be opened in `chrome://tracing`; while the run is live, `tail -f trace.json`
-shows flushed events. The snapshot endpoint remains useful for inspection: pass
-the prior response's `otherData.event_count` as `after`, and
-`otherData.complete` marks the last batch. Trace state is not part of the
-request tree, so two invocations of the same computation share a cache key but
-remain distinct observations. The server retains the latest 100 traces in
-memory.
+shows flushed events. The server retains no completed trace and offers no
+snapshot or cursor API: each event is handed directly to the one live stream,
+and the ephemeral trace entry is removed when the request ends. Trace state is
+not part of the request tree, so two invocations of the same computation share
+a cache key but remain distinct observations.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).

@@ -1727,14 +1727,17 @@ fn run_request(
     if trace_id.is_some_and(|id| !valid_trace_id(id)) {
         return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
     }
+    if trace_id.is_some() != trace_output.is_some() {
+        return Err("trace id and trace output must be provided together".to_string());
+    }
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
     let server = t.server_url()?;
     match (trace_id, trace_output) {
         (Some(id), Some(output)) => request_compute_streamed(&server, &req, id, output),
-        (_, None) => request_compute(&server, &req, trace_id),
-        (None, Some(_)) => Err("trace output requires a trace id".to_string()),
+        (None, None) => request_compute(&server, &req, None),
+        _ => unreachable!("trace id and output were checked together"),
     }
 }
 

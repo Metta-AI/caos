@@ -8,10 +8,9 @@
 //! Compute:
 //!
 //! * `GET /run?req=<hash>&trace=<id>` — run the request tree `<hash>` and return
-//!   the hash of its result, optionally recording this invocation.
-//! * `GET /trace/<id>?after=<count>` — inspect a live or completed invocation
-//!   trace, optionally returning only events after a cursor.
-//! * `GET /trace/<id>/stream` — follow an invocation as chunked NDJSON.
+//!   the hash of its result, optionally emitting this invocation to an open
+//!   trace stream.
+//! * `GET /trace/<id>/stream` — follow one live invocation as chunked NDJSON.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
 //! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
@@ -82,7 +81,7 @@ struct Config {
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
-    trace: trace::Store,
+    trace: trace::Hub,
 }
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
@@ -160,7 +159,7 @@ fn main() {
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         git_dir,
         repo,
-        trace: trace::Store::default(),
+        trace: trace::Hub::default(),
     });
 
     let server = match Server::http(addr.as_str()) {
@@ -236,20 +235,21 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
                     Response::from_string("invalid trace id\n").with_status_code(StatusCode(400)),
                 );
             }
-            let query = request.url().split_once('?').map_or("", |(_, query)| query);
-            let after = match compute::query_param(query, "after") {
-                Some(value) => match value.parse::<usize>() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return request.respond(
-                            Response::from_string("invalid trace cursor\n")
-                                .with_status_code(StatusCode(400)),
-                        )
-                    }
-                },
-                None => 0,
+            if request.url().contains('?') {
+                return request.respond(
+                    Response::from_string("trace streams do not accept query parameters\n")
+                        .with_status_code(StatusCode(400)),
+                );
+            }
+            let stream = match config.trace.stream(id) {
+                Ok(stream) => stream,
+                Err(message) => {
+                    return request.respond(
+                        Response::from_string(format!("{message}\n"))
+                            .with_status_code(StatusCode(409)),
+                    )
+                }
             };
-            let stream = config.trace.stream(id, after);
             let content_type = Header::from_bytes(
                 b"Content-Type".as_slice(),
                 b"application/x-ndjson".as_slice(),
@@ -286,24 +286,6 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
 
     match request.method() {
         Method::Get if path == "/run" => compute::run(config, &query),
-        Method::Get if path.starts_with("/trace/") => {
-            let id = path.trim_start_matches("/trace/");
-            if !trace::valid_id(id) {
-                return Err(HttpError::new(400, "invalid trace id"));
-            }
-            let after = match compute::query_param(&query, "after") {
-                Some(value) => value
-                    .parse::<usize>()
-                    .map_err(|_| HttpError::new(400, "invalid trace cursor"))?,
-                None => 0,
-            };
-            let snapshot = config
-                .trace
-                .get(id, after)
-                .ok_or_else(|| HttpError::new(404, "trace not found"))?;
-            serde_json::to_vec(&snapshot)
-                .map_err(|e| HttpError::new(500, format!("serializing trace: {e}")))
-        }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),

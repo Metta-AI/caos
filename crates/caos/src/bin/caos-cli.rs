@@ -66,6 +66,9 @@ fn run(args: &[String]) -> Result<(), String> {
             if trace_path == Some("") {
                 return Err("--trace needs a file path or '-' for stdout".to_string());
             }
+            if trace_id.is_some() && trace_path.is_none() {
+                return Err("--trace-id is only an override for --trace".to_string());
+            }
             if trace_path == Some("-") && output.is_none() {
                 return Err(
                     "--trace=- requires an <output> path for the computation result".to_string(),
