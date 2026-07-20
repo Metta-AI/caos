@@ -276,36 +276,75 @@ There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is
 tested by *using* the edited caos to run them.
 
-### Phase 4 — the podman class
+### Phase 4 — the image class, by socket delegation (not nested podman)
 
 The process backend leaves the docker-facing slices untested inside: the
 git-docker → OCI convert, registry push, `docker://` base stacking, and
-runnerd's docker half. Running podman *inside a test worker* moves those in
-too (with a registry binary in-container for the push tests).
+runnerd's docker half. Those need a test worker that can run *image*-based
+sub-workers, not just `bin`-workers through the trampoline.
 
-What that actually requires — precisely, because it's less than it sounds:
+**The nested-podman plan is dead — a kernel wall, not a config knob.** Running
+a container runtime *inside* a test worker is a second level of nesting, and
+its container setup must `mount -t sysfs` into a fresh namespace. In a nested
+user namespace whose `/sys` is a locked read-only mount, the kernel refuses
+that with `VFS: Mount too revealing`. The check is skipped only for a mount in
+the *initial* user namespace with real `CAP_SYS_ADMIN`. Single-level rootless
+podman never needs `CAP_SYS_ADMIN` (it borrows namespace-scoped privilege),
+which is why containers-in-container already work here — but the *second* level
+can't escape the revealing check. Verified directly (2026-07-20): rootless
+`podman run` succeeds; `unshare --user --net --mount … mount -t sysfs` fails
+"too revealing". So nested podman would need the host sandbox itself launched
+with `CAP_SYS_ADMIN` + unmasked systempaths — a real host-isolation
+relaxation.
 
-- There is one kernel. The outer worker's seccomp/AppArmor confinement is
-  inherited transitively by everything nested, and Docker's *default*
-  profile blocks what container-creation needs (`mount`, `pivot_root`,
-  userns creation) — capability-gated against the *outer* container's cap
-  set, so in-namespace `CAP_SYS_ADMIN` never enters into it.
-- Therefore the podman worker class needs a **relaxed confinement profile**:
-  a custom seccomp allowlist (or unconfined) plus AppArmor unconfined —
-  flags runnerd passes for designated images. **No `--privileged`, no added
-  capabilities, no devices**: kernels ≥ ~5.12 mount native overlayfs inside
-  an unprivileged userns (fuse-overlayfs and `/dev/fuse` are the legacy
-  path; VFS the universal fallback). Host policy must allow unprivileged
-  userns at all (e.g. Ubuntu 24.04 restricts it via AppArmor) — `caosd up`
-  should probe.
-- It stays a **designated class**, not the default — not because it grants
-  privilege but because unprivileged userns + mount are historically the
-  richest kernel-escape attack surface, which is exactly why Docker filters
-  them by default. Per-worker containment grants, not dogma (same stance as
-  network).
-- Base images ride in as inputs (OCI layouts, `podman load`ed), pinned by
-  digest in the cache key — network may be granted, but the digest in the
-  key is what keeps the run deterministic.
+**Instead: delegate to the outer engine's socket (Docker-out-of-Docker).** The
+test worker doesn't run a runtime; it talks to the *outer* engine through a
+bind-mounted API socket, and the sub-workers launch as **siblings** of the
+worker — created by the outer engine at the layer that already works. No second
+nesting level, no `mount_too_revealing`, **no host change at all**. The trade
+is a per-worker grant of the engine socket (root-equivalent over that engine)
+plus a little plumbing. This is the same "per-worker containment grant, not
+dogma" stance as network and the uid-0 grant.
+
+Mechanics (all proven end to end, 2026-07-20 — reproducer:
+`tests/socket-in-caos/manual-spike.sh`, which builds a setuid runner image,
+starts a podman API service, launches a worker with the socket, and runs
+`manual-inner.sh` — the pre-staged twin of `inner-socket.sh`):
+
+- **runnerd knobs** (`crates/runnerd`): `CAOS_RUNNER_SOCKET=<host sock>` makes
+  the *outer* runnerd bind-mount the engine socket into a granted worker at a
+  fixed path (`/run/caos/engine.sock`, advertised as `CAOS_ENGINE_SOCKET`).
+  `CAOS_DOCKER_ARGS` injects global flags before `run` so the *inner* runnerd
+  runs `podman --remote --url unix://<sock> run …` — delegating to the socket
+  rather than a local (nesting) runtime. Both are additive and env-gated; unset
+  = today's behavior.
+- **Sibling reachability**: the inner runnerd sets
+  `CAOS_DOCKER_NETWORK=container:<self>` so each sibling joins the *worker's*
+  network namespace (proven: identical `/proc/self/ns/net` inode). The inner
+  server, a process inside the worker on `127.0.0.1`, is then reachable by the
+  siblings exactly as `CAOS_SERVER_URL=http://127.0.0.1` — the same URL the
+  runner already expects.
+- **Client must be remote**: the local `docker`/`podman` here is a shim that
+  runs *locally* (i.e. nests). Delegation requires the podman *remote* client
+  against an API service (`podman system service --time=0 unix://<sock>`); the
+  socket-activated one isn't reliably present.
+- **Image resolution**: `resolve_image` passes `docker://<ref>` through before
+  any convert, so the first cut references a self-contained runner image the
+  outer store already has — no inner registry needed. (The convert/registry
+  path — for the git-docker → OCI tests — layers on top later, pushing to a
+  registry the siblings can pull, same as the outer stack.)
+- The runner image the siblings run must carry a **setuid-root** `/bin/caos`
+  (the worker drops to uid 1000 and reaches the root-owned `/cas`, xattrs and
+  all, only through it) and the `/worker` trampoline — exactly what the normal
+  worker images install. Static musl binaries mean it can be a thin `FROM
+  scratch`/debian image.
+
+Remaining to land it in the suite: put a `podman` (remote client) in the
+testenv image; stand up a `podman system service` socket during `run-all` and
+set `CAOS_RUNNER_SOCKET` on the outer runnerd; publish a self-contained runner
+image tag for the inner `docker://` ref; wire `tests/socket-in-caos`
+(`inner-socket.sh` written). Base images still ride in as inputs pinned by
+digest in the cache key.
 
 ### The tiers
 

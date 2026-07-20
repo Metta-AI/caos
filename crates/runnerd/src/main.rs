@@ -37,6 +37,9 @@
 //! injected into the containers), `CAOS_RUNNER_TOKEN` (bearer token, if the
 //! server requires one), `CAOS_RUNNER_SLOTS` (default 8), `CAOS_DOCKER_NETWORK`
 //! (default `caos-net`), `CAOS_DOCKER_BIN` (default `docker`),
+//! `CAOS_DOCKER_ARGS` (global flags before `run`, e.g.
+//! `--remote --url unix://…` for the phase-4 socket-delegation backend),
+//! `CAOS_RUNNER_SOCKET` (an engine socket to bind-mount into every worker),
 //! `CAOS_RUNNER_MODE` (`docker` | `process`), and in process mode
 //! `CAOS_RUNNER_ROOT` (default `/tmp/caos-slots`), `CAOS_PROCESS_CAOS`,
 //! `CAOS_PROCESS_WORKER`.
@@ -47,6 +50,10 @@ use std::time::Duration;
 
 /// The caos binary inside every compute image, forced as the entrypoint.
 const CAOS_BIN: &str = "/bin/caos";
+
+/// Fixed in-container path where a granted engine socket is bind-mounted
+/// (`CAOS_RUNNER_SOCKET`); advertised to the worker as `CAOS_ENGINE_SOCKET`.
+const ENGINE_SOCKET_PATH: &str = "/run/caos/engine.sock";
 
 /// How long each generic poll hangs. Purely a reconnect cadence — a generic
 /// runner never idles out, it just polls again.
@@ -61,6 +68,17 @@ struct Config {
     slots: u32,
     network: String,
     docker_bin: String,
+    /// Global args inserted *before* the `run` subcommand — e.g.
+    /// `--remote --url unix://…` so an INNER runnerd delegates to an outer
+    /// engine's API socket (the sibling/socket-delegation backend,
+    /// design/cargo-workers.md phase 4) instead of running a nested runtime.
+    docker_args: Vec<String>,
+    /// If set, bind-mount this engine socket into every worker container
+    /// (`-v <sock>:<sock>`). The OUTER runnerd sets it to hand a granted
+    /// worker the socket its own inner runnerd will delegate to. This is a
+    /// coarse pool-level grant (every worker this runnerd launches gets it);
+    /// only set it on a runnerd whose workers are trusted with the engine.
+    socket: Option<String>,
     /// Process mode: `Some(root)` — slots are chroots under `root` instead of
     /// docker containers.
     process_root: Option<std::path::PathBuf>,
@@ -101,6 +119,14 @@ fn main() {
         slots: env_or("CAOS_RUNNER_SLOTS", "8").parse().unwrap_or(8),
         network: env_or("CAOS_DOCKER_NETWORK", "caos-net"),
         docker_bin: env_or("CAOS_DOCKER_BIN", "docker"),
+        docker_args: std::env::var("CAOS_DOCKER_ARGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        socket: std::env::var("CAOS_RUNNER_SOCKET")
+            .ok()
+            .filter(|s| !s.is_empty()),
         process_root: process_mode.then(|| env_or("CAOS_RUNNER_ROOT", "/tmp/caos-slots").into()),
     });
     if let Some(root) = &config.process_root {
@@ -303,10 +329,22 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         "runnerd slot {slot}: req {} -> container ({})",
         job.req, job.image_ref
     );
-    let out = Command::new(&config.docker_bin)
+    let mut command = Command::new(&config.docker_bin);
+    command
+        .args(&config.docker_args) // global flags (e.g. --remote --url …) precede `run`
         .arg("run")
         .arg("--rm")
-        .args(["--network", &config.network])
+        .args(["--network", &config.network]);
+    if let Some(sock) = &config.socket {
+        // Hand the worker the engine socket so its own inner runnerd can
+        // delegate sibling containers to this engine (phase 4). Bind it at a
+        // fixed in-container path and advertise that path, so the worker never
+        // needs to know the host socket's location.
+        command
+            .args(["-v", &format!("{sock}:{ENGINE_SOCKET_PATH}")])
+            .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")]);
+    }
+    let out = command
         .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
         .args(["--entrypoint", CAOS_BIN])
         .arg(&job.image_ref)
