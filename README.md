@@ -201,18 +201,6 @@ match on the worker alongside the rest, and a worker, seeing its args at
    over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
    fetch/watch point. Sub-runs set no ref.
 
-Pass `--trace=<file>` to write Chrome Trace Events as JSONL. `--trace` and
-`--trace=-` write to stdout and require a separate computation output path.
-`--trace-id=<id>` optionally overrides the generated invocation id.
-
-```sh
-caos-cli run --trace=trace.jsonl <image> <result-path> -- --input=value
-caos-cli run --trace <image> <result-path> -- --input=value
-```
-
-Traces are live-only and discarded when the run ends. Trace ids do not affect
-request or cache identity.
-
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
 
@@ -348,6 +336,18 @@ blocking, user-facing run):
    editable on the host directly. `<output>` is optional: with it omitted, a
    **file** result is streamed to **stdout** (handy for `| less` or `> file`);
    a **tree** result has no single stream, so it still needs an `<output>` path.
+
+Pass `--trace=<file>` to write Chrome Trace Events as JSONL. `--trace` and
+`--trace=-` write to stdout and require a separate computation output path.
+`--trace-id=<id>` optionally overrides the generated invocation id.
+
+```sh
+caos-cli run --trace=trace.jsonl <image> <result-path> -- --input=value
+caos-cli run --trace <image> <result-path> -- --input=value
+```
+
+Traces are live-only and discarded when the run ends. Trace ids do not affect
+request or cache identity.
 
 The worker-side `caos map-then <in> -- [--map=<image>] [--then=<image>]` is a
 different thing entirely: a **tail call**. It records the continuation
