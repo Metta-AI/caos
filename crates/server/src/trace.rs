@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -17,10 +17,10 @@ struct Event {
     name: &'static str,
     ph: &'static str,
     ts: u64,
-    dur: u64,
     pid: u32,
     tid: u64,
-    args: Args,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<Args>,
 }
 
 #[derive(Serialize)]
@@ -31,8 +31,6 @@ struct Args {
 }
 
 struct Span {
-    started: Instant,
-    started_unix_us: u64,
     input_hashes: Vec<String>,
     cache_hit: Option<bool>,
 }
@@ -110,19 +108,28 @@ impl Hub {
     }
 
     pub(crate) fn start(&self, trace_id: &str) -> Option<u64> {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let record = inner.traces.get_mut(trace_id)?;
-        let id = record.next_span;
-        record.next_span += 1;
-        record.spans.insert(
-            id,
-            Span {
-                started: Instant::now(),
-                started_unix_us: unix_us(),
-                input_hashes: Vec::new(),
-                cache_hit: None,
-            },
-        );
+        let (sender, id) = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let record = inner.traces.get_mut(trace_id)?;
+            let id = record.next_span;
+            record.next_span += 1;
+            record.spans.insert(
+                id,
+                Span {
+                    input_hashes: Vec::new(),
+                    cache_hit: None,
+                },
+            );
+            (record.sender.clone(), id)
+        };
+        let _ = sender.send(Event {
+            name: "compute",
+            ph: "B",
+            ts: unix_us(),
+            pid: std::process::id(),
+            tid: id,
+            args: None,
+        });
         Some(id)
     }
 
@@ -148,15 +155,14 @@ impl Hub {
             };
             let event = Event {
                 name: "compute",
-                ph: "X",
-                ts: span.started_unix_us,
-                dur: span.started.elapsed().as_micros() as u64,
+                ph: "E",
+                ts: unix_us(),
                 pid: std::process::id(),
                 tid: span_id,
-                args: Args {
+                args: Some(Args {
                     cache_hit: span.cache_hit,
                     input_hashes: span.input_hashes,
-                },
+                }),
             };
             (record.sender.clone(), event)
         };
@@ -277,19 +283,29 @@ mod tests {
 
         let body = reader.join().unwrap();
         let mut lines = body.lines();
-        let event: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(event["name"], "compute");
-        assert_eq!(event["ph"], "X");
-        for field in ["ts", "dur", "pid", "tid"] {
-            assert!(event[field].is_number());
+        let start: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(start["name"], "compute");
+        assert_eq!(start["ph"], "B");
+        for field in ["ts", "pid", "tid"] {
+            assert!(start[field].is_number());
         }
-        assert_eq!(event["args"]["cache_hit"], false);
+        assert!(start.get("dur").is_none());
+        assert!(start.get("args").is_none());
+
+        let end: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(end["name"], "compute");
+        assert_eq!(end["ph"], "E");
+        assert_eq!(end["pid"], start["pid"]);
+        assert_eq!(end["tid"], start["tid"]);
+        assert!(end["ts"].as_u64().unwrap() >= start["ts"].as_u64().unwrap());
+        assert!(end.get("dur").is_none());
+        assert_eq!(end["args"]["cache_hit"], false);
         assert_eq!(
-            event["args"]["input_hashes"],
+            end["args"]["input_hashes"],
             serde_json::json!(["aaa", "bbb"])
         );
-        assert!(event["args"].get("first").is_none());
-        assert!(event.get("result").is_none());
+        assert!(end["args"].get("first").is_none());
+        assert!(end.get("result").is_none());
         assert_eq!(lines.next(), None);
 
         assert!(hub.begin("test").is_err());
