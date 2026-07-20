@@ -25,7 +25,7 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -2373,7 +2373,11 @@ fn request_compute_streamed(
     }
 
     std::thread::scope(|scope| {
-        let trace = scope.spawn(|| write_chrome_trace(response, output));
+        let trace = scope.spawn(|| {
+            std::io::copy(&mut response, output)
+                .and_then(|_| output.flush())
+                .map_err(|e| format!("writing trace: {e}"))
+        });
         let result = request_compute_traced(base, req, trace_id);
         let trace_result = trace
             .join()
@@ -2382,50 +2386,6 @@ fn request_compute_streamed(
         trace_result?;
         Ok(result)
     })
-}
-
-fn write_chrome_trace(response: impl Read, output: &mut dyn Write) -> Result<(), String> {
-    output
-        .write_all(b"{\"traceEvents\":[")
-        .and_then(|()| output.flush())
-        .map_err(|e| format!("writing trace: {e}"))?;
-
-    let mut count = 0usize;
-    let mut complete = false;
-    for line in BufReader::new(response).lines() {
-        let line = line.map_err(|e| format!("reading trace stream: {e}"))?;
-        if line.is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|e| format!("invalid trace event from server: {e}"))?;
-        if value["complete"].as_bool() == Some(true) {
-            complete = true;
-            break;
-        }
-        if count > 0 {
-            output
-                .write_all(b",")
-                .map_err(|e| format!("writing trace: {e}"))?;
-        }
-        output
-            .write_all(line.as_bytes())
-            .and_then(|()| output.flush())
-            .map_err(|e| format!("writing trace: {e}"))?;
-        count += 1;
-    }
-
-    writeln!(
-        output,
-        "],\"displayTimeUnit\":\"ms\",\"otherData\":{{\"complete\":{complete},\"event_count\":{count}}}}}"
-    )
-    .and_then(|()| output.flush())
-    .map_err(|e| format!("writing trace: {e}"))?;
-    if complete {
-        Ok(())
-    } else {
-        Err("trace stream ended before completion".to_string())
-    }
 }
 
 fn valid_trace_id(id: &str) -> bool {
@@ -2444,27 +2404,4 @@ pub fn prog_name(args: &[String]) -> &str {
         .and_then(Path::file_name)
         .and_then(OsStr::to_str)
         .unwrap_or("caos")
-}
-
-#[cfg(test)]
-mod trace_tests {
-    use super::*;
-
-    #[test]
-    fn streamed_events_become_a_chrome_trace() {
-        let input = std::io::Cursor::new(concat!(
-            "{\"name\":\"compute\",\"ph\":\"X\",\"ts\":1,\"dur\":2,",
-            "\"pid\":3,\"tid\":4,\"args\":{\"cache_hit\":true,",
-            "\"input_hashes\":[\"abc\"]}}\n",
-            "{\"complete\":true}\n"
-        ));
-        let mut output = Vec::new();
-        write_chrome_trace(input, &mut output).unwrap();
-
-        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(value["traceEvents"][0]["name"], "compute");
-        assert_eq!(value["traceEvents"][0]["args"]["cache_hit"], true);
-        assert_eq!(value["otherData"]["complete"], true);
-        assert_eq!(value["otherData"]["event_count"], 1);
-    }
 }

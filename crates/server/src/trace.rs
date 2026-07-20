@@ -37,14 +37,9 @@ struct Span {
     cache_hit: Option<bool>,
 }
 
-enum Message {
-    Event(Event),
-    Complete,
-}
-
 struct Record {
     token: u64,
-    sender: mpsc::SyncSender<Message>,
+    sender: mpsc::SyncSender<Event>,
     spans: HashMap<u64, Span>,
     next_span: u64,
     started: bool,
@@ -65,7 +60,7 @@ pub(crate) struct Stream {
     inner: Arc<Mutex<Inner>>,
     trace_id: String,
     token: u64,
-    receiver: mpsc::Receiver<Message>,
+    receiver: mpsc::Receiver<Event>,
     pending: Vec<u8>,
     offset: usize,
     done: bool,
@@ -165,19 +160,15 @@ impl Hub {
             };
             (record.sender.clone(), event)
         };
-        let _ = event.0.send(Message::Event(event.1));
+        let _ = event.0.send(event.1);
     }
 
     pub(crate) fn end(&self, trace_id: &str) {
-        let record = self
-            .inner
+        self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .traces
             .remove(trace_id);
-        if let Some(record) = record {
-            let _ = record.sender.send(Message::Complete);
-        }
     }
 
     fn with_span(&self, trace_id: &str, span_id: u64, f: impl FnOnce(&mut Span)) {
@@ -199,14 +190,10 @@ impl Stream {
             return Ok(None);
         }
         match self.receiver.recv() {
-            Ok(Message::Event(event)) => {
+            Ok(event) => {
                 let mut line = serde_json::to_vec(&event).map_err(std::io::Error::other)?;
                 line.push(b'\n');
                 Ok(Some(line))
-            }
-            Ok(Message::Complete) => {
-                self.done = true;
-                Ok(Some(b"{\"complete\":true}\n".to_vec()))
             }
             Err(_) => {
                 self.done = true;
@@ -303,7 +290,6 @@ mod tests {
         );
         assert!(event["args"].get("first").is_none());
         assert!(event.get("result").is_none());
-        assert_eq!(lines.next(), Some("{\"complete\":true}"));
         assert_eq!(lines.next(), None);
 
         assert!(hub.begin("test").is_err());
