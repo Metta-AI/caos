@@ -325,9 +325,12 @@ starts a podman API service, launches a worker with the socket, and runs
   siblings exactly as `CAOS_SERVER_URL=http://127.0.0.1` — the same URL the
   runner already expects.
 - **Client must be remote**: the local `docker`/`podman` here is a shim that
-  runs *locally* (i.e. nests). Delegation requires the podman *remote* client
-  against an API service (`podman system service --time=0 unix://<sock>`); the
-  socket-activated one isn't reliably present.
+  runs *locally* (i.e. nests). Delegation needs a client that talks to the
+  engine's API socket: either the moby `docker` client against the podman
+  docker-compat socket (`/var/run/docker.sock` — exactly what the outer runnerd
+  already uses, `DOCKER_HOST=unix://…`, no extra flag), or `podman --remote
+  --url` against a podman API service. The in-suite path uses the former (the
+  socket is already there); the manual spike used the latter.
 - **Image resolution**: `resolve_image` passes `docker://<ref>` through before
   any convert, so the first cut references a self-contained runner image the
   outer store already has — no inner registry needed. (The convert/registry
@@ -339,12 +342,22 @@ starts a podman API service, launches a worker with the socket, and runs
   worker images install. Static musl binaries mean it can be a thin `FROM
   scratch`/debian image.
 
-Remaining to land it in the suite: put a `podman` (remote client) in the
-testenv image; stand up a `podman system service` socket during `run-all` and
-set `CAOS_RUNNER_SOCKET` on the outer runnerd; publish a self-contained runner
-image tag for the inner `docker://` ref; wire `tests/socket-in-caos`
-(`inner-socket.sh` written). Base images still ride in as inputs pinned by
-digest in the cache key.
+**Landed in the suite (`tests/socket-in-caos`, 2026-07-20):** the testenv image
+carries the slimmed moby `docker` client; the compose runnerd sets
+`CAOS_RUNNER_SOCKET=/var/run/docker.sock` (the socket it already has), so every
+worker gets it bind-mounted at `/run/caos/engine.sock` (coarse for now — a
+per-image grant is future work); `cli.sh` builds + tags a self-contained setuid
+runner image host-side and passes the `docker://` ref as an arg; `inner-socket.sh`
+runs the inner server + a docker-mode inner runnerd that launches siblings via
+the socket. Result: 20.8s cold, **69 ms cache hit** (identical inputs never
+re-run) — image-based workers nesting as caos jobs, the process backend's gap
+closed for the run-then/symlink/other-image tests.
+
+Still open: refine the socket grant from pool-wide to per-image; the
+convert/registry path for the git-docker → OCI tests (siblings pull converted
+images from a registry, same as the outer stack) rather than the `docker://`
+self-contained shortcut. Base images still ride in as inputs pinned by digest
+in the cache key.
 
 ### The tiers
 

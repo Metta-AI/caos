@@ -489,6 +489,13 @@
             linuxPkgs.gnugrep
             linuxPkgs.findutils
             linuxPkgs.gitMinimal
+            # The docker (moby) client, so an inner runnerd in this worker can
+            # delegate sibling containers to the outer engine over the granted
+            # socket (phase 4). Same slimmed client the runnerd image ships.
+            (if pkgs.stdenv.hostPlatform.isLinux then
+              linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
+            else
+              linuxPkgs.docker-client)
           ];
         };
         workerTestenvConfig = {
@@ -883,6 +890,13 @@
               networks: [caos-net]
               environment:
                 CAOS_DOCKER_NETWORK: caos-net
+                # Pass the engine socket through to workers that ask for it, so a
+                # worker's own inner runnerd can launch sibling containers via the
+                # same engine (phase 4, design/cargo-workers.md). The host socket
+                # (bind source resolves on the host, docker-out-of-docker) is
+                # mounted into each worker at /run/caos/engine.sock. Coarse for now
+                # — every worker gets it; a per-image grant is future work.
+                CAOS_RUNNER_SOCKET: /var/run/docker.sock
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
               depends_on: [caos-server]

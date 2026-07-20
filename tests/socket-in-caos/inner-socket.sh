@@ -28,10 +28,12 @@ unset CAOS_STD CAOS_SALT
 INNER=http://127.0.0.1
 SOCK=${CAOS_ENGINE_SOCKET:?the outer runnerd must grant an engine socket}
 # The image the siblings run: a self-contained runner image the OUTER engine
-# already has. The inner server passes docker://<ref> straight through
-# (resolve_image handles it before any convert), so no inner registry is
-# needed for this first cut.
-RUNNER_IMAGE=${CAOS_PHASE4_RUNNER_IMAGE:?runner image ref not provided}
+# already has (built + tagged host-side by cli.sh, ref passed in as an arg).
+# The inner server passes docker://<ref> straight through (resolve_image
+# handles it before any convert), so no inner registry is needed for this cut.
+# Args materialize lazily (placeholder until fetched), so get it first.
+caos get /cas/args/runner_image
+RUNNER_IMAGE=$(cat /cas/args/runner_image)
 
 [ -S "$SOCK" ] || fail "engine socket $SOCK is not a socket"
 
@@ -47,13 +49,13 @@ done
 [ -n "$ok" ] || { cat /tmp/server.log >&2; fail "inner server never came up"; }
 
 echo "== inner runnerd (socket-delegation: siblings via the outer engine) =="
-# CAOS_DOCKER_ARGS puts `--remote --url` before `run` so podman talks to the
-# outer service; CAOS_DOCKER_NETWORK=container:<self> makes each sibling share
-# this worker's netns, so CAOS_SERVER_URL=http://127.0.0.1 resolves for them.
+# The docker client talks to the granted socket via DOCKER_HOST;
+# CAOS_DOCKER_NETWORK=container:<self> makes each sibling share this worker's
+# netns, so CAOS_SERVER_URL=http://127.0.0.1 resolves for them.
 SELF=$(cat /etc/hostname)
 CAOS_SERVER_URL=$INNER \
-  CAOS_DOCKER_BIN=podman \
-  CAOS_DOCKER_ARGS="--remote --url unix://$SOCK" \
+  CAOS_DOCKER_BIN=docker \
+  DOCKER_HOST="unix://$SOCK" \
   CAOS_DOCKER_NETWORK="container:$SELF" \
   CAOS_RUNNER_SLOTS=2 \
   /pt/runnerd >/tmp/runnerd.log 2>&1 &
