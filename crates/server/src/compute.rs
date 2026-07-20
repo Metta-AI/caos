@@ -87,20 +87,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
     if req.is_empty() || !req.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid req hash: {req:?}")));
     }
-    let trace_id = query_param(query, "trace");
-    if let Some(id) = &trace_id {
-        if !crate::trace::valid_id(id) {
-            return Err(HttpError::new(400, "invalid trace id"));
-        }
-        config.trace.begin(id).map_err(|e| HttpError::new(409, e))?;
-    }
     // An HTTP run is by definition top-level: the run stack (cycle detection)
     // exists only inside the server, threaded through promise sub-runs.
-    let result = run_req(config, &req, &[], trace_id.as_deref());
-    if let Some(id) = &trace_id {
-        config.trace.end(id);
-    }
-    let result = result?;
+    let result = run_req(config, &req, &[])?;
     // Pin an external run's result so a client can fetch it by ref and it
     // survives gc; sub-runs set no ref (they'd flood the namespace).
     pin_result(config, &req, &result);
@@ -111,27 +100,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
 /// top-level), returning the fully-resolved `"<type> <hash>"`. The whole
 /// pipeline behind both `GET /run` and promise sub-runs: cache lookup →
 /// run-cycle detection → the container run → promise resolution → cache store.
-fn run_req(
-    config: &Config,
-    req: &str,
-    stack: &[String],
-    trace_id: Option<&str>,
-) -> Result<String, HttpError> {
-    let span_id = trace_id.and_then(|id| config.trace.start(id));
-    let result = run_req_inner(config, req, stack, trace_id, span_id);
-    if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-        config.trace.finish(trace_id, span_id);
-    }
-    result
-}
-
-fn run_req_inner(
-    config: &Config,
-    req: &str,
-    stack: &[String],
-    trace_id: Option<&str>,
-    span_id: Option<u64>,
-) -> Result<String, HttpError> {
+fn run_req(config: &Config, req: &str, stack: &[String]) -> Result<String, HttpError> {
     // Unpack the request: args (a tree; the worker image is its reserved `image`
     // entry — an embedded tree for a git image, a ref blob for `docker://`), std
     // (a ref blob), salt (an opaque blob). `std` names the standard library,
@@ -139,16 +108,6 @@ fn run_req_inner(
     // are part of the request (hence the key), threaded into the worker, and
     // inherited by any promise sub-runs this request leaves behind.
     let (image, args, std, salt) = read_request(config, req)?;
-    let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
-        Some(args_entries(config, &args)?)
-    } else {
-        None
-    };
-    if let (Some(trace_id), Some(span_id), Some(entries)) =
-        (trace_id, span_id, traced_arg_entries.as_ref())
-    {
-        config.trace.inputs(trace_id, span_id, entries);
-    }
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
     }
@@ -167,21 +126,11 @@ fn run_req_inner(
     let key = format!("caos:result:{req}");
     match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
-            if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-                config.trace.cache(trace_id, span_id, true);
-            }
             eprintln!("cache hit: req={req} -> {result}");
             return Ok(result);
         }
-        Ok(None) => {
-            if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-                config.trace.cache(trace_id, span_id, false);
-            }
-            eprintln!("cache miss: req={req} (image={image} args={args}); running worker")
-        }
-        Err(e) => {
-            eprintln!("cache lookup failed ({e}); running worker: req={req}")
-        }
+        Ok(None) => eprintln!("cache miss: req={req} (image={image} args={args}); running worker"),
+        Err(e) => eprintln!("cache lookup failed ({e}); running worker: req={req}"),
     }
 
     // Re-entering a request already on the stack has no fixpoint — fail, listing
@@ -211,10 +160,7 @@ fn run_req_inner(
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
         let image_ref = resolve_image(config, &image)?;
-        let arg_entries = match traced_arg_entries {
-            Some(entries) => entries,
-            None => args_entries(config, &args)?,
-        };
+        let arg_entries = args_entries(config, &args)?;
         crate::runner::dispatch(req, arg_entries, &image_ref)?
     };
 
@@ -228,7 +174,7 @@ fn run_req_inner(
     let result = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: req={req} -> continuation {cont}");
-            resolve_promise(config, cont, &std, &salt, &child_stack, trace_id)?
+            resolve_promise(config, cont, &std, &salt, &child_stack)?
         }
         _ => result,
     };
@@ -269,7 +215,6 @@ fn resolve_promise(
     std: &str,
     salt: &str,
     stack: &[String],
-    trace_id: Option<&str>,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -326,8 +271,7 @@ fn resolve_promise(
                             let img = img.as_str();
                             scope.spawn(move || {
                                 let arg = named_entry("in", kid.mode, kid.oid);
-                                let result =
-                                    run_image(config, img, vec![arg], std, salt, stack, trace_id)?;
+                                let result = run_image(config, img, vec![arg], std, salt, stack)?;
                                 result_entry(&kid.name, &result)
                             })
                         })
@@ -357,7 +301,7 @@ fn resolve_promise(
     } else if let Some(img) = &run {
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_req`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        let result = run_image(config, img, vec![input.clone()], std, salt, stack, trace_id)?;
+        let result = run_image(config, img, vec![input.clone()], std, salt, stack)?;
         Some((result_entry("result", &result)?, result))
     } else {
         None
@@ -372,7 +316,7 @@ fn resolve_promise(
             if let Some((extra, _)) = mid {
                 args.push(extra);
             }
-            run_image(config, &img, args, std, salt, stack, trace_id)
+            run_image(config, &img, args, std, salt, stack)
         }
         // No `then`: the middle step's own result is the request's result.
         (None, Some((_, result))) => Ok(result),
@@ -397,7 +341,6 @@ fn run_image(
     std: &str,
     salt: &str,
     stack: &[String],
-    trace_id: Option<&str>,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -436,7 +379,7 @@ fn run_image(
         ),
     ];
     let req = store_git_tree(config, entries).map_err(store_err)?;
-    run_req(config, &req.to_string(), stack, trace_id)
+    run_req(config, &req.to_string(), stack)
 }
 
 /// Peel any curry layers off `image_ref`, returning the underlying plain image
@@ -1221,7 +1164,7 @@ fn read_reply_line(reader: &mut impl BufRead) -> Result<String, String> {
 }
 
 /// Find `name` in an `a=b&c=d` query string and percent-decode its value.
-pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
+fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == name).then(|| percent_decode(v))

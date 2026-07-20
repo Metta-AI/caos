@@ -25,4 +25,3 @@ sha2 = "0.10"
 # Read/patch the image config JSON (recompute rootfs.diff_ids) and build the OCI
 # manifest.
 serde_json = "1"
-serde = { version = "1", features = ["derive"] }

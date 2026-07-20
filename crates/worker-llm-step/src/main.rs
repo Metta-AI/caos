@@ -103,11 +103,7 @@ fn start(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
     // First signal of the turn: everything before it is client/dispatch, the
     // stretch from here to `calling <model>…` is transcript/workspace prep.
-    progress::status(
-        cfg.conversation.as_deref(),
-        &head_hash,
-        "preparing the turn…",
-    );
+    progress::status(cfg.conversation.as_deref(), &head_hash, "preparing the turn…");
     let head = read_commit(&arg("head"))?;
     let prior = prior_messages(&head)?;
 
@@ -132,11 +128,7 @@ fn start(cfg: &Config) -> Result<(), String> {
 /// the loop state rode our own curry.
 fn callback(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
-    progress::status(
-        cfg.conversation.as_deref(),
-        &head_hash,
-        "folding the tool result in…",
-    );
+    progress::status(cfg.conversation.as_deref(), &head_hash, "folding the tool result in…");
     let pending = parse_blocks(&read_arg("pending")?, "pending")?;
     let mut results = parse_blocks(&read_arg("results")?, "results")?;
     let current_id = read_arg("current_id")?;
@@ -149,11 +141,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
     let ws = match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
-            results.push(tools::grep_result_block(
-                &current_id,
-                &arg("result"),
-                &scope,
-            )?);
+            results.push(tools::grep_result_block(&current_id, &arg("result"), &scope)?);
             let ws = arg("ws");
             caos(["get", &ws])?;
             ws
@@ -203,14 +191,7 @@ fn drive(
                 }
                 Ok((scope, prefix)) => {
                     return launch_grep(
-                        cfg,
-                        &call,
-                        &scope,
-                        &prefix,
-                        &ws,
-                        step_path,
-                        &queue[1..],
-                        &results,
+                        cfg, &call, &scope, &prefix, &ws, step_path, &queue[1..], &results,
                     )
                 }
             }
@@ -318,14 +299,7 @@ fn llm_round(
                 return Err("stop_reason tool_use but no tool_use blocks".to_string());
             }
             let (_, step_path) = mint_step(cfg, ws, prev, sent_results, &blocks)?;
-            drive(
-                cfg,
-                ws.to_string(),
-                head_hash,
-                &step_path,
-                &tool_uses,
-                Vec::new(),
-            )
+            drive(cfg, ws.to_string(), head_hash, &step_path, &tool_uses, Vec::new())
         }
         other => Err(format!(
             "LLM round ended with stop_reason {other:?} (only end_turn and tool_use \
@@ -393,9 +367,7 @@ fn launch(
 ) -> Result<(), String> {
     let name = call["name"].as_str().unwrap_or("");
     if name != "bash" {
-        return Err(format!(
-            "launch got non-bash tool {name:?} (drive routes those inline)"
-        ));
+        return Err(format!("launch got non-bash tool {name:?} (drive routes those inline)"));
     }
     let id = call["id"]
         .as_str()
@@ -419,13 +391,7 @@ fn launch(
     let in_path = fresh("toolin");
     caos(["put", path(&dir), &in_path])?;
 
-    let me = self_curry(
-        step_path,
-        pending,
-        results,
-        id,
-        &[("current_tool", Arg::Lit("bash"))],
-    )?;
+    let me = self_curry(step_path, pending, results, id, &[("current_tool", Arg::Lit("bash"))])?;
     run_then(&in_path, &cfg.bash_image, Some(&me))
 }
 
@@ -510,13 +476,10 @@ fn self_curry(
         kvs.push((name, Arg::Path(p)));
     }
     for (name, value) in extras {
-        kvs.push((
-            name,
-            match value {
-                Arg::Lit(s) => Arg::Lit(s),
-                Arg::Path(s) => Arg::Path(s),
-            },
-        ));
+        kvs.push((name, match value {
+            Arg::Lit(s) => Arg::Lit(s),
+            Arg::Path(s) => Arg::Path(s),
+        }));
     }
     caos_curry(&arg("image"), &kvs)
 }

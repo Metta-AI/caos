@@ -1720,16 +1720,12 @@ fn run_request(
     t: &dyn Transport,
     image: &str,
     cas: Option<&Path>,
-    trace_id: Option<&str>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
-    if trace_id.is_some_and(|id| !valid_trace_id(id)) {
-        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
-    }
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    request_compute(&t.server_url()?, &req, trace_id)
+    request_compute(&t.server_url()?, &req)
 }
 
 /// Everything in [`run_request`] up to (and including) getting the request onto
@@ -1920,11 +1916,10 @@ pub fn cli_run(
     t: &dyn Transport,
     image: &str,
     output: Option<&str>,
-    trace_id: Option<&str>,
     kvs: &[String],
 ) -> Result<(), String> {
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, trace_id, kvs)?;
+    let (kind, result) = run_request(t, &image, None, kvs)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2310,16 +2305,8 @@ fn merge_entries(
 /// Trigger compute for request `req` and return the result's `(type, hash)`. The
 /// server runs the container (resolving any promise it leaves behind) and
 /// replies with the final `"<type> <hash>"`.
-fn request_compute(
-    base: &str,
-    req: &str,
-    trace_id: Option<&str>,
-) -> Result<(String, String), String> {
-    let mut url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
-    if let Some(id) = trace_id {
-        url.push_str("&trace=");
-        url.push_str(id);
-    }
+fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
+    let url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
     let body = http_get(&url)?;
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
@@ -2331,14 +2318,6 @@ fn request_compute(
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
-}
-
-fn valid_trace_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),
