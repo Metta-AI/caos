@@ -59,11 +59,6 @@ pub const DEFAULT_STD_REF: &str = "refs/caos/std";
 /// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
 
-/// Optional caller-supplied id enabling an invocation trace on the server. The
-/// id is deliberately outside the request object: observability must not affect
-/// memoization or result identity.
-pub const TRACE_ID_ENV: &str = "CAOS_TRACE_ID";
-
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
 
@@ -1728,11 +1723,13 @@ fn run_request(
     trace_id: Option<&str>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
+    if trace_id.is_some_and(|id| !valid_trace_id(id)) {
+        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
+    }
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    let trace_id = selected_trace_id(trace_id)?;
-    request_compute(&t.server_url()?, &req, trace_id.as_deref())
+    request_compute(&t.server_url()?, &req, trace_id)
 }
 
 /// Everything in [`run_request`] up to (and including) getting the request onto
@@ -2334,24 +2331,6 @@ fn request_compute(
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
-}
-
-fn selected_trace_id(explicit: Option<&str>) -> Result<Option<String>, String> {
-    let id = match explicit {
-        Some(id) => id.to_string(),
-        None => {
-            let Some(id) = std::env::var_os(TRACE_ID_ENV) else {
-                return Ok(None);
-            };
-            id.into_string()
-                .map_err(|_| format!("{TRACE_ID_ENV} must be valid UTF-8"))?
-        }
-    };
-    if valid_trace_id(&id) {
-        Ok(Some(id))
-    } else {
-        Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string())
-    }
 }
 
 fn valid_trace_id(id: &str) -> bool {
