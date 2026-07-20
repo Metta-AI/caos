@@ -1,22 +1,12 @@
-//! Live Chrome trace events for compute invocations.
-//!
-//! Events contain only timing, cache outcome, and unnamed input hashes. They
-//! deliberately exclude request shape, argument names, results, and logs. A
-//! zero-capacity channel hands each event directly to the active HTTP stream;
-//! completed traces are not retained.
+//! Live Chrome `B`/`E` events with timing, cache outcome, and unnamed input
+//! hashes. Events pass directly to the HTTP stream and are not retained.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
+use std::io::Write;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-
-// tiny-http's chunked encoder buffers 8 KiB before writing to the socket. A
-// response reader cannot flush that encoder, so make each event span one full
-// chunk plus one byte. The JSON newline stays before the padding: clients can
-// parse the event immediately, and the padding remains ordinary JSON whitespace.
-const CHUNKED_BUFFER_BYTES: usize = 8192;
 
 #[derive(Serialize)]
 struct Event {
@@ -65,9 +55,6 @@ pub(crate) struct Stream {
     trace_id: String,
     token: u64,
     receiver: mpsc::Receiver<Event>,
-    pending: Vec<u8>,
-    offset: usize,
-    done: bool,
 }
 
 impl Hub {
@@ -94,9 +81,6 @@ impl Hub {
             trace_id: id.to_string(),
             token,
             receiver,
-            pending: Vec::new(),
-            offset: 0,
-            done: false,
         })
     }
 
@@ -198,42 +182,48 @@ impl Hub {
 
 impl Stream {
     fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        if self.done {
-            return Ok(None);
-        }
         match self.receiver.recv() {
             Ok(event) => {
                 let mut line = serde_json::to_vec(&event).map_err(std::io::Error::other)?;
                 line.push(b'\n');
-                let flush_bytes =
-                    line.len().div_ceil(CHUNKED_BUFFER_BYTES) * CHUNKED_BUFFER_BYTES + 1;
-                line.resize(flush_bytes, b' ');
                 Ok(Some(line))
             }
-            Err(_) => {
-                self.done = true;
-                Ok(None)
-            }
+            Err(_) => Ok(None),
         }
     }
-}
 
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
+    pub(crate) fn respond(mut self, request: tiny_http::Request) -> std::io::Result<()> {
+        // tiny-http buffers streaming bodies, so frame and flush each chunk here.
+        let version = request.http_version().clone();
+        let chunked = version > tiny_http::HTTPVersion(1, 0);
+        let mut output = request.into_writer();
+        write!(
+            output,
+            "HTTP/{version} 200 OK\r\nContent-Type: application/x-ndjson\r\n"
+        )?;
+        if chunked {
+            output.write_all(b"Transfer-Encoding: chunked\r\n")?;
+        } else {
+            output.write_all(b"Connection: close\r\n")?;
         }
-        if self.offset == self.pending.len() {
-            let Some(line) = self.next_line()? else {
-                return Ok(0);
-            };
-            self.pending = line;
-            self.offset = 0;
+        output.write_all(b"\r\n")?;
+        output.flush()?;
+
+        while let Some(line) = self.next_line()? {
+            if chunked {
+                write!(output, "{:x}\r\n", line.len())?;
+            }
+            output.write_all(&line)?;
+            if chunked {
+                output.write_all(b"\r\n")?;
+            }
+            output.flush()?;
         }
-        let len = buf.len().min(self.pending.len() - self.offset);
-        buf[..len].copy_from_slice(&self.pending[self.offset..self.offset + len]);
-        self.offset += len;
-        Ok(len)
+        if chunked {
+            output.write_all(b"0\r\n\r\n")?;
+            output.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -268,15 +258,18 @@ fn unix_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     #[test]
     fn streams_generic_chrome_events_without_retaining_them() {
         let hub = Hub::default();
         let mut stream = hub.stream("test").unwrap();
         let reader = std::thread::spawn(move || {
-            let mut body = String::new();
-            stream.read_to_string(&mut body).unwrap();
-            body
+            let mut lines = Vec::new();
+            while let Some(line) = stream.next_line().unwrap() {
+                lines.push(line);
+            }
+            lines
         });
 
         hub.begin("test").unwrap();
@@ -290,9 +283,8 @@ mod tests {
         hub.finish("test", span);
         hub.end("test");
 
-        let body = reader.join().unwrap();
-        let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-        let start: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let lines = reader.join().unwrap();
+        let start: serde_json::Value = serde_json::from_slice(&lines[0]).unwrap();
         assert_eq!(start["name"], "compute");
         assert_eq!(start["ph"], "B");
         for field in ["ts", "pid", "tid"] {
@@ -301,7 +293,7 @@ mod tests {
         assert!(start.get("dur").is_none());
         assert!(start.get("args").is_none());
 
-        let end: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let end: serde_json::Value = serde_json::from_slice(&lines[1]).unwrap();
         assert_eq!(end["name"], "compute");
         assert_eq!(end["ph"], "E");
         assert_eq!(end["pid"], start["pid"]);
@@ -315,7 +307,7 @@ mod tests {
         );
         assert!(end["args"].get("first").is_none());
         assert!(end.get("result").is_none());
-        assert_eq!(lines.next(), None);
+        assert_eq!(lines.len(), 2);
 
         assert!(hub.begin("test").is_err());
         assert!(hub.stream("test").is_ok());
@@ -326,5 +318,37 @@ mod tests {
         let hub = Hub::default();
         drop(hub.stream("test").unwrap());
         assert!(hub.stream("test").is_ok());
+    }
+
+    #[test]
+    fn responds_before_the_first_event() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let hub = Hub::default();
+        let server_hub = hub.clone();
+        let handler = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            server_hub.stream("test").unwrap().respond(request).unwrap();
+        });
+
+        let mut response = minreq::get(format!("http://{addr}/trace/test/stream"))
+            .with_timeout(2)
+            .send_lazy()
+            .unwrap();
+        assert_eq!(response.status_code, 200);
+        let reader = std::thread::spawn(move || {
+            let mut body = String::new();
+            response.read_to_string(&mut body).unwrap();
+            body
+        });
+
+        hub.begin("test").unwrap();
+        let span = hub.start("test").unwrap();
+        hub.finish("test", span);
+        hub.end("test");
+
+        let body = reader.join().unwrap();
+        assert_eq!(body.lines().count(), 2);
+        handler.join().unwrap();
     }
 }

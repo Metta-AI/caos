@@ -25,7 +25,7 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1720,24 +1720,16 @@ fn run_request(
     t: &dyn Transport,
     image: &str,
     cas: Option<&Path>,
-    trace_id: Option<&str>,
-    trace_output: Option<&mut (dyn Write + Send)>,
+    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
-    if trace_id.is_some_and(|id| !valid_trace_id(id)) {
-        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
-    }
-    if trace_id.is_some() != trace_output.is_some() {
-        return Err("trace id and trace output must be provided together".to_string());
-    }
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
     let server = t.server_url()?;
-    match (trace_id, trace_output) {
-        (Some(id), Some(output)) => request_compute_streamed(&server, &req, id, output),
-        (None, None) => request_compute(&server, &req),
-        _ => unreachable!("trace id and output were checked together"),
+    match trace {
+        Some((id, output)) => request_compute_streamed(&server, &req, id, output),
+        None => request_compute(&server, &req),
     }
 }
 
@@ -1929,12 +1921,17 @@ pub fn cli_run(
     t: &dyn Transport,
     image: &str,
     output: Option<&str>,
-    trace_id: Option<&str>,
-    trace_output: Option<&mut (dyn Write + Send)>,
+    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(), String> {
+    if trace
+        .as_ref()
+        .is_some_and(|(id, _)| !valid_trace_id(id))
+    {
+        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
+    }
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, trace_id, trace_output, kvs)?;
+    let (kind, result) = run_request(t, &image, None, trace, kvs)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2358,36 +2355,38 @@ fn request_compute_streamed(
     output: &mut (dyn Write + Send),
 ) -> Result<(String, String), String> {
     let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
+    let mut response = minreq::get(&stream_url)
+        .send_lazy()
+        .map_err(|e| format!("GET {stream_url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let status = response.status_code;
+        let reason = response.reason_phrase.clone();
+        let mut body = String::new();
+        let _ = response.read_to_string(&mut body);
+        return Err(format!(
+            "GET {stream_url}: server returned {status} {reason}: {}",
+            body.trim()
+        ));
+    }
+
     std::thread::scope(|scope| {
-        let trace = scope.spawn(|| {
-            let mut response = minreq::get(&stream_url)
-                .send_lazy()
-                .map_err(|e| format!("GET {stream_url}: {e}"))?;
-            if !(200..300).contains(&response.status_code) {
-                let status = response.status_code;
-                let reason = response.reason_phrase.clone();
-                let mut body = String::new();
-                let _ = response.read_to_string(&mut body);
-                return Err(format!(
-                    "GET {stream_url}: server returned {status} {reason}: {}",
-                    body.trim()
-                ));
-            }
-            for line in BufReader::new(response).lines() {
-                let line = line.map_err(|e| format!("reading trace: {e}"))?;
-                let event = line.trim();
-                if event.is_empty() {
-                    continue;
+        let trace = scope.spawn(|| -> Result<(), String> {
+            let mut buffer = [0; 8192];
+            loop {
+                let read = response
+                    .read(&mut buffer)
+                    .map_err(|e| format!("reading trace: {e}"))?;
+                if read == 0 {
+                    break;
                 }
                 output
-                    .write_all(event.as_bytes())
-                    .and_then(|()| output.write_all(b"\n"))
+                    .write_all(&buffer[..read])
                     .and_then(|()| output.flush())
                     .map_err(|e| format!("writing trace: {e}"))?;
             }
             Ok(())
         });
-        let result = request_compute_when_trace_is_ready(base, req, trace_id);
+        let result = request_compute_traced(base, req, trace_id);
         let trace_result = trace
             .join()
             .map_err(|_| "the trace stream thread panicked".to_string())?;
@@ -2395,32 +2394,6 @@ fn request_compute_streamed(
         trace_result?;
         Ok(result)
     })
-}
-
-/// The stream request and run request must be concurrent: tiny-http does not
-/// flush the stream response headers until it can write body bytes, while the
-/// first body bytes cannot exist until the run begins. The stream handler
-/// reserves the id before trying to write the response, so retry only the
-/// narrow race where `/run` arrives before that reservation.
-fn request_compute_when_trace_is_ready(
-    base: &str,
-    req: &str,
-    trace_id: &str,
-) -> Result<(String, String), String> {
-    const ATTEMPTS: usize = 200;
-    for attempt in 0..ATTEMPTS {
-        match request_compute_traced(base, req, trace_id) {
-            Err(error)
-                if attempt + 1 < ATTEMPTS
-                    && error.contains("trace stream")
-                    && error.contains("is not open") =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            result => return result,
-        }
-    }
-    unreachable!("the final trace reservation attempt always returns")
 }
 
 fn valid_trace_id(id: &str) -> bool {

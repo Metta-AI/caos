@@ -74,9 +74,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err("--trace-id is only an override for --trace".to_string());
             }
             if trace_path == Some("-") && output.is_none() {
-                return Err(
-                    "--trace=- requires an <output> path for the computation result".to_string(),
-                );
+                return Err("stdout tracing requires a computation output path".to_string());
             }
             if trace_path.is_some_and(|path| output == Some(path)) {
                 return Err("trace and computation output paths must differ".to_string());
@@ -92,16 +90,13 @@ fn run(args: &[String]) -> Result<(), String> {
                 None => None,
             };
             let transport = transport()?;
+            let run = |trace| caos::cli_run(&transport, image, output, trace, kvs);
             match trace_output.as_mut() {
-                Some(writer) => caos::cli_run(
-                    &transport,
-                    image,
-                    output,
-                    trace_id,
-                    Some(writer.as_mut()),
-                    kvs,
-                ),
-                None => caos::cli_run(&transport, image, output, trace_id, None, kvs),
+                Some(writer) => run(Some((
+                    trace_id.expect("trace output always has an id"),
+                    writer.as_mut(),
+                ))),
+                None => run(None),
             }
         }
         // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an
@@ -153,7 +148,7 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  \
-         {prog} run [--trace[=<file | ->]] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
+         {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \

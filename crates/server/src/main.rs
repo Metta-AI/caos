@@ -45,7 +45,7 @@ mod trace;
 
 use std::sync::Arc;
 
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use tiny_http::{Method, Request, Response, Server, StatusCode};
 
 /// Listen address; overridable for local runs outside the container. Binds the
 /// IPv6 wildcard (dual-stack: also accepts IPv4) so runners can reach us over
@@ -250,18 +250,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
                     )
                 }
             };
-            let content_type = Header::from_bytes(
-                b"Content-Type".as_slice(),
-                b"application/x-ndjson".as_slice(),
-            )
-            .expect("static header is valid");
-            return request.respond(Response::new(
-                StatusCode(200),
-                vec![content_type],
-                stream,
-                None,
-                None,
-            ));
+            return stream.respond(request);
         }
     }
 
