@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -45,9 +45,24 @@ struct Inner {
     next_token: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Hub {
     inner: Arc<Mutex<Inner>>,
+    unix_us: u64,
+    monotonic: Instant,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            unix_us: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
+            monotonic: Instant::now(),
+        }
+    }
 }
 
 pub(crate) struct Stream {
@@ -58,6 +73,11 @@ pub(crate) struct Stream {
 }
 
 impl Hub {
+    fn now_us(&self) -> u64 {
+        self.unix_us
+            .saturating_add(self.monotonic.elapsed().as_micros() as u64)
+    }
+
     pub(crate) fn stream(&self, id: &str) -> Result<Stream, String> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if inner.traces.contains_key(id) {
@@ -98,6 +118,7 @@ impl Hub {
     }
 
     pub(crate) fn start(&self, trace_id: &str) -> Option<u64> {
+        let ts = self.now_us();
         let (sender, id) = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let record = inner.traces.get_mut(trace_id)?;
@@ -115,7 +136,7 @@ impl Hub {
         let _ = sender.send(Event {
             name: "compute",
             ph: "B",
-            ts: unix_us(),
+            ts,
             pid: std::process::id(),
             tid: id,
             args: None,
@@ -135,6 +156,7 @@ impl Hub {
     }
 
     pub(crate) fn finish(&self, trace_id: &str, span_id: u64) {
+        let ts = self.now_us();
         let event = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let Some(record) = inner.traces.get_mut(trace_id) else {
@@ -146,7 +168,7 @@ impl Hub {
             let event = Event {
                 name: "compute",
                 ph: "E",
-                ts: unix_us(),
+                ts,
                 pid: std::process::id(),
                 tid: span_id,
                 args: Some(Args {
@@ -246,13 +268,6 @@ pub(crate) fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
-fn unix_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
 }
 
 #[cfg(test)]
