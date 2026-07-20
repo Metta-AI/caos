@@ -29,7 +29,8 @@ use serde_json::Value;
 
 use super::{
     curry_object, fetch_object_negotiated, git_capture, prepare_request, request_compute,
-    resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    resolve_cli_image,
+    GitTransport, HttpTransport, Transport, CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -220,7 +221,10 @@ pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     if a.log {
         return print_log(&name, &refname);
     }
-    eprintln!("[conversation {name}{}]", if fresh { " — new" } else { "" });
+    eprintln!(
+        "[conversation {name}{}]",
+        if fresh { " — new" } else { "" }
+    );
     if let Some(prompt) = &a.message {
         return turn(t, &a, &name, &refname, prompt);
     }
@@ -362,11 +366,9 @@ fn turn(
             // (step transcripts live there): refuse to start a conversation
             // over a tree that already carries one.
             if rev_parse_opt(&format!("{base}:.caos"))?.is_some() {
-                return Err(
-                    "the base commit's tree contains a top-level `.caos` entry, which \
+                return Err("the base commit's tree contains a top-level `.caos` entry, which \
                      is reserved for the agent harness; start from a tree without one"
-                        .to_string(),
-                );
+                    .to_string());
             }
             base
         }
@@ -472,7 +474,7 @@ fn turn(
     let server = t.server_url()?;
     let run = {
         let (server, req) = (server.clone(), req);
-        std::thread::spawn(move || request_compute(&server, &req, None))
+        std::thread::spawn(move || request_compute(&server, &req))
     };
 
     // While the run blocks, follow the worker's per-step progress ref and
@@ -501,9 +503,7 @@ fn turn(
         let _ = poll_status(&http, &status_ref, &human, &mut last_status);
     }
 
-    let outcome = run
-        .join()
-        .map_err(|_| "the run thread panicked".to_string())?;
+    let outcome = run.join().map_err(|_| "the run thread panicked".to_string())?;
     let (kind, turn_hash) = match outcome {
         Ok(result) => result,
         Err(e) => {
@@ -511,7 +511,9 @@ fn turn(
             // conversation ref is untouched (the human commit is harmlessly
             // orphaned — see design/agent-harness.md).
             let _ = poll_progress(&http, &progress_ref, &human, &mut printed);
-            return Err(format!("turn failed; {refname} was not advanced.\n{e}"));
+            return Err(format!(
+                "turn failed; {refname} was not advanced.\n{e}"
+            ));
         }
     };
     if kind != "commit" {
@@ -746,10 +748,7 @@ fn print_step(step: &Value, suppress_text: bool) {
             Some("tool_use") => match block["name"].as_str().unwrap_or("?") {
                 "bash" => println!("$ {}", block["input"]["cmd"].as_str().unwrap_or("?")),
                 name @ ("read" | "write" | "edit") => {
-                    println!(
-                        "{name} {}",
-                        block["input"]["file_path"].as_str().unwrap_or("?")
-                    )
+                    println!("{name} {}", block["input"]["file_path"].as_str().unwrap_or("?"))
                 }
                 "ls" => println!("ls {}", block["input"]["path"].as_str().unwrap_or(".")),
                 "grep" => {

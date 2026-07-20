@@ -179,9 +179,7 @@ fn run_req_inner(
             }
             eprintln!("cache miss: req={req} (image={image} args={args}); running worker")
         }
-        Err(e) => {
-            eprintln!("cache lookup failed ({e}); running worker: req={req}")
-        }
+        Err(e) => eprintln!("cache lookup failed ({e}); running worker: req={req}"),
     }
 
     // Re-entering a request already on the stack has no fixpoint — fail, listing
@@ -1221,7 +1219,7 @@ fn read_reply_line(reader: &mut impl BufRead) -> Result<String, String> {
 }
 
 /// Find `name` in an `a=b&c=d` query string and percent-decode its value.
-pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
+fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == name).then(|| percent_decode(v))

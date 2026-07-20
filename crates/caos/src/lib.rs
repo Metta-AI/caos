@@ -1736,7 +1736,7 @@ fn run_request(
     let server = t.server_url()?;
     match (trace_id, trace_output) {
         (Some(id), Some(output)) => request_compute_streamed(&server, &req, id, output),
-        (None, None) => request_compute(&server, &req, None),
+        (None, None) => request_compute(&server, &req),
         _ => unreachable!("trace id and output were checked together"),
     }
 }
@@ -2320,17 +2320,25 @@ fn merge_entries(
 /// Trigger compute for request `req` and return the result's `(type, hash)`. The
 /// server runs the container (resolving any promise it leaves behind) and
 /// replies with the final `"<type> <hash>"`.
-fn request_compute(
+fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
+    let url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
+    request_compute_url(&url)
+}
+
+fn request_compute_traced(
     base: &str,
     req: &str,
-    trace_id: Option<&str>,
+    trace_id: &str,
 ) -> Result<(String, String), String> {
-    let mut url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
-    if let Some(id) = trace_id {
-        url.push_str("&trace=");
-        url.push_str(id);
-    }
-    let body = http_get(&url)?;
+    let url = format!(
+        "{}/run?req={req}&trace={trace_id}",
+        base.trim_end_matches('/')
+    );
+    request_compute_url(&url)
+}
+
+fn request_compute_url(url: &str) -> Result<(String, String), String> {
+    let body = http_get(url)?;
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
@@ -2366,7 +2374,7 @@ fn request_compute_streamed(
 
     std::thread::scope(|scope| {
         let trace = scope.spawn(|| write_chrome_trace(response, output));
-        let result = request_compute(base, req, Some(trace_id));
+        let result = request_compute_traced(base, req, trace_id);
         let trace_result = trace
             .join()
             .map_err(|_| "the trace stream thread panicked".to_string())?;
