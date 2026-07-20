@@ -89,7 +89,7 @@ fn try_push(refname: &str, new_hash: &str) -> Result<(), String> {
 
     // Learn the ref's current value from the receive-pack advertisement — the
     // update must name it as `old` or the server rejects the push.
-    let old = advertised(base, refname)?.unwrap_or_else(|| ZERO_HASH.to_string());
+    let old = advertised(base, &refname)?.unwrap_or_else(|| ZERO_HASH.to_string());
 
     // One command pkt-line (with the capability list after NUL), flush, then
     // the empty pack — the objects are already server-side.

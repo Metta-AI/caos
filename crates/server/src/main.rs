@@ -7,10 +7,8 @@
 //!
 //! Compute:
 //!
-//! * `GET /run?req=<hash>&trace=<id>` — run the request tree `<hash>` and return
-//!   the hash of its result, optionally recording this invocation.
-//! * `GET /trace/<id>?after=<count>` — inspect a live or completed invocation
-//!   trace, optionally returning only events after a cursor.
+//! * `GET /run?req=<hash>` — run the request tree `<hash>` and return the hash
+//!   of its result.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
 //! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
@@ -41,7 +39,6 @@ mod compute;
 mod git;
 mod runner;
 mod storage;
-mod trace;
 
 use std::sync::Arc;
 
@@ -81,7 +78,6 @@ struct Config {
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
-    trace: trace::Store,
 }
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
@@ -159,7 +155,6 @@ fn main() {
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         git_dir,
         repo,
-        trace: trace::Store::default(),
     });
 
     let server = match Server::http(addr.as_str()) {
@@ -247,24 +242,6 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
 
     match request.method() {
         Method::Get if path == "/run" => compute::run(config, &query),
-        Method::Get if path.starts_with("/trace/") => {
-            let id = path.trim_start_matches("/trace/");
-            if !trace::valid_id(id) {
-                return Err(HttpError::new(400, "invalid trace id"));
-            }
-            let after = match compute::query_param(&query, "after") {
-                Some(value) => value
-                    .parse::<usize>()
-                    .map_err(|_| HttpError::new(400, "invalid trace cursor"))?,
-                None => 0,
-            };
-            let snapshot = config
-                .trace
-                .get(id, after)
-                .ok_or_else(|| HttpError::new(404, "trace not found"))?;
-            serde_json::to_vec(&snapshot)
-                .map_err(|e| HttpError::new(500, format!("serializing trace: {e}")))
-        }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),

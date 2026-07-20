@@ -33,25 +33,20 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
-        // `run [--trace-id=<id>] <image> [output] -- [--name=value | ...]`.
-        // The trace id is invocation metadata; everything after `--` is a
-        // computation argument and therefore part of the request hash.
-        Some("run") => {
-            let (trace_id, run_args) =
-                match args.get(2).and_then(|arg| arg.strip_prefix("--trace-id=")) {
-                    Some(id) => (Some(id), &args[3..]),
-                    None => (None, &args[2..]),
-                };
-            match run_args {
-                [image, sep, kvs @ ..] if sep == "--" => {
-                    caos::cli_run(&transport()?, image, None, trace_id, kvs)
-                }
-                [image, output, sep, kvs @ ..] if sep == "--" => {
-                    caos::cli_run(&transport()?, image, Some(output), trace_id, kvs)
-                }
-                _ => Err(usage(args)),
+        // `run <image> [output] -- [--name=value | --name:@=path ...]`. The `--`
+        // separates the fixed arguments from the (possibly empty) list of
+        // key/value args. `<output>`, if given, is any path on the host; the
+        // result is checked out there in full. If it's omitted and the result is
+        // a file, the file's bytes are written to stdout. `<image>` may be
+        // `/cas/std/<name>` to run a builtin from the published library, a
+        // `docker://<ref>`, or a git hash.
+        Some("run") => match &args[2..] {
+            [image, sep, kvs @ ..] if sep == "--" => caos::cli_run(&transport()?, image, None, kvs),
+            [image, output, sep, kvs @ ..] if sep == "--" => {
+                caos::cli_run(&transport()?, image, Some(output), kvs)
             }
-        }
+            _ => Err(usage(args)),
+        },
         // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an
         // image, printing a ref to the curried image (run it like any image).
         // Path args are host paths to ingest, or `/cas/std/<name>` builtin refs.
@@ -93,7 +88,7 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  \
-         {prog} run [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
+         {prog} run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
