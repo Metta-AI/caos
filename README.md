@@ -201,25 +201,18 @@ match on the worker alongside the rest, and a worker, seeing its args at
    over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
    fetch/watch point. Sub-runs set no ref.
 
-Pass `--trace=<file>` before the image to write a Chrome trace while
-`caos-cli run` is executing. The CLI opens one chunked stream and flushes each
-event as it arrives; it does not poll. Use `--trace=-` for stdout, in which case
-the computation needs a separate output path. `--trace-id=<id>` is an optional
-correlation override; `--trace` otherwise creates an invocation-local id. For
-example:
+Pass `--trace=<file>` to write a Chrome trace. `--trace` and `--trace=-` write
+it to stdout and require a separate computation output path. `--trace-id=<id>`
+optionally overrides the generated invocation id.
 
 ```sh
 caos-cli run --trace=trace.json <image> <result-path> -- --input=value
-caos-cli run --trace=- <image> <result-path> -- --input=value
+caos-cli run --trace <image> <result-path> -- --input=value
 ```
 
-The trace file is valid Chrome Trace Event Format when the run completes and
-can be opened in `chrome://tracing`; while the run is live, `tail -f trace.json`
-shows flushed events. The server retains no completed trace and offers no
-snapshot or cursor API: each event is handed directly to the one live stream,
-and the ephemeral trace entry is removed when the request ends. Trace state is
-not part of the request tree, so two invocations of the same computation share
-a cache key but remain distinct observations.
+Completed files use Chrome Trace Event Format and open in `chrome://tracing`.
+Traces are live-only and discarded when the run ends. Trace ids do not affect
+request or cache identity.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
@@ -337,7 +330,7 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos-cli run [--trace=<file|->] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path …]` (the
+`caos-cli run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — including the `<image>` under a

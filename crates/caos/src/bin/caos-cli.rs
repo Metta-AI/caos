@@ -35,7 +35,7 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
-        // `run [--trace=<file|->] [--trace-id=<id>] <image> [output] -- [...]`.
+        // `run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [...]`.
         // The trace id is invocation metadata; everything after `--` is a
         // computation argument and therefore part of the request hash.
         Some("run") => {
@@ -46,6 +46,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 if let Some(id) = arg.strip_prefix("--trace-id=") {
                     if trace_id.replace(id).is_some() {
                         return Err("--trace-id given twice".to_string());
+                    }
+                } else if arg == "--trace" {
+                    if trace_path.replace("-").is_some() {
+                        return Err("--trace given twice".to_string());
                     }
                 } else if let Some(path) = arg.strip_prefix("--trace=") {
                     if trace_path.replace(path).is_some() {
@@ -149,7 +153,7 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  \
-         {prog} run [--trace=<file | ->] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
+         {prog} run [--trace[=<file | ->]] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
