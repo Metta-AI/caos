@@ -201,9 +201,10 @@ match on the worker alongside the rest, and a worker, seeing its args at
    over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
    fetch/watch point. Sub-runs set no ref.
 
-Set `CAOS_TRACE_ID` to trace a `caos-cli run`. Poll `GET /trace/<traceId>` while
-the run is live or save its response and open it in `chrome://tracing`. For
-incremental consumption, pass the prior response's
+Pass `--trace-id=<id>` before the image to trace a `caos-cli run`; the
+`CAOS_TRACE_ID` environment variable is a fallback when the option is absent.
+Poll `GET /trace/<traceId>` while the run is live or save its response and open
+it in `chrome://tracing`. For incremental consumption, pass the prior response's
 `otherData.event_count` as `after`; `otherData.complete` marks the last batch.
 This lets a future `caos-cli` trace view stream batches beside its blocking
 `/run` request without changing the runner protocol. Trace state is not part of
@@ -326,7 +327,7 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos-cli run <image> [output] -- [--name=value | --name:@=path …]` (the
+`caos-cli run [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — including the `<image>` under a

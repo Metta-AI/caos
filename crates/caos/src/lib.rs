@@ -1725,12 +1725,13 @@ fn run_request(
     t: &dyn Transport,
     image: &str,
     cas: Option<&Path>,
+    trace_id: Option<&str>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    let trace_id = trace_id()?;
+    let trace_id = selected_trace_id(trace_id)?;
     request_compute(&t.server_url()?, &req, trace_id.as_deref())
 }
 
@@ -1922,10 +1923,11 @@ pub fn cli_run(
     t: &dyn Transport,
     image: &str,
     output: Option<&str>,
+    trace_id: Option<&str>,
     kvs: &[String],
 ) -> Result<(), String> {
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, kvs)?;
+    let (kind, result) = run_request(t, &image, None, trace_id, kvs)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2334,19 +2336,21 @@ fn request_compute(
     Ok((kind.to_string(), hash.to_string()))
 }
 
-fn trace_id() -> Result<Option<String>, String> {
-    let Some(id) = std::env::var_os(TRACE_ID_ENV) else {
-        return Ok(None);
+fn selected_trace_id(explicit: Option<&str>) -> Result<Option<String>, String> {
+    let id = match explicit {
+        Some(id) => id.to_string(),
+        None => {
+            let Some(id) = std::env::var_os(TRACE_ID_ENV) else {
+                return Ok(None);
+            };
+            id.into_string()
+                .map_err(|_| format!("{TRACE_ID_ENV} must be valid UTF-8"))?
+        }
     };
-    let id = id
-        .into_string()
-        .map_err(|_| format!("{TRACE_ID_ENV} must be valid UTF-8"))?;
     if valid_trace_id(&id) {
         Ok(Some(id))
     } else {
-        Err(format!(
-            "{TRACE_ID_ENV} must be 1-128 ASCII letters, digits, '-' or '_'"
-        ))
+        Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string())
     }
 }
 
