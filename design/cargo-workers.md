@@ -262,15 +262,25 @@ binaries, and runs the **unmodified `cli.sh`** of whatever test tree it's
 handed; the host driver fires one testenv job per curry-able test
 (file-count, dirs-only, deep-deps, rgrep), each keyed on `(run-test.sh, that
 test's tree, binaries)`. So each `tests/<name>` is now genuinely one caos
-job: the four real suites pass inside nested stacks (~27s cold across four),
-and a second pass is all cache hits (**281ms** — a ~100× memoization), with
-an edit to one test's fixtures re-running only its job. This is the
-tests-as-jobs contract on the real tests, not a proxy. What it does *not* yet
-cover is the same boundary as before — tests needing the bash **script**
-worker (`run-then`, `symlinks`, `untracked`) or a toolchain/other image
-(`commit`, `cargo*`, `rust-worker`) — because process-mode slots run only
-`bin`-workers via the trampoline; an *image*-based worker needs the podman
-backend (phase 4). That's the clean next capability for closing the gap.
+job. `run-test.sh` picks a backend per test: **process** for the curry-able
+Rust bin-workers (file-count, dirs-only, deep-deps, rgrep — fast chroot
+slots), and **socket** (phase 4) for the bash **script**-worker tests
+(symlinks, untracked, run-then), whose inner std maps `std/bash` to a
+self-contained bash image the host builds and the inner server passes through
+as `docker://`. Seven real suites now pass inside nested stacks (~35s cold),
+and a second pass is all cache hits (**486ms** — a ~70× memoization), with an
+edit to one test's fixtures re-running only its job. `run-then` folding is the
+strongest single check: its run-then continuations, nested runs, *and* cycle
+detection all resolve through the inner server driving socket-delegated
+siblings. This is the tests-as-jobs contract on the real tests, not a proxy.
+
+What it does *not* fold: tests whose `cli.sh` needs host `nix` (it builds a
+worker inline — `bash-tool`); the heavy toolchain-image tests (`cargo*`,
+`rust-worker`, `commit` — the ~800M cargo/rustc images as siblings); the
+network/stub tests (`chat*`, `llm-step`); and the **meta** nested-stack tests
+themselves (`proc-stack`, `test-in-caos`, `suite-in-caos`, `socket-in-caos`,
+and `test-all` — folding them would double-nest). The capability gap is now
+closed; what remains is the toolchain-image weight and these inherent limits.
 
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is
