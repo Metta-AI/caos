@@ -12,6 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+// tiny-http's chunked encoder buffers 8 KiB before writing to the socket. A
+// response reader cannot flush that encoder, so make each event span one full
+// chunk plus one byte. The JSON newline stays before the padding: clients can
+// parse the event immediately, and the padding remains ordinary JSON whitespace.
+const CHUNKED_BUFFER_BYTES: usize = 8192;
+
 #[derive(Serialize)]
 struct Event {
     name: &'static str,
@@ -199,6 +205,9 @@ impl Stream {
             Ok(event) => {
                 let mut line = serde_json::to_vec(&event).map_err(std::io::Error::other)?;
                 line.push(b'\n');
+                let flush_bytes =
+                    line.len().div_ceil(CHUNKED_BUFFER_BYTES) * CHUNKED_BUFFER_BYTES + 1;
+                line.resize(flush_bytes, b' ');
                 Ok(Some(line))
             }
             Err(_) => {
@@ -282,7 +291,7 @@ mod tests {
         hub.end("test");
 
         let body = reader.join().unwrap();
-        let mut lines = body.lines();
+        let mut lines = body.lines().filter(|line| !line.trim().is_empty());
         let start: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(start["name"], "compute");
         assert_eq!(start["ph"], "B");

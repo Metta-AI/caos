@@ -25,7 +25,7 @@
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -2373,9 +2373,19 @@ fn request_compute_streamed(
                     body.trim()
                 ));
             }
-            std::io::copy(&mut response, output)
-                .and_then(|_| output.flush())
-                .map_err(|e| format!("writing trace: {e}"))
+            for line in BufReader::new(response).lines() {
+                let line = line.map_err(|e| format!("reading trace: {e}"))?;
+                let event = line.trim();
+                if event.is_empty() {
+                    continue;
+                }
+                output
+                    .write_all(event.as_bytes())
+                    .and_then(|()| output.write_all(b"\n"))
+                    .and_then(|()| output.flush())
+                    .map_err(|e| format!("writing trace: {e}"))?;
+            }
+            Ok(())
         });
         let result = request_compute_when_trace_is_ready(base, req, trace_id);
         let trace_result = trace
