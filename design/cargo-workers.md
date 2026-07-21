@@ -300,15 +300,29 @@ case), that hash is the blob's oid, which no engine can run. Fix in
 to the ref itself. Outer stacks never hit this (images there are git trees,
 where the oid *is* the image) — nesting is what makes the blob case real.
 
-Folded so far: file-count, dirs-only, deep-deps, rgrep (bin-workers) +
-symlinks, untracked, run-then (bash script worker). `run-then` remains the
-strongest single check: continuations, nested runs, and cycle detection all
-resolve through the inner server driving socket-delegated siblings. Still
-host-driven, pending fold: the toolchain-image tests (`cargo*`, `commit`,
-`rust-worker` — need the cargo/rustc images passed by ID), and the tests whose
-`cli.sh` shells out to host nix for helper builds (`bash-tool`, `chat*`,
-`llm-step` — their builds become nested runs against the outer std).
-`chat-online` (real API key) stays self-skipped without a key, as today.
+Folded (2026-07-21): **15 of 16 tests run as nested caos jobs** — the
+bin-workers (file-count, dirs-only, deep-deps, rgrep), the bash tests
+(symlinks, untracked, run-then), the toolchain tests (cargo-check,
+cargo-crates, cargo-self, commit, rust-worker — the cargo base image rides by
+ID like the others; the inner std carries build-builtins' full shape including
+`rustc = curry(runner, bin, cargo, worker_common)`), and the stub tests
+(bash-tool, llm-step, chat-offline — helper binaries come from the job's
+`bins` tree via `CAOS_BIN_DIR` instead of host nix, and `CAOS_STUB_HOST`
+points workers at in-job stubs: siblings share the job's netns, so the stub
+lives at 127.0.0.1, not the engine-host alias). The testenv image grew a
+private redis — incrementality tests assert real memoization, and the
+hermetic-cache answer is a per-job redis that starts empty and dies with the
+job, not the poisoned shared one. `run-then` remains the strongest single
+check: continuations, nested runs, and cycle detection all resolve through
+the inner server driving socket-delegated siblings.
+
+Nested jobs run **unsalted**: their isolation is inherent (a fresh hermetic
+stack per job), and the per-run salt would re-key every job every run —
+defeating exactly the cross-run memoization the fold exists for. The host
+batch keeps the salt (those tests share the warm outer stack). The one
+holdout is `chat-online`: a real API key has no honest place in a cache key
+yet (fold ideas: key on a key-identity arg, not the secret), so it stays
+host-driven and self-skips without a key.
 
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is

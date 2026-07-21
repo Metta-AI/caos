@@ -24,13 +24,21 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
 }
 
 echo "== build the worker binaries and fixtures ==" >&2
-nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
-nix build "$CAOS_PROJECT#worker-llm-step" -o llm-step-out
-nix build "$CAOS_PROJECT#llm-stub" -o llm-stub-out
-cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
-cp -L llm-step-out/bin/worker-llm-step llm-step-bin
-stub_bin=$(readlink -f llm-stub-out/bin/llm-stub)
-rm bash-tool-out llm-step-out llm-stub-out
+# Prebuilt when the harness provides binaries (CAOS_BIN_DIR — the nested
+# runner does), else built by the flake.
+if [ -n "${CAOS_BIN_DIR:-}" ]; then
+  cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
+  cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
+  stub_bin=$CAOS_BIN_DIR/llm-stub
+else
+  nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
+  nix build "$CAOS_PROJECT#worker-llm-step" -o llm-step-out
+  nix build "$CAOS_PROJECT#llm-stub" -o llm-stub-out
+  cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
+  cp -L llm-step-out/bin/worker-llm-step llm-step-bin
+  stub_bin=$(readlink -f llm-stub-out/bin/llm-stub)
+  rm bash-tool-out llm-step-out llm-stub-out
+fi
 
 # The conversation's workspace: a small tree with a subdir that must survive
 # the turn untouched.
@@ -73,9 +81,12 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 echo "== curry the workers and run the turn ==" >&2
 conv="conv-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
 bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=bash-tool-bin)
+# Workers reach the stub as host.containers.internal from the outer engine's
+# container network; nested siblings share this job's netns (CAOS_STUB_HOST).
+stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=llm-step-bin \
   --api_key=test-key --system:@=system.txt --bash_image="$bash_tool" \
-  --model=test-model --base_url="http://host.containers.internal:$port" \
+  --model=test-model --base_url="http://$stub_host:$port" \
   --conversation="$conv")
 
 "$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit

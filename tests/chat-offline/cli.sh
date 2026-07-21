@@ -20,15 +20,24 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
 }
 
 echo "== build the worker binaries and fixtures ==" >&2
-nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
-nix build "$CAOS_PROJECT#worker-llm-step" -o llm-step-out
-nix build "$CAOS_PROJECT#worker-rgrep" -o rgrep-out
-nix build "$CAOS_PROJECT#llm-stub" -o llm-stub-out
-cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
-cp -L llm-step-out/bin/worker-llm-step llm-step-bin
-cp -L rgrep-out/bin/worker-rgrep rgrep-bin
-stub_bin=$(readlink -f llm-stub-out/bin/llm-stub)
-rm bash-tool-out llm-step-out rgrep-out llm-stub-out
+# Prebuilt when the harness provides binaries (CAOS_BIN_DIR — the nested
+# runner does), else built by the flake.
+if [ -n "${CAOS_BIN_DIR:-}" ]; then
+  cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
+  cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
+  cp "$CAOS_BIN_DIR/worker-rgrep" rgrep-bin
+  stub_bin=$CAOS_BIN_DIR/llm-stub
+else
+  nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
+  nix build "$CAOS_PROJECT#worker-llm-step" -o llm-step-out
+  nix build "$CAOS_PROJECT#worker-rgrep" -o rgrep-out
+  nix build "$CAOS_PROJECT#llm-stub" -o llm-stub-out
+  cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
+  cp -L llm-step-out/bin/worker-llm-step llm-step-bin
+  cp -L rgrep-out/bin/worker-rgrep rgrep-bin
+  stub_bin=$(readlink -f llm-stub-out/bin/llm-stub)
+  rm bash-tool-out llm-step-out rgrep-out llm-stub-out
+fi
 
 # The conversation's workspace, and the identity chat's human commits use.
 mkdir -p ws/notes
@@ -66,7 +75,10 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 conv="chat-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
 export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin CAOS_RGREP_BIN=rgrep-bin
-opts=(--model test-model --base-url "http://host.containers.internal:$port")
+# Workers reach the stub as host.containers.internal from the outer engine's
+# container network; nested siblings share this job's netns (CAOS_STUB_HOST).
+stub_host=${CAOS_STUB_HOST:-host.containers.internal}
+opts=(--model test-model --base-url "http://$stub_host:$port")
 
 echo "== missing ANTHROPIC_API_KEY fails before minting anything ==" >&2
 if env -u ANTHROPIC_API_KEY \

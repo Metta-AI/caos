@@ -26,10 +26,15 @@ echo one > ws/a/one.txt
 echo two > ws/a/b/two.txt
 echo top > ws/top.txt
 
-# The tool binary, built by the flake and bound into the shared runner.
-nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
-cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
-rm bash-tool-out
+# The tool binary, bound into the shared runner: prebuilt when the harness
+# provides binaries (CAOS_BIN_DIR — the nested runner does), else the flake.
+if [ -n "${CAOS_BIN_DIR:-}" ]; then
+  cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
+else
+  nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
+  cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
+  rm bash-tool-out
+fi
 commit "workspace + bash tool binary"
 base=$(git rev-parse HEAD)
 tool=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=bash-tool-bin)

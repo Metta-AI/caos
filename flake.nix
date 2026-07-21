@@ -487,8 +487,13 @@
             linuxPkgs.coreutils
             linuxPkgs.diffutils
             linuxPkgs.gnugrep
+            linuxPkgs.gnused
+            linuxPkgs.gnutar
             linuxPkgs.findutils
             linuxPkgs.gitMinimal
+            # A private redis backs the nested stack's result cache (tests
+            # assert real memoization); it starts empty and dies with the job.
+            linuxPkgs.redis
             # The docker (moby) client, so an inner runnerd in this worker can
             # delegate sibling containers to the outer engine over the granted
             # socket (phase 4). Same slimmed client the runnerd image ships.
