@@ -1884,7 +1884,7 @@ fn record_continuation(
                 return Err(format!("--{name} names an image, not a commit"));
             }
         };
-        let resolved = resolve_run_image(&cas, image)?;
+        let resolved = resolve_run_image(t, &cas, image)?;
         entries.push(Entry {
             mode: EntryKind::Blob.into(),
             filename: name.as_bytes().to_vec().into(),
@@ -2057,7 +2057,7 @@ pub fn resolve_ref(name: &str) -> Result<String, String> {
 /// expects. A git image is given as a path inside the CAS, which resolves to the
 /// git hash recorded on it; a `docker://<ref>` value is an ordinary docker image
 /// and passes through unchanged. Anything else is rejected.
-fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
+fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<String, String> {
     if image.starts_with(DOCKER_SCHEME) {
         return Ok(image.to_string());
     }
@@ -2077,6 +2077,20 @@ fn resolve_run_image(cas: &Path, image: &str) -> Result<String, String> {
             .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
         if !canon.starts_with(&cas_real) {
             return Err(format!("{image} resolves outside {}", cas.display()));
+        }
+        // A `docker://` image has no git object, so it rides as a *blob naming
+        // the ref* (see `read_args_image`); a file holding such a ref resolves
+        // to the ref itself — its recorded blob hash names an object no engine
+        // could run. Fetch the blob rather than reading the file: a CAS entry
+        // is a content-less placeholder until someone `get`s it.
+        if canon.is_file() {
+            let hash = read_hash(&canon)?;
+            if let Ok(content) = fetch_blob_string(t, &hash) {
+                if content.starts_with(DOCKER_SCHEME) {
+                    return Ok(content);
+                }
+            }
+            return Ok(hash);
         }
         return read_hash(&canon);
     }
@@ -2168,7 +2182,7 @@ fn std_tree() -> Result<String, String> {
 /// result is canonical (`curry (curry img a) b` == `curry img a b`).
 pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
-    let image = resolve_run_image(&cas, image)?;
+    let image = resolve_run_image(t, &cas, image)?;
     println!("{}", curry_object(t, &image, Some(&cas), kvs)?);
     Ok(())
 }

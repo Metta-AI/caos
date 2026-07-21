@@ -196,9 +196,11 @@ follow-up polling included. Every runnable worker is a `curry(_, bin=…)`;
 the server pairs with `CAOS_IMAGE_RESOLVE=none` (images pass through
 unconverted — no registry, and no redis either, since the cache is
 best-effort). Requires root + `CAP_SYS_CHROOT`: a stock container, even
-rootless-podman, no extra grants — validated end to end by
-`tests/proc-stack` (inner server + process runnerd + a recursive rgrep fold
-through map-then promises, in a stock `debian:stable-slim`).
+rootless-podman, no extra grants — validated end to end by the since-retired
+`proc-stack` demo (inner server + process runnerd + a recursive rgrep fold
+through map-then promises, in a stock `debian:stable-slim`). The process
+backend remains in runnerd as the no-socket fallback; the nested test stack
+itself is now socket-only (see the 2026-07-21 unification below).
 
 The uid fence survives: the harness runs as root and `caos runner` drops the
 worker child to uid 1000 exactly as in a container, so owner-only `/cas`
@@ -208,7 +210,7 @@ reproduce without namespaces.
 **Caos-in-caos (built):** the `testenv` image — the bash script worker plus
 git, with `CAOS_WORKER_UID=0` in its config: the per-image containment grant
 that lets its jobs run as root, which the inner stack needs (setuid installs
-into the slots, chroot). `tests/test-in-caos` runs the whole inner flow —
+into the slots, chroot). The (since-retired) `test-in-caos` demo ran the whole inner flow —
 edited server + process runnerd + a recursive fold — *as a caos worker job*
 keyed on (script, built binaries): the first run costs ~17s, the identical
 re-run 61ms. That is the tests-as-jobs contract demonstrated on itself; the
@@ -239,8 +241,8 @@ workers, test tree); a `test-all` worker maps over `tests/` — parallel, and
 a test whose inputs didn't change never re-runs. That's also the CI story.
 `chat-online` (real API key) stays host-side/self-skipped as today.
 
-**Suite-in-caos (built):** `tests/suite-in-caos` generalizes the one-worker
-`test-in-caos` to a multi-worker smoke suite — a file-count fold, the
+**Suite-in-caos (built, since retired):** the `suite-in-caos` demo generalized
+the one-worker `test-in-caos` to a multi-worker smoke suite — a file-count fold, the
 deep-deps DAG, an rgrep fold — inside one nested process-mode job, keyed on
 (script, binaries): first run ~18s, identical re-run 65ms. It introduces
 **inner-std publishing without nix**: for each worker binary, `curry(dummy,
@@ -256,31 +258,57 @@ the correct shape for every worker, and the reason the nix-free process-mode
 publish is possible at all. The nix-building and toolchain-image tests
 (cargo*, chat*, rust-worker, proc-stack, test-in-caos itself) stay host-side.
 
-**Real per-test jobs (built) — `tests/test-all`.** A generic inner
-`run-test.sh` stands up the nested stack, publishes std from the passed
-binaries, and runs the **unmodified `cli.sh`** of whatever test tree it's
-handed; the host driver fires one testenv job per curry-able test
-(file-count, dirs-only, deep-deps, rgrep), each keyed on `(run-test.sh, that
-test's tree, binaries)`. So each `tests/<name>` is now genuinely one caos
-job. `run-test.sh` picks a backend per test: **process** for the curry-able
-Rust bin-workers (file-count, dirs-only, deep-deps, rgrep — fast chroot
-slots), and **socket** (phase 4) for the bash **script**-worker tests
-(symlinks, untracked, run-then), whose inner std maps `std/bash` to a
-self-contained bash image the host builds and the inner server passes through
-as `docker://`. Seven real suites now pass inside nested stacks (~35s cold),
-and a second pass is all cache hits (**486ms** — a ~70× memoization), with an
-edit to one test's fixtures re-running only its job. `run-then` folding is the
-strongest single check: its run-then continuations, nested runs, *and* cycle
-detection all resolve through the inner server driving socket-delegated
-siblings. This is the tests-as-jobs contract on the real tests, not a proxy.
+**The unification (2026-07-21): one runner, socket-only, sharing via the
+cache.** The phase demos (`proc-stack`, `test-in-caos`, `suite-in-caos`,
+`socket-in-caos`, the `test-all` meta-test) are deleted; `tests/run-all.sh` is
+THE runner and `tests/lib/run-nested.sh` its one inner script. The settled
+architecture, from the restart discussion:
 
-What it does *not* fold: tests whose `cli.sh` needs host `nix` (it builds a
-worker inline — `bash-tool`); the heavy toolchain-image tests (`cargo*`,
-`rust-worker`, `commit` — the ~800M cargo/rustc images as siblings); the
-network/stub tests (`chat*`, `llm-step`); and the **meta** nested-stack tests
-themselves (`proc-stack`, `test-in-caos`, `suite-in-caos`, `socket-in-caos`,
-and `test-all` — folding them would double-nest). The capability gap is now
-closed; what remains is the toolchain-image weight and these inherent limits.
+- **Each test is one outer caos job** — the cache unit. An unchanged test is a
+  ~70ms hit that never starts a stack. Nothing shares a *live* inner stack
+  (ambient daemon state a job's key can't see would break hermetic caching);
+  the expensive inputs are shared **through the cache** instead — binaries and
+  images arrive pre-built, so a cache-miss stack start is process-spawn cheap.
+- **The inner stack is socket-only.** No per-test backend choice: the inner
+  runnerd delegates every worker to the outer engine as siblings — bin-workers
+  as `curry(runner image, bin)`, the pool shape verbatim; image workers (bash)
+  directly. The process backend stays in the tree as the no-socket fallback;
+  a hybrid per-job dispatch (chroot slots for bin-workers) is deferred unless
+  sibling-spawn latency ever matters.
+- **Images cross the boundary by image ID** (a content address — a `:latest`
+  tag in a cache key would lie), and the sibling images are the flake's own
+  runner + bash worker images. The runner ships as a bare delta meant to stack
+  on the stock debian base at registry-convert time; run-all reproduces that
+  stacking with a two-line local build, until the flake-build worker (phase D)
+  makes image production itself a caos job pushing to the caos registry
+  (content-addressed, shared — the safe store for image bytes, unlike redis).
+- **The host↔caos interface shrinks to**: a running outer stack + pinned stock
+  image refs. Everything derived from the edited tree crosses as git content,
+  built by caos jobs (binaries via a `std/cargo --cmd=build` job — phase B).
+- **One front door.** The suite itself becomes a worker: build the stack
+  pieces (nested cargo run against the outer std — the test job keeps *full*
+  outer-std access; only the inner stack is scrubbed), fan out per-test jobs
+  via map-then, summarize. Humans (`tests/run-all.sh`) and in-caos agents fire
+  the identical jobs, so their runs share cache hits.
+
+Folding the bin-worker tests through the socket surfaced a real client bug:
+a worker currying its *own image* from `/cas/args/image` (file-count,
+deep-deps, rgrep self-recursion) resolved the path to its recorded git hash —
+but when the image rides as a `docker://` **blob** (the nested passthrough
+case), that hash is the blob's oid, which no engine can run. Fix in
+`resolve_run_image`: a CAS *file* whose content is a `docker://` ref resolves
+to the ref itself. Outer stacks never hit this (images there are git trees,
+where the oid *is* the image) — nesting is what makes the blob case real.
+
+Folded so far: file-count, dirs-only, deep-deps, rgrep (bin-workers) +
+symlinks, untracked, run-then (bash script worker). `run-then` remains the
+strongest single check: continuations, nested runs, and cycle detection all
+resolve through the inner server driving socket-delegated siblings. Still
+host-driven, pending fold: the toolchain-image tests (`cargo*`, `commit`,
+`rust-worker` — need the cargo/rustc images passed by ID), and the tests whose
+`cli.sh` shells out to host nix for helper builds (`bash-tool`, `chat*`,
+`llm-step` — their builds become nested runs against the outer std).
+`chat-online` (real API key) stays self-skipped without a key, as today.
 
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is
@@ -316,10 +344,9 @@ is a per-worker grant of the engine socket (root-equivalent over that engine)
 plus a little plumbing. This is the same "per-worker containment grant, not
 dogma" stance as network and the uid-0 grant.
 
-Mechanics (all proven end to end, 2026-07-20 — reproducer:
-`tests/socket-in-caos/manual-spike.sh`, which builds a setuid runner image,
-starts a podman API service, launches a worker with the socket, and runs
-`manual-inner.sh` — the pre-staged twin of `inner-socket.sh`):
+Mechanics (all proven end to end, 2026-07-20, by a manual spike since retired
+along with the demo tests — the living implementation is
+`tests/lib/run-nested.sh`):
 
 - **runnerd knobs** (`crates/runnerd`): `CAOS_RUNNER_SOCKET=<host sock>` makes
   the *outer* runnerd bind-mount the engine socket into a granted worker at a
@@ -352,16 +379,14 @@ starts a podman API service, launches a worker with the socket, and runs
   worker images install. Static musl binaries mean it can be a thin `FROM
   scratch`/debian image.
 
-**Landed in the suite (`tests/socket-in-caos`, 2026-07-20):** the testenv image
-carries the slimmed moby `docker` client; the compose runnerd sets
+**Landed in the suite (2026-07-20, now the only nested backend):** the testenv
+image carries the slimmed moby `docker` client; the compose runnerd sets
 `CAOS_RUNNER_SOCKET=/var/run/docker.sock` (the socket it already has), so every
 worker gets it bind-mounted at `/run/caos/engine.sock` (coarse for now — a
-per-image grant is future work); `cli.sh` builds + tags a self-contained setuid
-runner image host-side and passes the `docker://` ref as an arg; `inner-socket.sh`
-runs the inner server + a docker-mode inner runnerd that launches siblings via
-the socket. Result: 20.8s cold, **69 ms cache hit** (identical inputs never
-re-run) — image-based workers nesting as caos jobs, the process backend's gap
-closed for the run-then/symlink/other-image tests.
+per-image grant is future work); `run-nested.sh` runs the inner server + a
+docker-mode inner runnerd that launches siblings via the socket. ~20s cold per
+test job, **~70 ms cache hit** (identical inputs never re-run) — image-based
+workers nesting as caos jobs, the process backend's gap closed.
 
 Still open: refine the socket grant from pool-wide to per-image; the
 convert/registry path for the git-docker → OCI tests (siblings pull converted

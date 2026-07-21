@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# The caos test runner. Foldable tests run as per-test caos JOBS in a nested
-# stack (design/cargo-workers.md) — cached, so an unchanged test is an instant
-# hit and editing one test's fixtures re-runs only its job. The rest still run
-# host-driven, until they're folded too (they need the full std inside the
-# nested stack — the toolchain images — or their cli.sh stops shelling out to
-# `nix`). There is no separate "test-all" test and no phase-demo tests: this IS
-# the runner, and run-nested.sh (shipped into each job) is its one inner script.
+# The caos test runner. Foldable tests run as per-test caos JOBS: each is a
+# nested-stack job (tests/lib/run-nested.sh) keyed on (runner script, test
+# tree, binaries under test, image IDs) — cached, so an unchanged test is an
+# instant hit and editing one test's fixtures re-runs only its job. The rest
+# still run host-driven, until they're folded too (design/cargo-workers.md:
+# the toolchain-image tests need their images passed by ID; bash-tool /
+# chat-offline / llm-step need their helper builds moved to nested runs
+# against the outer std instead of host nix).
+#
+# Interim (until the flake-build worker, phase D): the binaries come from host
+# nix builds and the worker images from the flake's load-* apps; both then
+# enter the jobs' cache keys as content (a git tree of binaries, image IDs).
 #
 # Usage: tests/run-all.sh          Exits non-zero if any test fails.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# Tests that run as nested caos jobs today, by backend:
-#   process  curry-able Rust bin-workers, on fast chroot slots
-#   socket   image-based workers (the bash SCRIPT worker) via the engine socket
-FOLD_PROCESS=(file-count dirs-only deep-deps rgrep)
-FOLD_SOCKET=(symlinks untracked run-then)
+# Tests that run as nested caos jobs today. Their inner std: the real bash
+# worker image + curry(runner image, bin) for the Rust bin-workers.
+FOLD=(file-count dirs-only deep-deps rgrep symlinks untracked run-then)
+BIN_WORKERS=(file-count dirs-only deep-deps rgrep)
 
 echo "building caos client + bringing the stack up (once for the suite)..." >&2
 nix build .#caos-cli -o result-caos || exit 1
@@ -28,9 +32,9 @@ export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
 pass=(); fail=()
 
 # ---------------------------------------------------------------------------
-# Nested batch: build the inner-stack pieces once, then fire one job per test.
+# Nested batch: build the shared inputs once, then fire one job per test.
 # ---------------------------------------------------------------------------
-echo "== preparing the nested-job stack (binaries + bash image) ==" >&2
+echo "== preparing the nested-job inputs (binaries + images) ==" >&2
 CLIENT=$PWD/.caos-dev/run-all-client
 rm -rf "$CLIENT"; mkdir -p "$CLIENT"; git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "http://localhost:9090"
@@ -39,64 +43,64 @@ trap 'rm -rf "$CLIENT" 2>/dev/null' EXIT
 
 cp tests/lib/run-nested.sh "$CLIENT/run-nested.sh"
 
-# Build the inner-stack binaries into a scratch dir (out-links must not land in
-# the client repo), then copy just the binaries in.
+# The binaries under test, built into a scratch dir (out-links must not land
+# in the client repo), then copied in as the jobs' `bins` input.
 BROOT=$(mktemp -d)
-for attr in server runnerd caos worker-runner worker-file-count \
-            worker-dirs-only worker-deep-deps worker-rgrep; do
+attrs=(server runnerd caos)
+for w in "${BIN_WORKERS[@]}"; do attrs+=("worker-$w"); done
+for attr in "${attrs[@]}"; do
   nix build ".#$attr" -o "$BROOT/$attr" || exit 1
 done
 mkdir -p "$CLIENT/bins"
 cp -L "$BROOT"/server/bin/server "$BROOT"/runnerd/bin/runnerd \
-  "$BROOT"/caos/bin/caos "$BROOT"/caos/bin/caos-cli "$BROOT"/worker-runner/bin/worker-runner \
-  "$BROOT"/worker-file-count/bin/worker-file-count "$BROOT"/worker-dirs-only/bin/worker-dirs-only \
-  "$BROOT"/worker-deep-deps/bin/worker-deep-deps "$BROOT"/worker-rgrep/bin/worker-rgrep "$CLIENT/bins/"
+  "$BROOT"/caos/bin/caos-cli "$CLIENT/bins/"
+for w in "${BIN_WORKERS[@]}"; do
+  cp -L "$BROOT/worker-$w/bin/worker-$w" "$CLIENT/bins/"
+done
 
-# The self-contained bash SCRIPT worker image for the socket cases (static
-# setuid caos + the generic bash /worker), tagged in the host store; the inner
-# server passes docker://<tag> through.
-BASH_IMAGE=localhost/caos-bash-worker:latest
+# The sibling worker images: the flake's own runner + bash images, loaded into
+# the outer engine store and referenced by image ID — a content address, so it
+# keys the jobs honestly (a `:latest` tag in a cache key would lie). The runner
+# ships as a bare delta meant to be stacked on the stock debian base at
+# registry-convert time; the production stack does that in the server's convert
+# path, and here we reproduce it with a two-line build (the chmod re-asserts
+# setuid, which COPY does not reliably carry).
+nix run .#load-caos-worker-runner >&2 || exit 1
+nix run .#load-caos-worker-bash >&2 || exit 1
 ictx=$(mktemp -d)
-cp -L "$CLIENT"/bins/caos "$ictx/caos"
-cat > "$ictx/worker" <<'WORKER'
-#!/bin/bash
-set -euo pipefail
-caos get /cas/args/script
-bash /cas/args/script
-if [ ! -e /cas/out ]; then : > /tmp/caos-empty-out; caos put /tmp/caos-empty-out /cas/out; fi
-WORKER
-cat > "$ictx/Containerfile" <<EOF
-FROM debian:stable-slim
-COPY caos /bin/caos
-COPY worker /worker
-RUN chmod 4755 /bin/caos && chmod 0755 /worker
+cat > "$ictx/Containerfile" <<'EOF'
+FROM docker.io/library/debian:stable-slim
+COPY --from=localhost/caos-worker-runner:latest / /
+RUN chmod 4755 /usr/bin/caos
+ENTRYPOINT ["/bin/caos","runner"]
 EOF
-docker build -t "$BASH_IMAGE" "$ictx" >/tmp/run-all-imgbuild.log 2>&1 \
-  || { tail -20 /tmp/run-all-imgbuild.log >&2; echo "bash image build failed" >&2; exit 1; }
+docker build -t localhost/caos-test-runner:latest "$ictx" \
+  >/tmp/run-all-imgbuild.log 2>&1 \
+  || { tail -20 /tmp/run-all-imgbuild.log >&2
+       echo "stacked runner image build failed" >&2; exit 1; }
 rm -rf "$ictx"
+img_id() { docker inspect --format '{{.Id}}' "$1" | sed 's/^sha256://'; }
+RUNNER_REF=$(img_id localhost/caos-test-runner:latest) || exit 1
+BASH_REF=$(img_id localhost/caos-worker-bash:latest) || exit 1
 
 mkdir -p "$CLIENT/cases"
-for c in "${FOLD_PROCESS[@]}" "${FOLD_SOCKET[@]}"; do cp -r "tests/$c" "$CLIENT/cases/$c"; done
+for c in "${FOLD[@]}"; do cp -r "tests/$c" "$CLIENT/cases/$c"; done
 ( cd "$CLIENT" && git add -A && git -c user.email=t@c -c user.name=c commit -qm setup )
 
-fire() { # <name> <backend>
-  local extra=(); [ "$2" = socket ] && extra=(--bash_image="$BASH_IMAGE")
-  ( cd "$CLIENT" && "$CAOS_CLI" run /cas/std/testenv "out-$1" \
-      -- --script:@=run-nested.sh --test:@="cases/$1" --bins:@=bins \
-         --backend="$2" "${extra[@]}" )
-}
-nested() { # <name> <backend>
-  echo "=== tests/$1 (nested:$2) ===" >&2
-  if fire "$1" "$2" && grep -q "RUN-TEST: PASS" "$CLIENT/out-$1"; then
+nested() { # <name>
+  echo "=== tests/$1 (nested) ===" >&2
+  if ( cd "$CLIENT" && "$CAOS_CLI" run /cas/std/testenv "out-$1" \
+         -- --script:@=run-nested.sh --test:@="cases/$1" --bins:@=bins \
+            --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" ) \
+     && grep -q "RUN-TEST: PASS" "$CLIENT/out-$1"; then
     pass+=("tests/$1"); else fail+=("tests/$1"); fi
 }
-for c in "${FOLD_PROCESS[@]}"; do nested "$c" process; done
-for c in "${FOLD_SOCKET[@]}"; do nested "$c" socket; done
+for c in "${FOLD[@]}"; do nested "$c"; done
 
 # ---------------------------------------------------------------------------
-# Host-driven batch: everything else with a cli.sh (pending fold — step 2/3).
+# Host-driven batch: everything else with a cli.sh (pending fold).
 # ---------------------------------------------------------------------------
-folded=" ${FOLD_PROCESS[*]} ${FOLD_SOCKET[*]} "
+folded=" ${FOLD[*]} "
 for d in tests/*/; do
   t=$(basename "${d%/}")
   [ -f "$d/cli.sh" ] || continue
