@@ -99,7 +99,9 @@ add "$(cli curry "docker://$RUNNER_IMAGE" --)" runner
 add "$(cli curry "docker://$BASH_IMAGE" --)" bash
 for b in /pt/worker-*; do
   n=${b#/pt/worker-}
-  case "$n" in cargo | rustc) continue ;; esac
+  # cargo/rustc curry onto their own bases below; `runner` names the runner
+  # IMAGE entry above (the worker-runner bin is that image's own trampoline).
+  case "$n" in cargo | rustc | runner) continue ;; esac
   add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-$n")" "$n"
 done
 cargo_ref=$(cli curry "docker://$CARGO_IMAGE" -- "--bin:@=worker-cargo")

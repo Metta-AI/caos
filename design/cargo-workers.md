@@ -326,9 +326,32 @@ arg — it already travels through request args inside `caos chat` itself, so
 this adds no new exposure — and same key = same cache key, so the real-API
 test re-runs only when the code or the key changes. (An earlier idea here,
 salting that one job per run, was wrong: cached-when-unchanged is exactly
-the semantics we want for it, like every other test.) Warm full suite: 86s,
-every job a cross-run cache hit; the remainder is flake evals — which phase
-B/D erase by moving binary and image production into caos jobs.
+the semantics we want for it, like every other test.)
+
+**Phase B landed (2026-07-21): the binaries under test are built BY caos.**
+run-all fires one bash job that run-thens `std/cargo --cmd=build
+--target=<musl> --profile=release` over the workspace and strips the result
+to the bin tree (`tests/lib/build-bins.sh` + `strip-bins.sh`). The strip is
+cache honesty: cargo's result carries volatile stderr (timings), so
+downstream jobs key on the content-stable bin tree only. The host threads
+that tree to every test job as `--bins:tree=<hash>` — a new CLI arg form
+referencing a tree the server already holds (results composing into new
+requests); pathful `cli run` now prints `<kind> <hash>` so scripts can
+thread results onward. Both are host-boundary bridges: once the suite is a
+worker (phase C), run-then hands the result over as a CAS path and neither
+is needed in the flow.
+
+With bins server-side, the suite runs FROM the project repo (the `caos`
+remote is asserted, not auto-added; a stale local `refs/caos/std` shadows
+the server's — delete it): inputs ingest straight from the tracked worktree,
+dirty edits included, and the throwaway client repo + copies + setup commit
+are gone. The cargo image grew a second deps bake — (musl, release), what
+the bins build uses — plus a musl cross-cc (`pkgsCross`) with matching
+`CC_<target>` env at bake- and run-time: rustc links musl self-contained,
+but C-carrying deps (ring, via rustls) need a real musl cc, and the small
+rustc-built workers never hit that because their dep set has no C. Warm
+full suite: **20s**, bins job + all 16 test jobs cross-run cache hits; the
+rest is flake evals (phase D) and 16 serial hit-checks (phase C).
 
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is

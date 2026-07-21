@@ -7,17 +7,17 @@
 # batch (tests/run.sh remains for running one test against the outer stack
 # by hand).
 #
-# Interim (until the flake-build worker, phase D): the binaries come from host
-# nix builds and the worker images from the flake's load-* apps; both then
-# enter the jobs' cache keys as content (a git tree of binaries, image IDs).
+# The binaries under test are built BY caos (phase B): one std/cargo build
+# job on the outer stack whose result is just the bin tree, threaded to every
+# test job as `--bins:tree=<hash>`. The suite runs FROM this repo — inputs
+# are ingested straight from the tracked worktree (dirty tracked edits
+# included: the tests see the tree as you edited it), and job outputs land
+# under .caos-dev. Host nix remains only for the CLI, the stack itself, and
+# the worker images (the flake-build worker, phase D, folds those too).
 #
 # Usage: tests/run-all.sh          Exits non-zero if any test fails.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-
-# The Rust bin-workers published into the inner std as curry(runner, bin) —
-# plus cargo/rustc, which curry onto their own bases (see run-nested.sh).
-BIN_WORKERS=(file-count dirs-only deep-deps rgrep cargo rustc bash-tool llm-step)
 
 echo "building caos client + bringing the stack up (once for the suite)..." >&2
 nix build .#caos-cli -o result-caos || exit 1
@@ -26,64 +26,46 @@ export CAOS_DATA="${CAOS_DATA:-$PWD/.caos-data}"
 nix run .#caosd -- up >&2 || exit 1
 export CAOS_STACK_READY=1
 
+# The caos remote is how the CLI finds the server; require it rather than
+# mutating this repo behind the user's back.
+git remote get-url caos >/dev/null 2>&1 || {
+  echo "tests/run-all.sh: this repo needs a 'caos' remote naming the local server:" >&2
+  echo "  git remote add caos http://localhost:9090" >&2
+  exit 1
+}
+OUT=$PWD/.caos-dev/run-all
+rm -rf "$OUT" && mkdir -p "$OUT"
+
 pass=(); fail=()
 
 # ---------------------------------------------------------------------------
-# Build the shared inputs once, then fire one job per test.
+# The sibling worker images (phase-D fodder: these become caos jobs).
 # ---------------------------------------------------------------------------
-echo "== preparing the nested-job inputs (binaries + images) ==" >&2
-CLIENT=$PWD/.caos-dev/run-all-client
-rm -rf "$CLIENT"; mkdir -p "$CLIENT"; git init -q "$CLIENT"
-git -C "$CLIENT" remote add caos "http://localhost:9090"
-git -C "$CLIENT" config gc.auto 0
-trap 'rm -rf "$CLIENT" 2>/dev/null' EXIT
-
-cp tests/lib/run-nested.sh "$CLIENT/run-nested.sh"
-
-# The binaries under test, built into a scratch dir (out-links must not land
-# in the client repo), then copied in as the jobs' `bins` input.
-BROOT=$(mktemp -d)
-attrs=(server runnerd caos)
-for w in "${BIN_WORKERS[@]}"; do attrs+=("worker-$w"); done
-for attr in "${attrs[@]}"; do
-  nix build ".#$attr" -o "$BROOT/$attr" || exit 1
-done
-mkdir -p "$CLIENT/bins"
-cp -L "$BROOT"/server/bin/server "$BROOT"/runnerd/bin/runnerd \
-  "$BROOT"/caos/bin/caos-cli "$CLIENT/bins/"
-for w in "${BIN_WORKERS[@]}"; do
-  cp -L "$BROOT/worker-$w/bin/worker-$w" "$CLIENT/bins/"
-done
-# The stub LLM server the chat/llm-step tests script (not a worker — their
-# cli.sh runs it inside the job, siblings reach it over the shared netns).
-nix build .#llm-stub -o "$BROOT/llm-stub" || exit 1
-cp -L "$BROOT/llm-stub/bin/llm-stub" "$CLIENT/bins/"
-
-# The sibling worker images: the flake's own runner + bash images, loaded into
-# the outer engine store and referenced by image ID — a content address, so it
-# keys the jobs honestly (a `:latest` tag in a cache key would lie). The runner
-# ships as a bare delta meant to be stacked on the stock debian base at
-# registry-convert time; the production stack does that in the server's convert
-# path, and here we reproduce it with a two-line build (the chmod re-asserts
-# setuid, which COPY does not reliably carry).
+# The flake's own runner + bash images, loaded into the outer engine store and
+# referenced by image ID — a content address, so it keys the jobs honestly (a
+# `:latest` tag in a cache key would lie). The runner ships as a bare delta
+# meant to be stacked on the stock debian base at registry-convert time; the
+# production stack does that in the server's convert path, and here we
+# reproduce it with a two-line build (the chmod re-asserts setuid, which COPY
+# does not reliably carry).
 nix run .#load-caos-worker-runner >&2 || exit 1
 nix run .#load-caos-worker-bash >&2 || exit 1
-ictx=$(mktemp -d)
-cat > "$ictx/Containerfile" <<'EOF'
+stacked_runner_build_ctx=$(mktemp -d)
+cat > "$stacked_runner_build_ctx/Containerfile" <<'EOF'
 FROM docker.io/library/debian:stable-slim
 COPY --from=localhost/caos-worker-runner:latest / /
 RUN chmod 4755 /usr/bin/caos
 ENTRYPOINT ["/bin/caos","runner"]
 EOF
-docker build -t localhost/caos-test-runner:latest "$ictx" \
+docker build -t localhost/caos-test-runner:latest "$stacked_runner_build_ctx" \
   >/tmp/run-all-imgbuild.log 2>&1 \
   || { tail -20 /tmp/run-all-imgbuild.log >&2
        echo "stacked runner image build failed" >&2; exit 1; }
-rm -rf "$ictx"
+rm -rf "$stacked_runner_build_ctx"
 # The cargo toolchain base image: big and slow to `docker load`, so skip the
 # load when the built tarball (its nix store path) is already the one loaded.
-nix build .#caos-worker-cargo-base-docker -o "$BROOT/cargo-img" || exit 1
-cargo_img=$(readlink -f "$BROOT/cargo-img")
+nix build .#caos-worker-cargo-base-docker -o /tmp/run-all-cargo-img || exit 1
+cargo_img=$(readlink -f /tmp/run-all-cargo-img)
 marker=$CAOS_DATA/.cargo-img-loaded
 if [ "$(cat "$marker" 2>/dev/null)" != "$cargo_img" ] \
    || ! docker image exists localhost/caos-worker-cargo-base:latest; then
@@ -97,45 +79,47 @@ RUNNER_REF=$(img_id localhost/caos-test-runner:latest) || exit 1
 BASH_REF=$(img_id localhost/caos-worker-bash:latest) || exit 1
 CARGO_REF=$(img_id localhost/caos-worker-cargo-base:latest) || exit 1
 
-# The worker-common source tree (rustc's curry links generated projects
-# against it) and the workspace snapshot (cargo-self dogfoods the tree under
-# test; only its job carries it, so other jobs don't re-key on source edits).
-cp -R crates/worker-common "$CLIENT/worker-common"
-chmod -R u+w "$CLIENT/worker-common"
-mkdir -p "$CLIENT/workspace"
-git archive HEAD | tar -x -C "$CLIENT/workspace"
+# ---------------------------------------------------------------------------
+# The binaries under test, built by caos: a bash job that run-thens std/cargo
+# over the workspace and strips the result to the bin tree (see
+# tests/lib/build-bins.sh for why the strip matters). Unsalted: same tree,
+# same binaries, cache hit.
+# ---------------------------------------------------------------------------
+echo "== building the workspace binaries in caos (std/cargo) ==" >&2
+bins_line=$(CAOS_SALT= "$CAOS_CLI" run /cas/std/bash "$OUT/bins" -- \
+  --script:@=tests/lib/build-bins.sh --strip:@=tests/lib/strip-bins.sh \
+  --target="$(uname -m)-unknown-linux-musl" --workspace:@=.) \
+  || { echo "workspace build failed" >&2; exit 1; }
+BINS_HASH=${bins_line#tree }
+echo "  bins: $BINS_HASH" >&2
 
-TESTS=()
-for d in tests/*/; do
-  t=$(basename "${d%/}")
-  [ -f "$d/cli.sh" ] && TESTS+=("$t")
-done
-mkdir -p "$CLIENT/cases"
-for c in "${TESTS[@]}"; do cp -r "tests/$c" "$CLIENT/cases/$c"; done
-( cd "$CLIENT" && git add -A && git -c user.email=t@c -c user.name=c commit -qm setup )
-
-# Jobs run UNSALTED: their isolation is inherent (each stands up its own
-# hermetic stack), and the whole point is that an unchanged test is a cache
-# hit across runs — a per-run salt would re-key every job every run.
+# ---------------------------------------------------------------------------
+# One job per test. Unsalted: isolation is inherent (each stands up its own
+# hermetic stack), and an unchanged test must be a cache hit across runs.
+# ---------------------------------------------------------------------------
 nested() { # <name>
   local extra=()
-  [ "$1" = cargo-self ] && extra=(--workspace:@=workspace)
+  [ "$1" = cargo-self ] && extra+=(--workspace:@=.)
   # The real API key rides as an ordinary arg (it already rides through
   # request args in `caos chat` itself): same key, same cache key — the test
   # re-runs only when the code or the key changes. Without a key the job runs
   # (and caches) the test's own skip path.
   [ "$1" = chat-online ] && [ -n "${ANTHROPIC_API_KEY:-}" ] \
-    && extra=(--api_key="$ANTHROPIC_API_KEY")
+    && extra+=(--api_key="$ANTHROPIC_API_KEY")
   echo "=== tests/$1 ===" >&2
-  if ( cd "$CLIENT" && CAOS_SALT= "$CAOS_CLI" run /cas/std/testenv "out-$1" \
-         -- --script:@=run-nested.sh --test:@="cases/$1" --bins:@=bins \
-            --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
-            --cargo_image="$CARGO_REF" --worker_common:@=worker-common \
-            "${extra[@]}" ) \
-     && grep -q "RUN-TEST: PASS" "$CLIENT/out-$1"; then
+  if CAOS_SALT= "$CAOS_CLI" run /cas/std/testenv "$OUT/out-$1" \
+       -- --script:@=tests/lib/run-nested.sh --test:@="tests/$1" \
+          --bins:tree="$BINS_HASH" \
+          --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
+          --cargo_image="$CARGO_REF" --worker_common:@=crates/worker-common \
+          "${extra[@]}" >/dev/null \
+     && grep -q "RUN-TEST: PASS" "$OUT/out-$1"; then
     pass+=("tests/$1"); else fail+=("tests/$1"); fi
 }
-for c in "${TESTS[@]}"; do nested "$c"; done
+for d in tests/*/; do
+  t=$(basename "${d%/}")
+  [ -f "$d/cli.sh" ] && nested "$t"
+done
 
 echo >&2
 echo "==== ${#pass[@]}/$(( ${#pass[@]} + ${#fail[@]} )) passed ====" >&2

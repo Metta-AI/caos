@@ -1547,7 +1547,9 @@ fn scratch_dir() -> Result<PathBuf, String> {
 ///   [`GitTransport::ingest_path`]); a worker has no host filesystem, so this is
 ///   an error there;
 /// * `--name:commit=value` — a commit, passed unpeeled as a gitlink entry (see
-///   [`resolve_commit_arg`]).
+///   [`resolve_commit_arg`]);
+/// * `--name:tree=hash` — a tree the server already holds (an earlier run's
+///   result), referenced directly by hash.
 fn build_arg_entries(
     t: &dyn Transport,
     cas: Option<&Path>,
@@ -1598,6 +1600,18 @@ fn build_arg_entries(
                 EntryKind::Commit.into(),
                 resolve_commit_arg(t, cas, v).map_err(|e| format!("`{name}`: {e}"))?,
             ),
+            // `--name:tree=hash` — a tree the server already holds (an earlier
+            // result), referenced by hash. Verified server-side to be a tree so
+            // a typo fails here, not as a bad materialization in the worker.
+            ArgValue::Tree(v) => {
+                let (kind, _) = t
+                    .get_object(v)
+                    .map_err(|e| format!("`{name}`: tree {v}: {e}"))?;
+                if kind != "tree" {
+                    return Err(format!("`{name}`: {v} is a {kind}, not a tree"));
+                }
+                (EntryKind::Tree.into(), parse_oid(v)?)
+            }
         };
 
         entries.push(Entry {
@@ -1679,6 +1693,12 @@ enum ArgValue<'a> {
     /// because the default forms peel commits to trees (which image refs rely
     /// on); see [`resolve_commit_arg`].
     Commit(&'a str),
+    /// `--name:tree=hash` — the value is the hash of a tree the *server*
+    /// already holds (typically an earlier run's result), referenced directly
+    /// as a tree entry with no content round-trip. This is how results compose
+    /// into new requests: e.g. a workspace-build job's `bin` tree feeding a
+    /// downstream job as `--bins:tree=<hash>`.
+    Tree(&'a str),
 }
 
 /// Split a `--name[:type]=value` argument into its name and typed value,
@@ -1696,10 +1716,12 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
         None => (key, ArgValue::Literal(value)),
         Some((name, "@")) => (name, ArgValue::Path(value)),
         Some((name, "commit")) => (name, ArgValue::Commit(value)),
+        Some((name, "tree")) => (name, ArgValue::Tree(value)),
         Some((_, ty)) => {
             return Err(format!(
                 "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
-                 --name:@=value (path), or --name:commit=value (commit)"
+                 --name:@=value (path), --name:commit=value (commit), or \
+                 --name:tree=hash (a tree the server already holds)"
             ))
         }
     };
@@ -1880,6 +1902,9 @@ fn record_continuation(
         let image = match value {
             ArgValue::Literal(v) => v,
             ArgValue::Path(p) => p,
+            // A tree hash is a valid image ref (a git image or curry node),
+            // so the typed form degenerates to the literal one here.
+            ArgValue::Tree(v) => v,
             ArgValue::Commit(_) => {
                 return Err(format!("--{name} names an image, not a commit"));
             }
@@ -1941,7 +1966,11 @@ pub fn cli_run(
     };
 
     // Check the result out in full as ordinary rw files — the object and, for a
-    // tree, every descendant — so it's readable and editable on the host.
+    // tree, every descendant — so it's readable and editable on the host. With
+    // the output going to files, stdout carries the result's identity —
+    // "<kind> <hash>" — so a script can thread it onward (e.g. as a
+    // `--name:tree=` arg to a later run).
+    println!("{kind} {result}");
     let target = PathBuf::from(output);
     let root = if kind == "tree" {
         gix::objs::tree::EntryKind::Tree

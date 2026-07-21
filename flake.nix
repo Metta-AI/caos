@@ -582,11 +582,47 @@
           postInstall = ''echo -n "$PWD" > $out/ws-root'';
         };
 
+        # A musl C cross-compiler for the image: rustc links musl binaries
+        # self-contained, but C-carrying deps (ring) compile via cc-rs, which
+        # needs a real musl cc when targeting musl. The env var below hands it
+        # to cc-rs; it must be identical at bake time and in-worker, or the
+        # baked fingerprints go stale (build scripts rerun-if-env-changed on
+        # CC_<target>).
+        muslCrossCC =
+          if pkgs.stdenv.hostPlatform.isAarch64 then
+            linuxPkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+          else
+            linuxPkgs.pkgsCross.musl64.stdenv.cc;
+        muslCCEnvName = "CC_${builtins.replaceStrings [ "-" ] [ "_" ] muslTarget}";
+        muslCCEnv = "${muslCCEnvName}=${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
+
+        # The workspace deps baked a second time for (musl, release) — what the
+        # phase-B bins build (`std/cargo --cmd=build --target=<musl>
+        # --profile=release`) uses, so a per-edit build recompiles only the
+        # workspace crates, never the dep graph. Keyed like the dev bake on
+        # manifests + lockfile only.
+        cargoWorkerDepsMusl = craneLibCargoWorker.buildDepsOnly (
+          {
+            inherit src;
+            pname = "caos-cargo-musl";
+            version = "0.1.0";
+            strictDeps = true;
+            cargoVendorDir = cargoWorkerVendor;
+            CARGO_PROFILE = "release";
+            CARGO_BUILD_TARGET = muslTarget;
+            cargoExtraArgs = "--locked --workspace";
+          }
+          // {
+            ${muslCCEnvName} = "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
+          }
+        );
+
         # The image root: the runner trampoline at /worker (the actual cargo
         # worker binary arrives as the curried `bin` arg) plus the baked
-        # target/ inflated at the exact workspace root the bake used. The
-        # toolchain, cc and vendor ride the image closure via the config
-        # references below.
+        # target/ inflated at the exact workspace root the bake used — both
+        # bakes, dev/host (check/test) and release/musl (the bins build),
+        # merged into one target/. The toolchain, cc and vendor ride the image
+        # closure via the config references below.
         cargoBaseRootEnv =
           pkgs.runCommand "caos-worker-cargo-base-root" { nativeBuildInputs = [ pkgs.zstd ]; }
             ''
@@ -595,6 +631,7 @@
               wsroot=$(cat ${cargoWorkerDeps}/ws-root)
               mkdir -p "$out$wsroot"
               tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$wsroot"
+              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$wsroot"
               cp ${cargoWorkerDeps}/ws-root $out/ws-root
             '';
         cargoBaseConfig = {
@@ -606,12 +643,13 @@
             # The pinned toolchain and a C linker (for build/test binaries; the
             # same cc-wrapper the bake's build scripts and proc macros linked
             # under, so everything resolves against one glibc).
-            "PATH=${cargoWorkerToolchain}/bin:${linuxPkgs.stdenv.cc}/bin:/bin"
+            "PATH=${cargoWorkerToolchain}/bin:${linuxPkgs.stdenv.cc}/bin:${muslCrossCC}/bin:/bin"
             # A writable home; the worker copies the vendor config here.
             "CARGO_HOME=/tmp/cargo"
             "CAOS_VENDOR_CONFIG=${cargoWorkerVendor}/config.toml"
-            # Must match the bake (see cargoWorkerDeps).
+            # Must match the bakes (see cargoWorkerDeps / cargoWorkerDepsMusl).
             "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
+            "${muslCCEnv}"
           ];
         };
         cargoBaseImage = pkgs.dockerTools.buildLayeredImage {
