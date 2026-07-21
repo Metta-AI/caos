@@ -147,7 +147,8 @@ runner-side: the set of hanging `/runner/poll`s *is* the pool.
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
-| `GET /run?req=<reqHash>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result). See [compute](#compute). |
+| `GET /run?req=<reqHash>&trace=<traceId>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result), optionally emitting trace events. See [compute](#compute). |
+| `GET /trace/<traceId>/stream` | Stream one live trace as Chrome `B`/`E` events in JSONL. |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
@@ -316,7 +317,7 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos-cli run <image> [output] -- [--name=value | --name:@=path …]` (the
+`caos-cli run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — including the `<image>` under a
@@ -335,6 +336,18 @@ blocking, user-facing run):
    editable on the host directly. `<output>` is optional: with it omitted, a
    **file** result is streamed to **stdout** (handy for `| less` or `> file`);
    a **tree** result has no single stream, so it still needs an `<output>` path.
+
+Pass `--trace=<file>` to write Chrome Trace Events as JSONL. `--trace` and
+`--trace=-` write to stdout and require a separate computation output path.
+`--trace-id=<id>` optionally overrides the generated invocation id.
+
+```sh
+caos-cli run --trace=trace.jsonl <image> <result-path> -- --input=value
+caos-cli run --trace <image> <result-path> -- --input=value
+```
+
+Traces are live-only and discarded when the run ends. Trace ids do not affect
+request or cache identity.
 
 The worker-side `caos map-then <in> -- [--map=<image>] [--then=<image>]` is a
 different thing entirely: a **tail call**. It records the continuation

@@ -1720,12 +1720,17 @@ fn run_request(
     t: &dyn Transport,
     image: &str,
     cas: Option<&Path>,
+    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    request_compute(&t.server_url()?, &req)
+    let server = t.server_url()?;
+    match trace {
+        Some((id, output)) => request_compute_streamed(&server, &req, id, output),
+        None => request_compute(&server, &req),
+    }
 }
 
 /// Everything in [`run_request`] up to (and including) getting the request onto
@@ -1916,10 +1921,17 @@ pub fn cli_run(
     t: &dyn Transport,
     image: &str,
     output: Option<&str>,
+    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(), String> {
+    if trace
+        .as_ref()
+        .is_some_and(|(id, _)| !valid_trace_id(id))
+    {
+        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
+    }
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, kvs)?;
+    let (kind, result) = run_request(t, &image, None, trace, kvs)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2307,7 +2319,23 @@ fn merge_entries(
 /// replies with the final `"<type> <hash>"`.
 fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
     let url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
-    let body = http_get(&url)?;
+    request_compute_url(&url)
+}
+
+fn request_compute_traced(
+    base: &str,
+    req: &str,
+    trace_id: &str,
+) -> Result<(String, String), String> {
+    let url = format!(
+        "{}/run?req={req}&trace={trace_id}",
+        base.trim_end_matches('/')
+    );
+    request_compute_url(&url)
+}
+
+fn request_compute_url(url: &str) -> Result<(String, String), String> {
+    let body = http_get(url)?;
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
@@ -2318,6 +2346,62 @@ fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
+}
+
+fn request_compute_streamed(
+    base: &str,
+    req: &str,
+    trace_id: &str,
+    output: &mut (dyn Write + Send),
+) -> Result<(String, String), String> {
+    let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
+    let mut response = minreq::get(&stream_url)
+        .send_lazy()
+        .map_err(|e| format!("GET {stream_url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let status = response.status_code;
+        let reason = response.reason_phrase.clone();
+        let mut body = String::new();
+        let _ = response.read_to_string(&mut body);
+        return Err(format!(
+            "GET {stream_url}: server returned {status} {reason}: {}",
+            body.trim()
+        ));
+    }
+
+    std::thread::scope(|scope| {
+        let trace = scope.spawn(|| -> Result<(), String> {
+            let mut buffer = [0; 8192];
+            loop {
+                let read = response
+                    .read(&mut buffer)
+                    .map_err(|e| format!("reading trace: {e}"))?;
+                if read == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..read])
+                    .and_then(|()| output.flush())
+                    .map_err(|e| format!("writing trace: {e}"))?;
+            }
+            Ok(())
+        });
+        let result = request_compute_traced(base, req, trace_id);
+        let trace_result = trace
+            .join()
+            .map_err(|_| "the trace stream thread panicked".to_string())?;
+        let result = result?;
+        trace_result?;
+        Ok(result)
+    })
+}
+
+fn valid_trace_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),
