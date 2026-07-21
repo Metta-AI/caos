@@ -318,11 +318,17 @@ the inner server driving socket-delegated siblings.
 
 Nested jobs run **unsalted**: their isolation is inherent (a fresh hermetic
 stack per job), and the per-run salt would re-key every job every run —
-defeating exactly the cross-run memoization the fold exists for. The host
-batch keeps the salt (those tests share the warm outer stack). The one
-holdout is `chat-online`: a real API key has no honest place in a cache key
-yet (fold ideas: key on a key-identity arg, not the secret), so it stays
-host-driven and self-skips without a key.
+defeating exactly the cross-run memoization the fold exists for.
+
+`chat-online` folds too (so: **all 16, no host batch, nested is the default
+for a new tests/<name>/cli.sh**): the API key rides as an ordinary request
+arg — it already travels through request args inside `caos chat` itself, so
+this adds no new exposure — and same key = same cache key, so the real-API
+test re-runs only when the code or the key changes. (An earlier idea here,
+salting that one job per run, was wrong: cached-when-unchanged is exactly
+the semantics we want for it, like every other test.) Warm full suite: 86s,
+every job a cross-run cache hit; the remainder is flake evals — which phase
+B/D erase by moving binary and image production into caos jobs.
 
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is

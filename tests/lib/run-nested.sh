@@ -127,6 +127,13 @@ fi
 # worker's netns, so localhost is the stub's address, not the engine host.
 export CAOS_BIN_DIR=/pt
 export CAOS_STUB_HOST=127.0.0.1
+# A real-API test's key arrives as an arg (chat-online; absent = its cli.sh
+# self-skips). Siblings share this worker's netns, so they have its egress.
+if [ -e /cas/args/api_key ]; then
+  caos get /cas/args/api_key
+  ANTHROPIC_API_KEY=$(cat /cas/args/api_key)
+  export ANTHROPIC_API_KEY
+fi
 cp -r /cas/args/test ./test
 git add -A && git commit -qm testtree
 if ! CAOS_CLI=/pt/caos-cli CAOS_SERVER_URL=$INNER bash test/cli.sh >/tmp/test.out 2>&1; then

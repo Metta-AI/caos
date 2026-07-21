@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# The caos test runner. Foldable tests run as per-test caos JOBS: each is a
+# The caos test runner. EVERY test runs as a caos JOB: each tests/<name> is a
 # nested-stack job (tests/lib/run-nested.sh) keyed on (runner script, test
 # tree, binaries under test, image IDs) — cached, so an unchanged test is an
-# instant hit and editing one test's fixtures re-runs only its job. The one
-# holdout is chat-online: it needs a real API key, which has no honest place
-# in a cache key yet, so it stays host-driven (and self-skips without a key).
+# instant hit and editing one test's fixtures re-runs only its job. A new
+# tests/<name>/cli.sh is picked up automatically; there is no host-driven
+# batch (tests/run.sh remains for running one test against the outer stack
+# by hand).
 #
 # Interim (until the flake-build worker, phase D): the binaries come from host
 # nix builds and the worker images from the flake's load-* apps; both then
@@ -14,12 +15,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# Tests that run as nested caos jobs today. Their inner std: the real bash
-# worker image, curry(runner image, bin) for the Rust bin-workers, and the
-# toolchain entries (cargo on its base image, rustc on the runner).
-FOLD=(file-count dirs-only deep-deps rgrep symlinks untracked run-then
-      cargo-check cargo-crates cargo-self commit rust-worker
-      bash-tool llm-step chat-offline)
+# The Rust bin-workers published into the inner std as curry(runner, bin) —
+# plus cargo/rustc, which curry onto their own bases (see run-nested.sh).
 BIN_WORKERS=(file-count dirs-only deep-deps rgrep cargo rustc bash-tool llm-step)
 
 echo "building caos client + bringing the stack up (once for the suite)..." >&2
@@ -28,12 +25,11 @@ export CAOS_CLI=$PWD/result-caos/bin/caos-cli
 export CAOS_DATA="${CAOS_DATA:-$PWD/.caos-data}"
 nix run .#caosd -- up >&2 || exit 1
 export CAOS_STACK_READY=1
-export CAOS_SALT="${CAOS_SALT:-$(date +%s%N)-$$}"
 
 pass=(); fail=()
 
 # ---------------------------------------------------------------------------
-# Nested batch: build the shared inputs once, then fire one job per test.
+# Build the shared inputs once, then fire one job per test.
 # ---------------------------------------------------------------------------
 echo "== preparing the nested-job inputs (binaries + images) ==" >&2
 CLIENT=$PWD/.caos-dev/run-all-client
@@ -109,18 +105,28 @@ chmod -R u+w "$CLIENT/worker-common"
 mkdir -p "$CLIENT/workspace"
 git archive HEAD | tar -x -C "$CLIENT/workspace"
 
+TESTS=()
+for d in tests/*/; do
+  t=$(basename "${d%/}")
+  [ -f "$d/cli.sh" ] && TESTS+=("$t")
+done
 mkdir -p "$CLIENT/cases"
-for c in "${FOLD[@]}"; do cp -r "tests/$c" "$CLIENT/cases/$c"; done
+for c in "${TESTS[@]}"; do cp -r "tests/$c" "$CLIENT/cases/$c"; done
 ( cd "$CLIENT" && git add -A && git -c user.email=t@c -c user.name=c commit -qm setup )
 
-# Nested jobs run UNSALTED: their isolation is inherent (each stands up its
-# own hermetic stack), and the whole point is that an unchanged test is a
-# cache hit across runs — the per-run salt would re-key every job every run.
-# The host batch keeps the salt (those tests share the warm outer stack).
+# Jobs run UNSALTED: their isolation is inherent (each stands up its own
+# hermetic stack), and the whole point is that an unchanged test is a cache
+# hit across runs — a per-run salt would re-key every job every run.
 nested() { # <name>
   local extra=()
   [ "$1" = cargo-self ] && extra=(--workspace:@=workspace)
-  echo "=== tests/$1 (nested) ===" >&2
+  # The real API key rides as an ordinary arg (it already rides through
+  # request args in `caos chat` itself): same key, same cache key — the test
+  # re-runs only when the code or the key changes. Without a key the job runs
+  # (and caches) the test's own skip path.
+  [ "$1" = chat-online ] && [ -n "${ANTHROPIC_API_KEY:-}" ] \
+    && extra=(--api_key="$ANTHROPIC_API_KEY")
+  echo "=== tests/$1 ===" >&2
   if ( cd "$CLIENT" && CAOS_SALT= "$CAOS_CLI" run /cas/std/testenv "out-$1" \
          -- --script:@=run-nested.sh --test:@="cases/$1" --bins:@=bins \
             --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
@@ -129,19 +135,7 @@ nested() { # <name>
      && grep -q "RUN-TEST: PASS" "$CLIENT/out-$1"; then
     pass+=("tests/$1"); else fail+=("tests/$1"); fi
 }
-for c in "${FOLD[@]}"; do nested "$c"; done
-
-# ---------------------------------------------------------------------------
-# Host-driven batch: everything else with a cli.sh (pending fold).
-# ---------------------------------------------------------------------------
-folded=" ${FOLD[*]} "
-for d in tests/*/; do
-  t=$(basename "${d%/}")
-  [ -f "$d/cli.sh" ] || continue
-  case "$folded" in *" $t "*) continue;; esac
-  echo "=== tests/$t (host) ===" >&2
-  if tests/run.sh "tests/$t"; then pass+=("tests/$t"); else fail+=("tests/$t"); fi
-done
+for c in "${TESTS[@]}"; do nested "$c"; done
 
 echo >&2
 echo "==== ${#pass[@]}/$(( ${#pass[@]} + ${#fail[@]} )) passed ====" >&2
