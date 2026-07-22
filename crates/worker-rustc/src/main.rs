@@ -4,7 +4,7 @@
 //! (typically curried in), it compiles the source for glibc (gnu), linking the
 //! vendored `worker-common`, and emits at `/cas/out` a ready-to-run worker:
 //! `curry(runner, bin=<the compiled binary>)`. So the worker is *not* its own
-//! image — it's the shared, warm-pooled runner ([`crates/worker-runner`]) bound
+//! image — it's the shared, warm-pooled runner (`crates/worker-runner`) bound
 //! to this binary, which is what avoids a per-worker image (no convert / registry
 //! push / app provision). run the result like any other image.
 //!

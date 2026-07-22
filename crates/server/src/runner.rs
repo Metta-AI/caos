@@ -12,7 +12,7 @@
 //!
 //! [`dispatch`] is the compute pipeline's entry: it enqueues the job, waits on
 //! a per-dispatch channel, and handles the two timeouts — a job no runner
-//! claims fails 503 after [`PENDING_TIMEOUT`]; a claimed job whose result
+//! claims fails 503 after the configured pending timeout; a claimed job whose result
 //! never arrives is requeued under a fresh nonce after [`JOB_DEADLINE`]
 //! (results are memoized and workers deterministic, so a spurious re-run is
 //! wasted work, never a wrong answer).

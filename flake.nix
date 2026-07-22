@@ -1120,6 +1120,15 @@
             }
           );
 
+          doc = craneLib.cargoDoc (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoExtraArgs = "--locked --workspace";
+              RUSTDOCFLAGS = "-D warnings";
+            }
+          );
+
           fmt = craneLib.cargoFmt { inherit src; };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

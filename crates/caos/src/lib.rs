@@ -68,7 +68,7 @@ pub const DOCKER_SCHEME: &str = "docker://";
 /// (merging the bound args under the call's args, then folding the base in as the
 /// args' `image` entry) so the server only ever sees an ordinary args tree. The
 /// marker lets it be told apart from a
-/// git-docker image tree, which it otherwise resembles. See [`unwrap_curry`].
+/// git-docker image tree, which it otherwise resembles. See `unwrap_curry`.
 pub const CURRY_MARKER: &str = ".caos-curry";
 
 /// Directory under which objects are materialized. Override (e.g. for local
@@ -1057,7 +1057,7 @@ fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String
     })
 }
 
-/// The result kind recorded at `path`: its [`KIND_XATTR`] if present (a promise
+/// The result kind recorded at `path`: its `KIND_XATTR` if present (a promise
 /// placeholder), else implied by shape — a directory is a tree, a file a blob.
 /// What the runner reports for `/cas/out`.
 pub fn result_kind(path: &Path) -> Result<String, String> {

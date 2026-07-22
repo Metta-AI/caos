@@ -295,7 +295,7 @@ impl ChatArgs {
     }
 }
 
-/// `chat <name> …` — the explicit, scriptable one-turn form; see [`usage`].
+/// `chat <name> …` — the explicit, scriptable one-turn form.
 pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Chat, args)?;
     let name = a.name.clone().expect("chat parse requires a name");
@@ -307,7 +307,7 @@ pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
     run_cli_turn(t, &a.turn_options(), &name, &message)
 }
 
-/// `talk [<prompt>] …` — the everyday surface; see [`usage`] and module docs.
+/// `talk [<prompt>] …` — the everyday surface; see the module documentation.
 pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Talk, args)?;
     let (name, fresh) = pick_conversation(t, &a)?;
