@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
@@ -211,8 +211,8 @@ impl ConversationState {
         }
     }
 
-    fn reload(&mut self) {
-        match conversation_history(&self.name) {
+    fn reload(&mut self, transport: &GitTransport) {
+        match conversation_history(transport, &self.name) {
             Ok(turns) => {
                 self.transcript = turns
                     .into_iter()
@@ -225,7 +225,7 @@ impl ConversationState {
                         text: turn.message,
                     })
                     .collect();
-                match conversation_workspace_diff(&self.name) {
+                match conversation_workspace_diff(transport, &self.name) {
                     Ok(diff) => self.diff = Some(diff),
                     Err(error) => {
                         self.diff = None;
@@ -276,6 +276,7 @@ enum ConfirmAction {
 }
 
 pub(crate) struct App {
+    repo_dir: PathBuf,
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
@@ -291,6 +292,7 @@ impl App {
     pub(crate) fn new(mut args: Args) -> Result<Self, String> {
         // Fail before taking over the terminal if the repo or remote is invalid.
         let transport = GitTransport::from_cwd()?;
+        let repo_dir = transport.work_dir().to_path_buf();
         if let Some(from) = args.from_commit.clone() {
             let commit = transport
                 .resolve_revspec(&from)?
@@ -299,7 +301,7 @@ impl App {
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        let conversations = list_conversations()?;
+        let conversations = list_conversations(&transport)?;
         let selected_name = choose_conversation(
             args.conversation.as_deref(),
             args.new_conversation,
@@ -318,7 +320,7 @@ impl App {
             })
             .collect();
         for state in &mut states {
-            state.reload();
+            state.reload(&transport);
         }
         if states.iter().all(|state| state.name != selected_name) {
             states.insert(
@@ -331,6 +333,7 @@ impl App {
             .position(|state| state.name == selected_name)
             .expect("the selected conversation was inserted");
         Ok(Self {
+            repo_dir,
             conversations: states,
             selected,
             should_quit: false,
@@ -349,6 +352,10 @@ impl App {
 
     fn selected_mut(&mut self) -> &mut ConversationState {
         &mut self.conversations[self.selected]
+    }
+
+    fn transport(&self) -> Result<GitTransport, String> {
+        GitTransport::discover(&self.repo_dir)
     }
 
     pub(crate) fn should_quit(&self) -> bool {
@@ -400,8 +407,9 @@ impl App {
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
         let conversation = self.selected().name.clone();
+        let repo_dir = self.repo_dir.clone();
         std::thread::spawn(move || {
-            let result = GitTransport::from_cwd().and_then(|transport| {
+            let result = GitTransport::discover(repo_dir).and_then(|transport| {
                 run_chat_turn(&transport, &options, &conversation, &message, |event| {
                     let _ = tx.send(UiMessage::Turn {
                         conversation: conversation.clone(),
@@ -472,6 +480,18 @@ impl App {
     }
 
     fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
+        if let TurnEvent::Completed(outcome) = event {
+            let transport = self.transport();
+            let state = &mut self.conversations[index];
+            state.running = false;
+            state.status = format!("completed {}", outcome.short_commit);
+            match transport {
+                Ok(transport) => state.reload(&transport),
+                Err(error) => state.status = format!("reloading completed turn failed: {error}"),
+            }
+            return;
+        }
+
         let state = &mut self.conversations[index];
         match event {
             TurnEvent::PhaseComplete {
@@ -532,11 +552,7 @@ impl App {
                     });
                 }
             }
-            TurnEvent::Completed(outcome) => {
-                state.running = false;
-                state.status = format!("completed {}", outcome.short_commit);
-                state.reload();
-            }
+            TurnEvent::Completed(_) => unreachable!("completed events return above"),
         }
     }
 
@@ -599,8 +615,13 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             if !self.selected().is_busy() {
-                self.selected_mut().reload();
-                self.selected_mut().status = "reloaded".to_string();
+                match self.transport() {
+                    Ok(transport) => {
+                        self.selected_mut().reload(&transport);
+                        self.selected_mut().status = "reloaded".to_string();
+                    }
+                    Err(error) => self.selected_mut().status = error,
+                }
             } else {
                 self.selected_mut().status =
                     "finish this conversation's operation before reloading".to_string();
@@ -648,7 +669,8 @@ impl App {
     }
 
     fn start_from_hash(&mut self, hash: &str) {
-        let resolved = GitTransport::from_cwd()
+        let resolved = self
+            .transport()
             .and_then(|transport| transport.resolve_revspec(hash))
             .and_then(|commit| commit.ok_or_else(|| format!("cannot resolve commit {hash:?}")));
         let commit = match resolved {
@@ -662,7 +684,14 @@ impl App {
     }
 
     fn start_new_conversation(&mut self, base: Option<String>) {
-        let disk = match list_conversations() {
+        let transport = match self.transport() {
+            Ok(transport) => transport,
+            Err(error) => {
+                self.selected_mut().status = error;
+                return;
+            }
+        };
+        let disk = match list_conversations(&transport) {
             Ok(conversations) => conversations,
             Err(error) => {
                 self.selected_mut().status = error;
@@ -819,6 +848,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (
             App {
+                repo_dir: PathBuf::from("."),
                 conversations,
                 selected: 0,
                 should_quit: false,
@@ -1027,7 +1057,8 @@ mod tests {
     #[test]
     fn reload_surfaces_history_errors_instead_of_showing_an_empty_chat() {
         let mut conversation = state("missing-conversation-for-reload-test");
-        conversation.reload();
+        let transport = GitTransport::from_cwd().unwrap();
+        conversation.reload(&transport);
         assert!(conversation.transcript.is_empty());
         assert!(conversation.diff.is_none());
         assert!(conversation.status.contains("loading conversation failed"));
