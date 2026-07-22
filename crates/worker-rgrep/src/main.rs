@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, caos_curry, cas_hash, entries, file_name, link, map_then, own_image, path,
-    read_arg, run_worker, scratch, Arg,
+    arg, caos, caos_curry, cas_hash, entries, file_name, link, map_then, own_image, path, read_arg,
+    run_worker, scratch, Arg,
 };
 
 /// git's well-known empty tree — a child result with no matches, skipped so
