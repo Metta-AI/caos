@@ -68,20 +68,21 @@ const RUNNER_IMAGE: &str = "/cas/std/runner";
 const BASH_TOOL_IMAGE: &str = "/cas/std/bash-tool";
 const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
 const RGREP_IMAGE: &str = "/cas/std/rgrep";
-/// The cargo worker's std image (its own toolchain image, not a runner curry;
-/// design/cargo-workers.md) — the `build`/`test` tools. Optional: a stack
-/// whose std predates it just doesn't register them.
-const CARGO_IMAGE: &str = "/cas/std/cargo";
+/// The script-worker image TREE TOOLS run on (the workspace's caos-tools/*.sh,
+/// discovered per round, resolved at invocation time — design/cargo-workers.md).
+/// Optional: a stack whose std predates it just doesn't register tree tools.
+const TOOLS_IMAGE: &str = "/cas/std/bash";
 
 /// Auto-named conversations (`talk` with no `-c`): `talk-1`, `talk-2`, …
 const AUTO_NAME_PREFIX: &str = "talk-";
 
 /// Default system prompt when neither `--system` nor `--system-file` is given.
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
-     read/ls/write/edit tools for file access and grep to search. For a cargo workspace, \
-     prefer the build/test tools (cached, offline) over cargo via bash. Use the bash tool to \
-     run other commands (scripts, generators), declaring every path a command reads in \
-     `paths`. Keep responses concise.";
+     read/ls/write/edit tools for file access and grep to search. The workspace may define \
+     its own tools (caos-tools/*.sh, e.g. build/test) — prefer them (cached caos jobs) over \
+     doing the same work via bash, and know that editing a tool script changes what the tool \
+     does on your next call. Use the bash tool to run other commands (scripts, generators), \
+     declaring every path a command reads in `paths`. Keep responses concise.";
 
 /// Milliseconds between progress/status polls while the run blocks. Each poll
 /// is two `ls-remote`s plus a few object reads — cheap enough to keep short
@@ -441,10 +442,10 @@ fn turn(
         None => resolve_cli_image(t, RGREP_IMAGE)?,
     };
 
-    // Optional: a stack whose std predates the cargo worker simply doesn't
-    // register the build/test tools (llm-step treats a missing cargo_image
+    // Optional: a stack whose std predates the bash script worker simply
+    // doesn't register tree tools (llm-step treats a missing tools_image
     // that way too).
-    let cargo_image = resolve_cli_image(t, CARGO_IMAGE).ok();
+    let tools_image = resolve_cli_image(t, TOOLS_IMAGE).ok();
 
     let mut kvs = vec![
         format!("--api_key={api_key}"),
@@ -453,8 +454,8 @@ fn turn(
         format!("--grep_image={grep_image}"),
         format!("--conversation={name}"),
     ];
-    if let Some(cargo) = &cargo_image {
-        kvs.push(format!("--cargo_image={cargo}"));
+    if let Some(tools) = &tools_image {
+        kvs.push(format!("--tools_image={tools}"));
     }
     if let Some(model) = &a.model {
         kvs.push(format!("--model={model}"));

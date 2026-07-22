@@ -66,9 +66,10 @@ struct Config {
     /// The rgrep fold worker's image; the `grep` tool is registered only when
     /// present (older curries without it keep working).
     grep_image: Option<String>,
-    /// The cargo worker's image (design/cargo-workers.md); the `build`/`test`
-    /// tools are registered only when present.
-    cargo_image: Option<String>,
+    /// The script-worker image (std/bash) TREE TOOLS run on: the workspace's
+    /// caos-tools/*.sh, discovered per round and resolved at invocation time
+    /// (design/cargo-workers.md). Registered only when present.
+    tools_image: Option<String>,
     model: String,
     base_url: String,
     conversation: Option<String>,
@@ -81,7 +82,7 @@ impl Config {
             system: read_arg("system")?,
             bash_image: read_arg("bash_image")?,
             grep_image: read_arg_opt("grep_image")?,
-            cargo_image: read_arg_opt("cargo_image")?,
+            tools_image: read_arg_opt("tools_image")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
             base_url: read_arg_opt("base_url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
@@ -162,11 +163,11 @@ fn callback(cfg: &Config) -> Result<(), String> {
             caos(["get", &ws])?;
             ws
         }
-        // A cargo result ({exit, stdout, stderr}) is diagnostics, not a
-        // workspace: cargo writes only target/, so the pre-run workspace rode
-        // our curry, exactly like grep.
-        "build" | "test" => {
-            results.push(tools::cargo_result_block(&current_id, &arg("result"))?);
+        // A tree tool's result (caos-tools/<name>.sh) is a VALUE — a report,
+        // a bin tree, diagnostics — never a workspace: the pre-run workspace
+        // rode our curry, exactly like grep.
+        name if name != "bash" => {
+            results.push(tools::tree_tool_result_block(&current_id, &arg("result"))?);
             let ws = arg("ws");
             caos(["get", &ws])?;
             ws
@@ -228,13 +229,26 @@ fn drive(
                 }
             }
         }
-        if matches!(name, "build" | "test") && cfg.cargo_image.is_some() {
-            return launch_cargo(cfg, &call, name, &ws, step_path, &queue[1..], &results);
+        // A tree tool? Resolved in the CURRENT workspace at invocation time,
+        // so a call made right after an edit runs the edited script.
+        if !tools::is_inline(name) && cfg.tools_image.is_some() {
+            if let Some(script) = tools::tree_tool_script(&ws, name)? {
+                return launch_tree_tool(
+                    cfg,
+                    &call,
+                    name,
+                    &script,
+                    &ws,
+                    step_path,
+                    &queue[1..],
+                    &results,
+                );
+            }
         }
         if !tools::is_inline(name) {
             return Err(format!(
-                "model called unknown tool {name:?} \
-                 (registered: bash, grep, build, test, read, ls, write, edit)"
+                "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, \
+                 write, edit; plus this workspace's caos-tools/*.sh)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -279,7 +293,7 @@ fn llm_round(
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
         "system": cfg.system,
-        "tools": registry(cfg),
+        "tools": registry(cfg, ws)?,
         "messages": messages,
     });
     // Bracket the API call with status-ref updates (progress::status): the
@@ -486,15 +500,18 @@ fn launch_grep(
     run_then(scope, &curried, Some(&me))
 }
 
-/// Launch a cargo run (`build` → check, `test` → test) as a run-then sub-run
-/// of the cargo worker: the input is the workspace tree itself and the cargo
-/// subcommand rides curried on the image, so the run caches on exactly
-/// (workspace tree, subcommand). The result is diagnostics, not a workspace —
-/// the current `ws` rides the continuation, unchanged by the run.
-fn launch_cargo(
+/// Launch a tree tool (caos-tools/<name>.sh, already resolved in the current
+/// workspace) as a run-then sub-run: the input is the workspace tree and the
+/// SCRIPT BLOB rides curried on the script-worker image, so the run caches
+/// on exactly (workspace tree, script content) — and an edited tool is a new
+/// key automatically. The result is a value, not a workspace — the current
+/// `ws` rides the continuation, unchanged by the run.
+#[allow(clippy::too_many_arguments)]
+fn launch_tree_tool(
     cfg: &Config,
     call: &Value,
     name: &str,
+    script: &str,
     ws: &str,
     step_path: &str,
     pending: &[Value],
@@ -503,15 +520,11 @@ fn launch_cargo(
     let id = call["id"]
         .as_str()
         .ok_or("tool_use block has no string id")?;
-    let cmd = if name == "test" { "test" } else { "check" };
     let image = cfg
-        .cargo_image
+        .tools_image
         .as_ref()
-        .ok_or("launch_cargo without a cargo_image (drive guards this)")?;
-    // mode=all: the per-crate decomposition (one cached job per workspace
-    // member) rather than the flat whole-workspace run — an edit recompiles
-    // the edited crate and its dependents, everything else is cache hits.
-    let curried = caos_curry(image, &[("cmd", Arg::Lit(cmd)), ("mode", Arg::Lit("all"))])?;
+        .ok_or("launch_tree_tool without a tools_image (drive guards this)")?;
+    let curried = caos_curry(image, &[("script", Arg::Path(script))])?;
     let me = self_curry(
         step_path,
         pending,
@@ -558,7 +571,7 @@ fn self_curry(
         "base_url",
         "conversation",
         "grep_image",
-        "cargo_image",
+        "tools_image",
     ]
     .iter()
     .map(|name| (*name, arg(name)))
@@ -694,16 +707,20 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 
 /// The full tool registry: bash, grep and the cargo tools (the sub-run tools)
 /// plus the inline file tools (`tools.rs`).
-fn registry(cfg: &Config) -> Vec<Value> {
+fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
     if cfg.grep_image.is_some() {
         tools.push(tools::grep_declaration());
     }
-    if cfg.cargo_image.is_some() {
-        tools.extend(tools::cargo_declarations());
+    // Tree tools: whatever caos-tools/*.sh the CURRENT workspace carries —
+    // re-discovered every round, so the set tracks the agent's own edits.
+    if cfg.tools_image.is_some() {
+        for (name, doc) in tools::tree_tools(ws)? {
+            tools.push(tools::tree_tool_declaration(&name, &doc));
+        }
     }
-    tools
+    Ok(tools)
 }
 
 /// The bash tool's registry entry, steering the model into the declared-paths

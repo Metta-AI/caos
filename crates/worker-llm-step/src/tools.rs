@@ -117,63 +117,131 @@ pub fn grep_declaration() -> Value {
     })
 }
 
-/// The cargo tools' registry entries (present only when a `cargo_image` is
-/// curried — see `Config`): `build` and `test`, whole-workspace cargo runs as
-/// run-then sub-runs of the cargo worker (design/cargo-workers.md). No
-/// parameters: the workspace tree is the input, and identical trees are cache
-/// hits — a no-change rebuild is free.
-pub fn cargo_declarations() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "build",
-            "description": "Compile-check the workspace (`cargo check --workspace --all-targets`, \
-        offline, in a toolchain container with the workspace's dependencies pre-built). Returns \
-        cargo's diagnostics; an unchanged workspace is a cache hit. Prefer this over cargo via bash.",
-            "input_schema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "test",
-            "description": "Build and run the workspace's tests (`cargo test --workspace`, \
-        offline, in a toolchain container with the workspace's dependencies pre-built). Returns \
-        the test report and diagnostics; an unchanged workspace is a cache hit. Prefer this over \
-        cargo via bash.",
-            "input_schema": {"type": "object", "properties": {}}
-        }),
-    ]
+// ---- Tree tools (caos-tools/*.sh — design/cargo-workers.md) -----------------
+/// Reserved built-in tool names a tree tool may not shadow: the model's
+/// primitives (including the repair path for a broken tool edit — bash and
+/// the file tools) must stay stable whatever the tree carries.
+const RESERVED_TOOLS: &[&str] = &["bash", "grep", "read", "ls", "write", "edit"];
+
+/// The tree's tool directory (`caos-tools/` in the workspace), expanded one
+/// level; `None` when the tree defines no tools.
+fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
+    caos(["get", ws])?;
+    let dir = format!("{ws}/caos-tools");
+    if !Path::new(&dir).is_dir() {
+        return Ok(None);
+    }
+    caos(["get", &dir])?;
+    Ok(Some(dir))
 }
 
-/// The tool_result block for a finished cargo run: exit code + the captured
-/// streams (each already tailed to 100KB by the worker), trimmed again to the
-/// transcript budget. Nonzero exit renders `is_error`, so the model treats
-/// diagnostics as something to fix.
-pub fn cargo_result_block(id: &str, result: &str) -> Result<Value, String> {
-    let _ = caos(["get", "-r", result]);
-    let read = |name: &str| -> Result<String, String> {
-        let p = Path::new(result).join(name);
-        if !p.exists() {
-            return Ok(String::new());
-        }
-        fs::read_to_string(&p).map_err(|e| format!("reading {}: {e}", p.display()))
+/// Discover the tree-defined tools: `caos-tools/*.sh`, each (name,
+/// description) with the description from its `#@doc ` lines. Resolved fresh
+/// from the CURRENT workspace every round, so an agent that adds, edits, or
+/// removes a tool sees the change on its next request. Reserved names are
+/// skipped loudly; subdirectories (caos-tools/lib/) are helpers, not tools.
+pub fn tree_tools(ws: &str) -> Result<Vec<(String, String)>, String> {
+    let Some(dir) = tree_tools_dir(ws)? else {
+        return Ok(Vec::new());
     };
-    let exit: i32 = read("exit")?.trim().parse().unwrap_or(-1);
-    let stdout = read("stdout")?;
-    let stderr = read("stderr")?;
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .map_err(|e| format!("reading {dir}: {e}"))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
 
-    let mut text = format!("exit {exit}\n");
-    for (label, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
-        if !stream.trim().is_empty() {
-            text += &format!("── {label} ──\n{}\n", stream.trim_end());
+    let mut out = Vec::new();
+    for fname in names {
+        let Some(name) = fname.strip_suffix(".sh") else {
+            continue;
+        };
+        let p = format!("{dir}/{fname}");
+        if !Path::new(&p).is_file() {
+            continue;
         }
+        if RESERVED_TOOLS.contains(&name) {
+            eprintln!("caos-tools/{fname} shadows the built-in {name:?} tool — ignored");
+            continue;
+        }
+        caos(["get", &p])?;
+        let text = fs::read_to_string(&p).map_err(|e| format!("reading {p}: {e}"))?;
+        let doc: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#@doc").map(str::trim))
+            .collect();
+        let doc = if doc.is_empty() {
+            format!("Project tool caos-tools/{fname} (no #@doc description).")
+        } else {
+            doc.join(" ")
+        };
+        out.push((name.to_string(), doc));
     }
+    Ok(out)
+}
+
+/// One discovered tool's registry entry. Tree tools take no arguments (yet —
+/// a `#@arg` schema convention can come later): the workspace tree IS the
+/// input, so the description carries everything the model needs.
+pub fn tree_tool_declaration(name: &str, doc: &str) -> Value {
+    json!({
+        "name": name,
+        "description": doc,
+        "input_schema": {"type": "object", "properties": {}}
+    })
+}
+
+/// Resolve tool `name` in the CURRENT workspace — invocation-time lookup, so
+/// a call made right after an edit runs the edited script. `None` when the
+/// tree doesn't define it (or the name is reserved / not a clean filename).
+pub fn tree_tool_script(ws: &str, name: &str) -> Result<Option<String>, String> {
+    if RESERVED_TOOLS.contains(&name) || name.contains('/') || name.contains("..") {
+        return Ok(None);
+    }
+    let Some(dir) = tree_tools_dir(ws)? else {
+        return Ok(None);
+    };
+    let p = format!("{dir}/{name}.sh");
+    Ok(Path::new(&p).is_file().then_some(p))
+}
+
+/// The tool_result block for a tree tool's result — a VALUE whose shape the
+/// tool chose, rendered by `caos-cli run-tool`'s conventions: a tree with a
+/// `report` shows the report (a FAILED banner renders `is_error`); a plain
+/// blob shows its text; any other tree shows its top-level listing.
+pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
+    caos(["get", result])?;
+    let p = Path::new(result);
+    let (mut text, is_err) = if p.is_dir() {
+        let report = p.join("report");
+        if report.exists() {
+            caos(["get", path(&report)])?;
+            let text = fs::read_to_string(&report)
+                .map_err(|e| format!("reading {}: {e}", report.display()))?;
+            let failed = text.contains("FAILED");
+            (text, failed)
+        } else {
+            let mut names: Vec<String> = fs::read_dir(p)
+                .map_err(|e| format!("reading {}: {e}", p.display()))?
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect();
+            names.sort();
+            (format!("result tree: {}", names.join(" ")), false)
+        }
+    } else {
+        let bytes = fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()))?;
+        (String::from_utf8_lossy(&bytes).into_owned(), false)
+    };
     if text.len() > MAX_READ_BYTES {
-        // Keep the tail: cargo puts the error summary last.
+        // Keep the tail: reports and diagnostics put the summary last.
         let mut cut = text.len() - MAX_READ_BYTES;
         while !text.is_char_boundary(cut) {
             cut += 1;
         }
         text = format!("[... truncated ...]\n{}", &text[cut..]);
     }
-    Ok(block(id, text.trim_end(), exit != 0))
+    Ok(block(id, text.trim_end(), is_err))
 }
 
 /// Validate a grep call before its sub-run launches: the pattern must compile
