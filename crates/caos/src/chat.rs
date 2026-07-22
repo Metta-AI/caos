@@ -23,7 +23,7 @@
 //! binary — the stub tests' path.
 
 use std::collections::HashSet;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 
 use serde_json::Value;
 
@@ -410,11 +410,28 @@ fn pick_conversation(a: &ChatArgs) -> Result<(String, bool), String> {
             return Ok((name, false));
         }
     }
-    // A fresh auto-named conversation: first free talk-<n>.
-    for n in 1.. {
-        let name = format!("{AUTO_NAME_PREFIX}{n}");
-        if rev_parse_opt(&format!("{CONV_REF_PREFIX}{name}"))?.is_none() {
-            return Ok((name, true));
+    let conversations = list_conversations()?;
+    Ok((
+        first_available_conversation_name(
+            conversations
+                .iter()
+                .map(|conversation| conversation.name.as_str()),
+        ),
+        true,
+    ))
+}
+
+/// Return the first unused auto-generated conversation name.
+///
+/// Name allocation is presentation-independent: every client uses the same
+/// `talk-<n>` scheme and may include names that exist only in its current
+/// session as well as durable conversation refs.
+pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let names: HashSet<&str> = names.into_iter().collect();
+    for number in 1.. {
+        let candidate = format!("{AUTO_NAME_PREFIX}{number}");
+        if !names.contains(candidate.as_str()) {
+            return candidate;
         }
     }
     unreachable!("some talk-<n> is always free")
@@ -475,8 +492,8 @@ pub fn conversation_history(name: &str) -> Result<Vec<ConversationTurn>, String>
 }
 
 /// Diff the conversation's current workspace against the commit it started
-/// from. This read is side-effect free; applying is a separate, explicit call
-/// to [`apply_conversation_workspace`].
+/// from. This operation is side-effect free; clients own any policy for
+/// applying or publishing the returned change.
 pub fn conversation_workspace_diff(name: &str) -> Result<WorkspaceDiff, String> {
     let refname = validated_refname(name)?;
     let head = rev_parse_opt(&refname)?
@@ -500,75 +517,6 @@ pub fn conversation_workspace_diff(name: &str) -> Result<WorkspaceDiff, String> 
         stat,
         patch,
     })
-}
-
-/// Apply the accumulated virtual-workspace patch to a clean host checkout.
-///
-/// The clean-checkout requirement keeps this operation deliberately narrow:
-/// no user edits are overwritten and no conflict policy is guessed. The TUI
-/// asks for an explicit second keypress before calling this function.
-pub fn apply_conversation_workspace(name: &str) -> Result<(), String> {
-    let dirty = git_capture(&["status", "--porcelain=v1", "--untracked-files=all"], None)?;
-    if !dirty.trim().is_empty() {
-        return Err(
-            "the working tree is not clean; commit or stash local changes before applying the conversation workspace"
-                .to_string(),
-        );
-    }
-    let diff = conversation_workspace_diff(name)?;
-    let patch = git_capture(
-        &[
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-ext-diff",
-            "--no-color",
-            &diff.base,
-            &diff.head,
-        ],
-        None,
-    )?;
-    if patch.is_empty() {
-        return Ok(());
-    }
-    git_apply(&patch, true)?;
-    git_apply(&patch, false)
-}
-
-fn git_apply(patch: &str, check: bool) -> Result<(), String> {
-    git_apply_in(patch, check, std::path::Path::new("."))
-}
-
-fn git_apply_in(patch: &str, check: bool, cwd: &std::path::Path) -> Result<(), String> {
-    let mut command = std::process::Command::new("git");
-    command.arg("apply");
-    if check {
-        command.arg("--check");
-    }
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::piped());
-    command.current_dir(cwd);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("running git apply: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("git apply stdin was not piped")?
-        .write_all(patch.as_bytes())
-        .map_err(|error| format!("writing patch to git apply: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("waiting for git apply: {error}"))?;
-    if !output.status.success() {
-        let action = if check { "checking" } else { "applying" };
-        return Err(format!(
-            "{action} the conversation workspace failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
 }
 
 /// Run one conversation turn, emitting structured progress as it happens.
@@ -1145,7 +1093,6 @@ fn history_from_head(head: &str) -> Result<(Vec<ConversationTurn>, String), Stri
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::path::Path;
 
     #[test]
     fn step_decoding_emits_results_text_and_tool_calls() {
@@ -1216,53 +1163,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_check_is_non_mutating_and_apply_updates_a_clean_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "caos-chat-apply-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {}", args.join(" "));
-        };
-        git(&["init", "-q"]);
-        std::fs::write(dir.join("note.txt"), "before\n").unwrap();
-        git(&["add", "note.txt"]);
-        git(&[
-            "-c",
-            "user.name=tester",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-qm",
-            "base",
-        ]);
-        let patch = "diff --git a/note.txt b/note.txt\n\
-                     index 90be1f3..3caf7ad 100644\n\
-                     --- a/note.txt\n\
-                     +++ b/note.txt\n\
-                     @@ -1 +1 @@\n\
-                     -before\n\
-                     +after\n";
-        git_apply_in(patch, true, Path::new(&dir)).unwrap();
+    fn auto_names_are_allocated_from_shared_conversation_policy() {
+        assert_eq!(first_available_conversation_name([]), "talk-1");
         assert_eq!(
-            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
-            "before\n"
+            first_available_conversation_name(["talk-1", "named", "talk-2"]),
+            "talk-3"
         );
-        git_apply_in(patch, false, Path::new(&dir)).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
-            "after\n"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

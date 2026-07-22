@@ -1,6 +1,7 @@
-//! caos client library: the logic shared by the two `caos` binaries.
+//! caos client library: the engine shared by the worker, line-oriented CLI,
+//! and richer clients such as `caos-tui`.
 //!
-//! There are two clients (see the crate's `bin/`):
+//! The package provides two binaries (see the crate's `bin/`):
 //!
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
 //!   It talks to the server over HTTP (`/object`) and runs the container
@@ -34,12 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
-mod chat;
-pub use chat::{
-    apply_conversation_workspace, cli_chat, cli_talk, conversation_history,
-    conversation_workspace_diff, list_conversations, run_chat_turn, ConversationRole,
-    ConversationSummary, ConversationTurn, TurnEvent, TurnOptions, TurnOutcome, WorkspaceDiff,
-};
+pub mod chat;
+pub use chat::{cli_chat, cli_talk};
 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";

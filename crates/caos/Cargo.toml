@@ -3,14 +3,14 @@ name = "caos"
 version = "0.1.0"
 edition = "2021"
 
-# Two binaries over one shared library:
+# Two binaries plus external clients over one shared library:
 #   * `caos`     — the worker-side client: talks HTTP `/object`, runs the
 #                  container `entrypoint`, is installed setuid-root in worker
 #                  images so an unprivileged worker reaches the root-owned /cas.
 #   * `caos-cli` — the user-facing client: uses the server as a `caos` git remote
 #                  (negotiated push/fetch over the local working repo).
-# The shared logic — object model, currying, args trees, CAS materialization —
-# lives in `lib.rs`, generic over a `Transport` (see there).
+# The shared logic — object model, currying, args trees, CAS materialization,
+# and the presentation-independent chat engine — lives in the library.
 
 [lib]
 name = "caos"
