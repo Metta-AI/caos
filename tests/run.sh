@@ -36,12 +36,16 @@ done
 # The client, like the stack, is part of the OLD, known-good caos — it only
 # fires the suite job, and is REQUIRED, never built from the edited tree
 # (the edited client is built and exercised INSIDE the suite: every test
-# drives /pt/caos-cli from the caos-built bins). Take it from $CAOS_CLI or
-# PATH (the devshell provides one).
+# drives /pt/caos-cli from the caos-built bins). Take it from $CAOS_CLI,
+# PATH (the devshell provides one), or the stack's own install (`caosd up`
+# puts its client at $CAOS_DATA/bin — client and stack deploy together).
+CAOS_DATA="${CAOS_DATA:-$PWD/.caos-data}"
 CAOS_CLI=${CAOS_CLI:-$(command -v caos-cli || true)}
+[ -n "$CAOS_CLI" ] || [ ! -x "$CAOS_DATA/bin/caos-cli" ] || CAOS_CLI=$CAOS_DATA/bin/caos-cli
 [ -n "$CAOS_CLI" ] || {
-  echo "tests/run.sh: no caos-cli on PATH (and CAOS_CLI unset)." >&2
-  echo "get the stack's client, e.g.: nix develop   (or nix build .#caos-cli)" >&2
+  echo "tests/run.sh: no caos client found (CAOS_CLI, PATH, $CAOS_DATA/bin)." >&2
+  echo "the stack's deploy installs one: nix run .#caosd -- up" >&2
+  echo "(or enter the devshell: nix develop)" >&2
   exit 1
 }
 export CAOS_CLI

@@ -1037,6 +1037,12 @@
 
             case "''${1:-up}" in
             up)
+              # Install THIS deploy's client next to the stack state: the
+              # client and the stack are one trust boundary (the old,
+              # known-good caos), and consumers that build nothing — the
+              # test runner — find it at $CAOS_DATA/bin/caos-cli.
+              mkdir -p "$CAOS_DATA/bin"
+              install -m 755 ${caos-cli}/bin/caos-cli "$CAOS_DATA/bin/caos-cli"
               # Load the server/runnerd images only when this exact build isn't
               # already in docker. We tag the loaded image with a hash of its
               # (immutable) nix store path; the tag's presence means "this build is
