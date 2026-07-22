@@ -1972,7 +1972,10 @@ pub fn cli_run(
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(), String> {
-    if trace.as_ref().is_some_and(|(id, _)| !valid_trace_id(id)) {
+    if trace
+        .as_ref()
+        .is_some_and(|(id, _)| !valid_trace_id(id))
+    {
         return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
     }
     let image = resolve_cli_image(t, image)?;
