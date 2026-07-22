@@ -535,18 +535,18 @@ loop (`tilt up` rebuilds an image when its sources change; UI at
 tilt is slated for removal.
 
 Building and testing run IN caos, as tools: `caos-tools/*.sh` are worker
-scripts (the same ones an LLM agent invokes), and `./run-tool` fires one as
+scripts (the same ones an LLM agent invokes), and `caos-cli run-tool` fires one as
 a caos job over this repo's tree against the running stack (it never
 starts or restarts the stack — `caosd up` that yourself, once). Every
 level is cached: an unchanged test never re-runs, a warm unchanged suite
 is one cache hit (~1s), and editing one test re-runs only its job.
 
 ```bash
-./run-tool caos-tools/build.sh      # compile + link, per-crate, cached
-./run-tool caos-tools/test.sh       # build + the whole test suite
-./run-tool test --only="unit rgrep" # just these tests (cache shared
+caos-cli run-tool build      # compile + link, per-crate, cached
+caos-cli run-tool test       # build + the whole test suite
+caos-cli run-tool test --only="unit rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
-CAOS_SALT=$(date +%s) ./run-tool test   # force a re-run (retry a flake)
+CAOS_SALT=$(date +%s) caos-cli run-tool test   # force a re-run (retry a flake)
 ```
 
 The test tool runs the suite worker (`tests/lib/suite.sh`, carried by this

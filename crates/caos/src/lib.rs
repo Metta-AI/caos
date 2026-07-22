@@ -37,6 +37,87 @@ use gix::objs::WriteTo;
 mod chat;
 pub use chat::{cli_chat, cli_talk};
 
+/// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
+/// the tool script as a caos job over this repo's tree, exactly what an
+/// agent's tool invocation does. The bash worker gets the tracked worktree
+/// (dirty edits included) as `--in`, plus the extra args verbatim. A bare
+/// name resolves to `caos-tools/<name>.sh` — the project's tree-defined
+/// tool directory. The result is checked out under `.caos-dev/tool-<name>`.
+///
+/// Conventions on the result: a `report` file is printed (a FAILED banner
+/// fails the command), and failing `results/<name>/` records show the tail
+/// of their `output`. Everything else just gets the printed result hash.
+pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
+    let (tool, kvs) = match args {
+        [tool, kvs @ ..] => (tool, kvs),
+        _ => return Err("usage: run-tool <script | name> [--name=value ...]".to_string()),
+    };
+    let script = if tool.contains('/') || tool.ends_with(".sh") {
+        tool.clone()
+    } else {
+        format!("caos-tools/{tool}.sh")
+    };
+    if !Path::new(&script).is_file() {
+        return Err(format!("no such tool script: {script}"));
+    }
+    let name = Path::new(&script)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tool")
+        .to_string();
+
+    let out = format!(".caos-dev/tool-{name}");
+    if let Err(e) = std::fs::remove_dir_all(&out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("clearing {out}: {e}"));
+        }
+    }
+    let mut all: Vec<String> = vec![format!("--script:@={script}"), "--in:@=.".to_string()];
+    all.extend(kvs.iter().cloned());
+    cli_run(t, "/cas/std/bash", Some(&out), &all)?;
+    eprintln!("{name}: result checked out at {out}");
+
+    let report = Path::new(&out).join("report");
+    if report.is_file() {
+        let text = std::fs::read_to_string(&report)
+            .map_err(|e| format!("reading {}: {e}", report.display()))?;
+        eprintln!();
+        eprint!("{text}");
+        let results = Path::new(&out).join("results");
+        if results.is_dir() {
+            for entry in std::fs::read_dir(&results)
+                .map_err(|e| format!("reading {}: {e}", results.display()))?
+            {
+                let dir = entry.map_err(|e| format!("results entry: {e}"))?.path();
+                let verdict = dir.join("verdict");
+                let passed = std::fs::read_to_string(&verdict)
+                    .map(|v| v.contains("PASS"))
+                    .unwrap_or(true);
+                if passed {
+                    continue;
+                }
+                let rec = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                eprintln!("\n---- {rec} (output tail; full record in results/{rec}) ----");
+                if let Ok(output) = std::fs::read_to_string(dir.join("output")) {
+                    let lines: Vec<&str> = output.lines().collect();
+                    let from = lines.len().saturating_sub(40);
+                    for line in &lines[from..] {
+                        eprintln!("{line}");
+                    }
+                }
+            }
+        }
+        if text.contains("FAILED") {
+            return Err(format!("{name} reported FAILED"));
+        }
+    }
+    Ok(())
+}
+
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 

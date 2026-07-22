@@ -75,6 +75,11 @@ fn run(args: &[String]) -> Result<(), String> {
         // progress, advance `refs/caos/conversations/<name>` on success. Flag
         // parsing (and the chat-specific usage) lives in `caos::cli_chat`.
         Some("chat") => caos::cli_chat(&transport()?, &args[2..]),
+        // `run-tool <script | name> [--name=value ...]` — run a caos-tool (a
+        // worker script, `caos-tools/<name>.sh` for a bare name) as a caos
+        // job over this repo's tree: what an agent's tool invocation does,
+        // callable by hand. See `caos::cli_run_tool` for the result conventions.
+        Some("run-tool") => caos::cli_run_tool(&transport()?, &args[2..]),
         _ => Err(usage(args)),
     }
 }
@@ -92,6 +97,7 @@ fn usage(args: &[String]) -> String {
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
-         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]"
+         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
+         {prog} run-tool <script | name> [--name=value ...]"
     )
 }
