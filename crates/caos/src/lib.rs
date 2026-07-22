@@ -1,6 +1,7 @@
-//! caos client library: the logic shared by the two `caos` binaries.
+//! caos client library: the engine shared by the worker, line-oriented CLI,
+//! and richer clients such as `caos-tui`.
 //!
-//! There are two clients (see the crate's `bin/`):
+//! The package provides two binaries (see the crate's `bin/`):
 //!
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
 //!   It talks to the server over HTTP (`/object`) and runs the container
@@ -34,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
-mod chat;
+pub mod chat;
 pub use chat::{cli_chat, cli_talk};
 
 /// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
@@ -74,7 +75,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     }
     let mut all: Vec<String> = vec![format!("--script:@={script}"), "--in:@=.".to_string()];
     all.extend(kvs.iter().cloned());
-    cli_run(t, "/cas/std/bash", Some(&out), &all)?;
+    cli_run(t, "/cas/std/bash", Some(&out), None, &all)?;
     eprintln!("{name}: result checked out at {out}");
 
     let report = Path::new(&out).join("report");
@@ -148,7 +149,7 @@ pub const DOCKER_SCHEME: &str = "docker://";
 /// (merging the bound args under the call's args, then folding the base in as the
 /// args' `image` entry) so the server only ever sees an ordinary args tree. The
 /// marker lets it be told apart from a
-/// git-docker image tree, which it otherwise resembles. See [`unwrap_curry`].
+/// git-docker image tree, which it otherwise resembles. See `unwrap_curry`.
 pub const CURRY_MARKER: &str = ".caos-curry";
 
 /// Directory under which objects are materialized. Override (e.g. for local
@@ -316,17 +317,52 @@ pub struct GitTransport {
     /// Its git directory, to re-open a fresh handle after a `git fetch` (the
     /// cached `repo`'s odb won't see a pack written behind its back).
     git_dir: PathBuf,
+    /// Canonical working-tree root used by every subprocess Git operation.
+    /// Keeping it here prevents a transport from silently switching repos if
+    /// the process working directory changes after discovery.
+    work_dir: PathBuf,
 }
 
 impl GitTransport {
     /// Discover the working repo from the current directory. `caos-cli` must run
     /// inside a git working tree that has the server as its `caos` remote.
     pub fn from_cwd() -> Result<Self, String> {
-        let repo = gix::discover(".").map_err(|e| {
+        Self::discover(".")
+    }
+
+    /// Discover the working repository containing `path` and bind all future
+    /// local Git commands to that worktree.
+    pub fn discover(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let repo = gix::discover(path).map_err(|e| {
             format!("caos-cli must run inside a git working tree (none found): {e}")
         })?;
         let git_dir = repo.git_dir().to_path_buf();
-        Ok(Self { repo, git_dir })
+        let work_dir = repo
+            .workdir()
+            .ok_or_else(|| {
+                "caos-cli requires a working tree; bare repositories are unsupported".to_string()
+            })?
+            .canonicalize()
+            .map_err(|e| format!("resolving the git working tree: {e}"))?;
+        Ok(Self {
+            repo,
+            git_dir,
+            work_dir,
+        })
+    }
+
+    /// The worktree this transport and its subprocess Git commands operate on.
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+
+    pub(crate) fn git_capture(
+        &self,
+        args: &[&str],
+        index: Option<&Path>,
+    ) -> Result<String, String> {
+        git_capture_in(args, index, &self.work_dir)
     }
 }
 
@@ -370,7 +406,7 @@ impl Transport for GitTransport {
         // lives there unreferenced). Fetch it by bare hash, then read it from a
         // fresh handle: the cached `repo` won't pick up the pack `git fetch` just
         // wrote.
-        fetch_object(hash)?;
+        self.fetch_object(hash)?;
         let repo = gix::open(&self.git_dir)
             .map_err(|e| format!("reopening {}: {e}", self.git_dir.display()))?;
         let object = repo
@@ -385,7 +421,7 @@ impl Transport for GitTransport {
         // negotiation base for the next push, so an edited tree ships only its
         // delta. The push carries the whole object graph reachable from `hash`.
         let refspec = format!("{hash}:refs/caos/req/{hash}");
-        run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
+        self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
             .map_err(|e| format!("pushing {hash} to {CAOS_REMOTE}: {e}"))
     }
 
@@ -405,11 +441,12 @@ impl Transport for GitTransport {
     fn resolve_revspec(&self, rev: &str) -> Result<Option<gix::ObjectId>, String> {
         // `^{commit}` peels annotated tags but *requires* a commit at the end —
         // a revspec naming a tree/blob is an error, never silently accepted.
-        let out = git_capture(
-            &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
-            None,
-        )
-        .map_err(|e| format!("resolving {rev:?} to a commit: {e}"))?;
+        let out = self
+            .git_capture(
+                &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+                None,
+            )
+            .map_err(|e| format!("resolving {rev:?} to a commit: {e}"))?;
         parse_oid(out.trim()).map(Some)
     }
 
@@ -499,7 +536,7 @@ impl GitTransport {
     /// Whether `abs` (inside the worktree) is clean and tracked — `git status`
     /// reports nothing for it (a dirty or untracked path is non-empty).
     fn is_clean(&self, abs: &Path) -> Result<bool, String> {
-        let out = git_capture(
+        let out = self.git_capture(
             &["status", "--porcelain", "--", &abs.to_string_lossy()],
             None,
         )?;
@@ -511,7 +548,7 @@ impl GitTransport {
     /// so an empty result means untracked. Used to reject untracked paths a clean
     /// check can't catch (a path with uncommitted changes is "dirty" either way).
     fn is_tracked(&self, abs: &Path) -> Result<bool, String> {
-        let out = git_capture(&["ls-files", "--", &abs.to_string_lossy()], None)?;
+        let out = self.git_capture(&["ls-files", "--", &abs.to_string_lossy()], None)?;
         Ok(!out.trim().is_empty())
     }
 
@@ -525,11 +562,11 @@ impl GitTransport {
         use gix::objs::tree::EntryKind;
 
         if rel.as_os_str().is_empty() {
-            let out = git_capture(&["rev-parse", "HEAD^{tree}"], None)?;
+            let out = self.git_capture(&["rev-parse", "HEAD^{tree}"], None)?;
             return Ok((EntryKind::Tree.into(), parse_oid(out.trim())?));
         }
 
-        let out = git_capture(&["ls-tree", "HEAD", "--", &abs.to_string_lossy()], None)?;
+        let out = self.git_capture(&["ls-tree", "HEAD", "--", &abs.to_string_lossy()], None)?;
         let line = out
             .lines()
             .next()
@@ -544,7 +581,7 @@ impl GitTransport {
 
     /// Hash a single file into the repo (`git hash-object -w`), returning its oid.
     fn hash_file(&self, abs: &Path) -> Result<gix::ObjectId, String> {
-        let out = git_capture(&["hash-object", "-w", "--", &abs.to_string_lossy()], None)?;
+        let out = self.git_capture(&["hash-object", "-w", "--", &abs.to_string_lossy()], None)?;
         parse_oid(out.trim())
     }
 
@@ -567,12 +604,12 @@ impl GitTransport {
             std::fs::copy(&real_index, &tmp).map_err(|e| format!("copying index: {e}"))?;
         }
         let oid = (|| {
-            git_capture(&["add", "-u", "--", &abs.to_string_lossy()], Some(&tmp))?;
+            self.git_capture(&["add", "-u", "--", &abs.to_string_lossy()], Some(&tmp))?;
             let tree = if rel.as_os_str().is_empty() {
-                git_capture(&["write-tree"], Some(&tmp))?
+                self.git_capture(&["write-tree"], Some(&tmp))?
             } else {
                 let prefix = format!("--prefix={}/", rel.to_string_lossy());
-                git_capture(&["write-tree", &prefix], Some(&tmp))?
+                self.git_capture(&["write-tree", &prefix], Some(&tmp))?
             };
             parse_oid(tree.trim())
         })();
@@ -581,57 +618,64 @@ impl GitTransport {
     }
 }
 
-/// Run `git` (in the current working directory, i.e. the working repo) for the
-/// network steps gix doesn't drive for us (push/fetch over smart-HTTP).
-fn run_git(args: &[&str]) -> Result<(), String> {
-    git_capture(args, None).map(|_| ())
-}
+impl GitTransport {
+    /// Run a network Git command in this transport's bound working tree.
+    fn run_git(&self, args: &[&str]) -> Result<(), String> {
+        self.git_capture(args, None).map(|_| ())
+    }
 
-/// Fetch object `hash` (and its closure) from the `caos` remote into the local
-/// repo.
-///
-/// `fetch.negotiationAlgorithm=noop` makes git send *no* "have" lines, so the
-/// negotiation is a single round. That's deliberate: the server's smart-HTTP
-/// delegate returns an empty body partway through a *multi-round* negotiation —
-/// which a client repo with real history (many refs/commits) triggers — and the
-/// fetch then dies with "the remote end hung up unexpectedly". The client and the
-/// caos server share no history anyway, so suppressing haves costs nothing here.
-fn fetch_object(hash: &str) -> Result<(), String> {
-    run_git(&[
-        "-c",
-        "fetch.negotiationAlgorithm=noop",
-        "fetch",
-        "--quiet",
-        CAOS_REMOTE,
-        hash,
-    ])
-    .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
-}
+    /// Fetch object `hash` (and its closure) from the `caos` remote into the
+    /// local repo.
+    ///
+    /// `fetch.negotiationAlgorithm=noop` makes git send *no* "have" lines, so
+    /// the negotiation is a single round. That's deliberate: the server's
+    /// smart-HTTP delegate returns an empty body partway through a *multi-round*
+    /// negotiation — which a client repo with real history (many refs/commits)
+    /// triggers — and the fetch then dies with "the remote end hung up
+    /// unexpectedly". The client and the caos server share no history anyway,
+    /// so suppressing haves costs nothing here. `--no-write-fetch-head` also
+    /// avoids the one shared worktree file otherwise touched by concurrent
+    /// raw-object fetches; fetched objects still land in the shared object
+    /// database.
+    fn fetch_object(&self, hash: &str) -> Result<(), String> {
+        self.run_git(&[
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            CAOS_REMOTE,
+            hash,
+        ])
+        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+    }
 
-/// Fetch object `hash` like [`fetch_object`], but negotiating with `tip` (a
-/// commit the server is known to hold — e.g. just pushed) as the only
-/// negotiation tip, so the pack carries only what's new *since* `tip` instead
-/// of `hash`'s entire closure.
-///
-/// Why not plain default negotiation: haves would walk every local ref and can
-/// go multi-round, which the smart-HTTP delegate has been seen to break on
-/// (see [`fetch_object`]'s noop rationale). A single tip the server certainly
-/// has is ACKed in the first round, so the negotiation stays single-round *and*
-/// the pack stays minimal — without it, a turn fetch in a repo with real
-/// history re-downloads the whole workspace closure every turn (measured:
-/// ~10s of index-pack CPU per turn on a large repo).
-pub(crate) fn fetch_object_negotiated(hash: &str, tip: &str) -> Result<(), String> {
-    run_git(&[
-        "-c",
-        "fetch.negotiationAlgorithm=default",
-        "fetch",
-        "--quiet",
-        "--negotiation-tip",
-        tip,
-        CAOS_REMOTE,
-        hash,
-    ])
-    .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+    /// Fetch object `hash` like [`Self::fetch_object`], but negotiate with `tip`
+    /// (a commit the server is known to hold — e.g. just pushed) as the only
+    /// negotiation tip, so the pack carries only what's new *since* `tip`
+    /// instead of `hash`'s entire closure.
+    ///
+    /// Why not plain default negotiation: haves would walk every local ref and
+    /// can go multi-round, which the smart-HTTP delegate has been seen to break
+    /// on (see [`Self::fetch_object`]'s noop rationale). A single tip the server
+    /// certainly has is ACKed in the first round, so the negotiation stays
+    /// single-round *and* the pack stays minimal — without it, a turn fetch in
+    /// a repo with real history re-downloads the whole workspace closure every
+    /// turn (measured: ~10s of index-pack CPU per turn on a large repo).
+    pub(crate) fn fetch_object_negotiated(&self, hash: &str, tip: &str) -> Result<(), String> {
+        self.run_git(&[
+            "-c",
+            "fetch.negotiationAlgorithm=default",
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--negotiation-tip",
+            tip,
+            CAOS_REMOTE,
+            hash,
+        ])
+        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
+    }
 }
 
 /// Run `git` in the working repo and return its stdout; error on failure. With
@@ -639,8 +683,12 @@ pub(crate) fn fetch_object_negotiated(hash: &str, tip: &str) -> Result<(), Strin
 /// `write-tree` don't touch the real one). Used for both the network steps and
 /// the path-ingestion plumbing.
 fn git_capture(args: &[&str], index: Option<&Path>) -> Result<String, String> {
+    git_capture_in(args, index, Path::new("."))
+}
+
+fn git_capture_in(args: &[&str], index: Option<&Path>, cwd: &Path) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
-    command.args(args);
+    command.args(args).current_dir(cwd);
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
@@ -1090,7 +1138,7 @@ fn write_placeholder(target: &Path, kind: &str, hash: &str) -> Result<(), String
     })
 }
 
-/// The result kind recorded at `path`: its [`KIND_XATTR`] if present (a promise
+/// The result kind recorded at `path`: its `KIND_XATTR` if present (a promise
 /// placeholder), else implied by shape — a directory is a tree, a file a blob.
 /// What the runner reports for `/cas/out`.
 pub fn result_kind(path: &Path) -> Result<String, String> {
@@ -1823,12 +1871,17 @@ fn run_request(
     t: &dyn Transport,
     image: &str,
     cas: Option<&Path>,
+    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
     let req = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
-    request_compute(&t.server_url()?, &req)
+    let server = t.server_url()?;
+    match trace {
+        Some((id, output)) => request_compute_streamed(&server, &req, id, output),
+        None => request_compute(&server, &req),
+    }
 }
 
 /// Everything in [`run_request`] up to (and including) getting the request onto
@@ -2022,10 +2075,14 @@ pub fn cli_run(
     t: &dyn Transport,
     image: &str,
     output: Option<&str>,
+    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(), String> {
+    if trace.as_ref().is_some_and(|(id, _)| !valid_trace_id(id)) {
+        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
+    }
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, kvs)?;
+    let (kind, result) = run_request(t, &image, None, trace, kvs)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2431,7 +2488,23 @@ fn merge_entries(
 /// replies with the final `"<type> <hash>"`.
 fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
     let url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
-    let body = http_get(&url)?;
+    request_compute_url(&url)
+}
+
+fn request_compute_traced(
+    base: &str,
+    req: &str,
+    trace_id: &str,
+) -> Result<(String, String), String> {
+    let url = format!(
+        "{}/run?req={req}&trace={trace_id}",
+        base.trim_end_matches('/')
+    );
+    request_compute_url(&url)
+}
+
+fn request_compute_url(url: &str) -> Result<(String, String), String> {
+    let body = http_get(url)?;
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
@@ -2444,6 +2517,62 @@ fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
     Ok((kind.to_string(), hash.to_string()))
 }
 
+fn request_compute_streamed(
+    base: &str,
+    req: &str,
+    trace_id: &str,
+    output: &mut (dyn Write + Send),
+) -> Result<(String, String), String> {
+    let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
+    let mut response = minreq::get(&stream_url)
+        .send_lazy()
+        .map_err(|e| format!("GET {stream_url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let status = response.status_code;
+        let reason = response.reason_phrase.clone();
+        let mut body = String::new();
+        let _ = response.read_to_string(&mut body);
+        return Err(format!(
+            "GET {stream_url}: server returned {status} {reason}: {}",
+            body.trim()
+        ));
+    }
+
+    std::thread::scope(|scope| {
+        let trace = scope.spawn(|| -> Result<(), String> {
+            let mut buffer = [0; 8192];
+            loop {
+                let read = response
+                    .read(&mut buffer)
+                    .map_err(|e| format!("reading trace: {e}"))?;
+                if read == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..read])
+                    .and_then(|()| output.flush())
+                    .map_err(|e| format!("writing trace: {e}"))?;
+            }
+            Ok(())
+        });
+        let result = request_compute_traced(base, req, trace_id);
+        let trace_result = trace
+            .join()
+            .map_err(|_| "the trace stream thread panicked".to_string())?;
+        let result = result?;
+        trace_result?;
+        Ok(result)
+    })
+}
+
+fn valid_trace_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),
 /// for diagnostics and usage.
 pub fn prog_name(args: &[String]) -> &str {
@@ -2452,4 +2581,128 @@ pub fn prog_name(args: &[String]) -> &str {
         .and_then(Path::file_name)
         .and_then(OsStr::to_str)
         .unwrap_or("caos")
+}
+
+#[cfg(test)]
+mod git_transport_tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("caos-{label}-{}-{sequence}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        git_capture_in(args, None, cwd).unwrap()
+    }
+
+    fn init_repo(path: &Path) {
+        git(path, &["init", "--quiet", "."]);
+        git(path, &["config", "user.name", "CAOS Test"]);
+        git(path, &["config", "user.email", "caos@example.invalid"]);
+        git(path, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit_file(repo: &Path, name: &str, contents: &str, message: &str) -> String {
+        std::fs::write(repo.join(name), contents).unwrap();
+        git(repo, &["add", name]);
+        git(repo, &["commit", "--quiet", "-m", message]);
+        git(repo, &["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    #[test]
+    fn transport_commands_stay_bound_to_the_discovered_repository() {
+        let root = TestDir::new("bound-repository");
+        let repo = root.path().join("repo");
+        let nested = repo.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&repo);
+        let expected_head = commit_file(&repo, "tracked", "temporary repo\n", "initial");
+
+        let transport = GitTransport::discover(&nested).unwrap();
+
+        assert_eq!(transport.work_dir(), repo.canonicalize().unwrap());
+        assert_eq!(
+            transport
+                .resolve_revspec("HEAD")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            expected_head
+        );
+    }
+
+    #[test]
+    fn concurrent_object_fetches_do_not_touch_fetch_head() {
+        let root = TestDir::new("concurrent-fetch");
+        let remote = root.path().join("remote.git");
+        let source = root.path().join("source");
+        let client = root.path().join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        git(&remote, &["init", "--quiet", "--bare", "."]);
+        init_repo(&source);
+        let base = commit_file(&source, "tracked", "base\n", "base");
+        git(&source, &["branch", "-M", "main"]);
+        let remote_path = remote.to_string_lossy();
+        git(&source, &["remote", "add", "origin", &remote_path]);
+        git(&source, &["push", "--quiet", "origin", "main"]);
+
+        let client_path = client.to_string_lossy();
+        git(
+            root.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--origin",
+                CAOS_REMOTE,
+                "--branch",
+                "main",
+                &remote_path,
+                &client_path,
+            ],
+        );
+        let target = commit_file(&source, "tracked", "updated\n", "updated");
+        git(&source, &["push", "--quiet", "origin", "main"]);
+        let fetch_head = client.join(".git/FETCH_HEAD");
+        let sentinel = b"leave this file alone\n";
+        std::fs::write(&fetch_head, sentinel).unwrap();
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let client = client.clone();
+                let base = base.clone();
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    GitTransport::discover(client)?.fetch_object_negotiated(&target, &base)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert_eq!(std::fs::read(fetch_head).unwrap(), sentinel);
+        git(
+            &client,
+            &["cat-file", "-e", &format!("{target}^{{commit}}")],
+        );
+    }
 }

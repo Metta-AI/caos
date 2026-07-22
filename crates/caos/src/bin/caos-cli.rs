@@ -16,7 +16,9 @@
 //! explicit one-turn form). The object-level commands (`get`/`put`/…) live
 //! only in the worker `caos`, which runs inside a sandbox with a real `/cas`.
 
+use std::io::Write;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use caos::{prog_name, GitTransport};
 
@@ -33,20 +35,70 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
-        // `run <image> [output] -- [--name=value | --name:@=path ...]`. The `--`
-        // separates the fixed arguments from the (possibly empty) list of
-        // key/value args. `<output>`, if given, is any path on the host; the
-        // result is checked out there in full. If it's omitted and the result is
-        // a file, the file's bytes are written to stdout. `<image>` may be
-        // `/cas/std/<name>` to run a builtin from the published library, a
-        // `docker://<ref>`, or a git hash.
-        Some("run") => match &args[2..] {
-            [image, sep, kvs @ ..] if sep == "--" => caos::cli_run(&transport()?, image, None, kvs),
-            [image, output, sep, kvs @ ..] if sep == "--" => {
-                caos::cli_run(&transport()?, image, Some(output), kvs)
+        // `run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [...]`.
+        // The trace id is invocation metadata; everything after `--` is a
+        // computation argument and therefore part of the request hash.
+        Some("run") => {
+            let mut trace_id = None;
+            let mut trace_path = None;
+            let mut index = 2;
+            while let Some(arg) = args.get(index) {
+                if let Some(id) = arg.strip_prefix("--trace-id=") {
+                    if trace_id.replace(id).is_some() {
+                        return Err("--trace-id given twice".to_string());
+                    }
+                } else if arg == "--trace" {
+                    if trace_path.replace("-").is_some() {
+                        return Err("--trace given twice".to_string());
+                    }
+                } else if let Some(path) = arg.strip_prefix("--trace=") {
+                    if trace_path.replace(path).is_some() {
+                        return Err("--trace given twice".to_string());
+                    }
+                } else {
+                    break;
+                }
+                index += 1;
             }
-            _ => Err(usage(args)),
-        },
+            let (image, output, kvs) = match &args[index..] {
+                [image, sep, kvs @ ..] if sep == "--" => (image, None, kvs),
+                [image, output, sep, kvs @ ..] if sep == "--" => {
+                    (image, Some(output.as_str()), kvs)
+                }
+                _ => return Err(usage(args)),
+            };
+            if trace_path == Some("") {
+                return Err("--trace needs a file path or '-' for stdout".to_string());
+            }
+            if trace_id.is_some() && trace_path.is_none() {
+                return Err("--trace-id is only an override for --trace".to_string());
+            }
+            if trace_path == Some("-") && output.is_none() {
+                return Err("stdout tracing requires a computation output path".to_string());
+            }
+            if trace_path.is_some_and(|path| output == Some(path)) {
+                return Err("trace and computation output paths must differ".to_string());
+            }
+            let generated_id = (trace_path.is_some() && trace_id.is_none()).then(fresh_trace_id);
+            let trace_id = trace_id.or(generated_id.as_deref());
+            let mut trace_output: Option<Box<dyn Write + Send>> = match trace_path {
+                Some("-") => Some(Box::new(std::io::stdout())),
+                Some(path) => Some(Box::new(
+                    std::fs::File::create(path)
+                        .map_err(|e| format!("creating trace file {path}: {e}"))?,
+                )),
+                None => None,
+            };
+            let transport = transport()?;
+            let run = |trace| caos::cli_run(&transport, image, output, trace, kvs);
+            match trace_output.as_mut() {
+                Some(writer) => run(Some((
+                    trace_id.expect("trace output always has an id"),
+                    writer.as_mut(),
+                ))),
+                None => run(None),
+            }
+        }
         // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an
         // image, printing a ref to the curried image (run it like any image).
         // Path args are host paths to ingest, or `/cas/std/<name>` builtin refs.
@@ -89,11 +141,19 @@ fn transport() -> Result<GitTransport, String> {
     GitTransport::from_cwd()
 }
 
+fn fresh_trace_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("cli-{}-{now}", std::process::id())
+}
+
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  \
-         {prog} run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
+         {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
