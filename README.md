@@ -35,7 +35,6 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | Crate | Binaries / image | What it is |
 |---|---|---|
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
-| `caos-tui` | `caos-tui` | Full-screen agent client over the same conversation engine: history, live tool/status activity, multiline prompts, and workspace diff review. |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
 | `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
@@ -57,7 +56,6 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
 | `Cargo.toml` | Workspace root (members + shared release profile) |
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
-| `crates/caos-tui/` | Host-native full-screen client for the agent harness |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
 | `Tiltfile`, `build-builtins.sh`, `test-*.sh` | Local dev + integration tests |
@@ -82,7 +80,6 @@ lint/format/test the way CI does with `nix flake check`.
 
 ```bash
 nix build .#caos              # ./result/bin/{caos,caos-cli}
-nix build .#caos-tui          # ./result/bin/caos-tui
 nix build .#server            # ./result/bin/server
 ```
 
@@ -284,12 +281,6 @@ logic — the difference is the **transport** and the privilege model.
   - `import-image` — get a docker image into caos, printing its hash;
   - `talk` / `chat` — agent conversations over the harness
     (design/agent-harness.md); `caos talk "<prompt>"` is the everyday form.
-- **`caos-tui`** is the full-screen presentation of the same host-side
-  conversation engine. It reads the existing `refs/caos/conversations/*`
-  history, sends turns through the same workers, shows status and tool results
-  as they arrive, and reviews the conversation's accumulated workspace diff.
-  It intentionally lives in a separate crate so its terminal dependencies do
-  not enter the worker-side `caos` binary.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are
@@ -298,32 +289,6 @@ fetched, so there is nothing else to configure:
 ```bash
 git remote add caos http://localhost:9090
 ```
-
-Start the full-screen client from that working tree with:
-
-```bash
-caos-tui                     # continue the most recent conversation
-caos-tui --new               # start a fresh conversation
-caos-tui --from 5ec3751      # branch from a completed turn
-```
-
-`Enter` sends, `Alt+Enter` or `Ctrl+J` inserts a newline, `F2` switches between
-chat and the workspace diff, `F3` expands or collapses the live activity strip
-above the prompt, `Ctrl+A` reviews and then applies the conversation patch, and
-`Ctrl+C` exits. `PageUp`/`PageDown` and the mouse wheel scroll by rendered rows,
-including wrapped text. Completed user and agent turns show their branchable
-hashes in the transcript; enter `/from <turn-hash>` to start fresh from one
-without leaving the TUI. Activity entries also show their durable internal step
-hashes for inspection, but those step trees contain harness metadata and are not
-branch points.
-
-The interface presents one active conversation rather than exposing the
-internal `talk-N` ref used to persist it. Agent workspaces remain virtual commit
-trees: opening the TUI never overwrites a working checkout, and applying
-requires a second keypress plus a clean working tree. API responses currently
-arrive one completed LLM round at a time, and the backend does not yet provide
-reliable cancellation for a running turn; both limitations are stated in the UI
-rather than simulated client-side.
 
 ### The CAS and `/cas`
 
