@@ -33,12 +33,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use worker_common::{
-    arg, caos, caos_curry, entries, file_name, link, map_then, own_image, path, read_arg, scratch,
-    Arg,
+    arg, caos, caos_curry, entries, file_name, link, map_then, own_image, path, read_arg,
+    read_arg_opt, scratch, Arg,
 };
 
 use crate::{exit_code, run_cargo, tail, ws_root};
@@ -97,13 +98,39 @@ pub fn all(cmd: &str) -> Result<(), String> {
     }
     caos(["put", path(&members_dir), "/cas/members"])?;
 
-    let map = self_curry(&[
+    let flags = build_flags()?;
+    let mut map_kvs = vec![
         ("mode", Arg::Lit("crate")),
         ("tree", Arg::Path(&tree)),
         ("cmd", Arg::Lit(cmd)),
-    ])?;
-    let then = self_curry(&[("mode", Arg::Lit("combine")), ("cmd", Arg::Lit(cmd))])?;
+    ];
+    map_kvs.extend(flag_extras(&flags));
+    let map = self_curry(&map_kvs)?;
+    let mut then_kvs = vec![("mode", Arg::Lit("combine")), ("cmd", Arg::Lit(cmd))];
+    then_kvs.extend(flag_extras(&flags));
+    let then = self_curry(&then_kvs)?;
     map_then("/cas/members", Some(&map), Some(&then))
+}
+
+/// The optional cross/profile flags (`--target`, `--profile`), threaded
+/// verbatim through every curry the decomposition mints — dep jobs included:
+/// a member's workspace-dep rlibs must be built with the same flags as the
+/// member itself, or cargo rebuilds them flat in the member's job.
+fn build_flags() -> Result<(Option<String>, Option<String>), String> {
+    Ok((read_arg_opt("target")?, read_arg_opt("profile")?))
+}
+
+fn flag_extras<'a>(
+    (target, profile): &'a (Option<String>, Option<String>),
+) -> Vec<(&'static str, Arg<'a>)> {
+    let mut extras = Vec::new();
+    if let Some(t) = target {
+        extras.push(("target", Arg::Lit(t.as_str())));
+    }
+    if let Some(p) = profile {
+        extras.push(("profile", Arg::Lit(p.as_str())));
+    }
+    extras
 }
 
 // ---- mode=crate: prune + recurse ---------------------------------------------
@@ -120,13 +147,16 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
     let member = ws.by_dir(&dir)?;
 
     let pruned = prune(&tree, &ws, member)?;
-    let job = self_curry(&[
+    let flags = build_flags()?;
+    let mut job_kvs = vec![
         ("mode", Arg::Lit("job")),
         ("ws", Arg::Path(&pruned)),
         ("name", Arg::Lit(&member.name)),
         ("dir", Arg::Lit(&member.dir)),
         ("cmd", Arg::Lit(cmd)),
-    ])?;
+    ];
+    job_kvs.extend(flag_extras(&flags));
+    let job = self_curry(&job_kvs)?;
 
     if member.deps.is_empty() {
         // No workspace deps: a plain tail call into the job (no children).
@@ -140,11 +170,13 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
         fs::write(deps_dir.join(name), dep).map_err(|e| format!("writing dep blob: {e}"))?;
     }
     caos(["put", path(&deps_dir), "/cas/deps"])?;
-    let map = self_curry(&[
+    let mut dep_kvs = vec![
         ("mode", Arg::Lit("crate")),
         ("tree", Arg::Path(&tree)),
         ("cmd", Arg::Lit("dep")),
-    ])?;
+    ];
+    dep_kvs.extend(flag_extras(&flags));
+    let map = self_curry(&dep_kvs)?;
     map_then("/cas/deps", Some(&map), Some(&job))
 }
 
@@ -228,7 +260,7 @@ pub fn job(cmd: &str) -> Result<(), String> {
     } else {
         HashSet::new()
     };
-    let runs: Vec<Vec<String>> = match cmd {
+    let mut runs: Vec<Vec<String>> = match cmd {
         "dep" => vec![
             vec!["check".into(), "-p".into(), name.clone()],
             vec!["build".into(), "-p".into(), name.clone()],
@@ -243,6 +275,20 @@ pub fn job(cmd: &str) -> Result<(), String> {
         "test" => vec![vec!["test".into(), "-p".into(), name.clone()]],
         other => return Err(format!("unknown job cmd {other:?}")),
     };
+    // Cross/profile flags apply to every run — dep artifacts included, so a
+    // member's workspace-dep rlibs match its own flags (see build_flags).
+    let (target, profile) = build_flags()?;
+    for argv in &mut runs {
+        if let Some(t) = &target {
+            argv.push("--target".into());
+            argv.push(t.clone());
+        }
+        if let Some(p) = &profile {
+            argv.push("--profile".into());
+            argv.push(p.clone());
+        }
+    }
+    let started = std::time::SystemTime::now();
     let mut last = None;
     for argv in &runs {
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -265,6 +311,20 @@ pub fn job(cmd: &str) -> Result<(), String> {
             link_files(child, &target)?;
         }
         stage_delta(&ws, &before, &target)?;
+    } else if cmd == "build" && exit == 0 {
+        // Stage THIS member's freshly linked executables into `res/bin` —
+        // what combine merges into the result's bin/. Selected by mtime, not
+        // path-delta: the deps bake's dummy pass already occupies the bin's
+        // target path (a path-set difference never sees the relink), but a
+        // binary built in this job has an mtime after the job started, while
+        // baked dummies carry store-epoch times.
+        fs::write(res.join("exit"), format!("{exit}\n"))
+            .map_err(|e| format!("writing exit: {e}"))?;
+        fs::write(res.join("stdout"), tail(&out.stdout))
+            .map_err(|e| format!("writing stdout: {e}"))?;
+        fs::write(res.join("stderr"), tail(&out.stderr))
+            .map_err(|e| format!("writing stderr: {e}"))?;
+        stage_fresh_binaries(&ws, &target, &profile, started, &res)?;
     } else {
         fs::write(res.join("exit"), format!("{exit}\n"))
             .map_err(|e| format!("writing exit: {e}"))?;
@@ -274,6 +334,43 @@ pub fn job(cmd: &str) -> Result<(), String> {
             .map_err(|e| format!("writing stderr: {e}"))?;
     }
     caos(["put", path(&res), "/cas/out"])
+}
+
+/// Stage the executables `cargo build` just linked (mtime >= `started`)
+/// from the profile dir into `res/bin/<name>` — the member-job side of the
+/// flat mode's stage_binaries contract. The mtime filter excludes the deps
+/// bake's dummy binaries, which occupy the same paths with store-epoch
+/// times.
+fn stage_fresh_binaries(
+    ws: &str,
+    target: &Option<String>,
+    profile: &Option<String>,
+    started: std::time::SystemTime,
+    res: &Path,
+) -> Result<(), String> {
+    let mut dir = Path::new(ws).join("target");
+    if let Some(t) = target {
+        dir = dir.join(t);
+    }
+    let profile = profile.as_deref().unwrap_or("dev");
+    dir = dir.join(if profile == "dev" { "debug" } else { profile });
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let bin_dir = res.join("bin");
+    for entry in entries(path(&dir))? {
+        let meta = fs::metadata(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
+        let fresh = meta.modified().map(|m| m >= started).unwrap_or(false);
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 && fresh {
+            if !bin_dir.exists() {
+                fs::create_dir(&bin_dir)
+                    .map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
+            }
+            fs::copy(&entry, bin_dir.join(file_name(&entry)))
+                .map_err(|e| format!("staging {}: {e}", entry.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// A failed dep's result becomes ours, verbatim.
@@ -452,6 +549,28 @@ pub fn combine() -> Result<(), String> {
         .map_err(|e| format!("writing stdout: {e}"))?;
     fs::write(res.join("stderr"), tail(stderr.as_bytes()))
         .map_err(|e| format!("writing stderr: {e}"))?;
+
+    // cmd=build: merge the children's staged binaries (each member job's
+    // res/bin — see stage_fresh_binaries) into the result's bin/<name>, the
+    // flat mode's stage_binaries contract: a decomposed build is a drop-in
+    // replacement for consumers like the suite's build worker.
+    if exit == 0 && read_arg("cmd")? == "build" {
+        let bin_dir = res.join("bin");
+        for child in entries(&children)? {
+            let cbin = child.join("bin");
+            if !cbin.is_dir() {
+                continue;
+            }
+            for f in entries(path(&cbin))? {
+                if !bin_dir.exists() {
+                    fs::create_dir(&bin_dir)
+                        .map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
+                }
+                fs::copy(&f, bin_dir.join(file_name(&f)))
+                    .map_err(|e| format!("staging {}: {e}", f.display()))?;
+            }
+        }
+    }
     caos(["put", path(&res), "/cas/out"])
 }
 

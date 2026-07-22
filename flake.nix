@@ -958,6 +958,12 @@
               pull_policy: never
               networks: [caos-net]
               ports: ["9090:80"]
+              environment:
+                # A fully cold suite (decomposed build members + image jobs +
+                # per-test jobs) legitimately queues jobs behind the pool for
+                # minutes; the claim timeout must mean "no runner exists",
+                # not "runners are busy".
+                CAOS_PENDING_TIMEOUT_SECS: "900"
               volumes:
                 - "''${CAOS_DATA:?set CAOS_DATA to an absolute data dir}/server-repo.git:/git"
               depends_on: [caos-redis, caos-registry]

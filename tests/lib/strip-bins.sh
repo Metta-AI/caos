@@ -12,5 +12,9 @@ if [ "$(cat /cas/args/result/exit)" != 0 ]; then
   echo "BUILD: workspace build failed" >&2
   exit 1
 fi
+if [ ! -e /cas/args/result/bin ]; then
+  echo "BUILD: build succeeded but staged no bin tree" >&2
+  exit 1
+fi
 ln -s /cas/args/result/bin /tmp/binlink
 caos put /tmp/binlink /cas/out

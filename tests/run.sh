@@ -83,14 +83,13 @@ extra=()
 [ "${#ONLY[@]}" -gt 0 ] && extra+=(--only="${ONLY[*]}")
 
 echo "== firing the suite job ==" >&2
-# The suite's interface is a tool's interface: the workspace tree, a target
-# triple, and the optional extras. Every downstream script comes from the
-# workspace itself (tests/lib/*) — the suite tests exactly the harness the
+# The suite's interface is a tool's interface: the workspace tree and the
+# optional extras. Every downstream script comes from the workspace itself
+# (caos-tools/*, tests/lib/*) — the suite tests exactly the harness the
 # tree carries. (--script names the same suite.sh; the two move together.)
 suite_hash=$(CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
   --script:@=tests/lib/suite.sh \
   --workspace:@=. \
-  --target="$(uname -m)-unknown-linux-musl" \
   "${extra[@]}") \
   || { echo "suite job failed" >&2; exit 1; }
 

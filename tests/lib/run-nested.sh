@@ -75,7 +75,7 @@ redis-cli -p 6390 ping >/dev/null 2>&1 || fail "inner redis never came up"
 
 mkdir -p /tmp/inner-git
 CAOS_GIT_DIR=/tmp/inner-git CAOS_IMAGE_RESOLVE=none \
-  CAOS_REDIS_ADDR=127.0.0.1:6390 \
+  CAOS_REDIS_ADDR=127.0.0.1:6390 CAOS_PENDING_TIMEOUT_SECS=900 \
   /pt/server >/tmp/server.log 2>&1 &
 ok=""
 for _ in $(seq 1 30); do
