@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
-# Generic per-test runner, INSIDE a testenv worker, as ROOT. Stands up a nested
-# caos stack built from the tree under test, publishes an inner std, then runs
-# the REAL cli.sh of the test tree at /cas/args/test against it — exactly as
-# tests/run.sh does on the host, but as a caos job. Keyed by the outer run on
+# Generic per-test runner, INSIDE a testenv worker, as ROOT — the suite's
+# map image (suite-stage2.sh curries it over the shared inputs; each map
+# child arrives as --in). Stands up a nested caos stack built from the tree
+# under test, publishes an inner std, then runs the REAL cli.sh of the test
+# at /cas/args/in — a plain test tree, or a wrapper {test, ...} carrying
+# per-test extras (cargo-self's workspace, chat-online's api_key). Keyed on
 # (this script, the test tree, the binaries, the image refs), so one such job
-# per test caches independently: an unchanged test is an instant hit and never
-# starts a stack at all.
+# per test caches independently: an unchanged test is an instant hit and
+# never starts a stack at all.
+#
+# The test's OUTCOME is a value, not a job error: the verdict blob at
+# /cas/out says "RUN-TEST: PASS" or "RUN-TEST: FAIL" (with the cli.sh output
+# tail), so one failing test never hides the others' results — and a failure
+# caches like any result (same inputs, same failure; salt to retry a flake).
+# Infrastructure failures (the inner stack not coming up) still error the
+# job, loudly and uncached.
 #
 # The inner stack is SOCKET-ONLY (design/cargo-workers.md, phase 4): the inner
 # runnerd delegates every worker to the OUTER engine via the granted socket, as
@@ -38,7 +47,11 @@ unset CAOS_STD CAOS_SALT
 
 caos get -r /cas/args/bins
 mkdir -p /pt && cp /cas/args/bins/* /pt/ && chmod +x /pt/*
-caos get -r /cas/args/test
+# The map child: a plain test tree, or a wrapper {test, workspace?, api_key?}.
+caos get /cas/args/in
+TEST=/cas/args/in
+[ -e /cas/args/in/test ] && TEST=/cas/args/in/test
+caos get -r "$TEST"
 caos get -r /cas/args/worker_common
 caos get /cas/args/runner_image
 caos get /cas/args/bash_image
@@ -111,11 +124,11 @@ add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-rustc" \
 stdtree=$(printf '%s' "$entries" | git mktree)
 git push -q --force caos "$stdtree:refs/caos/std" || fail "publishing inner std"
 
-# Tests that dogfood the workspace (cargo-self) get it as an input tree; stage
-# it as the git repo their cli.sh snapshots via $CAOS_PROJECT.
-if [ -e /cas/args/workspace ]; then
-  caos get -r /cas/args/workspace
-  mkdir -p /tmp/ws && cp -r /cas/args/workspace/. /tmp/ws/
+# Tests that dogfood the workspace (cargo-self) get it in their wrapper;
+# stage it as the git repo their cli.sh snapshots via $CAOS_PROJECT.
+if [ -e /cas/args/in/workspace ]; then
+  caos get -r /cas/args/in/workspace
+  mkdir -p /tmp/ws && cp -r /cas/args/in/workspace/. /tmp/ws/
   git -C /tmp/ws init -q
   git -C /tmp/ws add -A
   git -C /tmp/ws -c user.email=test@caos -c user.name=caos commit -qm workspace
@@ -129,20 +142,23 @@ fi
 # worker's netns, so localhost is the stub's address, not the engine host.
 export CAOS_BIN_DIR=/pt
 export CAOS_STUB_HOST=127.0.0.1
-# A real-API test's key arrives as an arg (chat-online; absent = its cli.sh
-# self-skips). Siblings share this worker's netns, so they have its egress.
-if [ -e /cas/args/api_key ]; then
-  caos get /cas/args/api_key
-  ANTHROPIC_API_KEY=$(cat /cas/args/api_key)
+# A real-API test's key arrives in its wrapper (chat-online; absent = its
+# cli.sh self-skips). Siblings share this worker's netns: they have its
+# egress, and in-job stubs are at 127.0.0.1.
+if [ -e /cas/args/in/api_key ]; then
+  caos get /cas/args/in/api_key
+  ANTHROPIC_API_KEY=$(cat /cas/args/in/api_key)
   export ANTHROPIC_API_KEY
 fi
-cp -r /cas/args/test ./test
+cp -r "$TEST" ./test
 git add -A && git commit -qm testtree
-if ! CAOS_CLI=/pt/caos-cli CAOS_SERVER_URL=$INNER bash test/cli.sh >/tmp/test.out 2>&1; then
-  cat /tmp/test.out >&2
-  fail "cli.sh failed"
+if CAOS_CLI=/pt/caos-cli CAOS_SERVER_URL=$INNER bash test/cli.sh >/tmp/test.out 2>&1; then
+  echo "RUN-TEST: PASS" > /tmp/verdict
+else
+  {
+    echo "RUN-TEST: FAIL"
+    tail -60 /tmp/test.out
+  } > /tmp/verdict
 fi
 cat /tmp/test.out >&2
-
-echo "RUN-TEST: PASS" > /tmp/verdict
 caos put /tmp/verdict /cas/out

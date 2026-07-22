@@ -349,9 +349,33 @@ are gone. The cargo image grew a second deps bake — (musl, release), what
 the bins build uses — plus a musl cross-cc (`pkgsCross`) with matching
 `CC_<target>` env at bake- and run-time: rustc links musl self-contained,
 but C-carrying deps (ring, via rustls) need a real musl cc, and the small
-rustc-built workers never hit that because their dep set has no C. Warm
-full suite: **20s**, bins job + all 16 test jobs cross-run cache hits; the
-rest is flake evals (phase D) and 16 serial hit-checks (phase C).
+rustc-built workers never hit that because their dep set has no C.
+
+**Phase C landed (2026-07-21): the suite IS a worker.** `tests/lib/suite.sh`
+(a bash job keyed on everything — workspace, harness scripts, image IDs,
+key; a full-suite hit means literally nothing changed, salt to force):
+run-then the workspace build → `suite-stage2.sh` selects the tests/<name>
+dirs with a cli.sh, curries run-nested.sh as the map image over the shared
+content-stable inputs (the bin tree — never the volatile cargo result —
+image IDs, worker-common), and map-thens over them → `suite-summarize.sh`
+assembles the report. No worker slot is held between stages (continuations
+all the way down), and test parallelism is slot-bounded by the pool for
+free — cargo-self passes under that concurrency.
+
+Two shapes worth keeping: **per-test extras ride in that test's map child**
+as a wrapper tree ({test, workspace} for cargo-self, {test, api_key} for
+chat-online), built with symlinks + `caos put` (recorded-hash reuse — no
+bytes move), so nobody else re-keys on them. And **test outcomes are
+values**: run-nested puts a PASS/FAIL verdict (failures carry the cli.sh
+output tail) and the suite always reports — one broken test never hides the
+others. Failed verdicts cache like any result (same inputs, same failure);
+salt is the retry lever for flakes. Infrastructure failures still error,
+loudly and uncached. run-all.sh is now just the host front door: stack up,
+load images, fire the one job, print the report — an in-caos agent fires
+the identical job. The `--bins:tree=`/printed-hash bridges from phase B
+dropped out of the flow same-day, as predicted: run-then threads the build
+result as a CAS path. Warm full suite: **5s** (one suite-level hit; the
+rest is flake evals — phase D's target).
 
 There's a pleasing recursive check here: the inner stack running the suite
 is caos-under-caos, so "does the edited caos still run workers correctly" is

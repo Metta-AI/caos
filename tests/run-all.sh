@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# The caos test runner. EVERY test runs as a caos JOB: each tests/<name> is a
-# nested-stack job (tests/lib/run-nested.sh) keyed on (runner script, test
-# tree, binaries under test, image IDs) — cached, so an unchanged test is an
-# instant hit and editing one test's fixtures re-runs only its job. A new
-# tests/<name>/cli.sh is picked up automatically; there is no host-driven
-# batch (tests/run.sh remains for running one test against the outer stack
-# by hand).
+# The caos test runner: bring the stack up, fire THE SUITE JOB, print its
+# report. The suite itself is a caos worker (tests/lib/suite.sh): it run-thens
+# the workspace build (std/cargo — the old, known-good caos building the
+# edited tree), fans out one job per tests/<name>/cli.sh (map-then, so
+# parallelism is slot-bounded by the runner pool), and summarizes. Every
+# level is cached: an unchanged test never re-runs, and an unchanged EVERYTHING
+# is one suite-level cache hit. An agent inside caos fires the identical job —
+# this script is just the host's front door.
 #
-# The binaries under test are built BY caos (phase B): one std/cargo build
-# job on the outer stack whose result is just the bin tree, threaded to every
-# test job as `--bins:tree=<hash>`. The suite runs FROM this repo — inputs
-# are ingested straight from the tracked worktree (dirty tracked edits
-# included: the tests see the tree as you edited it), and job outputs land
-# under .caos-dev. Host nix remains only for the CLI, the stack itself, and
-# the worker images (the flake-build worker, phase D, folds those too).
+# Jobs run unsalted by default so caching works across runs; export CAOS_SALT
+# to force a re-run (e.g. to retry a flaky failure — failed verdicts are
+# values and cache like results).
+#
+# Host nix remains only for the CLI, the stack itself, and the worker images
+# (the flake-build worker, phase D, folds those too). tests/run.sh remains for
+# running one test against the outer stack by hand.
 #
 # Usage: tests/run-all.sh          Exits non-zero if any test fails.
 set -uo pipefail
@@ -35,8 +36,6 @@ git remote get-url caos >/dev/null 2>&1 || {
 }
 OUT=$PWD/.caos-dev/run-all
 rm -rf "$OUT" && mkdir -p "$OUT"
-
-pass=(); fail=()
 
 # ---------------------------------------------------------------------------
 # The sibling worker images (phase-D fodder: these become caos jobs).
@@ -80,49 +79,30 @@ BASH_REF=$(img_id localhost/caos-worker-bash:latest) || exit 1
 CARGO_REF=$(img_id localhost/caos-worker-cargo-base:latest) || exit 1
 
 # ---------------------------------------------------------------------------
-# The binaries under test, built by caos: a bash job that run-thens std/cargo
-# over the workspace and strips the result to the bin tree (see
-# tests/lib/build-bins.sh for why the strip matters). Unsalted: same tree,
-# same binaries, cache hit.
+# The suite job.
 # ---------------------------------------------------------------------------
-echo "== building the workspace binaries in caos (std/cargo) ==" >&2
-bins_line=$(CAOS_SALT= "$CAOS_CLI" run /cas/std/bash "$OUT/bins" -- \
-  --script:@=tests/lib/build-bins.sh --strip:@=tests/lib/strip-bins.sh \
-  --target="$(uname -m)-unknown-linux-musl" --workspace:@=.) \
-  || { echo "workspace build failed" >&2; exit 1; }
-BINS_HASH=${bins_line#tree }
-echo "  bins: $BINS_HASH" >&2
+extra=()
+# The real API key rides as an ordinary arg; stage 2 places it in
+# chat-online's map child alone, so only that test re-keys when it rotates.
+[ -n "${ANTHROPIC_API_KEY:-}" ] && extra+=(--api_key="$ANTHROPIC_API_KEY")
 
-# ---------------------------------------------------------------------------
-# One job per test. Unsalted: isolation is inherent (each stands up its own
-# hermetic stack), and an unchanged test must be a cache hit across runs.
-# ---------------------------------------------------------------------------
-nested() { # <name>
-  local extra=()
-  [ "$1" = cargo-self ] && extra+=(--workspace:@=.)
-  # The real API key rides as an ordinary arg (it already rides through
-  # request args in `caos chat` itself): same key, same cache key — the test
-  # re-runs only when the code or the key changes. Without a key the job runs
-  # (and caches) the test's own skip path.
-  [ "$1" = chat-online ] && [ -n "${ANTHROPIC_API_KEY:-}" ] \
-    && extra+=(--api_key="$ANTHROPIC_API_KEY")
-  echo "=== tests/$1 ===" >&2
-  if CAOS_SALT= "$CAOS_CLI" run /cas/std/testenv "$OUT/out-$1" \
-       -- --script:@=tests/lib/run-nested.sh --test:@="tests/$1" \
-          --bins:tree="$BINS_HASH" \
-          --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
-          --cargo_image="$CARGO_REF" --worker_common:@=crates/worker-common \
-          "${extra[@]}" >/dev/null \
-     && grep -q "RUN-TEST: PASS" "$OUT/out-$1"; then
-    pass+=("tests/$1"); else fail+=("tests/$1"); fi
-}
-for d in tests/*/; do
-  t=$(basename "${d%/}")
-  [ -f "$d/cli.sh" ] && nested "$t"
-done
+echo "== firing the suite job ==" >&2
+CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
+  --script:@=tests/lib/suite.sh \
+  --stage2:@=tests/lib/suite-stage2.sh \
+  --summarize:@=tests/lib/suite-summarize.sh \
+  --run_nested:@=tests/lib/run-nested.sh \
+  --workspace:@=. \
+  --target="$(uname -m)-unknown-linux-musl" \
+  --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
+  --cargo_image="$CARGO_REF" "${extra[@]}" >/dev/null \
+  || { echo "suite job failed" >&2; exit 1; }
 
 echo >&2
-echo "==== ${#pass[@]}/$(( ${#pass[@]} + ${#fail[@]} )) passed ====" >&2
-for t in "${pass[@]}"; do echo "  PASS $t" >&2; done
-for t in "${fail[@]}"; do echo "  FAIL $t" >&2; done
-[ "${#fail[@]}" -eq 0 ]
+cat "$OUT/suite/report" >&2
+# A failing test's verdict carries its cli.sh output tail — show it.
+for v in "$OUT"/suite/verdicts/*; do
+  grep -q "^RUN-TEST: PASS" "$v" && continue
+  { echo; echo "---- tests/$(basename "$v") ----"; sed 1d "$v"; } >&2
+done
+grep -q "^SUITE OK" "$OUT/suite/report"
