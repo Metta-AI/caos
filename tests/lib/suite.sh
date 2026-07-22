@@ -1,13 +1,18 @@
 #!/bin/bash
 # THE test suite, as a caos worker (phase C — design/cargo-workers.md). Runs
 # in a bash worker on the outer stack, keyed on everything it takes in: the
-# workspace tree, the harness scripts, the image IDs, the API key. A full-
-# suite cache hit therefore means literally nothing changed; salt to force.
+# workspace tree, the harness scripts, the cargo image ID, the API key. A
+# full-suite cache hit therefore means literally nothing changed; salt to
+# force.
 #
-# Stage 1 (this script): run-then the workspace build — std/cargo, the old
-# known-good caos building the edited tree — into stage 2, which fans out
-# one job per test (map-then) and summarizes. The chain holds no worker slot
-# between stages: every step is a continuation the server resolves.
+# The chain, no worker slot held between stages (continuations all the way):
+#   1. (this script) run-then the workspace build — std/cargo, the old
+#      known-good caos building the edited tree — into stage 2;
+#   2. stage 2: fan out the IMAGE-BUILD jobs (runner + bash worker images
+#      from the stock debian base + the caos-built binaries, pushed to the
+#      caos registry — phase D1);
+#   3. stage 3: fan out one job per tests/<name>/cli.sh;
+#   4. summarize: the report + every test's complete record.
 set -euo pipefail
 
 # The build's input is a PRUNED tree — just what cargo reads — so editing a
@@ -26,12 +31,11 @@ cargo=$(caos curry /cas/std/cargo -- --cmd=build \
 fwd=(
   "--build_ws:@=/cas/build-ws"
   "--workspace:@=/cas/args/workspace"
-  "--stage2:@=/cas/args/stage2"
+  "--stage3:@=/cas/args/stage3"
+  "--images_script:@=/cas/args/images_script"
   "--summarize:@=/cas/args/summarize"
   "--run_nested:@=/cas/args/run_nested"
-  "--target:@=/cas/args/target"
-  "--runner_image:@=/cas/args/runner_image"
-  "--bash_image:@=/cas/args/bash_image"
+  "--bash_worker:@=/cas/args/bash_worker"
   "--cargo_image:@=/cas/args/cargo_image"
 )
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")

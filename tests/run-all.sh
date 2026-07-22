@@ -57,31 +57,15 @@ OUT=$PWD/.caos-dev/run-all
 rm -rf "$OUT" && mkdir -p "$OUT"
 
 # ---------------------------------------------------------------------------
-# The sibling worker images (phase-D fodder: these become caos jobs).
+# The cargo toolchain base image — the ONE image still produced host-side
+# (phase D2 folds it into a nix-capable builder job): it embodies the pinned
+# toolchain + baked deps, changes only on toolchain/lockfile bumps, and needs
+# nix to build. The runner and bash worker images are built IN the suite
+# (phase D1): stage 2 assembles them from the stock debian base + the freshly
+# caos-built binaries and pushes them to the caos registry.
 # ---------------------------------------------------------------------------
-# The flake's own runner + bash images, loaded into the outer engine store and
-# referenced by image ID — a content address, so it keys the jobs honestly (a
-# `:latest` tag in a cache key would lie). The runner ships as a bare delta
-# meant to be stacked on the stock debian base at registry-convert time; the
-# production stack does that in the server's convert path, and here we
-# reproduce it with a two-line build (the chmod re-asserts setuid, which COPY
-# does not reliably carry).
-nix run .#load-caos-worker-runner >&2 || exit 1
-nix run .#load-caos-worker-bash >&2 || exit 1
-stacked_runner_build_ctx=$(mktemp -d)
-cat > "$stacked_runner_build_ctx/Containerfile" <<'EOF'
-FROM docker.io/library/debian:stable-slim
-COPY --from=localhost/caos-worker-runner:latest / /
-RUN chmod 4755 /usr/bin/caos
-ENTRYPOINT ["/bin/caos","runner"]
-EOF
-docker build -t localhost/caos-test-runner:latest "$stacked_runner_build_ctx" \
-  >/tmp/run-all-imgbuild.log 2>&1 \
-  || { tail -20 /tmp/run-all-imgbuild.log >&2
-       echo "stacked runner image build failed" >&2; exit 1; }
-rm -rf "$stacked_runner_build_ctx"
-# The cargo toolchain base image: big and slow to `docker load`, so skip the
-# load when the built tarball (its nix store path) is already the one loaded.
+# Big and slow to `docker load`, so skip the load when the built tarball (its
+# nix store path) is already the one loaded.
 nix build .#caos-worker-cargo-base-docker -o /tmp/run-all-cargo-img || exit 1
 cargo_img=$(readlink -f /tmp/run-all-cargo-img)
 marker=$PWD/.caos-dev/cargo-img-loaded
@@ -93,8 +77,6 @@ if [ "$(cat "$marker" 2>/dev/null)" != "$cargo_img" ] \
 fi
 
 img_id() { docker inspect --format '{{.Id}}' "$1" | sed 's/^sha256://'; }
-RUNNER_REF=$(img_id localhost/caos-test-runner:latest) || exit 1
-BASH_REF=$(img_id localhost/caos-worker-bash:latest) || exit 1
 CARGO_REF=$(img_id localhost/caos-worker-cargo-base:latest) || exit 1
 
 # ---------------------------------------------------------------------------
@@ -110,11 +92,13 @@ echo "== firing the suite job ==" >&2
 suite_hash=$(CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
   --script:@=tests/lib/suite.sh \
   --stage2:@=tests/lib/suite-stage2.sh \
+  --stage3:@=tests/lib/suite-stage3.sh \
+  --images_script:@=tests/lib/suite-images.sh \
   --summarize:@=tests/lib/suite-summarize.sh \
   --run_nested:@=tests/lib/run-nested.sh \
+  --bash_worker:@=images/bash-worker.sh \
   --workspace:@=. \
   --target="$(uname -m)-unknown-linux-musl" \
-  --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
   --cargo_image="$CARGO_REF" "${extra[@]}") \
   || { echo "suite job failed" >&2; exit 1; }
 

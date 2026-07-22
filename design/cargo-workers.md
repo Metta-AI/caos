@@ -362,6 +362,26 @@ assembles the report. No worker slot is held between stages (continuations
 all the way down), and test parallelism is slot-bounded by the pool for
 free — cargo-self passes under that concurrency.
 
+**Phase D1 landed (2026-07-21): the runner + bash worker images are built IN
+the suite.** Stage 2 fans out image-build jobs (`suite-images.sh`, a testenv
+worker): each assembles its image from the stock debian base + the freshly
+caos-built binaries — `docker build` THROUGH the granted socket, so the
+outer engine does the build with no nesting — pushes it to the caos
+REGISTRY (the content-addressed store image bytes belong in; an engine
+store is a prunable cache), and returns the digest ref, which flows through
+the inner server's `docker://` passthrough and any engine can pull. The
+image jobs key on (builder script, base ref, file contents): unchanged
+binaries are an instant hit, no build. These are the first worker images
+whose caos binary is itself caos-built. The bash `/worker` entrypoint moved
+to `images/bash-worker.sh` (tracked git data; the flake `readFile`s the
+same file — one source of truth). run-all no longer runs `load-*` or the
+stacked-runner build; the ONE host-produced image left is the cargo
+toolchain base (pinned toolchain + baked deps — genuinely needs nix; phase
+D2 gives it a nix-capable builder job). Gotcha: the slimmed moby client has
+no buildx and its legacy builder wants `Dockerfile`, not `Containerfile`.
+Base ref is still the mutable `debian:stable-slim` tag (as before D1);
+pinning it by digest is an easy follow-up. Warm suite: **1s**.
+
 Two shapes worth keeping: **per-test extras ride in that test's map child**
 as a wrapper tree ({test, workspace} for cargo-self, {test, api_key} for
 chat-online), built with symlinks + `caos put` (recorded-hash reuse — no

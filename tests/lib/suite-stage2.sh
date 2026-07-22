@@ -1,12 +1,13 @@
 #!/bin/bash
-# Suite stage 2 (the `then` of the workspace build): select the test dirs,
-# curry the per-test image, map-then over the tests, summarize.
+# Suite stage 2 (the `then` of the workspace build): check the build, then
+# fan out the IMAGE-BUILD jobs (phase D1) — the runner and bash worker
+# images, assembled from the stock debian base + the freshly caos-built
+# binaries by suite-images.sh, pushed to the caos registry, returned as
+# digest refs. Stage 3 takes those refs and fans out the tests.
 #
-# The per-test jobs key on the CONTENT-STABLE inputs only — the bin tree
-# (never the whole cargo result: its stderr carries volatile timings), the
-# test's own tree, the harness script, the image IDs. Inputs that only one
-# test needs ride in that test's map child as a wrapper tree — cargo-self's
-# workspace, chat-online's API key — so nobody else re-keys on them.
+# The specs are built with symlinks + `caos put` (recorded-hash reuse), so
+# an image job's key is exactly (builder script, base ref, file contents):
+# unchanged binaries mean an instant hit and no build.
 set -euo pipefail
 
 caos get /cas/args/result
@@ -17,58 +18,30 @@ if [ "$(cat /cas/args/result/exit)" != 0 ]; then
   echo "SUITE: workspace build failed" >&2
   exit 1
 fi
+caos get /cas/args/result/bin
 
-# The test selection: every tests/<name> with a cli.sh — or just the names
-# in --only (a filtered suite; its per-test jobs share their cache with full
-# runs). Symlinks into the args materialize nothing — `caos put` resolves
-# them to recorded hashes.
-only=""
-if [ -e /cas/args/only ]; then
-  caos get /cas/args/only
-  only=" $(cat /cas/args/only) "
-fi
-caos get /cas/args/workspace
-caos get /cas/args/workspace/tests
-mkdir /tmp/sel
-for d in /cas/args/workspace/tests/*/; do
-  t=$(basename "$d")
-  if [ -n "$only" ]; then
-    case "$only" in *" $t "*) ;; *) continue ;; esac
-  fi
-  caos get "/cas/args/workspace/tests/$t"
-  [ -e "/cas/args/workspace/tests/$t/cli.sh" ] || continue
-  case "$t" in
-    cargo-self)
-      # Dogfoods the tree under test — the PRUNED build tree (what cargo
-      # reads), so only Rust-relevant edits re-key cargo-self, exactly like
-      # the build itself.
-      mkdir /tmp/sel/cargo-self
-      ln -s "/cas/args/workspace/tests/$t" /tmp/sel/cargo-self/test
-      ln -s /cas/args/build_ws /tmp/sel/cargo-self/workspace
-      ;;
-    chat-online)
-      mkdir /tmp/sel/chat-online
-      ln -s "/cas/args/workspace/tests/$t" /tmp/sel/chat-online/test
-      # The real-API key, when the suite was given one: same key, same cache
-      # key — only this test re-keys when it rotates. Without one the test's
-      # cli.sh self-skips.
-      if [ -e /cas/args/api_key ]; then
-        caos get /cas/args/api_key
-        cp /cas/args/api_key /tmp/sel/chat-online/api_key
-      fi
-      ;;
-    *) ln -s "/cas/args/workspace/tests/$t" "/tmp/sel/$t" ;;
-  esac
-done
-caos put /tmp/sel /cas/sel
+BASE=docker.io/library/debian:stable-slim
+spec() { # <name> <worker source path>
+  mkdir -p "/tmp/imgs/$1/files/usr/bin"
+  printf '%s' "$BASE" > "/tmp/imgs/$1/base"
+  ln -s /cas/args/result/bin/caos "/tmp/imgs/$1/files/usr/bin/caos"
+  ln -s "$2" "/tmp/imgs/$1/files/worker"
+}
+spec runner /cas/args/result/bin/worker-runner
+spec bash /cas/args/bash_worker
+caos put /tmp/imgs /cas/imgs
 
-caos get /cas/args/workspace/crates
-map=$(caos curry /cas/std/testenv -- \
-  "--script:@=/cas/args/run_nested" \
-  "--bins:@=/cas/args/result/bin" \
-  "--worker_common:@=/cas/args/workspace/crates/worker-common" \
-  "--runner_image:@=/cas/args/runner_image" \
-  "--bash_image:@=/cas/args/bash_image" \
-  "--cargo_image:@=/cas/args/cargo_image")
-then_img=$(caos curry /cas/std/bash -- "--script:@=/cas/args/summarize")
-caos map-then /cas/sel -- --map="$map" --then="$then_img"
+fwd=(
+  "--build:@=/cas/args/result"
+  "--build_ws:@=/cas/args/build_ws"
+  "--workspace:@=/cas/args/workspace"
+  "--run_nested:@=/cas/args/run_nested"
+  "--summarize:@=/cas/args/summarize"
+  "--cargo_image:@=/cas/args/cargo_image"
+)
+[ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
+[ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
+
+imgmap=$(caos curry /cas/std/testenv -- "--script:@=/cas/args/images_script")
+stage3=$(caos curry /cas/std/bash -- "--script:@=/cas/args/stage3" "${fwd[@]}")
+caos map-then /cas/imgs -- --map="$imgmap" --then="$stage3"
