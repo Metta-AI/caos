@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Run a caos integration test that lives in a directory.
+# Run ONE test's cli.sh on the host, directly against the outer stack — the
+# interactive-debugging path: live output, no nesting, re-runs every time
+# (salted). The CANONICAL way to run tests is tests/run-all.sh [name...],
+# which runs them as cached caos jobs (the suite worker); this script is for
+# developing a test, poking at a failure, or working without the suite.
 #
 # All boilerplate lives here: bring the stack up (`caosd up`, which also
 # publishes std), build the CLI, and set up a throwaway client repo with the

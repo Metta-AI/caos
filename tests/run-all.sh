@@ -16,9 +16,17 @@
 # (the flake-build worker, phase D, folds those too). tests/run.sh remains for
 # running one test against the outer stack by hand.
 #
-# Usage: tests/run-all.sh          Exits non-zero if any test fails.
+# Usage: tests/run-all.sh [name...]   Exits non-zero if any test fails.
+# With names, the suite job runs just those tests (a filtered suite caches
+# separately, but its per-test jobs share their cache with full runs — so
+# `run-all.sh symlinks` after a full run is all hits, and vice versa).
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+ONLY=("$@")
+for t in "${ONLY[@]}"; do
+  [ -f "tests/$t/cli.sh" ] || { echo "no such test: tests/$t/cli.sh" >&2; exit 2; }
+done
 
 echo "building caos client + bringing the stack up (once for the suite)..." >&2
 nix build .#caos-cli -o result-caos || exit 1
@@ -85,6 +93,7 @@ extra=()
 # The real API key rides as an ordinary arg; stage 2 places it in
 # chat-online's map child alone, so only that test re-keys when it rotates.
 [ -n "${ANTHROPIC_API_KEY:-}" ] && extra+=(--api_key="$ANTHROPIC_API_KEY")
+[ "${#ONLY[@]}" -gt 0 ] && extra+=(--only="${ONLY[*]}")
 
 echo "== firing the suite job ==" >&2
 CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \

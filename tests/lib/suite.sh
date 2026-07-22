@@ -35,6 +35,7 @@ fwd=(
   "--cargo_image:@=/cas/args/cargo_image"
 )
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
+[ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
 
 stage2=$(caos curry /cas/std/bash -- "--script:@=/cas/args/stage2" "${fwd[@]}")
 caos run-then /cas/build-ws -- --run="$cargo" --then="$stage2"

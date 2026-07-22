@@ -18,13 +18,23 @@ if [ "$(cat /cas/args/result/exit)" != 0 ]; then
   exit 1
 fi
 
-# The test selection: every tests/<name> with a cli.sh. Symlinks into the
-# args materialize nothing — `caos put` resolves them to recorded hashes.
+# The test selection: every tests/<name> with a cli.sh — or just the names
+# in --only (a filtered suite; its per-test jobs share their cache with full
+# runs). Symlinks into the args materialize nothing — `caos put` resolves
+# them to recorded hashes.
+only=""
+if [ -e /cas/args/only ]; then
+  caos get /cas/args/only
+  only=" $(cat /cas/args/only) "
+fi
 caos get /cas/args/workspace
 caos get /cas/args/workspace/tests
 mkdir /tmp/sel
 for d in /cas/args/workspace/tests/*/; do
   t=$(basename "$d")
+  if [ -n "$only" ]; then
+    case "$only" in *" $t "*) ;; *) continue ;; esac
+  fi
   caos get "/cas/args/workspace/tests/$t"
   [ -e "/cas/args/workspace/tests/$t/cli.sh" ] || continue
   case "$t" in

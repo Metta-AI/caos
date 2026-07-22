@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Runs on the HOST (launched by tests/run.sh), cwd'd into a throwaway client
-# repo with the test directory committed at ./test and $CAOS_CLI set.
+# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
+# set — normally INSIDE a testenv worker, as the suite's per-test job
+# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
+# outer stack for interactive debugging.
 #
 # End-to-end agent-harness test (design/agent-harness.md) with NO real API
 # calls: a scripted stub (llm-stub, on this host) plays the LLM, and llm-step's

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Runs on the HOST (launched by tests/run.sh), cwd'd into a throwaway client
-# repo with the caos remote set and $CAOS_CLI pointing at the CLI.
+# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
+# set — normally INSIDE a testenv worker, as the suite's per-test job
+# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
+# outer stack for interactive debugging.
 #
 # One REAL turn against the live Anthropic API — the one check the stub suites
 # structurally can't make: only the live API rejects a bad model choice (e.g.
