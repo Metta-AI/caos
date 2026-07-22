@@ -241,8 +241,9 @@ conversation content). Same best-effort contract as the progress ref.
 
 ## Client
 
-Two verbs over one turn engine (implemented — `crates/caos/src/chat.rs`,
-tested end-to-end against the stub in `tests/chat-offline`):
+Two verbs and a full-screen client over one turn engine (implemented —
+`crates/caos/src/chat.rs`, tested end-to-end against the stub in
+`tests/chat-offline`):
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one
@@ -254,6 +255,15 @@ tested end-to-end against the stub in `tests/chat-offline`):
   piped stdin the whole of it is one prompt.
 - **`caos-cli chat <name> [-m <message>]`** — the explicit, scriptable
   one-turn form (message from `-m` or stdin).
+- **`caos-tui [-c <name> | --new]`** — a Ratatui/Crossterm client in its own
+  crate. It consumes structured `TurnEvent`s from the same engine, reconstructs
+  durable history from the conversation ref, shows live status/tool activity,
+  accepts multiline prompts, and renders the accumulated base-to-head
+  workspace diff. Applying that virtual diff takes an explicit double
+  `Ctrl+A`, requires a clean host checkout, and first runs `git apply --check`;
+  merely opening the TUI never mutates the checkout. Progress remains one
+  completed API round at a time, and a running turn is not cancellable until
+  the server/runner protocol grows cancellation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>` (in
@@ -327,3 +337,7 @@ deadlines are comfortable; the top-level pending timeout
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
    published by build-builtins.sh so a turn needs nothing built or committed
    locally. **Done** (same files; `tests/chat-online` is the UX spec).
+7. Structured client events + `caos-tui` — presentation-independent turn
+   events, durable history/diff readers, multiline composer, task switching,
+   live activity, workspace review, and confirmed clean-checkout apply. **Done**
+   (`crates/caos-tui`; unit tests plus the existing chat integration suite).
