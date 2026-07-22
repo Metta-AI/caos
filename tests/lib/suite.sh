@@ -1,47 +1,45 @@
 #!/bin/bash
-# THE test suite, as a caos worker (phase C — design/cargo-workers.md). Runs
-# in a bash worker on the outer stack, keyed on everything it takes in: the
-# workspace tree, the harness scripts, the cargo image ID, the API key. A
-# full-suite cache hit therefore means literally nothing changed; salt to
-# force.
+# THE test suite, as a caos worker (design/cargo-workers.md, phases C/D).
+# Runs in a bash worker on the outer stack. Its interface is a TOOL's
+# interface: the workspace tree, a target triple, and optionally an API key
+# and a test filter — every script it runs downstream comes from the
+# workspace itself (tests/lib/*), so the suite tests exactly the harness the
+# tree carries. Keyed on all of it: a full-suite cache hit means literally
+# nothing changed; salt to force.
 #
 # The chain, no worker slot held between stages (continuations all the way):
-#   1. (this script) run-then the workspace build — std/cargo, the old
-#      known-good caos building the edited tree — into stage 2;
-#   2. stage 2: fan out the IMAGE-BUILD jobs (runner + bash worker images
-#      from the stock debian base + the caos-built binaries, pushed to the
-#      caos registry — phase D1);
-#   3. stage 3: fan out one job per tests/<name>/cli.sh;
-#   4. summarize: the report + every test's complete record.
+#   1. (this script) prune the tree to what cargo reads and run-then THE
+#      BUILD WORKER (tests/lib/build.sh: std/cargo + strip -> bin tree);
+#   2. stage 2: fan out the base-image builds (runner, bash, nix-builder);
+#   3. stage 2b: bake the cargo toolchain base (nix, in the builder);
+#   4. stage 2c: stack the cargo worker image onto it;
+#   5. stage 3: fan out one job per tests/<name>/cli.sh;
+#   6. summarize: the report + every test's complete record.
 set -euo pipefail
+
+caos get /cas/args/workspace
+caos get /cas/args/workspace/tests
+caos get /cas/args/workspace/tests/lib
+LIB=/cas/args/workspace/tests/lib
 
 # The build's input is a PRUNED tree — just what cargo reads — so editing a
 # test's cli.sh (or a doc) never re-keys the build or anything downstream of
 # the bin tree. Symlinks + `caos put` reuse recorded hashes; no bytes move.
-caos get /cas/args/workspace
 mkdir /tmp/build-ws
 for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
   [ -e "/cas/args/workspace/$e" ] && ln -s "/cas/args/workspace/$e" "/tmp/build-ws/$e"
 done
 caos put /tmp/build-ws /cas/build-ws
 
-cargo=$(caos curry /cas/std/cargo -- --cmd=build \
-  "--target:@=/cas/args/target" --profile=release)
+build=$(caos curry /cas/std/bash -- "--script:@=$LIB/build.sh" \
+  "--strip:@=$LIB/strip-bins.sh" "--target:@=/cas/args/target")
 
 fwd=(
   "--build_ws:@=/cas/build-ws"
   "--workspace:@=/cas/args/workspace"
-  "--stage2b:@=/cas/args/stage2b"
-  "--stage2c:@=/cas/args/stage2c"
-  "--stage3:@=/cas/args/stage3"
-  "--images_script:@=/cas/args/images_script"
-  "--bake_script:@=/cas/args/bake_script"
-  "--summarize:@=/cas/args/summarize"
-  "--run_nested:@=/cas/args/run_nested"
-  "--bash_worker:@=/cas/args/bash_worker"
 )
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
 [ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
 
-stage2=$(caos curry /cas/std/bash -- "--script:@=/cas/args/stage2" "${fwd[@]}")
-caos run-then /cas/build-ws -- --run="$cargo" --then="$stage2"
+stage2=$(caos curry /cas/std/bash -- "--script:@=$LIB/suite-stage2.sh" "${fwd[@]}")
+caos run-then /cas/build-ws -- --run="$build" --then="$stage2"

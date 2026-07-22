@@ -9,7 +9,10 @@ set -euo pipefail
 
 caos get /cas/args/children
 caos get /cas/args/workspace
+caos get /cas/args/workspace/tests
+caos get /cas/args/workspace/tests/lib
 caos get -r /cas/args/workspace/crates
+LIB=/cas/args/workspace/tests/lib
 
 mkdir /tmp/bake-ws
 for f in flake.nix flake.lock rust-toolchain.toml Cargo.toml Cargo.lock; do
@@ -38,10 +41,6 @@ fwd=(
   "--build:@=/cas/args/build"
   "--build_ws:@=/cas/args/build_ws"
   "--workspace:@=/cas/args/workspace"
-  "--run_nested:@=/cas/args/run_nested"
-  "--images_script:@=/cas/args/images_script"
-  "--stage3:@=/cas/args/stage3"
-  "--summarize:@=/cas/args/summarize"
   "--runner_image:@=/cas/args/children/runner"
   "--bash_image:@=/cas/args/children/bash"
 )
@@ -50,6 +49,6 @@ fwd=(
 
 caos get /cas/args/children/nixbuilder
 bake=$(caos curry "docker://$(cat /cas/args/children/nixbuilder)" -- \
-  "--script:@=/cas/args/bake_script")
-stage2c=$(caos curry /cas/std/bash -- "--script:@=/cas/args/stage2c" "${fwd[@]}")
+  "--script:@=$LIB/suite-bake.sh")
+stage2c=$(caos curry /cas/std/bash -- "--script:@=$LIB/suite-stage2c.sh" "${fwd[@]}")
 caos run-then /cas/bake-ws -- --run="$bake" --then="$stage2c"

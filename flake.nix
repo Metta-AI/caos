@@ -179,6 +179,11 @@
           chmod 4755 bin/caos
           mkdir -p tmp
           chmod 1777 tmp
+          # /usr/bin/env, for env-shebang worker scripts (images/bash-worker.sh
+          # runs on these nix-rooted images AND on nixos/nix, which has env but
+          # no /bin/bash — the env shebang is the portable meeting point).
+          mkdir -p usr/bin
+          [ -e usr/bin/env ] || ln -s /bin/env usr/bin/env
         '';
         # The same, but for images that stack on a stock docker base (e.g. rustc on
         # rust:1-bookworm). There we must NOT create a real /bin or /tmp: on Debian

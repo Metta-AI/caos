@@ -31,7 +31,7 @@ diff <(cd out/dup1 && find . -type f -exec cat {} +) \
 [ ! -e out/sub/none.txt ] || fail "non-matching nested file present"
 echo "  ok: matches only, binaries skipped, empty subtrees absent" >&2
 
-echo "== the same grep again: served from cache == XX" >&2
+echo "== the same grep again: served from cache ==" >&2
 t2=$(ms)
 "$CAOS_CLI" run /cas/std/rgrep out2 -- --pattern='need.e' --in:@=test/tree
 t3=$(ms)
