@@ -1,7 +1,7 @@
 #!/bin/bash
-# Suite stage 3 (the `then` of the cargo-image build): --result is the cargo
-# worker image's digest ref, and the runner/bash refs arrive curried; select
-# the tests and map-then over them, with suite-summarize.sh as the `then`.
+# Suite stage 3 (the `then` of the build tool): --result is the ARTIFACT
+# TREE {report, bin/, images/{runner,bash,cargo}}; select the tests and
+# map-then over them, with suite-summarize.sh as the `then`.
 #
 # The per-test jobs key on the CONTENT-STABLE inputs only — the bin tree,
 # the image refs (registry digests — content addresses), the test's own
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 caos get /cas/args/result
-caos get /cas/args/build
+caos get /cas/args/result/images
 caos get /cas/args/workspace
 caos get /cas/args/workspace/tests
 caos get /cas/args/workspace/tests/lib
@@ -38,8 +38,8 @@ for d in /cas/args/workspace/tests/*/; do
   case "$t" in
     cargo-self | unit)
       # Dogfood the tree under test — the PRUNED build tree (what cargo
-      # reads, the build's own input), so only Rust-relevant edits re-key
-      # these, exactly like the build itself.
+      # reads, the compile's own input), so only Rust-relevant edits re-key
+      # these, exactly like the compile itself.
       mkdir "/tmp/sel/$t"
       ln -s "/cas/args/workspace/tests/$t" "/tmp/sel/$t/test"
       ln -s /cas/args/build_ws "/tmp/sel/$t/workspace"
@@ -63,10 +63,10 @@ caos put /tmp/sel /cas/sel
 caos get /cas/args/workspace/crates
 map=$(caos curry /cas/std/testenv -- \
   "--script:@=$LIB/run-nested.sh" \
-  "--bins:@=/cas/args/build" \
+  "--bins:@=/cas/args/result/bin" \
   "--worker_common:@=/cas/args/workspace/crates/worker-common" \
-  "--runner_image:@=/cas/args/runner_image" \
-  "--bash_image:@=/cas/args/bash_image" \
-  "--cargo_image:@=/cas/args/result")
+  "--runner_image:@=/cas/args/result/images/runner" \
+  "--bash_image:@=/cas/args/result/images/bash" \
+  "--cargo_image:@=/cas/args/result/images/cargo")
 then_img=$(caos curry /cas/std/bash -- "--script:@=$LIB/suite-summarize.sh")
 caos map-then /cas/sel -- --map="$map" --then="$then_img"

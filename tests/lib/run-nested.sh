@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generic per-test runner, INSIDE a testenv worker, as ROOT — the suite's
-# map image (suite-stage2.sh curries it over the shared inputs; each map
+# map image (suite-stage3.sh curries it over the shared inputs; each map
 # child arrives as --in). Stands up a nested caos stack built from the tree
 # under test, publishes an inner std, then runs the REAL cli.sh of the test —
 # at /cas/args/in: a plain test tree, or a wrapper {test, ...} carrying
