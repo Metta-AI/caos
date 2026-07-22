@@ -56,30 +56,10 @@ OUT=$PWD/.caos-dev/run-all
 rm -rf "$OUT" && mkdir -p "$OUT"
 
 # ---------------------------------------------------------------------------
-# The cargo toolchain base image — the ONE image still produced host-side
-# (phase D2 folds it into a nix-capable builder job): it embodies the pinned
-# toolchain + baked deps, changes only on toolchain/lockfile bumps, and needs
-# nix to build. The runner and bash worker images are built IN the suite
-# (phase D1): stage 2 assembles them from the stock debian base + the freshly
-# caos-built binaries and pushes them to the caos registry.
-# ---------------------------------------------------------------------------
-# Big and slow to `docker load`, so skip the load when the built tarball (its
-# nix store path) is already the one loaded.
-nix build .#caos-worker-cargo-base-docker -o /tmp/run-all-cargo-img || exit 1
-cargo_img=$(readlink -f /tmp/run-all-cargo-img)
-marker=$PWD/.caos-dev/cargo-img-loaded
-if [ "$(cat "$marker" 2>/dev/null)" != "$cargo_img" ] \
-   || ! docker image exists localhost/caos-worker-cargo-base:latest; then
-  echo "loading the cargo toolchain image (once per toolchain change)..." >&2
-  docker load -i "$cargo_img" >&2 || exit 1
-  echo "$cargo_img" > "$marker"
-fi
-
-img_id() { docker inspect --format '{{.Id}}' "$1" | sed 's/^sha256://'; }
-CARGO_REF=$(img_id localhost/caos-worker-cargo-base:latest) || exit 1
-
-# ---------------------------------------------------------------------------
-# The suite job.
+# The suite job. Every image the tests use is built IN the suite: the
+# runner/bash/nix-builder images from pinned stock bases + the caos-built
+# binaries (phase D1), and the cargo toolchain base by a nix bake inside the
+# nix-builder worker (phase D2). Nothing image-shaped is produced here.
 # ---------------------------------------------------------------------------
 extra=()
 # The real API key rides as an ordinary arg; stage 2 places it in
@@ -91,14 +71,17 @@ echo "== firing the suite job ==" >&2
 suite_hash=$(CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
   --script:@=tests/lib/suite.sh \
   --stage2:@=tests/lib/suite-stage2.sh \
+  --stage2b:@=tests/lib/suite-stage2b.sh \
+  --stage2c:@=tests/lib/suite-stage2c.sh \
   --stage3:@=tests/lib/suite-stage3.sh \
   --images_script:@=tests/lib/suite-images.sh \
+  --bake_script:@=tests/lib/suite-bake.sh \
   --summarize:@=tests/lib/suite-summarize.sh \
   --run_nested:@=tests/lib/run-nested.sh \
   --bash_worker:@=images/bash-worker.sh \
   --workspace:@=. \
   --target="$(uname -m)-unknown-linux-musl" \
-  --cargo_image="$CARGO_REF" "${extra[@]}") \
+  "${extra[@]}") \
   || { echo "suite job failed" >&2; exit 1; }
 
 echo >&2

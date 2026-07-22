@@ -24,13 +24,29 @@ BASE=$(cat /cas/args/in/base)
 ctx=/tmp/img-ctx
 mkdir -p "$ctx"
 cp -rL /cas/args/in/files "$ctx/files"
+# The /bin/caos link is guarded: debian's merged /bin already reaches
+# /usr/bin/caos (an unguarded link would clobber the binary with a
+# self-reference), while bare nix-rooted bases (nixos/nix, the cargo deps
+# base) have no /bin merge and need it created.
 cat > "$ctx/Dockerfile" <<EOF
 FROM $BASE
 COPY files/usr /usr
 COPY files/worker /worker
-RUN chmod 4755 /usr/bin/caos && chmod 0755 /worker
+RUN chmod 4755 /usr/bin/caos && chmod 0755 /worker \
+ && { [ -e /bin/caos ] || { mkdir -p /bin && ln -s /usr/bin/caos /bin/caos; }; }
 ENTRYPOINT ["/bin/caos","runner"]
+ENV PATH=/usr/bin:/bin:\$PATH
 EOF
+# Optional per-image env (`env` in the spec, K=V per line) — e.g. the
+# nix-builder's CAOS_WORKER_UID=0: its jobs must run as root (the image's
+# nix store is root-owned), the same per-image containment grant testenv
+# carries.
+if [ -e /cas/args/in/env ]; then
+  caos get /cas/args/in/env
+  while IFS= read -r kv; do
+    [ -n "$kv" ] && printf 'ENV %s\n' "$kv" >> "$ctx/Dockerfile"
+  done < /cas/args/in/env
+fi
 
 # The tag is scratch (unique per run — this job's container name); the
 # durable identity is the pushed DIGEST, which is content-addressed and

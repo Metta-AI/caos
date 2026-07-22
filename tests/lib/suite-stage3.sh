@@ -1,6 +1,7 @@
 #!/bin/bash
-# Suite stage 3 (the `then` of the image builds): --children holds the
-# runner/bash image digest refs; select the tests and map-then over them.
+# Suite stage 3 (the `then` of the cargo-image build): --result is the cargo
+# worker image's digest ref, and the runner/bash refs arrive curried; select
+# the tests and map-then over them.
 #
 # The per-test jobs key on the CONTENT-STABLE inputs only — the bin tree
 # (never the whole cargo result: its stderr carries volatile timings), the
@@ -10,7 +11,7 @@
 # key — so nobody else re-keys on them.
 set -euo pipefail
 
-caos get /cas/args/children
+caos get /cas/args/result
 caos get /cas/args/build
 
 # The test selection: every tests/<name> with a cli.sh — or just the names
@@ -62,8 +63,8 @@ map=$(caos curry /cas/std/testenv -- \
   "--script:@=/cas/args/run_nested" \
   "--bins:@=/cas/args/build/bin" \
   "--worker_common:@=/cas/args/workspace/crates/worker-common" \
-  "--runner_image:@=/cas/args/children/runner" \
-  "--bash_image:@=/cas/args/children/bash" \
-  "--cargo_image:@=/cas/args/cargo_image")
+  "--runner_image:@=/cas/args/runner_image" \
+  "--bash_image:@=/cas/args/bash_image" \
+  "--cargo_image:@=/cas/args/result")
 then_img=$(caos curry /cas/std/bash -- "--script:@=/cas/args/summarize")
 caos map-then /cas/sel -- --map="$map" --then="$then_img"

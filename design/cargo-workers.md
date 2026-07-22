@@ -382,6 +382,33 @@ no buildx and its legacy builder wants `Dockerfile`, not `Containerfile`.
 Base ref is still the mutable `debian:stable-slim` tag (as before D1);
 pinning it by digest is an easy follow-up. Warm suite: **1s**.
 
+**Phase D2 landed (2026-07-22): the cargo toolchain image is baked IN caos —
+nothing image-shaped is produced on the host.** The chain: stage 2's image
+map gained a `nixbuilder` image (stock `nixos/nix` by pinned digest + caos,
+running as root via a per-image `CAOS_WORKER_UID=0` env — its nix store is
+root-owned); stage 2b assembles the BAKE TREE — flake files, manifests,
+lockfiles, and the crates' target entry points as EMPTY files, so the
+bake's key is independent of source content (crane's dummy-source pass
+just needs the paths) — and run-thens `suite-bake.sh` in the builder:
+`nix build path:<tree>#caos-worker-cargo-deps-docker` + a skopeo push
+(skopeo from OUR flake — locked nixpkgs, pure) to the registry; stage 2c
+stacks {caos, worker-runner} from the caos-built bins onto the baked base
+(the D1 delta-over-base move — so per-edit cost never touches the bake)
+and the chain continues to the tests. The deps-only image (`cargoDepsImage`)
+carries toolchain + baked deps + env but NO caos/worker — plus bash,
+coreutils, an sh link and a 1777 /tmp, because a bare nix root has none of
+the things Dockerfile RUN steps and uid-1000 workers assume. Base refs are
+pinned by digest in tracked files (`images/*-base.ref`). The cold bake
+measured ~3 minutes in-worker (substituters are fast), re-running only on
+toolchain/lockfile/manifest changes. Host nix now builds exactly one thing
+for the suite: `caos-cli`. Warm suite: 2s.
+
+Gotchas collected: nixos/nix has /bin/sh and /usr/bin/env but no /bin/bash
+(env shebang) and its PATH omits /usr/bin (the generic Dockerfile now
+extends PATH); skopeo needs --insecure-policy in a bare image; a guarded
+/bin/caos link is required on bare nix roots but would clobber the binary
+on debian's merged /bin.
+
 Two shapes worth keeping: **per-test extras ride in that test's map child**
 as a wrapper tree ({test, workspace} for cargo-self, {test, api_key} for
 chat-online), built with symlinks + `caos put` (recorded-hash reuse — no

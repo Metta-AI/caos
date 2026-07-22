@@ -31,12 +31,14 @@ cargo=$(caos curry /cas/std/cargo -- --cmd=build \
 fwd=(
   "--build_ws:@=/cas/build-ws"
   "--workspace:@=/cas/args/workspace"
+  "--stage2b:@=/cas/args/stage2b"
+  "--stage2c:@=/cas/args/stage2c"
   "--stage3:@=/cas/args/stage3"
   "--images_script:@=/cas/args/images_script"
+  "--bake_script:@=/cas/args/bake_script"
   "--summarize:@=/cas/args/summarize"
   "--run_nested:@=/cas/args/run_nested"
   "--bash_worker:@=/cas/args/bash_worker"
-  "--cargo_image:@=/cas/args/cargo_image"
 )
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
 [ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")

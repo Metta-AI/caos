@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# (env shebang: this runs on debian-based images AND bare nix-rooted ones —
+# the nix builder — where /bin/bash doesn't exist but /usr/bin/env does.)
 # The caos runner runs us as /worker, with /cas set up and the args
 # materialized under /cas/args. Fetch the script and run it; on exit
 # caos reads the hash of /cas/out. If the script left no result there,

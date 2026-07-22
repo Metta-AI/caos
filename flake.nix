@@ -658,6 +658,46 @@
           '';
         };
 
+        # The DEPS-ONLY cargo base (phase D2): toolchain + baked deps + env,
+        # WITHOUT caos or the /worker trampoline — those are stacked on by the
+        # suite's image jobs from the freshly caos-built binaries (the D1
+        # delta-over-base move). So this image is keyed on (toolchain,
+        # manifests, lockfile) alone, and the expensive in-caos nix bake that
+        # produces it re-runs only when those change — never on a source edit.
+        cargoDepsRootEnv =
+          pkgs.runCommand "caos-worker-cargo-deps-root" { nativeBuildInputs = [ pkgs.zstd ]; }
+            ''
+              mkdir -p $out
+              wsroot=$(cat ${cargoWorkerDeps}/ws-root)
+              mkdir -p "$out$wsroot"
+              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$wsroot"
+              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$wsroot"
+              cp ${cargoWorkerDeps}/ws-root $out/ws-root
+            '';
+        cargoDepsImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-cargo-deps";
+          tag = "latest";
+          # bash + coreutils (+ the /bin/sh link below): a bare nix-rooted
+          # image has neither a shell nor chmod/ln, and the suite's image job
+          # stacks the delta with Dockerfile RUN steps that need both.
+          contents = [
+            cargoDepsRootEnv
+            linuxPkgs.bashInteractive
+            linuxPkgs.coreutils
+          ];
+          config = {
+            Env = cargoBaseConfig.Env;
+          };
+          fakeRootCommands = ''
+            wsroot=$(cat ws-root)
+            chown -R 1000:1000 ".$wsroot"
+            ln -sf bash bin/sh
+            # Workers (uid 1000) scratch under /tmp; a bare nix root has none.
+            mkdir -p tmp
+            chmod 1777 tmp
+          '';
+        };
+
         # The caos server: storage *and* compute in one process (it serves
         # /object from a git repo and /run by matching jobs to polling runners —
         # it runs no containers itself; that's runnerd's job). It shells out to
@@ -1147,6 +1187,12 @@
           caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-runner-docker = workerRunnerImage;
           caos-worker-cargo-base-docker = cargoBaseImage;
+          caos-worker-cargo-deps-docker = cargoDepsImage;
+          # skopeo, from OUR locked nixpkgs — the in-caos bake job pushes its
+          # image to the registry with it (`nix shell path:<ws>#skopeo`), and
+          # taking it from the flake keeps the job pure (a bare `nixpkgs#`
+          # ref would float with the global registry).
+          skopeo = linuxPkgs.skopeo;
           caos-worker-testenv-docker = workerTestenvImage;
         };
 
