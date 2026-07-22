@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set — normally INSIDE a testenv worker, as the suite's per-test job
-# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
-# outer stack for interactive debugging.
+# set, INSIDE a testenv worker — the suite's per-test job
+# (tests/lib/run-nested.sh).
 #
 # End-to-end `caos-cli chat` test (design/agent-harness.md, "Client") with NO
 # real API calls: the scripted llm-stub plays the LLM exactly as in
@@ -21,25 +20,13 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
     commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg"
 }
 
-echo "== build the worker binaries and fixtures ==" >&2
-# Prebuilt when the harness provides binaries (CAOS_BIN_DIR — the nested
-# runner does), else built by the flake.
-if [ -n "${CAOS_BIN_DIR:-}" ]; then
-  cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
-  cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
-  cp "$CAOS_BIN_DIR/worker-rgrep" rgrep-bin
-  stub_bin=$CAOS_BIN_DIR/llm-stub
-else
-  nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
-  nix build "$CAOS_PROJECT#worker-llm-step" -o llm-step-out
-  nix build "$CAOS_PROJECT#worker-rgrep" -o rgrep-out
-  nix build "$CAOS_PROJECT#llm-stub" -o llm-stub-out
-  cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
-  cp -L llm-step-out/bin/worker-llm-step llm-step-bin
-  cp -L rgrep-out/bin/worker-rgrep rgrep-bin
-  stub_bin=$(readlink -f llm-stub-out/bin/llm-stub)
-  rm bash-tool-out llm-step-out rgrep-out llm-stub-out
-fi
+echo "== stage the worker binaries and fixtures ==" >&2
+# From the harness-provided bins (CAOS_BIN_DIR: the caos-built binaries the
+# suite threads in).
+cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
+cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
+cp "$CAOS_BIN_DIR/worker-rgrep" rgrep-bin
+stub_bin=$CAOS_BIN_DIR/llm-stub
 
 # The conversation's workspace, and the identity chat's human commits use.
 mkdir -p ws/notes

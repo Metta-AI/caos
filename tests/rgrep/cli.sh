@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set — normally INSIDE a testenv worker, as the suite's per-test job
-# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
-# outer stack for interactive debugging.
+# set, INSIDE a testenv worker — the suite's per-test job
+# (tests/lib/run-nested.sh).
 #
 # Exercises the rgrep worker directly (no LLM in the loop): a recursive grep
 # fold — one job per directory, results a SPARSE TREE (only matching files,
@@ -32,7 +31,7 @@ diff <(cd out/dup1 && find . -type f -exec cat {} +) \
 [ ! -e out/sub/none.txt ] || fail "non-matching nested file present"
 echo "  ok: matches only, binaries skipped, empty subtrees absent" >&2
 
-echo "== the same grep again: served from cache ==" >&2
+echo "== the same grep again: served from cache == XX" >&2
 t2=$(ms)
 "$CAOS_CLI" run /cas/std/rgrep out2 -- --pattern='need.e' --in:@=test/tree
 t3=$(ms)

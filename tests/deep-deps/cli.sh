@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set — normally INSIDE a testenv worker, as the suite's per-test job
-# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
-# outer stack for interactive debugging.
+# set, INSIDE a testenv worker — the suite's per-test job
+# (tests/lib/run-nested.sh).
 #
 # deep-deps turns a flat, name-keyed package map (each package a `DEPS` list, one
 # dependency name per line) into a DAG of nodes: the output mirrors the input but

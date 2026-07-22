@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set — normally INSIDE a testenv worker, as the suite's per-test job
-# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
-# outer stack for interactive debugging.
+# set, INSIDE a testenv worker — the suite's per-test job
+# (tests/lib/run-nested.sh).
 #
 # Proves the rustc builder loop: a Rust source file -> the builder compiles it
 # (glibc/gnu, linking the vendored worker-common) and emits a ready-to-run worker

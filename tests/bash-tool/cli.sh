@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set — normally INSIDE a testenv worker, as the suite's per-test job
-# (tests/lib/run-nested.sh); tests/run.sh runs it on the host against the
-# outer stack for interactive debugging.
+# set, INSIDE a testenv worker — the suite's per-test job
+# (tests/lib/run-nested.sh).
 #
 # Exercises the bounded bash tool (worker-bash-tool, design/agent-harness.md):
 # a command over a workspace tree with only the *declared* paths materialized.
@@ -28,15 +27,9 @@ echo one > ws/a/one.txt
 echo two > ws/a/b/two.txt
 echo top > ws/top.txt
 
-# The tool binary, bound into the shared runner: prebuilt when the harness
-# provides binaries (CAOS_BIN_DIR — the nested runner does), else the flake.
-if [ -n "${CAOS_BIN_DIR:-}" ]; then
-  cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
-else
-  nix build "$CAOS_PROJECT#worker-bash-tool" -o bash-tool-out
-  cp -L bash-tool-out/bin/worker-bash-tool bash-tool-bin
-  rm bash-tool-out
-fi
+# The tool binary, bound into the shared runner — from the harness-provided
+# bins (CAOS_BIN_DIR: the caos-built binaries the suite threads in).
+cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
 commit "workspace + bash tool binary"
 base=$(git rev-parse HEAD)
 tool=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=bash-tool-bin)
