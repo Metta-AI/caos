@@ -341,6 +341,7 @@ struct App {
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
+    copy_mode: bool,
     confirm_action: Option<ConfirmAction>,
     activity_expanded: bool,
     view: View,
@@ -395,6 +396,7 @@ impl App {
             conversations: states,
             selected,
             should_quit: false,
+            copy_mode: false,
             confirm_action: None,
             activity_expanded: false,
             view: View::Chat,
@@ -592,6 +594,16 @@ impl App {
             self.should_quit = true;
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            self.copy_mode = !self.copy_mode;
+            return;
+        }
+        if self.copy_mode {
+            if key.code == KeyCode::Esc {
+                self.copy_mode = false;
+            }
+            return;
+        }
         let is_load =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a');
         let is_publish =
@@ -607,7 +619,7 @@ impl App {
             self.publish_selected();
             return;
         }
-        if key.code == KeyCode::F(2) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             self.view = match self.view {
                 View::Chat => View::Diff,
                 View::Diff => View::Chat,
@@ -617,14 +629,6 @@ impl App {
         }
         if key.code == KeyCode::F(3) {
             self.activity_expanded = !self.activity_expanded;
-            return;
-        }
-        if key.code == KeyCode::F(6) {
-            self.select_relative(if key.modifiers.contains(KeyModifiers::SHIFT) {
-                -1
-            } else {
-                1
-            });
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
@@ -1022,8 +1026,8 @@ fn render(app: &App, frame: &mut Frame<'_>) {
         View::Diff => render_diff(state, frame, conversation[0]),
     }
     render_activity(state, app.activity_expanded, frame, conversation[1]);
-    render_composer(state, app.view, frame, conversation[2]);
-    render_footer(frame, outer[2]);
+    render_composer(state, app.view, !app.copy_mode, frame, conversation[2]);
+    render_footer(app.copy_mode, frame, outer[2]);
 }
 
 fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
@@ -1034,7 +1038,9 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     } else {
         "idle"
     };
-    let view = if app.view == View::Chat {
+    let view = if app.copy_mode {
+        "copy"
+    } else if app.view == View::Chat {
         "chat"
     } else {
         "diff"
@@ -1262,7 +1268,13 @@ fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_composer(state: &ConversationState, view: View, frame: &mut Frame<'_>, area: Rect) {
+fn render_composer(
+    state: &ConversationState,
+    view: View,
+    show_cursor: bool,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     let title = if state.running {
         " Prompt (turn running; cancellation is not available) "
     } else if state.publishing {
@@ -1279,7 +1291,7 @@ fn render_composer(state: &ConversationState, view: View, frame: &mut Frame<'_>,
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         area,
     );
-    if view == View::Chat {
+    if view == View::Chat && show_cursor {
         let cursor_row = row.saturating_sub(vertical_scroll);
         let x = area.x.saturating_add(1).saturating_add(column as u16);
         let y = area.y.saturating_add(1).saturating_add(cursor_row as u16);
@@ -1289,10 +1301,15 @@ fn render_composer(state: &ConversationState, view: View, frame: &mut Frame<'_>,
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect) {
-    let footer = Line::raw(
-        " F6 chat  ^N new  F2 diff  F3 activity  ^A load  ^P PR  PgUp/Dn scroll  ^C quit",
-    );
+fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
+    let footer = if copy_mode {
+        Line::styled(
+            " Copy mode: drag to select, use terminal copy, ^Y/Esc resumes",
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )
+    } else {
+        Line::raw(" ^Up/Dn chat  ^N new  ^Q changes  F3 activity  ^A load  ^P PR  ^Y copy  ^C quit")
+    };
     frame.render_widget(Paragraph::new(footer), area);
 }
 
@@ -1317,18 +1334,34 @@ fn run_app(
         .draw(|frame| render(app, frame))
         .map_err(|error| format!("drawing terminal: {error}"))?;
     while !app.should_quit {
-        let mut changed = app.drain_messages();
+        // Copy mode deliberately freezes the frame: background turn messages
+        // remain queued so redraws cannot invalidate a native terminal
+        // selection. They are drained immediately when copy mode ends.
+        let mut changed = if app.copy_mode {
+            false
+        } else {
+            app.drain_messages()
+        };
         if event::poll(TICK).map_err(|error| format!("polling terminal input: {error}"))? {
             match event::read().map_err(|error| format!("reading terminal input: {error}"))? {
                 TerminalEvent::Key(key) => {
+                    let was_copy_mode = app.copy_mode;
                     app.handle_key(key);
+                    if was_copy_mode != app.copy_mode {
+                        if app.copy_mode {
+                            execute!(terminal.backend_mut(), DisableMouseCapture)
+                        } else {
+                            execute!(terminal.backend_mut(), EnableMouseCapture)
+                        }
+                        .map_err(|error| format!("switching terminal copy mode: {error}"))?;
+                    }
                     changed = true;
                 }
-                TerminalEvent::Paste(text) if app.view == View::Chat => {
+                TerminalEvent::Paste(text) if app.view == View::Chat && !app.copy_mode => {
                     app.selected_mut().composer.insert_str(&text);
                     changed = true;
                 }
-                TerminalEvent::Mouse(mouse) => match mouse.kind {
+                TerminalEvent::Mouse(mouse) if !app.copy_mode => match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         app.scroll_up(3);
                         changed = true;
@@ -1339,7 +1372,7 @@ fn run_app(
                     }
                     _ => {}
                 },
-                TerminalEvent::Resize(_, _) => changed = true,
+                TerminalEvent::Resize(_, _) if !app.copy_mode => changed = true,
                 _ => {}
             }
         }
@@ -1434,6 +1467,7 @@ mod tests {
                 conversations,
                 selected: 0,
                 should_quit: false,
+                copy_mode: false,
                 confirm_action: None,
                 activity_expanded: false,
                 view: View::Chat,
@@ -1670,7 +1704,7 @@ mod tests {
         first.status = "calling model".to_string();
         let (mut app, tx) = app_with(vec![first, state("talk-2")]);
 
-        app.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(app.selected().name, "talk-2");
         assert!(app.conversations[0].running);
 
@@ -1682,5 +1716,21 @@ mod tests {
         assert!(app.drain_messages());
         assert_eq!(app.conversations[0].status, "running a tool");
         assert_eq!(app.selected().name, "talk-2");
+    }
+
+    #[test]
+    fn copy_mode_blocks_edits_and_ctrl_q_toggles_changes() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Diff);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.copy_mode);
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.selected().composer.text.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.copy_mode);
     }
 }

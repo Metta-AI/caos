@@ -265,14 +265,16 @@ Two verbs and a full-screen client over one turn engine (implemented —
   activity carries its durable step hash, while completed transcript turns show
   the clean hashes accepted by `--from` and the in-session `/from <turn>`
   command. Chat and diff scrolling count wrapped visual rows and accept both
-  page keys and the mouse wheel. Loading the virtual base-to-head diff takes an
-  explicit double `Ctrl+A`, requires a clean host checkout, and first runs
-  `git apply --check`. Double `Ctrl+P` publishes the selected workspace without
-  checking it out: it advances a clean `caos/<conversation>` snapshot branch,
-  pushes to `origin`, and opens or finds its PR through `gh`. Merely opening,
-  running, switching, or publishing conversations never mutates the checkout.
-  Progress remains one completed API round at a time, and a running turn is not
-  cancellable until the server/runner protocol grows cancellation.
+  page keys and the mouse wheel. `Ctrl+Y` temporarily releases mouse capture
+  and freezes redraws for native terminal text selection. Loading the virtual
+  base-to-head diff takes an explicit double `Ctrl+A`, requires a clean host
+  checkout, and first runs `git apply --check`. Double `Ctrl+P` publishes the
+  selected workspace without checking it out: it advances a clean
+  `caos/<conversation>` snapshot branch, pushes to `origin`, and opens or finds
+  its PR through `gh`. Merely opening, running, switching, or publishing
+  conversations never mutates the checkout. Progress remains one completed API
+  round at a time, and a running turn is not cancellable until the server/runner
+  protocol grows cancellation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>` (in

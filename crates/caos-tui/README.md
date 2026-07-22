@@ -35,13 +35,13 @@ caos-tui --from 5ec3751   branch from a completed turn
 |---|---|
 | `Enter` | Send the prompt |
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
-| `F6` / `Shift+F6` | Select the next or previous conversation |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
-| `F2` | Switch between conversation and workspace diff |
+| `Ctrl+Q` | Switch between conversation and workspace changes |
 | `F3` | Expand or collapse live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
 | Mouse wheel | Scroll by rendered rows |
+| `Ctrl+Y` | Enter or leave terminal text-selection mode |
 | `Ctrl+A` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
@@ -52,6 +52,11 @@ Completed user and agent turns show branchable hashes in the transcript. Enter
 TUI. Activity entries show the durable hashes of internal harness steps for
 inspection; those step trees contain harness metadata and are not branch
 points.
+
+`Ctrl+Y` releases mouse capture and freezes redraws so terminal-native text
+selection remains stable. Drag across any visible text, use the terminal's
+normal copy shortcut (`Cmd+C` on macOS or usually `Ctrl+Shift+C` elsewhere),
+then press `Ctrl+Y` or `Escape` to resume the live interface.
 
 ## Workspace safety
 
