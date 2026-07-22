@@ -267,7 +267,7 @@ Two verbs and a full-screen client over one turn engine (implemented —
   command. Chat and diff scrolling count wrapped visual rows and accept both
   page keys and the mouse wheel. `Ctrl+Y` temporarily releases mouse capture
   and freezes redraws for native terminal text selection. Loading the virtual
-  base-to-head diff takes an explicit double `Ctrl+A`, requires a clean host
+  base-to-head diff takes an explicit double `Ctrl+L`, requires a clean host
   checkout, and first runs `git apply --check`. Double `Ctrl+P` publishes the
   selected workspace without checking it out: it advances a clean
   `caos/<conversation>` snapshot branch, pushes to `origin`, and opens or finds

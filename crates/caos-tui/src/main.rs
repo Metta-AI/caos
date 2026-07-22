@@ -605,7 +605,7 @@ impl App {
             return;
         }
         let is_load =
-            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a');
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
         let is_publish =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
         if !is_load && !is_publish {
@@ -627,7 +627,7 @@ impl App {
             self.selected_mut().scroll_from_bottom = 0;
             return;
         }
-        if key.code == KeyCode::F(3) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             self.activity_expanded = !self.activity_expanded;
             return;
         }
@@ -749,7 +749,7 @@ impl App {
         } else if self.confirm_action != Some(ConfirmAction::Load) {
             self.confirm_action = Some(ConfirmAction::Load);
             self.selected_mut().status =
-                "press Ctrl+A again to load this diff into a clean working tree".to_string();
+                "press Ctrl+L again to load this diff into a clean working tree".to_string();
         } else {
             self.confirm_action = None;
             let name = self.selected().name.clone();
@@ -1209,9 +1209,9 @@ fn render_activity(state: &ConversationState, expanded: bool, frame: &mut Frame<
         lines.push(Line::from(spans));
     }
     let title = if expanded {
-        " Activity (F3 collapse) "
+        " Activity (Ctrl+A collapse) "
     } else {
-        " Activity (F3 expand) "
+        " Activity (Ctrl+A expand) "
     };
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width.saturating_sub(2));
@@ -1308,7 +1308,7 @@ fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else {
-        Line::raw(" ^Up/Dn chat  ^N new  ^Q changes  F3 activity  ^A load  ^P PR  ^Y copy  ^C quit")
+        Line::raw(" ^Up/Dn chat  ^N new  ^Q changes  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
     };
     frame.render_widget(Paragraph::new(footer), area);
 }
@@ -1668,7 +1668,7 @@ mod tests {
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("cancellation is not available"));
 
-        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(app.activity_expanded);
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let expanded: String = terminal
@@ -1687,9 +1687,9 @@ mod tests {
             stat: "1 file changed".to_string(),
             patch: "diff --git a/a b/a".to_string(),
         });
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         assert_eq!(app.confirm_action, Some(ConfirmAction::Load));
-        assert!(app.selected().status.contains("press Ctrl+A again"));
+        assert!(app.selected().status.contains("press Ctrl+L again"));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));

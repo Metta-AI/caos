@@ -38,11 +38,11 @@ caos-tui --from 5ec3751   branch from a completed turn
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
-| `F3` | Expand or collapse live Activity above the prompt |
+| `Ctrl+A` | Expand or collapse live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
 | Mouse wheel | Scroll by rendered rows |
 | `Ctrl+Y` | Enter or leave terminal text-selection mode |
-| `Ctrl+A` twice | Load the selected conversation into the working tree |
+| `Ctrl+L` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Exit |
@@ -62,7 +62,7 @@ then press `Ctrl+Y` or `Escape` to resume the live interface.
 
 Agent workspaces remain virtual commit trees under independent conversation
 refs. Opening, switching, and running conversations never overwrite the working
-checkout. Loading changes requires two `Ctrl+A` presses, a clean working tree,
+checkout. Loading changes requires two `Ctrl+L` presses, a clean working tree,
 and a successful `git apply --check` before the patch is applied.
 
 Publishing also leaves the checkout untouched. Two `Ctrl+P` presses create or
