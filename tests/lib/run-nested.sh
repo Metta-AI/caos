@@ -45,20 +45,25 @@ fail() {
 # against the outer server.
 unset CAOS_STD CAOS_SALT
 
-caos get -r /cas/args/bins
-mkdir -p /pt && cp /cas/args/bins/* /pt/ && chmod +x /pt/*
-# The map child: a plain test tree, or a wrapper {test, workspace?, api_key?}.
+# The map child: a uniform wrapper {test, bins/, images/, workspace?,
+# api_key?} carrying ONLY what this test's std-manifest declared (see
+# suite-stage3.sh) — the job's key covers exactly the test's real inputs.
 caos get /cas/args/in
-TEST=/cas/args/in
-[ -e /cas/args/in/test ] && TEST=/cas/args/in/test
+caos get -r /cas/args/in/bins
+mkdir -p /pt && cp /cas/args/in/bins/* /pt/ && chmod +x /pt/*
+TEST=/cas/args/in/test
 caos get -r "$TEST"
 caos get -r /cas/args/worker_common
-caos get /cas/args/runner_image
-caos get /cas/args/bash_image
-caos get /cas/args/cargo_image
-RUNNER_IMAGE=$(cat /cas/args/runner_image)
-BASH_IMAGE=$(cat /cas/args/bash_image)
-CARGO_IMAGE=$(cat /cas/args/cargo_image)
+caos get /cas/args/in/images
+img() { # <name> -> the ref, or "" when this test doesn't use it
+  if [ -e "/cas/args/in/images/$1" ]; then
+    caos get "/cas/args/in/images/$1"
+    cat "/cas/args/in/images/$1"
+  fi
+}
+RUNNER_IMAGE=$(img runner)
+BASH_IMAGE=$(img bash)
+CARGO_IMAGE=$(img cargo)
 SOCK=${CAOS_ENGINE_SOCKET:?the nested stack needs a granted engine socket}
 [ -S "$SOCK" ] || fail "engine socket $SOCK is not a socket"
 
@@ -101,26 +106,33 @@ git config user.name caos
 git config gc.auto 0
 git remote add caos "$INNER"
 
-# Inner std, as a cheap mktree, in build-builtins.sh's shape.
-for b in /pt/worker-*; do cp "$b" .; done
+# Inner std, as a cheap mktree, in build-builtins.sh's shape — PRESENCE-
+# DRIVEN: publish exactly the entries whose ingredients arrived in the
+# wrapper (the declared subset), nothing more.
+for b in /pt/worker-*; do [ -e "$b" ] && cp "$b" .; done
 cp -r /cas/args/worker_common ./worker-common
 git add -A && git commit -qm setup
 
 entries=""
 add() { entries+="040000 tree $1"$'\t'"$2"$'\n'; }
-add "$(cli curry "docker://$RUNNER_IMAGE" --)" runner
-add "$(cli curry "docker://$BASH_IMAGE" --)" bash
+[ -n "$RUNNER_IMAGE" ] && add "$(cli curry "docker://$RUNNER_IMAGE" --)" runner
+[ -n "$BASH_IMAGE" ] && add "$(cli curry "docker://$BASH_IMAGE" --)" bash
 for b in /pt/worker-*; do
+  [ -e "$b" ] || continue
   n=${b#/pt/worker-}
   # cargo/rustc curry onto their own bases below; `runner` names the runner
   # IMAGE entry above (the worker-runner bin is that image's own trampoline).
   case "$n" in cargo | rustc | runner) continue ;; esac
   add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-$n")" "$n"
 done
-cargo_ref=$(cli curry "docker://$CARGO_IMAGE" -- "--bin:@=worker-cargo")
-add "$cargo_ref" cargo
-add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-rustc" \
-        "--cargo=$cargo_ref" "--worker_common:@=worker-common")" rustc
+if [ -n "$CARGO_IMAGE" ]; then
+  cargo_ref=$(cli curry "docker://$CARGO_IMAGE" -- "--bin:@=worker-cargo")
+  add "$cargo_ref" cargo
+  if [ -e /pt/worker-rustc ]; then
+    add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-rustc" \
+            "--cargo=$cargo_ref" "--worker_common:@=worker-common")" rustc
+  fi
+fi
 stdtree=$(printf '%s' "$entries" | git mktree)
 git push -q --force caos "$stdtree:refs/caos/std" || fail "publishing inner std"
 
