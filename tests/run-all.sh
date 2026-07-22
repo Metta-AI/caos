@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# The caos test runner: bring the stack up, fire THE SUITE JOB, print its
-# report. The suite itself is a caos worker (tests/lib/suite.sh): it run-thens
+# The caos test runner: fire THE SUITE JOB against the running stack and
+# print its report. It never starts, updates, or restarts the stack — that's
+# where agents live, and it embodies the old, known-good caos that builds and
+# tests the edited tree; it only requires one (with a published std) and adds
+# worker images to the engine store, which disturbs nothing running. The
+# suite itself is a caos worker (tests/lib/suite.sh): it run-thens
 # the workspace build (std/cargo — the old, known-good caos building the
 # edited tree), fans out one job per tests/<name>/cli.sh (map-then, so
 # parallelism is slot-bounded by the runner pool), and summarizes. Every
@@ -28,20 +32,27 @@ for t in "${ONLY[@]}"; do
   [ -f "tests/$t/cli.sh" ] || { echo "no such test: tests/$t/cli.sh" >&2; exit 2; }
 done
 
-echo "building caos client + bringing the stack up (once for the suite)..." >&2
+echo "building caos client..." >&2
 nix build .#caos-cli -o result-caos || exit 1
 export CAOS_CLI=$PWD/result-caos/bin/caos-cli
-export CAOS_DATA="${CAOS_DATA:-$PWD/.caos-data}"
-nix run .#caosd -- up >&2 || exit 1
-export CAOS_STACK_READY=1
 
-# The caos remote is how the CLI finds the server; require it rather than
-# mutating this repo behind the user's back.
+# The tester does NOT start, update, or restart the stack: the stack is
+# where agents (and their conversations) live, and it embodies the OLD,
+# known-good caos that builds and tests the edited tree — replacing it is a
+# deploy decision, never a side effect of running tests. Require a working
+# stack with a published std, and otherwise leave it alone.
 git remote get-url caos >/dev/null 2>&1 || {
   echo "tests/run-all.sh: this repo needs a 'caos' remote naming the local server:" >&2
   echo "  git remote add caos http://localhost:9090" >&2
   exit 1
 }
+if [ -z "$(git ls-remote caos refs/caos/std 2>/dev/null | cut -f1)" ]; then
+  echo "tests/run-all.sh: no running caos stack with a published std at" >&2
+  echo "  $(git remote get-url caos)" >&2
+  echo "start one (separately — this script never touches the stack) with:" >&2
+  echo "  nix run .#caosd -- up" >&2
+  exit 1
+fi
 OUT=$PWD/.caos-dev/run-all
 rm -rf "$OUT" && mkdir -p "$OUT"
 
@@ -73,7 +84,7 @@ rm -rf "$stacked_runner_build_ctx"
 # load when the built tarball (its nix store path) is already the one loaded.
 nix build .#caos-worker-cargo-base-docker -o /tmp/run-all-cargo-img || exit 1
 cargo_img=$(readlink -f /tmp/run-all-cargo-img)
-marker=$CAOS_DATA/.cargo-img-loaded
+marker=$PWD/.caos-dev/cargo-img-loaded
 if [ "$(cat "$marker" 2>/dev/null)" != "$cargo_img" ] \
    || ! docker image exists localhost/caos-worker-cargo-base:latest; then
   echo "loading the cargo toolchain image (once per toolchain change)..." >&2
