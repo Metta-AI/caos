@@ -28,8 +28,8 @@ use std::io::{IsTerminal, Read};
 use serde_json::Value;
 
 use super::{
-    curry_object, fetch_object_negotiated, git_capture, prepare_request, request_compute,
-    resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    curry_object, prepare_request, request_compute, resolve_cli_image, GitTransport, HttpTransport,
+    Transport, CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -299,9 +299,9 @@ impl ChatArgs {
 pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Chat, args)?;
     let name = a.name.clone().expect("chat parse requires a name");
-    let refname = validated_refname(&name)?;
+    let refname = validated_refname(t, &name)?;
     if a.log {
-        return print_log(&name, &refname);
+        return print_log(t, &name, &refname);
     }
     let message = read_message(a.message.as_deref())?;
     run_cli_turn(t, &a.turn_options(), &name, &message)
@@ -310,10 +310,10 @@ pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
 /// `talk [<prompt>] …` — the everyday surface; see [`usage`] and module docs.
 pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Talk, args)?;
-    let (name, fresh) = pick_conversation(&a)?;
-    let refname = validated_refname(&name)?;
+    let (name, fresh) = pick_conversation(t, &a)?;
+    let refname = validated_refname(t, &name)?;
     if a.log {
-        return print_log(&name, &refname);
+        return print_log(t, &name, &refname);
     }
     eprintln!("[conversation {name}{}]", if fresh { " — new" } else { "" });
     if let Some(prompt) = &a.message {
@@ -377,7 +377,7 @@ fn run_cli_turn(
 /// the `-progress`/`-status` channel refs, so let git check it — and reserve
 /// those suffixes, or conversation `foo-progress` would shadow `foo`'s
 /// channel).
-fn validated_refname(name: &str) -> Result<String, String> {
+fn validated_refname(t: &GitTransport, name: &str) -> Result<String, String> {
     for suffix in [PROGRESS_SUFFIX, STATUS_SUFFIX] {
         if name.ends_with(suffix) {
             return Err(format!(
@@ -386,7 +386,7 @@ fn validated_refname(name: &str) -> Result<String, String> {
         }
     }
     let refname = format!("{CONV_REF_PREFIX}{name}");
-    git_capture(&["check-ref-format", &refname], None)
+    t.git_capture(&["check-ref-format", &refname], None)
         .map_err(|_| format!("invalid conversation name {name:?}"))?;
     Ok(refname)
 }
@@ -395,22 +395,22 @@ fn validated_refname(name: &str) -> Result<String, String> {
 /// `-c <name>` names one (existing or not); `--new` mints a fresh auto-named
 /// one; with neither, the repo's most recently advanced conversation — or a
 /// fresh one when there is none yet.
-fn pick_conversation(a: &ChatArgs) -> Result<(String, bool), String> {
+fn pick_conversation(t: &GitTransport, a: &ChatArgs) -> Result<(String, bool), String> {
     if let Some(name) = &a.name {
-        if a.new_conv && rev_parse_opt(&format!("{CONV_REF_PREFIX}{name}"))?.is_some() {
+        if a.new_conv && rev_parse_opt(t, &format!("{CONV_REF_PREFIX}{name}"))?.is_some() {
             return Err(format!(
                 "--new: conversation {name:?} already exists (drop --new to continue it)"
             ));
         }
-        let fresh = rev_parse_opt(&format!("{CONV_REF_PREFIX}{name}"))?.is_none();
+        let fresh = rev_parse_opt(t, &format!("{CONV_REF_PREFIX}{name}"))?.is_none();
         return Ok((name.clone(), fresh));
     }
     if !a.new_conv {
-        if let Some(name) = latest_conversation()? {
+        if let Some(name) = latest_conversation(t)? {
             return Ok((name, false));
         }
     }
-    let conversations = list_conversations()?;
+    let conversations = list_conversations(t)?;
     Ok((
         first_available_conversation_name(
             conversations
@@ -441,14 +441,14 @@ pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a
 /// committer date (turn commits carry wall-clock timestamps). Channel refs
 /// (`-progress`/`-status`) are server-side, but skip them defensively in case
 /// a broad fetch ever mirrored them here.
-fn latest_conversation() -> Result<Option<String>, String> {
-    Ok(list_conversations()?.into_iter().next().map(|c| c.name))
+fn latest_conversation(t: &GitTransport) -> Result<Option<String>, String> {
+    Ok(list_conversations(t)?.into_iter().next().map(|c| c.name))
 }
 
 /// List the local conversation refs, newest first. Progress/status channel refs
 /// are server-owned implementation details and never appear in this list.
-pub fn list_conversations() -> Result<Vec<ConversationSummary>, String> {
-    let out = git_capture(
+pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, String> {
+    let out = t.git_capture(
         &[
             "for-each-ref",
             "--sort=-committerdate",
@@ -484,22 +484,22 @@ pub fn list_conversations() -> Result<Vec<ConversationSummary>, String> {
 }
 
 /// Read a named conversation's clean human/agent spine, oldest first.
-pub fn conversation_history(name: &str) -> Result<Vec<ConversationTurn>, String> {
-    let refname = validated_refname(name)?;
-    let head = rev_parse_opt(&refname)?
+pub fn conversation_history(t: &GitTransport, name: &str) -> Result<Vec<ConversationTurn>, String> {
+    let refname = validated_refname(t, name)?;
+    let head = rev_parse_opt(t, &refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
-    history_from_head(&head).map(|(turns, _base)| turns)
+    history_from_head(t, &head).map(|(turns, _base)| turns)
 }
 
 /// Diff the conversation's current workspace against the commit it started
 /// from. This operation is side-effect free; clients own any policy for
 /// applying or publishing the returned change.
-pub fn conversation_workspace_diff(name: &str) -> Result<WorkspaceDiff, String> {
-    let refname = validated_refname(name)?;
-    let head = rev_parse_opt(&refname)?
+pub fn conversation_workspace_diff(t: &GitTransport, name: &str) -> Result<WorkspaceDiff, String> {
+    let refname = validated_refname(t, name)?;
+    let head = rev_parse_opt(t, &refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
-    let (_turns, base) = history_from_head(&head)?;
-    let stat = git_capture(
+    let (_turns, base) = history_from_head(t, &head)?;
+    let stat = t.git_capture(
         &[
             "diff",
             "--no-ext-diff",
@@ -510,7 +510,7 @@ pub fn conversation_workspace_diff(name: &str) -> Result<WorkspaceDiff, String> 
         ],
         None,
     )?;
-    let patch = git_capture(&["diff", "--no-ext-diff", "--no-color", &base, &head], None)?;
+    let patch = t.git_capture(&["diff", "--no-ext-diff", "--no-color", &base, &head], None)?;
     Ok(WorkspaceDiff {
         base,
         head,
@@ -531,7 +531,7 @@ pub fn run_chat_turn(
     message: &str,
     mut emit: impl FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
-    let refname = validated_refname(name)?;
+    let refname = validated_refname(t, name)?;
     if message.trim().is_empty() {
         return Err("empty message".to_string());
     }
@@ -566,7 +566,7 @@ fn turn(
 
     // The human commit's parent: the conversation head, or — for a new
     // conversation — the base commit (HEAD unless --base overrides).
-    let parent = match rev_parse_opt(refname)? {
+    let parent = match rev_parse_opt(t, refname)? {
         Some(head) => head,
         None => {
             let rev = options.base.as_deref().unwrap_or("HEAD");
@@ -577,7 +577,7 @@ fn turn(
             // `.caos` is the harness's reserved top-level workspace entry
             // (step transcripts live there): refuse to start a conversation
             // over a tree that already carries one.
-            if rev_parse_opt(&format!("{base}:.caos"))?.is_some() {
+            if rev_parse_opt(t, &format!("{base}:.caos"))?.is_some() {
                 return Err(
                     "the base commit's tree contains a top-level `.caos` entry, which \
                      is reserved for the agent harness; start from a tree without one"
@@ -590,7 +590,8 @@ fn turn(
 
     // The agent author name is the turn-walk marker; a human commit carrying it
     // would corrupt every future transcript walk.
-    let ident = git_capture(&["var", "GIT_AUTHOR_IDENT"], None)
+    let ident = t
+        .git_capture(&["var", "GIT_AUTHOR_IDENT"], None)
         .map_err(|e| format!("no git author identity (set user.name/user.email): {e}"))?;
     if ident.split(" <").next().unwrap_or("").trim() == AGENT_AUTHOR {
         return Err(format!(
@@ -602,10 +603,12 @@ fn turn(
     // Mint the human turn: parent = head/base, tree = parent's tree (human
     // turns are text-only for now), message = the user's text, author = the
     // user's git identity.
-    let tree = git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
+    let tree = t
+        .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
         .trim()
         .to_string();
-    let human = git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
+    let human = t
+        .git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
         .trim()
         .to_string();
 
@@ -707,13 +710,13 @@ fn turn(
         if run.is_finished() {
             break;
         }
-        if let Err(e) = poll_progress(&http, &progress_ref, &human, &mut printed, emit) {
+        if let Err(e) = poll_progress(t, &http, &progress_ref, &human, &mut printed, emit) {
             emit(TurnEvent::Status(format!(
                 "progress poll failed (non-fatal): {e}"
             )));
         }
         // Best-effort by design, like the ref it reads.
-        let _ = poll_status(&http, &status_ref, &human, &mut last_status, emit);
+        let _ = poll_status(t, &http, &status_ref, &human, &mut last_status, emit);
     }
 
     let outcome = run
@@ -725,7 +728,7 @@ fn turn(
             // Show whatever steps did land before the failure, then fail; the
             // conversation ref is untouched (the human commit is harmlessly
             // orphaned — see design/agent-harness.md).
-            let _ = poll_progress(&http, &progress_ref, &human, &mut printed, emit);
+            let _ = poll_progress(t, &http, &progress_ref, &human, &mut printed, emit);
             return Err(format!("turn failed; {refname} was not advanced.\n{e}"));
         }
     };
@@ -742,13 +745,13 @@ fn turn(
     // turn's new objects — a noop fetch would re-download the workspace
     // closure (including the base's whole history) every turn.
     let phase = std::time::Instant::now();
-    fetch_object_negotiated(&turn_hash, &human)?;
+    t.fetch_object_negotiated(&turn_hash, &human)?;
     emit(TurnEvent::PhaseComplete {
         label: "fetching the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
     let mut show_message = true;
-    if let Some(tail) = rev_parse_opt(&format!("{turn_hash}^2"))? {
+    if let Some(tail) = rev_parse_opt(t, &format!("{turn_hash}^2"))? {
         if printed.contains(&tail) {
             show_message = false;
         } else {
@@ -756,9 +759,10 @@ fn turn(
         }
     }
 
-    git_capture(&["update-ref", refname, &turn_hash], None)?;
-    let text = git_capture(&["show", "-s", "--format=%B", &turn_hash], None)?;
-    let short = git_capture(&["rev-parse", "--short", &turn_hash], None)?
+    t.git_capture(&["update-ref", refname, &turn_hash], None)?;
+    let text = t.git_capture(&["show", "-s", "--format=%B", &turn_hash], None)?;
+    let short = t
+        .git_capture(&["rev-parse", "--short", &turn_hash], None)?
         .trim()
         .to_string();
     if show_message {
@@ -804,8 +808,8 @@ fn read_message(message: Option<&str>) -> Result<String, String> {
 }
 
 /// `git rev-parse --verify --quiet <spec>`, `None` when it doesn't resolve.
-fn rev_parse_opt(spec: &str) -> Result<Option<String>, String> {
-    match git_capture(&["rev-parse", "--verify", "--quiet", spec], None) {
+fn rev_parse_opt(t: &GitTransport, spec: &str) -> Result<Option<String>, String> {
+    match t.git_capture(&["rev-parse", "--verify", "--quiet", spec], None) {
         Ok(out) => Ok(Some(out.trim().to_string())),
         Err(_) => Ok(None),
     }
@@ -818,13 +822,14 @@ fn rev_parse_opt(spec: &str) -> Result<Option<String>, String> {
 /// One poll: read the progress ref off the server and print any new steps.
 /// The ref not existing yet (first round still in flight) is normal.
 fn poll_progress(
+    t: &GitTransport,
     http: &HttpTransport,
     progress_ref: &str,
     human: &str,
     printed: &mut HashSet<String>,
     emit: &mut dyn FnMut(TurnEvent),
 ) -> Result<(), String> {
-    let out = git_capture(&["ls-remote", CAOS_REMOTE, progress_ref], None)?;
+    let out = t.git_capture(&["ls-remote", CAOS_REMOTE, progress_ref], None)?;
     let Some(tip) = out.split_whitespace().next().filter(|h| !h.is_empty()) else {
         return Ok(()); // no ref yet
     };
@@ -836,13 +841,14 @@ fn poll_progress(
 /// isn't this turn's human commit is a previous turn's stale status. `last`
 /// tracks the printed blob's hash (same hash = same text = already shown).
 fn poll_status(
+    t: &GitTransport,
     http: &HttpTransport,
     status_ref: &str,
     human: &str,
     last: &mut Option<String>,
     emit: &mut dyn FnMut(TurnEvent),
 ) -> Result<(), String> {
-    let out = git_capture(&["ls-remote", CAOS_REMOTE, status_ref], None)?;
+    let out = t.git_capture(&["ls-remote", CAOS_REMOTE, status_ref], None)?;
     let Some(tip) = out.split_whitespace().next().filter(|h| !h.is_empty()) else {
         return Ok(()); // no ref yet
     };
@@ -1036,10 +1042,10 @@ fn block_text(content: &Value) -> String {
 /// the head. Below a turn commit sits its human turn; below a human turn,
 /// either the previous (agent-authored) turn or the base commit — which ends
 /// the conversation (design/agent-harness.md, "Commit structure").
-fn print_log(name: &str, refname: &str) -> Result<(), String> {
-    let head = rev_parse_opt(refname)?
+fn print_log(t: &GitTransport, name: &str, refname: &str) -> Result<(), String> {
+    let head = rev_parse_opt(t, refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
-    let (turns, _base) = history_from_head(&head)?;
+    let (turns, _base) = history_from_head(t, &head)?;
     for turn in turns {
         println!("── {} {}", turn.short_commit, turn.author);
         println!("{}", turn.message);
@@ -1049,12 +1055,16 @@ fn print_log(name: &str, refname: &str) -> Result<(), String> {
 }
 
 /// Return the clean conversation and the base commit immediately beneath it.
-fn history_from_head(head: &str) -> Result<(Vec<ConversationTurn>, String), String> {
+fn history_from_head(
+    t: &GitTransport,
+    head: &str,
+) -> Result<(Vec<ConversationTurn>, String), String> {
     let mut turns = Vec::new();
     let mut cur = head.to_string();
     let mut prev_was_agent = false;
     loop {
-        let author = git_capture(&["show", "-s", "--format=%an", &cur], None)?
+        let author = t
+            .git_capture(&["show", "-s", "--format=%an", &cur], None)?
             .trim()
             .to_string();
         let is_agent = author == AGENT_AUTHOR;
@@ -1062,10 +1072,12 @@ fn history_from_head(head: &str) -> Result<(Vec<ConversationTurn>, String), Stri
             turns.reverse();
             return Ok((turns, cur)); // the base commit — conversation starts above it
         }
-        let short = git_capture(&["rev-parse", "--short", &cur], None)?
+        let short = t
+            .git_capture(&["rev-parse", "--short", &cur], None)?
             .trim()
             .to_string();
-        let message = git_capture(&["show", "-s", "--format=%B", &cur], None)?
+        let message = t
+            .git_capture(&["show", "-s", "--format=%B", &cur], None)?
             .trim_end()
             .to_string();
         turns.push(ConversationTurn {
@@ -1079,7 +1091,7 @@ fn history_from_head(head: &str) -> Result<(Vec<ConversationTurn>, String), Stri
             },
             message,
         });
-        let Some(parent) = rev_parse_opt(&format!("{cur}^"))? else {
+        let Some(parent) = rev_parse_opt(t, &format!("{cur}^"))? else {
             return Err(format!(
                 "conversation rooted at {cur} has no distinct base commit"
             ));
