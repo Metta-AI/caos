@@ -29,11 +29,12 @@ for d in /cas/args/workspace/tests/*/; do
   [ -e "/cas/args/workspace/tests/$t/cli.sh" ] || continue
   case "$t" in
     cargo-self)
-      # Dogfoods the tree under test: only ITS child carries the workspace,
-      # so source edits re-key cargo-self alone (plus the build, of course).
+      # Dogfoods the tree under test — the PRUNED build tree (what cargo
+      # reads), so only Rust-relevant edits re-key cargo-self, exactly like
+      # the build itself.
       mkdir /tmp/sel/cargo-self
       ln -s "/cas/args/workspace/tests/$t" /tmp/sel/cargo-self/test
-      ln -s /cas/args/workspace /tmp/sel/cargo-self/workspace
+      ln -s /cas/args/build_ws /tmp/sel/cargo-self/workspace
       ;;
     chat-online)
       mkdir /tmp/sel/chat-online

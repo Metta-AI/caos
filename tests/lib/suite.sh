@@ -10,10 +10,21 @@
 # between stages: every step is a continuation the server resolves.
 set -euo pipefail
 
+# The build's input is a PRUNED tree — just what cargo reads — so editing a
+# test's cli.sh (or a doc) never re-keys the build or anything downstream of
+# the bin tree. Symlinks + `caos put` reuse recorded hashes; no bytes move.
+caos get /cas/args/workspace
+mkdir /tmp/build-ws
+for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
+  [ -e "/cas/args/workspace/$e" ] && ln -s "/cas/args/workspace/$e" "/tmp/build-ws/$e"
+done
+caos put /tmp/build-ws /cas/build-ws
+
 cargo=$(caos curry /cas/std/cargo -- --cmd=build \
   "--target:@=/cas/args/target" --profile=release)
 
 fwd=(
+  "--build_ws:@=/cas/build-ws"
   "--workspace:@=/cas/args/workspace"
   "--stage2:@=/cas/args/stage2"
   "--summarize:@=/cas/args/summarize"
@@ -26,4 +37,4 @@ fwd=(
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
 
 stage2=$(caos curry /cas/std/bash -- "--script:@=/cas/args/stage2" "${fwd[@]}")
-caos run-then /cas/args/workspace -- --run="$cargo" --then="$stage2"
+caos run-then /cas/build-ws -- --run="$cargo" --then="$stage2"
