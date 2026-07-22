@@ -93,10 +93,20 @@
         }
         // crossLinkerEnv;
 
-        # Build all workspace dependencies once and cache them separately from
-        # the crates — this is crane's key win for fast incremental rebuilds,
-        # and both binaries below share this single dep build.
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # Build the compute/runtime workspace dependencies once and cache them
+        # separately from the crates. The host-only TUI has its own dependency
+        # build so Crossterm/Ratatui never lengthen worker or server builds.
+        cargoArtifacts = craneLib.buildDepsOnly (
+          commonArgs
+          // { cargoExtraArgs = "--workspace --exclude caos-tui"; }
+        );
+        tuiCargoArtifacts = craneLib.buildDepsOnly (
+          commonArgs
+          // {
+            cargoExtraArgs = "--package caos-tui";
+            pname = "caos-tui-deps";
+          }
+        );
 
         # One member of the workspace. `--package` scopes the build so each
         # output contains only that crate's binary (keeps each image minimal).
@@ -117,6 +127,15 @@
         # `caos-cli` (user-facing). crateBin builds the package, so both land in
         # the output's /bin; consumers pick the one they need.
         caos = crateBin "caos";
+        caos-tui-static = craneLib.buildPackage (
+          commonArgs
+          // {
+            cargoArtifacts = tuiCargoArtifacts;
+            cargoExtraArgs = "--package caos-tui";
+            pname = "caos-tui";
+            doCheck = false;
+          }
+        );
         server = crateBin "server";
         runnerd = crateBin "runnerd";
         worker-hello = crateBin "worker-hello";
@@ -696,9 +715,20 @@
         nativeArgs = {
           inherit src;
           strictDeps = true;
-          pname = "caos-cli";
+          pname = "caos-host-tools";
           version = "0.1.0";
         };
+        nativeCliArtifacts = craneLib.buildDepsOnly (
+          nativeArgs
+          // { cargoExtraArgs = "--package caos --bin caos-cli"; }
+        );
+        nativeTuiArtifacts = craneLib.buildDepsOnly (
+          nativeArgs
+          // {
+            cargoExtraArgs = "--package caos-tui";
+            pname = "caos-tui-deps";
+          }
+        );
         # Installed under both names: `caos` is what a person types (`caos talk`),
         # `caos-cli` stays for scripts and docs that spell it out. (No collision
         # with the worker-side `caos` binary — that one is baked into images and
@@ -714,10 +744,29 @@
             craneLib.buildPackage (
               nativeArgs
               // {
-                cargoArtifacts = craneLib.buildDepsOnly nativeArgs;
+                cargoArtifacts = nativeCliArtifacts;
                 cargoExtraArgs = "--package caos --bin caos-cli";
+                pname = "caos-cli";
                 doCheck = false;
                 postInstall = "ln -s caos-cli $out/bin/caos";
+              }
+            );
+
+        # Full-screen conversation client. Keep it in its own crate so Ratatui
+        # and Crossterm never enter the worker-side `caos` binary's dependency
+        # closure. Like caos-cli, it must run on the host rather than in Linux
+        # worker images.
+        caos-tui =
+          if pkgs.stdenv.hostPlatform.isLinux then
+            caos-tui-static
+          else
+            craneLib.buildPackage (
+              nativeArgs
+              // {
+                cargoArtifacts = nativeTuiArtifacts;
+                cargoExtraArgs = "--package caos-tui";
+                pname = "caos-tui";
+                doCheck = false;
               }
             );
 
@@ -739,6 +788,7 @@
           name = "caos-tools";
           paths = [
             caos-cli
+            caos-tui
             caosd
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ runnerd ];
@@ -986,7 +1036,7 @@
       {
         packages = {
           default = caos;
-          inherit caos server runnerd caos-cli caosd caos-tools;
+          inherit caos server runnerd caos-cli caos-tui caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
