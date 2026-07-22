@@ -25,11 +25,10 @@ caos get /cas/args/workspace/tests/lib
 caos get /cas/args/workspace/caos-tools
 LIB=/cas/args/workspace/tests/lib
 
-# The build's input is a PRUNED tree — just what cargo reads — so editing a
-# test's cli.sh (or a doc) never re-keys the build or anything downstream of
-# the bin tree. Symlinks + `caos put` reuse recorded hashes; no bytes move.
-# (build.sh prunes again — idempotently — so a tool call over the FULL tree
-# still lands its cargo jobs on these same keys.)
+# The pruned tree — just what cargo reads — feeds the wrapper tests
+# (cargo-self, unit), whose jobs must not re-key on non-Rust edits. The
+# build worker prunes identically inside itself, so its cargo jobs land on
+# the same keys whether fired here, by a host runner, or by an agent.
 mkdir /tmp/build-ws
 for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
   [ -e "/cas/args/workspace/$e" ] && ln -s "/cas/args/workspace/$e" "/tmp/build-ws/$e"
@@ -37,8 +36,7 @@ done
 caos put /tmp/build-ws /cas/build-ws
 
 build=$(caos curry /cas/std/bash -- \
-  "--script:@=/cas/args/workspace/caos-tools/build.sh" \
-  "--strip:@=$LIB/strip-bins.sh")
+  "--script:@=/cas/args/workspace/caos-tools/build.sh")
 
 fwd=(
   "--build_ws:@=/cas/build-ws"
@@ -48,4 +46,4 @@ fwd=(
 [ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
 
 stage2=$(caos curry /cas/std/bash -- "--script:@=$LIB/suite-stage2.sh" "${fwd[@]}")
-caos run-then /cas/build-ws -- --run="$build" --then="$stage2"
+caos run-then /cas/args/workspace -- --run="$build" --then="$stage2"

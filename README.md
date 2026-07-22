@@ -534,29 +534,31 @@ loop (`tilt up` rebuilds an image when its sources change; UI at
 `http://localhost:10350`), but `caosd` is the supported way to run the stack and
 tilt is slated for removal.
 
-The test suite runs IN caos: `tests/run.sh` fires one suite job against the
-running stack (it never starts or restarts the stack — `caosd up` that
-yourself, once) and prints its report. The suite worker builds the workspace
-with `std/cargo`, builds the worker images from the caos-built binaries,
-fans out one job per `tests/<name>/cli.sh`, and summarizes. Every level is
-cached: an unchanged test never re-runs, a warm unchanged suite is one
-cache hit (~1s), and editing one test re-runs only its job (~7s).
+Building and testing run IN caos, as tools: `caos-tools/*.sh` are worker
+scripts (the same ones an LLM agent invokes), and `./run-tool` fires one as
+a caos job over this repo's tree against the running stack (it never
+starts or restarts the stack — `caosd up` that yourself, once). Every
+level is cached: an unchanged test never re-runs, a warm unchanged suite
+is one cache hit (~1s), and editing one test re-runs only its job.
 
 ```bash
-tests/run.sh                  # the whole suite, as one cached caos job
-tests/run.sh symlinks         # just this test (its job shares the cache
-                              # with full runs, both directions)
-CAOS_SALT=$(date +%s) \
-  tests/run.sh                # force a re-run (e.g. to retry a flake)
+./run-tool caos-tools/build.sh      # compile + link, per-crate, cached
+./run-tool caos-tools/test.sh       # build + the whole test suite
+./run-tool test --only="unit rgrep" # just these tests (cache shared
+                                    # with full runs, both directions)
+CAOS_SALT=$(date +%s) ./run-tool test   # force a re-run (retry a flake)
 ```
 
-A test is a directory `tests/<name>/` with a `cli.sh`, which runs inside a
-testenv worker, cwd'd into a client repo with the test tree at `./test` and
-`$CAOS_CLI` set, driving computations through `caos-cli` against a nested
-caos stack built from your edited tree. New tests are picked up
-automatically. Results — every test's verdict, full output, and the inner
-stack's logs — land as a git tree pinned on the server and checked out
-under `.caos-dev/run-all/suite/`.
+The test tool runs the suite worker (`tests/lib/suite.sh`, carried by this
+tree): build the workspace via `caos-tools/build.sh`, build the worker
+images from the caos-built binaries, fan out one job per
+`tests/<name>/cli.sh`, summarize. A test is a directory `tests/<name>/`
+with a `cli.sh`, which runs inside a testenv worker, cwd'd into a client
+repo with the test tree at `./test` and `$CAOS_CLI` set, driving
+computations through `caos-cli` against a nested caos stack built from
+your edited tree. New tests are picked up automatically. Results — every
+test's verdict, full output, and the inner stack's logs — land as a git
+tree pinned on the server and checked out under `.caos-dev/tool-test/`.
 
 ## Notes
 
