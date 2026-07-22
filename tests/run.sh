@@ -16,8 +16,10 @@
 # to force a re-run (e.g. to retry a flaky failure — failed verdicts are
 # values and cache like results).
 #
-# Host nix remains only for the CLI, the stack itself, and the cargo
-# toolchain image (phase D2 folds that too).
+# Nothing is built on the host: the client is the installed one (like the
+# stack, it's the old, known-good caos — a deploy artifact), and everything
+# under test — binaries, worker images, the toolchain bake — is built by
+# caos jobs from the workspace tree. No nix in the test path at all.
 #
 # Usage: tests/run.sh [name...]   Exits non-zero if any test fails.
 # With names, the suite job runs just those tests (a filtered suite caches
@@ -31,9 +33,18 @@ for t in "${ONLY[@]}"; do
   [ -f "tests/$t/cli.sh" ] || { echo "no such test: tests/$t/cli.sh" >&2; exit 2; }
 done
 
-echo "building caos client..." >&2
-nix build .#caos-cli -o result-caos || exit 1
-export CAOS_CLI=$PWD/result-caos/bin/caos-cli
+# The client, like the stack, is part of the OLD, known-good caos — it only
+# fires the suite job, and is REQUIRED, never built from the edited tree
+# (the edited client is built and exercised INSIDE the suite: every test
+# drives /pt/caos-cli from the caos-built bins). Take it from $CAOS_CLI or
+# PATH (the devshell provides one).
+CAOS_CLI=${CAOS_CLI:-$(command -v caos-cli || true)}
+[ -n "$CAOS_CLI" ] || {
+  echo "tests/run.sh: no caos-cli on PATH (and CAOS_CLI unset)." >&2
+  echo "get the stack's client, e.g.: nix develop   (or nix build .#caos-cli)" >&2
+  exit 1
+}
+export CAOS_CLI
 
 # The tester does NOT start, update, or restart the stack: the stack is
 # where agents (and their conversations) live, and it embodies the OLD,
