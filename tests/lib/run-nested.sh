@@ -152,13 +152,20 @@ if [ -e /cas/args/in/api_key ]; then
 fi
 cp -r "$TEST" ./test
 git add -A && git commit -qm testtree
+mkdir /tmp/res
 if CAOS_CLI=/pt/caos-cli CAOS_SERVER_URL=$INNER bash test/cli.sh >/tmp/test.out 2>&1; then
-  echo "RUN-TEST: PASS" > /tmp/verdict
+  echo "RUN-TEST: PASS" > /tmp/res/verdict
 else
-  {
-    echo "RUN-TEST: FAIL"
-    tail -60 /tmp/test.out
-  } > /tmp/verdict
+  echo "RUN-TEST: FAIL" > /tmp/res/verdict
 fi
 cat /tmp/test.out >&2
-caos put /tmp/verdict /cas/out
+
+# The COMPLETE record rides in the result tree — the test's full output and
+# the inner stack's logs — so the suite result (a git tree on the host's
+# caosd) holds everything a debugger, human or agent, would want to read.
+# No streaming, no archaeology: address the byte you need by path.
+cp /tmp/test.out /tmp/res/output
+for log in server runnerd redis; do
+  [ -e "/tmp/$log.log" ] && cp "/tmp/$log.log" "/tmp/res/$log.log"
+done
+caos put /tmp/res /cas/out

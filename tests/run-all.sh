@@ -96,7 +96,7 @@ extra=()
 [ "${#ONLY[@]}" -gt 0 ] && extra+=(--only="${ONLY[*]}")
 
 echo "== firing the suite job ==" >&2
-CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
+suite_hash=$(CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
   --script:@=tests/lib/suite.sh \
   --stage2:@=tests/lib/suite-stage2.sh \
   --summarize:@=tests/lib/suite-summarize.sh \
@@ -104,14 +104,19 @@ CAOS_SALT="${CAOS_SALT:-}" "$CAOS_CLI" run /cas/std/bash "$OUT/suite" -- \
   --workspace:@=. \
   --target="$(uname -m)-unknown-linux-musl" \
   --runner_image="$RUNNER_REF" --bash_image="$BASH_REF" \
-  --cargo_image="$CARGO_REF" "${extra[@]}" >/dev/null \
+  --cargo_image="$CARGO_REF" "${extra[@]}") \
   || { echo "suite job failed" >&2; exit 1; }
 
 echo >&2
 cat "$OUT/suite/report" >&2
-# A failing test's verdict carries its cli.sh output tail — show it.
-for v in "$OUT"/suite/verdicts/*; do
-  grep -q "^RUN-TEST: PASS" "$v" && continue
-  { echo; echo "---- tests/$(basename "$v") ----"; sed 1d "$v"; } >&2
+# The COMPLETE record — every test's full output + inner-stack logs — is the
+# suite result's `results/` tree, checked out under $OUT/suite and pinned on
+# the server (the printed hash). Show a failing test's output tail here.
+echo "  full results: $OUT/suite/results ($suite_hash)" >&2
+for r in "$OUT"/suite/results/*/; do
+  t=$(basename "$r")
+  grep -q "^RUN-TEST: PASS" "$r/verdict" && continue
+  { echo; echo "---- tests/$t (output tail; full record in results/$t) ----"
+    tail -40 "$r/output"; } >&2
 done
 grep -q "^SUITE OK" "$OUT/suite/report"
