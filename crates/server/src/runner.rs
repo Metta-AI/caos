@@ -12,10 +12,10 @@
 //!
 //! [`dispatch`] is the compute pipeline's entry: it enqueues the job, waits on
 //! a per-dispatch channel, and handles the two timeouts — a job no runner
-//! claims fails 503 after [`PENDING_TIMEOUT`]; a claimed job whose result
-//! never arrives is requeued under a fresh nonce after [`JOB_DEADLINE`]
-//! (results are memoized and workers deterministic, so a spurious re-run is
-//! wasted work, never a wrong answer).
+//! claims fails 503 after [`pending_timeout`]. A claimed job has NO execution
+//! deadline: it runs until its result arrives (a forced requeue would race a
+//! fresh worker against the still-running one; dead-worker detection is
+//! future work).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc;
@@ -43,11 +43,6 @@ fn pending_timeout() -> Duration {
             .unwrap_or(60)
     }))
 }
-
-/// How long a claimed job may run before it's requeued under a fresh nonce.
-/// Generous: long compiles are real, and determinism makes a spurious re-run
-/// wasteful rather than wrong.
-const JOB_DEADLINE: Duration = Duration::from_secs(600);
 
 /// A poll stops matching this close to its TTL, so a job isn't handed to a
 /// connection the runner is about to abandon. Proportional for short polls
@@ -107,8 +102,12 @@ enum Phase {
         /// While set (and in the future), only polls with ≥1 required key match.
         defer_generic_until: Option<Instant>,
     },
-    /// Handed to a runner; a result must arrive by `deadline` or it's requeued.
-    Inflight { deadline: Instant },
+    /// Handed to a runner; runs until its result arrives. No execution
+    /// deadline: a deadline + forced requeue races a fresh worker against the
+    /// still-running one (nothing kills the old container), and duplicate
+    /// 20-core bakes ground the machine — dead-worker detection is future
+    /// work, likely leases.
+    Inflight,
 }
 
 /// One dispatched job, from enqueue to result.
@@ -186,7 +185,9 @@ fn payload(job: &Job) -> String {
         "req": job.req,
         "nonce": job.nonce,
         "image_ref": job.image_ref,
-        "deadline_ms": JOB_DEADLINE.as_millis() as u64,
+        // No execution deadline (see Phase::Inflight); 0 kept for payload
+        // shape compatibility.
+        "deadline_ms": 0,
     });
     if let Some(token) = token() {
         body["token"] = serde_json::Value::String(token);
@@ -233,9 +234,16 @@ pub(crate) fn dispatch(
         let wait = {
             let st = lock();
             match st.jobs.get(&id).map(|j| &j.phase) {
-                Some(Phase::Pending { deadline, .. }) | Some(Phase::Inflight { deadline }) => {
+                Some(Phase::Pending { deadline, .. }) => {
                     deadline.saturating_duration_since(Instant::now())
                 }
+                // Claimed: no deadline — wait on the channel in long chunks.
+                // A claimed job runs until its result arrives, however long
+                // (an execution deadline + requeue spawns a RACER against the
+                // still-running worker — duplicate 20-core bakes ground this
+                // machine to a halt; dead-worker detection is future work,
+                // likely leases).
+                Some(Phase::Inflight) => Duration::from_secs(3600),
                 // Job already resolved and removed: the outcome is in the channel.
                 None => Duration::ZERO,
             }
@@ -263,13 +271,6 @@ pub(crate) fn dispatch(
                                 pending_timeout()
                             ),
                         ));
-                    }
-                    Phase::Inflight { deadline } if now >= deadline => {
-                        eprintln!(
-                            "runner: job {} (req {}) missed its deadline; requeueing",
-                            id, job.req
-                        );
-                        requeue(&mut st, id, None);
                     }
                     // Deadline moved (claimed or requeued meanwhile): re-wait.
                     _ => {}
@@ -356,9 +357,7 @@ fn offer_job(st: &mut State, id: u64) {
 /// Hand job `id` to a poll: mark it inflight and answer the poll.
 fn claim(st: &mut State, id: u64, reply: &mpsc::Sender<PollReply>) {
     let job = st.jobs.get_mut(&id).expect("job present under lock");
-    job.phase = Phase::Inflight {
-        deadline: Instant::now() + JOB_DEADLINE,
-    };
+    job.phase = Phase::Inflight;
     let body = payload(job);
     let _ = reply.send(PollReply::Job(body));
 }
@@ -437,7 +436,7 @@ fn best_pending(st: &State, required: &ArgSet) -> Option<u64> {
                 defer_generic_until,
                 ..
             } => !(required.is_empty() && defer_generic_until.is_some_and(|until| until > now)),
-            Phase::Inflight { .. } => false,
+            Phase::Inflight => false,
         })
         .filter(|(_, job)| matches(required, &job.arg_entries))
         .min_by_key(|(_, job)| job.enqueued)

@@ -72,7 +72,7 @@ The job payload is the rendezvous ids plus only what the runner can't derive:
 {
   "req": "<reqHash>", "nonce": "<hex>",
   "image_ref": "<docker ref>",
-  "deadline_ms": 600000,
+  "deadline_ms": 0,
   "token": "<runner token>"
 }
 ```
@@ -124,9 +124,16 @@ Details:
 
 - **TTL margin**: a poll stops matching in its last ~1s, so a job isn't handed
   to a connection the runner is abandoning.
-- **Job deadline**: no result by `deadline_ms` → requeue under a fresh
-  nonce. Determinism makes a spurious re-run wasteful, never wrong, so the
-  deadline can be generous (default ~10 min).
+- **No job deadline** (2026-07-22): a claimed job runs until its result
+  arrives; `deadline_ms` is always 0 (kept for payload shape). The earlier
+  deadline-plus-requeue presumed a slow worker dead and raced a fresh one
+  against it — nothing killed the old container, so duplicate long jobs
+  (20-core toolchain bakes) compounded until the machine thrashed.
+  "Spurious re-runs are wasteful, never wrong" is only survivable when the
+  waste is small. Dead-worker detection is future work, likely leases
+  (liveness from the worker's own server traffic, never inferred from
+  slowness). The *voluntary* requeue (`requeue: true` — the provisioning
+  handoff) is unaffected.
 - **Pending deadline**: a job no poll and no lineage can serve waits for new
   capacity, then fails 503 after a dispatch timeout (~60s).
 - **No worker-slot semaphore on this path**: capacity is runner-side.
