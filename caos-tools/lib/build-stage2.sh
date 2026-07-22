@@ -13,15 +13,33 @@ set -euo pipefail
 
 caos get /cas/args/result
 caos get /cas/args/result/exit
+# A compile failure is a VALUE, not a job error: the artifact tree becomes
+# {report} carrying the diagnostics, so `run-tool build` prints WHY it failed
+# (and the suite's stage 3 sees the missing bin/ and reports the build
+# failure instead of fanning out tests). Same "failures are values" contract
+# as the test verdicts.
+fail_report() { # <headline>  (diagnostics on /cas/args/result/{stdout,stderr})
+  caos get /cas/args/result/stdout 2>/dev/null || true
+  caos get /cas/args/result/stderr 2>/dev/null || true
+  mkdir -p /tmp/art
+  {
+    echo "BUILD FAILED: $1"
+    echo
+    for s in stdout stderr; do
+      if [ -s "/cas/args/result/$s" ]; then
+        echo "── $s ──"
+        tail -80 "/cas/args/result/$s"
+      fi
+    done
+  } > /tmp/art/report
+  caos put /tmp/art /cas/out
+  exit 0
+}
 if [ "$(cat /cas/args/result/exit)" != 0 ]; then
-  caos get /cas/args/result/stderr || true
-  tail -60 /cas/args/result/stderr >&2 || true
-  echo "BUILD: workspace compile failed" >&2
-  exit 1
+  fail_report "workspace compile failed"
 fi
 if [ ! -e /cas/args/result/bin ]; then
-  echo "BUILD: compile succeeded but staged no bin tree" >&2
-  exit 1
+  fail_report "compile succeeded but staged no bin tree"
 fi
 caos get /cas/args/result/bin
 caos get /cas/args/workspace

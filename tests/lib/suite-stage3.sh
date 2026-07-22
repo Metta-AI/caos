@@ -12,6 +12,16 @@
 set -euo pipefail
 
 caos get /cas/args/result
+# A failed build (see build-stage2.sh) is an artifact tree with a `report`
+# and no `bin/`: surface it as the suite result, no tests to run.
+if [ ! -e /cas/args/result/bin ]; then
+  caos get /cas/args/result/report 2>/dev/null || true
+  mkdir -p /tmp/rep
+  { echo "SUITE FAILED: build failed"; echo
+    cat /cas/args/result/report 2>/dev/null || true; } > /tmp/rep/report
+  caos put /tmp/rep /cas/out
+  exit 0
+fi
 caos get /cas/args/result/images
 caos get /cas/args/workspace
 caos get /cas/args/workspace/tests
