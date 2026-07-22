@@ -302,20 +302,28 @@ git remote add caos http://localhost:9090
 Start the full-screen client from that working tree with:
 
 ```bash
-caos-tui                    # continue the most recent conversation
-caos-tui --new              # choose the next free talk-N name
-caos-tui -c review-api      # continue or create a named conversation
+caos-tui                     # continue the most recent conversation
+caos-tui --new               # start a fresh conversation
+caos-tui --from 5ec3751      # branch from a completed turn
 ```
 
 `Enter` sends, `Alt+Enter` or `Ctrl+J` inserts a newline, `F2` switches between
-chat and the workspace diff, `F6` selects the next local conversation,
-`Ctrl+N` starts a new one, `Ctrl+A` reviews and then applies the conversation
-patch, and `Ctrl+C` exits. Agent workspaces remain virtual commit trees: opening
-the TUI never overwrites a working checkout, and applying requires a second
-keypress plus a clean working tree. API responses currently arrive one
-completed LLM round at a time, and the backend does not yet provide reliable
-cancellation for a running turn; both limitations are stated in the UI rather
-than simulated client-side.
+chat and the workspace diff, `F3` expands or collapses the live activity strip
+above the prompt, `Ctrl+A` reviews and then applies the conversation patch, and
+`Ctrl+C` exits. `PageUp`/`PageDown` and the mouse wheel scroll by rendered rows,
+including wrapped text. Completed user and agent turns show their branchable
+hashes in the transcript; enter `/from <turn-hash>` to start fresh from one
+without leaving the TUI. Activity entries also show their durable internal step
+hashes for inspection, but those step trees contain harness metadata and are not
+branch points.
+
+The interface presents one active conversation rather than exposing the
+internal `talk-N` ref used to persist it. Agent workspaces remain virtual commit
+trees: opening the TUI never overwrites a working checkout, and applying
+requires a second keypress plus a clean working tree. API responses currently
+arrive one completed LLM round at a time, and the backend does not yet provide
+reliable cancellation for a running turn; both limitations are stated in the UI
+rather than simulated client-side.
 
 ### The CAS and `/cas`
 

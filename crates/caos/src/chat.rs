@@ -109,11 +109,13 @@ pub enum TurnEvent {
     Status(String),
     AssistantText(String),
     ToolCall {
+        step_commit: String,
         tool_use_id: String,
         name: String,
         summary: String,
     },
     ToolResult {
+        step_commit: String,
         tool_use_id: String,
         is_error: bool,
         content: String,
@@ -947,7 +949,7 @@ fn drain_steps(
         }
     }
     for (hash, step) in chain.into_iter().rev() {
-        emit_step(&step, suppress_text == Some(hash.as_str()), emit);
+        emit_step(&step, &hash, suppress_text == Some(hash.as_str()), emit);
         printed.insert(hash);
     }
     Ok(())
@@ -1006,13 +1008,19 @@ fn step_json(http: &HttpTransport, tree: &str) -> Result<Value, String> {
 }
 
 /// Decode one durable step into frontend events. Thinking blocks stay private.
-fn emit_step(step: &Value, suppress_text: bool, emit: &mut dyn FnMut(TurnEvent)) {
+fn emit_step(
+    step: &Value,
+    step_commit: &str,
+    suppress_text: bool,
+    emit: &mut dyn FnMut(TurnEvent),
+) {
     if let Some(results) = step["results"].as_array() {
         for result in results {
             let tool_use_id = result["tool_use_id"].as_str().unwrap_or("?").to_string();
             let is_error = result["is_error"].as_bool().unwrap_or(false);
             let content = block_text(&result["content"]);
             emit(TurnEvent::ToolResult {
+                step_commit: step_commit.to_string(),
                 tool_use_id,
                 is_error,
                 content,
@@ -1049,6 +1057,7 @@ fn emit_step(step: &Value, suppress_text: bool, emit: &mut dyn FnMut(TurnEvent))
                     other => format!("[tool call: {other}]"),
                 };
                 emit(TurnEvent::ToolCall {
+                    step_commit: step_commit.to_string(),
                     tool_use_id: block["id"].as_str().unwrap_or("?").to_string(),
                     name: name.to_string(),
                     summary,
@@ -1158,17 +1167,21 @@ mod tests {
             ]
         });
         let mut events = Vec::new();
-        emit_step(&step, false, &mut |event| events.push(event));
+        emit_step(&step, "1234567890abcdef", false, &mut |event| {
+            events.push(event)
+        });
         assert_eq!(
             events,
             vec![
                 TurnEvent::ToolResult {
+                    step_commit: "1234567890abcdef".to_string(),
                     tool_use_id: "tool-0".to_string(),
                     is_error: false,
                     content: "exit: 0\nstdout:\nok".to_string(),
                 },
                 TurnEvent::AssistantText("working".to_string()),
                 TurnEvent::ToolCall {
+                    step_commit: "1234567890abcdef".to_string(),
                     tool_use_id: "tool-1".to_string(),
                     name: "bash".to_string(),
                     summary: "$ cargo test".to_string(),
@@ -1188,10 +1201,13 @@ mod tests {
             "content": [{"type": "text", "text": "final answer"}]
         });
         let mut events = Vec::new();
-        emit_step(&step, true, &mut |event| events.push(event));
+        emit_step(&step, "abcdef1234567890", true, &mut |event| {
+            events.push(event)
+        });
         assert_eq!(
             events,
             vec![TurnEvent::ToolResult {
+                step_commit: "abcdef1234567890".to_string(),
                 tool_use_id: "tool-1".to_string(),
                 is_error: true,
                 content: "failed".to_string(),

@@ -255,15 +255,19 @@ Two verbs and a full-screen client over one turn engine (implemented —
   piped stdin the whole of it is one prompt.
 - **`caos-cli chat <name> [-m <message>]`** — the explicit, scriptable
   one-turn form (message from `-m` or stdin).
-- **`caos-tui [-c <name> | --new]`** — a Ratatui/Crossterm client in its own
-  crate. It consumes structured `TurnEvent`s from the same engine, reconstructs
-  durable history from the conversation ref, shows live status/tool activity,
-  accepts multiline prompts, and renders the accumulated base-to-head
-  workspace diff. Applying that virtual diff takes an explicit double
-  `Ctrl+A`, requires a clean host checkout, and first runs `git apply --check`;
-  merely opening the TUI never mutates the checkout. Progress remains one
-  completed API round at a time, and a running turn is not cancellable until
-  the server/runner protocol grows cancellation.
+- **`caos-tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
+  own crate. It consumes structured `TurnEvent`s from the same engine,
+  reconstructs durable history from the conversation ref, and presents one
+  active conversation without exposing the internal ref name. Live status and
+  tool activity sit in a collapsible strip above the multiline prompt; each
+  activity carries its durable step hash, while completed transcript turns show
+  the clean hashes accepted by `--from` and the in-session `/from <turn>`
+  command. Chat and diff scrolling count wrapped visual rows and accept both
+  page keys and the mouse wheel. Applying the virtual base-to-head diff takes an
+  explicit double `Ctrl+A`, requires a clean host checkout, and first runs
+  `git apply --check`; merely opening the TUI never mutates the checkout.
+  Progress remains one completed API round at a time, and a running turn is not
+  cancellable until the server/runner protocol grows cancellation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>` (in
