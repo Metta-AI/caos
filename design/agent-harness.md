@@ -257,15 +257,20 @@ Two verbs and a full-screen client over one turn engine (implemented —
   one-turn form (message from `-m` or stdin).
 - **`caos-tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
   own crate. It consumes structured `TurnEvent`s from the same engine,
-  reconstructs durable history from the conversation ref, and presents one
-  active conversation without exposing the internal ref name. Live status and
+  reconstructs durable history from conversation refs, and presents independent
+  virtual conversations in a left sidebar. Every conversation retains its own
+  transcript, prompt, activity, diff, and running worker thread, so turns can
+  advance concurrently while the user switches between them. Live status and
   tool activity sit in a collapsible strip above the multiline prompt; each
   activity carries its durable step hash, while completed transcript turns show
   the clean hashes accepted by `--from` and the in-session `/from <turn>`
   command. Chat and diff scrolling count wrapped visual rows and accept both
-  page keys and the mouse wheel. Applying the virtual base-to-head diff takes an
+  page keys and the mouse wheel. Loading the virtual base-to-head diff takes an
   explicit double `Ctrl+A`, requires a clean host checkout, and first runs
-  `git apply --check`; merely opening the TUI never mutates the checkout.
+  `git apply --check`. Double `Ctrl+P` publishes the selected workspace without
+  checking it out: it advances a clean `caos/<conversation>` snapshot branch,
+  pushes to `origin`, and opens or finds its PR through `gh`. Merely opening,
+  running, switching, or publishing conversations never mutates the checkout.
   Progress remains one completed API round at a time, and a running turn is not
   cancellable until the server/runner protocol grows cancellation.
 

@@ -1,4 +1,6 @@
 use std::io::{self, IsTerminal};
+use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -22,6 +24,7 @@ use ratatui_crossterm::crossterm::terminal::{
 use ratatui_crossterm::CrosstermBackend;
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
+use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 const TICK: Duration = Duration::from_millis(50);
@@ -248,13 +251,8 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
         .unwrap_or(end)
 }
 
-enum UiMessage {
-    Turn(TurnEvent),
-    Failed(String),
-}
-
-struct App {
-    conversation: String,
+struct ConversationState {
+    name: String,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
@@ -262,11 +260,90 @@ struct App {
     composer: Composer,
     status: String,
     running: bool,
+    publishing: bool,
+    scroll_from_bottom: usize,
+}
+
+impl ConversationState {
+    fn new(name: String, turn_options: TurnOptions, status: String) -> Self {
+        Self {
+            name,
+            turn_options,
+            transcript: Vec::new(),
+            activities: Vec::new(),
+            diff: None,
+            composer: Composer::default(),
+            status,
+            running: false,
+            publishing: false,
+            scroll_from_bottom: 0,
+        }
+    }
+
+    fn reload(&mut self) {
+        match conversation_history(&self.name) {
+            Ok(turns) => {
+                self.transcript = turns
+                    .into_iter()
+                    .map(|turn| TranscriptEntry {
+                        role: match turn.role {
+                            ConversationRole::Human => EntryRole::Human,
+                            ConversationRole::Agent => EntryRole::Agent,
+                        },
+                        commit: Some(turn.commit),
+                        text: turn.message,
+                    })
+                    .collect();
+                self.diff = conversation_workspace_diff(&self.name).ok();
+            }
+            Err(_) => {
+                self.transcript.clear();
+                self.diff = None;
+            }
+        }
+        self.scroll_from_bottom = 0;
+    }
+
+    fn current_hash(&self) -> Option<&str> {
+        self.transcript
+            .iter()
+            .rev()
+            .find_map(|entry| entry.commit.as_deref())
+    }
+
+    fn is_busy(&self) -> bool {
+        self.running || self.publishing
+    }
+}
+
+enum UiMessage {
+    Turn {
+        conversation: String,
+        event: TurnEvent,
+    },
+    Failed {
+        conversation: String,
+        error: String,
+    },
+    Published {
+        conversation: String,
+        result: Result<String, String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfirmAction {
+    Load,
+    Publish,
+}
+
+struct App {
+    conversations: Vec<ConversationState>,
+    selected: usize,
     should_quit: bool,
-    confirm_apply: bool,
+    confirm_action: Option<ConfirmAction>,
     activity_expanded: bool,
     view: View,
-    scroll_from_bottom: usize,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
 }
@@ -284,7 +361,7 @@ impl App {
             args.turn.base = Some(commit);
         }
         let conversations = list_conversations()?;
-        let conversation = choose_conversation(
+        let selected_name = choose_conversation(
             args.conversation.as_deref(),
             args.new_conversation,
             &conversations,
@@ -295,57 +372,52 @@ impl App {
             .as_deref()
             .map(|hash| format!("ready from {}", short_hash(hash)))
             .unwrap_or_else(|| "ready".to_string());
-        let mut app = Self {
-            conversation,
-            turn_options: args.turn,
-            transcript: Vec::new(),
-            activities: Vec::new(),
-            diff: None,
-            composer: Composer::default(),
-            status: initial_status,
-            running: false,
+        let mut states: Vec<ConversationState> = conversations
+            .iter()
+            .map(|summary| {
+                ConversationState::new(summary.name.clone(), args.turn.clone(), "ready".to_string())
+            })
+            .collect();
+        for state in &mut states {
+            state.reload();
+        }
+        if states.iter().all(|state| state.name != selected_name) {
+            states.insert(
+                0,
+                ConversationState::new(selected_name.clone(), args.turn, initial_status),
+            );
+        }
+        let selected = states
+            .iter()
+            .position(|state| state.name == selected_name)
+            .expect("the selected conversation was inserted");
+        Ok(Self {
+            conversations: states,
+            selected,
             should_quit: false,
-            confirm_apply: false,
+            confirm_action: None,
             activity_expanded: false,
             view: View::Chat,
-            scroll_from_bottom: 0,
             tx,
             rx,
-        };
-        app.reload_conversation();
-        Ok(app)
+        })
     }
 
-    fn reload_conversation(&mut self) {
-        match conversation_history(&self.conversation) {
-            Ok(turns) => {
-                self.transcript = turns
-                    .into_iter()
-                    .map(|turn| TranscriptEntry {
-                        role: match turn.role {
-                            ConversationRole::Human => EntryRole::Human,
-                            ConversationRole::Agent => EntryRole::Agent,
-                        },
-                        commit: Some(turn.commit),
-                        text: turn.message,
-                    })
-                    .collect();
-                self.diff = conversation_workspace_diff(&self.conversation).ok();
-            }
-            Err(_) => {
-                self.transcript.clear();
-                self.diff = None;
-            }
-        }
-        self.scroll_from_bottom = 0;
+    fn selected(&self) -> &ConversationState {
+        &self.conversations[self.selected]
+    }
+
+    fn selected_mut(&mut self) -> &mut ConversationState {
+        &mut self.conversations[self.selected]
     }
 
     fn start_turn(&mut self) {
-        if self.running {
-            self.status = "a turn is already running".to_string();
+        if self.selected().is_busy() {
+            self.selected_mut().status =
+                "this conversation already has an operation running".to_string();
             return;
         }
-        let Some(message) = self.composer.take_message() else {
+        let Some(message) = self.selected_mut().composer.take_message() else {
             return;
         };
         if let Some(hash) = message.strip_prefix("/from ").map(str::trim) {
@@ -353,31 +425,40 @@ impl App {
             return;
         }
         if message == "/from" {
-            self.status = "usage: /from <commit>".to_string();
+            self.selected_mut().status = "usage: /from <commit>".to_string();
             return;
         }
-        self.transcript.push(TranscriptEntry {
-            role: EntryRole::Human,
-            commit: None,
-            text: message.clone(),
-        });
-        self.activities.clear();
-        self.running = true;
-        self.status = "starting turn".to_string();
-        self.scroll_from_bottom = 0;
+        {
+            let state = self.selected_mut();
+            state.transcript.push(TranscriptEntry {
+                role: EntryRole::Human,
+                commit: None,
+                text: message.clone(),
+            });
+            state.activities.clear();
+            state.running = true;
+            state.status = "starting turn".to_string();
+            state.scroll_from_bottom = 0;
+        }
 
         let tx = self.tx.clone();
-        let options = self.turn_options.clone();
-        let conversation = self.conversation.clone();
+        let options = self.selected().turn_options.clone();
+        let conversation = self.selected().name.clone();
         std::thread::spawn(move || {
             let result = GitTransport::from_cwd().and_then(|transport| {
                 run_chat_turn(&transport, &options, &conversation, &message, |event| {
-                    let _ = tx.send(UiMessage::Turn(event));
+                    let _ = tx.send(UiMessage::Turn {
+                        conversation: conversation.clone(),
+                        event,
+                    });
                 })
                 .map(|_| ())
             });
             if let Err(error) = result {
-                let _ = tx.send(UiMessage::Failed(error));
+                let _ = tx.send(UiMessage::Failed {
+                    conversation,
+                    error,
+                });
             }
         });
     }
@@ -387,35 +468,68 @@ impl App {
         while let Ok(message) = self.rx.try_recv() {
             changed = true;
             match message {
-                UiMessage::Turn(event) => self.on_turn_event(event),
-                UiMessage::Failed(error) => {
-                    self.running = false;
-                    self.status = "turn failed".to_string();
-                    self.transcript.push(TranscriptEntry {
-                        role: EntryRole::Notice,
-                        commit: None,
-                        text: error,
-                    });
+                UiMessage::Turn {
+                    conversation,
+                    event,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.on_turn_event(index, event);
+                    }
+                }
+                UiMessage::Failed {
+                    conversation,
+                    error,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.running = false;
+                        state.status = "turn failed".to_string();
+                        state.transcript.push(TranscriptEntry {
+                            role: EntryRole::Notice,
+                            commit: None,
+                            text: error,
+                        });
+                    }
+                }
+                UiMessage::Published {
+                    conversation,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.publishing = false;
+                        state.status = match result {
+                            Ok(url) => format!("PR ready: {url}"),
+                            Err(error) => format!("PR failed: {error}"),
+                        };
+                    }
                 }
             }
         }
         changed
     }
 
-    fn on_turn_event(&mut self, event: TurnEvent) {
+    fn conversation_index(&self, name: &str) -> Option<usize> {
+        self.conversations
+            .iter()
+            .position(|state| state.name == name)
+    }
+
+    fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
+        let state = &mut self.conversations[index];
         match event {
             TurnEvent::PhaseComplete {
                 label,
                 elapsed_secs,
-            } => self.status = format!("{label}: {elapsed_secs:.1}s"),
-            TurnEvent::Status(status) => self.status = status,
+            } => state.status = format!("{label}: {elapsed_secs:.1}s"),
+            TurnEvent::Status(status) => state.status = status,
             TurnEvent::AssistantText(text) => {
-                self.transcript.push(TranscriptEntry {
+                state.transcript.push(TranscriptEntry {
                     role: EntryRole::Agent,
                     commit: None,
                     text,
                 });
-                self.scroll_from_bottom = 0;
+                state.scroll_from_bottom = 0;
             }
             TurnEvent::ToolCall {
                 step_commit,
@@ -423,7 +537,7 @@ impl App {
                 summary,
                 ..
             } => {
-                self.activities.push(Activity {
+                state.activities.push(Activity {
                     id: tool_use_id,
                     step_commit,
                     summary,
@@ -437,7 +551,7 @@ impl App {
                 is_error,
                 content,
             } => {
-                if let Some(activity) = self
+                if let Some(activity) = state
                     .activities
                     .iter_mut()
                     .find(|activity| activity.id == tool_use_id)
@@ -449,7 +563,7 @@ impl App {
                     };
                     activity.detail = content;
                 } else {
-                    self.activities.push(Activity {
+                    state.activities.push(Activity {
                         id: tool_use_id.clone(),
                         step_commit,
                         summary: format!("result {tool_use_id}"),
@@ -463,9 +577,9 @@ impl App {
                 }
             }
             TurnEvent::Completed(outcome) => {
-                self.running = false;
-                self.status = format!("completed {}", outcome.short_commit);
-                self.reload_conversation();
+                state.running = false;
+                state.status = format!("completed {}", outcome.short_commit);
+                state.reload();
             }
         }
     }
@@ -478,27 +592,19 @@ impl App {
             self.should_quit = true;
             return;
         }
-        let is_apply =
+        let is_load =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a');
-        if !is_apply {
-            self.confirm_apply = false;
+        let is_publish =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
+        if !is_load && !is_publish {
+            self.confirm_action = None;
         }
-        if is_apply {
-            if self.running {
-                self.status = "finish the running turn before applying changes".to_string();
-            } else if self.diff.as_ref().is_none_or(|diff| diff.patch.is_empty()) {
-                self.status = "there are no conversation changes to apply".to_string();
-            } else if !self.confirm_apply {
-                self.confirm_apply = true;
-                self.status =
-                    "press Ctrl+A again to apply this diff to a clean working tree".to_string();
-            } else {
-                self.confirm_apply = false;
-                match apply_conversation_workspace(&self.conversation) {
-                    Ok(()) => self.status = "workspace changes applied".to_string(),
-                    Err(error) => self.status = error,
-                }
-            }
+        if is_load {
+            self.load_selected();
+            return;
+        }
+        if is_publish {
+            self.publish_selected();
             return;
         }
         if key.code == KeyCode::F(2) {
@@ -506,17 +612,40 @@ impl App {
                 View::Chat => View::Diff,
                 View::Diff => View::Chat,
             };
-            self.scroll_from_bottom = 0;
+            self.selected_mut().scroll_from_bottom = 0;
             return;
         }
         if key.code == KeyCode::F(3) {
             self.activity_expanded = !self.activity_expanded;
             return;
         }
+        if key.code == KeyCode::F(6) {
+            self.select_relative(if key.modifiers.contains(KeyModifiers::SHIFT) {
+                -1
+            } else {
+                1
+            });
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            self.start_new_conversation(None);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Up {
+            self.select_relative(-1);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
+            self.select_relative(1);
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            if !self.running {
-                self.reload_conversation();
-                self.status = "reloaded".to_string();
+            if !self.selected().is_busy() {
+                self.selected_mut().reload();
+                self.selected_mut().status = "reloaded".to_string();
+            } else {
+                self.selected_mut().status =
+                    "finish this conversation's operation before reloading".to_string();
             }
             return;
         }
@@ -529,64 +658,138 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
-                self.composer.insert_char('\n')
+                self.selected_mut().composer.insert_char('\n')
             }
             KeyCode::Enter => self.start_turn(),
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer.insert_char('\n')
+                self.selected_mut().composer.insert_char('\n')
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer.insert_char(ch)
+                self.selected_mut().composer.insert_char(ch)
             }
-            KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Delete => self.composer.delete(),
-            KeyCode::Left => self.composer.move_left(),
-            KeyCode::Right => self.composer.move_right(),
-            KeyCode::Up => self.composer.move_vertical(true),
-            KeyCode::Down => self.composer.move_vertical(false),
-            KeyCode::Home => self.composer.move_home(),
-            KeyCode::End => self.composer.move_end(),
+            KeyCode::Backspace => self.selected_mut().composer.backspace(),
+            KeyCode::Delete => self.selected_mut().composer.delete(),
+            KeyCode::Left => self.selected_mut().composer.move_left(),
+            KeyCode::Right => self.selected_mut().composer.move_right(),
+            KeyCode::Up => self.selected_mut().composer.move_vertical(true),
+            KeyCode::Down => self.selected_mut().composer.move_vertical(false),
+            KeyCode::Home => self.selected_mut().composer.move_home(),
+            KeyCode::End => self.selected_mut().composer.move_end(),
             _ => {}
         }
     }
 
     fn scroll_up(&mut self, rows: usize) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(rows);
+        let state = self.selected_mut();
+        state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(rows);
     }
 
     fn scroll_down(&mut self, rows: usize) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(rows);
+        let state = self.selected_mut();
+        state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(rows);
     }
 
     fn start_from_hash(&mut self, hash: &str) {
-        if self.running {
-            self.status = "finish the running turn before starting from a commit".to_string();
-            return;
-        }
         let resolved = GitTransport::from_cwd()
             .and_then(|transport| transport.resolve_revspec(hash))
             .and_then(|commit| commit.ok_or_else(|| format!("cannot resolve commit {hash:?}")));
         let commit = match resolved {
             Ok(commit) => commit.to_string(),
             Err(error) => {
-                self.status = error;
+                self.selected_mut().status = error;
                 return;
             }
         };
-        let conversations = match list_conversations() {
+        self.start_new_conversation(Some(commit));
+    }
+
+    fn start_new_conversation(&mut self, base: Option<String>) {
+        let disk = match list_conversations() {
             Ok(conversations) => conversations,
             Err(error) => {
-                self.status = error;
+                self.selected_mut().status = error;
                 return;
             }
         };
-        self.conversation = next_auto_name(&conversations);
-        self.turn_options.base = Some(commit.clone());
-        self.activities.clear();
-        self.transcript.clear();
-        self.diff = None;
-        self.scroll_from_bottom = 0;
-        self.status = format!("ready from {}; enter a prompt", short_hash(&commit));
+        let name = next_available_name(&disk, &self.conversations);
+        let mut options = self.selected().turn_options.clone();
+        options.base = base.clone();
+        let status = base
+            .as_deref()
+            .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
+            .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
+        self.conversations
+            .insert(0, ConversationState::new(name, options, status));
+        self.selected = 0;
+        self.view = View::Chat;
+        self.confirm_action = None;
+    }
+
+    fn select_relative(&mut self, amount: isize) {
+        let len = self.conversations.len() as isize;
+        self.selected = (self.selected as isize + amount).rem_euclid(len) as usize;
+        self.confirm_action = None;
+    }
+
+    fn load_selected(&mut self) {
+        if self.selected().is_busy() {
+            self.selected_mut().status =
+                "finish this conversation's operation before loading it".to_string();
+        } else if self
+            .selected()
+            .diff
+            .as_ref()
+            .is_none_or(|diff| diff.patch.is_empty())
+        {
+            self.selected_mut().status = "there are no conversation changes to load".to_string();
+        } else if self.confirm_action != Some(ConfirmAction::Load) {
+            self.confirm_action = Some(ConfirmAction::Load);
+            self.selected_mut().status =
+                "press Ctrl+A again to load this diff into a clean working tree".to_string();
+        } else {
+            self.confirm_action = None;
+            let name = self.selected().name.clone();
+            self.selected_mut().status = match apply_conversation_workspace(&name) {
+                Ok(()) => "conversation loaded into the working tree".to_string(),
+                Err(error) => error,
+            };
+        }
+    }
+
+    fn publish_selected(&mut self) {
+        if self.selected().is_busy() {
+            self.selected_mut().status =
+                "finish this conversation's operation before publishing it".to_string();
+        } else if self
+            .selected()
+            .diff
+            .as_ref()
+            .is_none_or(|diff| diff.patch.is_empty())
+        {
+            self.selected_mut().status = "there are no conversation changes to publish".to_string();
+        } else if self.confirm_action != Some(ConfirmAction::Publish) {
+            self.confirm_action = Some(ConfirmAction::Publish);
+            self.selected_mut().status =
+                "press Ctrl+P again to push a clean branch and open a PR".to_string();
+        } else {
+            self.confirm_action = None;
+            let name = self.selected().name.clone();
+            let diff = self
+                .selected()
+                .diff
+                .clone()
+                .expect("a non-empty diff was checked");
+            self.selected_mut().publishing = true;
+            self.selected_mut().status = "publishing a clean conversation branch".to_string();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let result = publish_conversation_pr(&name, &diff);
+                let _ = tx.send(UiMessage::Published {
+                    conversation: name,
+                    result,
+                });
+            });
+        }
     }
 }
 
@@ -628,6 +831,146 @@ fn next_auto_name(conversations: &[ConversationSummary]) -> String {
     unreachable!("some talk-<n> is always free")
 }
 
+fn next_available_name(disk: &[ConversationSummary], states: &[ConversationState]) -> String {
+    for number in 1.. {
+        let candidate = format!("talk-{number}");
+        if disk.iter().all(|item| item.name != candidate)
+            && states.iter().all(|item| item.name != candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!("some talk-<n> is always free")
+}
+
+/// Publish the virtual workspace as a clean branch without checking it out.
+///
+/// Conversation commits retain their internal step DAG as second parents. A
+/// PR should not expose that implementation history, so the publish branch is
+/// a clean sequence of snapshot commits whose trees match conversation heads.
+fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Result<String, String> {
+    let cwd = Path::new(".");
+    let branch = prepare_publish_branch(name, diff, cwd)?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let push_ref = format!("{branch_ref}:refs/heads/{branch}");
+    capture_required("git", &["push", "--set-upstream", "origin", &push_ref], cwd)?;
+
+    if let Some(url) = capture_optional(
+        "gh",
+        &["pr", "view", &branch, "--json", "url", "--jq", ".url"],
+        cwd,
+    )?
+    .filter(|url| !url.is_empty())
+    {
+        return Ok(url);
+    }
+    let body = format!(
+        "Published from virtual CAOS conversation `{name}` at `{}`.\n\nThe working tree was not modified.",
+        short_hash(&diff.head)
+    );
+    capture_required(
+        "gh",
+        &[
+            "pr",
+            "create",
+            "--head",
+            &branch,
+            "--title",
+            &format!("CAOS conversation {name}"),
+            "--body",
+            &body,
+        ],
+        cwd,
+    )
+}
+
+fn prepare_publish_branch(name: &str, diff: &WorkspaceDiff, cwd: &Path) -> Result<String, String> {
+    let branch = format!("caos/{name}");
+    let branch_ref = format!("refs/heads/{branch}");
+    let head_tree_spec = format!("{}^{{tree}}", diff.head);
+    let head_tree = capture_required("git", &["rev-parse", &head_tree_spec], cwd)?;
+    let previous = capture_optional("git", &["rev-parse", "--verify", &branch_ref], cwd)?;
+    let publish_commit = if let Some(previous) = previous.as_deref() {
+        let previous_tree_spec = format!("{previous}^{{tree}}");
+        let previous_tree = capture_required("git", &["rev-parse", &previous_tree_spec], cwd)?;
+        if previous_tree == head_tree {
+            previous.to_string()
+        } else {
+            capture_required(
+                "git",
+                &[
+                    "commit-tree",
+                    &head_tree,
+                    "-p",
+                    previous,
+                    "-m",
+                    &format!("Update CAOS conversation {name}"),
+                ],
+                cwd,
+            )?
+        }
+    } else {
+        capture_required(
+            "git",
+            &[
+                "commit-tree",
+                &head_tree,
+                "-p",
+                &diff.base,
+                "-m",
+                &format!("CAOS conversation {name}"),
+            ],
+            cwd,
+        )?
+    };
+    match previous.as_deref() {
+        Some(old) if old != publish_commit => {
+            capture_required(
+                "git",
+                &["update-ref", &branch_ref, &publish_commit, old],
+                cwd,
+            )?;
+        }
+        None => {
+            capture_required("git", &["update-ref", &branch_ref, &publish_commit], cwd)?;
+        }
+        _ => {}
+    }
+    Ok(branch)
+}
+
+fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("running {program}: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("{program} exited with {}", output.status)
+        } else {
+            detail
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn capture_optional(program: &str, args: &[&str], cwd: &Path) -> Result<Option<String>, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("running {program}: {error}"))?;
+    if output.status.success() {
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
 fn first_line(text: &str) -> String {
     let line = text
         .lines()
@@ -654,41 +997,66 @@ fn render(app: &App, frame: &mut Frame<'_>) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(6),
-            Constraint::Length(activity_height),
-            Constraint::Length(6),
+            Constraint::Min(12),
             Constraint::Length(1),
         ])
         .split(area);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(26), Constraint::Min(40)])
+        .split(outer[1]);
+    let conversation = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(activity_height),
+            Constraint::Length(6),
+        ])
+        .split(body[1]);
+    let state = app.selected();
 
-    render_header(app, frame, outer[0]);
+    render_header(app, state, frame, outer[0]);
+    render_conversations(app, frame, body[0]);
     match app.view {
-        View::Chat => render_transcript(app, frame, outer[1]),
-        View::Diff => render_diff(app, frame, outer[1]),
+        View::Chat => render_transcript(state, frame, conversation[0]),
+        View::Diff => render_diff(state, frame, conversation[0]),
     }
-    render_activity(app, frame, outer[2]);
-    render_composer(app, frame, outer[3]);
-    render_footer(frame, outer[4]);
+    render_activity(state, app.activity_expanded, frame, conversation[1]);
+    render_composer(state, app.view, frame, conversation[2]);
+    render_footer(frame, outer[2]);
 }
 
-fn render_header(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let state = if app.running { "running" } else { "idle" };
+fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let operation = if state.running {
+        "running"
+    } else if state.publishing {
+        "publishing"
+    } else {
+        "idle"
+    };
     let view = if app.view == View::Chat {
         "chat"
     } else {
         "diff"
     };
+    let running = app
+        .conversations
+        .iter()
+        .filter(|conversation| conversation.running)
+        .count();
     let header = Line::from(vec![
         Span::styled(" caos ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw("  "),
-        Span::styled(state, Style::default().fg(Color::Yellow)),
+        Span::raw(format!("  {}  ", state.name)),
+        Span::styled(operation, Style::default().fg(Color::Yellow)),
         Span::raw(format!("  [{view}]")),
         Span::raw("  "),
         Span::styled(
-            current_hash(app)
+            state
+                .current_hash()
                 .map(|hash| format!("head {}", short_hash(hash)))
                 .or_else(|| {
-                    app.turn_options
+                    state
+                        .turn_options
                         .base
                         .as_deref()
                         .map(|hash| format!("from {}", short_hash(hash)))
@@ -696,26 +1064,66 @@ fn render_header(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .unwrap_or_else(|| "new conversation".to_string()),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled(
+            format!("  {running} running"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     frame.render_widget(Paragraph::new(header), area);
 }
 
-fn current_hash(app: &App) -> Option<&str> {
-    app.transcript
+fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let items: Vec<ListItem<'_>> = app
+        .conversations
         .iter()
-        .rev()
-        .find_map(|entry| entry.commit.as_deref())
+        .map(|state| {
+            let (mark, color) = if state.running {
+                ("*", Color::Yellow)
+            } else if state.publishing {
+                ("^", Color::Cyan)
+            } else {
+                (" ", Color::DarkGray)
+            };
+            let hash = state
+                .current_hash()
+                .or(state.turn_options.base.as_deref())
+                .map(short_hash)
+                .unwrap_or("new");
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::raw(state.name.clone()),
+                Span::styled(format!("  {hash}"), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut selected = ListState::default().with_selected(Some(app.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(" Conversations ")
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut selected,
+    );
 }
 
-fn render_transcript(app: &App, frame: &mut Frame<'_>, area: Rect) {
+fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = Vec::new();
-    if app.transcript.is_empty() {
+    if state.transcript.is_empty() {
         lines.push(Line::styled(
             "No turns yet. Write a prompt below to start.",
             Style::default().fg(Color::DarkGray),
         ));
     }
-    for entry in &app.transcript {
+    for entry in &state.transcript {
         let (label, color) = match entry.role {
             EntryRole::Human => ("You", Color::Cyan),
             EntryRole::Agent => ("Agent", Color::Green),
@@ -736,7 +1144,7 @@ fn render_transcript(app: &App, frame: &mut Frame<'_>, area: Rect) {
         lines.push(Line::raw(""));
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, app.scroll_from_bottom);
+    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
     let paragraph = paragraph
         .block(
             Block::default()
@@ -747,14 +1155,14 @@ fn render_transcript(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_activity(app: &App, frame: &mut Frame<'_>, area: Rect) {
+fn render_activity(state: &ConversationState, expanded: bool, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = Vec::new();
-    if app.activity_expanded {
+    if expanded {
         lines.push(Line::from(vec![
             Span::styled("status  ", Style::default().fg(Color::Yellow)),
-            Span::raw(app.status.clone()),
+            Span::raw(state.status.clone()),
         ]));
-        for item in &app.activities {
+        for item in &state.activities {
             let (mark, color) = activity_mark(item.state);
             lines.push(Line::from(vec![
                 Span::styled(format!("{mark} "), Style::default().fg(color)),
@@ -771,9 +1179,9 @@ fn render_activity(app: &App, frame: &mut Frame<'_>, area: Rect) {
     } else {
         let mut spans = vec![
             Span::styled("status  ", Style::default().fg(Color::Yellow)),
-            Span::raw(app.status.clone()),
+            Span::raw(state.status.clone()),
         ];
-        if let Some(item) = app.activities.last() {
+        if let Some(item) = state.activities.last() {
             let (mark, color) = activity_mark(item.state);
             spans.extend([
                 Span::raw("    "),
@@ -794,7 +1202,7 @@ fn render_activity(app: &App, frame: &mut Frame<'_>, area: Rect) {
         }
         lines.push(Line::from(spans));
     }
-    let title = if app.activity_expanded {
+    let title = if expanded {
         " Activity (F3 collapse) "
     } else {
         " Activity (F3 expand) "
@@ -819,8 +1227,8 @@ fn activity_mark(state: ActivityState) -> (&'static str, Color) {
     }
 }
 
-fn render_diff(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let text = match &app.diff {
+fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let text = match &state.diff {
         Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
         Some(_) => "No workspace changes in this conversation.",
         None => "This conversation has no completed turn yet.",
@@ -841,7 +1249,7 @@ fn render_diff(app: &App, frame: &mut Frame<'_>, area: Rect) {
         })
         .collect();
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, app.scroll_from_bottom);
+    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
     frame.render_widget(
         paragraph
             .block(
@@ -854,22 +1262,24 @@ fn render_diff(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_composer(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let title = if app.running {
+fn render_composer(state: &ConversationState, view: View, frame: &mut Frame<'_>, area: Rect) {
+    let title = if state.running {
         " Prompt (turn running; cancellation is not available) "
+    } else if state.publishing {
+        " Prompt (publishing PR) "
     } else {
         " Prompt (Enter sends, Alt+Enter/Ctrl+J adds a line) "
     };
-    let (row, column) = app.composer.cursor_row_col();
+    let (row, column) = state.composer.cursor_row_col();
     let inner_height = area.height.saturating_sub(2) as usize;
     let vertical_scroll = row.saturating_sub(inner_height.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(app.composer.text.as_str())
+        Paragraph::new(state.composer.text.as_str())
             .block(Block::default().title(title).borders(Borders::ALL))
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         area,
     );
-    if app.view == View::Chat {
+    if view == View::Chat {
         let cursor_row = row.saturating_sub(vertical_scroll);
         let x = area.x.saturating_add(1).saturating_add(column as u16);
         let y = area.y.saturating_add(1).saturating_add(cursor_row as u16);
@@ -881,7 +1291,7 @@ fn render_composer(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect) {
     let footer = Line::raw(
-        " F2 diff  F3 activity  ^A apply  PgUp/Dn or wheel scroll  /from TURN_HASH branch  ^C quit",
+        " F6 chat  ^N new  F2 diff  F3 activity  ^A load  ^P PR  PgUp/Dn scroll  ^C quit",
     );
     frame.render_widget(Paragraph::new(footer), area);
 }
@@ -915,7 +1325,7 @@ fn run_app(
                     changed = true;
                 }
                 TerminalEvent::Paste(text) if app.view == View::Chat => {
-                    app.composer.insert_str(&text);
+                    app.selected_mut().composer.insert_str(&text);
                     changed = true;
                 }
                 TerminalEvent::Mouse(mouse) => match mouse.kind {
@@ -1009,6 +1419,31 @@ mod tests {
         }
     }
 
+    fn state(name: &str) -> ConversationState {
+        ConversationState::new(
+            name.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        )
+    }
+
+    fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            App {
+                conversations,
+                selected: 0,
+                should_quit: false,
+                confirm_action: None,
+                activity_expanded: false,
+                view: View::Chat,
+                tx: tx.clone(),
+                rx,
+            },
+            tx,
+        )
+    }
+
     #[test]
     fn composer_edits_utf8_and_moves_between_lines() {
         let mut composer = Composer::default();
@@ -1040,6 +1475,10 @@ mod tests {
         assert_eq!(
             choose_conversation(Some("named"), false, &conversations).unwrap(),
             "named"
+        );
+        assert_eq!(
+            next_available_name(&conversations, &[state("talk-2")]),
+            "talk-3"
         );
     }
 
@@ -1096,43 +1535,85 @@ mod tests {
     }
 
     #[test]
-    fn full_layout_renders_chat_activity_and_prompt() {
-        let (tx, rx) = mpsc::channel();
-        let mut app = App {
-            conversation: "review-api".to_string(),
-            turn_options: TurnOptions::default(),
-            transcript: vec![
-                TranscriptEntry {
-                    role: EntryRole::Human,
-                    commit: Some("a".repeat(40)),
-                    text: "Please run the tests".to_string(),
-                },
-                TranscriptEntry {
-                    role: EntryRole::Agent,
-                    commit: Some("b".repeat(40)),
-                    text: "Running them now.".to_string(),
-                },
-            ],
-            activities: vec![Activity {
-                id: "tool-1".to_string(),
-                step_commit: "c".repeat(40),
-                summary: "$ cargo test".to_string(),
-                detail: "12 tests passed".to_string(),
-                state: ActivityState::Running,
-            }],
-            diff: None,
-            composer: Composer::default(),
-            status: "calling model".to_string(),
-            running: true,
-            should_quit: false,
-            confirm_apply: false,
-            activity_expanded: false,
-            view: View::Chat,
-            scroll_from_bottom: 0,
-            tx,
-            rx,
+    fn publish_branch_is_a_clean_snapshot_without_checkout_changes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "caos-tui-publish-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        capture_required("git", &["init", "-q"], &dir).unwrap();
+        capture_required("git", &["config", "user.name", "Test User"], &dir).unwrap();
+        capture_required("git", &["config", "user.email", "test@example.com"], &dir).unwrap();
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        capture_required("git", &["add", "file.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "base"], &dir).unwrap();
+        let base = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+        std::fs::write(dir.join("file.txt"), "conversation result\n").unwrap();
+        capture_required("git", &["add", "file.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "internal turn"], &dir).unwrap();
+        let head = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+        let before = std::fs::read_to_string(dir.join("file.txt")).unwrap();
+        let diff = WorkspaceDiff {
+            base: base.clone(),
+            head: head.clone(),
+            stat: String::new(),
+            patch: "changed".to_string(),
         };
-        app.composer.insert_str("follow-up");
+
+        let branch = prepare_publish_branch("publish-test", &diff, &dir).unwrap();
+        assert_eq!(branch, "caos/publish-test");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("file.txt")).unwrap(),
+            before
+        );
+        assert_eq!(
+            capture_required("git", &["rev-parse", "caos/publish-test^{tree}"], &dir,).unwrap(),
+            capture_required("git", &["rev-parse", &format!("{head}^{{tree}}")], &dir).unwrap()
+        );
+        assert_eq!(
+            capture_required("git", &["rev-parse", "caos/publish-test^"], &dir).unwrap(),
+            base
+        );
+        let first = capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
+        prepare_publish_branch("publish-test", &diff, &dir).unwrap();
+        assert_eq!(
+            capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
+            first
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn full_layout_renders_chat_activity_and_prompt() {
+        let mut selected = state("review-api");
+        selected.transcript = vec![
+            TranscriptEntry {
+                role: EntryRole::Human,
+                commit: Some("a".repeat(40)),
+                text: "Please run the tests".to_string(),
+            },
+            TranscriptEntry {
+                role: EntryRole::Agent,
+                commit: Some("b".repeat(40)),
+                text: "Running them now.".to_string(),
+            },
+        ];
+        selected.activities = vec![Activity {
+            id: "tool-1".to_string(),
+            step_commit: "c".repeat(40),
+            summary: "$ cargo test".to_string(),
+            detail: "12 tests passed".to_string(),
+            state: ActivityState::Running,
+        }];
+        selected.status = "calling model".to_string();
+        selected.running = true;
+        selected.composer.insert_str("follow-up");
+        let (mut app, _) = app_with(vec![selected, state("other-chat")]);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
@@ -1143,7 +1624,9 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!rendered.contains("Tasks"));
+        assert!(rendered.contains("Conversations"));
+        assert!(rendered.contains("review-api"));
+        assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
         assert!(rendered.contains("Please run the tests"));
         assert!(rendered.contains("ccccccc"));
@@ -1163,15 +1646,41 @@ mod tests {
             .collect();
         assert!(expanded.contains("12 tests passed"));
 
-        app.running = false;
-        app.diff = Some(WorkspaceDiff {
+        app.selected_mut().running = false;
+        app.selected_mut().diff = Some(WorkspaceDiff {
             base: "a".repeat(40),
             head: "b".repeat(40),
             stat: "1 file changed".to_string(),
             patch: "diff --git a/a b/a".to_string(),
         });
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(app.confirm_apply);
-        assert!(app.status.contains("press Ctrl+A again"));
+        assert_eq!(app.confirm_action, Some(ConfirmAction::Load));
+        assert!(app.selected().status.contains("press Ctrl+A again"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));
+        assert!(app.selected().status.contains("press Ctrl+P again"));
+        assert!(!app.selected().publishing);
+    }
+
+    #[test]
+    fn switching_conversations_keeps_background_turn_state() {
+        let mut first = state("talk-1");
+        first.running = true;
+        first.status = "calling model".to_string();
+        let (mut app, tx) = app_with(vec![first, state("talk-2")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert_eq!(app.selected().name, "talk-2");
+        assert!(app.conversations[0].running);
+
+        tx.send(UiMessage::Turn {
+            conversation: "talk-1".to_string(),
+            event: TurnEvent::Status("running a tool".to_string()),
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+        assert_eq!(app.conversations[0].status, "running a tool");
+        assert_eq!(app.selected().name, "talk-2");
     }
 }

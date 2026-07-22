@@ -4,9 +4,11 @@
 the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
-The interface presents one active conversation with durable history,
-multiline prompts, live status and tool activity, completed-turn hashes, and
-workspace diff review.
+The interface keeps independent virtual conversations in a left sidebar. Each
+has its own durable history, multiline prompt, live activity, completed-turn
+hashes, and workspace diff. Turns continue running when another conversation
+is selected, so several agent workspaces can advance concurrently without
+touching the working checkout.
 
 ## Build and run
 
@@ -33,11 +35,15 @@ caos-tui --from 5ec3751   branch from a completed turn
 |---|---|
 | `Enter` | Send the prompt |
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
+| `F6` / `Shift+F6` | Select the next or previous conversation |
+| `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
+| `Ctrl+N` | Start a new virtual conversation |
 | `F2` | Switch between conversation and workspace diff |
 | `F3` | Expand or collapse live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
 | Mouse wheel | Scroll by rendered rows |
-| `Ctrl+A` twice | Apply the conversation workspace diff |
+| `Ctrl+A` twice | Load the selected conversation into the working tree |
+| `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Exit |
 
@@ -49,9 +55,16 @@ points.
 
 ## Workspace safety
 
-Agent workspaces remain virtual commit trees. Opening the TUI never overwrites
-the working checkout. Applying changes requires two `Ctrl+A` presses, a clean
-working tree, and a successful `git apply --check` before the patch is applied.
+Agent workspaces remain virtual commit trees under independent conversation
+refs. Opening, switching, and running conversations never overwrite the working
+checkout. Loading changes requires two `Ctrl+A` presses, a clean working tree,
+and a successful `git apply --check` before the patch is applied.
+
+Publishing also leaves the checkout untouched. Two `Ctrl+P` presses create or
+advance `caos/<conversation>` with clean snapshot commits, push that branch to
+`origin`, and use the authenticated `gh` CLI to find or open its pull request.
+The clean branch deliberately excludes the conversation's internal step DAG and
+`.caos` metadata.
 
 API responses currently arrive one completed model round at a time. The
 backend also does not yet provide reliable cancellation for a running turn;
