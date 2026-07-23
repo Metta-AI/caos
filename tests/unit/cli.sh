@@ -19,5 +19,10 @@ commit "workspace snapshot"
 
 echo "== cargo test of the workspace, per-crate, in a caos worker ==" >&2
 "$CAOS_CLI" run /cas/std/cargo r1 -- --tree:@=ws --cmd=test --mode=all
-[ "$(cat r1/exit)" = "0" ] || fail "unit tests failed: $(tail -c 2000 r1/stderr)"
+if [ "$(cat r1/exit)" != "0" ]; then
+  echo "== cargo test FAILED (exit $(cat r1/exit)) — full output ==" >&2
+  echo "---- stdout ----" >&2; cat r1/stdout >&2
+  echo "---- stderr ----" >&2; cat r1/stderr >&2
+  fail "unit tests failed"
+fi
 echo "unit: ALL PASS" >&2
