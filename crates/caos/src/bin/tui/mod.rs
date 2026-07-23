@@ -13,6 +13,7 @@ use ratatui_crossterm::CrosstermBackend;
 
 mod app;
 mod args;
+mod backend;
 mod workspace;
 
 use app::{ui::render, App, View};
