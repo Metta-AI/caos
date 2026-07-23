@@ -57,6 +57,22 @@ spec() { # <name> <base ref blob> <worker source path>
 spec runner /cas/args/workspace/images/debian-base.ref /cas/args/result/bin/worker-runner
 spec bash /cas/args/workspace/images/debian-base.ref /cas/args/workspace/images/bash-worker.sh
 spec nixbuilder /cas/args/workspace/images/nix-base.ref /cas/args/workspace/images/bash-worker.sh
+
+# runner and bash are part of the test stack but nixbuilder is part of the host
+# stack and is used to build other parts of the test stack. As such, it should
+# have the host caos binary, not the test caos binary. This has the fortunate
+# side effect of making the cache key for nixbuilder stable across changes to
+# the test stack's caos, which is desirable becasue if we rebuild nixbuilder we
+# also have to rebuild anything that it builds, including the toolchain, which
+# is very slow
+#
+# The tested caos is layered onto the toolchain image
+# separately (build-stage2c), so nothing host leaks into the test world.
+# (runner/bash above DO carry the tested caos — they're the nested stack's
+# own images.)
+rm /tmp/imgs/nixbuilder/files/usr/bin/caos
+cp /bin/caos /tmp/imgs/nixbuilder/files/usr/bin/caos
+
 # The bake must run as root: the builder image's nix store is root-owned.
 # Same per-image containment grant testenv carries.
 echo "CAOS_WORKER_UID=0" > /tmp/imgs/nixbuilder/env
