@@ -590,10 +590,18 @@
           # image env repeats it: a profile mismatch is a silent full rebuild.
           CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
           cargoExtraArgs = "--locked --workspace";
-          # Record the sandbox workspace root: fingerprints are absolute-path
-          # keyed, so the worker must rebuild the workspace at this exact path
-          # (the image inflates target/ there; the worker reads /ws-root).
-          postInstall = ''echo -n "$PWD" > $out/ws-root'';
+          # Record both absolute paths Cargo fingerprints. The worker must use
+          # these exact locations: merely placing the archive below the same
+          # workspace root is insufficient when Cargo reruns a dependency's
+          # build script, because its cached executable and OUT_DIR are keyed
+          # on the target directory too.
+          postInstall = ''
+            wsroot=$(pwd -P)
+            echo -n "$wsroot" > $out/ws-root
+            targetdir="''${CARGO_TARGET_DIR:-target}"
+            case "$targetdir" in /*) ;; *) targetdir="$wsroot/$targetdir" ;; esac
+            echo -n "$targetdir" > $out/target-dir
+          '';
         };
 
         # A musl C cross-compiler for the image: rustc links musl binaries
@@ -625,6 +633,13 @@
             CARGO_PROFILE = "release";
             CARGO_BUILD_TARGET = muslTarget;
             cargoExtraArgs = "--locked --workspace";
+            postInstall = ''
+              wsroot=$(pwd -P)
+              echo -n "$wsroot" > $out/ws-root
+              targetdir="''${CARGO_TARGET_DIR:-target}"
+              case "$targetdir" in /*) ;; *) targetdir="$wsroot/$targetdir" ;; esac
+              echo -n "$targetdir" > $out/target-dir
+            '';
           }
           // {
             ${muslCCEnvName} = "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
@@ -643,10 +658,19 @@
               mkdir -p $out
               cp ${workerRoot "worker-runner" worker-runner}/worker $out/worker
               wsroot=$(cat ${cargoWorkerDeps}/ws-root)
-              mkdir -p "$out$wsroot"
-              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$wsroot"
-              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$wsroot"
+              targetdir=$(cat ${cargoWorkerDeps}/target-dir)
+              test "$wsroot" = "$(cat ${cargoWorkerDepsMusl}/ws-root)"
+              test "$targetdir" = "$(cat ${cargoWorkerDepsMusl}/target-dir)"
+              mkdir -p "$out$wsroot" "$out$targetdir"
+              # Crane archives the CONTENTS of CARGO_TARGET_DIR, not a
+              # top-level target/ directory. Extracting at $wsroot therefore
+              # put debug/, release/, ... beside Cargo.toml and left Cargo's
+              # real target directory empty. Build-script reruns exposed the
+              # mistake; inflate both archives at their recorded target path.
+              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$targetdir"
+              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$targetdir"
               cp ${cargoWorkerDeps}/ws-root $out/ws-root
+              cp ${cargoWorkerDeps}/target-dir $out/target-dir
             '';
         cargoBaseConfig = {
           Entrypoint = [
@@ -678,7 +702,8 @@
             # The workspace root must be writable by the (uid 1000) worker:
             # it materializes sources there and cargo writes target/.
             wsroot=$(cat ws-root)
-            chown -R 1000:1000 ".$wsroot"
+            targetdir=$(cat target-dir)
+            chown -R 1000:1000 ".$wsroot" ".$targetdir"
           '';
         };
 
@@ -693,10 +718,14 @@
             ''
               mkdir -p $out
               wsroot=$(cat ${cargoWorkerDeps}/ws-root)
-              mkdir -p "$out$wsroot"
-              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$wsroot"
-              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$wsroot"
+              targetdir=$(cat ${cargoWorkerDeps}/target-dir)
+              test "$wsroot" = "$(cat ${cargoWorkerDepsMusl}/ws-root)"
+              test "$targetdir" = "$(cat ${cargoWorkerDepsMusl}/target-dir)"
+              mkdir -p "$out$wsroot" "$out$targetdir"
+              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$targetdir"
+              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$targetdir"
               cp ${cargoWorkerDeps}/ws-root $out/ws-root
+              cp ${cargoWorkerDeps}/target-dir $out/target-dir
             '';
         cargoDepsImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-cargo-deps";
@@ -714,7 +743,8 @@
           };
           fakeRootCommands = ''
             wsroot=$(cat ws-root)
-            chown -R 1000:1000 ".$wsroot"
+            targetdir=$(cat target-dir)
+            chown -R 1000:1000 ".$wsroot" ".$targetdir"
             ln -sf bash bin/sh
             # Workers (uid 1000) scratch under /tmp; a bare nix root has none.
             mkdir -p tmp

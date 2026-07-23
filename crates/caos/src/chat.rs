@@ -28,8 +28,8 @@ use std::io::{IsTerminal, Read};
 use serde_json::Value;
 
 use super::{
-    curry_object, prepare_request, request_compute, resolve_cli_image, GitTransport, HttpTransport,
-    Transport, CAOS_REMOTE,
+    curry_object, entry_name, fetch_blob_string, fetch_tree_entries, prepare_request,
+    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -101,6 +101,82 @@ pub struct TurnOptions {
     pub llm_step_bin: Option<String>,
     pub bash_tool_bin: Option<String>,
     pub rgrep_bin: Option<String>,
+}
+
+/// One project-defined tool available to the selected conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolDescription {
+    pub name: String,
+    pub docs: String,
+    pub image: String,
+}
+
+/// Project-defined tools for a turn. The harness's built-ins are separate and
+/// are identified as such by clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolSetDescription {
+    pub source: String,
+    pub tools: Vec<ToolDescription>,
+}
+
+/// Describe the project tools visible to a conversation's current workspace.
+/// Existing conversations use their virtual head; new conversations use their
+/// configured base (or `HEAD`). Only the `caos-tools/*.sh` blobs are read.
+pub fn describe_tool_set(
+    t: &GitTransport,
+    conversation: &str,
+    options: &TurnOptions,
+) -> Result<ToolSetDescription, String> {
+    use gix::objs::tree::EntryKind;
+
+    let conversation_ref = format!("{CONV_REF_PREFIX}{conversation}");
+    let root = if rev_parse_opt(t, &conversation_ref)?.is_some() {
+        conversation_ref
+    } else {
+        options.base.clone().unwrap_or_else(|| "HEAD".to_string())
+    };
+    let source = format!("{root}:caos-tools");
+    let Some(tree) = rev_parse_opt(t, &source)? else {
+        return Ok(ToolSetDescription {
+            source,
+            tools: Vec::new(),
+        });
+    };
+    let entries = fetch_tree_entries(t, &tree)?
+        .ok_or_else(|| format!("project tools object {tree} is not a tree"))?;
+    let mut tools = Vec::new();
+    for entry in entries {
+        let filename = String::from_utf8(entry_name(&entry).to_vec())
+            .map_err(|_| "tool name is not UTF-8".to_string())?;
+        let Some(name) = filename.strip_suffix(".sh") else {
+            continue;
+        };
+        if !matches!(
+            entry.mode.kind(),
+            EntryKind::Blob | EntryKind::BlobExecutable
+        )
+            || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name)
+        {
+            continue;
+        }
+        let script = fetch_blob_string(t, &entry.oid.to_string())?;
+        let docs: Vec<&str> = script
+            .lines()
+            .filter_map(|line| line.strip_prefix("#@doc").map(str::trim))
+            .collect();
+        let docs = if docs.is_empty() {
+            format!("Project tool caos-tools/{filename} (no #@doc description).")
+        } else {
+            docs.join(" ")
+        };
+        tools.push(ToolDescription {
+            name: name.to_string(),
+            docs,
+            image: TOOLS_IMAGE.to_string(),
+        });
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ToolSetDescription { source, tools })
 }
 
 /// Structured progress from one turn. Frontends decide how to render these;
