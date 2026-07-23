@@ -68,6 +68,11 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
         .to_string();
 
     let out = format!(".caos-dev/tool-{name}");
+    // We own `.caos-dev` (it's gitignored, per-checkout scratch); create it so a
+    // fresh clone — or a tree whose `.caos-dev` was wiped — checks out here rather
+    // than failing when the atomic-replace temp file can't find its parent dir.
+    std::fs::create_dir_all(".caos-dev")
+        .map_err(|e| format!("creating .caos-dev: {e}"))?;
     if let Err(e) = std::fs::remove_dir_all(&out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("clearing {out}: {e}"));
@@ -102,12 +107,11 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
-                eprintln!("\n---- {rec} (output tail; full record in results/{rec}) ----");
+                eprintln!("\n---- {rec} (full output; also in results/{rec}) ----");
                 if let Ok(output) = std::fs::read_to_string(dir.join("output")) {
-                    let lines: Vec<&str> = output.lines().collect();
-                    let from = lines.len().saturating_sub(40);
-                    for line in &lines[from..] {
-                        eprintln!("{line}");
+                    eprint!("{output}");
+                    if !output.ends_with('\n') {
+                        eprintln!();
                     }
                 }
             }
@@ -2627,9 +2631,6 @@ mod git_transport_tests {
         git(repo, &["rev-parse", "HEAD"]).trim().to_string()
     }
 
-    // TODO: needs `git` in the caos cargo worker image (the toolchain image
-    // has rustc+cc but no git). Passes under nix. Re-enable once git is added.
-    #[ignore = "spawns git, absent from the cargo worker image"]
     #[test]
     fn transport_commands_stay_bound_to_the_discovered_repository() {
         let root = TestDir::new("bound-repository");
@@ -2652,8 +2653,6 @@ mod git_transport_tests {
         );
     }
 
-    // TODO: needs `git` in the caos cargo worker image (see above).
-    #[ignore = "spawns git, absent from the cargo worker image"]
     #[test]
     fn concurrent_object_fetches_do_not_touch_fetch_head() {
         let root = TestDir::new("concurrent-fetch");

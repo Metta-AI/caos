@@ -18,6 +18,12 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ms() { date +%s%3N; } # epoch milliseconds
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
+# Target musl, exactly like the `build` tool (caos-tools/build.sh): that is the
+# one profile the deps bake carries, so a check reuses it instead of recompiling
+# the dep graph. A host build has no bake to reuse and no consumer — every test
+# runs in the Linux stack, where musl statics run fine.
+tgt="$(uname -m)-unknown-linux-musl"
+
 # The caos workspace source, as git records it (tracked files only — target/,
 # .caos-dev etc. are untracked or ignored and never land here).
 mkdir ws
@@ -26,7 +32,7 @@ commit "caos workspace snapshot"
 
 echo "== cargo check of the caos workspace, in a caos worker ==" >&2
 t0=$(ms)
-"$CAOS_CLI" run /cas/std/cargo r1 -- --tree:@=ws --cmd=check
+"$CAOS_CLI" run /cas/std/cargo r1 -- --tree:@=ws --cmd=check "--target=$tgt"
 t1=$(ms)
 [ "$(cat r1/exit)" = "0" ] || fail "self-check failed: $(tail -c 2000 r1/stderr)"
 took=$((t1 - t0))
@@ -39,7 +45,7 @@ echo "  ok: workspace checks clean (${took}ms)" >&2
 
 echo "== per-crate (mode=all): cold, then a one-crate edit ==" >&2
 t2=$(ms)
-"$CAOS_CLI" run /cas/std/cargo r2 -- --tree:@=ws --cmd=check --mode=all
+"$CAOS_CLI" run /cas/std/cargo r2 -- --tree:@=ws --cmd=check --mode=all "--target=$tgt"
 t3=$(ms)
 [ "$(cat r2/exit)" = "0" ] || fail "mode=all check failed: $(tail -c 2000 r2/stderr)"
 cold=$((t3 - t2))
@@ -52,7 +58,7 @@ echo "  ok: per-crate check clean (${cold}ms cold)" >&2
 echo "// tripwire edit" >> ws/crates/worker-rgrep/src/main.rs
 commit "edit one crate"
 t4=$(ms)
-"$CAOS_CLI" run /cas/std/cargo r3 -- --tree:@=ws --cmd=check --mode=all
+"$CAOS_CLI" run /cas/std/cargo r3 -- --tree:@=ws --cmd=check --mode=all "--target=$tgt"
 t5=$(ms)
 [ "$(cat r3/exit)" = "0" ] || fail "edited mode=all check failed: $(tail -c 2000 r3/stderr)"
 edit=$((t5 - t4))

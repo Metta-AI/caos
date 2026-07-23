@@ -573,37 +573,6 @@
         # fingerprints require.
         cargoWorkerVendor = craneLibCargoWorker.vendorCargoDeps { inherit src; };
 
-        # Every workspace dependency pre-compiled (check + build + test-deps,
-        # dev profile) against crane's DUMMY workspace sources — keyed on
-        # manifests + lockfile only, so source edits never re-bake. The worker
-        # re-materializes real sources at the same absolute root with fresh
-        # mtimes: deps stay fingerprint-fresh, workspace crates always rebuild.
-        cargoWorkerDeps = craneLibCargoWorker.buildDepsOnly {
-          inherit src;
-          pname = "caos-cargo";
-          version = "0.1.0";
-          strictDeps = true;
-          cargoVendorDir = cargoWorkerVendor;
-          # dev profile: what the worker's plain `cargo check/build/test` use.
-          CARGO_PROFILE = "dev";
-          # Smaller debuginfo (file:line in backtraces, no full DWARF). The
-          # image env repeats it: a profile mismatch is a silent full rebuild.
-          CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
-          cargoExtraArgs = "--locked --workspace";
-          # Record both absolute paths Cargo fingerprints. The worker must use
-          # these exact locations: merely placing the archive below the same
-          # workspace root is insufficient when Cargo reruns a dependency's
-          # build script, because its cached executable and OUT_DIR are keyed
-          # on the target directory too.
-          postInstall = ''
-            wsroot=$(pwd -P)
-            echo -n "$wsroot" > $out/ws-root
-            targetdir="''${CARGO_TARGET_DIR:-target}"
-            case "$targetdir" in /*) ;; *) targetdir="$wsroot/$targetdir" ;; esac
-            echo -n "$targetdir" > $out/target-dir
-          '';
-        };
-
         # A musl C cross-compiler for the image: rustc links musl binaries
         # self-contained, but C-carrying deps (ring) compile via cc-rs, which
         # needs a real musl cc when targeting musl. The env var below hands it
@@ -618,11 +587,21 @@
         muslCCEnvName = "CC_${builtins.replaceStrings [ "-" ] [ "_" ] muslTarget}";
         muslCCEnv = "${muslCCEnvName}=${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
 
-        # The workspace deps baked a second time for (musl, release) — what the
-        # phase-B bins build (`std/cargo --cmd=build --target=<musl>
-        # --profile=release`) uses, so a per-edit build recompiles only the
-        # workspace crates, never the dep graph. Keyed like the dev bake on
-        # manifests + lockfile only.
+        # THE workspace-deps bake: every dependency pre-compiled for
+        # (musl, dev) against crane's DUMMY workspace sources — keyed on
+        # manifests + lockfile only, so source edits never re-bake. This one
+        # bake serves everything: `build` and `test` both compile with
+        # `--target=<musl>` at the default (dev) profile (caos-tools/build.sh),
+        # so a per-edit build recompiles only the workspace crates, never the
+        # dep graph. musl still links static regardless of profile (crt-static
+        # is on for musl), so the produced binaries run on any base. There is
+        # deliberately no second (host, release) bake — a second bake gets a
+        # different absolute build dir under the sandbox-off in-caos
+        # nix-builder, and the two can't share the one target/ dir Cargo
+        # fingerprints against. The worker re-materializes real sources at this
+        # same absolute root with fresh mtimes: deps stay fingerprint-fresh,
+        # workspace crates always rebuild. (An ad-hoc `cargo check` for the
+        # host arch simply finds no baked deps — correct, just uncached.)
         cargoWorkerDepsMusl = craneLibCargoWorker.buildDepsOnly (
           {
             inherit src;
@@ -630,9 +609,18 @@
             version = "0.1.0";
             strictDeps = true;
             cargoVendorDir = cargoWorkerVendor;
-            CARGO_PROFILE = "release";
+            CARGO_PROFILE = "dev";
+            # Smaller debuginfo (file:line in backtraces, no full DWARF). The
+            # image env repeats it: a profile-key mismatch is a silent full
+            # rebuild.
+            CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
             CARGO_BUILD_TARGET = muslTarget;
             cargoExtraArgs = "--locked --workspace";
+            # Record both absolute paths Cargo fingerprints. The worker must use
+            # these exact locations: merely placing the archive below the same
+            # workspace root is insufficient when Cargo reruns a dependency's
+            # build script, because its cached executable and OUT_DIR are keyed
+            # on the target directory too.
             postInstall = ''
               wsroot=$(pwd -P)
               echo -n "$wsroot" > $out/ws-root
@@ -647,30 +635,25 @@
         );
 
         # The image root: the runner trampoline at /worker (the actual cargo
-        # worker binary arrives as the curried `bin` arg) plus the baked
-        # target/ inflated at the exact workspace root the bake used — both
-        # bakes, dev/host (check/test) and release/musl (the bins build),
-        # merged into one target/. The toolchain, cc and vendor ride the image
-        # closure via the config references below.
+        # worker binary arrives as the curried `bin` arg) plus the single
+        # (musl, dev) baked target/ inflated at the exact workspace root the
+        # bake used. The toolchain, cc and vendor ride the image closure via the
+        # config references below.
+        # The image root proper carries only the runner trampoline (/worker) and
+        # the two recorded paths (/ws-root, /target-dir). The baked target/ is
+        # deliberately NOT inflated into this store path: dockerTools would then
+        # symlink every one of its files into the read-only /nix/store, and the
+        # worker must *overwrite* the dummy workspace-crate artifacts in place
+        # when it rebuilds them (deps are reused read-only) — a store symlink
+        # gives EACCES. The image lays the target down as real, writable files in
+        # fakeRootCommands instead (see cargoBaseImage).
         cargoBaseRootEnv =
-          pkgs.runCommand "caos-worker-cargo-base-root" { nativeBuildInputs = [ pkgs.zstd ]; }
+          pkgs.runCommand "caos-worker-cargo-base-root" { }
             ''
               mkdir -p $out
               cp ${workerRoot "worker-runner" worker-runner}/worker $out/worker
-              wsroot=$(cat ${cargoWorkerDeps}/ws-root)
-              targetdir=$(cat ${cargoWorkerDeps}/target-dir)
-              test "$wsroot" = "$(cat ${cargoWorkerDepsMusl}/ws-root)"
-              test "$targetdir" = "$(cat ${cargoWorkerDepsMusl}/target-dir)"
-              mkdir -p "$out$wsroot" "$out$targetdir"
-              # Crane archives the CONTENTS of CARGO_TARGET_DIR, not a
-              # top-level target/ directory. Extracting at $wsroot therefore
-              # put debug/, release/, ... beside Cargo.toml and left Cargo's
-              # real target directory empty. Build-script reruns exposed the
-              # mistake; inflate both archives at their recorded target path.
-              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$targetdir"
-              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$targetdir"
-              cp ${cargoWorkerDeps}/ws-root $out/ws-root
-              cp ${cargoWorkerDeps}/target-dir $out/target-dir
+              cp ${cargoWorkerDepsMusl}/ws-root $out/ws-root
+              cp ${cargoWorkerDepsMusl}/target-dir $out/target-dir
             '';
         cargoBaseConfig = {
           Entrypoint = [
@@ -680,8 +663,10 @@
           Env = [
             # The pinned toolchain and a C linker (for build/test binaries; the
             # same cc-wrapper the bake's build scripts and proc macros linked
-            # under, so everything resolves against one glibc).
-            "PATH=${cargoWorkerToolchain}/bin:${linuxPkgs.stdenv.cc}/bin:${muslCrossCC}/bin:/bin"
+            # under, so everything resolves against one glibc). git rides along
+            # so the workspace's git-spawning unit tests (transport, TUI
+            # workspace) run in the worker instead of being ignored.
+            "PATH=${cargoWorkerToolchain}/bin:${linuxPkgs.stdenv.cc}/bin:${muslCrossCC}/bin:${linuxPkgs.gitMinimal}/bin:/bin"
             # A writable home; the worker copies the vendor config here.
             "CARGO_HOME=/tmp/cargo"
             "CAOS_VENDOR_CONFIG=${cargoWorkerVendor}/config.toml"
@@ -699,11 +684,22 @@
           ];
           config = cargoBaseConfig;
           fakeRootCommands = installWorkerFiles + ''
-            # The workspace root must be writable by the (uid 1000) worker:
-            # it materializes sources there and cargo writes target/.
             wsroot=$(cat ws-root)
             targetdir=$(cat target-dir)
-            chown -R 1000:1000 ".$wsroot" ".$targetdir"
+            # Inflate the baked (musl, dev) target/ as REAL, writable files
+            # directly in the image. Extracting here — rather than into a store
+            # path dockerTools would symlink read-only — is what lets the worker
+            # (uid 1000) rebuild the workspace crates in place while reusing the
+            # deps. Crane archives the CONTENTS of CARGO_TARGET_DIR, so extract
+            # at $targetdir, not $wsroot.
+            mkdir -p ".$targetdir"
+            ${pkgs.gnutar}/bin/tar --use-compress-program=${pkgs.zstd}/bin/zstd \
+              -xf ${cargoWorkerDepsMusl}/target.tar.zst -C ".$targetdir"
+            # The whole workspace root (target/ included) must be owned and
+            # writable by the worker: it materializes sources here and cargo
+            # rewrites target/.
+            chown -R 1000:1000 ".$wsroot"
+            chmod -R u+w ".$wsroot"
           '';
         };
 
@@ -713,19 +709,14 @@
         # delta-over-base move). So this image is keyed on (toolchain,
         # manifests, lockfile) alone, and the expensive in-caos nix bake that
         # produces it re-runs only when those change — never on a source edit.
+        # Like cargoBaseRootEnv: carry only the recorded paths, not the baked
+        # target/ (inflated as real writable files in the image below).
         cargoDepsRootEnv =
-          pkgs.runCommand "caos-worker-cargo-deps-root" { nativeBuildInputs = [ pkgs.zstd ]; }
+          pkgs.runCommand "caos-worker-cargo-deps-root" { }
             ''
               mkdir -p $out
-              wsroot=$(cat ${cargoWorkerDeps}/ws-root)
-              targetdir=$(cat ${cargoWorkerDeps}/target-dir)
-              test "$wsroot" = "$(cat ${cargoWorkerDepsMusl}/ws-root)"
-              test "$targetdir" = "$(cat ${cargoWorkerDepsMusl}/target-dir)"
-              mkdir -p "$out$wsroot" "$out$targetdir"
-              tar --zstd -xf ${cargoWorkerDeps}/target.tar.zst -C "$out$targetdir"
-              tar --zstd -xf ${cargoWorkerDepsMusl}/target.tar.zst -C "$out$targetdir"
-              cp ${cargoWorkerDeps}/ws-root $out/ws-root
-              cp ${cargoWorkerDeps}/target-dir $out/target-dir
+              cp ${cargoWorkerDepsMusl}/ws-root $out/ws-root
+              cp ${cargoWorkerDepsMusl}/target-dir $out/target-dir
             '';
         cargoDepsImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-cargo-deps";
@@ -744,7 +735,13 @@
           fakeRootCommands = ''
             wsroot=$(cat ws-root)
             targetdir=$(cat target-dir)
-            chown -R 1000:1000 ".$wsroot" ".$targetdir"
+            # Inflate the baked target/ as real, writable files (see
+            # cargoBaseImage for why this is done here, not in the store path).
+            mkdir -p ".$targetdir"
+            ${pkgs.gnutar}/bin/tar --use-compress-program=${pkgs.zstd}/bin/zstd \
+              -xf ${cargoWorkerDepsMusl}/target.tar.zst -C ".$targetdir"
+            chown -R 1000:1000 ".$wsroot"
+            chmod -R u+w ".$wsroot"
             ln -sf bash bin/sh
             # Workers (uid 1000) scratch under /tmp; a bare nix root has none.
             mkdir -p tmp

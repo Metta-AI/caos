@@ -346,7 +346,8 @@ remote is asserted, not auto-added; a stale local `refs/caos/std` shadows
 the server's — delete it): inputs ingest straight from the tracked worktree,
 dirty edits included, and the throwaway client repo + copies + setup commit
 are gone. The cargo image grew a second deps bake — (musl, release), what
-the bins build uses — plus a musl cross-cc (`pkgsCross`) with matching
+the bins build uses (superseded 2026-07-23: collapsed to one (musl, dev)
+bake — see below) — plus a musl cross-cc (`pkgsCross`) with matching
 `CC_<target>` env at bake- and run-time: rustc links musl self-contained,
 but C-carrying deps (ring, via rustls) need a real musl cc, and the small
 rustc-built workers never hit that because their dep set has no C.
@@ -408,6 +409,31 @@ Gotchas collected: nixos/nix has /bin/sh and /usr/bin/env but no /bin/bash
 extends PATH); skopeo needs --insecure-policy in a bare image; a guarded
 /bin/caos link is required on bare nix roots but would clobber the binary
 on debian's merged /bin.
+
+**One (musl, dev) bake + git in the image landed (2026-07-23).** The cargo
+image had carried TWO deps bakes — (host/glibc, dev) for plain check/test and
+(musl, release) for the bins build — which had to record the *same* absolute
+workspace root, since cargo fingerprints are path-keyed and both `target/`
+trees merge into one. Under the sandbox-off in-caos nix-builder (D2) each bake
+got a *different* per-build dir (`/nix/var/nix/builds/nix-…N/source` vs
+`…N+1/source`), so the D2 bake aborted the instant a flake edit busted the
+registry cache and the bake actually ran — host bakes (sandbox-on) had always
+shared `/build/source` and masked it. Fix: **one bake**. Everything now builds
+(musl, dev): musl because every worker and every test runs in the Linux stack,
+so a host/glibc build has no consumer; dev because it keeps
+`debug_assert!`/overflow checks live and recompiles only workspace crates per
+edit (musl links static at any profile, so bins still run on a bare base).
+`build.sh` dropped `--profile=release`; every test's `std/cargo` call gained
+`--target=<arch>-unknown-linux-musl` — they were the last host builds, and
+`cargo-self`'s deps-reuse tripwire had been silently measuring against a bake
+that didn't match its target.
+
+With host builds gone, `gitMinimal` joined the cargo image PATH so the
+workspace's git-spawning unit tests run in the worker instead of `#[ignore]`d:
+the `caos` transport tests and the `caos-tui` workspace tests spawn git against
+local repos, and the `caos-tui` reload test now `git init`s its own throwaway
+repo (`GitTransport::discover`) rather than assuming cwd is one. `run-tool`
+also prints a failing test's WHOLE output now, not a 40-line tail.
 
 Two shapes worth keeping: **per-test extras ride in that test's map child**
 as a wrapper tree ({test, workspace} for cargo-self, {test, api_key} for

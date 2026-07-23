@@ -1085,13 +1085,34 @@ mod tests {
 
     #[test]
     fn reload_surfaces_history_errors_instead_of_showing_an_empty_chat() {
+        // A throwaway repo so the transport discovers a real working tree; the
+        // conversation itself is absent, which is the error we're asserting on.
+        // (Don't depend on cwd being a repo — the cargo worker's is not.)
+        let dir = std::env::temp_dir().join(format!(
+            "caos-tui-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+
         let mut conversation = state("missing-conversation-for-reload-test");
-        let transport = GitTransport::from_cwd().unwrap();
+        let transport = GitTransport::discover(&dir).unwrap();
         conversation.reload(&transport);
         assert!(conversation.transcript.is_empty());
         assert!(conversation.diff.is_none());
         assert!(conversation.status.contains("loading conversation failed"));
         assert!(conversation.status.contains("no conversation"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

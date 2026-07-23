@@ -33,7 +33,7 @@ sk() { nixf shell "path:/tmp/ws#skopeo" -c skopeo --insecure-policy "$@"; }
 if digest=$(sk inspect --tls-verify=false --format '{{.Digest}}' "docker://$tag" 2>/dev/null); then
   echo "bake: registry hit for $tag" >&2
 else
-  nixf build "path:/tmp/ws#caos-worker-cargo-deps-docker" -o /tmp/img \
+  nixf build -L "path:/tmp/ws#caos-worker-cargo-deps-docker" -o /tmp/img \
     || fail "nix build of the deps image"
   # The image tarball is gzipped, which docker-archive can't always read, so
   # unpack first. Push by the registry's on-net name; the returned ref uses

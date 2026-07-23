@@ -37,8 +37,11 @@ for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
 done
 caos put /tmp/bw /cas/bw
 
+# Static musl (runs on any base) at the default dev profile — the one profile
+# the deps bake carries, so only workspace crates recompile per edit. dev keeps
+# debug_assert!/overflow checks live in the produced bins and test binaries.
 cargo=$(caos curry /cas/std/cargo -- --cmd=build --mode=all \
-  "--target=$(uname -m)-unknown-linux-musl" --profile=release)
+  "--target=$(uname -m)-unknown-linux-musl")
 stage2=$(caos curry /cas/std/bash -- "--script:@=$LIB/build-stage2.sh" \
   "--workspace:@=/cas/args/in")
 caos run-then /cas/bw -- --run="$cargo" --then="$stage2"
