@@ -37,6 +37,7 @@ caos tui --from 5ec3751   branch from a completed turn
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
+| `Ctrl+W` | Close the selected conversation in the sidebar |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Show the tools available to the selected conversation |
 | `Ctrl+A` | Expand or collapse live Activity above the prompt |
@@ -53,6 +54,10 @@ Completed user and agent turns show branchable hashes in the transcript. Enter
 TUI. Activity entries show the durable hashes of internal harness steps for
 inspection; those step trees contain harness metadata and are not branch
 points.
+
+Closing a conversation removes it from the current sidebar only; it does not
+delete the durable conversation ref. A running or publishing conversation must
+finish before it can be closed.
 
 `Ctrl+Y` releases mouse capture and freezes redraws so terminal-native text
 selection remains stable. Drag across any visible text, use the terminal's

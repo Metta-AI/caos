@@ -616,6 +616,10 @@ impl App {
             self.start_new_conversation(None);
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+            self.close_selected_conversation();
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Up {
             self.select_relative(-1);
             return;
@@ -696,13 +700,21 @@ impl App {
     }
 
     fn start_new_conversation(&mut self, base: Option<String>) {
-        let disk = match self.backend.list_conversations() {
-            Ok(conversations) => conversations,
+        let state = match self.new_conversation_state(base) {
+            Ok(state) => state,
             Err(error) => {
                 self.selected_mut().status = error;
                 return;
             }
         };
+        self.conversations.insert(0, state);
+        self.selected = 0;
+        self.view = View::Chat;
+        self.confirm_action = None;
+    }
+
+    fn new_conversation_state(&self, base: Option<String>) -> Result<ConversationState, String> {
+        let disk = self.backend.list_conversations()?;
         let name = first_available_conversation_name(
             disk.iter()
                 .map(|item| item.name.as_str())
@@ -714,10 +726,25 @@ impl App {
             .as_deref()
             .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
             .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
-        self.conversations
-            .insert(0, ConversationState::new(name, options, status));
-        self.selected = 0;
-        self.view = View::Chat;
+        Ok(ConversationState::new(name, options, status))
+    }
+
+    fn close_selected_conversation(&mut self) {
+        if self.selected().is_busy() {
+            self.selected_mut().status =
+                "finish this conversation's operation before closing it".to_string();
+            return;
+        }
+        if self.conversations.len() == 1 {
+            match self.new_conversation_state(None) {
+                Ok(state) => self.conversations[0] = state,
+                Err(error) => self.selected_mut().status = error,
+            }
+            self.selected = 0;
+        } else {
+            self.conversations.remove(self.selected);
+            self.selected = self.selected.min(self.conversations.len() - 1);
+        }
         self.confirm_action = None;
     }
 
@@ -1160,6 +1187,48 @@ mod tests {
         assert!(app.drain_messages());
         assert_eq!(app.conversations[0].status, "running a tool");
         assert_eq!(app.selected().name, "talk-2");
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_selected_sidebar_chat_and_selects_its_neighbor() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(app.selected().name, "talk-2");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        let names: Vec<_> = app
+            .conversations
+            .iter()
+            .map(|conversation| conversation.name.as_str())
+            .collect();
+        assert_eq!(names, ["talk-1", "talk-3"]);
+        assert_eq!(app.selected().name, "talk-3");
+    }
+
+    #[test]
+    fn ctrl_w_keeps_a_busy_chat_open() {
+        let mut running = state("talk-1");
+        running.running = true;
+        let (mut app, _) = app_with(vec![running, state("talk-2")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().name, "talk-1");
+        assert!(app.selected().status.contains("before closing"));
+    }
+
+    #[test]
+    fn ctrl_w_replaces_the_only_chat_with_a_fresh_virtual_chat() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected().name, "talk-2");
+        assert!(app.selected().transcript.is_empty());
+        assert!(app.selected().status.contains("new virtual conversation"));
     }
 
     #[test]

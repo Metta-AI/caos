@@ -425,7 +425,7 @@ fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else {
-        Line::raw(" ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
+        Line::raw(" ^Up/Dn chat  ^N new  ^W close  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
     };
     frame.render_widget(Paragraph::new(footer), area);
 }
