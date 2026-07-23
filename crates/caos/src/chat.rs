@@ -29,7 +29,8 @@ use serde_json::Value;
 
 use super::{
     curry_object, entry_name, fetch_blob_string, fetch_tree_entries, prepare_request,
-    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    request_compute, resolve_cli_image, unwrap_curry, GitTransport, HttpTransport, Transport,
+    CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -101,9 +102,10 @@ pub struct TurnOptions {
     pub llm_step_bin: Option<String>,
     pub bash_tool_bin: Option<String>,
     pub rgrep_bin: Option<String>,
+    pub tools: Option<String>,
 }
 
-/// One project-defined tool available to the selected conversation.
+/// One model-facing tool available to the selected conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolDescription {
     pub name: String,
@@ -111,22 +113,55 @@ pub struct ToolDescription {
     pub image: String,
 }
 
-/// Project-defined tools for a turn. The harness's built-ins are separate and
-/// are identified as such by clients.
+/// Tools from one independently configured source.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolSetDescription {
+pub struct ToolSourceDescription {
     pub source: String,
     pub tools: Vec<ToolDescription>,
 }
 
-/// Describe the project tools visible to a conversation's current workspace.
-/// Existing conversations use their virtual head; new conversations use their
-/// configured base (or `HEAD`). Only the `caos-tools/*.sh` blobs are read.
+/// Additional tools visible to a turn. Harness built-ins are rendered
+/// separately by clients because they do not come from either source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolSetDescription {
+    pub project: ToolSourceDescription,
+    pub configured: Option<ToolSourceDescription>,
+}
+
+/// Describe project-owned `caos-tools/*.sh` and, when selected, the
+/// docs-driven tool set passed with `--tools`.
 pub fn describe_tool_set(
     t: &GitTransport,
     conversation: &str,
     options: &TurnOptions,
 ) -> Result<ToolSetDescription, String> {
+    let project = read_project_tools(t, conversation, options)?;
+    let configured = read_configured_tools(t, options)?;
+    if let Some(configured) = &configured {
+        for tool in &configured.tools {
+            if project
+                .tools
+                .iter()
+                .any(|existing| existing.name == tool.name)
+            {
+                return Err(format!(
+                    "configured tool {:?} conflicts with a project tool",
+                    tool.name
+                ));
+            }
+        }
+    }
+    Ok(ToolSetDescription {
+        project,
+        configured,
+    })
+}
+
+fn read_project_tools(
+    t: &GitTransport,
+    conversation: &str,
+    options: &TurnOptions,
+) -> Result<ToolSourceDescription, String> {
     use gix::objs::tree::EntryKind;
 
     let conversation_ref = format!("{CONV_REF_PREFIX}{conversation}");
@@ -137,7 +172,7 @@ pub fn describe_tool_set(
     };
     let source = format!("{root}:caos-tools");
     let Some(tree) = rev_parse_opt(t, &source)? else {
-        return Ok(ToolSetDescription {
+        return Ok(ToolSourceDescription {
             source,
             tools: Vec::new(),
         });
@@ -154,8 +189,7 @@ pub fn describe_tool_set(
         if !matches!(
             entry.mode.kind(),
             EntryKind::Blob | EntryKind::BlobExecutable
-        )
-            || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name)
+        ) || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name)
         {
             continue;
         }
@@ -176,7 +210,143 @@ pub fn describe_tool_set(
         });
     }
     tools.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ToolSetDescription { source, tools })
+    Ok(ToolSourceDescription { source, tools })
+}
+
+fn read_configured_tools(
+    t: &GitTransport,
+    options: &TurnOptions,
+) -> Result<Option<ToolSourceDescription>, String> {
+    use gix::objs::tree::EntryKind;
+
+    match &options.tools {
+        Some(source) if source.starts_with("/cas/std/") => {
+            let hash = resolve_cli_image(t, source)?;
+            let remote = HttpTransport::new(t.server_url()?);
+            Ok(Some(ToolSourceDescription {
+                source: source.clone(),
+                tools: read_declarative_tools(&remote, &hash)?,
+            }))
+        }
+        Some(source) => {
+            let (mode, oid) = t
+                .ingest_path(source)?
+                .ok_or_else(|| format!("cannot read tools from {source:?}"))?;
+            if mode.kind() != EntryKind::Tree {
+                return Err(format!("tools path {source:?} is not a directory"));
+            }
+            Ok(Some(ToolSourceDescription {
+                source: source.clone(),
+                tools: read_declarative_tools(t, &oid.to_string())?,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+fn read_declarative_tools(t: &dyn Transport, root: &str) -> Result<Vec<ToolDescription>, String> {
+    use gix::objs::tree::EntryKind;
+
+    let entries = fetch_tree_entries(t, root)?
+        .ok_or_else(|| format!("configured tools object {root} is not a tree"))?;
+    let mut tools = Vec::new();
+    for entry in entries {
+        let name = String::from_utf8(entry_name(&entry).to_vec())
+            .map_err(|_| "tool name is not UTF-8".to_string())?;
+        validate_tool_name(&name)?;
+        if entry.mode.kind() != EntryKind::Tree {
+            return Err(format!("configured tool {name:?} is not a directory"));
+        }
+        let children = fetch_tree_entries(t, &entry.oid.to_string())?
+            .ok_or_else(|| format!("configured tool {name:?} is not a tree"))?;
+        if children.len() != 2
+            || !children
+                .iter()
+                .all(|entry| matches!(entry_name(entry), b"docs" | b"image"))
+        {
+            return Err(format!(
+                "configured tool {name:?} must contain exactly `docs` and `image` files"
+            ));
+        }
+        let leaf = |leaf: &str| -> Result<String, String> {
+            let entry = children
+                .iter()
+                .find(|entry| entry_name(entry) == leaf.as_bytes())
+                .ok_or_else(|| format!("configured tool {name:?} has no {leaf:?} file"))?;
+            fetch_blob_string(t, &entry.oid.to_string())
+        };
+        let docs = leaf("docs")?;
+        let image = leaf("image")?;
+        let docs = docs.trim().to_string();
+        let image = image.trim().to_string();
+        if docs.is_empty() || image.is_empty() {
+            return Err(format!("configured tool {name:?} has empty docs or image"));
+        }
+        tools.push(ToolDescription { name, docs, image });
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tools)
+}
+
+fn validate_tool_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!(
+            "invalid configured tool name {name:?}; use 1-64 ASCII letters, digits, `_`, or `-`"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a host-selected tool set before minting a turn, and explicitly
+/// publish image hashes because an image named inside a text blob is not part
+/// of the tool-set tree's Git reachability closure.
+fn prepare_configured_tools(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
+    if options.tools.is_none() {
+        return Ok(());
+    }
+    let configured = read_configured_tools(t, options)?
+        .expect("a configured source produces a tool description");
+    for tool in configured.tools {
+        let image = tool.image.as_str();
+        if image.starts_with("/cas/std/") {
+            resolve_cli_image(t, image)
+                .map_err(|error| format!("configured tool {:?}: {error}", tool.name))?;
+        } else if let Some(reference) = image.strip_prefix("docker://") {
+            if reference.is_empty() {
+                return Err(format!(
+                    "configured tool {:?} has an empty docker image reference",
+                    tool.name
+                ));
+            }
+        } else if image.len() == 40 && image.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let (kind, _) = t.get_object(image).map_err(|error| {
+                format!("configured tool {:?} image {image}: {error}", tool.name)
+            })?;
+            if kind != "tree" {
+                return Err(format!(
+                    "configured tool {:?} image {image} is a {kind}, not a tree",
+                    tool.name
+                ));
+            }
+            t.ensure_pushed(image)?;
+            let (base, _) = unwrap_curry(t, image)?;
+            if base.len() == 40 && base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                t.ensure_pushed(&base)?;
+            }
+        } else {
+            return Err(format!(
+                "configured tool {:?} has invalid image reference {image:?}; use /cas/std/<name>, \
+                 a 40-character Git image hash, or docker://<reference>",
+                tool.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Structured progress from one turn. Frontends decide how to render these;
@@ -271,13 +441,14 @@ struct ChatArgs {
     llm_step_bin: Option<String>,
     bash_tool_bin: Option<String>,
     rgrep_bin: Option<String>,
+    tools: Option<String>,
     log: bool,
 }
 
 fn usage(verb: Verb) -> String {
     let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
          [--model <model>] [--base-url <url>] [--llm-step-bin <path>] \
-         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--log]";
+         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--tools <path>] [--log]";
     match verb {
         Verb::Chat => format!(
             "usage: chat <name> [-m <message>] {common}\n\
@@ -309,6 +480,7 @@ impl ChatArgs {
             llm_step_bin: None,
             bash_tool_bin: None,
             rgrep_bin: None,
+            tools: None,
             log: false,
         };
         let mut positional: Option<String> = None;
@@ -330,6 +502,7 @@ impl ChatArgs {
                 "--llm-step-bin" => a.llm_step_bin = Some(value(arg)?),
                 "--bash-tool-bin" => a.bash_tool_bin = Some(value(arg)?),
                 "--rgrep-bin" => a.rgrep_bin = Some(value(arg)?),
+                "--tools" => a.tools = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other}\n{}", usage(verb)))
@@ -373,6 +546,7 @@ impl ChatArgs {
             llm_step_bin: self.llm_step_bin.clone(),
             bash_tool_bin: self.bash_tool_bin.clone(),
             rgrep_bin: self.rgrep_bin.clone(),
+            tools: self.tools.clone(),
         }
     }
 }
@@ -638,6 +812,7 @@ fn turn(
     let llm_bin = worker_bin(options.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV);
     let bash_bin = worker_bin(options.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV);
     let rgrep_bin = worker_bin(options.rgrep_bin.as_deref(), RGREP_BIN_ENV);
+    prepare_configured_tools(t, options)?;
     let system = match (&options.system, &options.system_file) {
         (Some(text), _) => text.clone(),
         (None, Some(path)) => {
@@ -742,6 +917,9 @@ fn turn(
     ];
     if let Some(tools) = &tools_image {
         kvs.push(format!("--tools_image={tools}"));
+    }
+    if let Some(tools) = &options.tools {
+        kvs.push(format!("--tools:@={tools}"));
     }
     if let Some(model) = &options.model {
         kvs.push(format!("--model={model}"));
@@ -1195,6 +1373,34 @@ fn history_from_head(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tools_selects_a_declarative_tool_set() {
+        let args =
+            ChatArgs::parse(Verb::Talk, &["--tools".to_string(), "my-tools".to_string()]).unwrap();
+        assert_eq!(args.turn_options().tools.as_deref(), Some("my-tools"));
+
+        let old = "--tool-bundle";
+        let error = ChatArgs::parse(Verb::Talk, &[old.to_string(), "path".to_string()])
+            .err()
+            .expect("old selector should fail");
+        assert!(error.contains("unknown option"), "{old}: {error}");
+        let args = ChatArgs::parse(
+            Verb::Talk,
+            &[
+                "--bash-tool-bin".to_string(),
+                "bash-bin".to_string(),
+                "--rgrep-bin".to_string(),
+                "grep-bin".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            args.turn_options().bash_tool_bin.as_deref(),
+            Some("bash-bin")
+        );
+        assert_eq!(args.turn_options().rgrep_bin.as_deref(), Some("grep-bin"));
+    }
 
     #[test]
     fn step_decoding_emits_results_text_and_tool_calls() {

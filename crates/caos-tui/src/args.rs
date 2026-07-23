@@ -30,6 +30,7 @@ impl Args {
                 "--llm-step-bin" => parsed.turn.llm_step_bin = Some(value(&mut args, arg)?),
                 "--bash-tool-bin" => parsed.turn.bash_tool_bin = Some(value(&mut args, arg)?),
                 "--rgrep-bin" => parsed.turn.rgrep_bin = Some(value(&mut args, arg)?),
+                "--tools" => parsed.turn.tools = Some(value(&mut args, arg)?),
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }
@@ -55,6 +56,7 @@ impl Args {
 
 pub(crate) fn usage() -> String {
     "usage: caos-tui [--new | --from <commit>] [--base <revspec>] \
-     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
+     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>] \
+     [--tools <path>]"
         .to_string()
 }

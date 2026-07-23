@@ -256,11 +256,14 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    /// Address an explicit server for client-side object reads.
+    pub fn new(base: impl Into<String>) -> Self {
+        Self { base: base.into() }
+    }
+
     /// Read the server URL from [`SERVER_ENV`].
     pub fn from_env() -> Result<Self, String> {
-        Ok(Self {
-            base: server_url()?,
-        })
+        Ok(Self::new(server_url()?))
     }
 }
 

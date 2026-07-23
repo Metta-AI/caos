@@ -942,12 +942,16 @@ mod tests {
             "5ec3751".into(),
             "--model".into(),
             "test-model".into(),
+            "--tools".into(),
+            "my-tools".into(),
         ])
         .unwrap();
         assert!(args.new_conversation);
         assert_eq!(args.from_commit.as_deref(), Some("5ec3751"));
         assert_eq!(args.turn.model.as_deref(), Some("test-model"));
+        assert_eq!(args.turn.tools.as_deref(), Some("my-tools"));
         assert_eq!(args.turn.base.as_deref(), Some("5ec3751"));
+        assert!(Args::parse(&["--tool-bundle".into(), "old-tools".into()]).is_err());
     }
 
     #[test]
@@ -1114,18 +1118,28 @@ mod tests {
     fn ctrl_t_shows_the_selected_chat_tool_set() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
-            tools: vec![caos::chat::ToolDescription {
-                name: "build".to_string(),
-                docs: "Build everything the tree defines.".to_string(),
-                image: "/cas/std/bash".to_string(),
-            }],
+            project: caos::chat::ToolSourceDescription {
+                source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
+                tools: vec![caos::chat::ToolDescription {
+                    name: "build".to_string(),
+                    docs: "Build everything the tree defines.".to_string(),
+                    image: "/cas/std/bash".to_string(),
+                }],
+            },
+            configured: Some(caos::chat::ToolSourceDescription {
+                source: "my-tools".to_string(),
+                tools: vec![caos::chat::ToolDescription {
+                    name: "cargo".to_string(),
+                    docs: "Run Cargo in the Rust workspace.".to_string(),
+                    image: "a".repeat(40),
+                }],
+            }),
         }));
         let (mut app, _) = app_with(vec![conversation]);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Tools);
 
-        let backend = TestBackend::new(100, 30);
+        let backend = TestBackend::new(180, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let rendered: String = terminal
@@ -1138,9 +1152,14 @@ mod tests {
         assert!(rendered.contains("Always available"));
         assert!(rendered.contains("read, ls, write, edit"));
         assert!(rendered.contains("talk-1:caos-tools"));
+        assert!(rendered.contains("Configured tools"));
+        assert!(rendered.contains("my-tools"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("Build everything the tree defines."));
         assert!(rendered.contains("[/cas/std/bash]"));
+        assert!(rendered.contains("cargo"));
+        assert!(rendered.contains("Run Cargo in the Rust workspace."));
+        assert!(rendered.contains("[aaaaaaa]"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Chat);

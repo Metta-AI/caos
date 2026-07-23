@@ -29,6 +29,46 @@ caos-tui --new            start a fresh conversation
 caos-tui --from 5ec3751   branch from a completed turn
 ```
 
+### Custom tools
+
+A tool-set directory has one direct child per model-facing tool. The child
+name becomes the tool name, `docs` is the description given to the LLM, and
+`image` contains the runnable worker image reference:
+
+```text
+agent-tools/
+└── lint/
+    ├── docs
+    └── image
+```
+
+Given a compatible worker image in `TOOL_IMAGE`, create and select a tool set
+like this:
+
+```sh
+mkdir -p agent-tools/lint
+printf '%s\n' \
+  'Check the workspace. Pass an optional string `target` to limit the check.' \
+  > agent-tools/lint/docs
+printf '%s\n' "$TOOL_IMAGE" > agent-tools/lint/image
+git add agent-tools
+
+nix run .#caos-tui -- --new --tools agent-tools
+```
+
+The directory must be Git-tracked; like the rest of caos input ingestion,
+untracked files are ignored. The inline file tools, `bash`, `grep`, and the
+workspace's `caos-tools/*.sh` remain available. Press `Ctrl+T` in the TUI to
+inspect project and configured tools separately.
+
+A compatible worker receives a tree-valued `in` argument, materialized at
+`/cas/args/in`, containing `workspace/` and an opaque `call.json`. Its docs must
+tell the LLM which JSON fields to send. The worker writes `/cas/out` as a tree
+containing a textual `result`, an optional `is_error` marker, and an optional
+updated `workspace/`. An updated workspace must not contain a top-level `.caos`
+entry. The `image` file may name a `/cas/std/...` worker, a content-addressed
+Git image hash, or a `docker://...` image reference.
+
 ## Controls
 
 | Input | Action |

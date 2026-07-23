@@ -32,6 +32,7 @@
 //! design/agent-harness.md; the constants below are the load-bearing bits.
 
 mod api;
+mod bundle;
 mod progress;
 mod tools;
 
@@ -73,6 +74,8 @@ struct Config {
     model: String,
     base_url: String,
     conversation: Option<String>,
+    /// Optional docs-driven external-tool set.
+    tools: Option<String>,
 }
 
 impl Config {
@@ -87,6 +90,10 @@ impl Config {
             base_url: read_arg_opt("base_url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             conversation: read_arg_opt("conversation")?,
+            // Unlike the scalar options above, a bundle is a tree-valued arg.
+            // Keep its materialized path; trying to read it as a blob would
+            // fail before the first model request.
+            tools: Path::new(&arg("tools")).exists().then(|| arg("tools")),
         })
     }
 }
@@ -147,9 +154,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
     let current_id = read_arg("current_id")?;
 
     // Fold the tool's outcome into a tool_result block the model will see,
-    // and establish the workspace the queue continues over: bash results
-    // carry the post-command workspace as `tree`; a grep result is a sparse
-    // match tree, NOT a workspace — the pre-grep workspace rode our curry.
+    // and establish the workspace the queue continues over.
     let current_tool = read_arg_opt("current_tool")?.unwrap_or_else(|| "bash".to_string());
     let ws = match current_tool.as_str() {
         "grep" => {
@@ -162,6 +167,23 @@ fn callback(cfg: &Config) -> Result<(), String> {
             let ws = arg("ws");
             caos(["get", &ws])?;
             ws
+        }
+        "external" => {
+            results.push(external_result_block(&current_id)?);
+            let returned = format!("{}/workspace", arg("result"));
+            if Path::new(&returned).exists() {
+                caos(["get", &returned])?;
+                if Path::new(&returned).join(STEP_DIR).exists() {
+                    return Err(format!(
+                        "external tool returned a workspace containing reserved {STEP_DIR:?}"
+                    ));
+                }
+                returned
+            } else {
+                let ws = arg("ws");
+                caos(["get", &ws])?;
+                ws
+            }
         }
         // A tree tool's result (caos-tools/<name>.sh) is a VALUE — a report,
         // a bin tree, diagnostics — never a workspace: the pre-run workspace
@@ -245,10 +267,16 @@ fn drive(
                 );
             }
         }
+        if let Some(tool) = bundle::load(cfg.tools.as_deref())?
+            .into_iter()
+            .find(|tool| tool.name == name)
+        {
+            return launch_external(&tool, &call, &ws, step_path, &queue[1..], &results);
+        }
         if !tools::is_inline(name) {
             return Err(format!(
                 "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, \
-                 write, edit; plus this workspace's caos-tools/*.sh)"
+                 write, edit; plus this workspace's caos-tools/*.sh and configured tools)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -500,7 +528,7 @@ fn launch_grep(
     run_then(scope, &curried, Some(&me))
 }
 
-/// Launch a tree tool (caos-tools/<name>.sh, already resolved in the current
+/// Launch a tree tool (`caos-tools/<name>.sh`, already resolved in the current
 /// workspace) as a run-then sub-run: the input is the workspace tree and the
 /// SCRIPT BLOB rides curried on the script-worker image, so the run caches
 /// on exactly (workspace tree, script content) — and an edited tool is a new
@@ -533,6 +561,40 @@ fn launch_tree_tool(
         &[("current_tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
     )?;
     run_then(ws, &curried, Some(&me))
+}
+
+/// Launch one docs-driven external tool. Every bundle image receives the same
+/// `{workspace, call.json}` tree and returns a `result` text blob plus an
+/// optional `workspace` tree.
+fn launch_external(
+    tool: &bundle::Tool,
+    call: &Value,
+    ws: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let dir = scratch("external-tool-in")?;
+    link(ws, dir.join("workspace"))?;
+    let input = call.get("input").cloned().unwrap_or_else(|| json!({}));
+    fs::write(dir.join("call.json"), input.to_string())
+        .map_err(|e| format!("writing external tool call.json: {e}"))?;
+    let in_path = fresh("external-tool-in");
+    caos(["put", path(&dir), &in_path])?;
+    let me = self_curry(
+        step_path,
+        pending,
+        results,
+        id,
+        &[
+            ("current_tool", Arg::Lit("external")),
+            ("ws", Arg::Path(ws)),
+        ],
+    )?;
+    run_then(&in_path, &tool.image, Some(&me))
 }
 
 /// Rebuild ourselves as `curry(image, bin, <config>, <loop state>)` — a
@@ -572,6 +634,7 @@ fn self_curry(
         "conversation",
         "grep_image",
         "tools_image",
+        "tools",
     ]
     .iter()
     .map(|name| (*name, arg(name)))
@@ -705,8 +768,8 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
-/// The full tool registry: bash, grep and the cargo tools (the sub-run tools)
-/// plus the inline file tools (`tools.rs`).
+/// The full tool registry: built-ins, workspace tree tools, and configured
+/// docs-driven external tools.
 fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
@@ -719,6 +782,16 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
         for (name, doc) in tools::tree_tools(ws)? {
             tools.push(tools::tree_tool_declaration(&name, &doc));
         }
+    }
+    let external = bundle::load(cfg.tools.as_deref())?;
+    for tool in external {
+        if tools.iter().any(|entry| entry["name"] == tool.name) {
+            return Err(format!(
+                "external tool {:?} conflicts with an already registered tool",
+                tool.name
+            ));
+        }
+        tools.push(tool.declaration());
     }
     Ok(tools)
 }
@@ -790,6 +863,24 @@ fn tool_result_block(current_id: &str) -> Result<Value, String> {
         "content": [{"type": "text", "text": text}],
     });
     if exit != "0" {
+        block["is_error"] = Value::Bool(true);
+    }
+    Ok(block)
+}
+
+/// The fixed external-tool result convention: a text `result` blob and an
+/// optional `is_error` marker. The optional `workspace` is handled by callback.
+fn external_result_block(current_id: &str) -> Result<Value, String> {
+    caos(["get", &arg("result")])?;
+    let result = format!("{}/result", arg("result"));
+    caos(["get", &result])?;
+    let text = fs::read_to_string(&result).map_err(|e| format!("reading {result}: {e}"))?;
+    let mut block = json!({
+        "type": "tool_result",
+        "tool_use_id": current_id,
+        "content": [{"type": "text", "text": text}],
+    });
+    if Path::new(&format!("{}/is_error", arg("result"))).exists() {
         block["is_error"] = Value::Bool(true);
     }
     Ok(block)

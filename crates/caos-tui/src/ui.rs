@@ -7,6 +7,8 @@ use ratatui_widgets::borders::Borders;
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
+use caos::chat::ToolSourceDescription;
+
 use super::{short_hash, ActivityState, App, ConversationState, EntryRole, View};
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
@@ -298,12 +300,6 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  bash                  — commands in the workspace sandbox"),
         Line::raw("  grep                  — cached regular-expression search"),
         Line::raw(""),
-        Line::styled(
-            "Project tools",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
     ];
     match &state.tool_set {
         None => lines.push(Line::styled(
@@ -315,35 +311,10 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Red),
         )),
         Some(Ok(set)) => {
-            lines.push(Line::from(vec![
-                Span::styled("  source  ", Style::default().fg(Color::DarkGray)),
-                Span::raw(set.source.clone()),
-            ]));
-            if set.tools.is_empty() {
-                lines.push(Line::styled(
-                    "  No additional tools.",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            for tool in &set.tools {
+            append_tool_source(&mut lines, "Project tools", &set.project);
+            if let Some(configured) = &set.configured {
                 lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {}", tool.name),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  [{}]", tool_image_label(&tool.image)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-                lines.extend(
-                    tool.docs
-                        .lines()
-                        .map(|line| Line::raw(format!("    {line}"))),
-                );
+                append_tool_source(&mut lines, "Configured tools", configured);
             }
         }
     }
@@ -359,6 +330,49 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
             .scroll((scroll, 0)),
         area,
     );
+}
+
+fn append_tool_source<'a>(
+    lines: &mut Vec<Line<'a>>,
+    title: &'a str,
+    source: &'a ToolSourceDescription,
+) {
+    lines.push(Line::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::from(vec![
+        Span::styled("  source  ", Style::default().fg(Color::DarkGray)),
+        Span::raw(source.source.as_str()),
+    ]));
+    if source.tools.is_empty() {
+        lines.push(Line::styled(
+            "  No additional tools.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    for tool in &source.tools {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}", tool.name),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  [{}]", tool_image_label(&tool.image)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.extend(
+            tool.docs
+                .lines()
+                .map(|line| Line::raw(format!("    {line}"))),
+        );
+    }
 }
 
 fn tool_image_label(image: &str) -> &str {

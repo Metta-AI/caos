@@ -28,6 +28,18 @@ cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
 cp "$CAOS_BIN_DIR/worker-rgrep" rgrep-bin
 stub_bin=$CAOS_BIN_DIR/llm-stub
 
+cat > external-tool.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/in
+caos get /cas/args/in/call.json
+grep -q '"message":"hello tools"' /cas/args/in/call.json
+mkdir -p /tmp/external-out
+printf '%s\n' 'custom tool saw hello tools' > /tmp/external-out/result
+caos put /tmp/external-out /cas/out
+EOF
+chmod +x external-tool.sh
+
 # The conversation's workspace, and the identity chat's human commits use.
 mkdir -p ws/notes
 echo "hello notes" > ws/notes/todo.txt
@@ -163,7 +175,7 @@ grep -qx "base" log.out && fail "--log printed the base commit"
 echo "  ok: both turns, no base" >&2
 
 echo "== talk (std worker curries): sticky pick continues $conv ==" >&2
-# No CAOS_*_BIN overrides: the workers must resolve from the published std
+# No CAOS_LLM_STEP_BIN override: the workers must resolve from the published std
 # (refs/caos/std — build-builtins.sh publishes std/bash-tool and std/llm-step).
 T3_TEXT="sticky turn reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T3_TEXT" > stub/response-4.json
@@ -284,5 +296,32 @@ grep -qF '"is_error":true' stub/request-11.json || fail "invalid pattern not mar
 grep -qF 'invalid pattern' stub/request-11.json || fail "invalid pattern error not explained"
 [ ! -f stub/request-12.json ] || fail "unexpected extra LLM round"
 echo "  ok: fold matches rendered, scope honored, bad pattern as value, tree untouched" >&2
+
+echo "== configured tool: registered, invoked, and folded into the next round ==" >&2
+external_image=$("$CAOS_CLI" curry /cas/std/bash -- --script:@=external-tool.sh)
+mkdir -p agent-tools/echoer
+printf '%s\n' 'Echo a message. Pass a string named message.' > agent-tools/echoer/docs
+printf '%s\n' "$external_image" > agent-tools/echoer/image
+git add agent-tools
+printf '%s' \
+  '{"content":[{"id":"tu_external","input":{"message":"hello tools"},"name":"echoer","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  > stub/response-12.json
+printf '%s' \
+  '{"content":[{"text":"configured tool done","type":"text"}],"stop_reason":"end_turn"}' \
+  > stub/response-13.json
+"$CAOS_CLI" chat "$conv" -m "call the configured tool" --tools agent-tools "${opts[@]}" \
+  > external.out
+sed 's/^/  external| /' external.out >&2
+turn_external=$(git rev-parse "refs/caos/conversations/$conv")
+git diff --quiet "$turn_grep" "$turn_external" -- \
+  || fail "read-only configured tool changed the workspace tree"
+grep -qF '"name":"echoer"' stub/request-12.json || fail "configured tool not registered"
+grep -qF '"additionalProperties":true' stub/request-12.json \
+  || fail "configured tool did not get the generic permissive input object"
+grep -qF 'custom tool saw hello tools' stub/request-13.json \
+  || fail "configured tool result was not returned to the model"
+grep -qF 'configured tool done' external.out || fail "configured-tool turn did not complete"
+[ ! -f stub/request-14.json ] || fail "unexpected extra LLM round"
+echo "  ok: configured image ran and its result reached the model" >&2
 
 echo "chat-offline: ALL PASS" >&2
