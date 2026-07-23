@@ -500,7 +500,7 @@ fn launch_grep(
     run_then(scope, &curried, Some(&me))
 }
 
-/// Launch a tree tool (caos-tools/<name>.sh, already resolved in the current
+/// Launch a tree tool (`caos-tools/<name>.sh`, already resolved in the current
 /// workspace) as a run-then sub-run: the input is the workspace tree and the
 /// SCRIPT BLOB rides curried on the script-worker image, so the run caches
 /// on exactly (workspace tree, script content) — and an edited tool is a new
