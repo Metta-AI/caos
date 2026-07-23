@@ -39,6 +39,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     match app.view {
         View::Chat => render_transcript(state, frame, conversation[0]),
         View::Diff => render_diff(state, frame, conversation[0]),
+        View::Tools => render_tools(state, frame, conversation[0]),
     }
     render_activity(state, app.activity_expanded, frame, conversation[1]);
     render_composer(state, app.view, !app.copy_mode, frame, conversation[2]);
@@ -55,10 +56,12 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     };
     let view = if app.copy_mode {
         "copy"
-    } else if app.view == View::Chat {
-        "chat"
     } else {
-        "diff"
+        match app.view {
+            View::Chat => "chat",
+            View::Diff => "diff",
+            View::Tools => "tools",
+        }
     };
     let running = app
         .conversations
@@ -283,6 +286,89 @@ fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![
+        Line::styled(
+            "Always available",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw("  read, ls, write, edit  — inline workspace operations"),
+        Line::raw("  bash                  — commands in the workspace sandbox"),
+        Line::raw("  grep                  — cached regular-expression search"),
+        Line::raw(""),
+        Line::styled(
+            "Project tools",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    match &state.tool_set {
+        None => lines.push(Line::styled(
+            "  Tool metadata has not been loaded.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Some(Err(error)) => lines.push(Line::styled(
+            format!("  Unable to load tools: {error}"),
+            Style::default().fg(Color::Red),
+        )),
+        Some(Ok(set)) => {
+            lines.push(Line::from(vec![
+                Span::styled("  source  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(set.source.clone()),
+            ]));
+            if set.tools.is_empty() {
+                lines.push(Line::styled(
+                    "  No additional tools.",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            for tool in &set.tools {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}", tool.name),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  [{}]", tool_image_label(&tool.image)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                lines.extend(
+                    tool.docs
+                        .lines()
+                        .map(|line| Line::raw(format!("    {line}"))),
+                );
+            }
+        }
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    frame.render_widget(
+        paragraph
+            .block(
+                Block::default()
+                    .title(" Tools (Ctrl+T returns) ")
+                    .borders(Borders::ALL),
+            )
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
+fn tool_image_label(image: &str) -> &str {
+    if image.len() >= 40 && image.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        short_hash(image)
+    } else {
+        image
+    }
+}
+
 fn render_composer(
     state: &ConversationState,
     view: View,
@@ -294,6 +380,10 @@ fn render_composer(
         " Prompt (turn running; cancellation is not available) "
     } else if state.publishing {
         " Prompt (publishing PR) "
+    } else if view == View::Tools {
+        " Prompt (tool view; Ctrl+T returns) "
+    } else if view == View::Diff {
+        " Prompt (changes view; Ctrl+Q returns) "
     } else {
         " Prompt (Enter sends, Alt+Enter/Ctrl+J adds a line) "
     };
@@ -323,7 +413,7 @@ fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else {
-        Line::raw(" ^Up/Dn chat  ^N new  ^Q changes  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
+        Line::raw(" ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
     };
     frame.render_widget(Paragraph::new(footer), area);
 }

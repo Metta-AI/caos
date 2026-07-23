@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
-    conversation_history, conversation_workspace_diff, first_available_conversation_name,
-    list_conversations, run_chat_turn, ConversationRole, ConversationSummary, TurnEvent,
-    TurnOptions, WorkspaceDiff,
+    conversation_history, conversation_workspace_diff, describe_tool_set,
+    first_available_conversation_name, list_conversations, run_chat_turn, ConversationRole,
+    ConversationSummary, ToolSetDescription, TurnEvent, TurnOptions, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -23,6 +23,7 @@ fn short_hash(hash: &str) -> &str {
 pub(crate) enum View {
     Chat,
     Diff,
+    Tools,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +189,7 @@ struct ConversationState {
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
     diff: Option<WorkspaceDiff>,
+    tool_set: Option<Result<ToolSetDescription, String>>,
     composer: Composer,
     status: String,
     running: bool,
@@ -203,6 +205,7 @@ impl ConversationState {
             transcript: Vec::new(),
             activities: Vec::new(),
             diff: None,
+            tool_set: None,
             composer: Composer::default(),
             status,
             running: false,
@@ -591,10 +594,21 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             self.view = match self.view {
-                View::Chat => View::Diff,
+                View::Chat | View::Tools => View::Diff,
                 View::Diff => View::Chat,
             };
             self.selected_mut().scroll_from_bottom = 0;
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.view = match self.view {
+                View::Tools => View::Chat,
+                View::Chat | View::Diff => View::Tools,
+            };
+            self.selected_mut().scroll_from_bottom = 0;
+            if self.view == View::Tools {
+                self.load_selected_tool_set();
+            }
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
@@ -631,7 +645,7 @@ impl App {
         match key.code {
             KeyCode::PageUp => self.scroll_up(8),
             KeyCode::PageDown => self.scroll_down(8),
-            _ if self.view == View::Diff => {}
+            _ if self.view != View::Chat => {}
             KeyCode::Enter
                 if key
                     .modifiers
@@ -720,6 +734,21 @@ impl App {
         let len = self.conversations.len() as isize;
         self.selected = (self.selected as isize + amount).rem_euclid(len) as usize;
         self.confirm_action = None;
+        if self.view == View::Tools {
+            self.load_selected_tool_set();
+        }
+    }
+
+    fn load_selected_tool_set(&mut self) {
+        if self.selected().tool_set.is_some() {
+            return;
+        }
+        let name = self.selected().name.clone();
+        let options = self.selected().turn_options.clone();
+        let result = self
+            .transport()
+            .and_then(|transport| describe_tool_set(&transport, &name, &options));
+        self.selected_mut().tool_set = Some(result);
     }
 
     fn load_selected(&mut self) {
@@ -1079,5 +1108,41 @@ mod tests {
         assert!(app.selected().composer.text.is_empty());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.copy_mode);
+    }
+
+    #[test]
+    fn ctrl_t_shows_the_selected_chat_tool_set() {
+        let mut conversation = state("talk-1");
+        conversation.tool_set = Some(Ok(ToolSetDescription {
+            source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
+            tools: vec![caos::chat::ToolDescription {
+                name: "build".to_string(),
+                docs: "Build everything the tree defines.".to_string(),
+                image: "/cas/std/bash".to_string(),
+            }],
+        }));
+        let (mut app, _) = app_with(vec![conversation]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Tools);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Always available"));
+        assert!(rendered.contains("read, ls, write, edit"));
+        assert!(rendered.contains("talk-1:caos-tools"));
+        assert!(rendered.contains("build"));
+        assert!(rendered.contains("Build everything the tree defines."));
+        assert!(rendered.contains("[/cas/std/bash]"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
     }
 }
