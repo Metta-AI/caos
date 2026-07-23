@@ -53,6 +53,12 @@ const STREAM_CAP: usize = 100_000;
 /// bake ran in (fingerprints pin it), holding the pre-compiled `target/`.
 const WS_ROOT_FILE: &str = "/ws-root";
 
+/// Written beside [`WS_ROOT_FILE`]: the absolute target directory Crane used
+/// for the dependency bake. Build-script executables and their `OUT_DIR`s are
+/// fingerprinted with this path, so worker Cargo must not infer a different
+/// default when one of those scripts reruns.
+const TARGET_DIR_FILE: &str = "/target-dir";
+
 mod decompose;
 
 fn main() -> ExitCode {
@@ -114,17 +120,30 @@ fn flat(cmd: &str) -> Result<(), String> {
     fs::write(res.join("stdout"), tail(&out.stdout)).map_err(|e| format!("writing stdout: {e}"))?;
     fs::write(res.join("stderr"), tail(&out.stderr)).map_err(|e| format!("writing stderr: {e}"))?;
     if cmd == "build" && exit == 0 {
-        stage_binaries(&ws, target.as_deref(), &profile, &res)?;
+        stage_binaries(target.as_deref(), &profile, &res)?;
     }
     caos(["put", path(&res), "/cas/out"])
 }
 
 /// The baked workspace root (recorded by the image build; fingerprints pin it).
 pub(crate) fn ws_root() -> Result<String, String> {
-    Ok(fs::read_to_string(WS_ROOT_FILE)
-        .map_err(|e| format!("reading {WS_ROOT_FILE}: {e}"))?
+    read_recorded_path(WS_ROOT_FILE)
+}
+
+/// The exact target directory used by both dependency bakes.
+pub(crate) fn target_dir() -> Result<PathBuf, String> {
+    Ok(PathBuf::from(read_recorded_path(TARGET_DIR_FILE)?))
+}
+
+fn read_recorded_path(file: &str) -> Result<String, String> {
+    let value = fs::read_to_string(file)
+        .map_err(|e| format!("reading {file}: {e}"))?
         .trim()
-        .to_string())
+        .to_string();
+    if value.is_empty() {
+        return Err(format!("{file} is empty"));
+    }
+    Ok(value)
 }
 
 /// Run cargo with `argv` + `--offline` in `ws`, after pointing a writable
@@ -149,6 +168,7 @@ pub(crate) fn run_cargo(argv: &[&str], ws: &str) -> Result<std::process::Output,
     Command::new("cargo")
         .args(argv)
         .arg("--offline")
+        .env("CARGO_TARGET_DIR", target_dir()?)
         .current_dir(ws)
         .output()
         .map_err(|e| format!("running cargo: {e}"))
@@ -158,8 +178,8 @@ pub(crate) fn run_cargo(argv: &[&str], ws: &str) -> Result<std::process::Output,
 /// worker-producing caller (rustc) is after. Cargo places a workspace's final
 /// binaries directly in the profile dir (`target[/<triple>]/<debug|release>`);
 /// everything else there (deps/, build/, .fingerprint/, *.d) is intermediate.
-fn stage_binaries(ws: &str, target: Option<&str>, profile: &str, res: &Path) -> Result<(), String> {
-    let mut dir = Path::new(ws).join("target");
+fn stage_binaries(target: Option<&str>, profile: &str, res: &Path) -> Result<(), String> {
+    let mut dir = target_dir()?;
     if let Some(t) = target {
         dir = dir.join(t);
     }
@@ -263,5 +283,18 @@ mod tests {
         fs::write(src.join("d/f"), b"hi").unwrap();
         copy_into(&src, &dst).unwrap();
         assert_eq!(fs::read(dst.join("d/f")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn recorded_paths_reject_empty_files() {
+        let file = PathBuf::from("/tmp/wc-test-recorded-path");
+        fs::write(&file, "  \n").unwrap();
+        assert!(read_recorded_path(file.to_str().unwrap()).is_err());
+        fs::write(&file, " /build/source/target\n").unwrap();
+        assert_eq!(
+            read_recorded_path(file.to_str().unwrap()).unwrap(),
+            "/build/source/target"
+        );
+        fs::remove_file(file).unwrap();
     }
 }

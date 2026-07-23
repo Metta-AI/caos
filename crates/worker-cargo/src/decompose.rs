@@ -42,7 +42,7 @@ use worker_common::{
     read_arg_opt, scratch, Arg,
 };
 
-use crate::{exit_code, run_cargo, tail, ws_root};
+use crate::{exit_code, run_cargo, tail, target_dir, ws_root};
 
 /// One workspace member, as parsed from the manifests.
 struct Member {
@@ -256,7 +256,7 @@ pub fn job(cmd: &str) -> Result<(), String> {
     // checks, rlibs for their builds/tests); the other cmds match the flat
     // modes, scoped to the member.
     let before = if cmd == "dep" {
-        snapshot_target(&ws)?
+        snapshot_target()?
     } else {
         HashSet::new()
     };
@@ -310,7 +310,7 @@ pub fn job(cmd: &str) -> Result<(), String> {
         for child in &child_targets {
             link_files(child, &target)?;
         }
-        stage_delta(&ws, &before, &target)?;
+        stage_delta(&before, &target)?;
     } else if cmd == "build" && exit == 0 {
         // Stage THIS member's freshly linked executables into `res/bin` —
         // what combine merges into the result's bin/. Selected by mtime, not
@@ -324,7 +324,7 @@ pub fn job(cmd: &str) -> Result<(), String> {
             .map_err(|e| format!("writing stdout: {e}"))?;
         fs::write(res.join("stderr"), tail(&out.stderr))
             .map_err(|e| format!("writing stderr: {e}"))?;
-        stage_fresh_binaries(&ws, &target, &profile, started, &res)?;
+        stage_fresh_binaries(&target, &profile, started, &res)?;
     } else {
         fs::write(res.join("exit"), format!("{exit}\n"))
             .map_err(|e| format!("writing exit: {e}"))?;
@@ -342,13 +342,12 @@ pub fn job(cmd: &str) -> Result<(), String> {
 /// bake's dummy binaries, which occupy the same paths with store-epoch
 /// times.
 fn stage_fresh_binaries(
-    ws: &str,
     target: &Option<String>,
     profile: &Option<String>,
     started: std::time::SystemTime,
     res: &Path,
 ) -> Result<(), String> {
-    let mut dir = Path::new(ws).join("target");
+    let mut dir = target_dir()?;
     if let Some(t) = target {
         dir = dir.join(t);
     }
@@ -456,8 +455,8 @@ fn target_paths_present(pruned: &str, m: &Member) -> bool {
         .any(|rel| Path::new(pruned).join(&m.dir).join(rel).exists())
 }
 
-/// The set of files currently under `<ws>/target`, as target-relative paths.
-fn snapshot_target(ws: &str) -> Result<HashSet<PathBuf>, String> {
+/// The files currently under the recorded target directory, as relative paths.
+fn snapshot_target() -> Result<HashSet<PathBuf>, String> {
     fn walk(dir: &Path, root: &Path, out: &mut HashSet<PathBuf>) -> Result<(), String> {
         for entry in entries(path(dir))? {
             let meta =
@@ -471,18 +470,18 @@ fn snapshot_target(ws: &str) -> Result<HashSet<PathBuf>, String> {
         Ok(())
     }
     let mut set = HashSet::new();
-    let target = Path::new(ws).join("target");
+    let target = target_dir()?;
     if target.exists() {
         walk(&target, &target, &mut set)?;
     }
     Ok(set)
 }
 
-/// Stage every file added under `<ws>/target` since `before` into `out`,
+/// Stage every file added under the target directory since `before` into `out`,
 /// preserving relative structure — the member's own artifact delta.
-fn stage_delta(ws: &str, before: &HashSet<PathBuf>, out: &Path) -> Result<(), String> {
-    let target = Path::new(ws).join("target");
-    let after = snapshot_target(ws)?;
+fn stage_delta(before: &HashSet<PathBuf>, out: &Path) -> Result<(), String> {
+    let target = target_dir()?;
+    let after = snapshot_target()?;
     for rel in after.difference(before) {
         let src = target.join(rel);
         let dst = out.join(rel);
