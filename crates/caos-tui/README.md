@@ -38,6 +38,7 @@ caos-tui --from 5ec3751   branch from a completed turn
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
+| `Ctrl+T` | Show the tools available to the selected conversation |
 | `Ctrl+A` | Expand or collapse live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
 | Mouse wheel | Scroll by rendered rows |
