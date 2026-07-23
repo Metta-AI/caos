@@ -32,17 +32,9 @@ LIB=/cas/args/in/caos-tools/lib
 # edits never re-key it or anything downstream of the bin tree. Symlinks +
 # `caos put` reuse recorded hashes; no bytes move.
 mkdir /tmp/bw
-for e in Cargo.lock rust-toolchain.toml crates; do
+for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
   [ -e "/cas/args/in/$e" ] && ln -s "/cas/args/in/$e" "/tmp/bw/$e"
 done
-# caos-tui is a host terminal UI, not a caos worker, and it trips a latent
-# build-script-rerun bug in the cargo worker (baked target dir vs the
-# worker's default target dir — tracked separately). Exclude it from the
-# workspace the build compiles: drop it from members (its crate dir rides
-# along, unbuilt). A scoped harness decision, not an edit to the real
-# Cargo.toml.
-caos get /cas/args/in/Cargo.toml
-grep -v '"crates/caos-tui"' /cas/args/in/Cargo.toml > /tmp/bw/Cargo.toml
 caos put /tmp/bw /cas/bw
 
 cargo=$(caos curry /cas/std/cargo -- --cmd=build --mode=all \

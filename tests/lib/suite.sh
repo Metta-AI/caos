@@ -24,14 +24,9 @@ LIB=/cas/args/workspace/tests/lib
 # (cargo-self, unit), whose jobs must not re-key on non-Rust edits. The
 # build tool prunes identically inside itself.
 mkdir /tmp/build-ws
-for e in Cargo.lock rust-toolchain.toml crates; do
+for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
   [ -e "/cas/args/workspace/$e" ] && ln -s "/cas/args/workspace/$e" "/tmp/build-ws/$e"
 done
-# Exclude caos-tui (a host TUI, not a caos worker — see caos-tools/build.sh)
-# from the workspace the build + cargo-self/unit compile. build.sh prunes
-# identically, so its cargo jobs land on the same keys.
-caos get /cas/args/workspace/Cargo.toml
-grep -v '"crates/caos-tui"' /cas/args/workspace/Cargo.toml > /tmp/build-ws/Cargo.toml
 caos put /tmp/build-ws /cas/build-ws
 
 build=$(caos curry /cas/std/bash -- \
