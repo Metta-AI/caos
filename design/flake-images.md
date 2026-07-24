@@ -1,6 +1,9 @@
 # Flakes as first-class images — design note
 
-**Status:** proposed. Decided in a design discussion (2026-07). Generalizes the
+**Status:** SHIPPED (2026-07) — the mechanism, the cargo-base pilot, and the
+full std conversion (see "The rest of std follows"); the streamed
+flake-builder is the only nix-built worker image left. Decided in a design
+discussion (2026-07). Generalizes the
 phase-2 **flake-worker** from `runner-pool-and-cloud-builds.md` (written for the
 now-dead fly backend — read "in a worker" wherever it says "on fly") from a
 worker you invoke by hand into an **image form** that image resolution builds on

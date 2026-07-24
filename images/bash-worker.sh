@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# (env shebang: this runs on debian-based images AND bare nix-rooted ones —
-# the nix builder — where /bin/bash doesn't exist but /usr/bin/env does.)
+# (env shebang: the flake bases this runs on (bash-base, testenv-base) have
+# bash at /bin/bash, but the nix-builder images have only the nix profile's —
+# /usr/bin/env, which the flake-builder's caos delta guarantees, is the
+# portable meeting point.)
 # The caos runner runs us as /worker, with /cas set up and the args
 # materialized under /cas/args. Fetch the script and run it; on exit
 # caos reads the hash of /cas/out. If the script left no result there,
