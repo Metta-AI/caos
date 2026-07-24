@@ -44,7 +44,14 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         View::Tools => render_tools(state, frame, conversation[0]),
     }
     render_activity(state, app.activity_expanded, frame, conversation[1]);
-    render_composer(state, app.view, !app.copy_mode, frame, conversation[2]);
+    render_composer(
+        state,
+        app.view,
+        app.capabilities,
+        !app.copy_mode,
+        frame,
+        conversation[2],
+    );
     render_footer(app.copy_mode, frame, outer[2]);
 }
 
@@ -374,12 +381,15 @@ fn tool_image_label(image: &str) -> &str {
 fn render_composer(
     state: &ConversationState,
     view: View,
+    capabilities: super::super::backend::BackendCapabilities,
     show_cursor: bool,
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let title = if state.running {
+    let title = if state.running && !capabilities.cancellation {
         " Prompt (turn running; cancellation is not available) "
+    } else if state.running {
+        " Prompt (turn running) "
     } else if state.publishing {
         " Prompt (publishing PR) "
     } else if view == View::Tools {

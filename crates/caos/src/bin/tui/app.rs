@@ -1,15 +1,14 @@
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
-use caos::chat::{
-    conversation_history, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, list_conversations, run_chat_turn, ConversationRole,
-    ConversationSummary, ToolSetDescription, TurnEvent, TurnOptions, WorkspaceDiff,
-};
-use caos::{GitTransport, Transport};
+use caos::chat::first_available_conversation_name;
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::args::Args;
+use super::backend::{
+    BackendCapabilities, CaosBackend, ChatBackend, ConversationSnapshot, ConversationSummary,
+    MessageRole, ToolSetDescription, TurnOptions, TurnUpdate, WorkspaceDiff,
+};
 use super::workspace::{load_conversation_workspace, publish_conversation_pr};
 
 #[path = "ui.rs"]
@@ -214,34 +213,32 @@ impl ConversationState {
         }
     }
 
-    fn reload(&mut self, transport: &GitTransport) {
-        match conversation_history(transport, &self.name) {
-            Ok(turns) => {
-                self.transcript = turns
-                    .into_iter()
-                    .map(|turn| TranscriptEntry {
-                        role: match turn.role {
-                            ConversationRole::Human => EntryRole::Human,
-                            ConversationRole::Agent => EntryRole::Agent,
-                        },
-                        commit: Some(turn.commit),
-                        text: turn.message,
-                    })
-                    .collect();
-                match conversation_workspace_diff(transport, &self.name) {
-                    Ok(diff) => self.diff = Some(diff),
-                    Err(error) => {
-                        self.diff = None;
-                        self.status = format!("loading workspace changes failed: {error}");
-                    }
-                }
-            }
+    fn reload(&mut self, backend: &dyn ChatBackend) {
+        match backend.load_conversation(&self.name) {
+            Ok(snapshot) => self.apply_snapshot(snapshot),
             Err(error) => {
                 self.transcript.clear();
                 self.diff = None;
                 self.status = format!("loading conversation failed: {error}");
             }
         }
+        self.scroll_from_bottom = 0;
+    }
+
+    fn apply_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        self.transcript = snapshot
+            .messages
+            .into_iter()
+            .map(|message| TranscriptEntry {
+                role: match message.role {
+                    MessageRole::Human => EntryRole::Human,
+                    MessageRole::Agent => EntryRole::Agent,
+                },
+                commit: Some(message.commit),
+                text: message.text,
+            })
+            .collect();
+        self.diff = Some(snapshot.diff);
         self.scroll_from_bottom = 0;
     }
 
@@ -260,7 +257,7 @@ impl ConversationState {
 enum UiMessage {
     Turn {
         conversation: String,
-        event: TurnEvent,
+        update: TurnUpdate,
     },
     Failed {
         conversation: String,
@@ -279,7 +276,8 @@ enum ConfirmAction {
 }
 
 pub(crate) struct App {
-    repo_dir: PathBuf,
+    backend: Arc<dyn ChatBackend>,
+    capabilities: BackendCapabilities,
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
@@ -292,19 +290,21 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(mut args: Args) -> Result<Self, String> {
+    pub(crate) fn new(args: Args) -> Result<Self, String> {
         // Fail before taking over the terminal if the repo or remote is invalid.
-        let transport = GitTransport::from_cwd()?;
-        let repo_dir = transport.work_dir().to_path_buf();
+        Self::with_backend(args, Arc::new(CaosBackend::from_cwd()?))
+    }
+
+    fn with_backend(mut args: Args, backend: Arc<dyn ChatBackend>) -> Result<Self, String> {
         if let Some(from) = args.from_commit.clone() {
-            let commit = transport
-                .resolve_revspec(&from)?
+            let commit = backend
+                .resolve_revision(&from)?
                 .ok_or_else(|| format!("cannot resolve --from {from:?}"))?
                 .to_string();
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        let conversations = list_conversations(&transport)?;
+        let conversations = backend.list_conversations()?;
         let selected_name = choose_conversation(
             args.conversation.as_deref(),
             args.new_conversation,
@@ -323,7 +323,7 @@ impl App {
             })
             .collect();
         for state in &mut states {
-            state.reload(&transport);
+            state.reload(backend.as_ref());
         }
         if states.iter().all(|state| state.name != selected_name) {
             states.insert(
@@ -336,7 +336,8 @@ impl App {
             .position(|state| state.name == selected_name)
             .expect("the selected conversation was inserted");
         Ok(Self {
-            repo_dir,
+            capabilities: backend.capabilities(),
+            backend,
             conversations: states,
             selected,
             should_quit: false,
@@ -355,10 +356,6 @@ impl App {
 
     fn selected_mut(&mut self) -> &mut ConversationState {
         &mut self.conversations[self.selected]
-    }
-
-    fn transport(&self) -> Result<GitTransport, String> {
-        GitTransport::discover(&self.repo_dir)
     }
 
     pub(crate) fn should_quit(&self) -> bool {
@@ -410,16 +407,13 @@ impl App {
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
         let conversation = self.selected().name.clone();
-        let repo_dir = self.repo_dir.clone();
+        let backend = Arc::clone(&self.backend);
         std::thread::spawn(move || {
-            let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                run_chat_turn(&transport, &options, &conversation, &message, |event| {
-                    let _ = tx.send(UiMessage::Turn {
-                        conversation: conversation.clone(),
-                        event,
-                    });
-                })
-                .map(|_| ())
+            let result = backend.run_turn(&conversation, &message, &options, &mut |update| {
+                let _ = tx.send(UiMessage::Turn {
+                    conversation: conversation.clone(),
+                    update,
+                });
             });
             if let Err(error) = result {
                 let _ = tx.send(UiMessage::Failed {
@@ -437,10 +431,10 @@ impl App {
             match message {
                 UiMessage::Turn {
                     conversation,
-                    event,
+                    update,
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
-                        self.on_turn_event(index, event);
+                        self.on_turn_update(index, update);
                     }
                 }
                 UiMessage::Failed {
@@ -482,27 +476,30 @@ impl App {
             .position(|state| state.name == name)
     }
 
-    fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
-        if let TurnEvent::Completed(outcome) = event {
-            let transport = self.transport();
+    fn on_turn_update(&mut self, index: usize, update: TurnUpdate) {
+        if let TurnUpdate::Completed {
+            commit: _,
+            short_commit,
+        } = update
+        {
             let state = &mut self.conversations[index];
             state.running = false;
-            state.status = format!("completed {}", outcome.short_commit);
-            match transport {
-                Ok(transport) => state.reload(&transport),
+            state.status = format!("completed {short_commit}");
+            match self.backend.load_conversation(&state.name) {
+                Ok(snapshot) => state.apply_snapshot(snapshot),
                 Err(error) => state.status = format!("reloading completed turn failed: {error}"),
             }
             return;
         }
 
         let state = &mut self.conversations[index];
-        match event {
-            TurnEvent::PhaseComplete {
+        match update {
+            TurnUpdate::PhaseComplete {
                 label,
                 elapsed_secs,
             } => state.status = format!("{label}: {elapsed_secs:.1}s"),
-            TurnEvent::Status(status) => state.status = status,
-            TurnEvent::AssistantText(text) => {
+            TurnUpdate::Status(status) => state.status = status,
+            TurnUpdate::AssistantMessage(text) => {
                 state.transcript.push(TranscriptEntry {
                     role: EntryRole::Agent,
                     commit: None,
@@ -510,30 +507,30 @@ impl App {
                 });
                 state.scroll_from_bottom = 0;
             }
-            TurnEvent::ToolCall {
+            TurnUpdate::ToolCall {
                 step_commit,
-                tool_use_id,
+                id,
                 summary,
                 ..
             } => {
                 state.activities.push(Activity {
-                    id: tool_use_id,
+                    id,
                     step_commit,
                     summary,
                     detail: String::new(),
                     state: ActivityState::Running,
                 });
             }
-            TurnEvent::ToolResult {
+            TurnUpdate::ToolCallUpdate {
                 step_commit,
-                tool_use_id,
+                id,
                 is_error,
                 content,
             } => {
                 if let Some(activity) = state
                     .activities
                     .iter_mut()
-                    .find(|activity| activity.id == tool_use_id)
+                    .find(|activity| activity.id == id)
                 {
                     activity.state = if is_error {
                         ActivityState::Failed
@@ -543,9 +540,9 @@ impl App {
                     activity.detail = content;
                 } else {
                     state.activities.push(Activity {
-                        id: tool_use_id.clone(),
+                        id: id.clone(),
                         step_commit,
-                        summary: format!("result {tool_use_id}"),
+                        summary: format!("result {id}"),
                         detail: content,
                         state: if is_error {
                             ActivityState::Failed
@@ -555,7 +552,7 @@ impl App {
                     });
                 }
             }
-            TurnEvent::Completed(_) => unreachable!("completed events return above"),
+            TurnUpdate::Completed { .. } => unreachable!("completed updates return above"),
         }
     }
 
@@ -629,13 +626,14 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             if !self.selected().is_busy() {
-                match self.transport() {
-                    Ok(transport) => {
-                        self.selected_mut().reload(&transport);
+                let name = self.selected().name.clone();
+                match self.backend.load_conversation(&name) {
+                    Ok(snapshot) => {
+                        self.selected_mut().apply_snapshot(snapshot);
                         self.selected_mut().status = "reloaded".to_string();
                     }
                     Err(error) => self.selected_mut().status = error,
-                }
+                };
             } else {
                 self.selected_mut().status =
                     "finish this conversation's operation before reloading".to_string();
@@ -684,8 +682,8 @@ impl App {
 
     fn start_from_hash(&mut self, hash: &str) {
         let resolved = self
-            .transport()
-            .and_then(|transport| transport.resolve_revspec(hash))
+            .backend
+            .resolve_revision(hash)
             .and_then(|commit| commit.ok_or_else(|| format!("cannot resolve commit {hash:?}")));
         let commit = match resolved {
             Ok(commit) => commit.to_string(),
@@ -698,14 +696,7 @@ impl App {
     }
 
     fn start_new_conversation(&mut self, base: Option<String>) {
-        let transport = match self.transport() {
-            Ok(transport) => transport,
-            Err(error) => {
-                self.selected_mut().status = error;
-                return;
-            }
-        };
-        let disk = match list_conversations(&transport) {
+        let disk = match self.backend.list_conversations() {
             Ok(conversations) => conversations,
             Err(error) => {
                 self.selected_mut().status = error;
@@ -745,9 +736,7 @@ impl App {
         }
         let name = self.selected().name.clone();
         let options = self.selected().turn_options.clone();
-        let result = self
-            .transport()
-            .and_then(|transport| describe_tool_set(&transport, &name, &options));
+        let result = self.backend.describe_tools(&name, &options);
         self.selected_mut().tool_set = Some(result);
     }
 
@@ -774,10 +763,11 @@ impl App {
                 .as_ref()
                 .expect("a non-empty diff was checked")
                 .clone();
-            self.selected_mut().status = match load_conversation_workspace(&diff, Path::new(".")) {
-                Ok(()) => "conversation loaded into the working tree".to_string(),
-                Err(error) => error,
-            };
+            self.selected_mut().status =
+                match load_conversation_workspace(&diff, self.backend.work_dir()) {
+                    Ok(()) => "conversation loaded into the working tree".to_string(),
+                    Err(error) => error,
+                };
         }
     }
 
@@ -850,12 +840,100 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    use super::super::backend::ConversationMessage;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::terminal::Terminal;
     use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
     use super::ui::{paragraph_scroll, render, scroll_offset};
+
+    struct StubChatBackend {
+        conversations: Vec<ConversationSummary>,
+        snapshots: HashMap<String, ConversationSnapshot>,
+        updates: Vec<TurnUpdate>,
+        work_dir: PathBuf,
+    }
+
+    impl StubChatBackend {
+        fn for_conversations(names: &[&str]) -> Self {
+            let conversations: Vec<_> = names.iter().map(|name| summary(name)).collect();
+            let snapshots = names
+                .iter()
+                .map(|name| ((*name).to_string(), empty_snapshot()))
+                .collect();
+            Self {
+                conversations,
+                snapshots,
+                updates: Vec::new(),
+                work_dir: PathBuf::from("."),
+            }
+        }
+    }
+
+    impl ChatBackend for StubChatBackend {
+        fn work_dir(&self) -> &Path {
+            &self.work_dir
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::default()
+        }
+
+        fn resolve_revision(&self, revision: &str) -> Result<Option<String>, String> {
+            Ok(Some(revision.to_string()))
+        }
+
+        fn list_conversations(&self) -> Result<Vec<ConversationSummary>, String> {
+            Ok(self.conversations.clone())
+        }
+
+        fn load_conversation(&self, name: &str) -> Result<ConversationSnapshot, String> {
+            self.snapshots
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("no conversation named {name:?}"))
+        }
+
+        fn describe_tools(
+            &self,
+            _name: &str,
+            _options: &TurnOptions,
+        ) -> Result<ToolSetDescription, String> {
+            Ok(ToolSetDescription {
+                source: "test:caos-tools".to_string(),
+                tools: Vec::new(),
+            })
+        }
+
+        fn run_turn(
+            &self,
+            _name: &str,
+            _prompt: &str,
+            _options: &TurnOptions,
+            on_update: &mut dyn FnMut(TurnUpdate),
+        ) -> Result<(), String> {
+            for update in self.updates.clone() {
+                on_update(update);
+            }
+            Ok(())
+        }
+    }
+
+    fn empty_snapshot() -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: Vec::new(),
+            diff: WorkspaceDiff {
+                base: "a".repeat(40),
+                head: "a".repeat(40),
+                stat: String::new(),
+                patch: String::new(),
+            },
+        }
+    }
 
     fn summary(name: &str) -> ConversationSummary {
         ConversationSummary {
@@ -877,7 +955,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (
             App {
-                repo_dir: PathBuf::from("."),
+                backend: Arc::new(StubChatBackend::for_conversations(&[])),
+                capabilities: BackendCapabilities::default(),
                 conversations,
                 selected: 0,
                 should_quit: false,
@@ -1075,7 +1154,7 @@ mod tests {
 
         tx.send(UiMessage::Turn {
             conversation: "talk-1".to_string(),
-            event: TurnEvent::Status("running a tool".to_string()),
+            update: TurnUpdate::Status("running a tool".to_string()),
         })
         .unwrap();
         assert!(app.drain_messages());
@@ -1084,35 +1163,83 @@ mod tests {
     }
 
     #[test]
-    fn reload_surfaces_history_errors_instead_of_showing_an_empty_chat() {
-        // A throwaway repo so the transport discovers a real working tree; the
-        // conversation itself is absent, which is the error we're asserting on.
-        // (Don't depend on cwd being a repo — the cargo worker's is not.)
-        let dir = std::env::temp_dir().join(format!(
-            "caos-cli-tui-reload-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
+    fn backend_updates_drive_transcript_tool_state_and_completion() {
+        let mut backend = StubChatBackend::for_conversations(&["talk-1"]);
+        backend.snapshots.insert(
+            "talk-1".to_string(),
+            ConversationSnapshot {
+                messages: vec![
+                    ConversationMessage {
+                        role: MessageRole::Human,
+                        commit: "a".repeat(40),
+                        text: "build it".to_string(),
+                    },
+                    ConversationMessage {
+                        role: MessageRole::Agent,
+                        commit: "b".repeat(40),
+                        text: "done".to_string(),
+                    },
+                ],
+                diff: WorkspaceDiff {
+                    base: "a".repeat(40),
+                    head: "b".repeat(40),
+                    stat: "1 file changed".to_string(),
+                    patch: "diff --git a/a b/a".to_string(),
+                },
+            },
+        );
+        backend.updates = vec![
+            TurnUpdate::Status("running a tool".to_string()),
+            TurnUpdate::AssistantMessage("working".to_string()),
+            TurnUpdate::ToolCall {
+                step_commit: "c".repeat(40),
+                id: "tool-1".to_string(),
+                name: "build".to_string(),
+                summary: "build workspace".to_string(),
+            },
+            TurnUpdate::ToolCallUpdate {
+                step_commit: "c".repeat(40),
+                id: "tool-1".to_string(),
+                is_error: false,
+                content: "all tests passed".to_string(),
+            },
+            TurnUpdate::Completed {
+                commit: "b".repeat(40),
+                short_commit: "bbbbbbb".to_string(),
+            },
+        ];
+        let args = Args::parse(&["-c".into(), "talk-1".into()]).unwrap();
+        let mut app = App::with_backend(args, Arc::new(backend)).unwrap();
+        app.selected_mut().composer.insert_str("build it");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
+        for _ in 0..100 {
+            app.drain_messages();
+            if !app.selected().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(!app.selected().running);
+        assert_eq!(app.selected().status, "completed bbbbbbb");
+        assert_eq!(app.selected().transcript.len(), 2);
+        assert_eq!(app.selected().transcript[1].text, "done");
+        assert_eq!(app.selected().activities.len(), 1);
+        assert_eq!(app.selected().activities[0].state, ActivityState::Succeeded);
+        assert_eq!(app.selected().activities[0].detail, "all tests passed");
+        assert_eq!(app.selected().diff.as_ref().unwrap().stat, "1 file changed");
+    }
+
+    #[test]
+    fn reload_surfaces_history_errors_instead_of_showing_an_empty_chat() {
         let mut conversation = state("missing-conversation-for-reload-test");
-        let transport = GitTransport::discover(&dir).unwrap();
-        conversation.reload(&transport);
+        let backend = StubChatBackend::for_conversations(&[]);
+        conversation.reload(&backend);
         assert!(conversation.transcript.is_empty());
         assert!(conversation.diff.is_none());
         assert!(conversation.status.contains("loading conversation failed"));
         assert!(conversation.status.contains("no conversation"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
