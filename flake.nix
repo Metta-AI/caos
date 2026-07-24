@@ -911,7 +911,7 @@
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
         # These let another tree (one that has caos as a flake input) get the
         # user-facing CLI on its PATH, bring the dev stack up, and publish the
-        # builtin worker library — without the caos source tree or `tilt`.
+        # builtin worker library without the caos source tree.
 
         # Just the user-facing CLI (a consumer wants only `caos-cli`, not the
         # worker-side `caos`, in its devShell) — and it runs on the *host*. On
@@ -1008,8 +1008,8 @@
         };
 
         # The dev stack as docker compose: redis + registry + the caos server +
-        # runnerd, mirroring the Tiltfile's wiring. The network and container
-        # names are *pinned* (not compose's project-prefixed defaults) so the
+        # runnerd. The network and container names are *pinned* (not compose's
+        # project-prefixed defaults) so the
         # worker containers runnerd spawns over the docker socket — which it
         # attaches to CAOS_DOCKER_NETWORK by this literal name — land on
         # caos-net and can reach caos-server. The server and runnerd images are
@@ -1394,8 +1394,6 @@
             # was checked out. The pinned workflow is explicit instead: run
             # `nix build` to produce ./result/bin/caosd (baked to this checkout),
             # then `./result/bin/caosd up`. The stack only moves when you rebuild.
-            # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
-            pkgs.tilt
             # `fly` CLI: auth (`fly auth token`), org/region lookup, and operating
             # the fly backend (apps, machines, logs). caosd itself talks to the
             # Machines API + registry over HTTP and does not need this.
