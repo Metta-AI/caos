@@ -37,6 +37,7 @@ caos tui --from 5ec3751   branch from a completed turn
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
+| `Ctrl+W` | Close the selected chat tab |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Show the tools available to the selected conversation |
 | `Ctrl+A` | Expand or collapse live Activity above the prompt |

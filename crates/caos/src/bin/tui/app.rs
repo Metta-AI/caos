@@ -619,6 +619,10 @@ impl App {
             self.start_new_conversation(None);
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+            self.close_selected();
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Up {
             self.select_relative(-1);
             return;
@@ -733,6 +737,19 @@ impl App {
     fn select_relative(&mut self, amount: isize) {
         let len = self.conversations.len() as isize;
         self.selected = (self.selected as isize + amount).rem_euclid(len) as usize;
+        self.confirm_action = None;
+        if self.view == View::Tools {
+            self.load_selected_tool_set();
+        }
+    }
+
+    fn close_selected(&mut self) {
+        if self.conversations.len() == 1 {
+            self.selected_mut().status = "cannot close the only chat tab".to_string();
+            return;
+        }
+        self.conversations.remove(self.selected);
+        self.selected = self.selected.min(self.conversations.len() - 1);
         self.confirm_action = None;
         if self.view == View::Tools {
             self.load_selected_tool_set();
@@ -1081,6 +1098,30 @@ mod tests {
         assert!(app.drain_messages());
         assert_eq!(app.conversations[0].status, "running a tool");
         assert_eq!(app.selected().name, "talk-2");
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_selected_chat_tab() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        app.selected = 1;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.conversations
+                .iter()
+                .map(|conversation| conversation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["talk-1", "talk-3"]
+        );
+        assert_eq!(app.selected().name, "talk-3");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().name, "talk-1");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected().name, "talk-1");
+        assert_eq!(app.selected().status, "cannot close the only chat tab");
     }
 
     #[test]
