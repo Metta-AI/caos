@@ -109,8 +109,7 @@ Worker images contain **only** their static `/worker` binary plus a setuid-root
 libc, no `/nix/store`. The `caos-server` image is not minimal: it bundles the
 `docker` client, `git`, and `tar`, and expects the host's docker socket.
 
-> Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
-> remote/linux builder; the binaries and dev shell build natively.
+> On macOS, see [Building on macOS](BUILDING_ON_MACOS.md).
 
 ## The big picture
 
