@@ -91,16 +91,24 @@ generalized into two workers:
   (`H = caos hash <flaketree>` — a git tree hash, identical no matter which caos
   computes it) and the **nix store**. On a hit the inner skips the `nix build`
   and the push and just returns the existing digest. So a caos edit costs one
-  inspect-and-return here; only the cheap stage-2 caos delta actually re-stacks.
-  `flake.nix` (`workerFlakeBuilderImage`) + `images/flake-builder-inner.sh`.
-- **`std/flake-builder`** (outer) — **has `/caos`**. One script, `images/flake-builder-outer.sh`,
-  curried onto `std/bash`, branching on a curried-in `--stage`:
-  - **stage 1:** `run-then` the inner over the flake tree; the inner's `{ref,
-    config}` becomes stage 2's `--result`.
-  - **stage 2:** emit a git-docker delta `{base: docker://<clean>, config.json,
-    layer00: /bin/caos setuid 4755 (via a `.caosmeta` sidecar) + /bin/caos symlink
-    + /tmp + userdb}`. The server converts that (cheap, one caos layer on a docker
-    base) → **`digestWorker`**.
+  inspect-and-return here; only the cheap stack-stage caos delta re-stacks.
+
+**Implemented as ONE self-contained builtin** (`std/flake-builder`,
+`images/flake-builder.sh`, image `workerFlakeBuilderImage` in `flake.nix`): a
+single script branching on a curried-in `--stage`:
+
+- **orchestrate** (default): `run-then` the **build** stage over the flake
+  tree, with the **stack** stage as the `then`.
+- **build**: the "inner" role above — `nix build` the flake's `#caosImage`,
+  stream it to the registry, return the clean image as `{ref, config}`.
+- **stack**: emit a git-docker delta `{base: docker://<clean>, config.json,
+  layer00: /bin/caos setuid 4755 (via a `.caosmeta` sidecar) + /bin/caos symlink
+  + **/worker runner trampoline** + /tmp + userdb}`. The server converts that
+  (cheap, one caos layer on a docker base) → **`digestWorker`**.
+
+The trampoline in the delta is what lets a flake `#caosImage` be a **pure
+base** — no `/worker`, no caos, stable hash — and a worker be
+`curry(<flake image>, bin=<binary>)`, the runner-pool model.
 
 Why the inner returns `config` too: a real flake worker (e.g. rustc) keeps its
 toolchain at nix-store paths only its own OCI config names. Stage 2 must carry
@@ -131,6 +139,38 @@ the delta is cached on the delta-tree hash. A repeated resolve is a lookup; a ca
 edit re-keys only the cheap outer run (inner still hits the registry tag). Under
 `durable-resolution.md` the outer run is just a pending node, single-flighted by a
 Redis lease.
+
+## std entries as flakes: cargo-base (finding B)
+
+The end-state is **most std entries are git trees containing flakes**, built by
+the flake-builder and streamed to the registry — ideally one built-in (the
+flake-builder) and everything else defined as a flake. `std/cargo-base` is the
+pilot, because it was the heaviest git-imported image (toolchain + baked deps):
+
+- **`std/cargo-base/flake.nix`** (checked in) replicates the main flake's
+  cargo machinery — toolchain from the workspace's `rust-toolchain.toml`
+  (`minimal` + musl target), crane vendor + `buildDepsOnly` (musl, dev),
+  musl cross cc — as a `#caosImage` that carries `/ws-root`, `/target-dir`
+  and the inflated writable `target/`, the same worker Env as before, and
+  **no `/worker`, no caos** (the builder's delta supplies those).
+- **The published tree is GENERATED at publish** (`std/cargo-base/stage-tree.sh`,
+  run by `build-builtins.sh`): the flake + the workspace's
+  `rust-toolchain.toml`, `Cargo.toml`/`Cargo.lock` and member manifests, plus
+  **empty stubs at each crate's real target paths** (cargo only sees
+  autodiscovered targets whose files exist; crane's `mkDummySrc` detects them
+  the same way and overwrites the contents). No source — so a source edit
+  never re-keys the tree and the registry memo `flake-<H>` holds.
+- **The flake.lock is DERIVED from the main flake.lock** in `stage-tree.sh`
+  (jq: same nixpkgs/rust-overlay/crane nodes, a root naming just those).
+  This is the toolchain-pin coupling: the cargo worker must compile with the
+  exact rustc that builds caos (the caos-in-caos suite), and deriving the lock
+  makes drift structurally impossible.
+- `std/cargo` stays `curry(std/cargo-base, bin=worker-cargo)` — curries peel
+  before image resolution on both the client and `run_image` paths, so the
+  flake branch sees the bare tree with no new server code.
+- The old `cargoBaseImage` git-import is gone (`flake.nix`,
+  `builtinWorkerImages`, `build-builtins.sh`). The deps-bake machinery stays
+  in the main flake for `cargoDepsImage`, the test suite's D2 deps-only base.
 
 ## Open items
 

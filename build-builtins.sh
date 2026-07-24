@@ -11,13 +11,24 @@
 #
 # Usage: ./build-builtins.sh [name ...]   (default: all)
 # A name maps to the `caos-worker-<name>` image; `base` -> `caos-worker-base`.
-# Requires the dev server running and git on PATH.
+# Flake-tree entries (cargo-base) are generated trees, not images — see
+# is_flake_entry below. Requires the dev server running and git + jq on PATH.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
 [ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv flake-builder)
+
+# std entries that are FLAKE TREES, not worker images (design/flake-images.md):
+# published as the bake tree itself; the server's flake-builder turns it into
+# an image on first use. Everything below that builds/imports nix images skips
+# these.
+is_flake_entry() { case "$1" in cargo-base) return 0 ;; *) return 1 ;; esac; }
+image_names=()
+for name in "${names[@]}"; do
+  is_flake_entry "$name" || image_names+=("$name")
+done
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
 # runs us from a store copy with no `nix` at runtime), else built from the flake.
@@ -69,8 +80,8 @@ if [ -n "${CAOS_BUILTIN_IMAGES:-}" ]; then
   built_paths=$CAOS_BUILTIN_IMAGES
 else
   attrs=()
-  for name in "${names[@]}"; do attrs+=(".#$(image_attr "$name")"); done
-  echo "building ${#names[@]} images in parallel..." >&2
+  for name in "${image_names[@]}"; do attrs+=(".#$(image_attr "$name")"); done
+  echo "building ${#image_names[@]} images in parallel..." >&2
   if ! built_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
     echo "build-builtins: nix build failed" >&2; exit 1
   fi
@@ -81,11 +92,11 @@ declare -A img_path
 # whitespace or glob chars, so this is safe.
 # shellcheck disable=SC2086
 for p in $built_paths; do
-  for name in "${names[@]}"; do
+  for name in "${image_names[@]}"; do
     case "$p" in *-caos-worker-"$name".tar.gz) img_path[$name]=$p ;; esac
   done
 done
-for name in "${names[@]}"; do
+for name in "${image_names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done
 
@@ -99,7 +110,7 @@ src_ref_of() { echo "refs/caos/src/$(printf '%s' "$1" | sha1sum | cut -c1-40)"; 
 
 declare -A hash_of
 to_import=()
-for name in "${names[@]}"; do
+for name in "${image_names[@]}"; do
   cached=$(git -C "$CLIENT" rev-parse --verify --quiet "$(src_ref_of "${img_path[$name]}")^{tree}" || true)
   if [ -n "$cached" ]; then
     echo "$name: reusing import $cached" >&2
@@ -143,6 +154,22 @@ if [ "${#to_import[@]}" -gt 0 ]; then
     git -C "$CLIENT" update-ref "$(src_ref_of "${img_path[$name]}")" "${hash_of[$name]}"
   done
 fi
+
+# The flake-tree std entries (design/flake-images.md): std/cargo-base is the
+# GENERATED bake tree — the checked-in flake + a lock derived from the main
+# flake.lock + the workspace's manifests (stage-tree.sh) — published as a
+# plain git tree. The server's flake-builder turns it into the toolchain+deps
+# image on first use, memoized in the registry on the tree's own hash, so
+# re-publishing an unchanged tree costs nothing. Staged inside CLIENT (like
+# worker-common below) because only git-tracked paths can be hashed here.
+for name in "${names[@]}"; do
+  is_flake_entry "$name" || continue
+  rm -rf "${CLIENT:?}/$name"
+  "$PROJECT/std/$name/stage-tree.sh" "$PROJECT" "$CLIENT/$name"
+  git -C "$CLIENT" add "$name"
+  hash_of[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
+  echo "$name: flake tree ${hash_of[$name]}" >&2
+done
 
 # Agent-harness worker binaries (design/agent-harness.md): each is published as
 # a ready-to-run curry over the shared runner image — std/<name> =
