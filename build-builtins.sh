@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Populate the caos `std` library — the worker images clients reach as
+# Populate the caos `std` library — the workers clients reach as
 # `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
 #
-# Entries come in four forms (see the is_*_entry predicates below):
-#   image     (base, runner)                nix-built, imported as a git-docker
-#                                           tree — real git objects, versions dedup
+# Entries come in three forms (see the is_*_entry predicates below):
 #   streamed  (flake-builder)               nix-built, composed onto its stock
 #                                           base and pushed to the registry; the
 #                                           entry is a curry over the digest ref
-#   flake     (cargo-base, bash-base,       generated flake trees (each
-#              testenv-base)                std/<name>/stage-tree.sh); the
+#   flake     (runner, cargo-base,          generated flake trees (each
+#              bash-base, testenv-base)     std/<name>/stage-tree.sh); the
 #                                           flake-builder images them on first use
 #   curry     (bash, testenv + bin_names)   curry(<base>, bin=…) — script workers
 #                                           bind images/bash-worker.sh, binary
@@ -25,13 +23,13 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base runner cargo-base bash-base testenv-base bash testenv flake-builder)
+[ ${#names[@]} -eq 0 ] && names=(runner cargo-base bash-base testenv-base bash testenv flake-builder)
 
 # std entries that are FLAKE TREES, not worker images (design/flake-images.md):
 # published as the bake tree itself (std/<name>/stage-tree.sh); the server's
 # flake-builder turns it into an image on first use. Everything below that
 # builds/imports nix images skips these.
-is_flake_entry() { case "$1" in cargo-base | bash-base | testenv-base) return 0 ;; *) return 1 ;; esac; }
+is_flake_entry() { case "$1" in runner | cargo-base | bash-base | testenv-base) return 0 ;; *) return 1 ;; esac; }
 # std entries that are SCRIPT WORKERS over a flake base: curry(<name>-base,
 # bin=images/bash-worker.sh) — the bin fetches the run's `script` arg and
 # executes it. No image of their own.
@@ -45,10 +43,6 @@ is_streamed_entry() { case "$1" in flake-builder) return 0 ;; *) return 1 ;; esa
 image_names=()
 for name in "${names[@]}"; do
   is_flake_entry "$name" || is_script_entry "$name" || image_names+=("$name")
-done
-import_names=()
-for name in "${image_names[@]}"; do
-  is_streamed_entry "$name" || import_names+=("$name")
 done
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
@@ -73,19 +67,6 @@ git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
   || git -C "$CLIENT" remote set-url caos "$SERVER_URL"
 
 image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
-
-# Some builtins ship as a thin delta on a stock docker base instead of a
-# self-contained image: the nix image holds only our bits, and `import-image
-# --base docker://<ref>` records the stock base so the heavy layers ride as
-# stock registry layers (pulled server-side at convert time) rather than in
-# git. The worker base and the runner base on stock debian (glibc); the rest
-# are self-contained.
-import_base() { # std name -> docker:// base ref, or empty for self-contained
-  case "$1" in
-    base | runner) echo "docker://debian:stable-slim" ;;
-    *) echo "" ;;
-  esac
-}
 
 # The image tarball store paths. If the caller prebuilt them (CAOS_BUILTIN_IMAGES,
 # a whitespace-separated list — how caosd hands us the flake's images with no
@@ -117,61 +98,10 @@ for name in "${image_names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done
 
-# Import cache: refs/caos/src/<sha1(image store path)> in CLIENT pins each image's
-# imported tree. The store path is immutable + content-addressed, so the ref's
-# presence means "already imported this exact image" — we reuse the hash and skip
-# the multi-second re-unpack/re-hash (rustc especially). The ref also keeps the
-# objects from gc. (Same scheme as the flake's set-stdlib, flake.nix.) Wipe CLIENT
-# and the cache goes with it; change an image and its store path -> a new ref.
-src_ref_of() { echo "refs/caos/src/$(printf '%s' "$1" | sha1sum | cut -c1-40)"; }
-
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 declare -A hash_of
-to_import=()
-for name in "${import_names[@]}"; do
-  cached=$(git -C "$CLIENT" rev-parse --verify --quiet "$(src_ref_of "${img_path[$name]}")^{tree}" || true)
-  if [ -n "$cached" ]; then
-    echo "$name: reusing import $cached" >&2
-    hash_of[$name]=$cached
-  else
-    to_import+=("$name")
-  fi
-done
-
-# Import the cache-misses in PARALLEL. `import-image` only writes objects into its
-# *local* repo (no network I/O), so each runs in its own throwaway repo with zero
-# contention (the parallel win is the per-layer materialize/hash). We then union
-# every repo's objects into CLIENT, pin each src_ref, and push ONCE below —
-# concurrent pushes to one server repo race and corrupt it, so the push stays serial.
-if [ "${#to_import[@]}" -gt 0 ]; then
-  pids=()
-  for name in "${to_import[@]}"; do
-    echo "$name: importing..." >&2
-    (
-      repo="$WORK/repo-$name"
-      git init -q "$repo"
-      git -C "$repo" remote add caos "$SERVER_URL"
-      base=$(import_base "$name")
-      if [ -n "$base" ]; then
-        hash=$(cd "$repo" && "$caos" import-image --base "$base" "${img_path[$name]}")
-      else
-        hash=$(cd "$repo" && "$caos" import-image "${img_path[$name]}")
-      fi
-      printf '%s' "$hash" >"$WORK/$name.hash"
-    ) &
-    pids+=("$!")
-  done
-  rc=0
-  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
-  [ "$rc" -eq 0 ] || { echo "build-builtins: an import failed" >&2; exit 1; }
-  for name in "${to_import[@]}"; do
-    cp -rn "$WORK/repo-$name/.git/objects/." "$CLIENT/.git/objects/"
-    hash_of[$name]=$(cat "$WORK/$name.hash")
-    git -C "$CLIENT" update-ref "$(src_ref_of "${img_path[$name]}")" "${hash_of[$name]}"
-  done
-fi
 
 # The streamed std entries (design/flake-images.md): compose the nix tarball's
 # layers onto the stock nixos/nix base with `docker build` — ADD extracts each

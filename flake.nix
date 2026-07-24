@@ -188,16 +188,6 @@
         # through it), and Nix strips the setuid bit when it seals a store path.
         # So caos (and a writable /tmp) are installed per-image by
         # `installWorkerFiles` below, which runs while the image layer is built.
-        # A worker image root: a single static worker binary placed at /worker.
-        # Each Rust worker crate's binary is named after its package, so pass that
-        # name and the built crate. The result is combined with workerBaseRoot
-        # (the user database) and the setuid caos installed by installWorkerFiles —
-        # no shell or coreutils, since the worker itself does all the file work.
-        workerRoot = binName: drv: pkgs.runCommand "caos-${binName}-root" { } ''
-          mkdir -p $out
-          cp ${drv}/bin/${binName} $out/worker
-        '';
-
         workerBaseRoot = pkgs.runCommand "caos-worker-base-root" { } ''
           mkdir -p $out/etc
           printf 'root:x:0:0:root:/root:/sbin/nologin\n' > $out/etc/passwd
@@ -223,107 +213,29 @@
           mkdir -p usr/bin
           [ -e usr/bin/env ] || ln -s /bin/env usr/bin/env
         '';
-        # The same, but for images that stack on a stock docker base (e.g. rustc on
-        # rust:1-bookworm). There we must NOT create a real /bin or /tmp: on Debian
-        # /bin is a symlink to /usr/bin, and a real /bin in our layer would shadow
-        # that symlink (hiding cc, sh, …); /tmp already exists. Install caos into
-        # /usr/bin (a real dir on the base — our layer MERGES with it, leaving the
-        # base's binaries intact) so it's reachable both via PATH and as `/bin/caos`
-        # (which the base's /bin -> usr/bin symlink resolves) — the latter matters
-        # because runnerd forces `--entrypoint /bin/caos` on every
-        # worker, regardless of the image's own Entrypoint.
-        installWorkerFilesBaseStacked = ''
-          mkdir -p usr/bin
-          cp ${caos}/bin/caos usr/bin/caos
-          chmod 4755 usr/bin/caos
-        '';
-        # The container runs `caos runner`: set up /cas, run /worker, post the
-        # hash of /cas/out back to the server, then poll for more work. The
-        # server URL a worker needs is injected at runtime by runnerd for the
-        # containers it spawns — so none are baked into the images. PATH is
-        # Debian's default (the base is a stock Debian image; /bin -> /usr/bin,
-        # where caos lives).
-        workerBaseConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-          ];
-        };
-        # The worker base is a thin delta on a stock glibc base
-        # (docker://debian:stable-slim — see build-builtins.sh). It carries only the
-        # setuid caos (installed at /usr/bin via installWorkerFilesBaseStacked); the
-        # glibc/coreutils come from the Debian base. Workers stacked on it
-        # inherit this setuid caos layer by hash, so an unprivileged builder
-        # never has to synthesize a setuid-root binary itself.
-        workerBaseImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-base";
-          tag = "latest";
-          contents = [ ];
-          config = workerBaseConfig;
-          fakeRootCommands = installWorkerFilesBaseStacked;
-        };
-
-        # The "bash" script worker, the example workers (hello, file-count,
-        # dirs-only, deep-deps) and testenv no longer have images here: their
-        # environments are std FLAKES (std/bash-base, std/testenv-base —
-        # design/flake-images.md) or the shared runner, and build-builtins.sh
-        # publishes each worker as curry(<base>, bin=…) — the script workers
-        # bind images/bash-worker.sh, the example workers bind their static
-        # musl binaries (builtinWorkerBins below).
-
-        # The "rustc" worker *builds other workers*, but carries no toolchain:
-        # it is pure orchestration over the cargo worker (lay out the project,
-        # run-then into cargo-base, curry the produced binary into the runner
-        # — see crates/worker-rustc and design/cargo-workers.md). It runs as
-        # `curry(runner, bin=worker-rustc)` in the shared pool like the other
-        # source-level workers; build-builtins.sh curries in the cargo worker
-        # and the worker-common source tree. The old rust:1-bookworm-based
-        # rustc image is retired.
-
-        # The "runner": one warm, pooled image that runs a compiled worker binary
-        # passed as the `bin` arg (see crates/worker-runner). Workers built from
-        # source (by rustc) are produced as just a binary and curried into this
-        # image, so they need no image of their own — no per-worker convert /
-        # registry push / app provision, which is the cold-start cost. A thin delta
-        # on the stock glibc base (debian:stable-slim, via build-builtins' --base),
-        # carrying only the /worker trampoline; caos comes from
-        # installWorkerFilesBaseStacked, libc + the rest from the base.
-        workerRunnerRootEnv = pkgs.runCommand "caos-worker-runner-root" { } ''
-          mkdir -p $out
-          cp ${workerRoot "worker-runner" worker-runner}/worker $out/worker
-        '';
-        workerRunnerConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-          ];
-        };
-        workerRunnerImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-runner";
-          tag = "latest";
-          contents = [ workerRunnerRootEnv ];
-          config = workerRunnerConfig;
-          fakeRootCommands = installWorkerFilesBaseStacked;
-        };
+        # No worker images live here anymore, bar the flake-builder below.
+        # Every other std entry is a flake tree (std/{runner,cargo-base,
+        # bash-base,testenv-base} — design/flake-images.md) or a
+        # curry(<base>, bin=…) over one: the script workers bind
+        # images/bash-worker.sh, the binary workers (agent harness, examples,
+        # cargo/rustc) their static musl binaries (builtinWorkerBins below).
+        # std/runner is the pooled bin-worker base; the old debian-delta
+        # `base` entry had no consumers and is gone.
 
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin.
         # One self-contained worker — nix + skopeo + jq + caos + the runner
         # trampoline — whose one `--stage` script (images/flake-builder.sh)
         # `nix build`s a flake's `#caosImage`, streams the CLEAN image to the
-        # registry, then stacks a caos runner delta. A thin delta on stock
-        # `docker://nixos/nix` (import-image --base in build-builtins.sh — so nix
-        # + its store ride as stock registry layers, never through git). We bake
-        # only what the bare nix base lacks: the /worker script, skopeo (push +
-        # inspect — a general flake makes no `#skopeo` promise), jq (to massage
-        # the returned config), bash/coreutils/gzip, and the runner trampoline
-        # (/caos-trampoline — laid into the caos delta as /worker so flake
-        # #caosImage stay pure bases). nix comes from the base's profile (PATH).
+        # registry, then stacks a caos runner delta. build-builtins.sh composes
+        # this tarball onto stock `docker://nixos/nix` with `docker build` and
+        # streams THAT to the registry too — nix + its store ride as stock
+        # registry layers and our delta as pushed blobs, never through git. We
+        # bake only what the bare nix base lacks: the /worker script, skopeo
+        # (push + inspect — a general flake makes no `#skopeo` promise), jq (to
+        # massage the returned config), bash/coreutils/gzip, and the runner
+        # trampoline (/caos-trampoline — laid into the caos delta as /worker so
+        # flake #caosImage stay pure bases). nix comes from the base's profile
+        # (PATH).
         workerFlakeBuilderScript = pkgs.writeTextFile {
           name = "caos-worker-flake-builder-script";
           executable = true;
@@ -504,12 +416,6 @@
             '';
           };
 
-        loadWorkerBase = loadImage {
-          name = "caos-worker-base";
-          contents = [ ];
-          config = workerBaseConfig;
-          fakeRootCommands = installWorkerFilesBaseStacked;
-        };
         loadServer = loadImage {
           name = "caos-server";
           contents = serverContents;
@@ -519,12 +425,6 @@
           name = "caos-runnerd";
           contents = runnerdContents;
           config = runnerdConfig;
-        };
-        loadWorkerRunner = loadImage {
-          name = "caos-worker-runner";
-          contents = [ workerRunnerRootEnv ];
-          config = workerRunnerConfig;
-          fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
@@ -709,8 +609,6 @@
         # tarball's store path). caosd hands these to build-builtins.sh so it
         # publishes the flake's own images without a runtime `nix build`.
         builtinWorkerImages = [
-          workerBaseImage
-          workerRunnerImage
           # Streamed to the registry by build-builtins.sh, never git-imported.
           workerFlakeBuilderImage
         ];
@@ -911,10 +809,8 @@
           docker-compose = composeFile;
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
-          caos-worker-base-docker = workerBaseImage;
           caos-server-docker = serverImage;
           caos-runnerd-docker = runnerdImage;
-          caos-worker-runner-docker = workerRunnerImage;
           caos-worker-cargo-deps-docker = cargoDepsImage;
           # skopeo, from OUR locked nixpkgs — the in-caos bake job pushes its
           # image to the registry with it (`nix shell path:<ws>#skopeo`), and
@@ -932,10 +828,6 @@
           };
 
           # Build the image and load it into the local docker daemon in one go.
-          load-caos-worker-base = {
-            type = "app";
-            program = "${loadWorkerBase}/bin/load-caos-worker-base";
-          };
           load-caos-server = {
             type = "app";
             program = "${loadServer}/bin/load-caos-server";
@@ -943,10 +835,6 @@
           load-caos-runnerd = {
             type = "app";
             program = "${loadRunnerd}/bin/load-caos-runnerd";
-          };
-          load-caos-worker-runner = {
-            type = "app";
-            program = "${loadWorkerRunner}/bin/load-caos-worker-runner";
           };
         };
 

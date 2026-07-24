@@ -90,7 +90,7 @@ Docker images (crates are unprefixed; images carry a `caos-` prefix):
 
 ```bash
 nix build .#caos-server-docker            # image tarball at ./result
-nix build .#caos-worker-base-docker       # ...-runner, -flake-builder
+nix build .#caos-worker-flake-builder-docker
 
 docker load < result
 ```
@@ -100,15 +100,14 @@ large written to the Nix store):
 
 ```bash
 nix run .#load-caos-server
-nix run .#load-caos-worker-base           # load-caos-{runnerd,worker-runner,...}
+nix run .#load-caos-runnerd
 ```
 
-Only three images remain nix-built here: `base`, `runner`, and the
-`flake-builder`. Every other std worker is a `curry(<base>, bin)` over the
-runner or over a flake-built base (`std/*-base/`, built on demand by the
-flake-builder — see `design/flake-images.md`). The `caos-server` image is not
-minimal: it bundles the `docker` client, `git`, and `tar`, and expects the
-host's docker socket.
+Only ONE worker image remains nix-built here: the `flake-builder`. Every std
+worker is a `curry(<base>, bin)` over a flake-built base (`std/runner`,
+`std/*-base/` — built on demand by the flake-builder, see
+`design/flake-images.md`). The `caos-server` image is not minimal: it bundles
+the `docker` client, `git`, and `tar`, and expects the host's docker socket.
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
 > remote/linux builder; the binaries and dev shell build natively.
@@ -475,9 +474,10 @@ files.
 
 ## Workers
 
-A worker image is built `FROM` `caos-worker-base` (keeping `/bin/caos` as the
-entrypoint) and adds a `/worker` that reads `/cas/args` and writes `/cas/out`.
-The Rust workers share `worker-common` (arg helpers, `caos`/`map_then`/`caos
+A worker is a `curry(<base image>, bin=<binary>)`: the base's `/worker`
+trampoline (stacked in by the flake-builder's caos delta) stages the curried
+`bin` and execs it; the binary reads `/cas/args` and writes `/cas/out`. The
+Rust workers share `worker-common` (arg helpers, `caos`/`map_then`/`caos
 curry` wrappers, result staging).
 
 - **`worker-hello`** — a leaf example: gathers its `/cas/args` entries into a
