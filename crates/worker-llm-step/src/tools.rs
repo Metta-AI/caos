@@ -17,6 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use globset::GlobBuilder;
 use serde_json::{json, Value};
 use worker_common::{caos, entries, file_name, link, path, scratch};
 
@@ -117,11 +118,29 @@ pub fn grep_declaration() -> Value {
     })
 }
 
+/// The glob tool's registry entry. The worker returns a sparse marker tree;
+/// this module validates calls and renders that tree as matching paths.
+pub fn glob_declaration() -> Value {
+    json!({
+        "name": "glob",
+        "description": "Find files in the workspace by glob pattern. Returns sorted \
+    workspace-relative paths. `*` does not cross `/`; use `**` to search recursively \
+    (for example `crates/**/*.rs`). Prefer this over find or shell expansion via bash.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern relative to the workspace root."}
+            },
+            "required": ["pattern"]
+        }
+    })
+}
+
 // ---- Tree tools (caos-tools/*.sh — design/cargo-workers.md) -----------------
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
 /// the file tools) must stay stable whatever the tree carries.
-const RESERVED_TOOLS: &[&str] = &["bash", "grep", "read", "ls", "write", "edit"];
+const RESERVED_TOOLS: &[&str] = &["bash", "grep", "glob", "read", "ls", "write", "edit"];
 
 /// The tree's tool directory (`caos-tools/` in the workspace), expanded one
 /// level; `None` when the tree defines no tools.
@@ -316,6 +335,68 @@ pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, S
         );
     }
     Ok(block(id, text.trim_end(), false))
+}
+
+/// Validate glob syntax before launching a sub-run. A malformed pattern is a
+/// normal tool error the model can correct, not an infrastructure failure.
+pub fn glob_precheck(call: &Value) -> Result<String, Value> {
+    let id = call["id"].as_str().unwrap_or("");
+    let Some(pattern) = call["input"]["pattern"].as_str() else {
+        return Err(block(id, "glob needs a string `pattern`", true));
+    };
+    if let Err(error) = GlobBuilder::new(pattern).literal_separator(true).build() {
+        return Err(block(id, &format!("invalid pattern: {error}"), true));
+    }
+    Ok(pattern.to_string())
+}
+
+/// Render the glob worker's sparse marker tree as a bounded path list.
+pub fn glob_result_block(id: &str, result: &str) -> Result<Value, String> {
+    let _ = caos(["get", result]);
+    let mut render = GlobRender {
+        paths: Vec::new(),
+        total: 0,
+    };
+    render.walk(Path::new(result), "")?;
+    if render.total == 0 {
+        return Ok(block(id, "no matches", false));
+    }
+    let mut text = render.paths.join("\n");
+    if render.total > render.paths.len() {
+        text += &format!(
+            "\n[truncated: first {MAX_ENTRIES} of {} matches — narrow the pattern]",
+            render.total
+        );
+    }
+    Ok(block(id, &text, false))
+}
+
+struct GlobRender {
+    paths: Vec<String>,
+    total: usize,
+}
+
+impl GlobRender {
+    fn walk(&mut self, dir: &Path, prefix: &str) -> Result<(), String> {
+        let _ = caos(["get", path(dir)]);
+        for child in entries(path(dir))? {
+            let name = file_name(&child);
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if child.is_dir() {
+                self.walk(&child, &relative)?;
+            } else {
+                self.total += 1;
+                if self.paths.len() < MAX_ENTRIES {
+                    self.paths.push(relative);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 struct GrepRender {

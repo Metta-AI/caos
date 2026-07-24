@@ -18,6 +18,9 @@ minreq = { version = "2", default-features = false, features = ["https-rustls"] 
 # Validating grep patterns BEFORE launching the rgrep sub-run, so a bad
 # pattern is an is_error tool_result, never a failed turn.
 regex = "1"
+# Validate glob syntax before launching the glob worker, so malformed patterns
+# are tool-result values rather than failed turns.
+globset = "0.4"
 
 [[bin]]
 name = "worker-llm-step"

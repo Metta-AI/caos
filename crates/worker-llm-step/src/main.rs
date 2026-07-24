@@ -15,7 +15,7 @@
 //!
 //! Tool calls are driven serially through one queue (`drive`): the inline file
 //! tools (read/ls/write/edit — `tools.rs`) execute in-process, advancing the
-//! workspace with no sub-run; only `bash` exits into a run-then sub-run.
+//! workspace with no sub-run; bash, grep, glob, and project tools use sub-runs.
 //!
 //! Curried configuration: `api_key`, `system` (the system prompt), `bash_image`
 //! (the sub-run tool's image), and optionally `model` (default
@@ -66,6 +66,9 @@ struct Config {
     /// The rgrep fold worker's image; the `grep` tool is registered only when
     /// present (older curries without it keep working).
     grep_image: Option<String>,
+    /// The glob fold worker's image; the `glob` tool is registered only when
+    /// present.
+    glob_image: Option<String>,
     /// The script-worker image (std/bash) TREE TOOLS run on: the workspace's
     /// caos-tools/*.sh, discovered per round and resolved at invocation time
     /// (design/cargo-workers.md). Registered only when present.
@@ -82,6 +85,7 @@ impl Config {
             system: read_arg("system")?,
             bash_image: read_arg("bash_image")?,
             grep_image: read_arg_opt("grep_image")?,
+            glob_image: read_arg_opt("glob_image")?,
             tools_image: read_arg_opt("tools_image")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
             base_url: read_arg_opt("base_url")?
@@ -163,6 +167,12 @@ fn callback(cfg: &Config) -> Result<(), String> {
             caos(["get", &ws])?;
             ws
         }
+        "glob" => {
+            results.push(tools::glob_result_block(&current_id, &arg("result"))?);
+            let ws = arg("ws");
+            caos(["get", &ws])?;
+            ws
+        }
         // A tree tool's result (caos-tools/<name>.sh) is a VALUE — a report,
         // a bin tree, diagnostics — never a workspace: the pre-run workspace
         // rode our curry, exactly like grep.
@@ -229,6 +239,17 @@ fn drive(
                 }
             }
         }
+        if name == "glob" && cfg.glob_image.is_some() {
+            let pattern = match tools::glob_precheck(&call) {
+                Ok(pattern) => pattern,
+                Err(block) => {
+                    results.push(block);
+                    queue.remove(0);
+                    continue;
+                }
+            };
+            return launch_glob(cfg, &call, &pattern, &ws, step_path, &queue[1..], &results);
+        }
         // A tree tool? Resolved in the CURRENT workspace at invocation time,
         // so a call made right after an edit runs the edited script.
         if !tools::is_inline(name) && cfg.tools_image.is_some() {
@@ -247,7 +268,7 @@ fn drive(
         }
         if !tools::is_inline(name) {
             return Err(format!(
-                "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, \
+                "model called unknown tool {name:?} (built-ins: bash, grep, glob, read, ls, \
                  write, edit; plus this workspace's caos-tools/*.sh)"
             ));
         }
@@ -500,6 +521,36 @@ fn launch_grep(
     run_then(scope, &curried, Some(&me))
 }
 
+/// Launch the glob fold over the current workspace. Its sparse marker-tree
+/// result is read-only; the workspace rides the continuation unchanged.
+#[allow(clippy::too_many_arguments)]
+fn launch_glob(
+    cfg: &Config,
+    call: &Value,
+    pattern: &str,
+    ws: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let image = cfg
+        .glob_image
+        .as_ref()
+        .ok_or("launch_glob without a glob_image (drive guards this)")?;
+    let curried = caos_curry(image, &[("pattern", Arg::Lit(pattern))])?;
+    let me = self_curry(
+        step_path,
+        pending,
+        results,
+        id,
+        &[("current_tool", Arg::Lit("glob")), ("ws", Arg::Path(ws))],
+    )?;
+    run_then(ws, &curried, Some(&me))
+}
+
 /// Launch a tree tool (caos-tools/<name>.sh, already resolved in the current
 /// workspace) as a run-then sub-run: the input is the workspace tree and the
 /// SCRIPT BLOB rides curried on the script-worker image, so the run caches
@@ -571,6 +622,7 @@ fn self_curry(
         "base_url",
         "conversation",
         "grep_image",
+        "glob_image",
         "tools_image",
     ]
     .iter()
@@ -705,13 +757,16 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
-/// The full tool registry: bash, grep and the cargo tools (the sub-run tools)
+/// The full tool registry: bash, grep, glob and project tools (the sub-run tools)
 /// plus the inline file tools (`tools.rs`).
 fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
     if cfg.grep_image.is_some() {
         tools.push(tools::grep_declaration());
+    }
+    if cfg.glob_image.is_some() {
+        tools.push(tools::glob_declaration());
     }
     // Tree tools: whatever caos-tools/*.sh the CURRENT workspace carries —
     // re-discovered every round, so the set tracks the agent's own edits.

@@ -1,0 +1,15 @@
+[package]
+name = "worker-glob"
+version = "0.1.0"
+edition = "2021"
+
+# Glob workspace paths as a decomposed tree fold. The sparse result preserves
+# matching paths as empty marker blobs, so callers can render a path list
+# without materializing file contents.
+[dependencies]
+worker-common = { path = "../worker-common" }
+globset = "0.4"
+
+[[bin]]
+name = "worker-glob"
+path = "src/main.rs"

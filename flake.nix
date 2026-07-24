@@ -141,6 +141,7 @@
         worker-bash-tool = workspaceBins;
         worker-llm-step = workspaceBins;
         worker-rgrep = workspaceBins;
+        worker-glob = workspaceBins;
         # The llm-step tests' scripted LLM API stand-in — a host binary, not a
         # worker (the musl build runs on any Linux host).
         llm-stub = workspaceBins;
@@ -1058,6 +1059,7 @@
           worker-bash-tool
           worker-llm-step
           worker-rgrep
+          worker-glob
           # Published as curry(cargo-base, bin) — see bin_base in
           # build-builtins.sh.
           worker-cargo
@@ -1220,7 +1222,7 @@
           inherit caos server runnerd caos-cli caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
-          inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
+          inherit worker-bash-tool worker-llm-step worker-rgrep worker-glob llm-stub;
           # The cargo worker (curry(cargo-base, bin)) and the rustc
           # orchestrator (curry(runner, bin)) — build-builtins.sh needs the
           # binaries exposed.

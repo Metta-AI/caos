@@ -26,6 +26,7 @@ echo "== stage the worker binaries and fixtures ==" >&2
 cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
 cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
 cp "$CAOS_BIN_DIR/worker-rgrep" rgrep-bin
+cp "$CAOS_BIN_DIR/worker-glob" glob-bin
 stub_bin=$CAOS_BIN_DIR/llm-stub
 
 # The conversation's workspace, and the identity chat's human commits use.
@@ -63,7 +64,8 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 conv="chat-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin CAOS_RGREP_BIN=rgrep-bin
+export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin
+export CAOS_RGREP_BIN=rgrep-bin CAOS_GLOB_BIN=glob-bin
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
@@ -167,7 +169,7 @@ echo "== talk (std worker curries): sticky pick continues $conv ==" >&2
 # (refs/caos/std — build-builtins.sh publishes std/bash-tool and std/llm-step).
 T3_TEXT="sticky turn reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T3_TEXT" > stub/response-4.json
-env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
+env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN -u CAOS_GLOB_BIN \
   "$CAOS_CLI" talk "still there?" "${opts[@]}" > talk1.out 2>talk1.err
 sed 's/^/  talk1| /' talk1.out >&2
 grep -qF "[conversation $conv]" talk1.err \
@@ -185,7 +187,7 @@ echo "  ok: std workers, sticky conversation continued and advanced" >&2
 echo "== talk --new starts an auto-named conversation ==" >&2
 T4_TEXT="fresh conversation reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T4_TEXT" > stub/response-5.json
-env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
+env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN -u CAOS_GLOB_BIN \
   "$CAOS_CLI" talk --new "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
 sed 's/^/  talk2| /' talk2.out >&2
 grep -qF "[conversation talk-1 — new]" talk2.err \
@@ -284,5 +286,23 @@ grep -qF '"is_error":true' stub/request-11.json || fail "invalid pattern not mar
 grep -qF 'invalid pattern' stub/request-11.json || fail "invalid pattern error not explained"
 [ ! -f stub/request-12.json ] || fail "unexpected extra LLM round"
 echo "  ok: fold matches rendered, scope honored, bad pattern as value, tree untouched" >&2
+
+echo "== glob: workspace-relative paths and invalid pattern ==" >&2
+GLOB_CALLS='[
+ {"id":"tu_gl1","input":{"pattern":"notes/*.txt"},"name":"glob","type":"tool_use"},
+ {"id":"tu_gl2","input":{"pattern":"["},"name":"glob","type":"tool_use"}]'
+printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$GLOB_CALLS" | tr -d '\n')" > stub/response-12.json
+printf '{"content":[{"text":"glob done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-13.json
+"$CAOS_CLI" chat "$conv" -m "find note files" "${opts[@]}" > glob.out
+sed 's/^/  glob| /' glob.out >&2
+turn_glob=$(git rev-parse "refs/caos/conversations/$conv")
+git diff --quiet "$turn_grep" "$turn_glob" -- || fail "glob changed the workspace tree"
+grep -qF "glob notes/*.txt" glob.out || fail "glob progress line missing"
+grep -qF 'notes/new.txt\nnotes/todo.txt' stub/request-13.json \
+  || fail "glob matches not sent"
+grep -qF '"is_error":true' stub/request-13.json || fail "invalid glob not marked is_error"
+grep -qF 'invalid pattern' stub/request-13.json || fail "invalid glob error not explained"
+[ ! -f stub/request-14.json ] || fail "unexpected extra LLM round"
+echo "  ok: matches rendered, bad pattern as value, tree untouched" >&2
 
 echo "chat-offline: ALL PASS" >&2

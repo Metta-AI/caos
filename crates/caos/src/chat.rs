@@ -58,6 +58,7 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const LLM_STEP_BIN_ENV: &str = "CAOS_LLM_STEP_BIN";
 const BASH_TOOL_BIN_ENV: &str = "CAOS_BASH_TOOL_BIN";
 const RGREP_BIN_ENV: &str = "CAOS_RGREP_BIN";
+const GLOB_BIN_ENV: &str = "CAOS_GLOB_BIN";
 
 /// The std builtin the worker binaries run under (`curry(runner, bin=...)`),
 /// used when a `--*-bin` override supplies the binary.
@@ -68,6 +69,7 @@ const RUNNER_IMAGE: &str = "/cas/std/runner";
 const BASH_TOOL_IMAGE: &str = "/cas/std/bash-tool";
 const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
 const RGREP_IMAGE: &str = "/cas/std/rgrep";
+const GLOB_IMAGE: &str = "/cas/std/glob";
 /// The script-worker image TREE TOOLS run on (the workspace's caos-tools/*.sh,
 /// discovered per round, resolved at invocation time — design/cargo-workers.md).
 /// Optional: a stack whose std predates it just doesn't register tree tools.
@@ -78,7 +80,7 @@ const AUTO_NAME_PREFIX: &str = "talk-";
 
 /// Default system prompt when neither `--system` nor `--system-file` is given.
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
-     read/ls/write/edit tools for file access and grep to search. The workspace may define \
+     read/ls/write/edit tools for file access, glob to find files, and grep to search. The workspace may define \
      its own tools (caos-tools/*.sh, e.g. build/test) — prefer them (cached caos jobs) over \
      doing the same work via bash, and know that editing a tool script changes what the tool \
      does on your next call. Use the bash tool to run other commands (scripts, generators), \
@@ -101,6 +103,7 @@ pub struct TurnOptions {
     pub llm_step_bin: Option<String>,
     pub bash_tool_bin: Option<String>,
     pub rgrep_bin: Option<String>,
+    pub glob_bin: Option<String>,
 }
 
 /// One project-defined tool available to the selected conversation.
@@ -154,8 +157,7 @@ pub fn describe_tool_set(
         if !matches!(
             entry.mode.kind(),
             EntryKind::Blob | EntryKind::BlobExecutable
-        )
-            || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name)
+        ) || ["bash", "grep", "glob", "read", "ls", "write", "edit"].contains(&name)
         {
             continue;
         }
@@ -271,13 +273,14 @@ struct ChatArgs {
     llm_step_bin: Option<String>,
     bash_tool_bin: Option<String>,
     rgrep_bin: Option<String>,
+    glob_bin: Option<String>,
     log: bool,
 }
 
 fn usage(verb: Verb) -> String {
     let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
          [--model <model>] [--base-url <url>] [--llm-step-bin <path>] \
-         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--log]";
+         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--glob-bin <path>] [--log]";
     match verb {
         Verb::Chat => format!(
             "usage: chat <name> [-m <message>] {common}\n\
@@ -309,6 +312,7 @@ impl ChatArgs {
             llm_step_bin: None,
             bash_tool_bin: None,
             rgrep_bin: None,
+            glob_bin: None,
             log: false,
         };
         let mut positional: Option<String> = None;
@@ -330,6 +334,7 @@ impl ChatArgs {
                 "--llm-step-bin" => a.llm_step_bin = Some(value(arg)?),
                 "--bash-tool-bin" => a.bash_tool_bin = Some(value(arg)?),
                 "--rgrep-bin" => a.rgrep_bin = Some(value(arg)?),
+                "--glob-bin" => a.glob_bin = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other}\n{}", usage(verb)))
@@ -373,6 +378,7 @@ impl ChatArgs {
             llm_step_bin: self.llm_step_bin.clone(),
             bash_tool_bin: self.bash_tool_bin.clone(),
             rgrep_bin: self.rgrep_bin.clone(),
+            glob_bin: self.glob_bin.clone(),
         }
     }
 }
@@ -638,6 +644,7 @@ fn turn(
     let llm_bin = worker_bin(options.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV);
     let bash_bin = worker_bin(options.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV);
     let rgrep_bin = worker_bin(options.rgrep_bin.as_deref(), RGREP_BIN_ENV);
+    let glob_bin = worker_bin(options.glob_bin.as_deref(), GLOB_BIN_ENV);
     let system = match (&options.system, &options.system_file) {
         (Some(text), _) => text.clone(),
         (None, Some(path)) => {
@@ -702,8 +709,8 @@ fn turn(
     // so its closure doesn't ride in the request graph — push it (and the
     // runner image) explicitly.
     let phase = std::time::Instant::now();
-    let runner = match (&llm_bin, &bash_bin, &rgrep_bin) {
-        (None, None, None) => None,
+    let runner = match (&llm_bin, &bash_bin, &rgrep_bin, &glob_bin) {
+        (None, None, None, None) => None,
         _ => Some(resolve_cli_image(t, RUNNER_IMAGE)?),
     };
     let bash_image = match &bash_bin {
@@ -728,6 +735,17 @@ fn turn(
         None => resolve_cli_image(t, RGREP_IMAGE)?,
     };
 
+    let glob_image = match &glob_bin {
+        Some(bin) => {
+            let runner = runner.as_deref().expect("resolved when a bin is given");
+            let img = curry_object(t, runner, None, &[format!("--bin:@={bin}")])?.to_string();
+            t.ensure_pushed(&img)?;
+            t.ensure_pushed(runner)?;
+            img
+        }
+        None => resolve_cli_image(t, GLOB_IMAGE)?,
+    };
+
     // Optional: a stack whose std predates the bash script worker simply
     // doesn't register tree tools (llm-step treats a missing tools_image
     // that way too).
@@ -738,6 +756,7 @@ fn turn(
         format!("--system={system}"),
         format!("--bash_image={bash_image}"),
         format!("--grep_image={grep_image}"),
+        format!("--glob_image={glob_image}"),
         format!("--conversation={name}"),
     ];
     if let Some(tools) = &tools_image {
@@ -1098,6 +1117,7 @@ fn emit_step(
                             None => format!("grep {pattern}"),
                         }
                     }
+                    "glob" => format!("glob {}", block["input"]["pattern"].as_str().unwrap_or("?")),
                     other => format!("[tool call: {other}]"),
                 };
                 emit(TurnEvent::ToolCall {

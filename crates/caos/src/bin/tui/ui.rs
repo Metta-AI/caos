@@ -299,6 +299,7 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  read, ls, write, edit  — inline workspace operations"),
         Line::raw("  bash                  — commands in the workspace sandbox"),
         Line::raw("  grep                  — cached regular-expression search"),
+        Line::raw("  glob                  — cached file discovery by path pattern"),
         Line::raw(""),
         Line::styled(
             "Project tools",

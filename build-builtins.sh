@@ -154,7 +154,7 @@ fi
 # toolchain+lockfile, and a worker rebuild ships one blob).
 # Order matters: rustc's curry references the published cargo worker, so
 # cargo precedes it.
-bin_names=(bash-tool llm-step rgrep cargo rustc)
+bin_names=(bash-tool llm-step rgrep glob cargo rustc)
 bin_base() { # worker binary -> the image its std curry binds it into
   case "$1" in
     cargo) echo "cargo-base" ;;

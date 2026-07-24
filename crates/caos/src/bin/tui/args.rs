@@ -32,6 +32,7 @@ impl Args {
                 "--llm-step-bin" => parsed.turn.llm_step_bin = Some(value(&mut args, arg)?),
                 "--bash-tool-bin" => parsed.turn.bash_tool_bin = Some(value(&mut args, arg)?),
                 "--rgrep-bin" => parsed.turn.rgrep_bin = Some(value(&mut args, arg)?),
+                "--glob-bin" => parsed.turn.glob_bin = Some(value(&mut args, arg)?),
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }

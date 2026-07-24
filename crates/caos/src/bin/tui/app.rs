@@ -1158,6 +1158,7 @@ mod tests {
             .collect();
         assert!(rendered.contains("Always available"));
         assert!(rendered.contains("read, ls, write, edit"));
+        assert!(rendered.contains("glob"));
         assert!(rendered.contains("talk-1:caos-tools"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("Build everything the tree defines."));
