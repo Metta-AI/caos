@@ -81,7 +81,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     let mut all: Vec<String> = vec![format!("--script:@={script}"), "--in:@=.".to_string()];
     all.extend(kvs.iter().cloned());
     cli_run(t, "/cas/std/bash", Some(&out), None, &all)?;
-    eprintln!("{name}: result checked out at {out}");
+    eprintln!("1126 {name}: result checked out at {out}");
 
     let report = Path::new(&out).join("report");
     if report.is_file() {
