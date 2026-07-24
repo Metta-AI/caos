@@ -559,26 +559,26 @@
           fakeRootCommands = installWorkerFiles;
         };
 
-        # The INNER flake-builder (design/flake-images.md): a worker that
-        # `nix build`s a user flake's `#caosImage` output and streams the result
-        # to the registry, returning the CLEAN image (no caos in it) as
-        # {ref, config} — the clean digest plus the flake image's OCI config,
-        # which the OUTER worker needs to preserve the flake's PATH/Env when it
-        # stacks the caos runner layer. A thin delta on stock
+        # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin.
+        # One self-contained worker — nix + skopeo + jq + caos + the runner
+        # trampoline — whose one `--stage` script (images/flake-builder.sh)
+        # `nix build`s a flake's `#caosImage`, streams the CLEAN image to the
+        # registry, then stacks a caos runner delta. A thin delta on stock
         # `docker://nixos/nix` (import-image --base in build-builtins.sh — so nix
         # + its store ride as stock registry layers, never through git). We bake
-        # only what the bare nix base lacks: the runner script (/worker), skopeo
-        # (the push/inspect tool — a general flake makes no `#skopeo` promise),
-        # jq (to massage the returned config), and bash/coreutils/gzip. nix
-        # itself comes from the base's profile (see PATH below).
+        # only what the bare nix base lacks: the /worker script, skopeo (push +
+        # inspect — a general flake makes no `#skopeo` promise), jq (to massage
+        # the returned config), bash/coreutils/gzip, and the runner trampoline
+        # (/caos-trampoline — laid into the caos delta as /worker so flake
+        # #caosImage stay pure bases). nix comes from the base's profile (PATH).
         workerFlakeBuilderScript = pkgs.writeTextFile {
-          name = "caos-worker-flake-builder-inner-script";
+          name = "caos-worker-flake-builder-script";
           executable = true;
           destination = "/worker";
-          text = builtins.readFile ./images/flake-builder-inner.sh;
+          text = builtins.readFile ./images/flake-builder.sh;
         };
         workerFlakeBuilderRoot = pkgs.buildEnv {
-          name = "caos-worker-flake-builder-inner-root";
+          name = "caos-worker-flake-builder-root";
           paths = [
             workerFlakeBuilderScript
             linuxPkgs.bashInteractive
@@ -589,7 +589,7 @@
           ];
         };
         workerFlakeBuilderImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-flake-builder-inner";
+          name = "caos-worker-flake-builder";
           tag = "latest";
           contents = [
             workerFlakeBuilderRoot
@@ -612,7 +612,13 @@
               "CAOS_WORKER_GID=0"
             ];
           };
-          fakeRootCommands = installWorkerFiles;
+          fakeRootCommands = installWorkerFiles + ''
+            # The runner trampoline, baked so the stack stage can lay it into the
+            # caos delta as /worker (design/flake-images.md) — this is what lets a
+            # flake #caosImage stay a pure base (no caos code, stable hash).
+            cp ${worker-runner}/bin/worker-runner caos-trampoline
+            chmod 0755 caos-trampoline
+          '';
         };
 
         # The cargo toolchain BASE image (design/cargo-workers.md, phases 0–1):
@@ -1364,7 +1370,7 @@
           # ref would float with the global registry).
           skopeo = linuxPkgs.skopeo;
           caos-worker-testenv-docker = workerTestenvImage;
-          caos-worker-flake-builder-inner-docker = workerFlakeBuilderImage;
+          caos-worker-flake-builder-docker = workerFlakeBuilderImage;
         };
 
         apps = {

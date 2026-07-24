@@ -8,27 +8,18 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      # A self-contained /worker (no bin curried in): caos runner execs it, it
-      # writes a greeting and stores it as the job's result via the stacked
-      # /bin/caos (the flake-builder's caos runner layer provides that).
-      worker = pkgs.writeTextFile {
-        name = "flake-worker-script";
-        executable = true;
-        destination = "/worker";
-        text = ''
-          #!${pkgs.bash}/bin/bash
-          echo "hello from a flake-built worker" > /tmp/out
-          /bin/caos put /tmp/out /cas/out
-        '';
-      };
     in
     {
-      # The contract the flake-builder builds (design/flake-images.md).
+      # The contract the flake-builder builds (design/flake-images.md). A
+      # #caosImage is a pure BASE — no /worker: the flake-builder's caos delta
+      # supplies the runner trampoline, and a worker is run as this image with a
+      # curried `bin` (here greet.sh, exec'd by the trampoline). So the base
+      # carries only the tools the bin needs — no caos code, stable hash. bash
+      # provides /bin/sh, so a shell-script bin runs.
       packages.${system}.caosImage = pkgs.dockerTools.buildLayeredImage {
         name = "flake-worker";
         tag = "latest";
         contents = [
-          worker
           pkgs.bash
           pkgs.coreutils
         ];
