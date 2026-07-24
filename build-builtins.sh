@@ -176,7 +176,9 @@ if [ -n "${hash_of[runner]:-}" ]; then
   # shellcheck disable=SC2086
   for p in $bin_paths; do
     for b in "${bin_names[@]}"; do
-      case "$p" in *-worker-"$b"*) bin_path[$b]=$p ;; esac
+      if [ -x "$p/bin/worker-$b" ]; then
+        bin_path[$b]=$p
+      fi
     done
   done
   for b in "${bin_names[@]}"; do
