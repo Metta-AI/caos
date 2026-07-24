@@ -25,8 +25,8 @@
 //! `get` expand a placeholder later.
 
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
-use std::io::{IsTerminal, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1466,13 +1466,23 @@ pub fn import_image(t: &dyn Transport, archive: &str, base: Option<&str>) -> Res
 
     let work = scratch_dir()?;
     let outcome = (|| {
-        // Unpack the (possibly gzipped) outer archive into the scratch dir.
-        let bytes = maybe_gunzip(std::fs::read(archive).map_err(|e| format!("{archive}: {e}"))?)?;
-        unpack_tar(&bytes, &work)?;
-
-        // manifest.json names the config blob and the ordered layers.
-        let manifest_bytes = std::fs::read(work.join("manifest.json"))
-            .map_err(|e| format!("reading manifest.json from {archive}: {e}"))?;
+        // Docker archives put manifest.json after the layers. Scan once for the
+        // small JSON metadata, then stream the layers on a second pass. Never
+        // expanding the outer archive keeps scratch use bounded by one layer.
+        let mut json_files = std::collections::HashMap::new();
+        visit_archive(archive, |path, entry| {
+            if path == "manifest.json" || (path.ends_with(".json") && !path.contains('/')) {
+                let mut bytes = Vec::new();
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| format!("reading {path} from {archive}: {e}"))?;
+                json_files.insert(path.to_string(), bytes);
+            }
+            Ok(())
+        })?;
+        let manifest_bytes = json_files
+            .remove("manifest.json")
+            .ok_or_else(|| format!("{archive}: missing manifest.json"))?;
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| format!("parsing manifest.json: {e}"))?;
         let image = manifest.get(0).ok_or("manifest.json is empty")?;
@@ -1484,6 +1494,15 @@ pub fn import_image(t: &dyn Transport, archive: &str, base: Option<&str>) -> Res
             .get("Layers")
             .and_then(|v| v.as_array())
             .ok_or("manifest.json: missing Layers array")?;
+        let layer_names = layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "manifest.json: Layers entry is not a string".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut entries: Vec<Entry> = Vec::new();
 
@@ -1504,36 +1523,45 @@ pub fn import_image(t: &dyn Transport, archive: &str, base: Option<&str>) -> Res
         }
 
         // config.json, stored verbatim.
-        let config_bytes = std::fs::read(work.join(config_name))
-            .map_err(|e| format!("reading {config_name}: {e}"))?;
+        let config_bytes = json_files
+            .remove(config_name)
+            .ok_or_else(|| format!("{archive}: missing config {config_name}"))?;
         entries.push(Entry {
             mode: EntryKind::Blob.into(),
             filename: "config.json".as_bytes().to_vec().into(),
             oid: post_object(t, "blob", &config_bytes)?,
         });
 
-        // layer<NN>: one subtree per layer, in manifest order.
-        for (i, layer) in layers.iter().enumerate() {
-            let layer_path = layer
-                .as_str()
-                .ok_or("manifest.json: Layers entry is not a string")?;
-            let layer_bytes = maybe_gunzip(
-                std::fs::read(work.join(layer_path))
-                    .map_err(|e| format!("reading {layer_path}: {e}"))?,
-            )?;
-            let layer_dir = work.join(format!("extract-layer{i:02}"));
+        let wanted: std::collections::HashMap<_, _> = layer_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index))
+            .collect();
+        if wanted.len() != layer_names.len() {
+            return Err("manifest.json contains a duplicate layer".to_string());
+        }
+        let mut layer_oids = vec![None; layer_names.len()];
+        visit_archive(archive, |path, entry| {
+            let Some(&index) = wanted.get(path) else {
+                return Ok(());
+            };
+            let layer_dir = work.join(format!("extract-layer{index:02}"));
             std::fs::create_dir(&layer_dir).map_err(|e| format!("{}: {e}", layer_dir.display()))?;
-            unpack_tar(&layer_bytes, &layer_dir)?;
-            // Record perms/ownership a git tree can't carry, as sidecars beside
-            // each entry, before storing the layer as a tree.
-            write_layer_metadata(&layer_bytes, &layer_dir)?;
+            let reader = maybe_gunzip_reader(BufReader::new(entry))?;
+            unpack_layer(reader, &layer_dir)?;
             let (_, oid) = store(t, None, &layer_dir)?;
+            std::fs::remove_dir_all(&layer_dir)
+                .map_err(|e| format!("removing {}: {e}", layer_dir.display()))?;
+            layer_oids[index] = Some(oid);
+            eprintln!("imported layer{index:02} from {path}");
+            Ok(())
+        })?;
+        for (index, (layer_path, oid)) in layer_names.iter().zip(layer_oids).enumerate() {
             entries.push(Entry {
                 mode: EntryKind::Tree.into(),
-                filename: format!("layer{i:02}").into_bytes().into(),
-                oid,
+                filename: format!("layer{index:02}").into_bytes().into(),
+                oid: oid.ok_or_else(|| format!("{archive}: missing layer {layer_path}"))?,
             });
-            eprintln!("imported layer{i:02} from {layer_path}");
         }
 
         let image_oid = post_tree(t, entries)?;
@@ -1542,46 +1570,60 @@ pub fn import_image(t: &dyn Transport, archive: &str, base: Option<&str>) -> Res
         Ok(())
     })();
 
-    let _ = std::fs::remove_dir_all(&work);
-    outcome
+    let cleanup = std::fs::remove_dir_all(&work)
+        .map_err(|e| format!("removing import scratch {}: {e}", work.display()));
+    match (outcome, cleanup) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
 }
 
-/// Beside any entry in the already-unpacked layer at `dir` whose permissions or
-/// ownership a git tree can't reproduce, write a `<name>.caosmeta` sidecar — a
-/// small JSON `{"mode":"<octal>","uid":N,"gid":N}` — so the server can
-/// restore them when it rebuilds the layer's tar. Files and directories are
-/// treated alike: the sidecar sits next to the entry, in its parent.
-///
-/// Metadata comes from the layer **tar headers**, not from the unpacked files:
-/// the headers are authoritative, whereas the unpacked owner/mode depend on who
-/// ran the unpack (a non-root unpack can't reproduce a non-root owner).
-///
-/// "Can't reproduce" means the entry's bits differ from what a plain materialize
-/// would recreate: a directory not `0755`, a file not `0644`/`0755` (so setuid,
-/// setgid, sticky, and odd perms are all captured), or non-root owner/group. Only
-/// regular files and directories are recorded; symlinks, hardlinks, and device
-/// nodes are skipped. Errors if the layer itself already uses the reserved suffix
-/// (we'd otherwise shadow a real file).
-fn write_layer_metadata(layer_tar: &[u8], dir: &Path) -> Result<(), String> {
-    let mut archive = tar::Archive::new(layer_tar);
+/// Stream a Docker archive, invoking `visit` for each outer entry.
+fn visit_archive(
+    path: &str,
+    mut visit: impl FnMut(&str, &mut dyn Read) -> Result<(), String>,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let reader = maybe_gunzip_reader(BufReader::new(file))?;
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("reading {path}: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("reading {path}: {e}"))?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| format!("reading path from {path}: {e}"))?
+            .to_string_lossy()
+            .into_owned();
+        visit(&entry_path, &mut entry)?;
+    }
+    Ok(())
+}
+
+/// Extract one layer while recording permissions/ownership that a git tree
+/// cannot reproduce. Streaming the tar avoids retaining a large layer in memory.
+fn unpack_layer(reader: impl Read, dir: &Path) -> Result<(), String> {
+    let mut archive = tar::Archive::new(reader);
+    // Applying a read-only directory mode while entries are still streaming
+    // would block its children. Normalize modes as each entry is unpacked.
+    archive.set_preserve_permissions(false);
     for entry in archive
         .entries()
         .map_err(|e| format!("reading layer tar: {e}"))?
     {
-        let entry = entry.map_err(|e| format!("reading layer tar: {e}"))?;
+        let mut entry = entry.map_err(|e| format!("reading layer tar: {e}"))?;
         let header = entry.header();
         let is_dir = header.entry_type().is_dir();
-        // Only plain files and directories carry perms we record here.
-        if !is_dir && !header.entry_type().is_file() {
-            continue;
-        }
+        let is_file = header.entry_type().is_file();
         let mode = header.mode().map_err(|e| format!("layer tar mode: {e}"))? & 0o7777;
         let uid = header.uid().map_err(|e| format!("layer tar uid: {e}"))?;
         let gid = header.gid().map_err(|e| format!("layer tar gid: {e}"))?;
 
         let rel = normalize_tar_path(&entry.path().map_err(|e| format!("layer tar path: {e}"))?);
         if rel.as_os_str().is_empty() {
-            continue; // the layer root (".") — no parent to hold a sidecar
+            continue;
         }
         if rel.to_string_lossy().ends_with(META_SUFFIX) {
             return Err(format!(
@@ -1590,23 +1632,29 @@ fn write_layer_metadata(layer_tar: &[u8], dir: &Path) -> Result<(), String> {
             ));
         }
 
+        if !entry
+            .unpack_in(dir)
+            .map_err(|e| format!("unpacking layer entry {}: {e}", rel.display()))?
+        {
+            return Err(format!("unsafe path in layer tar: {}", rel.display()));
+        }
+        // Only plain files and directories carry modes/owners we record.
+        if !is_dir && !is_file {
+            continue;
+        }
         let default = if is_dir || mode & 0o111 != 0 {
             0o755
         } else {
             0o644
         };
+        let entry_path = dir.join(&rel);
+        std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(default))
+            .map_err(|e| format!("chmod {}: {e}", entry_path.display()))?;
         if mode == default && uid == 0 && gid == 0 {
             continue;
         }
 
-        // Drop the sidecar next to the (already unpacked) entry. Its parent may be
-        // a read-only nix store dir, so make it writable first — harmless, since a
-        // git tree records no directory mode and the parent's own mode rides in
-        // its own sidecar.
-        let entry_path = dir.join(&rel);
         let parent = entry_path.parent().unwrap_or(dir);
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {}: {e}", parent.display()))?;
         let name = entry_path
             .file_name()
             .ok_or_else(|| format!("layer entry has no name: {}", rel.display()))?
@@ -1627,28 +1675,31 @@ fn normalize_tar_path(path: &Path) -> PathBuf {
         .collect()
 }
 
-/// Decompress `bytes` if it's gzip (magic `1f 8b`); otherwise return it as-is.
-/// Image archives are gzipped; the layer tars inside usually aren't.
-fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(bytes.as_slice())
-            .read_to_end(&mut out)
-            .map_err(|e| format!("gunzip: {e}"))?;
-        Ok(out)
-    } else {
-        Ok(bytes)
+/// Decompress a stream if it starts with gzip magic. Image archives are
+/// commonly gzipped; their nested layer tars usually are not.
+enum MaybeGzip<R> {
+    Plain(R),
+    Gzip(flate2::read::GzDecoder<R>),
+}
+
+impl<R: Read> Read for MaybeGzip<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(buffer),
+            Self::Gzip(reader) => reader.read(buffer),
+        }
     }
 }
 
-/// Unpack a tar archive into `dir`, preserving permissions so the exec bit on
-/// layer files survives into the git tree.
-fn unpack_tar(bytes: &[u8], dir: &Path) -> Result<(), String> {
-    let mut archive = tar::Archive::new(bytes);
-    archive.set_preserve_permissions(true);
-    archive
-        .unpack(dir)
-        .map_err(|e| format!("unpacking tar into {}: {e}", dir.display()))
+fn maybe_gunzip_reader<R: BufRead>(mut reader: R) -> Result<MaybeGzip<R>, String> {
+    let prefix = reader
+        .fill_buf()
+        .map_err(|e| format!("reading gzip header: {e}"))?;
+    if prefix.starts_with(&[0x1f, 0x8b]) {
+        Ok(MaybeGzip::Gzip(flate2::read::GzDecoder::new(reader)))
+    } else {
+        Ok(MaybeGzip::Plain(reader))
+    }
 }
 
 /// A fresh, unique scratch directory under the system temp dir (no xattrs needed
@@ -2708,5 +2759,45 @@ mod git_transport_tests {
             &client,
             &["cat-file", "-e", &format!("{target}^{{commit}}")],
         );
+    }
+
+    #[test]
+    fn imports_gzipped_docker_archive_with_trailing_manifest() {
+        fn append(builder: &mut tar::Builder<Vec<u8>>, path: &str, bytes: &[u8], mode: u32) {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(mode);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append_data(&mut header, path, bytes).unwrap();
+        }
+
+        let root = TestDir::new("stream-image");
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut layer = tar::Builder::new(Vec::new());
+        append(&mut layer, "bin/tool", b"#!/bin/sh\n", 0o755);
+        let layer = layer.into_inner().unwrap();
+
+        let config = br#"{"config":{"Env":["PATH=/bin"]}}"#;
+        let manifest = br#"[{"Config":"config.json","Layers":["layer/layer.tar"]}]"#;
+        let mut outer = tar::Builder::new(Vec::new());
+        append(&mut outer, "layer/layer.tar", &layer, 0o644);
+        append(&mut outer, "config.json", config, 0o644);
+        append(&mut outer, "manifest.json", manifest, 0o644);
+        let outer = outer.into_inner().unwrap();
+
+        let archive = root.path().join("image.tar.gz");
+        let file = File::create(&archive).unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        gzip.write_all(&outer).unwrap();
+        gzip.finish().unwrap();
+
+        let transport = GitTransport::discover(&repo).unwrap();
+        import_image(&transport, archive.to_str().unwrap(), None).unwrap();
+        assert!(!git(&repo, &["count-objects"]).starts_with("0 objects"));
     }
 }

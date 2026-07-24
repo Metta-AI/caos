@@ -518,7 +518,7 @@ the cache key, never hidden inside a memoized computation.
 
 ```bash
 ./build-builtins.sh                 # publish all built-ins to refs/caos/std
-./build-builtins.sh file-count deep-deps  # publish a subset
+./build-builtins.sh file-count deep-deps  # update these in the existing library
 ```
 
 ## Local testing

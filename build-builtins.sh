@@ -17,7 +17,11 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv)
+partial=1
+if [ ${#names[@]} -eq 0 ]; then
+  partial=0
+  names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv)
+fi
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
 # runs us from a store copy with no `nix` at runtime), else built from the flake.
@@ -39,6 +43,20 @@ CLIENT=${CAOS_CLIENT_REPO:-$PROJECT/.caos-dev/client-repo}
 git init -q "$CLIENT"
 git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
   || git -C "$CLIENT" remote set-url caos "$SERVER_URL"
+
+# A name-scoped publish updates the existing library; it must never replace the
+# canonical ref with only the requested names. Fetch the current tree up front,
+# and refuse a partial bootstrap because there is nothing complete to preserve.
+declare -A published_hash
+if [ "$partial" -eq 1 ]; then
+  if ! git -C "$CLIENT" fetch -q caos +refs/caos/std:refs/caos/std; then
+    echo "build-builtins: partial publish requires an existing refs/caos/std" >&2
+    exit 1
+  fi
+  while read -r _ _ hash name; do
+    published_hash[$name]=$hash
+  done < <(git -C "$CLIENT" ls-tree refs/caos/std)
+fi
 
 image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image attr
 
@@ -213,10 +231,17 @@ fi
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so
 # there's no commit to wrap it) and publish it to the server under refs/caos/std
 # in one push, which uploads every builtin image the server doesn't already have.
-entries=""
 for name in "${names[@]}"; do
-  entries+="040000 tree ${hash_of[$name]}"$'\t'"$name"$'\n'
+  published_hash[$name]=${hash_of[$name]}
 done
+entries=""
+while read -r name; do
+  entries+="040000 tree ${published_hash[$name]}"$'\t'"$name"$'\n'
+done < <(printf '%s\n' "${!published_hash[@]}" | sort)
+if [ -z "$entries" ]; then
+  echo "build-builtins: refusing to publish an empty std library" >&2
+  exit 1
+fi
 tree=$(printf '%s' "$entries" | git -C "$CLIENT" mktree)
 # --force: refs/caos/std points at a tree, and git refuses to update a non-commit
 # ref (or move it) without it. Re-publishing always replaces it.

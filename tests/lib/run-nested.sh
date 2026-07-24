@@ -154,6 +154,10 @@ fi
 # worker's netns, so localhost is the stub's address, not the engine host.
 export CAOS_BIN_DIR=/pt
 export CAOS_STUB_HOST=127.0.0.1
+if [ -e /cas/args/in/build-builtins.sh ]; then
+  caos get /cas/args/in/build-builtins.sh
+  export CAOS_BUILD_BUILTINS=/cas/args/in/build-builtins.sh
+fi
 # A real-API test's key arrives in its wrapper (chat-online; absent = its
 # cli.sh self-skips). Siblings share this worker's netns: they have its
 # egress, and in-job stubs are at 127.0.0.1.

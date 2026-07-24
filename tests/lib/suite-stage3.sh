@@ -103,6 +103,9 @@ for d in /cas/args/workspace/tests/*/; do
   [ -e "/cas/args/workspace/tests/$t/cli.sh" ] || continue
   child "$t"
   case "$t" in
+    build-builtins)
+      ln -s /cas/args/workspace/build-builtins.sh "/tmp/sel/$t/build-builtins.sh"
+      ;;
     cargo-self | unit)
       # Dogfood the tree under test — the PRUNED build tree (what cargo
       # reads, the compile's own input), so only Rust-relevant edits re-key
