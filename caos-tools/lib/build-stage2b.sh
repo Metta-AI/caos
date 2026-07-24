@@ -18,6 +18,13 @@ mkdir /tmp/bake-ws
 for f in flake.nix flake.lock rust-toolchain.toml Cargo.toml Cargo.lock; do
   [ -e "/cas/args/workspace/$f" ] && ln -s "/cas/args/workspace/$f" "/tmp/bake-ws/$f"
 done
+# The shared cargo bake the root flake imports (std/cargo-base/bake.nix,
+# design/flake-images.md finding B) — evaluating #caos-worker-cargo-deps-docker
+# needs it at the same relative path.
+caos get /cas/args/workspace/std
+caos get /cas/args/workspace/std/cargo-base
+mkdir -p /tmp/bake-ws/std/cargo-base
+ln -s /cas/args/workspace/std/cargo-base/bake.nix /tmp/bake-ws/std/cargo-base/bake.nix
 mkdir /tmp/bake-ws/crates
 for d in /cas/args/workspace/crates/*/; do
   c=$(basename "$d")

@@ -17,6 +17,7 @@ out=$2
 
 mkdir -p "$out"
 cp "$src/std/cargo-base/flake.nix" "$out/flake.nix"
+cp "$src/std/cargo-base/bake.nix" "$out/bake.nix"
 
 # The derived lock: the main lock's three nodes verbatim (locked + original +
 # rust-overlay's nixpkgs follows), under a root naming just those inputs.

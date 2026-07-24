@@ -54,8 +54,13 @@ The **flake-builder** is itself an image, so "resolve a flake by running the
 flake-builder" looks circular. It isn't, because the builder is referenced by a
 **docker digest**, never by a flake:
 
-- The **seed** flake-builder is host-nix-built alongside everything else in
-  `build-builtins.sh` — nothing special, just another image in the std set.
+- The **seed** flake-builder is host-nix-built by `build-builtins.sh` and
+  **streamed straight to the registry** — its layer tarball is composed onto
+  the stock nixos/nix base with `docker build` (ADD extracts each layer as
+  root, preserving the setuid caos) and pushed; `std/flake-builder` is then a
+  tiny **curry node over the digest ref**, so none of its ~75 layers ever
+  enter git. The registry tag, keyed on the tarball's store path, memoizes
+  the compose.
 - Building a *nested* stack (caos-in-caos, the test stack) builds **that stack's**
   flake-builder using the **host's** flake-builder. One level of self-hosting per
   stack; the recursion terminates at the host.

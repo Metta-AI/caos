@@ -87,7 +87,8 @@
           # (crt-static is on), so the binaries still run on any base.
           # line-tables-only keeps file:line backtraces without baking full
           # DWARF (plain dev debuginfo) into every image. This mirrors the cargo
-          # worker's bake (cargoWorkerDepsMusl), which already builds dev.
+          # worker's bake (cargoBake.deps, std/cargo-base/bake.nix), which
+          # already builds dev.
           CARGO_PROFILE = "dev";
           CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
@@ -622,131 +623,25 @@
         };
 
         # The cargo toolchain + workspace-deps bake (design/cargo-workers.md,
-        # phases 0–1). Two consumers:
-        #   - std/cargo-base is now a FLAKE tree (std/cargo-base/, finding B of
-        #     design/flake-images.md) that replicates this machinery standalone
-        #     — the flake-builder turns it into the base image std/cargo curries
-        #     onto, so nothing here rides the std publish anymore. The flake's
-        #     lock is derived from THIS flake's lock at publish (stage-tree.sh),
-        #     which keeps its toolchain the exact rustc that builds caos.
-        #   - cargoDepsImage below (the test suite's D2 deps-only base) still
-        #     consumes the bake directly.
-        # The image must be SELF-CONTAINED nix: cargo fingerprints are keyed on
-        # the exact compiler build, and dep artifacts contain proc-macro dylibs
-        # / build-script binaries linked against the compiling toolchain's
-        # glibc — so the toolchain that baked the deps must be the toolchain
-        # that uses them.
-        #
-        # `minimal` (rustc+cargo+host std) keeps clippy/rustfmt/rust-src out of
-        # the image; it resolves the same version as rust-toolchain.toml's
-        # `stable` channel because both come from the one flake.lock'd
-        # rust-overlay revision. The musl std rides along so produced binaries
-        # (rustc-built user workers) can be static — they then run on any base
-        # (the debian-slim runner today, scratch eventually).
-        cargoWorkerToolchain = linuxPkgs.rust-bin.stable.latest.minimal.override {
-          targets = [ muslTarget ];
+        # phases 0–1): ONE definition in std/cargo-base/bake.nix, shared with
+        # the published std/cargo-base flake (finding B, design/flake-images.md)
+        # — the flake-builder images that tree into the base std/cargo curries
+        # onto, so nothing here rides the std publish. The published flake's
+        # lock is derived from THIS flake's lock at publish (stage-tree.sh), so
+        # both sides evaluate the same expression against the same pins and
+        # cannot drift.
+        cargoBake = import ./std/cargo-base/bake.nix {
+          pkgs = linuxPkgs;
+          inherit crane src;
+          toolchainFile = ./rust-toolchain.toml;
         };
-        craneLibCargoWorker = (crane.mkLib linuxPkgs).overrideToolchain cargoWorkerToolchain;
 
-        # The vendored crates.io sources for the workspace's Cargo.lock, plus
-        # crane's source-replacement config pointing at them. A store path —
-        # the same absolute path at bake time and in-container, which the
-        # fingerprints require.
-        cargoWorkerVendor = craneLibCargoWorker.vendorCargoDeps { inherit src; };
-
-        # A musl C cross-compiler for the image: rustc links musl binaries
-        # self-contained, but C-carrying deps (ring) compile via cc-rs, which
-        # needs a real musl cc when targeting musl. The env var below hands it
-        # to cc-rs; it must be identical at bake time and in-worker, or the
-        # baked fingerprints go stale (build scripts rerun-if-env-changed on
-        # CC_<target>).
-        muslCrossCC =
-          if pkgs.stdenv.hostPlatform.isAarch64 then
-            linuxPkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
-          else
-            linuxPkgs.pkgsCross.musl64.stdenv.cc;
-        muslCCEnvName = "CC_${builtins.replaceStrings [ "-" ] [ "_" ] muslTarget}";
-        muslCCEnv = "${muslCCEnvName}=${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
-
-        # THE workspace-deps bake: every dependency pre-compiled for
-        # (musl, dev) against crane's DUMMY workspace sources — keyed on
-        # manifests + lockfile only, so source edits never re-bake. This one
-        # bake serves everything: `build` and `test` both compile with
-        # `--target=<musl>` at the default (dev) profile (caos-tools/build.sh),
-        # so a per-edit build recompiles only the workspace crates, never the
-        # dep graph. musl still links static regardless of profile (crt-static
-        # is on for musl), so the produced binaries run on any base. There is
-        # deliberately no second (host, release) bake — a second bake gets a
-        # different absolute build dir under the sandbox-off in-caos
-        # nix-builder, and the two can't share the one target/ dir Cargo
-        # fingerprints against. The worker re-materializes real sources at this
-        # same absolute root with fresh mtimes: deps stay fingerprint-fresh,
-        # workspace crates always rebuild. (An ad-hoc `cargo check` for the
-        # host arch simply finds no baked deps — correct, just uncached.)
-        cargoWorkerDepsMusl = craneLibCargoWorker.buildDepsOnly (
-          {
-            inherit src;
-            pname = "caos-cargo-musl";
-            version = "0.1.0";
-            strictDeps = true;
-            cargoVendorDir = cargoWorkerVendor;
-            CARGO_PROFILE = "dev";
-            # Smaller debuginfo (file:line in backtraces, no full DWARF). The
-            # image env repeats it: a profile-key mismatch is a silent full
-            # rebuild.
-            CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
-            CARGO_BUILD_TARGET = muslTarget;
-            cargoExtraArgs = "--locked --workspace";
-            # Record both absolute paths Cargo fingerprints. The worker must use
-            # these exact locations: merely placing the archive below the same
-            # workspace root is insufficient when Cargo reruns a dependency's
-            # build script, because its cached executable and OUT_DIR are keyed
-            # on the target directory too.
-            postInstall = ''
-              wsroot=$(pwd -P)
-              echo -n "$wsroot" > $out/ws-root
-              targetdir="''${CARGO_TARGET_DIR:-target}"
-              case "$targetdir" in /*) ;; *) targetdir="$wsroot/$targetdir" ;; esac
-              echo -n "$targetdir" > $out/target-dir
-            '';
-          }
-          // {
-            ${muslCCEnvName} = "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
-          }
-        );
-
-        # The worker-side env both cargo bases share (the std flake repeats it;
-        # the D2 image below consumes it directly).
-        cargoWorkerEnv = [
-          # The pinned toolchain and a C linker (for build/test binaries; the
-          # same cc-wrapper the bake's build scripts and proc macros linked
-          # under, so everything resolves against one glibc). git rides along
-          # so the workspace's git-spawning unit tests (transport, TUI
-          # workspace) run in the worker instead of being ignored.
-          "PATH=${cargoWorkerToolchain}/bin:${linuxPkgs.stdenv.cc}/bin:${muslCrossCC}/bin:${linuxPkgs.gitMinimal}/bin:/bin"
-          # A writable home; the worker copies the vendor config here.
-          "CARGO_HOME=/tmp/cargo"
-          "CAOS_VENDOR_CONFIG=${cargoWorkerVendor}/config.toml"
-          # Must match the bake (see cargoWorkerDepsMusl).
-          "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
-          "${muslCCEnv}"
-        ];
-
-        # The DEPS-ONLY cargo base (phase D2): toolchain + baked deps + env,
-        # WITHOUT caos or the /worker trampoline — those are stacked on by the
-        # suite's image jobs from the freshly caos-built binaries (the D1
-        # delta-over-base move). So this image is keyed on (toolchain,
-        # manifests, lockfile) alone, and the expensive in-caos nix bake that
-        # produces it re-runs only when those change — never on a source edit.
-        # Carry only the recorded paths, not the baked target/ (inflated as
-        # real writable files in the image below).
-        cargoDepsRootEnv =
-          pkgs.runCommand "caos-worker-cargo-deps-root" { }
-            ''
-              mkdir -p $out
-              cp ${cargoWorkerDepsMusl}/ws-root $out/ws-root
-              cp ${cargoWorkerDepsMusl}/target-dir $out/target-dir
-            '';
+        # The DEPS-ONLY cargo base (phase D2): the bake + env, WITHOUT caos or
+        # the /worker trampoline — those are stacked on by the suite's image
+        # jobs from the freshly caos-built binaries (the D1 delta-over-base
+        # move). So this image is keyed on (toolchain, manifests, lockfile)
+        # alone, and the expensive in-caos nix bake that produces it re-runs
+        # only when those change — never on a source edit.
         cargoDepsImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-cargo-deps";
           tag = "latest";
@@ -754,24 +649,14 @@
           # image has neither a shell nor chmod/ln, and the suite's image job
           # stacks the delta with Dockerfile RUN steps that need both.
           contents = [
-            cargoDepsRootEnv
+            cargoBake.rootEnv
             linuxPkgs.bashInteractive
             linuxPkgs.coreutils
           ];
           config = {
-            Env = cargoWorkerEnv;
+            Env = cargoBake.env;
           };
-          fakeRootCommands = ''
-            wsroot=$(cat ws-root)
-            targetdir=$(cat target-dir)
-            # Inflate the baked target/ as real, writable files — a store path
-            # would be symlinked read-only by dockerTools, and the worker must
-            # overwrite the dummy workspace-crate artifacts in place.
-            mkdir -p ".$targetdir"
-            ${pkgs.gnutar}/bin/tar --use-compress-program=${pkgs.zstd}/bin/zstd \
-              -xf ${cargoWorkerDepsMusl}/target.tar.zst -C ".$targetdir"
-            chown -R 1000:1000 ".$wsroot"
-            chmod -R u+w ".$wsroot"
+          fakeRootCommands = cargoBake.inflate + ''
             ln -sf bash bin/sh
             # Workers (uid 1000) scratch under /tmp; a bare nix root has none.
             mkdir -p tmp
@@ -1151,8 +1036,10 @@
         caosd = pkgs.writeShellApplication {
           name = "caosd";
           # jq: build-builtins.sh derives std/cargo-base's flake.lock from this
-          # flake's lock at publish (std/cargo-base/stage-tree.sh).
-          runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.jq ];
+          # flake's lock at publish (std/cargo-base/stage-tree.sh). tar: it
+          # unpacks the flake-builder tarball to stream it to the registry.
+          # docker rides in from the host PATH (caosd already requires it).
+          runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.jq pkgs.gnutar ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"

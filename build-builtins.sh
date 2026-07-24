@@ -25,9 +25,19 @@ names=("$@")
 # an image on first use. Everything below that builds/imports nix images skips
 # these.
 is_flake_entry() { case "$1" in cargo-base) return 0 ;; *) return 1 ;; esac; }
+# std entries whose image is STREAMED to the registry instead of imported into
+# git (design/flake-images.md): the nix tarball's layers are composed onto the
+# stock base with `docker build` and pushed; the std entry is a tiny curry
+# node over the digest ref, so no layer bytes ever enter git. Today that's the
+# flake-builder — the one remaining digest-referenced bootstrap image.
+is_streamed_entry() { case "$1" in flake-builder) return 0 ;; *) return 1 ;; esac; }
 image_names=()
 for name in "${names[@]}"; do
   is_flake_entry "$name" || image_names+=("$name")
+done
+import_names=()
+for name in "${image_names[@]}"; do
+  is_streamed_entry "$name" || import_names+=("$name")
 done
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
@@ -62,10 +72,6 @@ image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image at
 import_base() { # std name -> docker:// base ref, or empty for self-contained
   case "$1" in
     base | runner) echo "docker://debian:stable-slim" ;;
-    # The flake-builder rides on stock nixos/nix (pinned by digest in
-    # images/nix-base.ref) — so nix and its store stay stock registry layers,
-    # never git objects. See design/flake-images.md.
-    flake-builder) echo "docker://$(cat "$PROJECT/images/nix-base.ref")" ;;
     *) echo "" ;;
   esac
 }
@@ -108,9 +114,12 @@ done
 # and the cache goes with it; change an image and its store path -> a new ref.
 src_ref_of() { echo "refs/caos/src/$(printf '%s' "$1" | sha1sum | cut -c1-40)"; }
 
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
 declare -A hash_of
 to_import=()
-for name in "${image_names[@]}"; do
+for name in "${import_names[@]}"; do
   cached=$(git -C "$CLIENT" rev-parse --verify --quiet "$(src_ref_of "${img_path[$name]}")^{tree}" || true)
   if [ -n "$cached" ]; then
     echo "$name: reusing import $cached" >&2
@@ -126,8 +135,6 @@ done
 # every repo's objects into CLIENT, pin each src_ref, and push ONCE below —
 # concurrent pushes to one server repo race and corrupt it, so the push stays serial.
 if [ "${#to_import[@]}" -gt 0 ]; then
-  WORK=$(mktemp -d)
-  trap 'rm -rf "$WORK"' EXIT
   pids=()
   for name in "${to_import[@]}"; do
     echo "$name: importing..." >&2
@@ -154,6 +161,51 @@ if [ "${#to_import[@]}" -gt 0 ]; then
     git -C "$CLIENT" update-ref "$(src_ref_of "${img_path[$name]}")" "${hash_of[$name]}"
   done
 fi
+
+# The streamed std entries (design/flake-images.md): compose the nix tarball's
+# layers onto the stock nixos/nix base with `docker build` — ADD extracts each
+# layer.tar as root, preserving the setuid caos — push the result to the local
+# registry, and publish the std entry as a curry node over the digest ref
+# (`base` = docker://<host-facing ref>; runnerd's docker pulls it directly).
+# The registry tag, keyed on the tarball's immutable store path, is the memo:
+# an unchanged image re-publishes with one HEAD request and no build.
+REGISTRY=localhost:5000 # the compose stack's registry, host-published (caosd)
+manifest_digest() { # <repo:tag> -> the registry's manifest digest, or empty
+  curl -fsSI \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY/v2/caos/manifests/$1" 2>/dev/null \
+    | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" {print $2}'
+}
+for name in "${image_names[@]}"; do
+  is_streamed_entry "$name" || continue
+  tarball=${img_path[$name]}
+  stag="$name-$(printf '%s' "$tarball" | sha1sum | cut -c1-12)"
+  digest=$(manifest_digest "$stag" || true)
+  if [ -n "$digest" ]; then
+    echo "$name: registry hit for $stag" >&2
+  else
+    echo "$name: composing + streaming $stag..." >&2
+    ctx="$WORK/stream-$name"
+    mkdir "$ctx"
+    tar -xzf "$tarball" -C "$ctx"
+    cfg=$(jq -r '.[0].Config' "$ctx/manifest.json")
+    {
+      # The stock base (pinned by digest in images/nix-base.ref) — nix and its
+      # store stay stock registry layers, shared with every other consumer.
+      printf 'FROM %s\n' "$(cat "$PROJECT/images/nix-base.ref")"
+      jq -r '.[0].Layers[] | "ADD \(.) /"' "$ctx/manifest.json"
+      jq -r '.config.Env[]? | "ENV \(.)"' "$ctx/$cfg"
+      printf 'ENTRYPOINT %s\n' "$(jq -c '.config.Entrypoint' "$ctx/$cfg")"
+    } > "$ctx/Dockerfile"
+    docker build -t "$REGISTRY/caos:$stag" "$ctx" >&2
+    docker push "$REGISTRY/caos:$stag" >&2
+    digest=$(manifest_digest "$stag")
+    [ -n "$digest" ] || { echo "build-builtins: no digest for pushed $stag" >&2; exit 1; }
+  fi
+  hash_of[$name]=$(cd "$CLIENT" && "$caos" curry "docker://$REGISTRY/caos@$digest" --)
+  echo "$name: streamed -> curry ${hash_of[$name]}" >&2
+done
 
 # The flake-tree std entries (design/flake-images.md): std/cargo-base is the
 # GENERATED bake tree — the checked-in flake + a lock derived from the main
