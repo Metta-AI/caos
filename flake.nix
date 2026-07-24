@@ -266,203 +266,13 @@
           fakeRootCommands = installWorkerFilesBaseStacked;
         };
 
-        # A self-contained (musl) base layer shared by the non-source-built workers
-        # (bash/hello/file-count/deep-deps) via `fromImage` below. Distinct
-        # from workerBaseImage (the stock-glibc `base` builtin): these workers are
-        # self-contained musl images — they don't stack on a docker:// base — so
-        # they need the setuid caos at the real /bin/caos and the user db, exactly
-        # the old base. Sharing this one layer means a worker provisioned after any
-        # other only uploads its own delta, not the caos binary again (the registry
-        # dedups the identical base blob). It is NOT a builtin — just a fromImage.
-        workerSharedBaseConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerSharedBaseImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-shared-base";
-          tag = "latest";
-          contents = [ workerBaseRoot ];
-          config = workerSharedBaseConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
-
-        # A "bash" worker: it runs a shell script you hand it. The `caos` runner
-        # sets up /cas, materializes the run's args under /cas/args (one per
-        # --name=value / --name:@=path), and runs us as /worker; we fetch the
-        # `script` arg (a text file) and execute it with bash. The script does its
-        # work with the in-sandbox `caos` (get/put/run/curry/import-image), reads
-        # any other args from /cas/args/<name>, and leaves its result at /cas/out
-        # — so orchestration that used to run host-side now runs *inside* a worker,
-        # with a real /cas. Curry it (binding the script, or other args) and run it
-        # like any other image. Unlike the minimal Rust workers it carries a shell
-        # and coreutils, so it's not minimal — but it's a real, memoized worker.
-        # The script itself lives in images/bash-worker.sh — tracked git data,
-        # because the suite's image-build jobs (phase D) assemble the same
-        # image from it inside caos; this is the one source of truth.
-        workerBashScript = pkgs.writeTextFile {
-          name = "caos-worker-bash-script";
-          executable = true;
-          destination = "/worker";
-          text = builtins.readFile ./images/bash-worker.sh;
-        };
-        # bash's own files, merged into one root so they land as a single layer
-        # atop the shared workerSharedBaseImage (which already carries the setuid
-        # caos, /tmp, and the user db). Sharing that base means a worker provisioned
-        # after any other only uploads this layer, not the caos binary again. The
-        # binaries come from linuxPkgs so they're real Linux ELF even when the flake
-        # is evaluated on macOS (see linuxPkgs). The env itself is built with the
-        # *host's* buildEnv — it only symlinks store paths, so it needs no Linux
-        # builder even though its contents are Linux binaries.
-        workerBashRoot = pkgs.buildEnv {
-          name = "caos-worker-bash-root";
-          paths = [
-            workerBashScript
-            linuxPkgs.bash
-            linuxPkgs.coreutils
-            linuxPkgs.diffutils
-            linuxPkgs.gnugrep
-            linuxPkgs.findutils
-          ];
-        };
-        workerBashConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerBashImage = pkgs.dockerTools.buildImage {
-          name = "caos-worker-bash";
-          tag = "latest";
-          fromImage = workerSharedBaseImage;
-          copyToRoot = workerBashRoot;
-          config = workerBashConfig;
-        };
-
-
-        # A real, runnable worker image, with a /worker that reads its inputs from
-        # /cas/args (one entry per `--name=value` arg the run request carries), assembles
-        # them into a result tree along with a small receipt, and stores that at
-        # /cas/out. It runs via `caos runner`, which
-        # populates /cas/args and runs /worker. This is the `worker-hello` crate, a
-        # static binary at /worker — so the image needs no shell or coreutils.
-        workerHelloRoot = workerRoot "worker-hello" worker-hello;
-        workerHelloConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerHelloImage = pkgs.dockerTools.buildImage {
-          name = "caos-worker-hello";
-          tag = "latest";
-          fromImage = workerSharedBaseImage;
-          copyToRoot = workerHelloRoot;
-          config = workerHelloConfig;
-        };
-
-        # A "file-count" worker: counts the leaf files under `--in`, recursing
-        # with itself through map-then. A tree (no `--children` yet) records the
-        # continuation {in, map: file-count, then: file-count} and exits; called
-        # back with `--children` (the then position) it sums the child counts; a
-        # file counts as 1. The result, a blob holding the count, is left at
-        # /cas/out. It reaches its own image at /cas/args/image (the request's
-        # reserved entry). This is the `worker-file-count` crate, a static
-        # binary at /worker — so the image needs no shell or coreutils.
-        workerFileCountRoot = workerRoot "worker-file-count" worker-file-count;
-        workerFileCountConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerFileCountImage = pkgs.dockerTools.buildImage {
-          name = "caos-worker-file-count";
-          tag = "latest";
-          fromImage = workerSharedBaseImage;
-          copyToRoot = workerFileCountRoot;
-          config = workerFileCountConfig;
-        };
-
-        # A "dirs-only" worker: keeps only a node's directory children, dropping
-        # file (and other non-directory) children. It gets the node as `--in`
-        # and leaves the filtered children tree at /cas/out (one entry per
-        # surviving directory child, under its original name). Compose by
-        # filtering first and recursing over the result. It only touches
-        # the server (no sub-runs); the server injects that URL at runtime. This
-        # is the `worker-dirs-only` crate, a static binary at /worker — so the
-        # image needs no shell or coreutils.
-        workerDirsOnlyRoot = workerRoot "worker-dirs-only" worker-dirs-only;
-        workerDirsOnlyContents = [
-          workerBaseRoot
-          workerDirsOnlyRoot
-        ];
-        workerDirsOnlyConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerDirsOnlyImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-dirs-only";
-          tag = "latest";
-          contents = workerDirsOnlyContents;
-          config = workerDirsOnlyConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
-
-        # A "deep-deps" worker: turns a flat, name-keyed package map into a DAG of
-        # deepened nodes. The input `packages` tree holds one subtree per
-        # package, each with a `DEPS` blob (dependency names, one per line). The
-        # output mirrors it, but each node carries a `DEEP-DEPS` subtree of its
-        # recursively-deepened direct deps (which themselves carry DEEP-DEPS).
-        #
-        # It recurses through map-then, with this same image on both sides of
-        # the continuation. `--mode` is optional; omitting it is the simple
-        # public API:
-        #   (no mode) — deepen one package (`--name`).
-        #   all       — top-level convenience: deepen every package (a pure map).
-        # The internal modes, reached only via curry by the driver:
-        #   deepen — curried with `--packages` (the whole map): given a package
-        #            as `--in`, resolve its `DEPS` names to the dep subtrees
-        #            (pure CAS linking) and map-then itself over them.
-        #   finish — given the package (curried as `--pkg`) and its deepened
-        #            deps as `--children`, build the node (the package's files,
-        #            minus DEPS, plus a DEEP-DEPS of the children).
-        # Incrementality comes entirely from CAOS call memoization. deepen
-        # carries the whole map, so it re-runs on any edit — cheap
-        # orchestration. But finish (curried with only the package) is keyed on
-        # a package and its deepened subgraph, so real recompute is O(changed
-        # package + its dependents). A cycle re-enters the same deepen (image,
-        # args) and is caught by the server's run-cycle detection.
-        #
-        # It reaches its own image (to curry deepen/finish) at /cas/args/image
-        # (the request's reserved entry).
-        #
-        # This worker is the `worker-deep-deps` crate, a static binary placed at
-        # /worker — so, like the other Rust workers, its image needs no shell or
-        # coreutils, just caos (installed setuid by installWorkerFiles).
-        workerDeepDepsRoot = workerRoot "worker-deep-deps" worker-deep-deps;
-        workerDeepDepsConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [ "PATH=/bin" ];
-        };
-        workerDeepDepsImage = pkgs.dockerTools.buildImage {
-          name = "caos-worker-deep-deps";
-          tag = "latest";
-          fromImage = workerSharedBaseImage;
-          copyToRoot = workerDeepDepsRoot;
-          config = workerDeepDepsConfig;
-        };
+        # The "bash" script worker, the example workers (hello, file-count,
+        # dirs-only, deep-deps) and testenv no longer have images here: their
+        # environments are std FLAKES (std/bash-base, std/testenv-base —
+        # design/flake-images.md) or the shared runner, and build-builtins.sh
+        # publishes each worker as curry(<base>, bin=…) — the script workers
+        # bind images/bash-worker.sh, the example workers bind their static
+        # musl binaries (builtinWorkerBins below).
 
         # The "rustc" worker *builds other workers*, but carries no toolchain:
         # it is pure orchestration over the cargo worker (lay out the project,
@@ -500,64 +310,6 @@
           contents = [ workerRunnerRootEnv ];
           config = workerRunnerConfig;
           fakeRootCommands = installWorkerFilesBaseStacked;
-        };
-
-        # The "testenv" worker (design/cargo-workers.md, phase 3): the bash
-        # script worker's sibling, for jobs that run a whole INNER caos stack
-        # — a per-test job starts the edited server + a process-mode runnerd
-        # (chroot slots) inside its own container and drives a test against
-        # them. Differences from `bash`: git rides along (the inner server's
-        # smart-HTTP transport and the inner client repo need it), and the
-        # config grants CAOS_WORKER_UID=0 — the script runs as ROOT, which the
-        # inner stack requires (setuid installs into the slots, chroot). That
-        # grant is per-image containment policy: only jobs run on THIS image
-        # get it; every other worker keeps the uid-1000 fence.
-        workerTestenvRoot = pkgs.buildEnv {
-          name = "caos-worker-testenv-root";
-          paths = [
-            workerBashScript
-            linuxPkgs.bash
-            linuxPkgs.coreutils
-            linuxPkgs.diffutils
-            linuxPkgs.gnugrep
-            linuxPkgs.gnused
-            linuxPkgs.gnutar
-            linuxPkgs.findutils
-            linuxPkgs.gitMinimal
-            # A private redis backs the nested stack's result cache (tests
-            # assert real memoization); it starts empty and dies with the job.
-            linuxPkgs.redis
-            # The docker (moby) client, so an inner runnerd in this worker can
-            # delegate sibling containers to the outer engine over the granted
-            # socket (phase 4). Same slimmed client the runnerd image ships.
-            (if pkgs.stdenv.hostPlatform.isLinux then
-              linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
-            else
-              linuxPkgs.docker-client)
-          ];
-        };
-        workerTestenvConfig = {
-          Entrypoint = [
-            "/bin/caos"
-            "runner"
-          ];
-          Env = [
-            "PATH=/bin"
-            # The root grant (see above): caos runner reads these and skips
-            # the uid-1000 drop for this image's jobs.
-            "CAOS_WORKER_UID=0"
-            "CAOS_WORKER_GID=0"
-          ];
-        };
-        workerTestenvImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-testenv";
-          tag = "latest";
-          contents = [
-            workerTestenvRoot
-            workerBaseRoot
-          ];
-          config = workerTestenvConfig;
-          fakeRootCommands = installWorkerFiles;
         };
 
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin.
@@ -758,12 +510,6 @@
           config = workerBaseConfig;
           fakeRootCommands = installWorkerFilesBaseStacked;
         };
-        loadWorkerBash = loadImage {
-          name = "caos-worker-bash";
-          contents = [ workerBaseRoot workerBashRoot ];
-          config = workerBashConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
         loadServer = loadImage {
           name = "caos-server";
           contents = serverContents;
@@ -773,30 +519,6 @@
           name = "caos-runnerd";
           contents = runnerdContents;
           config = runnerdConfig;
-        };
-        loadWorkerHello = loadImage {
-          name = "caos-worker-hello";
-          contents = [ workerBaseRoot workerHelloRoot ];
-          config = workerHelloConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
-        loadWorkerFileCount = loadImage {
-          name = "caos-worker-file-count";
-          contents = [ workerBaseRoot workerFileCountRoot ];
-          config = workerFileCountConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
-        loadWorkerDirsOnly = loadImage {
-          name = "caos-worker-dirs-only";
-          contents = workerDirsOnlyContents;
-          config = workerDirsOnlyConfig;
-          fakeRootCommands = installWorkerFiles;
-        };
-        loadWorkerDeepDeps = loadImage {
-          name = "caos-worker-deep-deps";
-          contents = [ workerBaseRoot workerDeepDepsRoot ];
-          config = workerDeepDepsConfig;
-          fakeRootCommands = installWorkerFiles;
         };
         loadWorkerRunner = loadImage {
           name = "caos-worker-runner";
@@ -988,31 +710,29 @@
         # publishes the flake's own images without a runtime `nix build`.
         builtinWorkerImages = [
           workerBaseImage
-          workerBashImage
-          workerFileCountImage
-          workerDirsOnlyImage
-          workerHelloImage
-          workerDeepDepsImage
           workerRunnerImage
-          workerTestenvImage
-          # The inner flake-builder (design/flake-images.md); the outer is
-          # published as a curry over std/bash, so it needs no image here.
+          # Streamed to the registry by build-builtins.sh, never git-imported.
           workerFlakeBuilderImage
         ];
 
-        # The agent-harness worker binaries build-builtins.sh publishes as
-        # std curries over the runner image (std/bash-tool, std/llm-step) —
-        # handed over prebuilt for the same no-runtime-nix reason as the images.
+        # The worker binaries build-builtins.sh publishes as std curries —
+        # the agent harness (bash-tool, llm-step, rgrep), the cargo/rustc
+        # pair, and the example workers (hello, file-count, dirs-only,
+        # deep-deps), all curry(runner, bin) except cargo
+        # (curry(cargo-base, bin) — see bin_base in build-builtins.sh).
+        # Handed over prebuilt so caosd needs no runtime nix.
         builtinWorkerBins = [
           worker-bash-tool
           worker-llm-step
           worker-rgrep
-          # Published as curry(cargo-base, bin) — see bin_base in
-          # build-builtins.sh.
           worker-cargo
           # Published as curry(runner, bin) with the cargo worker and the
           # worker-common source curried in.
           worker-rustc
+          worker-hello
+          worker-file-count
+          worker-dirs-only
+          worker-deep-deps
         ];
 
         # The dev stack's control command. Subcommands:
@@ -1192,13 +912,8 @@
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-worker-base-docker = workerBaseImage;
-          caos-worker-bash-docker = workerBashImage;
           caos-server-docker = serverImage;
           caos-runnerd-docker = runnerdImage;
-          caos-worker-hello-docker = workerHelloImage;
-          caos-worker-file-count-docker = workerFileCountImage;
-          caos-worker-dirs-only-docker = workerDirsOnlyImage;
-          caos-worker-deep-deps-docker = workerDeepDepsImage;
           caos-worker-runner-docker = workerRunnerImage;
           caos-worker-cargo-deps-docker = cargoDepsImage;
           # skopeo, from OUR locked nixpkgs — the in-caos bake job pushes its
@@ -1206,7 +921,6 @@
           # taking it from the flake keeps the job pure (a bare `nixpkgs#`
           # ref would float with the global registry).
           skopeo = linuxPkgs.skopeo;
-          caos-worker-testenv-docker = workerTestenvImage;
           caos-worker-flake-builder-docker = workerFlakeBuilderImage;
         };
 
@@ -1222,10 +936,6 @@
             type = "app";
             program = "${loadWorkerBase}/bin/load-caos-worker-base";
           };
-          load-caos-worker-bash = {
-            type = "app";
-            program = "${loadWorkerBash}/bin/load-caos-worker-bash";
-          };
           load-caos-server = {
             type = "app";
             program = "${loadServer}/bin/load-caos-server";
@@ -1233,22 +943,6 @@
           load-caos-runnerd = {
             type = "app";
             program = "${loadRunnerd}/bin/load-caos-runnerd";
-          };
-          load-caos-worker-hello = {
-            type = "app";
-            program = "${loadWorkerHello}/bin/load-caos-worker-hello";
-          };
-          load-caos-worker-file-count = {
-            type = "app";
-            program = "${loadWorkerFileCount}/bin/load-caos-worker-file-count";
-          };
-          load-caos-worker-dirs-only = {
-            type = "app";
-            program = "${loadWorkerDirsOnly}/bin/load-caos-worker-dirs-only";
-          };
-          load-caos-worker-deep-deps = {
-            type = "app";
-            program = "${loadWorkerDeepDeps}/bin/load-caos-worker-deep-deps";
           };
           load-caos-worker-runner = {
             type = "app";

@@ -2,29 +2,40 @@
 # Populate the caos `std` library — the worker images clients reach as
 # `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
 #
-# For each named worker it builds the image with Nix and imports it as a
-# git-docker tree (real git objects, so versions dedup) into a local *client*
-# repo, assembles a `{name: image}` tree, and pushes that tree to the server
-# under `refs/caos/std`. The push uploads every referenced builtin image
-# (negotiated) and pins them under the ref. Clients then `git fetch caos
-# refs/caos/std` and resolve it locally to reach the library.
+# Entries come in four forms (see the is_*_entry predicates below):
+#   image     (base, runner)                nix-built, imported as a git-docker
+#                                           tree — real git objects, versions dedup
+#   streamed  (flake-builder)               nix-built, composed onto its stock
+#                                           base and pushed to the registry; the
+#                                           entry is a curry over the digest ref
+#   flake     (cargo-base, bash-base,       generated flake trees (each
+#              testenv-base)                std/<name>/stage-tree.sh); the
+#                                           flake-builder images them on first use
+#   curry     (bash, testenv + bin_names)   curry(<base>, bin=…) — script workers
+#                                           bind images/bash-worker.sh, binary
+#                                           workers their static musl binary
+# The final `{name: entry}` tree is pushed to the server under `refs/caos/std`
+# (uploading every referenced object, negotiated). Clients then `git fetch
+# caos refs/caos/std` and resolve it locally to reach the library.
 #
 # Usage: ./build-builtins.sh [name ...]   (default: all)
-# A name maps to the `caos-worker-<name>` image; `base` -> `caos-worker-base`.
-# Flake-tree entries (cargo-base) are generated trees, not images — see
-# is_flake_entry below. Requires the dev server running and git + jq on PATH.
+# Requires the dev server running and git + jq + docker on PATH.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv flake-builder)
+[ ${#names[@]} -eq 0 ] && names=(base runner cargo-base bash-base testenv-base bash testenv flake-builder)
 
 # std entries that are FLAKE TREES, not worker images (design/flake-images.md):
-# published as the bake tree itself; the server's flake-builder turns it into
-# an image on first use. Everything below that builds/imports nix images skips
-# these.
-is_flake_entry() { case "$1" in cargo-base) return 0 ;; *) return 1 ;; esac; }
+# published as the bake tree itself (std/<name>/stage-tree.sh); the server's
+# flake-builder turns it into an image on first use. Everything below that
+# builds/imports nix images skips these.
+is_flake_entry() { case "$1" in cargo-base | bash-base | testenv-base) return 0 ;; *) return 1 ;; esac; }
+# std entries that are SCRIPT WORKERS over a flake base: curry(<name>-base,
+# bin=images/bash-worker.sh) — the bin fetches the run's `script` arg and
+# executes it. No image of their own.
+is_script_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac; }
 # std entries whose image is STREAMED to the registry instead of imported into
 # git (design/flake-images.md): the nix tarball's layers are composed onto the
 # stock base with `docker build` and pushed; the std entry is a tiny curry
@@ -33,7 +44,7 @@ is_flake_entry() { case "$1" in cargo-base) return 0 ;; *) return 1 ;; esac; }
 is_streamed_entry() { case "$1" in flake-builder) return 0 ;; *) return 1 ;; esac; }
 image_names=()
 for name in "${names[@]}"; do
-  is_flake_entry "$name" || image_names+=("$name")
+  is_flake_entry "$name" || is_script_entry "$name" || image_names+=("$name")
 done
 import_names=()
 for name in "${image_names[@]}"; do
@@ -223,7 +234,23 @@ for name in "${names[@]}"; do
   echo "$name: flake tree ${hash_of[$name]}" >&2
 done
 
-# Agent-harness worker binaries (design/agent-harness.md): each is published as
+# The script workers: std/bash and std/testenv are curry(<name>-base,
+# bin=images/bash-worker.sh) — the same runner-pool move as the binary
+# workers below, with the script runner as the bin. The bin fetches the run's
+# `script` arg and executes it with bash; callers curry their script on top
+# exactly as before. Staged in CLIENT (ingestion takes git-tracked paths).
+for name in "${names[@]}"; do
+  is_script_entry "$name" || continue
+  base="$name-base"
+  # A name-scoped run may not have staged this worker's base tree; skip.
+  [ -n "${hash_of[$base]:-}" ] || continue
+  install -m 755 "$PROJECT/images/bash-worker.sh" "$CLIENT/bash-worker.sh"
+  git -C "$CLIENT" add bash-worker.sh
+  hash_of[$name]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--bin:@=bash-worker.sh")
+  echo "$name: script curry ${hash_of[$name]}" >&2
+done
+
+# Worker binaries: each is published as
 # a ready-to-run curry over the shared runner image — std/<name> =
 # curry(runner, bin=<static binary>) — NOT as a worker image of its own, so its
 # runs ride the warm runner pool (design/runner-protocol.md) and a rebuild
@@ -236,8 +263,9 @@ done
 # a different base: the heavy, rarely-changing image is keyed on
 # toolchain+lockfile, and a worker rebuild ships one blob).
 # Order matters: rustc's curry references the published cargo worker, so
-# cargo precedes it.
-bin_names=(bash-tool llm-step rgrep cargo rustc)
+# cargo precedes it. The example workers (hello, file-count, dirs-only,
+# deep-deps) ride the same mechanism — their dedicated images are gone.
+bin_names=(bash-tool llm-step rgrep cargo rustc hello file-count dirs-only deep-deps)
 bin_base() { # worker binary -> the image its std curry binds it into
   case "$1" in
     cargo) echo "cargo-base" ;;

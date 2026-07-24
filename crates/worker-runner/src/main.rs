@@ -27,6 +27,18 @@ fn run() -> Result<(), String> {
     // writable, executable copy under a scratch dir before running it.
     let bin = arg("bin");
     caos(["get", bin.as_str()])?;
+    // `bin` is the runner's RESERVED binding (call-time args override curry
+    // bindings, so a caller arg named `bin` silently replaces the worker
+    // binary). Diagnose that collision instead of failing with a bare io
+    // error from the copy.
+    let meta = std::fs::metadata(&bin).map_err(|e| format!("reading worker binary {bin}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "the `bin` arg is not a regular file — `bin` names the worker binary \
+             (the runner's reserved binding); a call-time arg named `bin` overrides \
+             the curried one, so rename the caller's arg"
+        ));
+    }
     let dir = scratch("run")?;
     let exe = dir.join("worker");
     std::fs::copy(&bin, &exe).map_err(|e| format!("staging worker binary: {e}"))?;

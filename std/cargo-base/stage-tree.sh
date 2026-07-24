@@ -21,16 +21,8 @@ cp "$src/std/cargo-base/bake.nix" "$out/bake.nix"
 
 # The derived lock: the main lock's three nodes verbatim (locked + original +
 # rust-overlay's nixpkgs follows), under a root naming just those inputs.
-jq '{
-  nodes: {
-    crane: .nodes.crane,
-    nixpkgs: .nodes.nixpkgs,
-    "rust-overlay": .nodes["rust-overlay"],
-    root: { inputs: { crane: "crane", nixpkgs: "nixpkgs", "rust-overlay": "rust-overlay" } }
-  },
-  root: "root",
-  version: 7
-}' "$src/flake.lock" > "$out/flake.lock"
+"$src/std/lib/derive-lock.sh" "$src/flake.lock" "$out/flake.lock" \
+  nixpkgs rust-overlay crane
 
 cp "$src/rust-toolchain.toml" "$out/"
 cp "$src/Cargo.toml" "$src/Cargo.lock" "$out/"

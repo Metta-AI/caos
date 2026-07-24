@@ -177,6 +177,25 @@ pilot, because it was the heaviest git-imported image (toolchain + baked deps):
   `builtinWorkerImages`, `build-builtins.sh`). The deps-bake machinery stays
   in the main flake for `cargoDepsImage`, the test suite's D2 deps-only base.
 
+## The rest of std follows
+
+With cargo-base proven, the remaining std entries converted to the same
+shapes (`build-builtins.sh` header lists the four entry forms):
+
+- **`std/bash-base`, `std/testenv-base`** — flake trees (checked-in
+  `flake.nix` + a lock derived from the main lock by `std/lib/derive-lock.sh`;
+  fully static, so their stage-tree.sh is two lines). `std/bash` and
+  `std/testenv` are `curry(<name>-base, bin=images/bash-worker.sh)` — the
+  script runner is just a bin like any other. The caos delta gained a
+  `/usr/bin/env` symlink so env-shebang script bins run on bare nix bases.
+- **`hello`, `file-count`, `dirs-only`, `deep-deps`** — no images at all
+  anymore: `curry(runner, bin=worker-<name>)`, the same runner-pool move the
+  agent-harness bins always used. Self-recursion through map-then works
+  under a curry (the bound `bin` rides the args tree into every child).
+- Only **three images remain nix-built**: `base` and `runner` (thin deltas on
+  stock debian) and the streamed `flake-builder`. Everything else a client
+  reaches through std is a curry over a flake-built base or the runner.
+
 ## Open items
 
 - Registry GC of built images — same concern as today's worker images

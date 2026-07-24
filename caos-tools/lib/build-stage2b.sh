@@ -48,7 +48,7 @@ caos get /cas/args/children/nixbuilder
 bake=$(caos curry "docker://$(cat /cas/args/children/nixbuilder)" -- \
   "--script:@=$LIB/bake.sh")
 stage2c=$(caos curry /cas/std/bash -- "--script:@=$LIB/build-stage2c.sh" \
-  "--workspace:@=/cas/args/workspace" "--bin:@=/cas/args/bin" \
+  "--workspace:@=/cas/args/workspace" "--bins:@=/cas/args/bins" \
   "--runner_image:@=/cas/args/children/runner" \
   "--bash_image:@=/cas/args/children/bash")
 caos run-then /cas/bake-ws -- --run="$bake" --then="$stage2c"

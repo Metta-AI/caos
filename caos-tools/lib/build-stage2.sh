@@ -80,5 +80,5 @@ caos put /tmp/imgs /cas/imgs
 
 imgmap=$(caos curry /cas/std/testenv -- "--script:@=$LIB/image-build.sh")
 stage2b=$(caos curry /cas/std/bash -- "--script:@=$LIB/build-stage2b.sh" \
-  "--workspace:@=/cas/args/workspace" "--bin:@=/cas/args/result/bin")
+  "--workspace:@=/cas/args/workspace" "--bins:@=/cas/args/result/bin")
 caos map-then /cas/imgs -- --map="$imgmap" --then="$stage2b"

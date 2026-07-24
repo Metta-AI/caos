@@ -37,7 +37,7 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
-| `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | `caos-worker-<name>` | Example/built-in workers. See [workers](#workers). |
+| `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | — (run as `curry(runner, bin)`) | Example/built-in workers. See [workers](#workers). |
 | `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, bin)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
 | `worker-cargo` | — (run as `curry(cargo-base, bin)`) | Whole-workspace `cargo check/build/test` atop `std/cargo-base` (pinned toolchain + pre-compiled deps — a flake tree the flake-builder images on first use, see `std/cargo-base/` and `design/flake-images.md`) — the agent's `build`/`test` tools. See `design/cargo-workers.md`. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
@@ -90,8 +90,7 @@ Docker images (crates are unprefixed; images carry a `caos-` prefix):
 
 ```bash
 nix build .#caos-server-docker            # image tarball at ./result
-nix build .#caos-worker-base-docker
-nix build .#caos-worker-hello-docker      # ...-file-count, -deep-deps, -rustc, -bash
+nix build .#caos-worker-base-docker       # ...-runner, -flake-builder
 
 docker load < result
 ```
@@ -101,13 +100,15 @@ large written to the Nix store):
 
 ```bash
 nix run .#load-caos-server
-nix run .#load-caos-worker-hello          # load-caos-worker-{base,file-count,...}
+nix run .#load-caos-worker-base           # load-caos-{runnerd,worker-runner,...}
 ```
 
-Worker images contain **only** their static `/worker` binary plus a setuid-root
-`/bin/caos`, the `worker` user (uid 1000), and a writable `/tmp` — no shell, no
-libc, no `/nix/store`. The `caos-server` image is not minimal: it bundles the
-`docker` client, `git`, and `tar`, and expects the host's docker socket.
+Only three images remain nix-built here: `base`, `runner`, and the
+`flake-builder`. Every other std worker is a `curry(<base>, bin)` over the
+runner or over a flake-built base (`std/*-base/`, built on demand by the
+flake-builder — see `design/flake-images.md`). The `caos-server` image is not
+minimal: it bundles the `docker` client, `git`, and `tar`, and expects the
+host's docker socket.
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
 > remote/linux builder; the binaries and dev shell build natively.

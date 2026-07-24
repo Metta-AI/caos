@@ -54,13 +54,34 @@ build)
     nix --extra-experimental-features "nix-command flakes" \
       --option build-users-group "" --option sandbox false "$@"
   }
+  # Unsandboxed builders run with HOME=/homeless-shelter; a builder that
+  # writes $HOME (go builds do — e.g. a flake compiling the slimmed docker
+  # client) leaves that directory behind, and nix (2.35) then refuses to
+  # START the next local build ("home directory exists ... purity") without
+  # ever cleaning it up itself — post-build-hook demonstrably does not fire
+  # for this. So: retry, removing the litter, but ONLY on that exact error —
+  # completed drvs stay in the store, so each retry makes monotonic progress
+  # and a genuinely broken flake still fails on its first real error.
+  nix_build_flake() {
+    while :; do
+      rm -rf /homeless-shelter
+      # The pipeline (pipefail is on) keeps the full log flowing to stderr
+      # while capturing a copy to grep; `-o` carries the result, stdout is
+      # empty.
+      if nixf build -L "path:/tmp/ws#caosImage" -o /tmp/img 2>&1 | tee /tmp/nix-err >&2; then
+        return 0
+      fi
+      grep -q "homeless-shelter" /tmp/nix-err || return 1
+      echo "flake-build: homeless-shelter litter; resuming the build" >&2
+    done
+  }
   sk() { skopeo --insecure-policy "$@"; }
 
   # Already built for this exact flake tree? (The tag is the content hash.)
   if digest=$(sk inspect --tls-verify=false --format '{{.Digest}}' "docker://$tag" 2>/dev/null); then
     echo "flake-build: registry hit for $tag" >&2
   else
-    nixf build -L "path:/tmp/ws#caosImage" -o /tmp/img \
+    nix_build_flake \
       || fail "nix build of path:/tmp/ws#caosImage (does the flake expose packages.<system>.caosImage?)"
     gunzip -c "$(readlink -f /tmp/img)" > /tmp/img.tar
     sk copy --dest-tls-verify=false "docker-archive:/tmp/img.tar" "docker://$tag" >&2 \
@@ -113,6 +134,10 @@ stack)
   # delta, not the flake.
   cp /caos-trampoline "$l/worker"
   chmod 0755 "$l/worker"
+  # /usr/bin/env, for env-shebang worker scripts (images/bash-worker.sh runs
+  # as a curried bin on flake bases) — the flake base's own /bin/env is where
+  # coreutils puts it.
+  ln -s /bin/env "$l/usr/bin/env"
   # The world-writable /tmp the unprivileged worker scratches in (empty dir
   # stores as an empty tree; its 1777 mode rides in the sibling sidecar).
   printf '{"mode":"1777","uid":0,"gid":0}' > "$l/tmp.caosmeta"
