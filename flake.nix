@@ -87,7 +87,7 @@
           # (crt-static is on), so the binaries still run on any base.
           # line-tables-only keeps file:line backtraces without baking full
           # DWARF (plain dev debuginfo) into every image. This mirrors the cargo
-          # worker's bake (cargoBake.deps, std/cargo-base/bake.nix), which
+          # worker's bake (cargoBake.deps, std/cargo/bake.nix), which
           # already builds dev.
           CARGO_PROFILE = "dev";
           CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
@@ -214,7 +214,7 @@
           [ -e usr/bin/env ] || ln -s /bin/env usr/bin/env
         '';
         # No worker images live here anymore, bar the flake-builder below.
-        # Every other std entry is a flake tree (std/{runner,cargo-base,
+        # Every other std entry is a flake tree (std/{runner,cargo,
         # bash-base,testenv-base} — design/flake-images.md) or a
         # curry(<base>, bin=…) over one: the script workers bind
         # images/bash-worker.sh, the binary workers (agent harness, examples,
@@ -232,10 +232,8 @@
         # registry layers and our delta as pushed blobs, never through git. We
         # bake only what the bare nix base lacks: the /worker script, skopeo
         # (push + inspect — a general flake makes no `#skopeo` promise), jq (to
-        # massage the returned config), bash/coreutils/gzip, and the runner
-        # trampoline (/caos-trampoline — laid into the caos delta as /worker so
-        # flake #caosImage stay pure bases). nix comes from the base's profile
-        # (PATH).
+        # massage the returned config), and bash/coreutils/gzip. nix comes from
+        # the base's profile (PATH).
         workerFlakeBuilderScript = pkgs.writeTextFile {
           name = "caos-worker-flake-builder-script";
           executable = true;
@@ -277,24 +275,18 @@
               "CAOS_WORKER_GID=0"
             ];
           };
-          fakeRootCommands = installWorkerFiles + ''
-            # The runner trampoline, baked so the stack stage can lay it into the
-            # caos delta as /worker (design/flake-images.md) — this is what lets a
-            # flake #caosImage stay a pure base (no caos code, stable hash).
-            cp ${worker-runner}/bin/worker-runner caos-trampoline
-            chmod 0755 caos-trampoline
-          '';
+          fakeRootCommands = installWorkerFiles;
         };
 
         # The cargo toolchain + workspace-deps bake (design/cargo-workers.md,
-        # phases 0–1): ONE definition in std/cargo-base/bake.nix, shared with
-        # the published std/cargo-base flake (finding B, design/flake-images.md)
+        # phases 0–1): ONE definition in std/cargo/bake.nix, shared with
+        # the published std/cargo flake (finding B, design/flake-images.md)
         # — the flake-builder images that tree into the base std/cargo curries
         # onto, so nothing here rides the std publish. The published flake's
         # lock is derived from THIS flake's lock at publish (stage-tree.sh), so
         # both sides evaluate the same expression against the same pins and
         # cannot drift.
-        cargoBake = import ./std/cargo-base/bake.nix {
+        cargoBake = import ./std/cargo/bake.nix {
           pkgs = linuxPkgs;
           inherit crane src;
           toolchainFile = ./rust-toolchain.toml;
@@ -613,18 +605,19 @@
           workerFlakeBuilderImage
         ];
 
-        # The worker binaries build-builtins.sh publishes as std curries —
-        # the agent harness (bash-tool, llm-step, rgrep), the cargo/rustc
-        # pair, and the example workers (hello, file-count, dirs-only,
-        # deep-deps), all curry(runner, bin) except cargo
-        # (curry(cargo-base, bin) — see bin_base in build-builtins.sh).
-        # Handed over prebuilt so caosd needs no runtime nix.
+        # The worker binaries build-builtins.sh needs at publish — curried
+        # onto std/runner (the agent harness, rustc, the example workers) or
+        # staged into flake trees as their /worker (worker-runner, worker-
+        # cargo). Handed over prebuilt so caosd needs no runtime nix.
         builtinWorkerBins = [
           worker-bash-tool
           worker-llm-step
           worker-rgrep
+          # Staged INTO flake trees as their /worker (std/cargo, std/runner —
+          # see the stage-tree.sh scripts), not published as curries.
           worker-cargo
-          # Published as curry(runner, bin) with the cargo worker and the
+          worker-runner
+          # Published as curry(runner, worker1) with the cargo ref and the
           # worker-common source curried in.
           worker-rustc
           worker-hello
@@ -653,8 +646,8 @@
         # persistent state — server repo, publish client repo, redis, registry.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          # jq: build-builtins.sh derives std/cargo-base's flake.lock from this
-          # flake's lock at publish (std/cargo-base/stage-tree.sh). tar: it
+          # jq: build-builtins.sh derives the std flakes' flake.locks from this
+          # flake's lock at publish (std/cargo/stage-tree.sh). tar: it
           # unpacks the flake-builder tarball to stream it to the registry.
           # docker rides in from the host PATH (caosd already requires it).
           runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.jq pkgs.gnutar ];
@@ -792,11 +785,11 @@
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
-          # The cargo worker (curry(cargo-base, bin)) and the rustc
-          # orchestrator (curry(runner, bin)) — build-builtins.sh needs the
-          # binaries exposed.
+          # The cargo worker (std/cargo's /worker) and the rustc
+          # orchestrator (curry(runner, worker1)) — build-builtins.sh needs
+          # the binaries exposed.
           inherit worker-cargo worker-rustc;
-          # The runner-pool trampoline binary, exposed for the process-mode
+          # The runner interpreter binary, exposed for the process-mode
           # backend (it becomes each chroot slot's /worker; tests/proc-stack).
           inherit worker-runner;
           # The pure-Rust example workers' binaries, exposed for the inner

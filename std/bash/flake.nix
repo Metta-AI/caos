@@ -1,20 +1,17 @@
 {
-  # std/runner (design/flake-images.md, design/runner-protocol.md): the ONE
-  # warm, pooled interpreter image every compiled worker runs on — std/<name>
-  # = curry(runner, worker1=<static musl binary>), so a worker rebuild ships
-  # one small blob, never an image. /worker here is the interpreter itself
-  # (crates/worker-runner, copied into this tree at publish by
-  # stage-tree.sh): it fetches the `worker1` arg and execs it. The rest is
-  # the USERLAND those binaries — and the commands bash-tool runs for the
-  # agent — see at runtime.
+  # std/bash (design/flake-images.md): the script worker — a complete
+  # interpreter worker image. /worker is the script runner
+  # (images/bash-worker.sh, copied into this tree at publish): it fetches the
+  # `worker1` arg — the script, the next executable in the chain — and runs
+  # it with bash. The contents are the shell and file tools a worker script
+  # leans on. Curry a script on (`--worker1:@=…`) and run it like any image.
   #
   # The contract (images/flake-builder.sh): a flake defines everything about
-  # the image except the caos additions (setuid /bin/caos, /tmp, the user
-  # db, /usr/bin/env). /worker included — caos never installs one.
+  # the image except the caos additions. /worker included.
   #
   # The published tree is GENERATED (stage-tree.sh): this file, a flake.lock
-  # derived from the main flake.lock, and the interpreter binary.
-  description = "caos std/runner — the pooled interpreter image for compiled workers";
+  # derived from the main flake.lock, and the script runner.
+  description = "caos std/bash — the script worker: shell + file tools, /worker runs `worker1`";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -25,13 +22,13 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          workerRoot = pkgs.runCommand "runner-worker-root" { } ''
+          workerRoot = pkgs.runCommand "bash-worker-root" { } ''
             mkdir -p $out
             install -m 755 ${./worker} $out/worker
           '';
         in
         pkgs.dockerTools.buildLayeredImage {
-          name = "runner";
+          name = "bash";
           tag = "latest";
           # bash provides /bin/sh too. No Entrypoint: runnerd forces
           # `/bin/caos runner`, which execs /worker.
@@ -41,10 +38,7 @@
             pkgs.coreutils
             pkgs.diffutils
             pkgs.gnugrep
-            pkgs.gnused
             pkgs.findutils
-            pkgs.gnutar
-            pkgs.gzip
           ];
           config = {
             Env = [ "PATH=/bin" ];

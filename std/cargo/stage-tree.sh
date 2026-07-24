@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# Assemble std/cargo-base's publishable BAKE TREE (design/flake-images.md,
-# finding B): the flake next to this script plus exactly the workspace files
-# its deps bake reads — manifests, lockfile, toolchain file — and NO source,
-# so a source edit never re-keys the tree (the flake-builder's registry memo
-# is flake-<caos hash of this tree>).
+# Assemble std/cargo's publishable BAKE TREE (design/flake-images.md): the
+# flake next to this script plus exactly what its build reads — manifests,
+# lockfile, toolchain file, the worker-cargo binary as ./worker — and NO
+# source, so a source edit never re-keys the tree (the flake-builder's
+# registry memo is flake-<caos hash of this tree>).
 #
 # The flake.lock is DERIVED from the main flake.lock here, at publish: the
 # same nixpkgs/rust-overlay/crane revisions, so the flake's toolchain
 # expression resolves the exact rustc that builds caos (the caos-in-caos
 # suite needs the versions to match) and the pin structurally cannot drift.
 #
-# Usage: stage-tree.sh <project root> <output dir>
+# Usage: stage-tree.sh <project root> <output dir> <bin store paths...>
 set -euo pipefail
 src=$1
 out=$2
+shift 2
 
 mkdir -p "$out"
-cp "$src/std/cargo-base/flake.nix" "$out/flake.nix"
-cp "$src/std/cargo-base/bake.nix" "$out/bake.nix"
+cp "$src/std/cargo/flake.nix" "$out/flake.nix"
+cp "$src/std/cargo/bake.nix" "$out/bake.nix"
+for p in "$@"; do
+  [ -x "$p/bin/worker-cargo" ] && install -m 755 "$p/bin/worker-cargo" "$out/worker"
+done
+[ -e "$out/worker" ] || { echo "stage-tree: no worker-cargo among: $*" >&2; exit 1; }
 
 # The derived lock: the main lock's three nodes verbatim (locked + original +
 # rust-overlay's nixpkgs follows), under a root naming just those inputs.

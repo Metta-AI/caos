@@ -1,20 +1,19 @@
 {
-  # std/testenv-base (design/flake-images.md, design/cargo-workers.md phase 3):
-  # the bash script environment plus what a job needs to run a whole INNER
-  # caos stack — git (the inner server's smart-HTTP transport and the inner
-  # client repo), a private redis (the nested stack's result cache; starts
-  # empty, dies with the job), and the docker client (an inner runnerd
-  # delegates sibling containers to the outer engine over the granted socket,
-  # phase 4). The CAOS_WORKER_UID=0 grant makes jobs on this image run as
-  # ROOT — the inner stack requires it (setuid installs into the chroot
-  # slots); per-image containment policy, every other worker keeps the
-  # uid-1000 fence.
+  # std/testenv (design/flake-images.md, design/cargo-workers.md phase 3):
+  # std/bash's sibling for jobs that run a whole INNER caos stack — same
+  # script-runner /worker (images/bash-worker.sh: fetch `worker1`, run it
+  # with bash), plus git (the inner server's smart-HTTP transport and the
+  # inner client repo), a private redis (the nested stack's result cache;
+  # starts empty, dies with the job), and the docker client (an inner
+  # runnerd delegates sibling containers to the outer engine over the
+  # granted socket, phase 4). The CAOS_WORKER_UID=0 grant makes jobs on this
+  # image run as ROOT — the inner stack requires it (setuid installs into
+  # the chroot slots); per-image containment policy, every other worker
+  # keeps the uid-1000 fence.
   #
-  # A pure BASE like bash-base: no /worker, no caos — the flake-builder's
-  # delta supplies those. std/testenv is curry(<this tree>,
-  # bin=images/bash-worker.sh). The published tree is this file + a lock
-  # derived from the main flake.lock at publish (stage-tree.sh).
-  description = "caos std/testenv-base — script env + git/redis/docker for nested-stack jobs";
+  # The published tree is GENERATED (stage-tree.sh): this file, a flake.lock
+  # derived from the main flake.lock, and the script runner.
+  description = "caos std/testenv — script worker + git/redis/docker + root, for nested-stack jobs";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -25,11 +24,16 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          workerRoot = pkgs.runCommand "testenv-worker-root" { } ''
+            mkdir -p $out
+            install -m 755 ${./worker} $out/worker
+          '';
         in
         pkgs.dockerTools.buildLayeredImage {
-          name = "testenv-base";
+          name = "testenv";
           tag = "latest";
           contents = [
+            workerRoot
             pkgs.bash
             pkgs.coreutils
             pkgs.diffutils

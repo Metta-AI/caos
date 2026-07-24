@@ -3,15 +3,16 @@
 # `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
 #
 # Entries come in three forms (see the is_*_entry predicates below):
-#   streamed  (flake-builder)               nix-built, composed onto its stock
-#                                           base and pushed to the registry; the
-#                                           entry is a curry over the digest ref
-#   flake     (runner, cargo-base,          generated flake trees (each
-#              bash-base, testenv-base)     std/<name>/stage-tree.sh); the
-#                                           flake-builder images them on first use
-#   curry     (bash, testenv + bin_names)   curry(<base>, bin=…) — script workers
-#                                           bind images/bash-worker.sh, binary
-#                                           workers their static musl binary
+#   streamed  (flake-builder)            nix-built, composed onto its stock
+#                                        base and pushed to the registry; the
+#                                        entry is a curry over the digest ref
+#   flake     (runner, cargo,            generated flake trees (each
+#              bash, testenv)            std/<name>/stage-tree.sh) — complete
+#                                        worker images, /worker included; the
+#                                        flake-builder images them on first use
+#   curry     (bin_names)                curry(runner, worker1=<binary>) — the
+#                                        compiled workers ride the shared
+#                                        runner pool
 # The final `{name: entry}` tree is pushed to the server under `refs/caos/std`
 # (uploading every referenced object, negotiated). Clients then `git fetch
 # caos refs/caos/std` and resolve it locally to reach the library.
@@ -23,17 +24,13 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(runner cargo-base bash-base testenv-base bash testenv flake-builder)
+[ ${#names[@]} -eq 0 ] && names=(runner cargo bash testenv flake-builder)
 
-# std entries that are FLAKE TREES, not worker images (design/flake-images.md):
-# published as the bake tree itself (std/<name>/stage-tree.sh); the server's
-# flake-builder turns it into an image on first use. Everything below that
-# builds/imports nix images skips these.
-is_flake_entry() { case "$1" in runner | cargo-base | bash-base | testenv-base) return 0 ;; *) return 1 ;; esac; }
-# std entries that are SCRIPT WORKERS over a flake base: curry(<name>-base,
-# bin=images/bash-worker.sh) — the bin fetches the run's `script` arg and
-# executes it. No image of their own.
-is_script_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac; }
+# std entries that are FLAKE TREES (design/flake-images.md): published as the
+# generated tree itself (std/<name>/stage-tree.sh — the flake, a derived
+# lock, and whatever the image build reads, /worker's executable included).
+# The server's flake-builder images them on first use.
+is_flake_entry() { case "$1" in runner | cargo | bash | testenv) return 0 ;; *) return 1 ;; esac; }
 # std entries whose image is STREAMED to the registry instead of imported into
 # git (design/flake-images.md): the nix tarball's layers are composed onto the
 # stock base with `docker build` and pushed; the std entry is a tiny curry
@@ -42,7 +39,7 @@ is_script_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac
 is_streamed_entry() { case "$1" in flake-builder) return 0 ;; *) return 1 ;; esac; }
 image_names=()
 for name in "${names[@]}"; do
-  is_flake_entry "$name" || is_script_entry "$name" || image_names+=("$name")
+  is_flake_entry "$name" || image_names+=("$name")
 done
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
@@ -98,6 +95,24 @@ for name in "${image_names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done
 
+# The worker binaries: staged into flake trees as their /worker (runner's
+# interpreter, cargo's worker) and published as curries over runner
+# (bin_names below). Prebuilt store paths arrive via CAOS_BUILTIN_BINS (how
+# caosd avoids runtime nix), else they're nix-built here — the staged set
+# rides in `stage_bins`, so a default publish always builds them.
+bin_names=(bash-tool llm-step rgrep rustc hello file-count dirs-only deep-deps)
+stage_bins=(runner cargo)
+if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
+  bin_paths=$CAOS_BUILTIN_BINS
+else
+  attrs=()
+  for b in "${bin_names[@]}" "${stage_bins[@]}"; do attrs+=(".#worker-$b"); done
+  echo "building worker binaries..." >&2
+  if ! bin_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
+    echo "build-builtins: nix build failed" >&2; exit 1
+  fi
+fi
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -148,71 +163,32 @@ for name in "${image_names[@]}"; do
   echo "$name: streamed -> curry ${hash_of[$name]}" >&2
 done
 
-# The flake-tree std entries (design/flake-images.md): std/cargo-base is the
-# GENERATED bake tree — the checked-in flake + a lock derived from the main
-# flake.lock + the workspace's manifests (stage-tree.sh) — published as a
-# plain git tree. The server's flake-builder turns it into the toolchain+deps
-# image on first use, memoized in the registry on the tree's own hash, so
-# re-publishing an unchanged tree costs nothing. Staged inside CLIENT (like
-# worker-common below) because only git-tracked paths can be hashed here.
+# The flake-tree std entries (design/flake-images.md): each is a GENERATED
+# tree — the checked-in flake, a lock derived from the main flake.lock, and
+# whatever the image build reads (cargo's manifests, each worker image's
+# /worker executable) — published as a plain git tree. The server's
+# flake-builder images it on first use, memoized in the registry on the
+# tree's own hash, so re-publishing an unchanged tree costs nothing. Staged
+# inside CLIENT (like worker-common below) because only git-tracked paths can
+# be hashed here.
 for name in "${names[@]}"; do
   is_flake_entry "$name" || continue
   rm -rf "${CLIENT:?}/$name"
-  "$PROJECT/std/$name/stage-tree.sh" "$PROJECT" "$CLIENT/$name"
+  # shellcheck disable=SC2086
+  "$PROJECT/std/$name/stage-tree.sh" "$PROJECT" "$CLIENT/$name" $bin_paths
   git -C "$CLIENT" add "$name"
   hash_of[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
   echo "$name: flake tree ${hash_of[$name]}" >&2
 done
 
-# The script workers: std/bash and std/testenv are curry(<name>-base,
-# bin=images/bash-worker.sh) — the same runner-pool move as the binary
-# workers below, with the script runner as the bin. The bin fetches the run's
-# `script` arg and executes it with bash; callers curry their script on top
-# exactly as before. Staged in CLIENT (ingestion takes git-tracked paths).
-for name in "${names[@]}"; do
-  is_script_entry "$name" || continue
-  base="$name-base"
-  # A name-scoped run may not have staged this worker's base tree; skip.
-  [ -n "${hash_of[$base]:-}" ] || continue
-  install -m 755 "$PROJECT/images/bash-worker.sh" "$CLIENT/bash-worker.sh"
-  git -C "$CLIENT" add bash-worker.sh
-  hash_of[$name]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--worker1:@=bash-worker.sh")
-  echo "$name: script curry ${hash_of[$name]}" >&2
-done
-
-# Worker binaries: each is published as
-# a ready-to-run curry over the shared runner image — std/<name> =
-# curry(runner, bin=<static binary>) — NOT as a worker image of its own, so its
-# runs ride the warm runner pool (design/runner-protocol.md) and a rebuild
-# ships one small blob, not an image. `caos-cli curry` ingests the binary and
-# pushes the curry; the std ref push below pins both. Prebuilt store paths
-# arrive via CAOS_BUILTIN_BINS (how caosd avoids runtime nix), else they're
-# nix-built here. Skipped when `runner` isn't among the names (a partial,
-# name-scoped run has no image to curry onto). Most bins curry onto the shared
-# runner; `cargo` curries onto its toolchain base (bin_base — the same move at
-# a different base: the heavy, rarely-changing image is keyed on
-# toolchain+lockfile, and a worker rebuild ships one blob).
-# Order matters: rustc's curry references the published cargo worker, so
-# cargo precedes it. The example workers (hello, file-count, dirs-only,
-# deep-deps) ride the same mechanism — their dedicated images are gone.
-bin_names=(bash-tool llm-step rgrep cargo rustc hello file-count dirs-only deep-deps)
-bin_base() { # worker binary -> the image its std curry binds it into
-  case "$1" in
-    cargo) echo "cargo-base" ;;
-    *) echo "runner" ;;
-  esac
-}
+# The compiled workers: each is published as a ready-to-run curry over the
+# shared runner image — std/<name> = curry(runner, worker1=<static binary>) —
+# NOT as a worker image of its own, so its runs ride the warm runner pool
+# (design/runner-protocol.md) and a rebuild ships one small blob, not an
+# image. `caos-cli curry` ingests the binary and pushes the curry; the std
+# ref push below pins both. Skipped when `runner` isn't among the names (a
+# partial, name-scoped run has no image to curry onto).
 if [ -n "${hash_of[runner]:-}" ]; then
-  if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
-    bin_paths=$CAOS_BUILTIN_BINS
-  else
-    attrs=()
-    for b in "${bin_names[@]}"; do attrs+=(".#worker-$b"); done
-    echo "building ${#bin_names[@]} worker binaries..." >&2
-    if ! bin_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
-      echo "build-builtins: nix build failed" >&2; exit 1
-    fi
-  fi
   declare -A bin_path
   # Map each worker binary to the store path that CONTAINS it (bin/worker-<b>),
   # not by matching the path's name: the workspace builds as one derivation
@@ -227,11 +203,8 @@ if [ -n "${hash_of[runner]:-}" ]; then
   done
   for b in "${bin_names[@]}"; do
     [ -n "${bin_path[$b]:-}" ] || { echo "build-builtins: no binary built for worker-$b" >&2; exit 1; }
-    base=$(bin_base "$b")
-    # A name-scoped run may not have imported this bin's base image; skip.
-    [ -n "${hash_of[$base]:-}" ] || continue
     # rustc is orchestration over the cargo worker: curry in the published
-    # cargo curry (as a literal image ref) and the worker-common source tree
+    # cargo entry (as a literal image ref) and the worker-common source tree
     # its generated projects link against.
     extra=()
     if [ "$b" = rustc ]; then
@@ -248,7 +221,7 @@ if [ -n "${hash_of[runner]:-}" ]; then
     # the binary in the client repo (overwritten on every publish).
     install -m 755 "${bin_path[$b]}/bin/worker-$b" "$CLIENT/worker-$b"
     git -C "$CLIENT" add "worker-$b"
-    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--worker1:@=worker-$b" "${extra[@]}")
+    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[runner]}" -- "--worker1:@=worker-$b" "${extra[@]}")
     echo "$b: curry ${hash_of[$b]}" >&2
     names+=("$b")
   done

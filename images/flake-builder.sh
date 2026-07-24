@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin. One
-# self-contained image — nix + skopeo + jq + caos + the runner trampoline — and
-# one script that turns a flake dir into a runnable worker image, branching on a
-# curried-in --stage:
+# self-contained image — nix + skopeo + jq + caos — and one script that turns a
+# flake dir into a runnable image, branching on a curried-in --stage:
 #
 #   orchestrate (default): run-then the BUILD stage on the flake tree, then the
 #     STACK stage — a tail call the server resolves.
@@ -11,13 +10,16 @@
 #     flake tree alone (registry tag flake-<H>), so a caos change never rebuilds
 #     it (see design/flake-images.md).
 #   stack: emit a git-docker delta {base: docker://<clean>, config.json,
-#     layer00: /bin/caos setuid + /worker trampoline + /tmp + userdb}. The
-#     server converts that (one caos layer on a docker base) into a digest.
+#     layer00: the caos ADDITIONS — /bin/caos setuid, /tmp, the user db,
+#     /usr/bin/env}. The server converts that (one caos layer on a docker
+#     base) into a digest.
 #
-# A flake's #caosImage is a BASE (no /worker): the delta supplies the runner
-# trampoline, and a worker is curry(<flake image>, bin=<binary>) — the
-# runner-pool model. So the flake tree is pure (toolchain/deps only), keyed
-# without caos; only this cheap stack re-runs when caos changes.
+# THE CONTRACT: a flake defines everything about the image except the caos
+# additions. In particular /worker — the executable `caos runner` runs — comes
+# from the flake (or nowhere: an image without /worker isn't a worker image,
+# and running it fails plainly). caos never installs one. An interpreter-style
+# image (std/runner, std/bash) is just an image whose /worker reads the next
+# executable from the `worker1` arg and runs it.
 set -euo pipefail
 
 # skopeo (and nix) resolve $HOME; the worker runs as root in a minimal container
@@ -128,15 +130,8 @@ stack)
   # A scratch/bare flake base has no /bin merge, and runnerd forces
   # --entrypoint /bin/caos — so create the link explicitly.
   ln -s /usr/bin/caos "$l/bin/caos"
-  # The runner trampoline (baked into THIS image at /caos-trampoline): caos
-  # runner execs /worker, which reads the `bin` arg and execs it. This is what
-  # lets a flake #caosImage stay a pure base — the trampoline rides the caos
-  # delta, not the flake.
-  cp /caos-trampoline "$l/worker"
-  chmod 0755 "$l/worker"
-  # /usr/bin/env, for env-shebang worker scripts (images/bash-worker.sh runs
-  # as a curried bin on flake bases) — the flake base's own /bin/env is where
-  # coreutils puts it.
+  # /usr/bin/env, for env-shebang /worker scripts (std/bash's script runner) —
+  # the flake image's own /bin/env is where coreutils puts it.
   ln -s /bin/env "$l/usr/bin/env"
   # The world-writable /tmp the unprivileged worker scratches in (empty dir
   # stores as an empty tree; its 1777 mode rides in the sibling sidecar).

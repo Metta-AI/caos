@@ -1,7 +1,7 @@
 # The ONE cargo toolchain + workspace-deps bake (design/cargo-workers.md,
 # design/flake-images.md finding B), shared by its two consumers:
 #
-#   - std/cargo-base/flake.nix — the published std flake; `src` is its own
+#   - std/cargo/flake.nix — the published std flake; `src` is its own
 #     generated tree (manifests + stubs, no source; stage-tree.sh).
 #   - the root flake's cargoDepsImage — the test suite's D2 deps-only base;
 #     `src` is the cleaned workspace.
