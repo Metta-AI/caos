@@ -2361,7 +2361,9 @@ fn std_tree() -> Result<String, String> {
 /// ref), an `args` subtree (the bound args, in `build_arg_entries` shape), and a
 /// [`CURRY_MARKER`] blob. Currying flattens: if `<image>` is itself curried, its
 /// bindings are folded in and `base` stays a plain (docker/git) image, so the
-/// result is canonical (`curry (curry img a) b` == `curry img a b`).
+/// result is canonical (`curry (curry img a) b` == `curry img a b`) — and
+/// STRICT: rebinding an already-bound name is refused, not overridden (see
+/// [`curry_object`]).
 pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let image = resolve_run_image(t, &cas, image)?;
@@ -2397,8 +2399,22 @@ fn curry_object(
 
     let (image, bound) = unwrap_curry(t, image)?;
 
-    // New bindings override any already bound to the same name.
-    let args = merge_entries(bound, build_arg_entries(t, cas, kvs)?);
+    // REFUSE to rebind a name that's already bound: a colliding curry is
+    // almost always the reserved-name class of bug (a caller arg landing on
+    // `worker1`), and silent override turns it into a distant, cryptic
+    // failure. Call-time args still override curry bindings at run — only
+    // curry-over-curry is strict.
+    let new = build_arg_entries(t, cas, kvs)?;
+    for e in &new {
+        if bound.iter().any(|b| b.filename == e.filename) {
+            return Err(format!(
+                "curry: arg {:?} is already bound in {image}; rename one of them \
+                 (curry refuses to rebind — run-time args may still override)",
+                String::from_utf8_lossy(&e.filename)
+            ));
+        }
+    }
+    let args = merge_entries(bound, new);
     let args_tree = post_tree(t, args)?;
 
     let entries = vec![

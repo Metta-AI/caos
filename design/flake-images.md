@@ -1,218 +1,166 @@
-# Flakes as first-class images — design note
+# Images, workers, and flakes — the contract
 
-**Status:** SHIPPED (2026-07) — the mechanism, the cargo-base pilot, and the
-full std conversion (see "The rest of std follows"); the streamed
-flake-builder is the only nix-built worker image left. Decided in a design
-discussion (2026-07). Generalizes the
-phase-2 **flake-worker** from `runner-pool-and-cloud-builds.md` (written for the
-now-dead fly backend — read "in a worker" wherever it says "on fly") from a
-worker you invoke by hand into an **image form** that image resolution builds on
-demand. Pairs with `durable-resolution.md` for the build memo.
+**Status:** SHIPPED (2026-07). This note is the authority on what an image is,
+what a worker is, and how flakes become runnable — the vocabulary is
+deliberately docker's, with no new concepts beyond it.
 
-## Goal
+## The model
 
-Make any directory that contains **both `flake.nix` and `flake.lock`** runnable
-exactly like a git-docker image directory is today. You reference the flake tree
-where you'd reference an image; resolution converts it to a real image and runs
-it. No hand-invoked build step, no pre-published image.
+**caos runs docker images.** An image can be written down three ways:
 
-This is the same currency split as `runner-pool-and-cloud-builds.md`: git/CAS
-carries the *source* (the flake tree, tiny); the registry carries the *built OCI
-blob*; the two meet at a `docker://…@sha256` digest that caosd already runs and
-already stacks as `base =`. The flake form adds **no new concept to caosd's run
-path** — only a new branch in resolution that produces a digest.
+1. a **`docker://` ref** — used as-is;
+2. a **git-docker tree** — `{config.json, base?, layerNN/…}`, converted by the
+   server into a registry digest (`convert_git_image`);
+3. a **flake** — a git tree whose root holds `flake.nix` **and** `flake.lock`
+   (both required: an unlocked flake has no stable identity). Nix builds the
+   image; caos memoizes the build (below).
 
-## Resolution: a third image form
+**caos adds its layer to every image it builds from a flake**: the setuid
+`/bin/caos` client, the `worker` user (uid 1000), a writable `/tmp`, and
+`/usr/bin/env`. These are the *caos additions* — the things that either change
+with every caos build (the client) or can't ride a git tree (setuid).
 
-`resolve_image` (server `compute.rs`) today:
+**A flake defines everything about the image except the caos additions.**
+`/worker` — the executable `caos runner` execs — included. caos NEVER
+installs a `/worker`: an image whose definition has one is a **worker
+image**; an image without one is just an image (a base, an environment), and
+running it fails plainly.
 
-- `docker://ref` → used as-is;
-- hex hash (git tree) → `convert_git_image`.
+**An interpreter image** is a worker image whose `/worker` runs its argument
+— exactly `python:3` or `bash` on Docker Hub. The exec-chain argument names
+are the **workerN convention**: anything fetched and executed is `workerN`,
+where N is its depth from the image's `/worker`; data args keep domain names
+(`cmd`, `tree`, …). `std/runner`'s `/worker` fetches `worker1` and execs it
+(compiled workers); `std/bash`'s `/worker` runs `worker1` with bash
+(scripts). A curried interpreter at `worker1` would read `worker2`.
 
-Add, before `convert_git_image`, a test on the tree root:
+**A curry is an image ref plus saved args** — partial application, a tiny
+CAS tree `{base, args, .caos-curry}`, never an image build. Currying is
+STRICT: rebinding an already-bound name is refused (run-time args may still
+override — that remains the call-args-win rule). Most std workers are
+curries: `std/hello = curry(std/runner, worker1=worker-hello)` — one shared
+runner image, one warm pool, per-worker cost of one small blob.
 
-```
-tree has flake.nix AND flake.lock at root
-    → resolve_flake_image(tree)                     # builds it, returns a registry digest
-else
-    → convert_git_image(tree)                       # unchanged git-docker form
-```
+## Resolution: how a flake becomes a digest
 
-Both files are required. A flake dir without a lock is **rejected**, not built —
-determinism (a stable digest) is the whole premise, and an unlocked flake has none.
+`resolve_image` (server `compute.rs`): `docker://` passes through; a flake
+tree goes to `resolve_flake_image`; anything else hex is a git-docker tree.
 
-`resolve_flake_image` runs `std/flake-builder` over the flake tree (via the
-server's own `run_image` sub-run primitive), which returns a **git-docker delta
-tree** `{base: docker://<clean>, +caos}`; it then `convert_git_image`s that delta
-into a registry digest. Because `resolve_image` needs `std`/`salt`/`stack`/`trace`
-to launch the sub-run, those thread down from its one caller (`run_dispatch`).
+`resolve_flake_image` runs **`std/flake-builder`** over the flake tree (via
+the server's own `run_image` sub-run). One script, three curried stages
+(`images/flake-builder.sh`):
 
-**Implemented:** `crates/server/src/compute.rs` — `resolve_image` gains the flake
-branch, `is_flake_tree` (both-files probe), `resolve_flake_image` (run + convert),
-`std_image` (look up a name in the std tree).
+- **orchestrate** → `run-then` build, then stack.
+- **build**: check the registry for tag **`flake-<H>`** (`H` = the tree's
+  git hash — the durable, caos-independent memo); on a miss, `nix build
+  <tree>#caosImage` in-worker, stream the result to the registry, return
+  `{ref, config}` (config massaged: runner entrypoint forced, `:/bin`
+  appended to PATH).
+- **stack**: emit a git-docker delta `{base: docker://<ref>, config.json,
+  layer00: the caos additions}` — which the ordinary convert turns into the
+  final digest.
 
-## Bootstrap (catch 1): the seed builder is host-built
+Every step is memoized (registry tag, Redis request cache, convert cache):
+a repeated resolve is a lookup; a caos edit re-runs only the cheap stack.
 
-The **flake-builder** is itself an image, so "resolve a flake by running the
-flake-builder" looks circular. It isn't, because the builder is referenced by a
-**docker digest**, never by a flake:
+The build stage runs nix unsandboxed (a worker container can't nest the
+build sandbox — the flake's pinned lock carries reproducibility instead).
+Two consequences it handles: single-user mode (`--option build-users-group
+"" --option sandbox false`, `HOME=/tmp`), and builders that write `$HOME`
+(go builds) littering `/homeless-shelter`, which nix never cleans — the
+build retries, removing the litter, ONLY on that exact error (completed
+drvs stay in the store, so retries make monotonic progress).
 
-- The **seed** flake-builder is host-nix-built by `build-builtins.sh` and
-  **streamed straight to the registry** — its layer tarball is composed onto
-  the stock nixos/nix base with `docker build` (ADD extracts each layer as
-  root, preserving the setuid caos) and pushed; `std/flake-builder` is then a
-  tiny **curry node over the digest ref**, so none of its ~75 layers ever
-  enter git. The registry tag, keyed on the tarball's store path, memoizes
-  the compose.
-- Building a *nested* stack (caos-in-caos, the test stack) builds **that stack's**
-  flake-builder using the **host's** flake-builder. One level of self-hosting per
-  stack; the recursion terminates at the host.
+## std
 
-Invariant that keeps it bounded: **exactly one image — the flake-builder — is
-referenced by digest; every other image may be referenced by a flake dir.**
-Resolving a flake dispatches a run whose *image* is the flake-builder, which
-resolves to a digest (not a flake), so resolution never re-enters the flake
-branch for the builder.
+Publishing (`build-builtins.sh`, run by `caosd up`) has three entry forms:
 
-(Renamed from "nix-builder": it builds *images from flakes*, and nix is an
-implementation detail of how.)
+| form | entries | what ships |
+|---|---|---|
+| streamed | `flake-builder` | nix-built, composed onto stock `nixos/nix` with `docker build`, pushed; the entry is a curry over the digest ref — no layer bytes in git |
+| flake tree | `runner`, `cargo`, `bash`, `testenv` | a generated tree: the checked-in flake + a derived lock + whatever the build reads |
+| curry | `bash-tool`, `llm-step`, `rgrep`, `rustc`, `hello`, `file-count`, `dirs-only`, `deep-deps` | `curry(runner, worker1=<binary>)` |
 
-## Clean key (catch 2): two workers, inner clean, outer stacks caos
+The flake trees are **generated at publish** (`std/<name>/stage-tree.sh`)
+because a flake can only read its own tree, and resolution cannot strip a
+tree (only the flake knows which files its build reads). Each generator
+assembles exactly the build's inputs — and nothing else, so the tree's hash
+(= the image's cache key) never moves for irrelevant edits:
 
-The expensive nix build must be keyed **without `/caos`** so a caos edit never
-re-triggers it. This is the strip-caos trick in `caos-tools/lib/build-stage2.sh`
-(`rm usr/bin/caos; cp /bin/caos` — done there to keep the nixbuilder key stable),
-generalized into two workers:
+- **`runner`**: flake + lock + the `worker-runner` interpreter binary.
+- **`bash` / `testenv`**: flake + lock + `images/bash-worker.sh` as
+  `./worker` (one source of truth with the test suite's image jobs).
+  testenv adds git/redis/the docker client and the `CAOS_WORKER_UID=0`
+  grant — per-image containment policy for nested-stack jobs.
+- **`cargo`**: flake + lock + the workspace's manifests, `Cargo.lock`,
+  `rust-toolchain.toml`, empty stubs at each crate's real target paths
+  (cargo and crane's `mkDummySrc` detect autodiscovered targets by file
+  presence), and the `worker-cargo` binary. No source — a source edit never
+  re-keys the toolchain bake; a worker-cargo/worker_common edit does, and
+  pays one cold rebake.
 
-- **`std/flake-builder-inner`** — produces the **clean image** (no caos in the
-  *output*), though the worker image itself **does carry a setuid `/bin/caos`**
-  (it must, to run `caos hash`/`get`/`put`). A worker image on stock
-  `docker://nixos/nix` (via `import-image --base`, so nix + its store stay stock
-  registry layers). `nix build`s the flake's `#caosImage`, pushes it to the
-  registry, and returns the clean image as **`{ref, config}`** — the digest plus
-  the flake image's OCI config.
+Every `flake.lock` is **derived from the main flake.lock** at publish
+(`std/lib/derive-lock.sh`), so a std flake's pins structurally cannot drift
+from the root's — which keeps `std/cargo`'s rustc the exact compiler that
+builds caos (the caos-in-caos suite depends on that). `std/cargo`'s bake
+machinery lives in `std/cargo/bake.nix`, imported by BOTH that flake and the
+root flake (for `cargoDepsImage`, the suite's deps-only base) — one
+definition, no drift.
 
-  **The clean image is not rebuilt when the caos binary changes** — but not
-  because the inner is caos-free. A caos change re-keys the inner worker's
-  request, so it re-runs; the re-run is cheap because two **caos-independent**
-  caches short-circuit the expensive work: the **registry tag `flake-<H>`**
-  (`H = caos hash <flaketree>` — a git tree hash, identical no matter which caos
-  computes it) and the **nix store**. On a hit the inner skips the `nix build`
-  and the push and just returns the existing digest. So a caos edit costs one
-  inspect-and-return here; only the cheap stack-stage caos delta re-stacks.
+### rustc: the worker factory
 
-**Implemented as ONE self-contained builtin** (`std/flake-builder`,
-`images/flake-builder.sh`, image `workerFlakeBuilderImage` in `flake.nix`): a
-single script branching on a curried-in `--stage`:
+`std/rustc` compiles ONE worker's source and wraps it as a worker. It is
+pure orchestration — no toolchain in its image — published as
+`curry(runner, worker1=worker-rustc, cargo=<std/cargo's tree>,
+worker_common=<crates/worker-common>)`. The bound args are its linker
+inputs: it lays the user source out as a cargo project linking
+`worker_common`, `run-then`s the compile into the `cargo` ref, and its
+output is `curry(<caller-supplied runner ref>, worker1=<built binary>)` — a
+worker returning a worker. The wiring is invisible at the call site by
+design (callers pass only `--src` and `--runner`); this section is where
+it's written down.
 
-- **orchestrate** (default): `run-then` the **build** stage over the flake
-  tree, with the **stack** stage as the `then`.
-- **build**: the "inner" role above — `nix build` the flake's `#caosImage`,
-  stream it to the registry, return the clean image as `{ref, config}`.
-- **stack**: emit a git-docker delta `{base: docker://<clean>, config.json,
-  layer00: /bin/caos setuid 4755 (via a `.caosmeta` sidecar) + /bin/caos symlink
-  + **/worker runner trampoline** + /tmp + userdb}`. The server converts that
-  (cheap, one caos layer on a docker base) → **`digestWorker`**.
+## Bootstrap
 
-The trampoline in the delta is what lets a flake `#caosImage` be a **pure
-base** — no `/worker`, no caos, stable hash — and a worker be
-`curry(<flake image>, bin=<binary>)`, the runner-pool model.
-
-Why the inner returns `config` too: a real flake worker (e.g. rustc) keeps its
-toolchain at nix-store paths only its own OCI config names. Stage 2 must carry
-that config into the stacked image's `config.json` (convert uses **our**
-config.json, not the base's), forcing the runner entrypoint and appending `/bin`
-to PATH. The inner does that rewrite (it has the config + `jq`); the massaging is
-a pure function of the flake config and never perturbs the clean image or its tag.
-
-Consequence: a caos edit re-runs **only** the cheap outer stage 2; the inner's
-expensive build is a registry hit. The clean image is what you'd `base =` from
-other flakes; `digestWorker` is what you *run*.
-
-## Credentials
-
-The inner worker pushes to the local caos registry over HTTP (`skopeo
---insecure-policy --tls-verify=false`), so no creds today. When the registry
-needs auth, curry a token in as a bound arg (it rides the args tree = CAS);
-long-lived is fine for now (single-tenant), narrow to a short-lived
-registry-scoped token later, per `runner-pool-and-cloud-builds.md`.
-
-## Build memo
-
-No separate flake memo is needed: the inner's `nix build` is skipped by the
-**registry tag** `flake-<treehash>` (durable, self-healing across restarts), the
-outer run is single-flighted + Redis-cached by the compute machinery (keyed on
-the request, which includes the builder image), and the `convert_git_image` of
-the delta is cached on the delta-tree hash. A repeated resolve is a lookup; a caos
-edit re-keys only the cheap outer run (inner still hits the registry tag). Under
-`durable-resolution.md` the outer run is just a pending node, single-flighted by a
-Redis lease.
-
-## std entries as flakes: cargo-base (finding B)
-
-The end-state is **most std entries are git trees containing flakes**, built by
-the flake-builder and streamed to the registry — ideally one built-in (the
-flake-builder) and everything else defined as a flake. `std/cargo-base` is the
-pilot, because it was the heaviest git-imported image (toolchain + baked deps):
-
-- **`std/cargo-base/flake.nix`** (checked in) replicates the main flake's
-  cargo machinery — toolchain from the workspace's `rust-toolchain.toml`
-  (`minimal` + musl target), crane vendor + `buildDepsOnly` (musl, dev),
-  musl cross cc — as a `#caosImage` that carries `/ws-root`, `/target-dir`
-  and the inflated writable `target/`, the same worker Env as before, and
-  **no `/worker`, no caos** (the builder's delta supplies those).
-- **The published tree is GENERATED at publish** (`std/cargo-base/stage-tree.sh`,
-  run by `build-builtins.sh`): the flake + the workspace's
-  `rust-toolchain.toml`, `Cargo.toml`/`Cargo.lock` and member manifests, plus
-  **empty stubs at each crate's real target paths** (cargo only sees
-  autodiscovered targets whose files exist; crane's `mkDummySrc` detects them
-  the same way and overwrites the contents). No source — so a source edit
-  never re-keys the tree and the registry memo `flake-<H>` holds.
-- **The flake.lock is DERIVED from the main flake.lock** in `stage-tree.sh`
-  (jq: same nixpkgs/rust-overlay/crane nodes, a root naming just those).
-  This is the toolchain-pin coupling: the cargo worker must compile with the
-  exact rustc that builds caos (the caos-in-caos suite), and deriving the lock
-  makes drift structurally impossible.
-- `std/cargo` stays `curry(std/cargo-base, bin=worker-cargo)` — curries peel
-  before image resolution on both the client and `run_image` paths, so the
-  flake branch sees the bare tree with no new server code.
-- The old `cargoBaseImage` git-import is gone (`flake.nix`,
-  `builtinWorkerImages`, `build-builtins.sh`). The deps-bake machinery stays
-  in the main flake for `cargoDepsImage`, the test suite's D2 deps-only base.
-
-## The rest of std follows
-
-With cargo-base proven, the remaining std entries converted to the same
-shapes (`build-builtins.sh` header lists the entry forms):
-
-- **`std/bash-base`, `std/testenv-base`** — flake trees (checked-in
-  `flake.nix` + a lock derived from the main lock by `std/lib/derive-lock.sh`;
-  fully static, so their stage-tree.sh is two lines). `std/bash` and
-  `std/testenv` are `curry(<name>-base, bin=images/bash-worker.sh)` — the
-  script runner is just a bin like any other. The caos delta gained a
-  `/usr/bin/env` symlink so env-shebang script bins run on bare nix bases.
-- **`hello`, `file-count`, `dirs-only`, `deep-deps`** — no images at all
-  anymore: `curry(runner, bin=worker-<name>)`, the same runner-pool move the
-  agent-harness bins always used. Self-recursion through map-then works
-  under a curry (the bound `bin` rides the args tree into every child).
-- **`std/runner`** — a flake tree too: a pinned-nixpkgs userland (bash +
-  coreutils + grep/sed/find/tar/gzip — the agent-visible environment for
-  bash-tool), replacing the old thin delta on stock debian. The old `base`
-  entry (debian + caos, pre-runner-pool) had no consumers and is deleted.
-- So the **streamed `flake-builder` is the ONLY nix-built worker image**;
-  its stock base (nixos/nix) rides as registry layers via the docker-build
-  compose. Everything a client reaches through std is a flake tree or a
-  curry over one.
+The flake-builder is the one image that can't be a flake (it's what builds
+flakes). It's host-nix-built as a thin layer set over stock `nixos/nix`
+(pinned by digest in `images/nix-base.ref`) and **streamed**: composed with
+`docker build` (ADD extracts each layer as root, preserving the setuid
+caos), pushed, memoized on the tarball's store path. Exactly one image is
+referenced by digest; everything else may be a flake — so resolution never
+re-enters the flake branch for the builder, and the recursion is grounded.
 
 ## Open items
 
-- Registry GC of built images — same concern as today's worker images
-  (`runner-pool-and-cloud-builds.md`).
-- Where `dispatch_build` waits: inline blocking today (fine for the prototype),
-  the durable pending-node model later.
-- Flake detection is a tree-root probe; confirm it composes with `--base` /
-  currying inputs that also carry a tree (the flake test is on the *image* input's
-  root only).
-- Substituter reachability from the inner worker (cache.nixos.org or a private
-  substituter); consistent with `worker-network-stance` (pin via lock, network
-  allowed for pinned deps).
+- Registry GC of built images.
+- The nested test stack builds its own runner/bash/cargo images from the
+  tree under test (delta-over-pinned-debian, `caos-tools/lib/`) — a second
+  image pipeline, and a userland (debian) that production std no longer
+  uses. Unify onto the flake path when std-as-transformation lands.
+- Boundary caching for two-level images (a cheap worker layer over an
+  expensive base, both flake-defined) — today `std/cargo` accepts a full
+  rebake when its `/worker` changes.
+- Registry credentials: local HTTP today; curry a token as a bound arg when
+  auth arrives.
+
+## Appendix: how it got here (history, kept for archaeology)
+
+- Mechanism + `resolve_flake_image` seam, the cargo-base pilot ("finding
+  B"), the one-bake refactor, streaming the flake-builder, and the std
+  conversion landed as separate commits on `flake-images` — see `git log`.
+- The delta originally installed a "runner trampoline" at `/worker` into
+  every flake image, and flakes were "pure bases" that couldn't define
+  their worker. That inverted the docker-native contract and scattered the
+  runner's identity across three homes; it was replaced by
+  always-self-defining worker images (this note's contract). The `bin` and
+  `script` args became `worker1` at the same time, after a real collision
+  bug (a caller's `--bin` silently replacing the script runner) motivated
+  both the workerN convention and strict currying.
+- Operational gotchas that cost real debugging, preserved: value args are
+  lazy placeholders (`caos get` before reading); the clean-image ref the
+  build stage returns must be the ON-NET registry name
+  (`caos-registry:5000`), while curries over streamed digests use the
+  host-facing `localhost:5000` (runnerd pulls via the host daemon);
+  `fetch_base` needs `--src-tls-verify=false` for the HTTP registry; new
+  std files must be git-added before `caosd up` sees them (`${self}` is the
+  tracked tree only).

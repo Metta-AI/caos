@@ -6,14 +6,17 @@
 //! manifest — and tail-calls the cargo worker (`--cargo`, typically the
 //! std/cargo curry) to compile it musl-static in release. The `finish`
 //! continuation takes the built binary and emits at `/cas/out` a ready-to-run
-//! worker: `curry(runner, bin=<the binary>)` — the shared, warm-pooled runner
+//! worker: `curry(runner, worker1=<the binary>)` — the shared, warm-pooled runner
 //! bound to this binary, so the worker needs no image of its own. Static musl
 //! means the binary runs on any base (the glibc runner today, scratch
 //! eventually).
 //!
 //! So building a worker is itself a worker — memoized end to end: this run on
-//! `(src, runner, cargo, worker_common)`, the inner compile on the project
-//! tree. rustc itself runs as `curry(runner, bin=worker-rustc)` in the shared
+//! `(src, runner, cargo, worker_common)` — the bound `cargo` and `worker_common`
+//! are its LINKER INPUTS, wired in at publish (build-builtins.sh; see
+//! design/flake-images.md "rustc: the worker factory") — the inner compile on
+//! the project tree. rustc itself runs as
+//! `curry(runner, worker1=worker-rustc)` in the shared
 //! pool; the old rust:1-bookworm rustc image is retired. User source may use
 //! `std` + `worker_common` only — no crates.io deps.
 //!

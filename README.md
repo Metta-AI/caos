@@ -37,9 +37,9 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
-| `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | — (run as `curry(runner, bin)`) | Example/built-in workers. See [workers](#workers). |
-| `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, bin)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
-| `worker-cargo` | — (run as `curry(cargo-base, bin)`) | Whole-workspace `cargo check/build/test` atop `std/cargo-base` (pinned toolchain + pre-compiled deps — a flake tree the flake-builder images on first use, see `std/cargo-base/` and `design/flake-images.md`) — the agent's `build`/`test` tools. See `design/cargo-workers.md`. |
+| `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | — (run as `curry(runner, worker1)`) | Example/built-in workers. See [workers](#workers). |
+| `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, worker1)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
+| `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (one flake tree: pinned toolchain + pre-compiled deps + this binary as `/worker`, imaged on first use — see `std/cargo/` and `design/flake-images.md`) — the agent's `build`/`test` tools. See `design/cargo-workers.md`. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
 
 ## Prerequisites
@@ -104,9 +104,10 @@ nix run .#load-caos-runnerd
 ```
 
 Only ONE worker image remains nix-built here: the `flake-builder`. Every std
-worker is a `curry(<base>, bin)` over a flake-built base (`std/runner`,
-`std/*-base/` — built on demand by the flake-builder, see
-`design/flake-images.md`). The `caos-server` image is not minimal: it bundles
+worker is a flake-built worker image (`std/runner`, `std/cargo`, `std/bash`,
+`std/testenv` — complete flakes in `std/`, imaged on demand by the
+flake-builder) or a `curry(std/runner, worker1=<binary>)` over the runner —
+see `design/flake-images.md`. The `caos-server` image is not minimal: it bundles
 the `docker` client, `git`, and `tar`, and expects the host's docker socket.
 
 > Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
@@ -474,11 +475,13 @@ files.
 
 ## Workers
 
-A worker is a `curry(<base image>, bin=<binary>)`: the base's `/worker`
-trampoline (stacked in by the flake-builder's caos delta) stages the curried
-`bin` and execs it; the binary reads `/cas/args` and writes `/cas/out`. The
-Rust workers share `worker-common` (arg helpers, `caos`/`map_then`/`caos
-curry` wrappers, result staging).
+A worker image is an image whose definition includes `/worker` — the
+executable `caos runner` execs. An *interpreter* image's `/worker` runs its
+argument (the `worker1` arg — like `python:3` runs a script), which is how
+the compiled workers below ride one shared image: each is
+`curry(std/runner, worker1=<binary>)`, and the binary reads `/cas/args` and
+writes `/cas/out`. The Rust workers share `worker-common` (arg helpers,
+`caos`/`map_then`/`caos curry` wrappers, result staging).
 
 - **`worker-hello`** — a leaf example: gathers its `/cas/args` entries into a
   result tree.
@@ -499,7 +502,7 @@ curry` wrappers, result staging).
   pure orchestration over the cargo worker: it lays out a project (the source
   plus the curried-in `worker-common` tree), tail-calls the cargo worker to
   compile it static-musl, and curries the binary into the runner —
-  `curry(runner, bin=<binary>)`. So building a worker is itself a (memoized)
+  `curry(runner, worker1=<binary>)`. So building a worker is itself a (memoized)
   worker, and no toolchain image is dedicated to it.
 
 ### Built-ins (`/cas/std`)
