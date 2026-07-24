@@ -1,6 +1,11 @@
 use std::io::{self, IsTerminal};
 use std::time::Duration;
 
+use caos::chat::{
+    list_user_conversations, publish_unindexed_conversations, unarchive_user_conversation,
+    UserConversationStatus,
+};
+use caos::GitTransport;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, MouseEventKind,
@@ -88,6 +93,21 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let args = Args::parse(raw)?;
+    if args.list_archived || args.unarchive.is_some() {
+        let transport = GitTransport::from_cwd()?;
+        publish_unindexed_conversations(&transport, &args.user)?;
+        if args.list_archived {
+            for conversation in
+                list_user_conversations(&transport, &args.user, UserConversationStatus::Archived)?
+            {
+                println!("{}\t{}", conversation.id, conversation.title);
+            }
+        } else if let Some(id) = &args.unarchive {
+            unarchive_user_conversation(&transport, &args.user, id)?;
+            println!("unarchived {id}");
+        }
+        return Ok(());
+    }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("requires an interactive terminal; use `caos talk` for pipes".to_string());
     }

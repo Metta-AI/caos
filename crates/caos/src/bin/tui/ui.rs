@@ -72,7 +72,7 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         .count();
     let header = Line::from(vec![
         Span::styled(" caos ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(format!("  {}  ", state.name)),
+        Span::raw(format!("  {}  ", state.title)),
         Span::styled(operation, Style::default().fg(Color::Yellow)),
         Span::raw(format!("  [{view}]")),
         Span::raw("  "),
@@ -117,8 +117,11 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .unwrap_or("new");
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::raw(state.name.clone()),
-                Span::styled(format!("  {hash}"), Style::default().fg(Color::DarkGray)),
+                Span::raw(state.title.clone()),
+                Span::styled(
+                    format!("  {}  {hash}", short_hash(&state.id)),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]))
         })
         .collect();

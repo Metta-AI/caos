@@ -257,8 +257,14 @@ Two verbs and a full-screen client over one turn engine (implemented —
   one-turn form (message from `-m` or stdin).
 - **`caos tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
   own crate. It consumes structured `TurnEvent`s from the same engine,
-  reconstructs durable history from conversation refs, and presents independent
-  virtual conversations in a left sidebar. Every conversation retains its own
+  reconstructs durable history from server-indexed conversation refs, and
+  presents independent virtual conversations in a left sidebar. A stable
+  conversation ID addresses `refs/caos/conversations/<id>/head`; its mutable
+  title lives at the sibling `title` ref. Per-user active and archived membership
+  lives under `refs/caos/users/<user>/conversations/{active,archived}/`, with
+  `--user` defaulting to `$USER`. `Ctrl+W` atomically archives for that user
+  without changing HEAD or another user's state; `--list-archived` and
+  `--unarchive` recover old conversations. Every conversation retains its own
   transcript, prompt, activity, diff, and running worker thread, so turns can
   advance concurrently while the user switches between them. Live status and
   tool activity sit in a collapsible strip above the multiline prompt; each
