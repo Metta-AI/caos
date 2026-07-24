@@ -559,6 +559,62 @@
           fakeRootCommands = installWorkerFiles;
         };
 
+        # The INNER flake-builder (design/flake-images.md): a worker that
+        # `nix build`s a user flake's `#caosImage` output and streams the result
+        # to the registry, returning the CLEAN image (no caos in it) as
+        # {ref, config} — the clean digest plus the flake image's OCI config,
+        # which the OUTER worker needs to preserve the flake's PATH/Env when it
+        # stacks the caos runner layer. A thin delta on stock
+        # `docker://nixos/nix` (import-image --base in build-builtins.sh — so nix
+        # + its store ride as stock registry layers, never through git). We bake
+        # only what the bare nix base lacks: the runner script (/worker), skopeo
+        # (the push/inspect tool — a general flake makes no `#skopeo` promise),
+        # jq (to massage the returned config), and bash/coreutils/gzip. nix
+        # itself comes from the base's profile (see PATH below).
+        workerFlakeBuilderScript = pkgs.writeTextFile {
+          name = "caos-worker-flake-builder-inner-script";
+          executable = true;
+          destination = "/worker";
+          text = builtins.readFile ./images/flake-builder-inner.sh;
+        };
+        workerFlakeBuilderRoot = pkgs.buildEnv {
+          name = "caos-worker-flake-builder-inner-root";
+          paths = [
+            workerFlakeBuilderScript
+            linuxPkgs.bashInteractive
+            linuxPkgs.coreutils
+            linuxPkgs.gzip
+            linuxPkgs.skopeo
+            linuxPkgs.jq
+          ];
+        };
+        workerFlakeBuilderImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-flake-builder-inner";
+          tag = "latest";
+          contents = [
+            workerFlakeBuilderRoot
+            workerBaseRoot
+          ];
+          config = {
+            Entrypoint = [
+              "/bin/caos"
+              "runner"
+            ];
+            Env = [
+              # nix from the nixos/nix base's profile; caos, skopeo, bash,
+              # coreutils, gzip from our baked /bin. The git-docker convert
+              # builds this image's config from our own config.json (it does not
+              # merge the base's env), so the nix profile paths must be explicit.
+              "PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/bin"
+              # Root: the base's nix store is root-owned (the same per-image
+              # containment grant the test nixbuilder and testenv carry).
+              "CAOS_WORKER_UID=0"
+              "CAOS_WORKER_GID=0"
+            ];
+          };
+          fakeRootCommands = installWorkerFiles;
+        };
+
         # The cargo toolchain BASE image (design/cargo-workers.md, phases 0–1):
         # the pinned toolchain + the workspace's deps pre-compiled, with the
         # runner trampoline at /worker. The cargo worker itself is published as
@@ -911,7 +967,7 @@
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
         # These let another tree (one that has caos as a flake input) get the
         # user-facing CLI on its PATH, bring the dev stack up, and publish the
-        # builtin worker library — without the caos source tree or `tilt`.
+        # builtin worker library — without the caos source tree.
 
         # Just the user-facing CLI (a consumer wants only `caos-cli`, not the
         # worker-side `caos`, in its devShell) — and it runs on the *host*. On
@@ -1008,7 +1064,7 @@
         };
 
         # The dev stack as docker compose: redis + registry + the caos server +
-        # runnerd, mirroring the Tiltfile's wiring. The network and container
+        # runnerd, brought up by `caosd up`. The network and container
         # names are *pinned* (not compose's project-prefixed defaults) so the
         # worker containers runnerd spawns over the docker socket — which it
         # attaches to CAOS_DOCKER_NETWORK by this literal name — land on
@@ -1099,6 +1155,9 @@
           workerRunnerImage
           cargoBaseImage
           workerTestenvImage
+          # The inner flake-builder (design/flake-images.md); the outer is
+          # published as a curry over std/bash, so it needs no image here.
+          workerFlakeBuilderImage
         ];
 
         # The agent-harness worker binaries build-builtins.sh publishes as
@@ -1305,6 +1364,7 @@
           # ref would float with the global registry).
           skopeo = linuxPkgs.skopeo;
           caos-worker-testenv-docker = workerTestenvImage;
+          caos-worker-flake-builder-inner-docker = workerFlakeBuilderImage;
         };
 
         apps = {
@@ -1394,8 +1454,6 @@
             # was checked out. The pinned workflow is explicit instead: run
             # `nix build` to produce ./result/bin/caosd (baked to this checkout),
             # then `./result/bin/caosd up`. The stack only moves when you rebuild.
-            # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
-            pkgs.tilt
             # `fly` CLI: auth (`fly auth token`), org/region lookup, and operating
             # the fly backend (apps, machines, logs). caosd itself talks to the
             # Machines API + registry over HTTP and does not need this.

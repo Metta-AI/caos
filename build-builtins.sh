@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv)
+[ ${#names[@]} -eq 0 ] && names=(base bash file-count dirs-only hello deep-deps runner cargo-base testenv flake-builder-inner)
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
 # runs us from a store copy with no `nix` at runtime), else built from the flake.
@@ -51,6 +51,10 @@ image_attr() { echo "caos-worker-$1-docker"; } # std name -> nix docker image at
 import_base() { # std name -> docker:// base ref, or empty for self-contained
   case "$1" in
     base | runner) echo "docker://debian:stable-slim" ;;
+    # The inner flake-builder rides on stock nixos/nix (pinned by digest in
+    # images/nix-base.ref) — so nix and its store stay stock registry layers,
+    # never git objects. See design/flake-images.md.
+    flake-builder-inner) echo "docker://$(cat "$PROJECT/images/nix-base.ref")" ;;
     *) echo "" ;;
   esac
 }
@@ -173,10 +177,15 @@ if [ -n "${hash_of[runner]:-}" ]; then
     fi
   fi
   declare -A bin_path
+  # Map each worker binary to the store path that CONTAINS it (bin/worker-<b>),
+  # not by matching the path's name: the workspace builds as one derivation
+  # (caos-workspace), so every worker binary shares a single store path — a
+  # name match on "-worker-<b>" would never hit. Existence of bin/worker-<b>
+  # is the honest test and works whether bins are one path or many.
   # shellcheck disable=SC2086
   for p in $bin_paths; do
     for b in "${bin_names[@]}"; do
-      case "$p" in *-worker-"$b"*) bin_path[$b]=$p ;; esac
+      [ -x "$p/bin/worker-$b" ] && bin_path[$b]=$p
     done
   done
   for b in "${bin_names[@]}"; do
@@ -206,6 +215,20 @@ if [ -n "${hash_of[runner]:-}" ]; then
     echo "$b: curry ${hash_of[$b]}" >&2
     names+=("$b")
   done
+fi
+
+# The flake-builder OUTER worker (design/flake-images.md): a two-stage bash
+# orchestration curried onto std/bash — stage 1 runs std/flake-builder-inner on
+# the flake tree, stage 2 stacks the caos runner layer on the clean image. It
+# reaches the inner via /cas/std at run time, so it curries in only its script.
+# Published as std/flake-builder. Needs the bash base and the inner image.
+if [ -n "${hash_of[bash]:-}" ] && [ -n "${hash_of[flake-builder-inner]:-}" ]; then
+  install -m 755 "$PROJECT/images/flake-builder-outer.sh" "$CLIENT/flake-builder-outer.sh"
+  git -C "$CLIENT" add flake-builder-outer.sh
+  hash_of[flake-builder]=$(cd "$CLIENT" && "$caos" curry "${hash_of[bash]}" -- \
+    "--script:@=flake-builder-outer.sh")
+  echo "flake-builder: curry ${hash_of[flake-builder]}" >&2
+  names+=("flake-builder")
 fi
 
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so

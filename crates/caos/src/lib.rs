@@ -2281,10 +2281,21 @@ fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// the same path directly against the published library, so one vocabulary works
 /// in both places.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    match image.strip_prefix(&std_arg_prefix()) {
-        Some(name) => resolve_std_image(t, name),
-        None => Ok(image.to_string()),
+    if let Some(name) = image.strip_prefix(&std_arg_prefix()) {
+        return resolve_std_image(t, name);
     }
+    // A directory is an image tree to ingest — notably a flake dir (flake.nix +
+    // flake.lock), which the server builds into a real image via the
+    // flake-builder (design/flake-images.md). Ingest it exactly like a
+    // `--name:@=path` arg (git-tracked paths only) and hand the server its tree
+    // hash; the server decides whether it's a flake or a git-docker image.
+    if Path::new(image).is_dir() {
+        let (_, oid) = t
+            .ingest_path(image)?
+            .ok_or_else(|| format!("this transport cannot ingest the image dir {image}"))?;
+        return Ok(oid.to_string());
+    }
+    Ok(image.to_string())
 }
 
 /// The path prefix that names a builtin off-worker (`/cas/std/`).

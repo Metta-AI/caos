@@ -282,7 +282,7 @@ fn run_dispatch(
     // server thread until a runner posts the result; capacity is runner-side
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
-        let image_ref = resolve_image(config, image).map_err(fail)?;
+        let image_ref = resolve_image(config, image, std, salt, &child_stack, trace_id).map_err(fail)?;
         // Reuse the args tree the tracer already read, else read it now.
         let arg_entries = match traced_arg_entries {
             Some(entries) => entries,
@@ -820,7 +820,14 @@ fn pin_result(config: &Config, req: &str, result: &str) {
 /// `docker://<ref>` is an ordinary docker reference, used as-is. Anything else is
 /// one of our git images (the default): convert it to a real image, push it to
 /// the registry, and return a digest reference into the registry.
-fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
+fn resolve_image(
+    config: &Config,
+    image: &str,
+    std: &str,
+    salt: &str,
+    stack: &[String],
+    trace_id: Option<&str>,
+) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         if reference.is_empty() || reference.starts_with('-') {
             return Err(HttpError::new(
@@ -844,8 +851,72 @@ fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
     if std::env::var("CAOS_IMAGE_RESOLVE").as_deref() == Ok("none") {
         return Ok(image.to_string());
     }
+    // A tree whose root holds both `flake.nix` and `flake.lock` is a flake image
+    // (design/flake-images.md): it is built into a real image by the flake-builder
+    // worker. The lock is required — an unlocked flake has no stable digest.
+    // Everything else is a git-docker image tree.
+    if is_flake_tree(config, image)
+        .map_err(|e| HttpError::new(500, format!("probing flake image {image}: {e}")))?
+    {
+        return resolve_flake_image(config, image, std, salt, stack, trace_id);
+    }
     convert_git_image(config, image)
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
+}
+
+/// True if `tree_hash`'s root has both `flake.nix` and `flake.lock`.
+fn is_flake_tree(config: &Config, tree_hash: &str) -> Result<bool, String> {
+    let entries = fetch_tree(config, tree_hash)?;
+    let has = |name: &str| entries.iter().any(|e| e.name == name);
+    Ok(has("flake.nix") && has("flake.lock"))
+}
+
+/// Resolve a flake image tree to a runnable registry digest by building it in the
+/// flake-builder worker (design/flake-images.md).
+///
+/// Runs `std/flake-builder` over the flake tree: it `nix build`s the flake's
+/// `#caosImage` in the INNER worker (clean, no caos — streamed to the registry,
+/// keyed on the flake tree alone), then stacks the caos runner layer, returning a
+/// git-docker delta tree `{base: docker://<clean>, +caos}`. We convert that delta
+/// — cheap: one caos layer on a docker base — to a registry digest. Because the
+/// expensive nix build is keyed purely on the flake, a caos change re-runs only
+/// this cheap stack+convert; a warm build is a registry hit inside the inner.
+///
+/// The run itself is single-flighted and Redis-cached by the compute machinery
+/// (keyed on the request, which includes the builder image), and the convert is
+/// cached on the delta tree — so a repeated resolve is a lookup.
+fn resolve_flake_image(
+    config: &Config,
+    flake_tree: &str,
+    std: &str,
+    salt: &str,
+    stack: &[String],
+    trace_id: Option<&str>,
+) -> Result<String, HttpError> {
+    let builder = std_image(config, std, "flake-builder")?;
+    let oid = gix::ObjectId::from_hex(flake_tree.as_bytes())
+        .map_err(|e| HttpError::new(400, format!("invalid flake tree hash {flake_tree}: {e}")))?;
+    let in_entry = named_entry("in", gix::objs::tree::EntryKind::Tree.into(), oid);
+    // "<type> <hash>": the git-docker delta tree the outer worker produced.
+    let result = run_image(config, &builder, vec![in_entry], std, salt, stack, trace_id)?;
+    let delta_tree = result.split_once(' ').map(|(_, h)| h).unwrap_or(&result);
+    convert_git_image(config, delta_tree).map_err(|e| {
+        HttpError::new(
+            500,
+            format!("converting built flake image {flake_tree} (delta {delta_tree}): {e}"),
+        )
+    })
+}
+
+/// Look up a named image in the `std` library tree (`refs/caos/std`), returning
+/// its object hash.
+fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
+    fetch_tree(config, std)
+        .map_err(|e| HttpError::new(500, format!("reading std {std}: {e}")))?
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.oid.to_string())
+        .ok_or_else(|| HttpError::new(500, format!("std library has no {name:?}")))
 }
 
 /// Convert the git-docker image tree `git_hash` to a real image and push it to
@@ -975,6 +1046,7 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
                 "copy",
                 "--format",
                 "oci",
+                "--src-tls-verify=false",
                 "--dest-tls-verify=false",
                 "--override-os",
                 "linux",
@@ -1462,5 +1534,56 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod flake_detection_tests {
+    use super::*;
+    use gix::objs::tree::EntryKind;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A throwaway bare repo wrapped in a minimal `Config`. Only `repo` is
+    /// exercised by the flake probe; the rest are inert placeholders.
+    fn temp_config() -> (Config, std::path::PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("caos-flake-test-{}-{n}", std::process::id()));
+        let repo = gix::init_bare(&dir).unwrap().into_sync();
+        let config = Config {
+            registry_push_url: String::new(),
+            registry_pull_host: String::new(),
+            redis_addr: String::new(),
+            git_dir: dir.to_string_lossy().into_owned(),
+            repo,
+            trace: crate::trace::Hub::default(),
+        };
+        (config, dir)
+    }
+
+    /// Store a tree whose root holds `names` (each a blob) and return its hash.
+    fn tree_of(config: &Config, names: &[&str]) -> String {
+        let blob = store_git_blob(config, b"contents").unwrap();
+        let entries = names
+            .iter()
+            .map(|n| named_entry(n, EntryKind::Blob.into(), blob))
+            .collect();
+        store_git_tree(config, entries).unwrap().to_string()
+    }
+
+    #[test]
+    fn flake_image_needs_both_flake_files() {
+        let (config, dir) = temp_config();
+        // Both files present -> a flake image.
+        let flake = tree_of(&config, &["flake.lock", "flake.nix", "src"]);
+        assert!(is_flake_tree(&config, &flake).unwrap());
+        // The lock is required: flake.nix alone is not a flake image.
+        let unlocked = tree_of(&config, &["flake.nix", "src"]);
+        assert!(!is_flake_tree(&config, &unlocked).unwrap());
+        // A git-docker image tree (config.json + layer<NN>) is not a flake image.
+        let image = tree_of(&config, &["config.json", "layer00"]);
+        assert!(!is_flake_tree(&config, &image).unwrap());
+        std::fs::remove_dir_all(dir).ok();
     }
 }
