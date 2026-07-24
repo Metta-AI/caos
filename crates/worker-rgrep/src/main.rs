@@ -103,12 +103,12 @@ fn run() -> Result<(), String> {
     // children, the local matches for `then` (combine is pure linking, no
     // pattern). Content-addressed, hence identical objects at every level.
     let me = own_image();
-    let bin = arg("bin");
+    let bin = arg("worker1");
     let mut map_kvs: Vec<(&str, Arg)> = vec![("pattern", Arg::Lit(&pattern))];
     let mut then_kvs: Vec<(&str, Arg)> = vec![("own", Arg::Path(own_cas))];
     if Path::new(&bin).exists() {
-        map_kvs.push(("bin", Arg::Path(&bin)));
-        then_kvs.push(("bin", Arg::Path(&bin)));
+        map_kvs.push(("worker1", Arg::Path(&bin)));
+        then_kvs.push(("worker1", Arg::Path(&bin)));
     }
     let map = caos_curry(&me, &map_kvs)?;
     let then = caos_curry(&me, &then_kvs)?;

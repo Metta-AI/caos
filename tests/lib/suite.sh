@@ -30,7 +30,7 @@ done
 caos put /tmp/build-ws /cas/build-ws
 
 build=$(caos curry /cas/std/bash -- \
-  "--script:@=/cas/args/workspace/caos-tools/build.sh")
+  "--worker1:@=/cas/args/workspace/caos-tools/build.sh")
 
 fwd=(
   "--build_ws:@=/cas/build-ws"
@@ -39,5 +39,5 @@ fwd=(
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
 [ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
 
-stage3=$(caos curry /cas/std/bash -- "--script:@=$LIB/suite-stage3.sh" "${fwd[@]}")
+stage3=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/suite-stage3.sh" "${fwd[@]}")
 caos run-then /cas/args/workspace -- --run="$build" --then="$stage3"

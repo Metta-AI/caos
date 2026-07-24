@@ -5,5 +5,5 @@
 # the same --in. The sub-request is byte-identical to the in-flight one, so the
 # server's run-cycle detection must fail the run.
 set -euo pipefail
-me=$(caos curry /cas/args/image -- --script:@=/cas/args/script)
+me=$(caos curry /cas/args/image -- --worker1:@=/cas/args/worker1)
 caos run-then /cas/args/in -- --run="$me"

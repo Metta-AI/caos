@@ -78,7 +78,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
             return Err(format!("clearing {out}: {e}"));
         }
     }
-    let mut all: Vec<String> = vec![format!("--script:@={script}"), "--in:@=.".to_string()];
+    let mut all: Vec<String> = vec![format!("--worker1:@={script}"), "--in:@=.".to_string()];
     all.extend(kvs.iter().cloned());
     cli_run(t, "/cas/std/bash", Some(&out), None, &all)?;
     eprintln!("1126 {name}: result checked out at {out}");

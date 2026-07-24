@@ -56,9 +56,9 @@ fn run() -> Result<(), String> {
 /// A no-op when there's no `bin` (a baked image already carries `/worker`).
 fn recur_image() -> Result<String, String> {
     let me = own_image();
-    let bin = arg("bin");
+    let bin = arg("worker1");
     if Path::new(&bin).exists() {
-        caos_curry(&me, &[("bin", Arg::Path(&bin))])
+        caos_curry(&me, &[("worker1", Arg::Path(&bin))])
     } else {
         Ok(me)
     }

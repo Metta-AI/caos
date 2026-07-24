@@ -42,6 +42,6 @@ caos put /tmp/bw /cas/bw
 # debug_assert!/overflow checks live in the produced bins and test binaries.
 cargo=$(caos curry /cas/std/cargo -- --cmd=build --mode=all \
   "--target=$(uname -m)-unknown-linux-musl")
-stage2=$(caos curry /cas/std/bash -- "--script:@=$LIB/build-stage2.sh" \
+stage2=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/build-stage2.sh" \
   "--workspace:@=/cas/args/in")
 caos run-then /cas/bw -- --run="$cargo" --then="$stage2"

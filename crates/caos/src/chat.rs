@@ -709,7 +709,7 @@ fn turn(
     let bash_image = match &bash_bin {
         Some(bin) => {
             let runner = runner.as_deref().expect("resolved when a bin is given");
-            let img = curry_object(t, runner, None, &[format!("--bin:@={bin}")])?.to_string();
+            let img = curry_object(t, runner, None, &[format!("--worker1:@={bin}")])?.to_string();
             t.ensure_pushed(&img)?;
             t.ensure_pushed(runner)?;
             img
@@ -720,7 +720,7 @@ fn turn(
     let grep_image = match &rgrep_bin {
         Some(bin) => {
             let runner = runner.as_deref().expect("resolved when a bin is given");
-            let img = curry_object(t, runner, None, &[format!("--bin:@={bin}")])?.to_string();
+            let img = curry_object(t, runner, None, &[format!("--worker1:@={bin}")])?.to_string();
             t.ensure_pushed(&img)?;
             t.ensure_pushed(runner)?;
             img
@@ -754,7 +754,7 @@ fn turn(
     // with the override binary.
     let llm_base = match &llm_bin {
         Some(bin) => {
-            kvs.push(format!("--bin:@={bin}"));
+            kvs.push(format!("--worker1:@={bin}"));
             runner.clone().expect("resolved when a bin is given")
         }
         None => resolve_cli_image(t, LLM_STEP_IMAGE)?,

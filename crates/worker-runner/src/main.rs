@@ -1,6 +1,6 @@
 //! caos-worker-runner: a generic worker runner.
 //!
-//! It receives a compiled worker binary as the `bin` argument and execs it — so
+//! It receives a compiled worker binary as the `worker1` argument and execs it — so
 //! any worker built as a single self-contained binary runs in this one warm,
 //! pooled image instead of being baked into (and provisioned as) its own image.
 //! The exec'd binary *is* the worker: it reads its remaining arguments from
@@ -23,20 +23,21 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    // Fetch the worker binary (the `bin` arg). `/cas` is root-owned, so stage a
+    // Fetch the worker binary (the `worker1` arg). `/cas` is root-owned, so stage a
     // writable, executable copy under a scratch dir before running it.
-    let bin = arg("bin");
+    let bin = arg("worker1");
     caos(["get", bin.as_str()])?;
-    // `bin` is the runner's RESERVED binding (call-time args override curry
-    // bindings, so a caller arg named `bin` silently replaces the worker
-    // binary). Diagnose that collision instead of failing with a bare io
-    // error from the copy.
+    // `worker1` is the exec-chain slot (workerN naming: anything fetched and
+    // executed; the next interpreter down would read `worker2`). Call-time
+    // args override curry bindings, so a colliding caller arg would silently
+    // replace the worker binary — diagnose that instead of failing with a
+    // bare io error from the copy.
     let meta = std::fs::metadata(&bin).map_err(|e| format!("reading worker binary {bin}: {e}"))?;
     if !meta.is_file() {
         return Err(format!(
-            "the `bin` arg is not a regular file — `bin` names the worker binary \
-             (the runner's reserved binding); a call-time arg named `bin` overrides \
-             the curried one, so rename the caller's arg"
+            "the `worker1` arg is not a regular file — `worker1` names the next \
+             executable in the chain; a colliding caller arg overrides the curried \
+             one, so rename the caller's arg"
         ));
     }
     let dir = scratch("run")?;

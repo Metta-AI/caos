@@ -12,4 +12,4 @@ set -euo pipefail
 
 printf 'untracked: must not reach the worker\n' >test/tree/untracked.txt
 
-"$CAOS_CLI" run /cas/std/bash -- --script:@=test/check.sh --test:@=test
+"$CAOS_CLI" run /cas/std/bash -- --worker1:@=test/check.sh --test:@=test

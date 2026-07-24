@@ -176,7 +176,7 @@ for name in "${names[@]}"; do
   [ -n "${hash_of[$base]:-}" ] || continue
   install -m 755 "$PROJECT/images/bash-worker.sh" "$CLIENT/bash-worker.sh"
   git -C "$CLIENT" add bash-worker.sh
-  hash_of[$name]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--bin:@=bash-worker.sh")
+  hash_of[$name]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--worker1:@=bash-worker.sh")
   echo "$name: script curry ${hash_of[$name]}" >&2
 done
 
@@ -248,7 +248,7 @@ if [ -n "${hash_of[runner]:-}" ]; then
     # the binary in the client repo (overwritten on every publish).
     install -m 755 "${bin_path[$b]}/bin/worker-$b" "$CLIENT/worker-$b"
     git -C "$CLIENT" add "worker-$b"
-    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--bin:@=worker-$b" "${extra[@]}")
+    hash_of[$b]=$(cd "$CLIENT" && "$caos" curry "${hash_of[$base]}" -- "--worker1:@=worker-$b" "${extra[@]}")
     echo "$b: curry ${hash_of[$b]}" >&2
     names+=("$b")
   done

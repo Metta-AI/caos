@@ -67,9 +67,9 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 echo "== run the turn ==" >&2
 conv="ct-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=bash-tool-bin)
+bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
 tools_img=$("$CAOS_CLI" curry /cas/std/bash --)
-llm=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=llm-step-bin \
+llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
   --api_key=test-key --system:@=system.txt --bash_image="$bash_tool" \
   --tools_image="$tools_img" --model=test-model \
   --base_url="http://$stub_host:$port" --conversation="$conv")

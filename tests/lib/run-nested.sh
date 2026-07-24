@@ -123,13 +123,13 @@ for b in /pt/worker-*; do
   # cargo/rustc curry onto their own bases below; `runner` names the runner
   # IMAGE entry above (the worker-runner bin is that image's own trampoline).
   case "$n" in cargo | rustc | runner) continue ;; esac
-  add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-$n")" "$n"
+  add "$(cli curry "docker://$RUNNER_IMAGE" -- "--worker1:@=worker-$n")" "$n"
 done
 if [ -n "$CARGO_IMAGE" ]; then
-  cargo_ref=$(cli curry "docker://$CARGO_IMAGE" -- "--bin:@=worker-cargo")
+  cargo_ref=$(cli curry "docker://$CARGO_IMAGE" -- "--worker1:@=worker-cargo")
   add "$cargo_ref" cargo
   if [ -e /pt/worker-rustc ]; then
-    add "$(cli curry "docker://$RUNNER_IMAGE" -- "--bin:@=worker-rustc" \
+    add "$(cli curry "docker://$RUNNER_IMAGE" -- "--worker1:@=worker-rustc" \
             "--cargo=$cargo_ref" "--worker_common:@=worker-common")" rustc
   fi
 fi

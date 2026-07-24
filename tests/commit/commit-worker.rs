@@ -37,7 +37,7 @@ fn start() -> Result<(), String> {
 
     let tool = caos_curry(
         &std_image("bash"),
-        &[("script", Arg::Path(&arg("tool-script")))],
+        &[("worker1", Arg::Path(&arg("tool-script")))],
     )?;
     // A source-built worker is curry(runner, bin), unwrapped into args by the
     // caller — so "ourselves" is that same curry rebuilt from our own args
@@ -46,7 +46,7 @@ fn start() -> Result<(), String> {
     let me = caos_curry(
         &arg("image"),
         &[
-            ("bin", Arg::Path(&arg("bin"))),
+            ("worker1", Arg::Path(&arg("worker1"))),
             ("head", Arg::Path(&arg("head"))),
         ],
     )?;

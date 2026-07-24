@@ -21,6 +21,6 @@ extra=()
 [ -e /cas/args/api_key ] && extra+=("--api_key:@=/cas/args/api_key")
 [ -e /cas/args/only ] && extra+=("--only:@=/cas/args/only")
 suite=$(caos curry /cas/std/bash -- \
-  "--script:@=/cas/args/in/tests/lib/suite.sh" \
+  "--worker1:@=/cas/args/in/tests/lib/suite.sh" \
   "--workspace:@=/cas/args/in" "${extra[@]}")
 caos run-then /cas/args/in -- --run="$suite"

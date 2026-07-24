@@ -524,7 +524,7 @@ fn launch_tree_tool(
         .tools_image
         .as_ref()
         .ok_or("launch_tree_tool without a tools_image (drive guards this)")?;
-    let curried = caos_curry(image, &[("script", Arg::Path(script))])?;
+    let curried = caos_curry(image, &[("worker1", Arg::Path(script))])?;
     let me = self_curry(
         step_path,
         pending,
@@ -550,13 +550,13 @@ fn self_curry(
     let pending_json = Value::Array(pending.to_vec()).to_string();
     let results_json = Value::Array(results.to_vec()).to_string();
 
-    let bin = arg("bin");
+    let bin = arg("worker1");
     let head = arg("head");
     let api_key = arg("api_key");
     let system = arg("system");
     let bash_image = arg("bash_image");
     let mut kvs: Vec<(&str, Arg)> = vec![
-        ("bin", Arg::Path(&bin)),
+        ("worker1", Arg::Path(&bin)),
         ("head", Arg::Path(&head)),
         ("api_key", Arg::Path(&api_key)),
         ("system", Arg::Path(&system)),

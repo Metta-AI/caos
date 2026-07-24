@@ -71,11 +71,11 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry the workers and run the turn ==" >&2
 conv="conv-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=bash-tool-bin)
+bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-llm=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=llm-step-bin \
+llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
   --api_key=test-key --system:@=system.txt --bash_image="$bash_tool" \
   --model=test-model --base_url="http://$stub_host:$port" \
   --conversation="$conv")

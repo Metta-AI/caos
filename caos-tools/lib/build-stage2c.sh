@@ -18,8 +18,8 @@ ln -s /cas/args/bins/caos /tmp/spec/files/usr/bin/caos
 ln -s /cas/args/bins/worker-runner /tmp/spec/files/worker
 caos put /tmp/spec /cas/spec
 
-build_img=$(caos curry /cas/std/testenv -- "--script:@=$LIB/image-build.sh")
-final=$(caos curry /cas/std/bash -- "--script:@=$LIB/build-final.sh" \
+build_img=$(caos curry /cas/std/testenv -- "--worker1:@=$LIB/image-build.sh")
+final=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/build-final.sh" \
   "--bins:@=/cas/args/bins" \
   "--runner_image:@=/cas/args/runner_image" \
   "--bash_image:@=/cas/args/bash_image")

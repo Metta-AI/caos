@@ -590,10 +590,10 @@ fn workspace_tree() -> Result<String, String> {
 
 /// Rebuild our own curry (we run as curry(cargo-base, bin=…)) with `extras`.
 fn self_curry(extras: &[(&str, Arg)]) -> Result<String, String> {
-    let bin = arg("bin");
+    let bin = arg("worker1");
     let mut kvs: Vec<(&str, Arg)> = Vec::new();
     if Path::new(&bin).exists() {
-        kvs.push(("bin", Arg::Path(&bin)));
+        kvs.push(("worker1", Arg::Path(&bin)));
     }
     for (name, value) in extras {
         kvs.push((

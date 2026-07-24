@@ -32,7 +32,7 @@ echo top > ws/top.txt
 cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
 commit "workspace + bash tool binary"
 base=$(git rev-parse HEAD)
-tool=$("$CAOS_CLI" curry /cas/std/runner -- --bin:@=bash-tool-bin)
+tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
 
 echo "== targeted read: declared path only; workspace round-trips by hash ==" >&2
 "$CAOS_CLI" run "$tool" r1 -- --tree:@=ws --cmd='cat a/one.txt' --paths='a/one.txt'

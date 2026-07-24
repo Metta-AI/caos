@@ -124,7 +124,7 @@ caos put /tmp/sel /cas/sel
 
 caos get /cas/args/workspace/crates
 map=$(caos curry /cas/std/testenv -- \
-  "--script:@=$LIB/run-nested.sh" \
+  "--worker1:@=$LIB/run-nested.sh" \
   "--worker_common:@=/cas/args/workspace/crates/worker-common")
-then_img=$(caos curry /cas/std/bash -- "--script:@=$LIB/suite-summarize.sh")
+then_img=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/suite-summarize.sh")
 caos map-then /cas/sel -- --map="$map" --then="$then_img"

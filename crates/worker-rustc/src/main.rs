@@ -81,12 +81,12 @@ fn start() -> Result<(), String> {
     // image with our bin re-bound) plus what finish needs. `cargo` and
     // `worker_common` deliberately don't ride — finish's cache key is just
     // (bin, runner, result).
-    let bin = arg("bin");
+    let bin = arg("worker1");
     let runner = arg("runner");
     let mut kvs: Vec<(&str, Arg)> =
         vec![("mode", Arg::Lit("finish")), ("runner", Arg::Path(&runner))];
     if Path::new(&bin).exists() {
-        kvs.insert(0, ("bin", Arg::Path(&bin)));
+        kvs.insert(0, ("worker1", Arg::Path(&bin)));
     }
     let me = caos_curry(&own_image(), &kvs)?;
     run_then("/cas/proj", &build, Some(&me))
@@ -111,7 +111,7 @@ fn finish() -> Result<(), String> {
     if !Path::new(&bin).exists() {
         return Err("cargo result carries no bin/worker".to_string());
     }
-    let curried = caos_curry(&arg("runner"), &[("bin", Arg::Path(&bin))])?;
+    let curried = caos_curry(&arg("runner"), &[("worker1", Arg::Path(&bin))])?;
     caos(["get-hash", &curried, "/cas/out"])
 }
 

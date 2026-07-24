@@ -78,7 +78,7 @@ cp /bin/caos /tmp/imgs/nixbuilder/files/usr/bin/caos
 echo "CAOS_WORKER_UID=0" > /tmp/imgs/nixbuilder/env
 caos put /tmp/imgs /cas/imgs
 
-imgmap=$(caos curry /cas/std/testenv -- "--script:@=$LIB/image-build.sh")
-stage2b=$(caos curry /cas/std/bash -- "--script:@=$LIB/build-stage2b.sh" \
+imgmap=$(caos curry /cas/std/testenv -- "--worker1:@=$LIB/image-build.sh")
+stage2b=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/build-stage2b.sh" \
   "--workspace:@=/cas/args/workspace" "--bins:@=/cas/args/result/bin")
 caos map-then /cas/imgs -- --map="$imgmap" --then="$stage2b"
