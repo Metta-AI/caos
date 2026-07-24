@@ -101,21 +101,10 @@
         // crossLinkerEnv;
 
         # Build the compute/runtime workspace dependencies once and cache them
-        # separately from the crates. The host-only TUI has its own dependency
-        # build so Crossterm/Ratatui never lengthen worker or server builds.
-        cargoArtifacts = craneLib.buildDepsOnly (
-          commonArgs
-          // { cargoExtraArgs = "--workspace --exclude caos-tui"; }
-        );
-        tuiCargoArtifacts = craneLib.buildDepsOnly (
-          commonArgs
-          // {
-            cargoExtraArgs = "--package caos-tui";
-            pname = "caos-tui-deps";
-          }
-        );
+        # separately from the crates.
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        # ONE build for every non-TUI binary. Each crate used to be its own
+        # ONE build for every binary. Each crate used to be its own
         # `buildPackage (--package <name>)`, but all of them took the same
         # whole-tree `src`, so any edit re-keyed and rebuilt every one of them —
         # the split bought no incrementality while paying the per-binary compile
@@ -127,7 +116,7 @@
           commonArgs
           // {
             inherit cargoArtifacts;
-            cargoExtraArgs = "--workspace --exclude caos-tui";
+            cargoExtraArgs = "--workspace";
             doCheck = false;
           }
         );
@@ -155,19 +144,6 @@
         # The llm-step tests' scripted LLM API stand-in — a host binary, not a
         # worker (the musl build runs on any Linux host).
         llm-stub = workspaceBins;
-
-        # The host-facing TUI keeps its OWN build: it's the only crate pulling in
-        # Ratatui/Crossterm, so isolating it keeps that graph out of the worker /
-        # server dep cache (see tuiCargoArtifacts).
-        caos-tui-static = craneLib.buildPackage (
-          commonArgs
-          // {
-            cargoArtifacts = tuiCargoArtifacts;
-            cargoExtraArgs = "--package caos-tui";
-            pname = "caos-tui";
-            doCheck = false;
-          }
-        );
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
@@ -923,7 +899,7 @@
           strictDeps = true;
           pname = "caos-host-tools";
           version = "0.1.0";
-          # Dev profile here too (the macOS host build of caos-cli / caos-tui),
+          # Dev profile here too (the macOS host build of caos-cli),
           # matching commonArgs — one profile everywhere.
           CARGO_PROFILE = "dev";
           CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
@@ -931,13 +907,6 @@
         nativeCliArtifacts = craneLib.buildDepsOnly (
           nativeArgs
           // { cargoExtraArgs = "--package caos --bin caos-cli"; }
-        );
-        nativeTuiArtifacts = craneLib.buildDepsOnly (
-          nativeArgs
-          // {
-            cargoExtraArgs = "--package caos-tui";
-            pname = "caos-tui-deps";
-          }
         );
         # Installed under both names: `caos` is what a person types (`caos talk`),
         # `caos-cli` stays for scripts and docs that spell it out. (No collision
@@ -962,24 +931,6 @@
               }
             );
 
-        # Full-screen conversation client. Keep it in its own crate so Ratatui
-        # and Crossterm never enter the worker-side `caos` binary's dependency
-        # closure. Like caos-cli, it must run on the host rather than in Linux
-        # worker images.
-        caos-tui =
-          if pkgs.stdenv.hostPlatform.isLinux then
-            caos-tui-static
-          else
-            craneLib.buildPackage (
-              nativeArgs
-              // {
-                cargoArtifacts = nativeTuiArtifacts;
-                cargoExtraArgs = "--package caos-tui";
-                pname = "caos-tui";
-                doCheck = false;
-              }
-            );
-
         # All the host-facing caos commands in one package, so a consumer lists
         # *this* in its devShell and gets `caos-cli` and `caosd` on PATH together
         # (like `pkgs.typescript` giving you tsc + tsserver) — no enumerating the
@@ -998,7 +949,6 @@
           name = "caos-tools";
           paths = [
             caos-cli
-            caos-tui
             caosd
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ runnerd ];
@@ -1260,14 +1210,14 @@
       {
         packages = {
           # `nix build` (no attr) yields the PINNED host tools: caos-cli,
-          # caos-tui, caosd, caos-runnerd, all in one result/bin. This is the
+          # caos, caosd, and (on Linux) caos-runnerd in one result/bin. This is the
           # explicit build step — its `caosd` bakes the exact server/runnerd/
           # worker image store paths from THIS checkout, so `result/bin/caosd up`
           # runs that fixed stack and never changes when you edit code. Rebuild
           # (another `nix build`) is the only thing that moves it. The workspace
           # binaries stay available as `.#caos`.
           default = caos-tools;
-          inherit caos server runnerd caos-cli caos-tui caosd caos-tools;
+          inherit caos server runnerd caos-cli caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;

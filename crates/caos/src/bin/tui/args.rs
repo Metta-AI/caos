@@ -1,3 +1,5 @@
+//! TUI command-line arguments.
+
 use caos::chat::TurnOptions;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,7 +56,7 @@ impl Args {
 }
 
 pub(crate) fn usage() -> String {
-    "usage: caos-tui [--new | --from <commit>] [--base <revspec>] \
+    "usage: caos tui [--new | --from <commit>] [--base <revspec>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
         .to_string()
 }

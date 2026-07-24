@@ -255,7 +255,7 @@ Two verbs and a full-screen client over one turn engine (implemented —
   piped stdin the whole of it is one prompt.
 - **`caos-cli chat <name> [-m <message>]`** — the explicit, scriptable
   one-turn form (message from `-m` or stdin).
-- **`caos-tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
+- **`caos tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
   own crate. It consumes structured `TurnEvent`s from the same engine,
   reconstructs durable history from conversation refs, and presents independent
   virtual conversations in a left sidebar. Every conversation retains its own
@@ -348,7 +348,7 @@ deadlines are comfortable; the top-level pending timeout
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
    published by build-builtins.sh so a turn needs nothing built or committed
    locally. **Done** (same files; `tests/chat-online` is the UX spec).
-7. Structured client events + `caos-tui` — presentation-independent turn
+7. Structured client events + `caos tui` — presentation-independent turn
    events, durable history/diff readers, multiline composer, task switching,
    live activity, workspace review, and confirmed clean-checkout apply. **Done**
-   (`crates/caos-tui`; unit tests plus the existing chat integration suite).
+   (`crates/caos/src/bin/tui`; unit tests plus the existing chat integration suite).

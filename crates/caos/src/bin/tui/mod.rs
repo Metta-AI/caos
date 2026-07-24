@@ -79,15 +79,7 @@ fn run_app(
     Ok(())
 }
 
-fn main() {
-    if let Err(error) = real_main() {
-        eprintln!("caos-tui: {error}");
-        std::process::exit(1);
-    }
-}
-
-fn real_main() -> Result<(), String> {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     if raw
         .iter()
         .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
@@ -95,7 +87,7 @@ fn real_main() -> Result<(), String> {
         println!("{}", usage());
         return Ok(());
     }
-    let args = Args::parse(&raw)?;
+    let args = Args::parse(raw)?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("requires an interactive terminal; use `caos talk` for pipes".to_string());
     }

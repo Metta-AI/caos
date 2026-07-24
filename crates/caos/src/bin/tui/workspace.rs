@@ -228,8 +228,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("caos-tui-{label}-{}-{unique}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "caos-cli-tui-{label}-{}-{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir(&dir).unwrap();
         capture_required("git", &["init", "-q"], &dir).unwrap();
         capture_required("git", &["config", "user.name", "Test User"], &dir).unwrap();
