@@ -1051,9 +1051,9 @@
           workerTestenvImage
         ];
 
-        # The agent-harness worker binaries build-builtins.sh publishes as
-        # std curries over the runner image (std/bash-tool, std/llm-step) —
-        # handed over prebuilt for the same no-runtime-nix reason as the images.
+        # The agent-harness worker binaries build-builtins.sh publishes as std
+        # curries over the runner image (std/bash-tool, std/llm-step). It finds
+        # each binary under /bin, so these may share one consolidated output.
         builtinWorkerBins = [
           worker-bash-tool
           worker-llm-step
