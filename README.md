@@ -59,12 +59,12 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
-| `Tiltfile`, `build-builtins.sh`, `test-*.sh` | Local dev + integration tests |
+| `build-builtins.sh`, `test-*.sh` | Local development and integration tests |
 
 ## Development
 
 Enter a shell with the pinned `rustc`, `cargo`, `clippy`, `rustfmt`, plus
-`rust-analyzer`, `cargo-watch`, and `tilt`:
+`rust-analyzer` and `cargo-watch`:
 
 ```bash
 nix develop
@@ -134,7 +134,8 @@ its hash, so identical work is deduplicated and memoized.
 
 One daemon (`crates/server`), image `caos-server`, serving everything over a
 single URL. It backs onto a git repository it **owns** (mounted at `/git`); in
-dev, Tilt creates a dedicated bare repo for it (see [local testing](#local-testing)).
+development, `caosd` creates a dedicated bare repo under `CAOS_DATA` (see
+[local testing](#local-testing)).
 
 It serves requests **concurrently — one thread per request** — so a worker can
 fetch objects while its own `/run` is in flight, and several top-level runs can
@@ -541,11 +542,6 @@ services via `docker compose`: `caos-server` (`:9090`, its dedicated bare repo
 mounted at `/git`), `caos-runnerd` (the generic runner, with the docker socket),
 `caos-redis`, and `caos-registry`. Redis and the registry persist across restarts
 (named volumes); the server's bare repo persists under `CAOS_DATA`.
-
-[Tilt](https://tilt.dev) is still pinned in the dev shell for its auto-rebuild
-loop (`tilt up` rebuilds an image when its sources change; UI at
-`http://localhost:10350`), but `caosd` is the supported way to run the stack and
-tilt is slated for removal.
 
 Building and testing run IN caos, as tools: `caos-tools/*.sh` are worker
 scripts (the same ones an LLM agent invokes), and `caos-cli run-tool` fires one as

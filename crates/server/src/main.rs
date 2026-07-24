@@ -87,7 +87,7 @@ struct Config {
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
 /// in a container, where the daemon is PID 1: the kernel applies no default
 /// disposition for these signals to PID 1, so without an explicit handler
-/// `docker stop` (and Tilt's Ctrl-C) would hang until the 10s `SIGKILL`.
+/// `docker stop` would hang until the 10s `SIGKILL`.
 fn install_termination_handlers() {
     // Async-signal-safe: we hold no state that needs flushing, so just exit.
     extern "C" fn terminate(_signum: std::ffi::c_int) {
@@ -113,9 +113,9 @@ fn main() {
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let git_dir = env_or("CAOS_GIT_DIR", DEFAULT_GIT_DIR);
 
-    // Self-bootstrap the bare repo on first run (e.g. a fresh fly Volume), the
-    // same setup the dev Tiltfile does by hand: `http.receivepack` lets clients
-    // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
+    // Self-bootstrap the bare repo on first run (e.g. a fresh fly Volume):
+    // `http.receivepack` lets clients `git push`, `allowAnySHA1InWant` lets them
+    // fetch a result by bare hash.
     // `git init --bare` is idempotent, so this is a no-op once seeded.
     let git = |args: &[&str]| {
         let _ = std::process::Command::new("git").args(args).status();
