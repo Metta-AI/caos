@@ -180,7 +180,7 @@ pilot, because it was the heaviest git-imported image (toolchain + baked deps):
 ## The rest of std follows
 
 With cargo-base proven, the remaining std entries converted to the same
-shapes (`build-builtins.sh` header lists the four entry forms):
+shapes (`build-builtins.sh` header lists the entry forms):
 
 - **`std/bash-base`, `std/testenv-base`** — flake trees (checked-in
   `flake.nix` + a lock derived from the main lock by `std/lib/derive-lock.sh`;
@@ -192,9 +192,14 @@ shapes (`build-builtins.sh` header lists the four entry forms):
   anymore: `curry(runner, bin=worker-<name>)`, the same runner-pool move the
   agent-harness bins always used. Self-recursion through map-then works
   under a curry (the bound `bin` rides the args tree into every child).
-- Only **three images remain nix-built**: `base` and `runner` (thin deltas on
-  stock debian) and the streamed `flake-builder`. Everything else a client
-  reaches through std is a curry over a flake-built base or the runner.
+- **`std/runner`** — a flake tree too: a pinned-nixpkgs userland (bash +
+  coreutils + grep/sed/find/tar/gzip — the agent-visible environment for
+  bash-tool), replacing the old thin delta on stock debian. The old `base`
+  entry (debian + caos, pre-runner-pool) had no consumers and is deleted.
+- So the **streamed `flake-builder` is the ONLY nix-built worker image**;
+  its stock base (nixos/nix) rides as registry layers via the docker-build
+  compose. Everything a client reaches through std is a flake tree or a
+  curry over one.
 
 ## Open items
 
