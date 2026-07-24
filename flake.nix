@@ -80,6 +80,17 @@
 
           CARGO_BUILD_TARGET = muslTarget;
 
+          # Build everything at the dev profile (opt-level 0, no LTO, many
+          # codegen units). These are dev-stack / local artifacts, so we trade
+          # runtime speed and binary size for much faster builds — the whole
+          # point of this flake path. musl still links static at any profile
+          # (crt-static is on), so the binaries still run on any base.
+          # line-tables-only keeps file:line backtraces without baking full
+          # DWARF (plain dev debuginfo) into every image. This mirrors the cargo
+          # worker's bake (cargoWorkerDepsMusl), which already builds dev.
+          CARGO_PROFILE = "dev";
+          CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
+
           # Native build inputs / runtime libs go here as the project grows,
           # e.g. pkgs.openssl + pkgs.pkg-config for TLS. Note: C deps would
           # need a musl cross-toolchain to stay static. (the server's gix
@@ -104,25 +115,50 @@
           }
         );
 
-        # One member of the workspace. `--package` scopes the build so each
-        # output contains only that crate's binary (keeps each image minimal).
-        crateBin =
-          pname:
-          craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts pname;
-              cargoExtraArgs = "--package ${pname}";
-              # The package builds only its own binary, so nothing else lands
-              # in the output's /bin.
-              doCheck = false;
-            }
-          );
+        # ONE build for every non-TUI binary. Each crate used to be its own
+        # `buildPackage (--package <name>)`, but all of them took the same
+        # whole-tree `src`, so any edit re-keyed and rebuilt every one of them —
+        # the split bought no incrementality while paying the per-binary compile
+        # + link N times over. A single `--workspace` build does the shared work
+        # once and parallelizes across cores. Images stay single-binary: their
+        # roots copy one *named* binary out of this output's /bin (see workerRoot
+        # / installWorkerFiles), so nothing extra ever lands in an image.
+        workspaceBins = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "--workspace --exclude caos-tui";
+            doCheck = false;
+          }
+        );
 
-        # One crate, two binaries: `caos` (worker-side, baked into images) and
-        # `caos-cli` (user-facing). crateBin builds the package, so both land in
-        # the output's /bin; consumers pick the one they need.
-        caos = crateBin "caos";
+        # Every crate's binary is selected (by name, at copy time) from the one
+        # build above, so these are all the same derivation. `caos` carries two
+        # binaries — `caos` (worker-side, baked into images) and `caos-cli`
+        # (user-facing) — both in /bin; consumers pick the one they need.
+        caos = workspaceBins;
+        server = workspaceBins;
+        runnerd = workspaceBins;
+        worker-hello = workspaceBins;
+        worker-file-count = workspaceBins;
+        worker-dirs-only = workspaceBins;
+        worker-deep-deps = workspaceBins;
+        worker-rustc = workspaceBins;
+        worker-runner = workspaceBins;
+        worker-cargo = workspaceBins;
+        # The agent-harness workers (design/agent-harness.md). They have no
+        # image of their own: each runs as curry(runner, bin=<static binary>)
+        # in the shared runner pool, so only the binaries are exposed.
+        worker-bash-tool = workspaceBins;
+        worker-llm-step = workspaceBins;
+        worker-rgrep = workspaceBins;
+        # The llm-step tests' scripted LLM API stand-in — a host binary, not a
+        # worker (the musl build runs on any Linux host).
+        llm-stub = workspaceBins;
+
+        # The host-facing TUI keeps its OWN build: it's the only crate pulling in
+        # Ratatui/Crossterm, so isolating it keeps that graph out of the worker /
+        # server dep cache (see tuiCargoArtifacts).
         caos-tui-static = craneLib.buildPackage (
           commonArgs
           // {
@@ -132,24 +168,6 @@
             doCheck = false;
           }
         );
-        server = crateBin "server";
-        runnerd = crateBin "runnerd";
-        worker-hello = crateBin "worker-hello";
-        worker-file-count = crateBin "worker-file-count";
-        worker-dirs-only = crateBin "worker-dirs-only";
-        worker-deep-deps = crateBin "worker-deep-deps";
-        worker-rustc = crateBin "worker-rustc";
-        worker-runner = crateBin "worker-runner";
-        worker-cargo = crateBin "worker-cargo";
-        # The agent-harness workers (design/agent-harness.md). They have no
-        # image of their own: each runs as curry(runner, bin=<static binary>)
-        # in the shared runner pool, so only the binaries are exposed.
-        worker-bash-tool = crateBin "worker-bash-tool";
-        worker-llm-step = crateBin "worker-llm-step";
-        worker-rgrep = crateBin "worker-rgrep";
-        # The llm-step tests' scripted LLM API stand-in — a host binary, not a
-        # worker (the musl build runs on any Linux host).
-        llm-stub = crateBin "llm-stub";
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
@@ -905,6 +923,10 @@
           strictDeps = true;
           pname = "caos-host-tools";
           version = "0.1.0";
+          # Dev profile here too (the macOS host build of caos-cli / caos-tui),
+          # matching commonArgs — one profile everywhere.
+          CARGO_PROFILE = "dev";
+          CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
         };
         nativeCliArtifacts = craneLib.buildDepsOnly (
           nativeArgs
@@ -1234,22 +1256,17 @@
             esac
           '';
         };
-
-        # A thin `caosd` for the dev shell. It defers to `nix run` against the
-        # working-tree flake, so caosd's image closure (server/runnerd/worker
-        # images) builds lazily on the first `caosd up` — exactly as running
-        # `nix run .#caosd` by hand would — instead of being dragged onto the
-        # dev-shell's critical path at shell entry. Resolves the flake from the
-        # git top level so it works from any subdirectory, and passes args
-        # through, so up/down/reset/logs all work. Note: it always runs the
-        # *current* checkout (a dirty tree just prints nix's "dirty" warning).
-        caosd-launcher = pkgs.writeShellScriptBin "caosd" ''
-          exec nix run "$(${pkgs.git}/bin/git rev-parse --show-toplevel)#caosd" -- "$@"
-        '';
       in
       {
         packages = {
-          default = caos;
+          # `nix build` (no attr) yields the PINNED host tools: caos-cli,
+          # caos-tui, caosd, caos-runnerd, all in one result/bin. This is the
+          # explicit build step — its `caosd` bakes the exact server/runnerd/
+          # worker image store paths from THIS checkout, so `result/bin/caosd up`
+          # runs that fixed stack and never changes when you edit code. Rebuild
+          # (another `nix build`) is the only thing that moves it. The workspace
+          # binaries stay available as `.#caos`.
+          default = caos-tools;
           inherit caos server runnerd caos-cli caos-tui caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
@@ -1371,10 +1388,12 @@
           packages = [
             pkgs.cargo-watch
             pkgs.rust-analyzer
-            # `caosd` on PATH as a thin launcher (see caosd-launcher): it defers to
-            # `nix run .#caosd`, so the stack's image closure builds lazily on the
-            # first `caosd up`, not at dev-shell entry.
-            caosd-launcher
+            # NOTE: `caosd` is deliberately NOT on the dev-shell PATH. It used to
+            # be a launcher that ran `nix run .#caosd` against the live tree, so
+            # every `caosd up` silently rebuilt the image closure from whatever
+            # was checked out. The pinned workflow is explicit instead: run
+            # `nix build` to produce ./result/bin/caosd (baked to this checkout),
+            # then `./result/bin/caosd up`. The stack only moves when you rebuild.
             # `tilt up` builds the images and runs the daemons (see ./Tiltfile).
             pkgs.tilt
             # `fly` CLI: auth (`fly auth token`), org/region lookup, and operating
