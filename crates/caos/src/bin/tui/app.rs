@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
-    conversation_history, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, list_conversations, run_chat_turn, ConversationRole,
-    ConversationSummary, ToolSetDescription, TurnEvent, TurnOptions, WorkspaceDiff,
+    archive_user_conversation, conversation_history, conversation_workspace_diff,
+    describe_tool_set, first_available_conversation_name, list_user_conversations,
+    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
+    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
+    TurnEvent, TurnOptions, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -184,7 +186,8 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 }
 
 struct ConversationState {
-    name: String,
+    id: String,
+    title: String,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
@@ -198,9 +201,10 @@ struct ConversationState {
 }
 
 impl ConversationState {
-    fn new(name: String, turn_options: TurnOptions, status: String) -> Self {
+    fn new(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         Self {
-            name,
+            id,
+            title,
             turn_options,
             transcript: Vec::new(),
             activities: Vec::new(),
@@ -215,7 +219,7 @@ impl ConversationState {
     }
 
     fn reload(&mut self, transport: &GitTransport) {
-        match conversation_history(transport, &self.name) {
+        match conversation_history(transport, &self.id) {
             Ok(turns) => {
                 self.transcript = turns
                     .into_iter()
@@ -228,7 +232,7 @@ impl ConversationState {
                         text: turn.message,
                     })
                     .collect();
-                match conversation_workspace_diff(transport, &self.name) {
+                match conversation_workspace_diff(transport, &self.id) {
                     Ok(diff) => self.diff = Some(diff),
                     Err(error) => {
                         self.diff = None;
@@ -280,6 +284,7 @@ enum ConfirmAction {
 
 pub(crate) struct App {
     repo_dir: PathBuf,
+    user: String,
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
@@ -304,7 +309,32 @@ impl App {
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        let conversations = list_conversations(&transport)?;
+        publish_unindexed_conversations(&transport, &args.user)?;
+        let mut conversations =
+            list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
+        if let Some(requested) = args.conversation.as_deref() {
+            if conversations
+                .iter()
+                .all(|conversation| conversation.id != requested)
+            {
+                let archived = list_user_conversations(
+                    &transport,
+                    &args.user,
+                    UserConversationStatus::Archived,
+                )?;
+                if archived
+                    .iter()
+                    .any(|conversation| conversation.id == requested)
+                {
+                    unarchive_user_conversation(&transport, &args.user, requested)?;
+                    conversations = list_user_conversations(
+                        &transport,
+                        &args.user,
+                        UserConversationStatus::Active,
+                    )?;
+                }
+            }
+        }
         let selected_name = choose_conversation(
             args.conversation.as_deref(),
             args.new_conversation,
@@ -319,24 +349,43 @@ impl App {
         let mut states: Vec<ConversationState> = conversations
             .iter()
             .map(|summary| {
-                ConversationState::new(summary.name.clone(), args.turn.clone(), "ready".to_string())
+                ConversationState::new(
+                    summary.id.clone(),
+                    summary.title.clone(),
+                    args.turn.clone(),
+                    "ready".to_string(),
+                )
             })
             .collect();
         for state in &mut states {
             state.reload(&transport);
         }
-        if states.iter().all(|state| state.name != selected_name) {
+        let selected_id = if states.iter().any(|state| state.id == selected_name) {
+            selected_name.clone()
+        } else {
+            let id = if args.conversation.is_some() {
+                selected_name.clone()
+            } else {
+                fresh_conversation_id(&transport, &args.user)?
+            };
             states.insert(
                 0,
-                ConversationState::new(selected_name.clone(), args.turn, initial_status),
+                ConversationState::new(
+                    id.clone(),
+                    selected_name.clone(),
+                    args.turn,
+                    initial_status,
+                ),
             );
-        }
+            id
+        };
         let selected = states
             .iter()
-            .position(|state| state.name == selected_name)
+            .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
         Ok(Self {
             repo_dir,
+            user: args.user,
             conversations: states,
             selected,
             should_quit: false,
@@ -394,6 +443,14 @@ impl App {
             self.selected_mut().status = "usage: /from <commit>".to_string();
             return;
         }
+        if let Some(title) = message.strip_prefix("/title ").map(str::trim) {
+            self.rename_selected(title);
+            return;
+        }
+        if message == "/title" {
+            self.selected_mut().status = "usage: /title <new title>".to_string();
+            return;
+        }
         {
             let state = self.selected_mut();
             state.transcript.push(TranscriptEntry {
@@ -409,7 +466,7 @@ impl App {
 
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
-        let conversation = self.selected().name.clone();
+        let conversation = self.selected().id.clone();
         let repo_dir = self.repo_dir.clone();
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
@@ -476,20 +533,27 @@ impl App {
         changed
     }
 
-    fn conversation_index(&self, name: &str) -> Option<usize> {
-        self.conversations
-            .iter()
-            .position(|state| state.name == name)
+    fn conversation_index(&self, id: &str) -> Option<usize> {
+        self.conversations.iter().position(|state| state.id == id)
     }
 
     fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
         if let TurnEvent::Completed(outcome) = event {
             let transport = self.transport();
+            let user = self.user.clone();
             let state = &mut self.conversations[index];
             state.running = false;
             state.status = format!("completed {}", outcome.short_commit);
             match transport {
-                Ok(transport) => state.reload(&transport),
+                Ok(transport) => {
+                    match publish_user_conversation(&transport, &user, &state.id, &state.title) {
+                        Ok(()) => state.reload(&transport),
+                        Err(error) => {
+                            state.status =
+                                format!("publishing completed conversation failed: {error}")
+                        }
+                    }
+                }
                 Err(error) => state.status = format!("reloading completed turn failed: {error}"),
             }
             return;
@@ -709,18 +773,37 @@ impl App {
                 return;
             }
         };
-        let disk = match list_conversations(&transport) {
-            Ok(conversations) => conversations,
+        let active =
+            match list_user_conversations(&transport, &self.user, UserConversationStatus::Active) {
+                Ok(conversations) => conversations,
+                Err(error) => {
+                    self.selected_mut().status = error;
+                    return;
+                }
+            };
+        let archived =
+            match list_user_conversations(&transport, &self.user, UserConversationStatus::Archived)
+            {
+                Ok(conversations) => conversations,
+                Err(error) => {
+                    self.selected_mut().status = error;
+                    return;
+                }
+            };
+        let title = first_available_conversation_name(
+            active
+                .iter()
+                .chain(&archived)
+                .map(|item| item.title.as_str())
+                .chain(self.conversations.iter().map(|item| item.title.as_str())),
+        );
+        let id = match fresh_conversation_id(&transport, &self.user) {
+            Ok(id) => id,
             Err(error) => {
                 self.selected_mut().status = error;
                 return;
             }
         };
-        let name = first_available_conversation_name(
-            disk.iter()
-                .map(|item| item.name.as_str())
-                .chain(self.conversations.iter().map(|item| item.name.as_str())),
-        );
         let mut options = self.selected().turn_options.clone();
         options.base = base.clone();
         let status = base
@@ -728,7 +811,7 @@ impl App {
             .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
             .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
         self.conversations
-            .insert(0, ConversationState::new(name, options, status));
+            .insert(0, ConversationState::new(id, title, options, status));
         self.selected = 0;
         self.view = View::Chat;
         self.confirm_action = None;
@@ -744,23 +827,88 @@ impl App {
     }
 
     fn close_selected(&mut self) {
-        if self.conversations.len() == 1 {
-            self.selected_mut().status = "cannot close the only chat tab".to_string();
+        if self.selected().is_busy() {
+            self.selected_mut().status =
+                "finish this conversation's operation before archiving it".to_string();
             return;
         }
-        self.conversations.remove(self.selected);
-        self.selected = self.selected.min(self.conversations.len() - 1);
+        let replacement = if self.conversations.len() == 1 {
+            let title = first_available_conversation_name(
+                self.conversations
+                    .iter()
+                    .map(|conversation| conversation.title.as_str()),
+            );
+            let id = match self
+                .transport()
+                .and_then(|transport| fresh_conversation_id(&transport, &self.user))
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    self.selected_mut().status = error;
+                    return;
+                }
+            };
+            Some(ConversationState::new(
+                id,
+                title,
+                self.selected().turn_options.clone(),
+                "new virtual conversation; enter a prompt".to_string(),
+            ))
+        } else {
+            None
+        };
+        if self.selected().current_hash().is_some() {
+            let result = self.transport().and_then(|transport| {
+                archive_user_conversation(&transport, &self.user, &self.selected().id)
+            });
+            if let Err(error) = result {
+                self.selected_mut().status = format!("archiving conversation failed: {error}");
+                return;
+            }
+        }
+        if let Some(replacement) = replacement {
+            self.conversations[0] = replacement;
+            self.selected = 0;
+            self.view = View::Chat;
+        } else {
+            self.conversations.remove(self.selected);
+            self.selected = self.selected.min(self.conversations.len() - 1);
+        }
         self.confirm_action = None;
         if self.view == View::Tools {
             self.load_selected_tool_set();
         }
     }
 
+    fn rename_selected(&mut self, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.selected_mut().status = "conversation title cannot be empty".to_string();
+            return;
+        }
+        if title.contains(['\n', '\r', '\t']) {
+            self.selected_mut().status = "conversation title must be one line".to_string();
+            return;
+        }
+        if self.selected().current_hash().is_some() {
+            let id = self.selected().id.clone();
+            if let Err(error) = self
+                .transport()
+                .and_then(|transport| set_conversation_title(&transport, &id, title))
+            {
+                self.selected_mut().status = error;
+                return;
+            }
+        }
+        self.selected_mut().title = title.to_string();
+        self.selected_mut().status = format!("renamed conversation to {title:?}");
+    }
+
     fn load_selected_tool_set(&mut self) {
         if self.selected().tool_set.is_some() {
             return;
         }
-        let name = self.selected().name.clone();
+        let name = self.selected().id.clone();
         let options = self.selected().turn_options.clone();
         let result = self
             .transport()
@@ -815,7 +963,7 @@ impl App {
                 "press Ctrl+P again to push a clean branch and open a PR".to_string();
         } else {
             self.confirm_action = None;
-            let name = self.selected().name.clone();
+            let name = self.selected().id.clone();
             let diff = self
                 .selected()
                 .diff
@@ -835,16 +983,29 @@ impl App {
     }
 }
 
+fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String> {
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("reading the clock: {error}"))?
+        .as_nanos();
+    let descriptor = format!(
+        "caos conversation v1\ncreator {user}\ncreated {created}\nprocess {}\n",
+        std::process::id()
+    );
+    t.put_object("blob", descriptor.as_bytes())
+        .map(|id| id.to_string())
+}
+
 fn choose_conversation(
     requested: Option<&str>,
     new: bool,
-    conversations: &[ConversationSummary],
+    conversations: &[UserConversationSummary],
 ) -> Result<String, String> {
     if let Some(requested) = requested {
         if new
             && conversations
                 .iter()
-                .any(|conversation| conversation.name == requested)
+                .any(|conversation| conversation.id == requested)
         {
             return Err(format!(
                 "--new: conversation {requested:?} already exists; omit --new to continue it"
@@ -854,13 +1015,13 @@ fn choose_conversation(
     }
     if !new {
         if let Some(latest) = conversations.first() {
-            return Ok(latest.name.clone());
+            return Ok(latest.id.clone());
         }
     }
     Ok(first_available_conversation_name(
         conversations
             .iter()
-            .map(|conversation| conversation.name.as_str()),
+            .map(|conversation| conversation.title.as_str()),
     ))
 }
 
@@ -874,9 +1035,10 @@ mod tests {
 
     use super::ui::{paragraph_scroll, render, scroll_offset};
 
-    fn summary(name: &str) -> ConversationSummary {
-        ConversationSummary {
-            name: name.to_string(),
+    fn summary(id: &str) -> UserConversationSummary {
+        UserConversationSummary {
+            id: id.to_string(),
+            title: id.to_string(),
             head: "a".repeat(40),
             updated_unix: 1,
         }
@@ -884,6 +1046,7 @@ mod tests {
 
     fn state(name: &str) -> ConversationState {
         ConversationState::new(
+            name.to_string(),
             name.to_string(),
             TurnOptions::default(),
             "ready".to_string(),
@@ -895,6 +1058,7 @@ mod tests {
         (
             App {
                 repo_dir: PathBuf::from("."),
+                user: "tester".to_string(),
                 conversations,
                 selected: 0,
                 should_quit: false,
@@ -945,7 +1109,7 @@ mod tests {
             first_available_conversation_name(
                 conversations
                     .iter()
-                    .map(|conversation| conversation.name.as_str())
+                    .map(|conversation| conversation.id.as_str())
                     .chain(std::iter::once("talk-2")),
             ),
             "talk-3"
@@ -1087,7 +1251,7 @@ mod tests {
         let (mut app, tx) = app_with(vec![first, state("talk-2")]);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
-        assert_eq!(app.selected().name, "talk-2");
+        assert_eq!(app.selected().id, "talk-2");
         assert!(app.conversations[0].running);
 
         tx.send(UiMessage::Turn {
@@ -1097,11 +1261,11 @@ mod tests {
         .unwrap();
         assert!(app.drain_messages());
         assert_eq!(app.conversations[0].status, "running a tool");
-        assert_eq!(app.selected().name, "talk-2");
+        assert_eq!(app.selected().id, "talk-2");
     }
 
     #[test]
-    fn ctrl_w_closes_the_selected_chat_tab() {
+    fn ctrl_w_removes_virtual_conversations_and_replaces_the_last_one() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
         app.selected = 1;
 
@@ -1109,19 +1273,46 @@ mod tests {
         assert_eq!(
             app.conversations
                 .iter()
-                .map(|conversation| conversation.name.as_str())
+                .map(|conversation| conversation.id.as_str())
                 .collect::<Vec<_>>(),
             ["talk-1", "talk-3"]
         );
-        assert_eq!(app.selected().name, "talk-3");
+        assert_eq!(app.selected().id, "talk-3");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.selected().name, "talk-1");
+        assert_eq!(app.selected().id, "talk-1");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(app.conversations.len(), 1);
-        assert_eq!(app.selected().name, "talk-1");
-        assert_eq!(app.selected().status, "cannot close the only chat tab");
+        assert_eq!(app.selected().title, "talk-2");
+        assert_ne!(app.selected().id, app.selected().title);
+        assert!(app.selected().status.contains("new virtual conversation"));
+    }
+
+    #[test]
+    fn ctrl_w_keeps_a_busy_conversation_open() {
+        let mut running = state("talk-1");
+        running.running = true;
+        let (mut app, _) = app_with(vec![running, state("talk-2")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().id, "talk-1");
+        assert!(app.selected().status.contains("before archiving"));
+    }
+
+    #[test]
+    fn title_command_does_not_change_conversation_identity() {
+        let (mut app, _) = app_with(vec![state("stable-id")]);
+        app.selected_mut()
+            .composer
+            .insert_str("/title Mutable title");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.selected().id, "stable-id");
+        assert_eq!(app.selected().title, "Mutable title");
     }
 
     #[test]

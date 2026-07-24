@@ -22,7 +22,7 @@
 //! `--bash-tool-bin` (or the env vars) override with a local, git-tracked
 //! binary — the stub tests' path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};
 
 use serde_json::Value;
@@ -37,13 +37,15 @@ use super::{
 /// turn must carry any other author.
 const AGENT_AUTHOR: &str = "caos-agent";
 
-/// The client-owned conversation head ref, in the *local* repo.
+/// The conversation namespace. The turn engine keeps its working HEAD at
+/// `<id>` in the local repo; the TUI publishes the canonical server HEAD and
+/// mutable title at `<id>/{head,title}`.
 const CONV_REF_PREFIX: &str = "refs/caos/conversations/";
 
 /// A conversation's channels all live together under [`CONV_REF_PREFIX`]:
-/// `<name>` (the head, local, client-owned) plus two server-side refs the
-/// worker pushes — `<name>-progress` (the growing step chain) and
-/// `<name>-status` (a blob `"<human hash>\n<text>"` force-updated around each
+/// `<id>` (the engine's local cache), `<id>/{head,title}` on the server, plus
+/// two server-side refs the worker pushes — `<id>-progress` (the growing step
+/// chain) and `<id>-status` (a blob `"<human hash>\n<text>"` force-updated around each
 /// API attempt: calling / retrying / answered-in; the hash scopes it to a
 /// turn, so a stale one is ignorable). The suffixes are reserved in
 /// [`validated_refname`] so a conversation can't shadow another's channels.
@@ -154,8 +156,7 @@ pub fn describe_tool_set(
         if !matches!(
             entry.mode.kind(),
             EntryKind::Blob | EntryKind::BlobExecutable
-        )
-            || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name)
+        ) || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name)
         {
             continue;
         }
@@ -236,6 +237,34 @@ pub struct ConversationSummary {
     pub name: String,
     pub head: String,
     pub updated_unix: i64,
+}
+
+/// One conversation visible in a user's server-side active or archived index.
+///
+/// `id` is stable and addresses the conversation HEAD. `title` is mutable
+/// presentation metadata stored under a separate ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserConversationSummary {
+    pub id: String,
+    pub title: String,
+    pub head: String,
+    pub updated_unix: i64,
+}
+
+/// A user's independent view of a conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserConversationStatus {
+    Active,
+    Archived,
+}
+
+impl UserConversationStatus {
+    fn ref_component(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
 }
 
 /// The accumulated workspace change carried by a conversation.
@@ -548,7 +577,11 @@ pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, 
         let Some(name) = refname.strip_prefix(CONV_REF_PREFIX) else {
             continue;
         };
-        if name.ends_with(PROGRESS_SUFFIX) || name.ends_with(STATUS_SUFFIX) {
+        if name.ends_with(PROGRESS_SUFFIX)
+            || name.ends_with(STATUS_SUFFIX)
+            || name.ends_with("/head")
+            || name.ends_with("/title")
+        {
             continue;
         }
         let head = fields.next().unwrap_or_default().to_string();
@@ -562,6 +595,290 @@ pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, 
             updated_unix,
         });
     }
+    Ok(conversations)
+}
+
+const USER_CONVERSATION_PREFIX: &str = "refs/caos/users/";
+
+fn conversation_head_ref(id: &str) -> String {
+    format!("{CONV_REF_PREFIX}{id}/head")
+}
+
+fn conversation_title_ref(id: &str) -> String {
+    format!("{CONV_REF_PREFIX}{id}/title")
+}
+
+fn user_conversation_ref(user: &str, status: UserConversationStatus, id: &str) -> String {
+    format!(
+        "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/{id}",
+        status.ref_component()
+    )
+}
+
+fn validate_conversation_user(t: &GitTransport, user: &str) -> Result<(), String> {
+    let refname = user_conversation_ref(user, UserConversationStatus::Active, "conversation");
+    t.git_capture(&["check-ref-format", &refname], None)
+        .map(|_| ())
+        .map_err(|_| format!("invalid conversation user {user:?}"))
+}
+
+fn validate_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+    validated_refname(t, id)?;
+    validate_conversation_user(t, user)
+}
+
+fn validate_conversation_title(title: &str) -> Result<&str, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("conversation title cannot be empty".to_string());
+    }
+    if title.contains(['\n', '\r', '\t']) {
+        return Err("conversation title must be one line".to_string());
+    }
+    Ok(title)
+}
+
+fn remote_refs(
+    t: &GitTransport,
+    patterns: impl IntoIterator<Item = String>,
+) -> Result<HashMap<String, String>, String> {
+    let patterns: Vec<String> = patterns.into_iter().collect();
+    if patterns.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut args = vec![
+        "ls-remote".to_string(),
+        "--refs".to_string(),
+        CAOS_REMOTE.to_string(),
+    ];
+    args.extend(patterns);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = t.git_capture(&refs, None)?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (hash, refname) = line.split_once('\t')?;
+            Some((refname.to_string(), hash.to_string()))
+        })
+        .collect())
+}
+
+/// Publish a local conversation into the server-owned conversation namespace
+/// and mark it active for `user`.
+///
+/// The stable `id` remains in every ref path. Updating `title` changes only its
+/// metadata ref; advancing the conversation changes only its HEAD ref.
+pub fn publish_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+) -> Result<(), String> {
+    validate_user_conversation(t, user, id)?;
+    let title = validate_conversation_title(title)?;
+    let local_ref = validated_refname(t, id)?;
+    let head = rev_parse_opt(t, &local_ref)?
+        .ok_or_else(|| format!("cannot publish conversation {id:?} before its first turn"))?;
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    t.ensure_pushed(&title_hash)?;
+
+    let head_ref = conversation_head_ref(id);
+    let title_ref = conversation_title_ref(id);
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id);
+    let head_update = format!("{head}:{head_ref}");
+    let title_update = format!("+{title_hash}:{title_ref}");
+    let active_update = format!("+{head}:{active_ref}");
+    t.git_capture(
+        &[
+            "push",
+            "--quiet",
+            "--atomic",
+            CAOS_REMOTE,
+            &head_update,
+            &title_update,
+            &active_update,
+        ],
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("publishing conversation {id:?}: {error}"))
+}
+
+/// Change a conversation's shared title without changing its identity or HEAD.
+pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
+    validated_refname(t, id)?;
+    let title = validate_conversation_title(title)?;
+    let hash = t.put_object("blob", title.as_bytes())?.to_string();
+    t.ensure_pushed(&hash)?;
+    let title_ref = conversation_title_ref(id);
+    let update = format!("+{hash}:{title_ref}");
+    t.git_capture(&["push", "--quiet", CAOS_REMOTE, &update], None)
+        .map(|_| ())
+        .map_err(|error| format!("renaming conversation {id:?}: {error}"))
+}
+
+fn move_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    from: UserConversationStatus,
+    to: UserConversationStatus,
+) -> Result<(), String> {
+    validate_user_conversation(t, user, id)?;
+    let from_ref = user_conversation_ref(user, from, id);
+    let to_ref = user_conversation_ref(user, to, id);
+    let refs = remote_refs(t, [from_ref.clone(), to_ref.clone()])?;
+    match (refs.get(&from_ref), refs.get(&to_ref)) {
+        (None, Some(_)) => Ok(()),
+        (None, None) => Err(format!(
+            "conversation {id:?} is not {} for user {user:?}",
+            from.ref_component()
+        )),
+        (Some(_), Some(_)) => Err(format!(
+            "conversation {id:?} is both active and archived for user {user:?}"
+        )),
+        (Some(hash), None) => {
+            let create = format!("{hash}:{to_ref}");
+            let delete = format!(":{from_ref}");
+            t.git_capture(
+                &["push", "--quiet", "--atomic", CAOS_REMOTE, &create, &delete],
+                None,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "moving conversation {id:?} from {} to {}: {error}",
+                    from.ref_component(),
+                    to.ref_component()
+                )
+            })
+        }
+    }
+}
+
+/// Archive one conversation for one user. The canonical HEAD and every other
+/// user's state are untouched.
+pub fn archive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+    move_user_conversation(
+        t,
+        user,
+        id,
+        UserConversationStatus::Active,
+        UserConversationStatus::Archived,
+    )
+}
+
+/// Restore one archived conversation to a user's active list.
+pub fn unarchive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+    move_user_conversation(
+        t,
+        user,
+        id,
+        UserConversationStatus::Archived,
+        UserConversationStatus::Active,
+    )
+}
+
+/// Import legacy local conversation refs into a user's server-side index once.
+///
+/// Existing active or archived entries win, so opening the TUI never
+/// accidentally unarchives a conversation.
+pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(), String> {
+    validate_conversation_user(t, user)?;
+    let active = format!(
+        "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/{}",
+        UserConversationStatus::Active.ref_component(),
+        "*"
+    );
+    let archived = format!(
+        "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/{}",
+        UserConversationStatus::Archived.ref_component(),
+        "*"
+    );
+    let indexed = remote_refs(t, [active, archived])?;
+    for conversation in list_conversations(t)? {
+        validate_user_conversation(t, user, &conversation.name)?;
+        let active_ref =
+            user_conversation_ref(user, UserConversationStatus::Active, &conversation.name);
+        let archived_ref =
+            user_conversation_ref(user, UserConversationStatus::Archived, &conversation.name);
+        if !indexed.contains_key(&active_ref) && !indexed.contains_key(&archived_ref) {
+            publish_user_conversation(t, user, &conversation.name, &conversation.name)?;
+        }
+    }
+    Ok(())
+}
+
+/// List one user's active or archived conversations from authoritative remote
+/// refs, then refresh their local engine refs as a cache for transcript reads.
+pub fn list_user_conversations(
+    t: &GitTransport,
+    user: &str,
+    status: UserConversationStatus,
+) -> Result<Vec<UserConversationSummary>, String> {
+    validate_conversation_user(t, user)?;
+    let prefix = format!(
+        "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/",
+        status.ref_component()
+    );
+    let state_refs = remote_refs(t, [format!("{prefix}*")])?;
+    let ids: Vec<String> = state_refs
+        .keys()
+        .filter_map(|refname| refname.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    for id in &ids {
+        validate_user_conversation(t, user, id)?;
+    }
+
+    let mut metadata = HashMap::new();
+    for chunk in ids.chunks(128) {
+        metadata.extend(remote_refs(
+            t,
+            chunk
+                .iter()
+                .flat_map(|id| [conversation_head_ref(id), conversation_title_ref(id)]),
+        )?);
+    }
+    let mut conversations = Vec::new();
+    for id in ids {
+        let head_ref = conversation_head_ref(&id);
+        let head = metadata
+            .get(&head_ref)
+            .ok_or_else(|| format!("conversation {id:?} has no server HEAD"))?
+            .clone();
+        t.fetch_object(&head)?;
+        let local_ref = validated_refname(t, &id)?;
+        t.git_capture(&["update-ref", &local_ref, &head], None)?;
+
+        let title_ref = conversation_title_ref(&id);
+        let title_hash = metadata
+            .get(&title_ref)
+            .ok_or_else(|| format!("conversation {id:?} has no title"))?;
+        let (kind, title) = t.get_object(title_hash)?;
+        if kind != "blob" {
+            return Err(format!(
+                "conversation title {title_hash} is a {kind}, not a blob"
+            ));
+        }
+        let title = String::from_utf8(title)
+            .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?;
+        let updated_unix = t
+            .git_capture(&["show", "-s", "--format=%ct", &head], None)?
+            .trim()
+            .parse()
+            .map_err(|error| format!("conversation {id:?} has an invalid timestamp: {error}"))?;
+        conversations.push(UserConversationSummary {
+            id,
+            title,
+            head,
+            updated_unix,
+        });
+    }
+    conversations.sort_by(|a, b| {
+        b.updated_unix
+            .cmp(&a.updated_unix)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     Ok(conversations)
 }
 
@@ -1195,6 +1512,61 @@ fn history_from_head(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn conversation_repo() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "caos-user-conversations-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        git(&remote, &["init", "--quiet", "--bare"]);
+        git(&repo, &["config", "user.name", "tester"]);
+        git(&repo, &["config", "user.email", "tester@example.com"]);
+        std::fs::write(repo.join("file"), "one\n").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "--quiet", "-m", "one"]);
+        let first = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("file"), "two\n").unwrap();
+        git(&repo, &["commit", "--quiet", "-am", "two"]);
+        let second = git(&repo, &["rev-parse", "HEAD"]);
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/first", &first],
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/second", &second],
+        );
+        git(
+            &repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        (root, repo)
+    }
 
     #[test]
     fn step_decoding_emits_results_text_and_tool_calls() {
@@ -1271,5 +1643,91 @@ mod tests {
             first_available_conversation_name(["talk-1", "named", "talk-2"]),
             "talk-3"
         );
+    }
+
+    #[test]
+    fn remote_user_state_lists_renames_archives_and_restores_conversations() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+
+        publish_user_conversation(&transport, "alice", "first", "First title").unwrap();
+        publish_user_conversation(&transport, "alice", "second", "Second title").unwrap();
+        publish_user_conversation(&transport, "bob", "first", "First title").unwrap();
+        let first_head = git(&repo, &["rev-parse", "refs/caos/conversations/first"]);
+        let tree = git(&repo, &["rev-parse", &format!("{first_head}^{{tree}}")]);
+        let divergent = git(&repo, &["commit-tree", &tree, "-m", "divergent"]);
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/first", &divergent],
+        );
+        assert!(
+            publish_user_conversation(&transport, "alice", "first", "Conflict").is_err(),
+            "a non-fast-forward conversation HEAD was accepted"
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/first", &first_head],
+        );
+        git(
+            &repo,
+            &["update-ref", "-d", "refs/caos/conversations/first"],
+        );
+        git(
+            &repo,
+            &["update-ref", "-d", "refs/caos/conversations/second"],
+        );
+        let active =
+            list_user_conversations(&transport, "alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|conversation| (conversation.id.as_str(), conversation.title.as_str()))
+                .collect::<Vec<_>>(),
+            [("second", "Second title"), ("first", "First title")]
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/caos/conversations/first"]),
+            active
+                .iter()
+                .find(|conversation| conversation.id == "first")
+                .unwrap()
+                .head
+        );
+
+        set_conversation_title(&transport, "first", "Renamed").unwrap();
+        archive_user_conversation(&transport, "alice", "first").unwrap();
+        assert_eq!(
+            list_user_conversations(&transport, "alice", UserConversationStatus::Active)
+                .unwrap()
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        let archived =
+            list_user_conversations(&transport, "alice", UserConversationStatus::Archived).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "first");
+        assert_eq!(archived[0].title, "Renamed");
+        assert_eq!(
+            list_user_conversations(&transport, "bob", UserConversationStatus::Active)
+                .unwrap()
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+
+        unarchive_user_conversation(&transport, "alice", "first").unwrap();
+        assert_eq!(
+            list_user_conversations(&transport, "alice", UserConversationStatus::Active)
+                .unwrap()
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
