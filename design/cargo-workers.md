@@ -430,8 +430,8 @@ that didn't match its target.
 
 With host builds gone, `gitMinimal` joined the cargo image PATH so the
 workspace's git-spawning unit tests run in the worker instead of `#[ignore]`d:
-the `caos` transport tests and the `caos-tui` workspace tests spawn git against
-local repos, and the `caos-tui` reload test now `git init`s its own throwaway
+the `caos` transport tests and the `caos tui` workspace tests spawn git against
+local repos, and the `caos tui` reload test now `git init`s its own throwaway
 repo (`GitTransport::discover`) rather than assuming cwd is one. `run-tool`
 also prints a failing test's WHOLE output now, not a 40-line tail.
 

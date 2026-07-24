@@ -1,3 +1,5 @@
+//! Terminal rendering.
+
 use ratatui_core::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::terminal::Frame;

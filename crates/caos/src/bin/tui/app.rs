@@ -9,8 +9,8 @@ use caos::chat::{
 use caos::{GitTransport, Transport};
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::args::Args;
-use crate::workspace::{load_conversation_workspace, publish_conversation_pr};
+use super::args::Args;
+use super::workspace::{load_conversation_workspace, publish_conversation_pr};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -1089,7 +1089,7 @@ mod tests {
         // conversation itself is absent, which is the error we're asserting on.
         // (Don't depend on cwd being a repo — the cargo worker's is not.)
         let dir = std::env::temp_dir().join(format!(
-            "caos-tui-reload-{}-{}",
+            "caos-cli-tui-reload-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

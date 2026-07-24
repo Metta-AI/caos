@@ -1,6 +1,6 @@
-# caos-tui
+# `caos tui`
 
-`caos-tui` is a full-screen terminal client for the CAOS agent harness. It uses
+`caos tui` is a full-screen terminal client for the CAOS agent harness. It uses
 the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
@@ -17,16 +17,16 @@ CAOS server:
 
 ```bash
 git remote add caos http://localhost:9090
-nix build .#caos-tui
-./result/bin/caos-tui
+nix build
+./result/bin/caos tui
 ```
 
-During development, it can also be launched with `cargo run -p caos-tui`.
+During development, launch it with `cargo run -p caos --bin caos-cli -- tui`.
 
 ```text
-caos-tui                  continue the most recent conversation
-caos-tui --new            start a fresh conversation
-caos-tui --from 5ec3751   branch from a completed turn
+caos tui                  continue the most recent conversation
+caos tui --new            start a fresh conversation
+caos tui --from 5ec3751   branch from a completed turn
 ```
 
 ## Controls
