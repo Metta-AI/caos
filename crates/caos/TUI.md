@@ -75,6 +75,9 @@ conversation ID or HEAD. Activity entries show the durable hashes of internal
 harness steps for inspection; those step trees contain harness metadata and are
 not branch points.
 
+Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
+remain visible, and marker-like text inside inline backticks is left literal.
+
 A fresh conversation starts with a temporary `talk-N` title. Its first prompt
 automatically becomes a whitespace-collapsed title of at most 60 characters.
 Using `/title` before the first prompt keeps that explicit title instead.

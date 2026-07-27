@@ -216,10 +216,116 @@ fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
             ));
         }
         lines.push(Line::from(heading));
-        lines.extend(entry.text.lines().map(|line| Line::raw(line.to_string())));
+        lines.extend(entry.text.lines().map(inline_markdown_line));
         lines.push(Line::raw(""));
     }
     Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
+fn inline_markdown_line(text: &str) -> Line<'static> {
+    Line::from(inline_markdown_spans(text, Style::default()))
+}
+
+fn inline_markdown_spans(text: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut index = 0;
+
+    while index < text.len() {
+        let rest = &text[index..];
+        if let Some(after_tick) = rest.strip_prefix('`') {
+            if let Some(end) = after_tick.find('`') {
+                let end = index + end + 2;
+                plain.push_str(&text[index..end]);
+                index = end;
+                continue;
+            }
+        }
+        if rest.starts_with("**")
+            && text[index + 2..]
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_whitespace())
+        {
+            if let Some(end) =
+                find_closing_marker(text, index + 2, "**", |before, _| !before.is_whitespace())
+            {
+                push_plain(&mut spans, &mut plain, style);
+                spans.extend(inline_markdown_spans(
+                    &text[index + 2..end],
+                    style.add_modifier(Modifier::BOLD),
+                ));
+                index = end + 2;
+                continue;
+            }
+        }
+        if rest.starts_with('_') && underscore_can_open(text, index) {
+            if let Some(end) = find_closing_marker(text, index + 1, "_", |before, after| {
+                !before.is_whitespace()
+                    && before != '_'
+                    && after.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+            }) {
+                push_plain(&mut spans, &mut plain, style);
+                spans.extend(inline_markdown_spans(
+                    &text[index + 1..end],
+                    style.add_modifier(Modifier::ITALIC),
+                ));
+                index = end + 1;
+                continue;
+            }
+        }
+
+        let ch = rest.chars().next().expect("index is within text");
+        plain.push(ch);
+        index += ch.len_utf8();
+    }
+
+    push_plain(&mut spans, &mut plain, style);
+    spans
+}
+
+fn find_closing_marker(
+    text: &str,
+    mut index: usize,
+    marker: &str,
+    can_close: impl Fn(char, Option<char>) -> bool,
+) -> Option<usize> {
+    let content_start = index;
+    while index < text.len() {
+        let rest = &text[index..];
+        if let Some(after_tick) = rest.strip_prefix('`') {
+            if let Some(end) = after_tick.find('`') {
+                index += end + 2;
+                continue;
+            }
+        }
+        if index > content_start && rest.starts_with(marker) {
+            let before = text[..index]
+                .chars()
+                .next_back()
+                .expect("closing marker follows content");
+            let after = text[index + marker.len()..].chars().next();
+            if can_close(before, after) {
+                return Some(index);
+            }
+        }
+        let ch = rest.chars().next().expect("index is within text");
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn underscore_can_open(text: &str, index: usize) -> bool {
+    let before = text[..index].chars().next_back();
+    let after = text[index + 1..].chars().next();
+    before.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        && after.is_some_and(|ch| !ch.is_whitespace() && ch != '_')
+}
+
+fn push_plain(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
+    if !plain.is_empty() {
+        spans.push(Span::styled(std::mem::take(plain), style));
+    }
 }
 
 fn transcript_inner(area: Rect) -> Rect {
@@ -649,4 +755,43 @@ pub(crate) fn scroll_offset(line_count: usize, height: u16, from_bottom: usize) 
         .saturating_sub(visible)
         .saturating_sub(from_bottom)
         .min(u16::MAX as usize) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_markdown_styles_bold_italic_and_nested_emphasis() {
+        assert_eq!(
+            inline_markdown_line("plain **bold _and italic_**"),
+            Line::from(vec![
+                Span::raw("plain "),
+                Span::styled("bold ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "and italic",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn inline_markdown_preserves_unmatched_and_intraword_markers() {
+        assert_eq!(
+            inline_markdown_line("**open _still open snake_case __literal__"),
+            Line::raw("**open _still open snake_case __literal__")
+        );
+    }
+
+    #[test]
+    fn inline_markdown_does_not_parse_markers_inside_backticks() {
+        assert_eq!(
+            inline_markdown_line("`**not bold** _not italic_` and **bold**"),
+            Line::from(vec![
+                Span::raw("`**not bold** _not italic_` and "),
+                Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
+            ])
+        );
+    }
 }
