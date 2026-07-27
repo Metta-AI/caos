@@ -200,59 +200,25 @@
 
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
         # — the one image the flake path can't build (it IS the flake path),
-        # so the host builds it; its definition just lives here rather than in
-        # a flake tree. One self-contained worker — nix + skopeo + jq + caos —
-        # whose one `--stage` script (images/flake-builder.sh)
+        # so the host builds it. Its DEFINITION lives in its std directory
+        # (std/flake-builder/image.nix — the /worker stage script + what the
+        # bare nixos/nix base lacks), imported here and wrapped with the caos
+        # additions; its one `--stage` script (std/flake-builder/worker)
         # `nix build`s a flake's `#caosImage`, streams the CLEAN image to the
         # registry, then stacks a caos runner delta. build-builtins.sh composes
-        # this tarball onto stock `docker://nixos/nix` with `docker build` and
-        # streams THAT to the registry too — nix + its store ride as stock
-        # registry layers and our delta as pushed blobs, never through git. We
-        # bake only what the bare nix base lacks: the /worker script, skopeo
-        # (push + inspect — a general flake makes no `#skopeo` promise), jq (to
-        # massage the returned config), and bash/coreutils/gzip. nix comes from
-        # the base's profile (PATH).
-        workerFlakeBuilderScript = pkgs.writeTextFile {
-          name = "caos-worker-flake-builder-script";
-          executable = true;
-          destination = "/worker";
-          text = builtins.readFile ./images/flake-builder.sh;
-        };
-        workerFlakeBuilderRoot = pkgs.buildEnv {
-          name = "caos-worker-flake-builder-root";
-          paths = [
-            workerFlakeBuilderScript
-            linuxPkgs.bashInteractive
-            linuxPkgs.coreutils
-            linuxPkgs.gzip
-            linuxPkgs.skopeo
-            linuxPkgs.jq
-          ];
-        };
+        # this tarball onto stock `docker://nixos/nix` (pinned in
+        # std/flake-builder/base.ref) with `docker build` and streams THAT to
+        # the registry too — nix + its store ride as stock registry layers and
+        # our delta as pushed blobs, never through git.
+        flakeBuilderDef = import ./std/flake-builder/image.nix { pkgs = linuxPkgs; };
         workerFlakeBuilderImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-flake-builder";
           tag = "latest";
           contents = [
-            workerFlakeBuilderRoot
+            flakeBuilderDef.root
             workerBaseRoot
           ];
-          config = {
-            Entrypoint = [
-              "/bin/caos"
-              "runner"
-            ];
-            Env = [
-              # nix from the nixos/nix base's profile; caos, skopeo, bash,
-              # coreutils, gzip from our baked /bin. The git-docker convert
-              # builds this image's config from our own config.json (it does not
-              # merge the base's env), so the nix profile paths must be explicit.
-              "PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/bin"
-              # Root: the base's nix store is root-owned (the same per-image
-              # containment grant the test nixbuilder and testenv carry).
-              "CAOS_WORKER_UID=0"
-              "CAOS_WORKER_GID=0"
-            ];
-          };
+          config = flakeBuilderDef.config;
           fakeRootCommands = installWorkerFiles;
         };
 

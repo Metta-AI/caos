@@ -150,11 +150,11 @@ for name in "${image_names[@]}"; do
     tar -xzf "$tarball" -C "$ctx"
     cfg=$(jq -r '.[0].Config' "$ctx/manifest.json")
     # The flake-builder composes onto stock nixos/nix (pinned by digest in
-    # images/nix-base.ref) so nix and its store stay stock registry layers,
+    # std/flake-builder/base.ref) so nix and its store stay stock registry layers,
     # shared with every other consumer. The runner is self-contained — its
     # nix-built userland IS the image — so it builds FROM scratch.
     case "$name" in
-    flake-builder) from=$(cat "$PROJECT/images/nix-base.ref") ;;
+    flake-builder) from=$(cat "$PROJECT/std/flake-builder/base.ref") ;;
     runner) from=scratch ;;
     *) echo "build-builtins: no stream base for $name" >&2; exit 1 ;;
     esac

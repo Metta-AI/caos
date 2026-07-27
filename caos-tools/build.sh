@@ -36,6 +36,7 @@ caos get /cas/args/in
 caos get /cas/args/in/images
 caos get /cas/args/in/std
 caos get /cas/args/in/std/bash
+caos get /cas/args/in/std/flake-builder
 caos get /cas/args/in/caos-tools
 caos get /cas/args/in/caos-tools/lib
 LIB=/cas/args/in/caos-tools/lib
@@ -51,7 +52,7 @@ spec() { # <name> <base ref blob> <worker source path>
 }
 spec runner /cas/args/in/images/debian-base.ref /cas/bin/worker-runner
 spec bash /cas/args/in/images/debian-base.ref /cas/args/in/std/bash/worker
-spec nixbuilder /cas/args/in/images/nix-base.ref /cas/args/in/std/bash/worker
+spec nixbuilder /cas/args/in/std/flake-builder/base.ref /cas/args/in/std/bash/worker
 
 # runner and bash are part of the test stack but nixbuilder is part of the
 # host stack and is used to build other parts of the test stack. As such,

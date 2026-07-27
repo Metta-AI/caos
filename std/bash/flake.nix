@@ -7,7 +7,7 @@
   # the shell and file tools a worker script leans on. Curry a script on
   # (`--worker1:@=…`) and run it like any image.
   #
-  # The contract (images/flake-builder.sh): a flake defines everything about
+  # The contract (std/flake-builder/worker): a flake defines everything about
   # the image except the caos additions. /worker included.
   #
   # This directory IS the published tree (literal trees, part 2): flake.nix,
