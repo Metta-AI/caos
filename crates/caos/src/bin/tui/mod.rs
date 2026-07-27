@@ -7,7 +7,9 @@ use caos::chat::{
 };
 use caos::GitTransport;
 use ratatui_core::terminal::Terminal;
-use ratatui_crossterm::crossterm::event::{self, Event as TerminalEvent};
+use ratatui_crossterm::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent,
+};
 use ratatui_crossterm::crossterm::execute;
 use ratatui_crossterm::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -70,11 +72,11 @@ fn selection_lock_allows_redraw(was_locked: bool, is_locked: bool) -> bool {
 }
 
 fn enter_screen(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(writer, EnterAlternateScreen)
+    execute!(writer, EnterAlternateScreen, EnableBracketedPaste)
 }
 
 fn leave_screen(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(writer, LeaveAlternateScreen)
+    execute!(writer, DisableBracketedPaste, LeaveAlternateScreen)
 }
 
 pub(crate) fn run(raw: &[String]) -> Result<(), String> {
@@ -139,7 +141,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_lifecycle_does_not_enable_mouse_capture() {
+    fn terminal_lifecycle_enables_bracketed_paste_without_mouse_capture() {
         let mut output = Vec::new();
         enter_screen(&mut output).unwrap();
         leave_screen(&mut output).unwrap();
@@ -147,6 +149,9 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("\u{1b}[?1049h"));
         assert!(output.contains("\u{1b}[?1049l"));
+        assert!(output.contains("\u{1b}[?2004h"));
+        assert!(output.contains("\u{1b}[?2004l"));
+        assert!(output.find("\u{1b}[?2004h") < output.find("\u{1b}[?2004l"));
         assert!(!output.contains("\u{1b}[?1000h"));
         assert!(!output.contains("\u{1b}[?1002h"));
         assert!(!output.contains("\u{1b}[?1003h"));
