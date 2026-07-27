@@ -16,6 +16,8 @@ use super::{
 };
 use caos::chat::TurnPhase;
 
+pub(super) const ACTIVITY_INDICATORS: [&str; 4] = ["·", "✦", "✽", "✦"];
+
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let state = app.selected();
     let areas = layout(state, app.view == View::Chat, frame.area());
@@ -23,7 +25,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_header(app, state, frame, areas.header);
     render_conversations(app, frame, areas.sidebar);
     match app.view {
-        View::Chat => render_chat(state, frame, areas.content),
+        View::Chat => render_chat(state, app.animation_frame, frame, areas.content),
         View::Activity => render_activity_browser(state, frame, areas.content),
         View::Diff => render_diff(state, frame, areas.content),
         View::Tools => render_tools(state, frame, areas.content),
@@ -91,6 +93,26 @@ pub(super) fn content_contains(
     layout(state, false, area)
         .content
         .contains(Position::new(column, row))
+}
+
+fn conversation_list_offset(selected: usize, count: usize, height: u16) -> usize {
+    let visible = (height as usize / 2).max(1);
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(count.saturating_sub(visible))
+}
+
+pub(super) fn conversation_at(app: &App, terminal: Rect, column: u16, row: u16) -> Option<usize> {
+    let areas = layout(app.selected(), app.view == View::Chat, terminal);
+    let inner = Block::default().borders(Borders::ALL).inner(areas.sidebar);
+    let position = Position::new(column, row);
+    if !inner.contains(position) {
+        return None;
+    }
+    let offset = conversation_list_offset(app.selected, app.conversations.len(), inner.height);
+    let index = offset + ((row - inner.y) / 2) as usize;
+    (index < app.conversations.len()).then_some(index)
 }
 
 fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
@@ -194,7 +216,11 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ])
         })
         .collect();
-    let mut selected = ListState::default().with_selected(Some(app.selected));
+    let inner_height = Block::default().borders(Borders::ALL).inner(area).height;
+    let offset = conversation_list_offset(app.selected, app.conversations.len(), inner_height);
+    let mut selected = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(app.selected));
     frame.render_stateful_widget(
         List::new(items)
             .block(
@@ -213,15 +239,25 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_chat(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_chat(
+    state: &ConversationState,
+    animation_frame: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     let (transcript, activity) = chat_areas(state, area);
     render_transcript(state, frame, transcript);
     if let Some(activity) = activity {
-        render_live_activity(state, frame, activity);
+        render_live_activity(state, animation_frame, frame, activity);
     }
 }
 
-fn render_live_activity(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_live_activity(
+    state: &ConversationState,
+    animation_frame: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     let (verb, summary) = if state.publishing {
         ("Publishing", state.status.as_str())
     } else if let Some(activity) = state.running_activity() {
@@ -238,7 +274,7 @@ fn render_live_activity(state: &ConversationState, frame: &mut Frame<'_>, area: 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                format!("✽ {verb}…"),
+                format!("{} {verb}…", ACTIVITY_INDICATORS[animation_frame]),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

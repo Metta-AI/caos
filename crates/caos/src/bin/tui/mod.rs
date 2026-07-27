@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caos::chat::{
     list_user_conversations, publish_unindexed_conversations, unarchive_user_conversation,
@@ -28,6 +28,7 @@ use app::{ui::render, App, MouseAction, View};
 use args::{usage, Args};
 
 const TICK: Duration = Duration::from_millis(50);
+const ANIMATION_TICK: Duration = Duration::from_millis(250);
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -36,6 +37,7 @@ fn run_app(
     terminal
         .draw(|frame| render(app, frame))
         .map_err(|error| format!("drawing terminal: {error}"))?;
+    let mut next_animation = Instant::now() + ANIMATION_TICK;
     while !app.should_quit() {
         // Selection lock deliberately freezes the frame: background turn messages
         // remain queued so redraws cannot invalidate a native terminal
@@ -45,6 +47,15 @@ fn run_app(
         } else {
             app.drain_messages()
         };
+        let now = Instant::now();
+        let animating = app.has_visible_animation();
+        if !app.selection_locked() && animating && now >= next_animation {
+            app.advance_animation();
+            next_animation = now + ANIMATION_TICK;
+            changed = true;
+        } else if !animating {
+            next_animation = now + ANIMATION_TICK;
+        }
         if event::poll(TICK).map_err(|error| format!("polling terminal input: {error}"))? {
             match event::read().map_err(|error| format!("reading terminal input: {error}"))? {
                 TerminalEvent::Key(key) => {
