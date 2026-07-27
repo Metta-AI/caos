@@ -54,10 +54,11 @@ time that user opens the TUI.
 | `Ctrl+W` | Archive the selected conversation for this user |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Show the tools available to the selected conversation |
-| `Ctrl+A` | Expand or collapse live Activity above the prompt |
+| `Ctrl+A` | Show or hide full-height live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
-| Mouse drag | Select text using the terminal's native selection |
-| `Ctrl+Y` | Freeze or resume redraws while selecting text |
+| Mouse wheel over the transcript | Scroll the conversation by rendered rows |
+| `Shift`+mouse drag | Use the terminal's native selection when supported |
+| `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
@@ -96,13 +97,17 @@ unsent virtual conversation simply discards it. Use `--list-archived` and
 `--unarchive <conversation-id>` outside the full-screen UI to recover old
 conversations.
 
-Mouse capture is disabled, so dragging across visible text uses the terminal's
-native selection without entering a special mode. Use the terminal's normal
-copy shortcut (`Cmd+C` on macOS or usually `Ctrl+Shift+C` elsewhere).
-If a conversation is still producing output, press `Ctrl+Y` first to freeze
-redraws and keep the selection stable, then press `Ctrl+Y` or `Escape` to
-resume the live interface. Use `PageUp` and `PageDown` for in-app scrolling;
-mouse-wheel scrolling is intentionally left to the terminal.
+The transcript fills the conversation pane above the fixed composer. Use
+`PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
+Scrolling up pauses tail-follow until the viewport returns to the bottom.
+
+Mouse-wheel routing requires terminal mouse capture, which also intercepts
+ordinary drag selection. Hold `Shift` while dragging if the terminal supports
+the conventional native-selection override. For a reliable native selection,
+press `Ctrl+Y`: CAOS releases mouse capture and freezes redraws, so dragging and
+the terminal's normal copy shortcut (`Cmd+C` on macOS or usually
+`Ctrl+Shift+C` elsewhere) work without moving output. Press `Ctrl+Y` or
+`Escape` to resume.
 
 ## Workspace safety
 
