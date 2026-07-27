@@ -142,6 +142,7 @@ impl TranscriptSelection {
 struct Composer {
     text: String,
     cursor: usize,
+    selection_anchor: Option<usize>,
     pending_pastes: Vec<PendingPaste>,
     command_selection: usize,
     command_menu_dismissed: bool,
@@ -149,6 +150,7 @@ struct Composer {
 
 impl Composer {
     fn insert_char(&mut self, ch: char) {
+        self.delete_selection();
         self.snap_cursor_after_placeholder();
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
@@ -156,6 +158,7 @@ impl Composer {
     }
 
     fn insert_str(&mut self, text: &str) {
+        self.delete_selection();
         self.snap_cursor_after_placeholder();
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
@@ -178,6 +181,9 @@ impl Composer {
     }
 
     fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -190,6 +196,9 @@ impl Composer {
     }
 
     fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let Some(ch) = self.text[self.cursor..].chars().next() else {
             return;
         };
@@ -197,47 +206,98 @@ impl Composer {
     }
 
     fn move_left(&mut self) {
+        if let Some((start, _)) = self.selection_range() {
+            self.cursor = start;
+            self.selection_anchor = None;
+            return;
+        }
+        self.move_cursor(self.previous_cursor(), false);
+    }
+
+    fn select_left(&mut self) {
+        self.move_cursor(self.previous_cursor(), true);
+    }
+
+    fn previous_cursor(&self) -> usize {
         if let Some((start, _)) = self
             .paste_ranges()
             .into_iter()
             .find(|(start, end)| self.cursor > *start && self.cursor <= *end)
         {
-            self.cursor = start;
-            return;
+            return start;
         }
-        if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.cursor = index;
-        }
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(self.cursor)
     }
 
     fn move_right(&mut self) {
+        if let Some((_, end)) = self.selection_range() {
+            self.cursor = end;
+            self.selection_anchor = None;
+            return;
+        }
+        self.move_cursor(self.next_cursor(), false);
+    }
+
+    fn select_right(&mut self) {
+        self.move_cursor(self.next_cursor(), true);
+    }
+
+    fn next_cursor(&self) -> usize {
         if let Some((_, end)) = self
             .paste_ranges()
             .into_iter()
             .find(|(start, end)| self.cursor >= *start && self.cursor < *end)
         {
-            self.cursor = end;
-            return;
+            return end;
         }
-        if let Some(ch) = self.text[self.cursor..].chars().next() {
-            self.cursor += ch.len_utf8();
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+            .unwrap_or(self.cursor)
+    }
+
+    fn move_cursor(&mut self, target: usize, selecting: bool) {
+        if selecting {
+            self.selection_anchor.get_or_insert(self.cursor);
+        } else {
+            self.selection_anchor = None;
         }
+        self.cursor = target;
     }
 
     fn move_word_left(&mut self) {
-        self.cursor = self.word_left();
+        self.move_cursor(self.word_left(), false);
+    }
+
+    fn select_word_left(&mut self) {
+        self.move_cursor(self.word_left(), true);
     }
 
     fn move_word_right(&mut self) {
-        self.cursor = self.word_right();
+        self.move_cursor(self.word_right(), false);
+    }
+
+    fn select_word_right(&mut self) {
+        self.move_cursor(self.word_right(), true);
     }
 
     fn delete_word_left(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let start = self.word_left();
         self.delete_range(start, self.cursor);
     }
 
     fn delete_word_right(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let end = self.word_right();
         self.delete_range(self.cursor, end);
     }
@@ -283,14 +343,23 @@ impl Composer {
     }
 
     fn move_home(&mut self) {
-        self.cursor = self.line_bounds().0;
+        self.move_cursor(self.line_bounds().0, false);
+    }
+
+    fn select_home(&mut self) {
+        self.move_cursor(self.line_bounds().0, true);
     }
 
     fn move_end(&mut self) {
-        self.cursor = self.line_bounds().1;
+        self.move_cursor(self.line_bounds().1, false);
+    }
+
+    fn select_end(&mut self) {
+        self.move_cursor(self.line_bounds().1, true);
     }
 
     fn move_vertical(&mut self, up: bool) {
+        self.selection_anchor = None;
         let (start, end) = self.line_bounds();
         let column = self.text[start..self.cursor].chars().count();
         let target = if up {
@@ -345,6 +414,7 @@ impl Composer {
         }
         self.text.clear();
         self.cursor = 0;
+        self.selection_anchor = None;
         self.pending_pastes.clear();
         self.reset_command_menu();
         true
@@ -424,9 +494,35 @@ impl Composer {
         }
         self.text.drain(start..end);
         self.cursor = start;
+        self.selection_anchor = None;
         self.pending_pastes
             .retain(|paste| self.text.contains(&paste.placeholder));
         self.reset_command_menu();
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        (anchor != self.cursor).then_some({
+            if anchor < self.cursor {
+                (anchor, self.cursor)
+            } else {
+                (self.cursor, anchor)
+            }
+        })
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.selection_range()
+            .map(|(start, end)| &self.text[start..end])
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            self.selection_anchor = None;
+            return false;
+        };
+        self.delete_range(start, end);
+        true
     }
 
     fn command_token(&self) -> Option<&str> {
@@ -470,6 +566,7 @@ impl Composer {
             .unwrap_or(self.text.len());
         self.text.replace_range(..token_end, command.name);
         self.cursor = command.name.len();
+        self.selection_anchor = None;
         if let Some(ch) = self.text[self.cursor..].chars().next() {
             self.cursor += ch.len_utf8();
         } else {
@@ -1266,6 +1363,40 @@ impl App {
             KeyCode::PageUp => self.scroll_up(8),
             KeyCode::PageDown => self.scroll_down(8),
             _ if self.view != View::Chat => {}
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+            {
+                self.selected_mut().composer.select_home()
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+            {
+                self.selected_mut().composer.select_end()
+            }
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.selected_mut().composer.select_word_left()
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.selected_mut().composer.select_word_right()
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.selected_mut().composer.move_home()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.selected_mut().composer.move_end()
+            }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.selected_mut().composer.move_word_left()
             }
@@ -1301,11 +1432,21 @@ impl App {
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
                 self.selected_mut().composer.insert_char(ch)
             }
             KeyCode::Backspace => self.selected_mut().composer.backspace(),
             KeyCode::Delete => self.selected_mut().composer.delete(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_left()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_right()
+            }
             KeyCode::Left => self.selected_mut().composer.move_left(),
             KeyCode::Right => self.selected_mut().composer.move_right(),
             KeyCode::Up => {
@@ -1318,10 +1459,20 @@ impl App {
                     self.selected_mut().composer.move_vertical(false);
                 }
             }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_home()
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_end()
+            }
             KeyCode::Home => self.selected_mut().composer.move_home(),
             KeyCode::End => self.selected_mut().composer.move_end(),
             _ => {}
         }
+    }
+
+    pub(crate) fn selected_composer_text(&self) -> Option<&str> {
+        self.selected().composer.selected_text()
     }
 
     pub(crate) fn scroll_up(&mut self, rows: usize) {
@@ -2051,6 +2202,60 @@ mod tests {
         assert_eq!(app.selected().composer.text, "one  ");
         app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
         assert_eq!(app.selected().composer.text, "");
+    }
+
+    #[test]
+    fn command_arrows_move_to_line_boundaries() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("first\nsecond");
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER));
+        assert_eq!(app.selected().composer.cursor_row_col(), (1, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(app.selected().composer.cursor_row_col(), (1, 6));
+    }
+
+    #[test]
+    fn shifted_command_and_option_arrows_select_composer_text() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("one two\nthree");
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::SUPER,
+        ));
+        assert_eq!(
+            app.selected().composer.selection_range(),
+            Some((8, app.selected().composer.text.len()))
+        );
+        assert_eq!(app.selected_composer_text(), Some("three"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "one two\nx");
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.selected().composer.selection_range(), Some((8, 9)));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "one two\n");
+    }
+
+    #[test]
+    fn plain_arrows_collapse_composer_selections() {
+        let mut composer = Composer::default();
+        composer.insert_str("one two");
+        composer.select_word_left();
+        assert_eq!(composer.selection_range(), Some((4, 7)));
+
+        composer.move_left();
+        assert_eq!(composer.cursor, 4);
+        assert_eq!(composer.selection_range(), None);
+
+        composer.select_word_right();
+        composer.move_right();
+        assert_eq!(composer.cursor, 7);
+        assert_eq!(composer.selection_range(), None);
     }
 
     #[test]
