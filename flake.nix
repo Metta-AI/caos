@@ -652,7 +652,11 @@
           # flake's lock at publish (std/cargo/stage-tree.sh). tar: it
           # unpacks the flake-builder tarball to stream it to the registry.
           # docker rides in from the host PATH (caosd already requires it).
-          runtimeInputs = [ pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.jq pkgs.gnutar ];
+          # util-linux: setsid, so a hung compose up dies as a whole group.
+          runtimeInputs = [
+            pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.jq pkgs.gnutar
+            pkgs.util-linux
+          ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
@@ -660,6 +664,44 @@
             mkdir -p "$CAOS_DATA"
 
             compose() { docker compose -f ${composeFile} "$@"; }
+
+            # `compose up -d` can hang FOREVER: podman-compose implements
+            # depends_on as `podman wait --condition=running <dep>`, which
+            # never returns if that dep failed to start (e.g. a missing
+            # bind-mount source) — it prints "Error: …" for the failed
+            # start and presses on to hang on the dependents. So bring-up
+            # runs in its own process group with its output watched: an
+            # Error line kills it within a second (a deadline backstops
+            # errorless hangs), and every failure dies loudly with each
+            # container's state — State.Error carries the runtime's reason.
+            compose_up() {
+              local log; log=$(mktemp)
+              setsid docker compose -f ${composeFile} up -d "$@" >"$log" 2>&1 &
+              local pid=$! deadline=$((SECONDS + 120))
+              fail() {
+                echo "caosd: $1 — killing compose up" >&2
+                kill -TERM -- "-$pid" 2>/dev/null || true
+                cat "$log" >&2
+                compose_up_diagnose
+              }
+              while kill -0 "$pid" 2>/dev/null; do
+                grep -q "^Error" "$log" && fail "bring-up reported an error"
+                [ "$SECONDS" -ge "$deadline" ] && fail "bring-up hung for 120s"
+                sleep 1
+              done
+              cat "$log" >&2
+              wait "$pid" || compose_up_diagnose
+            }
+            compose_up_diagnose() {
+              echo "caosd: stack bring-up failed; container states:" >&2
+              local c
+              for c in caos-redis caos-registry caos-server caos-runnerd; do
+                docker inspect \
+                  -f "  $c: {{.State.Status}} {{.State.Error}}" "$c" >&2 \
+                  2>/dev/null || echo "  $c: not created" >&2
+              done
+              exit 1
+            }
 
             case "''${1:-up}" in
             up)
@@ -714,13 +756,13 @@
               # it creates only what's missing. No teardown trap — `up` returns with
               # the stack still up (stop it with `caosd down`).
               echo "==> starting stack (redis, registry, server, runnerd)" >&2
-              compose up -d
+              compose_up
               # Recreate exactly the services running a stale image — nothing else,
               # so an unchanged `up` (and a freshly-created stack) keeps its
               # containers in place.
               if [ "''${#stale[@]}" -gt 0 ]; then
                 echo "==> recreating onto rebuilt image(s): ''${stale[*]}" >&2
-                compose up -d --force-recreate "''${stale[@]}"
+                compose_up --force-recreate "''${stale[@]}"
               fi
 
               # The server self-bootstraps an empty /git on first boot; wait for it,
