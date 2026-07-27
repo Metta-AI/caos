@@ -7,9 +7,7 @@ use caos::chat::{
 };
 use caos::GitTransport;
 use ratatui_core::terminal::Terminal;
-use ratatui_crossterm::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, MouseEventKind,
-};
+use ratatui_crossterm::crossterm::event::{self, Event as TerminalEvent};
 use ratatui_crossterm::crossterm::execute;
 use ratatui_crossterm::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -33,10 +31,10 @@ fn run_app(
         .draw(|frame| render(app, frame))
         .map_err(|error| format!("drawing terminal: {error}"))?;
     while !app.should_quit() {
-        // Copy mode deliberately freezes the frame: background turn messages
+        // Selection lock deliberately freezes the frame: background turn messages
         // remain queued so redraws cannot invalidate a native terminal
-        // selection. They are drained immediately when copy mode ends.
-        let mut changed = if app.copy_mode() {
+        // selection. They are drained immediately when the lock ends.
+        let mut changed = if app.selection_locked() {
             false
         } else {
             app.drain_messages()
@@ -44,34 +42,17 @@ fn run_app(
         if event::poll(TICK).map_err(|error| format!("polling terminal input: {error}"))? {
             match event::read().map_err(|error| format!("reading terminal input: {error}"))? {
                 TerminalEvent::Key(key) => {
-                    let was_copy_mode = app.copy_mode();
+                    let was_locked = app.selection_locked();
                     app.handle_key(key);
-                    if was_copy_mode != app.copy_mode() {
-                        if app.copy_mode() {
-                            execute!(terminal.backend_mut(), DisableMouseCapture)
-                        } else {
-                            execute!(terminal.backend_mut(), EnableMouseCapture)
-                        }
-                        .map_err(|error| format!("switching terminal copy mode: {error}"))?;
-                    }
-                    changed = true;
+                    changed |= selection_lock_allows_redraw(was_locked, app.selection_locked());
                 }
-                TerminalEvent::Paste(text) if app.view() == View::Chat && !app.copy_mode() => {
+                TerminalEvent::Paste(text)
+                    if app.view() == View::Chat && !app.selection_locked() =>
+                {
                     app.insert_paste(&text);
                     changed = true;
                 }
-                TerminalEvent::Mouse(mouse) if !app.copy_mode() => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.scroll_up(3);
-                        changed = true;
-                    }
-                    MouseEventKind::ScrollDown => {
-                        app.scroll_down(3);
-                        changed = true;
-                    }
-                    _ => {}
-                },
-                TerminalEvent::Resize(_, _) if !app.copy_mode() => changed = true,
+                TerminalEvent::Resize(_, _) if !app.selection_locked() => changed = true,
                 _ => {}
             }
         }
@@ -82,6 +63,18 @@ fn run_app(
         }
     }
     Ok(())
+}
+
+fn selection_lock_allows_redraw(was_locked: bool, is_locked: bool) -> bool {
+    !is_locked || was_locked != is_locked
+}
+
+fn enter_screen(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, EnterAlternateScreen)
+}
+
+fn leave_screen(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, LeaveAlternateScreen)
 }
 
 pub(crate) fn run(raw: &[String]) -> Result<(), String> {
@@ -115,9 +108,9 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
 
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+    if let Err(error) = enter_screen(&mut stdout) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = leave_screen(&mut stdout);
         return Err(format!("entering alternate screen: {error}"));
     }
     let backend = CrosstermBackend::new(stdout);
@@ -125,22 +118,47 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
         Ok(terminal) => terminal,
         Err(error) => {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = leave_screen(&mut io::stdout());
             return Err(format!("initializing terminal: {error}"));
         }
     };
     let result = run_app(&mut terminal, &mut app);
 
     let raw_result = disable_raw_mode().map_err(|error| error.to_string());
-    let screen_result = execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )
-    .and_then(|()| terminal.show_cursor())
-    .map_err(|error| error.to_string());
+    let screen_result = leave_screen(terminal.backend_mut())
+        .and_then(|()| terminal.show_cursor())
+        .map_err(|error| error.to_string());
     result?;
     raw_result.map_err(|error| format!("restoring terminal mode: {error}"))?;
     screen_result.map_err(|error| format!("leaving alternate screen: {error}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_lifecycle_does_not_enable_mouse_capture() {
+        let mut output = Vec::new();
+        enter_screen(&mut output).unwrap();
+        leave_screen(&mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\u{1b}[?1049h"));
+        assert!(output.contains("\u{1b}[?1049l"));
+        assert!(!output.contains("\u{1b}[?1000h"));
+        assert!(!output.contains("\u{1b}[?1002h"));
+        assert!(!output.contains("\u{1b}[?1003h"));
+        assert!(!output.contains("\u{1b}[?1006h"));
+        assert!(!output.contains("\u{1b}[?1015h"));
+    }
+
+    #[test]
+    fn selection_lock_redraws_only_when_entering_or_leaving() {
+        assert!(selection_lock_allows_redraw(false, false));
+        assert!(selection_lock_allows_redraw(false, true));
+        assert!(!selection_lock_allows_redraw(true, true));
+        assert!(selection_lock_allows_redraw(true, false));
+    }
 }
