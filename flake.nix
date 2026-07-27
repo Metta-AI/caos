@@ -197,15 +197,12 @@
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
         # — the one image the flake path can't build (it IS the flake path),
         # so the host builds it. Its DEFINITION lives in its std directory
-        # (std/flake-builder/image.nix — the /worker stage script + what the
-        # bare nixos/nix base lacks), imported here and wrapped with the caos
-        # additions; its one `--stage` script (std/flake-builder/worker)
+        # (std/flake-builder/{image.nix, flake.nix, worker} — self-contained:
+        # nix, certs, tools, the /worker stage script), imported here and
+        # wrapped with the caos additions; build-builtins.sh streams the
+        # tarball FROM scratch, like the runner's. The stage script
         # `nix build`s a flake's `#caosImage`, streams the CLEAN image to the
-        # registry, then stacks a caos runner delta. build-builtins.sh composes
-        # this tarball onto stock `docker://nixos/nix` (pinned in
-        # std/flake-builder/base.ref) with `docker build` and streams THAT to
-        # the registry too — nix + its store ride as stock registry layers and
-        # our delta as pushed blobs, never through git.
+        # registry, then stacks a caos runner delta.
         flakeBuilderDef = import ./std/flake-builder/image.nix { pkgs = linuxPkgs; };
         workerFlakeBuilderImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-flake-builder";
@@ -215,6 +212,9 @@
             workerBaseRoot
           ];
           config = flakeBuilderDef.config;
+          # The in-image `nix build` needs the closure registered in the
+          # store db, not just present under /nix/store.
+          includeNixDB = true;
           fakeRootCommands = installWorkerFiles;
         };
 

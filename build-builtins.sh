@@ -37,9 +37,9 @@ is_flake_entry() { case "$1" in cargo | bash | testenv) return 0 ;; *) return 1 
 # std entries whose image is STREAMED to the registry instead of imported into
 # git (design/flake-images.md): host-nix-built core, composed with `docker
 # build` and pushed; the std entry is a tiny curry node over the digest ref,
-# so no layer bytes ever enter git. The flake-builder (the bootstrap image,
-# composed onto stock nixos/nix) and the runner (the pooled interpreter —
-# self-contained, FROM scratch).
+# so no layer bytes ever enter git. The flake-builder (the bootstrap image)
+# and the runner (the pooled interpreter) — both self-contained, FROM
+# scratch.
 is_streamed_entry() { case "$1" in flake-builder | runner) return 0 ;; *) return 1 ;; esac; }
 image_names=()
 for name in "${names[@]}"; do
@@ -149,17 +149,11 @@ for name in "${image_names[@]}"; do
     mkdir "$ctx"
     tar -xzf "$tarball" -C "$ctx"
     cfg=$(jq -r '.[0].Config' "$ctx/manifest.json")
-    # The flake-builder composes onto stock nixos/nix (pinned by digest in
-    # std/flake-builder/base.ref) so nix and its store stay stock registry layers,
-    # shared with every other consumer. The runner is self-contained — its
-    # nix-built userland IS the image — so it builds FROM scratch.
-    case "$name" in
-    flake-builder) from=$(cat "$PROJECT/std/flake-builder/base.ref") ;;
-    runner) from=scratch ;;
-    *) echo "build-builtins: no stream base for $name" >&2; exit 1 ;;
-    esac
+    # Both streamed images are self-contained — their nix-built closures
+    # ARE the images — so they compose FROM scratch; nothing stock rides
+    # underneath.
     {
-      printf 'FROM %s\n' "$from"
+      printf 'FROM scratch\n'
       jq -r '.[0].Layers[] | "ADD \(.) /"' "$ctx/manifest.json"
       jq -r '.config.Env[]? | "ENV \(.)"' "$ctx/$cfg"
       printf 'ENTRYPOINT %s\n' "$(jq -c '.config.Entrypoint' "$ctx/$cfg")"

@@ -138,15 +138,19 @@ it's written down.
 The flake-builder is the one image that can't be *built* by the flake path
 — resolution would recurse into itself. (Nothing stops its *definition*
 from being a flake tree; the grounding is about who runs the build, not
-the notation.) Its definition lives in its std directory
-(`std/flake-builder/{image.nix, worker, base.ref}` — the root flake imports
-it and wraps in the caos additions). It's host-nix-built as a thin layer
-set over stock `nixos/nix` (pinned by digest in `std/flake-builder/base.ref`)
-and **streamed**: composed with
-`docker build` (ADD extracts each layer as root, preserving the setuid
-caos), pushed, memoized on the tarball's store path. Exactly one image is
-referenced by digest; everything else may be a flake — so resolution never
-re-enters the flake branch for the builder, and the recursion is grounded.
+the notation — and its definition IS a flake:
+`std/flake-builder/{flake.nix, flake.lock, image.nix, worker}`, whose clean
+`#caosImage` carries everything but the caos additions.) It's host-nix-built
+SELF-CONTAINED — nix, CA certs, and tools from its own nixpkgs, the closure
+registered in the store db (`includeNixDB`) so in-image builds work — and
+**streamed**: the root flake imports `image.nix`, wraps in the caos
+additions, and build-builtins composes the ~100MB tarball `FROM scratch`
+(ADD extracts each layer as root, preserving the setuid caos), pushes it,
+memoized on the tarball's store path. The runner streams the same way. So
+resolution never re-enters the flake branch for the builder, and the
+recursion is grounded. (The stock-base pins now live with their only
+consumer: `caos-tools/{nix,debian}-base.ref`, the test suite's own image
+pipeline, until it unifies onto the flake path.)
 
 ## Part 2: literal trees, worker-built binaries (phase A shipped)
 
@@ -192,14 +196,13 @@ collapses to "hash the checked-in trees, build the curries."
 **`images/` dissolves into `std/*`** — every std entry gets its
 directory, the flake-builder included:
 
-- `std/flake-builder/` holds the definition (DONE: `image.nix` + `worker`
-  + `base.ref`, imported by the root flake, which wraps in the caos
-  additions — the compose-onto-stock layout). The follow-up is the
-  self-contained variant: a real `flake.nix` + lock, nix from nixpkgs
-  instead of the stock base (plus certs and nix.conf), at which point
-  `base.ref` goes — the pins move into the tree's own lock. (If pushing
-  the full nix closure per pin bump bites, this compose-onto-stock layout
-  is the documented fallback.)
+- `std/flake-builder/` is a literal flake tree (DONE): `flake.nix` + lock
+  + `image.nix` + `worker`, self-contained — nix + certs from its own
+  nixpkgs, `includeNixDB` for in-image builds, no nix.conf needed (the
+  worker passes every option explicitly). The feared closure push
+  measured ~100MB, streamed in seconds; `base.ref` is gone (the stock
+  pins moved to their only consumer, `caos-tools/`). `images/` no longer
+  exists.
 - `images/bash-worker.sh` → the checked-in `std/bash` / `std/testenv`
   worker copies above (DONE, phase A); the suite's image jobs reference
   the `std/bash` copy until they unify.

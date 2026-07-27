@@ -63,10 +63,11 @@ derive_lock() { # <out> <input name>...
 }
 
 # Generate the whole redundant set under $tmp, mirroring the repo layout.
-mkdir -p "$tmp/std/bash" "$tmp/std/testenv" "$tmp/std/cargo"
+mkdir -p "$tmp/std/bash" "$tmp/std/testenv" "$tmp/std/cargo" "$tmp/std/flake-builder"
 derive_lock "$tmp/std/bash/flake.lock" nixpkgs
 derive_lock "$tmp/std/testenv/flake.lock" nixpkgs
 derive_lock "$tmp/std/cargo/flake.lock" nixpkgs rust-overlay crane
+derive_lock "$tmp/std/flake-builder/flake.lock" nixpkgs
 
 cp std/bash/worker "$tmp/std/testenv/worker"
 
@@ -105,6 +106,7 @@ done
 files="std/bash/flake.lock
 std/testenv/flake.lock
 std/cargo/flake.lock
+std/flake-builder/flake.lock
 std/testenv/worker
 std/cargo/Cargo.toml
 std/cargo/Cargo.lock
