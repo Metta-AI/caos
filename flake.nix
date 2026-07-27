@@ -755,6 +755,15 @@
               # up -d is idempotent: a no-op when the stack is already running, and
               # it creates only what's missing. No teardown trap — `up` returns with
               # the stack still up (stop it with `caosd down`).
+              # The bind-mount sources in the compose file above. podman-compose
+              # creates a missing source only while CREATING a container
+              # (os.makedirs in its mount processing); `up -d` on an existing
+              # container just starts it, so a source deleted after creation
+              # (a wiped CAOS_DATA) dies in crun. caosd owns this layout —
+              # make it true before compose looks.
+              mkdir -p "$CAOS_DATA/redis" "$CAOS_DATA/registry" \
+                       "$CAOS_DATA/server-repo.git"
+
               echo "==> starting stack (redis, registry, server, runnerd)" >&2
               compose_up
               # Recreate exactly the services running a stale image — nothing else,
