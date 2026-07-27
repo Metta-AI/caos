@@ -709,6 +709,7 @@ pub(crate) struct App {
     selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
     selecting_transcript: bool,
+    copied_chars: Option<usize>,
     view: View,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
@@ -810,6 +811,7 @@ impl App {
             selection_locked: false,
             confirm_action: None,
             selecting_transcript: false,
+            copied_chars: None,
             view: View::Chat,
             tx,
             rx,
@@ -836,6 +838,14 @@ impl App {
         self.selection_locked
     }
 
+    pub(crate) fn clear_copy_notice(&mut self) {
+        self.copied_chars = None;
+    }
+
+    pub(crate) fn note_copy(&mut self, text: &str) {
+        self.copied_chars = Some(text.chars().count());
+    }
+
     pub(crate) fn view(&self) -> View {
         self.view
     }
@@ -852,14 +862,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp
                 if self.view == View::Activity
-                    && ui::content_contains(area, mouse.column, mouse.row) =>
+                    && ui::content_contains(self.selected(), area, mouse.column, mouse.row) =>
             {
                 self.scroll_activity_details_up(3);
                 MouseAction::Redraw
             }
             MouseEventKind::ScrollDown
                 if self.view == View::Activity
-                    && ui::content_contains(area, mouse.column, mouse.row) =>
+                    && ui::content_contains(self.selected(), area, mouse.column, mouse.row) =>
             {
                 self.scroll_activity_details_down(3);
                 MouseAction::Redraw
@@ -1258,11 +1268,7 @@ impl App {
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.selected_mut().composer.move_word_right()
             }
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-            {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_mut().composer.insert_char('\n')
             }
             KeyCode::Enter => {
@@ -1696,6 +1702,7 @@ mod tests {
                 selection_locked: false,
                 confirm_action: None,
                 selecting_transcript: false,
+                copied_chars: None,
                 view: View::Chat,
                 tx: tx.clone(),
                 rx,
@@ -1727,6 +1734,20 @@ mod tests {
         app.insert_paste("first\r\nsecond\rthird");
 
         assert_eq!(app.selected().composer.text, "first\nsecond\nthird");
+        assert!(app.selected().transcript.is_empty());
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_j_insert_newlines() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("first");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.selected_mut().composer.insert_str("second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.selected().composer.text, "first\nsecond\n");
         assert!(app.selected().transcript.is_empty());
         assert!(!app.selected().running);
     }
@@ -2186,10 +2207,15 @@ mod tests {
     #[test]
     fn transcript_uses_all_space_above_the_composer() {
         let terminal = Rect::new(0, 0, 100, 30);
-        assert!(content_contains(terminal, 27, 1));
-        assert!(content_contains(terminal, 99, 22));
-        assert!(!content_contains(terminal, 25, 12));
-        assert!(!content_contains(terminal, 27, 23));
+        let mut conversation = state("talk-1");
+        assert!(content_contains(&conversation, terminal, 27, 1));
+        assert!(content_contains(&conversation, terminal, 99, 25));
+        assert!(!content_contains(&conversation, terminal, 25, 12));
+        assert!(!content_contains(&conversation, terminal, 27, 26));
+
+        conversation.composer.insert_str("one\ntwo\nthree");
+        assert!(content_contains(&conversation, terminal, 99, 23));
+        assert!(!content_contains(&conversation, terminal, 99, 24));
     }
 
     #[test]
@@ -2199,8 +2225,8 @@ mod tests {
         assert!(transcript_contains(&conversation, terminal, 27, 22));
 
         conversation.running = true;
-        assert!(!transcript_contains(&conversation, terminal, 27, 22));
-        assert!(transcript_contains(&conversation, terminal, 27, 19));
+        assert!(!transcript_contains(&conversation, terminal, 27, 23));
+        assert!(transcript_contains(&conversation, terminal, 27, 22));
     }
 
     #[test]
@@ -2264,6 +2290,7 @@ mod tests {
             app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 29, 2), area),
             MouseAction::Copy("You".to_string())
         );
+        app.note_copy("You");
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2273,6 +2300,17 @@ mod tests {
             assert_eq!(cell.bg, Color::Cyan);
             assert_eq!(cell.fg, Color::Black);
         }
+        let footer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(footer.ends_with(" 3 chars copied "));
     }
 
     #[test]
@@ -2321,7 +2359,8 @@ mod tests {
         assert!(rendered.contains("$ cargo test"));
         assert!(rendered.contains("Ctrl+T expands"));
         assert!(rendered.contains("follow-up"));
-        assert!(rendered.contains("cancellation is not available"));
+        assert!(rendered.contains("Shift+Enter/^J newline"));
+        assert!(!rendered.contains("Alt+Enter"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Activity);

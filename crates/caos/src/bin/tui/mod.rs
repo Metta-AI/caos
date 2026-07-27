@@ -48,6 +48,7 @@ fn run_app(
         if event::poll(TICK).map_err(|error| format!("polling terminal input: {error}"))? {
             match event::read().map_err(|error| format!("reading terminal input: {error}"))? {
                 TerminalEvent::Key(key) => {
+                    app.clear_copy_notice();
                     let was_locked = app.selection_locked();
                     app.handle_key(key);
                     if was_locked != app.selection_locked() {
@@ -61,10 +62,12 @@ fn run_app(
                 TerminalEvent::Paste(text)
                     if app.view() == View::Chat && !app.selection_locked() =>
                 {
+                    app.clear_copy_notice();
                     app.insert_paste(&text);
                     changed = true;
                 }
                 TerminalEvent::Mouse(mouse) if !app.selection_locked() => {
+                    app.clear_copy_notice();
                     let size = terminal
                         .size()
                         .map_err(|error| format!("reading terminal size: {error}"))?;
@@ -76,6 +79,7 @@ fn run_app(
                             copy_to_clipboard(terminal.backend_mut(), &text).map_err(|error| {
                                 format!("copying transcript selection: {error}")
                             })?;
+                            app.note_copy(&text);
                             changed = true;
                         }
                     }
