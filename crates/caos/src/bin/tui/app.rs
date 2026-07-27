@@ -81,17 +81,21 @@ struct Activity {
 struct Composer {
     text: String,
     cursor: usize,
+    command_selection: usize,
+    command_menu_dismissed: bool,
 }
 
 impl Composer {
     fn insert_char(&mut self, ch: char) {
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
+        self.reset_command_menu();
     }
 
     fn insert_str(&mut self, text: &str) {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.reset_command_menu();
     }
 
     fn backspace(&mut self) {
@@ -105,6 +109,7 @@ impl Composer {
             .unwrap_or(0);
         self.text.drain(previous..self.cursor);
         self.cursor = previous;
+        self.reset_command_menu();
     }
 
     fn delete(&mut self) {
@@ -112,6 +117,7 @@ impl Composer {
             return;
         };
         self.text.drain(self.cursor..self.cursor + ch.len_utf8());
+        self.reset_command_menu();
     }
 
     fn move_left(&mut self) {
@@ -192,8 +198,110 @@ impl Composer {
         }
         self.text.clear();
         self.cursor = 0;
+        self.reset_command_menu();
         Some(message)
     }
+
+    fn command_token(&self) -> Option<&str> {
+        if self.command_menu_dismissed || !self.text.starts_with('/') {
+            return None;
+        }
+        let token_end = self
+            .text
+            .find(char::is_whitespace)
+            .unwrap_or(self.text.len());
+        (self.cursor <= token_end).then(|| &self.text[..token_end])
+    }
+
+    fn command_matches(&self) -> Vec<&'static Command> {
+        let Some(token) = self.command_token() else {
+            return Vec::new();
+        };
+        COMMANDS
+            .iter()
+            .filter(|command| command.name.starts_with(token))
+            .collect()
+    }
+
+    fn select_command(&mut self, amount: isize) -> bool {
+        let count = self.command_matches().len();
+        if count == 0 {
+            return false;
+        }
+        self.command_selection =
+            (self.command_selection as isize + amount).rem_euclid(count as isize) as usize;
+        true
+    }
+
+    fn complete_command(&mut self) -> bool {
+        let Some(command) = self.command_matches().get(self.command_selection).copied() else {
+            return false;
+        };
+        let token_end = self
+            .text
+            .find(char::is_whitespace)
+            .unwrap_or(self.text.len());
+        self.text.replace_range(..token_end, command.name);
+        self.cursor = command.name.len();
+        if let Some(ch) = self.text[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        } else {
+            self.text.push(' ');
+            self.cursor += 1;
+        }
+        self.reset_command_menu();
+        true
+    }
+
+    fn dismiss_command_menu(&mut self) -> bool {
+        if self.command_matches().is_empty() {
+            return false;
+        }
+        self.command_menu_dismissed = true;
+        true
+    }
+
+    fn reset_command_menu(&mut self) {
+        self.command_selection = 0;
+        self.command_menu_dismissed = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandAction {
+    From,
+    Title,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Command {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+    action: CommandAction,
+}
+
+const COMMANDS: [Command; 2] = [
+    Command {
+        name: "/from",
+        usage: "/from <commit>",
+        description: "start a conversation from a completed turn",
+        action: CommandAction::From,
+    },
+    Command {
+        name: "/title",
+        usage: "/title <new title>",
+        description: "rename the selected conversation",
+        action: CommandAction::Title,
+    },
+];
+
+fn parse_command(message: &str) -> Option<(&'static Command, &str)> {
+    let token_end = message.find(char::is_whitespace).unwrap_or(message.len());
+    let command = COMMANDS
+        .iter()
+        .find(|command| command.name == &message[..token_end])?;
+    Some((command, message[token_end..].trim()))
 }
 
 fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize {
@@ -478,20 +586,15 @@ impl App {
         let Some(message) = self.selected_mut().composer.take_message() else {
             return;
         };
-        if let Some(hash) = message.strip_prefix("/from ").map(str::trim) {
-            self.start_from_hash(hash);
-            return;
-        }
-        if message == "/from" {
-            self.selected_mut().status = "usage: /from <commit>".to_string();
-            return;
-        }
-        if let Some(title) = message.strip_prefix("/title ").map(str::trim) {
-            self.rename_selected(title);
-            return;
-        }
-        if message == "/title" {
-            self.selected_mut().status = "usage: /title <new title>".to_string();
+        if let Some((command, arguments)) = parse_command(&message) {
+            if arguments.is_empty() {
+                self.selected_mut().status = format!("usage: {}", command.usage);
+            } else {
+                match command.action {
+                    CommandAction::From => self.start_from_hash(arguments),
+                    CommandAction::Title => self.rename_selected(arguments),
+                }
+            }
             return;
         }
         {
@@ -765,7 +868,17 @@ impl App {
             {
                 self.selected_mut().composer.insert_char('\n')
             }
-            KeyCode::Enter => self.start_turn(),
+            KeyCode::Enter => {
+                if !self.selected_mut().composer.complete_command() {
+                    self.start_turn();
+                }
+            }
+            KeyCode::Tab => {
+                self.selected_mut().composer.complete_command();
+            }
+            KeyCode::Esc => {
+                self.selected_mut().composer.dismiss_command_menu();
+            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
             }
@@ -776,8 +889,16 @@ impl App {
             KeyCode::Delete => self.selected_mut().composer.delete(),
             KeyCode::Left => self.selected_mut().composer.move_left(),
             KeyCode::Right => self.selected_mut().composer.move_right(),
-            KeyCode::Up => self.selected_mut().composer.move_vertical(true),
-            KeyCode::Down => self.selected_mut().composer.move_vertical(false),
+            KeyCode::Up => {
+                if !self.selected_mut().composer.select_command(-1) {
+                    self.selected_mut().composer.move_vertical(true);
+                }
+            }
+            KeyCode::Down => {
+                if !self.selected_mut().composer.select_command(1) {
+                    self.selected_mut().composer.move_vertical(false);
+                }
+            }
             KeyCode::Home => self.selected_mut().composer.move_home(),
             KeyCode::End => self.selected_mut().composer.move_end(),
             _ => {}
@@ -1186,6 +1307,95 @@ mod tests {
         let mut existing = state("Existing title");
         existing.apply_automatic_title("A later prompt");
         assert_eq!(existing.title, "Existing title");
+    }
+
+    #[test]
+    fn composer_filters_selects_completes_and_dismisses_commands() {
+        let mut composer = Composer::default();
+        composer.insert_str("/");
+        assert_eq!(
+            composer
+                .command_matches()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/from", "/title"]
+        );
+
+        assert!(composer.select_command(1));
+        assert!(composer.complete_command());
+        assert_eq!(composer.text, "/title ");
+        assert!(composer.command_matches().is_empty());
+
+        composer.move_left();
+        assert_eq!(
+            composer
+                .command_matches()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/title"]
+        );
+        assert!(composer.dismiss_command_menu());
+        assert!(composer.command_matches().is_empty());
+        composer.insert_char('x');
+        assert!(!composer.command_menu_dismissed);
+    }
+
+    #[test]
+    fn command_parser_only_claims_catalog_commands() {
+        let (command, arguments) = parse_command("/title A useful title").unwrap();
+        assert_eq!(command.action, CommandAction::Title);
+        assert_eq!(arguments, "A useful title");
+
+        let (command, arguments) = parse_command("/from\nabc123").unwrap();
+        assert_eq!(command.action, CommandAction::From);
+        assert_eq!(arguments, "abc123");
+
+        assert!(parse_command("/future server convention").is_none());
+        assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn command_menu_keys_complete_select_and_dismiss() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/title ");
+        assert!(!app.selected().running);
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/f");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().composer.command_menu_dismissed);
+        assert_eq!(app.selected().composer.text, "/f");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/from ");
+    }
+
+    #[test]
+    fn command_menu_renders_usage_and_descriptions_in_the_prompt_box() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/");
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(terminal.backend().buffer().area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("> /from <commit> — start a conversation from a completed turn"));
+        assert!(rendered.contains("/title <new title> — rename the selected conversation"));
     }
 
     #[test]
