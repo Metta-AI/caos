@@ -132,6 +132,55 @@ impl Composer {
         }
     }
 
+    fn move_word_left(&mut self) {
+        self.cursor = self.word_left();
+    }
+
+    fn move_word_right(&mut self) {
+        self.cursor = self.word_right();
+    }
+
+    fn delete_word_left(&mut self) {
+        let start = self.word_left();
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
+        self.reset_command_menu();
+    }
+
+    fn delete_word_right(&mut self) {
+        let end = self.word_right();
+        self.text.drain(self.cursor..end);
+        self.reset_command_menu();
+    }
+
+    fn word_left(&self) -> usize {
+        let mut chars = self.text[..self.cursor].char_indices().rev().peekable();
+        while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
+            chars.next();
+        }
+        while chars.peek().is_some_and(|(_, ch)| !ch.is_whitespace()) {
+            chars.next();
+        }
+        chars
+            .peek()
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0)
+    }
+
+    fn word_right(&self) -> usize {
+        let mut chars = self.text[self.cursor..].char_indices().peekable();
+        while chars.peek().is_some_and(|(_, ch)| !ch.is_whitespace()) {
+            chars.next();
+        }
+        while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
+            chars.next();
+        }
+        chars
+            .peek()
+            .map(|(index, _)| self.cursor + index)
+            .unwrap_or(self.text.len())
+    }
+
     fn line_bounds(&self) -> (usize, usize) {
         let start = self.text[..self.cursor]
             .rfind('\n')
@@ -439,7 +488,7 @@ pub(crate) struct App {
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
-    copy_mode: bool,
+    selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
     activity_expanded: bool,
     view: View,
@@ -540,7 +589,7 @@ impl App {
             conversations: states,
             selected,
             should_quit: false,
-            copy_mode: false,
+            selection_locked: false,
             confirm_action: None,
             activity_expanded: false,
             view: View::Chat,
@@ -565,8 +614,8 @@ impl App {
         self.should_quit
     }
 
-    pub(crate) fn copy_mode(&self) -> bool {
-        self.copy_mode
+    pub(crate) fn selection_locked(&self) -> bool {
+        self.selection_locked
     }
 
     pub(crate) fn view(&self) -> View {
@@ -779,12 +828,12 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-            self.copy_mode = !self.copy_mode;
+            self.selection_locked = !self.selection_locked;
             return;
         }
-        if self.copy_mode {
+        if self.selection_locked {
             if key.code == KeyCode::Esc {
-                self.copy_mode = false;
+                self.selection_locked = false;
             }
             return;
         }
@@ -861,6 +910,24 @@ impl App {
             KeyCode::PageUp => self.scroll_up(8),
             KeyCode::PageDown => self.scroll_down(8),
             _ if self.view != View::Chat => {}
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_left()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_right()
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.delete_word_left()
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.delete_word_right()
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_left()
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_right()
+            }
             KeyCode::Enter
                 if key
                     .modifiers
@@ -1252,7 +1319,7 @@ mod tests {
                 conversations,
                 selected: 0,
                 should_quit: false,
-                copy_mode: false,
+                selection_locked: false,
                 confirm_action: None,
                 activity_expanded: false,
                 view: View::Chat,
@@ -1396,6 +1463,77 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("> /from <commit> — start a conversation from a completed turn"));
         assert!(rendered.contains("/title <new title> — rename the selected conversation"));
+    }
+
+    #[test]
+    fn composer_moves_by_whitespace_and_non_whitespace_runs() {
+        let mut composer = Composer::default();
+        composer.insert_str("one  λambda\n三");
+
+        composer.move_word_left();
+        assert_eq!(&composer.text[composer.cursor..], "三");
+        composer.move_word_left();
+        assert_eq!(&composer.text[composer.cursor..], "λambda\n三");
+        composer.move_word_left();
+        assert_eq!(&composer.text[composer.cursor..], "one  λambda\n三");
+        composer.move_word_left();
+        assert_eq!(composer.cursor, 0);
+
+        composer.move_word_right();
+        assert_eq!(&composer.text[composer.cursor..], "λambda\n三");
+        composer.move_word_right();
+        assert_eq!(&composer.text[composer.cursor..], "三");
+        composer.move_word_right();
+        assert_eq!(composer.cursor, composer.text.len());
+    }
+
+    #[test]
+    fn composer_deletes_words_without_splitting_utf8() {
+        let mut composer = Composer::default();
+        composer.insert_str("one  λambda\n三");
+
+        composer.delete_word_left();
+        assert_eq!(composer.text, "one  λambda\n");
+        composer.delete_word_left();
+        assert_eq!(composer.text, "one  ");
+
+        composer.cursor = 0;
+        composer.delete_word_right();
+        assert_eq!(composer.text, "");
+        assert_eq!(composer.cursor, 0);
+    }
+
+    #[test]
+    fn option_word_keys_edit_the_composer() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("one  λambda");
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(
+            app.selected().composer.cursor,
+            app.selected().composer.text.len()
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.selected().composer.cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        assert_eq!(app.selected().composer.text, "one  ");
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.selected().composer.text, "");
     }
 
     #[test]
@@ -1717,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_blocks_edits_and_ctrl_q_toggles_changes() {
+    fn selection_lock_blocks_edits_and_ctrl_q_toggles_changes() {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Diff);
@@ -1725,11 +1863,11 @@ mod tests {
         assert_eq!(app.view, View::Chat);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
-        assert!(app.copy_mode);
+        assert!(app.selection_locked);
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(app.selected().composer.text.is_empty());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!app.copy_mode);
+        assert!(!app.selection_locked);
     }
 
     #[test]

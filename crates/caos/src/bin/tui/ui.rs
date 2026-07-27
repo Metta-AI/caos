@@ -44,8 +44,14 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         View::Tools => render_tools(state, frame, conversation[0]),
     }
     render_activity(state, app.activity_expanded, frame, conversation[1]);
-    render_composer(state, app.view, !app.copy_mode, frame, conversation[2]);
-    render_footer(app.copy_mode, frame, outer[2]);
+    render_composer(
+        state,
+        app.view,
+        !app.selection_locked,
+        frame,
+        conversation[2],
+    );
+    render_footer(app.selection_locked, frame, outer[2]);
 }
 
 fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
@@ -56,8 +62,8 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     } else {
         "idle"
     };
-    let view = if app.copy_mode {
-        "copy"
+    let view = if app.selection_locked {
+        "selection lock"
     } else {
         match app.view {
             View::Chat => "chat",
@@ -453,15 +459,15 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
     frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
 }
 
-fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
-    let footer = if copy_mode {
+fn render_footer(selection_locked: bool, frame: &mut Frame<'_>, area: Rect) {
+    let footer = if selection_locked {
         Line::styled(
-            " Copy mode: drag to select, use terminal copy, ^Y/Esc resumes",
+            " Selection lock: redraws paused, ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else {
         Line::raw(
-            " ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit",
+            " Drag selects  ^Y lock  ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);

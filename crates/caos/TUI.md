@@ -47,6 +47,8 @@ time that user opens the TUI.
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
 | `Escape` | Dismiss slash-command matches |
+| `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
+| `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
 | `Ctrl+W` | Archive the selected conversation for this user |
@@ -54,8 +56,8 @@ time that user opens the TUI.
 | `Ctrl+T` | Show the tools available to the selected conversation |
 | `Ctrl+A` | Expand or collapse live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
-| Mouse wheel | Scroll by rendered rows |
-| `Ctrl+Y` | Enter or leave terminal text-selection mode |
+| Mouse drag | Select text using the terminal's native selection |
+| `Ctrl+Y` | Freeze or resume redraws while selecting text |
 | `Ctrl+L` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
@@ -86,10 +88,13 @@ unsent virtual conversation simply discards it. Use `--list-archived` and
 `--unarchive <conversation-id>` outside the full-screen UI to recover old
 conversations.
 
-`Ctrl+Y` releases mouse capture and freezes redraws so terminal-native text
-selection remains stable. Drag across any visible text, use the terminal's
-normal copy shortcut (`Cmd+C` on macOS or usually `Ctrl+Shift+C` elsewhere),
-then press `Ctrl+Y` or `Escape` to resume the live interface.
+Mouse capture is disabled, so dragging across visible text uses the terminal's
+native selection without entering a special mode. Use the terminal's normal
+copy shortcut (`Cmd+C` on macOS or usually `Ctrl+Shift+C` elsewhere).
+If a conversation is still producing output, press `Ctrl+Y` first to freeze
+redraws and keep the selection stable, then press `Ctrl+Y` or `Escape` to
+resume the live interface. Use `PageUp` and `PageDown` for in-app scrolling;
+mouse-wheel scrolling is intentionally left to the terminal.
 
 ## Workspace safety
 
