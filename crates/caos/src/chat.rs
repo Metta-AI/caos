@@ -185,6 +185,7 @@ pub fn describe_tool_set(
 /// or a full-screen UI.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnEvent {
+    PhaseStarted(TurnPhase),
     PhaseComplete {
         label: String,
         elapsed_secs: f64,
@@ -204,6 +205,12 @@ pub enum TurnEvent {
         content: String,
     },
     Completed(TurnOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnPhase {
+    System,
+    Model,
 }
 
 /// The durable result of a successful turn.
@@ -479,7 +486,9 @@ fn run_cli_turn(
         TurnEvent::Completed(outcome) => {
             println!("[{} {}]", outcome.conversation, outcome.short_commit)
         }
-        TurnEvent::PhaseComplete { .. } | TurnEvent::ToolResult { .. } => {}
+        TurnEvent::PhaseStarted(_)
+        | TurnEvent::PhaseComplete { .. }
+        | TurnEvent::ToolResult { .. } => {}
     })?;
     Ok(())
 }
@@ -934,6 +943,7 @@ pub fn run_chat_turn(
     if message.trim().is_empty() {
         return Err("empty message".to_string());
     }
+    emit(TurnEvent::PhaseStarted(TurnPhase::System));
     turn(t, options, name, &refname, message.trim(), &mut emit)
 }
 
@@ -1092,6 +1102,7 @@ fn turn(
         label: "pushing the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
+    emit(TurnEvent::PhaseStarted(TurnPhase::Model));
     let server = t.server_url()?;
     let run = {
         let (server, req) = (server.clone(), req);
@@ -1151,6 +1162,7 @@ fn turn(
     // Negotiating with the human commit as the tip keeps the pack to this
     // turn's new objects — a noop fetch would re-download the workspace
     // closure (including the base's whole history) every turn.
+    emit(TurnEvent::PhaseStarted(TurnPhase::System));
     let phase = std::time::Instant::now();
     t.fetch_object_negotiated(&turn_hash, &human)?;
     emit(TurnEvent::PhaseComplete {

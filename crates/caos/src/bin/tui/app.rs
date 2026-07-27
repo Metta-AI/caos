@@ -6,7 +6,8 @@ use caos::chat::{
     describe_tool_set, first_available_conversation_name, list_user_conversations,
     publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
     set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    TurnEvent, TurnOptions, TurnPhase, UserConversationStatus, UserConversationSummary,
+    WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::layout::Rect;
@@ -76,9 +77,35 @@ enum ActivityState {
 struct Activity {
     id: String,
     step_commit: String,
+    name: String,
     summary: String,
     detail: String,
     state: ActivityState,
+}
+
+impl Activity {
+    fn running_verb(&self) -> &'static str {
+        match self.name.as_str() {
+            "bash" => "Running",
+            "read" | "cat" => "Reading",
+            "write" => "Writing",
+            "edit" => "Editing",
+            "ls" => "Listing",
+            "grep" | "rgrep" => "Searching",
+            _ => "Running",
+        }
+    }
+
+    fn running_summary(&self) -> &str {
+        match self.name.as_str() {
+            "read" | "cat" | "write" | "edit" | "ls" | "grep" | "rgrep" => self
+                .summary
+                .strip_prefix(&self.name)
+                .and_then(|summary| summary.strip_prefix(' '))
+                .unwrap_or(&self.summary),
+            _ => &self.summary,
+        }
+    }
 }
 
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
@@ -524,6 +551,7 @@ struct ConversationState {
     composer: Composer,
     status: String,
     running: bool,
+    turn_phase: TurnPhase,
     publishing: bool,
     scroll_from_bottom: usize,
     transcript_selection: Option<TranscriptSelection>,
@@ -545,6 +573,7 @@ impl ConversationState {
             composer: Composer::default(),
             status,
             running: false,
+            turn_phase: TurnPhase::System,
             publishing: false,
             scroll_from_bottom: 0,
             transcript_selection: None,
@@ -616,6 +645,13 @@ impl ConversationState {
             .find(|entry| matches!(entry.role, EntryRole::Human | EntryRole::Agent))
             .map(|entry| collapse_whitespace(&entry.text))
             .unwrap_or_else(|| "New conversation".to_string())
+    }
+
+    fn running_activity(&self) -> Option<&Activity> {
+        self.activities
+            .iter()
+            .rev()
+            .find(|activity| activity.state == ActivityState::Running)
     }
 
     fn push_activity(&mut self, activity: Activity) {
@@ -830,7 +866,7 @@ impl App {
             }
             MouseEventKind::ScrollUp
                 if self.showing_transcript()
-                    && ui::content_contains(area, mouse.column, mouse.row) =>
+                    && ui::transcript_contains(self.selected(), area, mouse.column, mouse.row) =>
             {
                 self.selected_mut().transcript_selection = None;
                 self.scroll_up(3);
@@ -838,7 +874,7 @@ impl App {
             }
             MouseEventKind::ScrollDown
                 if self.showing_transcript()
-                    && ui::content_contains(area, mouse.column, mouse.row) =>
+                    && ui::transcript_contains(self.selected(), area, mouse.column, mouse.row) =>
             {
                 self.selected_mut().transcript_selection = None;
                 self.scroll_down(3);
@@ -922,6 +958,7 @@ impl App {
             state.activity_selection = None;
             state.activity_detail_scroll = 0;
             state.running = true;
+            state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
             state.scroll_from_bottom = 0;
             state.transcript_selection = None;
@@ -1024,6 +1061,7 @@ impl App {
 
         let state = &mut self.conversations[index];
         match event {
+            TurnEvent::PhaseStarted(phase) => state.turn_phase = phase,
             TurnEvent::PhaseComplete {
                 label,
                 elapsed_secs,
@@ -1041,12 +1079,13 @@ impl App {
             TurnEvent::ToolCall {
                 step_commit,
                 tool_use_id,
+                name,
                 summary,
-                ..
             } => {
                 state.push_activity(Activity {
                     id: tool_use_id,
                     step_commit,
+                    name,
                     summary,
                     detail: String::new(),
                     state: ActivityState::Running,
@@ -1073,6 +1112,7 @@ impl App {
                     state.push_activity(Activity {
                         id: tool_use_id.clone(),
                         step_commit,
+                        name: "result".to_string(),
                         summary: format!("result {tool_use_id}"),
                         detail: content,
                         state: if is_error {
@@ -1130,7 +1170,9 @@ impl App {
             self.selected_mut().scroll_from_bottom = 0;
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        let ctrl_t = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'));
+        if ctrl_t && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.view = match self.view {
                 View::Tools => View::Chat,
                 View::Chat | View::Activity | View::Diff => View::Tools,
@@ -1141,7 +1183,9 @@ impl App {
             }
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+        if ctrl_t
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a'))
+        {
             self.view = if self.view == View::Activity {
                 View::Chat
             } else {
@@ -1586,7 +1630,9 @@ mod tests {
     use ratatui_core::terminal::Terminal;
     use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-    use super::ui::{content_contains, paragraph_scroll, render, scroll_offset};
+    use super::ui::{
+        content_contains, paragraph_scroll, render, scroll_offset, transcript_contains,
+    };
 
     fn summary(id: &str) -> UserConversationSummary {
         UserConversationSummary {
@@ -1631,6 +1677,7 @@ mod tests {
         Activity {
             id: format!("tool-{number}"),
             step_commit: format!("{number:040x}"),
+            name: "bash".to_string(),
             summary: format!("tool summary {number}"),
             detail: format!("detail line {number}\n{}", "more detail\n".repeat(20)),
             state: ActivityState::Succeeded,
@@ -2069,6 +2116,31 @@ mod tests {
     }
 
     #[test]
+    fn live_activity_uses_tool_specific_verbs_and_concise_summaries() {
+        let mut activity = activity(1);
+        activity.name = "read".to_string();
+        activity.summary = "read crates/caos/src/chat.rs".to_string();
+        activity.state = ActivityState::Running;
+
+        assert_eq!(activity.running_verb(), "Reading");
+        assert_eq!(activity.running_summary(), "crates/caos/src/chat.rs");
+
+        activity.name = "bash".to_string();
+        activity.summary = "$ cargo test".to_string();
+        assert_eq!(activity.running_verb(), "Running");
+        assert_eq!(activity.running_summary(), "$ cargo test");
+
+        activity.name = "cat".to_string();
+        activity.summary = "cat README.md".to_string();
+        assert_eq!(activity.running_verb(), "Reading");
+        assert_eq!(activity.running_summary(), "README.md");
+
+        activity.name = "unknown".to_string();
+        activity.summary = "unknown something".to_string();
+        assert_eq!(activity.running_verb(), "Running");
+    }
+
+    #[test]
     fn new_activity_follows_only_a_selection_at_the_tail() {
         let mut conversation = state("talk-1");
         conversation.activities = vec![activity(1), activity(2)];
@@ -2118,6 +2190,49 @@ mod tests {
         assert!(content_contains(terminal, 99, 22));
         assert!(!content_contains(terminal, 25, 12));
         assert!(!content_contains(terminal, 27, 23));
+    }
+
+    #[test]
+    fn live_activity_reserves_space_below_the_transcript() {
+        let terminal = Rect::new(0, 0, 100, 30);
+        let mut conversation = state("talk-1");
+        assert!(transcript_contains(&conversation, terminal, 27, 22));
+
+        conversation.running = true;
+        assert!(!transcript_contains(&conversation, terminal, 27, 22));
+        assert!(transcript_contains(&conversation, terminal, 27, 19));
+    }
+
+    #[test]
+    fn live_activity_distinguishes_system_and_model_phases() {
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.status = "preparing turn".to_string();
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Chugging…"));
+
+        app.on_turn_event(0, TurnEvent::PhaseStarted(TurnPhase::Model));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Thinking…"));
+        assert!(!rendered.contains("Chugging…"));
     }
 
     #[test]
@@ -2178,6 +2293,7 @@ mod tests {
         selected.activities = vec![Activity {
             id: "tool-1".to_string(),
             step_commit: "c".repeat(40),
+            name: "bash".to_string(),
             summary: "$ cargo test".to_string(),
             detail: "12 tests passed".to_string(),
             state: ActivityState::Running,
@@ -2201,10 +2317,13 @@ mod tests {
         assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
         assert!(rendered.contains("Please run the tests"));
+        assert!(rendered.contains("Running…"));
+        assert!(rendered.contains("$ cargo test"));
+        assert!(rendered.contains("Ctrl+T expands"));
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("cancellation is not available"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Activity);
         assert_eq!(app.selected().activity_selection, Some(0));
         terminal.draw(|frame| render(&app, frame)).unwrap();
@@ -2458,7 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_shows_the_selected_chat_tool_set() {
+    fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
             source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
@@ -2470,6 +2589,13 @@ mod tests {
         }));
         let (mut app, _) = app_with(vec![conversation]);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Activity);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.view, View::Tools);
 
         let backend = TestBackend::new(100, 30);
@@ -2489,7 +2615,10 @@ mod tests {
         assert!(rendered.contains("Build everything the tree defines."));
         assert!(rendered.contains("[/cas/std/bash]"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.view, View::Chat);
     }
 }

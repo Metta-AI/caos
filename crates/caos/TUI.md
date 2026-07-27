@@ -53,8 +53,8 @@ time that user opens the TUI.
 | `Ctrl+N` | Start a new virtual conversation |
 | `Ctrl+W` | Archive the selected conversation for this user |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
-| `Ctrl+T` | Show the tools available to the selected conversation |
-| `Ctrl+A` | Enter or leave the Activity browser |
+| `Ctrl+T` or `Ctrl+A` | Enter or leave the Activity browser |
+| `Ctrl+Shift+T` | Show the tools available to the selected conversation |
 | `Up` / `Down` in Activity | Select the previous or next activity entry |
 | `PageUp` / `PageDown` in Activity | Scroll the selected activity's full details |
 | `Escape` in Activity | Return to the conversation |
@@ -97,12 +97,15 @@ sent. Backspace or Delete removes the whole placeholder. Press `Ctrl+C` to
 clear a draft and any stored paste content; press it again on the empty prompt
 to exit.
 
-`Ctrl+A` opens a focused Activity browser in all space above the composer.
-Up and Down select durable harness steps; the pane beside the list shows the
-selected step's complete result. Scroll long results with PageUp, PageDown, or
-the mouse wheel. Escape or `Ctrl+A` returns to the conversation. If the
-selection is already on the newest step, new activity remains selected. Moving
-to an older step pauses that tail-follow behavior.
+While a turn is running, a compact Activity row beneath the transcript shows a
+verb such as `Thinking…`, `Reading…`, or `Running…` and the current operation.
+`Ctrl+T` opens a focused Activity browser in all space above the composer;
+`Ctrl+A` remains an alias. Up and Down select durable harness steps, and the
+pane beside the list shows the selected step's complete result. Scroll long
+results with PageUp, PageDown, or the mouse wheel. Escape or `Ctrl+T` returns
+to the conversation. If the selection is already on the newest step, new
+activity remains selected. Moving to an older step pauses that tail-follow
+behavior.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other

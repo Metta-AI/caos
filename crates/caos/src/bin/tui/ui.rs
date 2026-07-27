@@ -14,6 +14,7 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use super::{
     short_hash, ActivityState, App, Command, ConversationState, EntryRole, TranscriptPoint, View,
 };
+use caos::chat::TurnPhase;
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let areas = layout(frame.area());
@@ -22,7 +23,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_header(app, state, frame, areas.header);
     render_conversations(app, frame, areas.sidebar);
     match app.view {
-        View::Chat => render_transcript(state, frame, areas.content),
+        View::Chat => render_chat(state, frame, areas.content),
         View::Activity => render_activity_browser(state, frame, areas.content),
         View::Diff => render_diff(state, frame, areas.content),
         View::Tools => render_tools(state, frame, areas.content),
@@ -74,6 +75,27 @@ fn layout(area: Rect) -> Areas {
 
 pub(super) fn content_contains(area: Rect, column: u16, row: u16) -> bool {
     layout(area).content.contains(Position::new(column, row))
+}
+
+fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
+    if !state.running && !state.publishing {
+        return (area, None);
+    }
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+    (split[0], Some(split[1]))
+}
+
+pub(super) fn transcript_contains(
+    state: &ConversationState,
+    terminal: Rect,
+    column: u16,
+    row: u16,
+) -> bool {
+    let (transcript, _) = chat_areas(state, layout(terminal).content);
+    transcript.contains(Position::new(column, row))
 }
 
 fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
@@ -172,6 +194,44 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ),
         area,
         &mut selected,
+    );
+}
+
+fn render_chat(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let (transcript, activity) = chat_areas(state, area);
+    render_transcript(state, frame, transcript);
+    if let Some(activity) = activity {
+        render_live_activity(state, frame, activity);
+    }
+}
+
+fn render_live_activity(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let (verb, summary) = if state.publishing {
+        ("Publishing", state.status.as_str())
+    } else if let Some(activity) = state.running_activity() {
+        (activity.running_verb(), activity.running_summary())
+    } else {
+        (
+            match state.turn_phase {
+                TurnPhase::System => "Chugging",
+                TurnPhase::Model => "Thinking",
+            },
+            state.status.as_str(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("✽ {verb}…"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {summary}"), Style::default().fg(Color::DarkGray)),
+            Span::styled("  Ctrl+T expands", Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(Block::default().title(" Activity ").borders(Borders::ALL)),
+        area,
     );
 }
 
@@ -342,7 +402,7 @@ pub(super) fn transcript_point(
     column: u16,
     row: u16,
 ) -> Option<TranscriptPoint> {
-    let area = layout(terminal).content;
+    let (area, _) = chat_areas(state, layout(terminal).content);
     let inner = transcript_inner(area);
     let position = Position::new(column, row);
     if !inner.contains(position) {
@@ -659,9 +719,9 @@ fn render_composer(
     } else if state.publishing {
         " Prompt (publishing PR) "
     } else if view == View::Tools {
-        " Prompt (tool view; Ctrl+T returns) "
+        " Prompt (tool view; Ctrl+Shift+T returns) "
     } else if view == View::Activity {
-        " Prompt (activity view; Ctrl+A/Esc returns) "
+        " Prompt (activity view; Ctrl+T/Esc returns) "
     } else if view == View::Diff {
         " Prompt (changes view; Ctrl+Q returns) "
     } else {
@@ -734,11 +794,11 @@ fn render_footer(selection_locked: bool, view: View, frame: &mut Frame<'_>, area
         )
     } else if view == View::Activity {
         Line::raw(
-            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^A/Esc return  ^Up/Dn chat  ^C quit",
+            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
         )
     } else {
         Line::raw(
-            " Wheel scrolls  Drag selects+copies  ^Y native selection  ^Up/Dn chat  ^A activity  ^Q diff  ^C quit",
+            " Wheel scrolls  Drag selects+copies  ^Y native selection  ^T activity  ^⇧T tools  ^Q diff  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);
