@@ -5,10 +5,11 @@ the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
 The interface keeps independent virtual conversations in a left sidebar. Each
-has its own durable history, multiline prompt, live activity, completed-turn
-hashes, and workspace diff. Turns continue running when another conversation
-is selected, so several agent workspaces can advance concurrently without
-touching the working checkout.
+two-row entry shows its title and latest user or agent message without exposing
+the internal conversation ID. Each conversation has its own durable history,
+multiline prompt, live activity, completed-turn hashes, and workspace diff.
+Turns continue running when another conversation is selected, so several agent
+workspaces can advance concurrently without touching the working checkout.
 
 ## Build and run
 
@@ -43,19 +44,29 @@ time that user opens the TUI.
 |---|---|
 | `Enter` | Send the prompt |
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
+| `Tab` | Complete the selected slash command |
+| `Up` / `Down` | Select a visible slash-command match |
+| `Escape` | Dismiss slash-command matches |
+| `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
+| `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
 | `Ctrl+W` | Archive the selected conversation for this user |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
-| `Ctrl+T` | Show the tools available to the selected conversation |
-| `Ctrl+A` | Expand or collapse live Activity above the prompt |
-| `PageUp` / `PageDown` | Scroll by rendered rows |
-| Mouse wheel | Scroll by rendered rows |
-| `Ctrl+Y` | Enter or leave terminal text-selection mode |
+| `Ctrl+T` or `Ctrl+A` | Enter or leave the Activity browser |
+| `Ctrl+Shift+T` | Show the tools available to the selected conversation |
+| `Up` / `Down` in Activity | Select the previous or next activity entry |
+| `PageUp` / `PageDown` in Activity | Scroll the selected activity's full details |
+| `Escape` in Activity | Return to the conversation |
+| `PageUp` / `PageDown` in conversation | Scroll by rendered rows |
+| Mouse wheel over the transcript | Scroll the conversation by rendered rows |
+| Mouse wheel over Activity | Scroll the selected activity's full details |
+| Mouse drag over visible transcript text | Select and copy rendered text |
+| `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
-| `Ctrl+C` | Exit |
+| `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
@@ -64,6 +75,38 @@ conversation ID or HEAD. Activity entries show the durable hashes of internal
 harness steps for inspection; those step trees contain harness metadata and are
 not branch points.
 
+Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
+remain visible, and marker-like text inside inline backticks is left literal.
+
+A fresh conversation starts with a temporary `talk-N` title. Its first prompt
+automatically becomes a whitespace-collapsed title of at most 60 characters.
+Using `/title` before the first prompt keeps that explicit title instead.
+Existing conversations are never automatically retitled.
+
+Typing `/` at the start of the prompt shows matching slash commands and their
+usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
+or Enter to complete it with a trailing space. Typing arguments closes the
+menu. Escape dismisses it without changing the prompt. An unrecognized
+slash-prefixed prompt is sent normally.
+
+Bracketed paste mode keeps pasted newlines inside the prompt instead of
+submitting partial lines. Pastes over 1,000 characters are kept out of the
+editable buffer and shown as an atomic `[Pasted text: N chars]` placeholder.
+The full text, including newlines, replaces the placeholder when the prompt is
+sent. Backspace or Delete removes the whole placeholder. Press `Ctrl+C` to
+clear a draft and any stored paste content; press it again on the empty prompt
+to exit.
+
+While a turn is running, a compact Activity row beneath the transcript shows a
+verb such as `Thinking…`, `Reading…`, or `Running…` and the current operation.
+`Ctrl+T` opens a focused Activity browser in all space above the composer;
+`Ctrl+A` remains an alias. Up and Down select durable harness steps, and the
+pane beside the list shows the selected step's complete result. Scroll long
+results with PageUp, PageDown, or the mouse wheel. Escape or `Ctrl+T` returns
+to the conversation. If the selection is already on the newest step, new
+activity remains selected. Moving to an older step pauses that tail-follow
+behavior.
+
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other
 users. A running or publishing conversation must finish first. Closing an
@@ -71,10 +114,20 @@ unsent virtual conversation simply discards it. Use `--list-archived` and
 `--unarchive <conversation-id>` outside the full-screen UI to recover old
 conversations.
 
-`Ctrl+Y` releases mouse capture and freezes redraws so terminal-native text
-selection remains stable. Drag across any visible text, use the terminal's
-normal copy shortcut (`Cmd+C` on macOS or usually `Ctrl+Shift+C` elsewhere),
-then press `Ctrl+Y` or `Escape` to resume the live interface.
+The transcript fills the conversation pane above the fixed composer. Use
+`PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
+Scrolling up pauses tail-follow until the viewport returns to the bottom.
+
+Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
+selection for the current transcript viewport. Drag across rendered transcript
+text to highlight it and copy automatically on mouse release. macOS uses
+`pbcopy`; other environments receive the same text through the standard OSC 52
+terminal clipboard sequence.
+
+For native terminal selection, press `Ctrl+Y`. CAOS releases mouse capture and
+freezes redraws, so dragging and the terminal's normal copy shortcut (`Cmd+C`
+on macOS or usually `Ctrl+Shift+C` elsewhere) work without moving output.
+Press `Ctrl+Y` or `Escape` to resume.
 
 ## Workspace safety
 

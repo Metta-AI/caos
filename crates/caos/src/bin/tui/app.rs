@@ -6,10 +6,14 @@ use caos::chat::{
     describe_tool_set, first_available_conversation_name, list_user_conversations,
     publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
     set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    TurnEvent, TurnOptions, TurnPhase, UserConversationStatus, UserConversationSummary,
+    WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
-use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui_core::layout::Rect;
+use ratatui_crossterm::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use super::args::Args;
 use super::workspace::{load_conversation_workspace, publish_conversation_pr};
@@ -21,9 +25,29 @@ fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
 }
 
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn automatic_title(prompt: &str) -> String {
+    const MAX_CHARS: usize = 60;
+
+    let title = collapse_whitespace(prompt);
+    if title.chars().count() <= MAX_CHARS {
+        return title;
+    }
+
+    title
+        .chars()
+        .take(MAX_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Chat,
+    Activity,
     Diff,
     Tools,
 }
@@ -53,29 +77,113 @@ enum ActivityState {
 struct Activity {
     id: String,
     step_commit: String,
+    name: String,
     summary: String,
     detail: String,
     state: ActivityState,
+}
+
+impl Activity {
+    fn running_verb(&self) -> &'static str {
+        match self.name.as_str() {
+            "bash" => "Running",
+            "read" | "cat" => "Reading",
+            "write" => "Writing",
+            "edit" => "Editing",
+            "ls" => "Listing",
+            "grep" | "rgrep" => "Searching",
+            _ => "Running",
+        }
+    }
+
+    fn running_summary(&self) -> &str {
+        match self.name.as_str() {
+            "read" | "cat" | "write" | "edit" | "ls" | "grep" | "rgrep" => self
+                .summary
+                .strip_prefix(&self.name)
+                .and_then(|summary| summary.strip_prefix(' '))
+                .unwrap_or(&self.summary),
+            _ => &self.summary,
+        }
+    }
+}
+
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPaste {
+    placeholder: String,
+    content: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TranscriptPoint {
+    row: u16,
+    column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptSelection {
+    anchor: TranscriptPoint,
+    head: TranscriptPoint,
+}
+
+impl TranscriptSelection {
+    fn ordered(self) -> (TranscriptPoint, TranscriptPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Composer {
     text: String,
     cursor: usize,
+    selection_anchor: Option<usize>,
+    pending_pastes: Vec<PendingPaste>,
+    command_selection: usize,
+    command_menu_dismissed: bool,
 }
 
 impl Composer {
     fn insert_char(&mut self, ch: char) {
+        self.delete_selection();
+        self.snap_cursor_after_placeholder();
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
+        self.reset_command_menu();
     }
 
     fn insert_str(&mut self, text: &str) {
+        self.delete_selection();
+        self.snap_cursor_after_placeholder();
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.reset_command_menu();
+    }
+
+    fn insert_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let char_count = text.chars().count();
+        if char_count > LARGE_PASTE_CHAR_THRESHOLD {
+            let placeholder = self.next_paste_placeholder(char_count);
+            self.insert_str(&placeholder);
+            self.pending_pastes.push(PendingPaste {
+                placeholder,
+                content: text,
+            });
+        } else {
+            self.insert_str(&text);
+        }
     }
 
     fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -84,27 +192,142 @@ impl Composer {
             .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
-        self.text.drain(previous..self.cursor);
-        self.cursor = previous;
+        self.delete_range(previous, self.cursor);
     }
 
     fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let Some(ch) = self.text[self.cursor..].chars().next() else {
             return;
         };
-        self.text.drain(self.cursor..self.cursor + ch.len_utf8());
+        self.delete_range(self.cursor, self.cursor + ch.len_utf8());
     }
 
     fn move_left(&mut self) {
-        if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.cursor = index;
+        if let Some((start, _)) = self.selection_range() {
+            self.cursor = start;
+            self.selection_anchor = None;
+            return;
         }
+        self.move_cursor(self.previous_cursor(), false);
+    }
+
+    fn select_left(&mut self) {
+        self.move_cursor(self.previous_cursor(), true);
+    }
+
+    fn previous_cursor(&self) -> usize {
+        if let Some((start, _)) = self
+            .paste_ranges()
+            .into_iter()
+            .find(|(start, end)| self.cursor > *start && self.cursor <= *end)
+        {
+            return start;
+        }
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(self.cursor)
     }
 
     fn move_right(&mut self) {
-        if let Some(ch) = self.text[self.cursor..].chars().next() {
-            self.cursor += ch.len_utf8();
+        if let Some((_, end)) = self.selection_range() {
+            self.cursor = end;
+            self.selection_anchor = None;
+            return;
         }
+        self.move_cursor(self.next_cursor(), false);
+    }
+
+    fn select_right(&mut self) {
+        self.move_cursor(self.next_cursor(), true);
+    }
+
+    fn next_cursor(&self) -> usize {
+        if let Some((_, end)) = self
+            .paste_ranges()
+            .into_iter()
+            .find(|(start, end)| self.cursor >= *start && self.cursor < *end)
+        {
+            return end;
+        }
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+            .unwrap_or(self.cursor)
+    }
+
+    fn move_cursor(&mut self, target: usize, selecting: bool) {
+        if selecting {
+            self.selection_anchor.get_or_insert(self.cursor);
+        } else {
+            self.selection_anchor = None;
+        }
+        self.cursor = target;
+    }
+
+    fn move_word_left(&mut self) {
+        self.move_cursor(self.word_left(), false);
+    }
+
+    fn select_word_left(&mut self) {
+        self.move_cursor(self.word_left(), true);
+    }
+
+    fn move_word_right(&mut self) {
+        self.move_cursor(self.word_right(), false);
+    }
+
+    fn select_word_right(&mut self) {
+        self.move_cursor(self.word_right(), true);
+    }
+
+    fn delete_word_left(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let start = self.word_left();
+        self.delete_range(start, self.cursor);
+    }
+
+    fn delete_word_right(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let end = self.word_right();
+        self.delete_range(self.cursor, end);
+    }
+
+    fn word_left(&self) -> usize {
+        let mut chars = self.text[..self.cursor].char_indices().rev().peekable();
+        while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
+            chars.next();
+        }
+        while chars.peek().is_some_and(|(_, ch)| !ch.is_whitespace()) {
+            chars.next();
+        }
+        chars
+            .peek()
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0)
+    }
+
+    fn word_right(&self) -> usize {
+        let mut chars = self.text[self.cursor..].char_indices().peekable();
+        while chars.peek().is_some_and(|(_, ch)| !ch.is_whitespace()) {
+            chars.next();
+        }
+        while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
+            chars.next();
+        }
+        chars
+            .peek()
+            .map(|(index, _)| self.cursor + index)
+            .unwrap_or(self.text.len())
     }
 
     fn line_bounds(&self) -> (usize, usize) {
@@ -120,14 +343,23 @@ impl Composer {
     }
 
     fn move_home(&mut self) {
-        self.cursor = self.line_bounds().0;
+        self.move_cursor(self.line_bounds().0, false);
+    }
+
+    fn select_home(&mut self) {
+        self.move_cursor(self.line_bounds().0, true);
     }
 
     fn move_end(&mut self) {
-        self.cursor = self.line_bounds().1;
+        self.move_cursor(self.line_bounds().1, false);
+    }
+
+    fn select_end(&mut self) {
+        self.move_cursor(self.line_bounds().1, true);
     }
 
     fn move_vertical(&mut self, up: bool) {
+        self.selection_anchor = None;
         let (start, end) = self.line_bounds();
         let column = self.text[start..self.cursor].chars().count();
         let target = if up {
@@ -152,6 +384,7 @@ impl Composer {
             (target_start, target_end)
         };
         self.cursor = byte_at_column(&self.text, target.0, target.1, column);
+        self.snap_cursor_after_placeholder();
     }
 
     fn cursor_row_col(&self) -> (usize, usize) {
@@ -167,14 +400,232 @@ impl Composer {
     }
 
     fn take_message(&mut self) -> Option<String> {
-        let message = self.text.trim().to_string();
+        let message = self.expanded_text().trim().to_string();
         if message.is_empty() {
             return None;
         }
-        self.text.clear();
-        self.cursor = 0;
+        self.clear();
         Some(message)
     }
+
+    fn clear(&mut self) -> bool {
+        if self.text.is_empty() && self.pending_pastes.is_empty() {
+            return false;
+        }
+        self.text.clear();
+        self.cursor = 0;
+        self.selection_anchor = None;
+        self.pending_pastes.clear();
+        self.reset_command_menu();
+        true
+    }
+
+    fn expanded_text(&self) -> String {
+        let mut ranges: Vec<_> = self
+            .pending_pastes
+            .iter()
+            .filter_map(|paste| {
+                self.text
+                    .find(&paste.placeholder)
+                    .map(|start| (start, start + paste.placeholder.len(), &paste.content))
+            })
+            .collect();
+        ranges.sort_by_key(|(start, _, _)| *start);
+
+        let mut expanded = String::new();
+        let mut previous = 0;
+        for (start, end, content) in ranges {
+            expanded.push_str(&self.text[previous..start]);
+            expanded.push_str(content);
+            previous = end;
+        }
+        expanded.push_str(&self.text[previous..]);
+        expanded
+    }
+
+    fn next_paste_placeholder(&self, char_count: usize) -> String {
+        let base = format!("[Pasted text: {char_count} chars]");
+        if !self.text.contains(&base) {
+            return base;
+        }
+        let mut ordinal = 2;
+        loop {
+            let candidate = format!("[Pasted text: {char_count} chars #{ordinal}]");
+            if !self.text.contains(&candidate) {
+                return candidate;
+            }
+            ordinal += 1;
+        }
+    }
+
+    fn paste_ranges(&self) -> Vec<(usize, usize)> {
+        self.pending_pastes
+            .iter()
+            .filter_map(|paste| {
+                self.text
+                    .find(&paste.placeholder)
+                    .map(|start| (start, start + paste.placeholder.len()))
+            })
+            .collect()
+    }
+
+    fn snap_cursor_after_placeholder(&mut self) {
+        if let Some((_, end)) = self
+            .paste_ranges()
+            .into_iter()
+            .find(|(start, end)| self.cursor > *start && self.cursor < *end)
+        {
+            self.cursor = end;
+        }
+    }
+
+    fn delete_range(&mut self, mut start: usize, mut end: usize) {
+        loop {
+            let original = (start, end);
+            for (paste_start, paste_end) in self.paste_ranges() {
+                if start < paste_end && end > paste_start {
+                    start = start.min(paste_start);
+                    end = end.max(paste_end);
+                }
+            }
+            if (start, end) == original {
+                break;
+            }
+        }
+        self.text.drain(start..end);
+        self.cursor = start;
+        self.selection_anchor = None;
+        self.pending_pastes
+            .retain(|paste| self.text.contains(&paste.placeholder));
+        self.reset_command_menu();
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        (anchor != self.cursor).then_some({
+            if anchor < self.cursor {
+                (anchor, self.cursor)
+            } else {
+                (self.cursor, anchor)
+            }
+        })
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.selection_range()
+            .map(|(start, end)| &self.text[start..end])
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            self.selection_anchor = None;
+            return false;
+        };
+        self.delete_range(start, end);
+        true
+    }
+
+    fn command_token(&self) -> Option<&str> {
+        if self.command_menu_dismissed || !self.text.starts_with('/') {
+            return None;
+        }
+        let token_end = self
+            .text
+            .find(char::is_whitespace)
+            .unwrap_or(self.text.len());
+        (self.cursor <= token_end).then(|| &self.text[..token_end])
+    }
+
+    fn command_matches(&self) -> Vec<&'static Command> {
+        let Some(token) = self.command_token() else {
+            return Vec::new();
+        };
+        COMMANDS
+            .iter()
+            .filter(|command| command.name.starts_with(token))
+            .collect()
+    }
+
+    fn select_command(&mut self, amount: isize) -> bool {
+        let count = self.command_matches().len();
+        if count == 0 {
+            return false;
+        }
+        self.command_selection =
+            (self.command_selection as isize + amount).rem_euclid(count as isize) as usize;
+        true
+    }
+
+    fn complete_command(&mut self) -> bool {
+        let Some(command) = self.command_matches().get(self.command_selection).copied() else {
+            return false;
+        };
+        let token_end = self
+            .text
+            .find(char::is_whitespace)
+            .unwrap_or(self.text.len());
+        self.text.replace_range(..token_end, command.name);
+        self.cursor = command.name.len();
+        self.selection_anchor = None;
+        if let Some(ch) = self.text[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        } else {
+            self.text.push(' ');
+            self.cursor += 1;
+        }
+        self.reset_command_menu();
+        true
+    }
+
+    fn dismiss_command_menu(&mut self) -> bool {
+        if self.command_matches().is_empty() {
+            return false;
+        }
+        self.command_menu_dismissed = true;
+        true
+    }
+
+    fn reset_command_menu(&mut self) {
+        self.command_selection = 0;
+        self.command_menu_dismissed = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandAction {
+    From,
+    Title,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Command {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+    action: CommandAction,
+}
+
+const COMMANDS: [Command; 2] = [
+    Command {
+        name: "/from",
+        usage: "/from <commit>",
+        description: "start a conversation from a completed turn",
+        action: CommandAction::From,
+    },
+    Command {
+        name: "/title",
+        usage: "/title <new title>",
+        description: "rename the selected conversation",
+        action: CommandAction::Title,
+    },
+];
+
+fn parse_command(message: &str) -> Option<(&'static Command, &str)> {
+    let token_end = message.find(char::is_whitespace).unwrap_or(message.len());
+    let command = COMMANDS
+        .iter()
+        .find(|command| command.name == &message[..token_end])?;
+    Some((command, message[token_end..].trim()))
 }
 
 fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize {
@@ -188,6 +639,7 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    automatic_title: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
@@ -196,8 +648,12 @@ struct ConversationState {
     composer: Composer,
     status: String,
     running: bool,
+    turn_phase: TurnPhase,
     publishing: bool,
     scroll_from_bottom: usize,
+    transcript_selection: Option<TranscriptSelection>,
+    activity_selection: Option<usize>,
+    activity_detail_scroll: usize,
 }
 
 impl ConversationState {
@@ -205,6 +661,7 @@ impl ConversationState {
         Self {
             id,
             title,
+            automatic_title: false,
             turn_options,
             transcript: Vec::new(),
             activities: Vec::new(),
@@ -213,9 +670,19 @@ impl ConversationState {
             composer: Composer::default(),
             status,
             running: false,
+            turn_phase: TurnPhase::System,
             publishing: false,
             scroll_from_bottom: 0,
+            transcript_selection: None,
+            activity_selection: None,
+            activity_detail_scroll: 0,
         }
+    }
+
+    fn new_virtual(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
+        let mut state = Self::new(id, title, turn_options, status);
+        state.automatic_title = true;
+        state
     }
 
     fn reload(&mut self, transport: &GitTransport) {
@@ -247,6 +714,7 @@ impl ConversationState {
             }
         }
         self.scroll_from_bottom = 0;
+        self.transcript_selection = None;
     }
 
     fn current_hash(&self) -> Option<&str> {
@@ -258,6 +726,46 @@ impl ConversationState {
 
     fn is_busy(&self) -> bool {
         self.running || self.publishing
+    }
+
+    fn apply_automatic_title(&mut self, prompt: &str) {
+        if self.automatic_title {
+            self.title = automatic_title(prompt);
+            self.automatic_title = false;
+        }
+    }
+
+    fn latest_message_preview(&self) -> String {
+        self.transcript
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.role, EntryRole::Human | EntryRole::Agent))
+            .map(|entry| collapse_whitespace(&entry.text))
+            .unwrap_or_else(|| "New conversation".to_string())
+    }
+
+    fn running_activity(&self) -> Option<&Activity> {
+        self.activities
+            .iter()
+            .rev()
+            .find(|activity| activity.state == ActivityState::Running)
+    }
+
+    fn push_activity(&mut self, activity: Activity) {
+        let followed_tail = self
+            .activity_selection
+            .is_none_or(|selected| selected + 1 == self.activities.len());
+        self.activities.push(activity);
+        if followed_tail {
+            self.activity_selection = Some(self.activities.len() - 1);
+            self.activity_detail_scroll = 0;
+        }
+    }
+
+    fn ensure_activity_selection(&mut self) {
+        if self.activity_selection.is_none() && !self.activities.is_empty() {
+            self.activity_selection = Some(self.activities.len() - 1);
+        }
     }
 }
 
@@ -282,15 +790,24 @@ enum ConfirmAction {
     Publish,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MouseAction {
+    Ignored,
+    Redraw,
+    Copy(String),
+}
+
 pub(crate) struct App {
     repo_dir: PathBuf,
     user: String,
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
-    copy_mode: bool,
+    selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
-    activity_expanded: bool,
+    selecting_transcript: bool,
+    copied_chars: Option<usize>,
+    animation_frame: usize,
     view: View,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
@@ -370,7 +887,7 @@ impl App {
             };
             states.insert(
                 0,
-                ConversationState::new(
+                ConversationState::new_virtual(
                     id.clone(),
                     selected_name.clone(),
                     args.turn,
@@ -389,9 +906,11 @@ impl App {
             conversations: states,
             selected,
             should_quit: false,
-            copy_mode: false,
+            selection_locked: false,
             confirm_action: None,
-            activity_expanded: false,
+            selecting_transcript: false,
+            copied_chars: None,
+            animation_frame: 0,
             view: View::Chat,
             tx,
             rx,
@@ -414,16 +933,120 @@ impl App {
         self.should_quit
     }
 
-    pub(crate) fn copy_mode(&self) -> bool {
-        self.copy_mode
+    pub(crate) fn selection_locked(&self) -> bool {
+        self.selection_locked
+    }
+
+    pub(crate) fn clear_copy_notice(&mut self) {
+        self.copied_chars = None;
+    }
+
+    pub(crate) fn note_copy(&mut self, text: &str) {
+        self.copied_chars = Some(text.chars().count());
+    }
+
+    pub(crate) fn has_visible_animation(&self) -> bool {
+        self.selected().is_busy()
+    }
+
+    pub(crate) fn advance_animation(&mut self) {
+        self.animation_frame = (self.animation_frame + 1) % ui::ACTIVITY_INDICATORS.len();
     }
 
     pub(crate) fn view(&self) -> View {
         self.view
     }
 
+    pub(crate) fn showing_transcript(&self) -> bool {
+        self.view == View::Chat
+    }
+
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        self.selected_mut().composer.insert_str(text);
+        self.selected_mut().composer.insert_paste(text);
+    }
+
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some(index) = ui::conversation_at(self, area, mouse.column, mouse.row) {
+                self.select(index);
+                return MouseAction::Redraw;
+            }
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp
+                if self.view == View::Activity
+                    && ui::content_contains(self.selected(), area, mouse.column, mouse.row) =>
+            {
+                self.scroll_activity_details_up(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollDown
+                if self.view == View::Activity
+                    && ui::content_contains(self.selected(), area, mouse.column, mouse.row) =>
+            {
+                self.scroll_activity_details_down(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollUp
+                if self.showing_transcript()
+                    && ui::transcript_contains(self.selected(), area, mouse.column, mouse.row) =>
+            {
+                self.selected_mut().transcript_selection = None;
+                self.scroll_up(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollDown
+                if self.showing_transcript()
+                    && ui::transcript_contains(self.selected(), area, mouse.column, mouse.row) =>
+            {
+                self.selected_mut().transcript_selection = None;
+                self.scroll_down(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.showing_transcript() => {
+                let Some(point) =
+                    ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
+                else {
+                    return MouseAction::Ignored;
+                };
+                self.selected_mut().transcript_selection = Some(TranscriptSelection {
+                    anchor: point,
+                    head: point,
+                });
+                self.selecting_transcript = true;
+                MouseAction::Redraw
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting_transcript => {
+                if let Some(point) =
+                    ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
+                {
+                    self.selected_mut()
+                        .transcript_selection
+                        .as_mut()
+                        .expect("dragging starts with a transcript selection")
+                        .head = point;
+                    MouseAction::Redraw
+                } else {
+                    MouseAction::Ignored
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selecting_transcript => {
+                if let Some(point) =
+                    ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
+                {
+                    self.selected_mut()
+                        .transcript_selection
+                        .as_mut()
+                        .expect("dragging starts with a transcript selection")
+                        .head = point;
+                }
+                self.selecting_transcript = false;
+                ui::transcript_selection_text(self.selected(), area)
+                    .map(MouseAction::Copy)
+                    .unwrap_or(MouseAction::Redraw)
+            }
+            _ => MouseAction::Ignored,
+        }
     }
 
     fn start_turn(&mut self) {
@@ -435,33 +1058,33 @@ impl App {
         let Some(message) = self.selected_mut().composer.take_message() else {
             return;
         };
-        if let Some(hash) = message.strip_prefix("/from ").map(str::trim) {
-            self.start_from_hash(hash);
-            return;
-        }
-        if message == "/from" {
-            self.selected_mut().status = "usage: /from <commit>".to_string();
-            return;
-        }
-        if let Some(title) = message.strip_prefix("/title ").map(str::trim) {
-            self.rename_selected(title);
-            return;
-        }
-        if message == "/title" {
-            self.selected_mut().status = "usage: /title <new title>".to_string();
+        if let Some((command, arguments)) = parse_command(&message) {
+            if arguments.is_empty() {
+                self.selected_mut().status = format!("usage: {}", command.usage);
+            } else {
+                match command.action {
+                    CommandAction::From => self.start_from_hash(arguments),
+                    CommandAction::Title => self.rename_selected(arguments),
+                }
+            }
             return;
         }
         {
             let state = self.selected_mut();
+            state.apply_automatic_title(&message);
             state.transcript.push(TranscriptEntry {
                 role: EntryRole::Human,
                 commit: None,
                 text: message.clone(),
             });
             state.activities.clear();
+            state.activity_selection = None;
+            state.activity_detail_scroll = 0;
             state.running = true;
+            state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
             state.scroll_from_bottom = 0;
+            state.transcript_selection = None;
         }
 
         let tx = self.tx.clone();
@@ -561,6 +1184,7 @@ impl App {
 
         let state = &mut self.conversations[index];
         match event {
+            TurnEvent::PhaseStarted(phase) => state.turn_phase = phase,
             TurnEvent::PhaseComplete {
                 label,
                 elapsed_secs,
@@ -573,16 +1197,18 @@ impl App {
                     text,
                 });
                 state.scroll_from_bottom = 0;
+                state.transcript_selection = None;
             }
             TurnEvent::ToolCall {
                 step_commit,
                 tool_use_id,
+                name,
                 summary,
-                ..
             } => {
-                state.activities.push(Activity {
+                state.push_activity(Activity {
                     id: tool_use_id,
                     step_commit,
+                    name,
                     summary,
                     detail: String::new(),
                     state: ActivityState::Running,
@@ -606,9 +1232,10 @@ impl App {
                     };
                     activity.detail = content;
                 } else {
-                    state.activities.push(Activity {
+                    state.push_activity(Activity {
                         id: tool_use_id.clone(),
                         step_commit,
+                        name: "result".to_string(),
                         summary: format!("result {tool_use_id}"),
                         detail: content,
                         state: if is_error {
@@ -628,16 +1255,18 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            if !self.selected_mut().composer.clear() {
+                self.should_quit = true;
+            }
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-            self.copy_mode = !self.copy_mode;
+            self.selection_locked = !self.selection_locked;
             return;
         }
-        if self.copy_mode {
+        if self.selection_locked {
             if key.code == KeyCode::Esc {
-                self.copy_mode = false;
+                self.selection_locked = false;
             }
             return;
         }
@@ -658,16 +1287,18 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             self.view = match self.view {
-                View::Chat | View::Tools => View::Diff,
+                View::Chat | View::Activity | View::Tools => View::Diff,
                 View::Diff => View::Chat,
             };
             self.selected_mut().scroll_from_bottom = 0;
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        let ctrl_t = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'));
+        if ctrl_t && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.view = match self.view {
                 View::Tools => View::Chat,
-                View::Chat | View::Diff => View::Tools,
+                View::Chat | View::Activity | View::Diff => View::Tools,
             };
             self.selected_mut().scroll_from_bottom = 0;
             if self.view == View::Tools {
@@ -675,8 +1306,15 @@ impl App {
             }
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-            self.activity_expanded = !self.activity_expanded;
+        if ctrl_t
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a'))
+        {
+            self.view = if self.view == View::Activity {
+                View::Chat
+            } else {
+                self.selected_mut().ensure_activity_selection();
+                View::Activity
+            };
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
@@ -710,44 +1348,171 @@ impl App {
             }
             return;
         }
+        if self.view == View::Activity {
+            match key.code {
+                KeyCode::Esc => self.view = View::Chat,
+                KeyCode::Up => self.select_activity(-1),
+                KeyCode::Down => self.select_activity(1),
+                KeyCode::PageUp => self.scroll_activity_details_up(8),
+                KeyCode::PageDown => self.scroll_activity_details_down(8),
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::PageUp => self.scroll_up(8),
             KeyCode::PageDown => self.scroll_down(8),
             _ if self.view != View::Chat => {}
-            KeyCode::Enter
+            KeyCode::Left
                 if key
                     .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
             {
+                self.selected_mut().composer.select_home()
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+            {
+                self.selected_mut().composer.select_end()
+            }
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.selected_mut().composer.select_word_left()
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.selected_mut().composer.select_word_right()
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.selected_mut().composer.move_home()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.selected_mut().composer.move_end()
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_left()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_right()
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.delete_word_left()
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.delete_word_right()
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_left()
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.selected_mut().composer.move_word_right()
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_mut().composer.insert_char('\n')
             }
-            KeyCode::Enter => self.start_turn(),
+            KeyCode::Enter => {
+                if !self.selected_mut().composer.complete_command() {
+                    self.start_turn();
+                }
+            }
+            KeyCode::Tab => {
+                self.selected_mut().composer.complete_command();
+            }
+            KeyCode::Esc => {
+                self.selected_mut().composer.dismiss_command_menu();
+            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
                 self.selected_mut().composer.insert_char(ch)
             }
             KeyCode::Backspace => self.selected_mut().composer.backspace(),
             KeyCode::Delete => self.selected_mut().composer.delete(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_left()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_right()
+            }
             KeyCode::Left => self.selected_mut().composer.move_left(),
             KeyCode::Right => self.selected_mut().composer.move_right(),
-            KeyCode::Up => self.selected_mut().composer.move_vertical(true),
-            KeyCode::Down => self.selected_mut().composer.move_vertical(false),
+            KeyCode::Up => {
+                if !self.selected_mut().composer.select_command(-1) {
+                    self.selected_mut().composer.move_vertical(true);
+                }
+            }
+            KeyCode::Down => {
+                if !self.selected_mut().composer.select_command(1) {
+                    self.selected_mut().composer.move_vertical(false);
+                }
+            }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_home()
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_mut().composer.select_end()
+            }
             KeyCode::Home => self.selected_mut().composer.move_home(),
             KeyCode::End => self.selected_mut().composer.move_end(),
             _ => {}
         }
     }
 
+    pub(crate) fn selected_composer_text(&self) -> Option<&str> {
+        self.selected().composer.selected_text()
+    }
+
     pub(crate) fn scroll_up(&mut self, rows: usize) {
         let state = self.selected_mut();
+        state.transcript_selection = None;
         state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(rows);
     }
 
     pub(crate) fn scroll_down(&mut self, rows: usize) {
         let state = self.selected_mut();
+        state.transcript_selection = None;
         state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(rows);
+    }
+
+    fn select_activity(&mut self, amount: isize) {
+        let state = self.selected_mut();
+        if state.activities.is_empty() {
+            state.activity_selection = None;
+            return;
+        }
+        let selected = state
+            .activity_selection
+            .unwrap_or(state.activities.len() - 1);
+        let next = selected
+            .saturating_add_signed(amount)
+            .min(state.activities.len() - 1);
+        if next != selected {
+            state.activity_selection = Some(next);
+            state.activity_detail_scroll = 0;
+        }
+    }
+
+    fn scroll_activity_details_up(&mut self, rows: usize) {
+        let state = self.selected_mut();
+        state.activity_detail_scroll = state.activity_detail_scroll.saturating_sub(rows);
+    }
+
+    fn scroll_activity_details_down(&mut self, rows: usize) {
+        let state = self.selected_mut();
+        state.activity_detail_scroll = state.activity_detail_scroll.saturating_add(rows);
     }
 
     fn start_from_hash(&mut self, hash: &str) {
@@ -810,8 +1575,10 @@ impl App {
             .as_deref()
             .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
             .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
-        self.conversations
-            .insert(0, ConversationState::new(id, title, options, status));
+        self.conversations.insert(
+            0,
+            ConversationState::new_virtual(id, title, options, status),
+        );
         self.selected = 0;
         self.view = View::Chat;
         self.confirm_action = None;
@@ -819,7 +1586,11 @@ impl App {
 
     fn select_relative(&mut self, amount: isize) {
         let len = self.conversations.len() as isize;
-        self.selected = (self.selected as isize + amount).rem_euclid(len) as usize;
+        self.select((self.selected as isize + amount).rem_euclid(len) as usize);
+    }
+
+    fn select(&mut self, index: usize) {
+        self.selected = index;
         self.confirm_action = None;
         if self.view == View::Tools {
             self.load_selected_tool_set();
@@ -848,7 +1619,7 @@ impl App {
                     return;
                 }
             };
-            Some(ConversationState::new(
+            Some(ConversationState::new_virtual(
                 id,
                 title,
                 self.selected().turn_options.clone(),
@@ -900,8 +1671,10 @@ impl App {
                 return;
             }
         }
-        self.selected_mut().title = title.to_string();
-        self.selected_mut().status = format!("renamed conversation to {title:?}");
+        let state = self.selected_mut();
+        state.title = title.to_string();
+        state.automatic_title = false;
+        state.status = format!("renamed conversation to {title:?}");
     }
 
     fn load_selected_tool_set(&mut self) {
@@ -1030,10 +1803,13 @@ mod tests {
     use super::*;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
+    use ratatui_core::style::{Color, Modifier};
     use ratatui_core::terminal::Terminal;
     use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-    use super::ui::{paragraph_scroll, render, scroll_offset};
+    use super::ui::{
+        content_contains, paragraph_scroll, render, scroll_offset, transcript_contains,
+    };
 
     fn summary(id: &str) -> UserConversationSummary {
         UserConversationSummary {
@@ -1074,6 +1850,17 @@ mod tests {
         dir
     }
 
+    fn activity(number: usize) -> Activity {
+        Activity {
+            id: format!("tool-{number}"),
+            step_commit: format!("{number:040x}"),
+            name: "bash".to_string(),
+            summary: format!("tool summary {number}"),
+            detail: format!("detail line {number}\n{}", "more detail\n".repeat(20)),
+            state: ActivityState::Succeeded,
+        }
+    }
+
     fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
         let (tx, rx) = mpsc::channel();
         (
@@ -1083,9 +1870,11 @@ mod tests {
                 conversations,
                 selected: 0,
                 should_quit: false,
-                copy_mode: false,
+                selection_locked: false,
                 confirm_action: None,
-                activity_expanded: false,
+                selecting_transcript: false,
+                copied_chars: None,
+                animation_frame: 0,
                 view: View::Chat,
                 tx: tx.clone(),
                 rx,
@@ -1108,6 +1897,365 @@ mod tests {
         composer.move_right();
         composer.delete();
         assert_eq!(composer.text, "ab\nx");
+    }
+
+    #[test]
+    fn pasted_newlines_are_inserted_without_submitting() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.insert_paste("first\r\nsecond\rthird");
+
+        assert_eq!(app.selected().composer.text, "first\nsecond\nthird");
+        assert!(app.selected().transcript.is_empty());
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_j_insert_newlines() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("first");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.selected_mut().composer.insert_str("second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.selected().composer.text, "first\nsecond\n");
+        assert!(app.selected().transcript.is_empty());
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn large_pastes_expand_only_when_the_message_is_taken() {
+        let mut composer = Composer::default();
+        let pasted = format!("first line\n{}", "λ".repeat(LARGE_PASTE_CHAR_THRESHOLD));
+
+        composer.insert_paste(&pasted);
+
+        assert_eq!(composer.pending_pastes.len(), 1);
+        assert_eq!(
+            composer.text,
+            format!(
+                "[Pasted text: {} chars]",
+                LARGE_PASTE_CHAR_THRESHOLD + "first line\n".chars().count()
+            )
+        );
+        assert!(!composer.text.contains("first line"));
+        assert_eq!(composer.take_message().as_deref(), Some(pasted.as_str()));
+        assert!(composer.text.is_empty());
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn multiple_large_pastes_keep_distinct_placeholders_and_expand_in_text_order() {
+        let mut composer = Composer::default();
+        let first = "a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        let second = "b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+
+        composer.insert_paste(&first);
+        composer.insert_str(" between ");
+        composer.insert_paste(&second);
+
+        assert!(composer.text.contains(&format!(
+            "[Pasted text: {} chars]",
+            LARGE_PASTE_CHAR_THRESHOLD + 1
+        )));
+        assert!(composer.text.contains(&format!(
+            "[Pasted text: {} chars #2]",
+            LARGE_PASTE_CHAR_THRESHOLD + 1
+        )));
+        assert_eq!(
+            composer.take_message().unwrap(),
+            format!("{first} between {second}")
+        );
+    }
+
+    #[test]
+    fn paste_placeholders_move_and_delete_as_atomic_text() {
+        let mut composer = Composer::default();
+        let pasted = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        composer.insert_str("before ");
+        let placeholder_start = composer.cursor;
+        composer.insert_paste(&pasted);
+        let placeholder_end = composer.cursor;
+        composer.insert_str(" after");
+
+        composer.cursor = placeholder_end;
+        composer.move_left();
+        assert_eq!(composer.cursor, placeholder_start);
+        composer.move_right();
+        assert_eq!(composer.cursor, placeholder_end);
+
+        composer.backspace();
+        assert_eq!(composer.text, "before  after");
+        assert!(composer.pending_pastes.is_empty());
+
+        composer.cursor = "before ".len();
+        composer.insert_paste(&pasted);
+        composer.cursor = "before ".len();
+        composer.delete();
+        assert_eq!(composer.text, "before  after");
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_clears_drafts_and_pending_pastes_before_exiting() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut()
+            .composer
+            .insert_paste(&"x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!app.should_quit());
+        assert!(app.selected().composer.text.is_empty());
+        assert!(app.selected().composer.pending_pastes.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn automatic_titles_collapse_whitespace_and_limit_unicode_scalars() {
+        assert_eq!(
+            automatic_title("  Review\t the\nλ parser  "),
+            "Review the λ parser"
+        );
+        assert_eq!(automatic_title(&"界".repeat(60)), "界".repeat(60));
+        assert_eq!(
+            automatic_title(&"界".repeat(61)),
+            format!("{}…", "界".repeat(59))
+        );
+    }
+
+    #[test]
+    fn only_new_virtual_conversations_take_their_first_prompt_as_title() {
+        let mut virtual_conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        virtual_conversation.apply_automatic_title("First prompt");
+        virtual_conversation.apply_automatic_title("Second prompt");
+        assert_eq!(virtual_conversation.title, "First prompt");
+
+        let mut existing = state("Existing title");
+        existing.apply_automatic_title("A later prompt");
+        assert_eq!(existing.title, "Existing title");
+    }
+
+    #[test]
+    fn composer_filters_selects_completes_and_dismisses_commands() {
+        let mut composer = Composer::default();
+        composer.insert_str("/");
+        assert_eq!(
+            composer
+                .command_matches()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/from", "/title"]
+        );
+
+        assert!(composer.select_command(1));
+        assert!(composer.complete_command());
+        assert_eq!(composer.text, "/title ");
+        assert!(composer.command_matches().is_empty());
+
+        composer.move_left();
+        assert_eq!(
+            composer
+                .command_matches()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/title"]
+        );
+        assert!(composer.dismiss_command_menu());
+        assert!(composer.command_matches().is_empty());
+        composer.insert_char('x');
+        assert!(!composer.command_menu_dismissed);
+    }
+
+    #[test]
+    fn command_parser_only_claims_catalog_commands() {
+        let (command, arguments) = parse_command("/title A useful title").unwrap();
+        assert_eq!(command.action, CommandAction::Title);
+        assert_eq!(arguments, "A useful title");
+
+        let (command, arguments) = parse_command("/from\nabc123").unwrap();
+        assert_eq!(command.action, CommandAction::From);
+        assert_eq!(arguments, "abc123");
+
+        assert!(parse_command("/future server convention").is_none());
+        assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn command_menu_keys_complete_select_and_dismiss() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/title ");
+        assert!(!app.selected().running);
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/f");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().composer.command_menu_dismissed);
+        assert_eq!(app.selected().composer.text, "/f");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/from ");
+    }
+
+    #[test]
+    fn command_menu_renders_usage_and_descriptions_in_the_prompt_box() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/");
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(terminal.backend().buffer().area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("> /from <commit> — start a conversation from a completed turn"));
+        assert!(rendered.contains("/title <new title> — rename the selected conversation"));
+    }
+
+    #[test]
+    fn composer_moves_by_whitespace_and_non_whitespace_runs() {
+        let mut composer = Composer::default();
+        composer.insert_str("one  λambda\n三");
+
+        composer.move_word_left();
+        assert_eq!(&composer.text[composer.cursor..], "三");
+        composer.move_word_left();
+        assert_eq!(&composer.text[composer.cursor..], "λambda\n三");
+        composer.move_word_left();
+        assert_eq!(&composer.text[composer.cursor..], "one  λambda\n三");
+        composer.move_word_left();
+        assert_eq!(composer.cursor, 0);
+
+        composer.move_word_right();
+        assert_eq!(&composer.text[composer.cursor..], "λambda\n三");
+        composer.move_word_right();
+        assert_eq!(&composer.text[composer.cursor..], "三");
+        composer.move_word_right();
+        assert_eq!(composer.cursor, composer.text.len());
+    }
+
+    #[test]
+    fn composer_deletes_words_without_splitting_utf8() {
+        let mut composer = Composer::default();
+        composer.insert_str("one  λambda\n三");
+
+        composer.delete_word_left();
+        assert_eq!(composer.text, "one  λambda\n");
+        composer.delete_word_left();
+        assert_eq!(composer.text, "one  ");
+
+        composer.cursor = 0;
+        composer.delete_word_right();
+        assert_eq!(composer.text, "");
+        assert_eq!(composer.cursor, 0);
+    }
+
+    #[test]
+    fn option_word_keys_edit_the_composer() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("one  λambda");
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(
+            app.selected().composer.cursor,
+            app.selected().composer.text.len()
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.selected().composer.cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(
+            &app.selected().composer.text[app.selected().composer.cursor..],
+            "λambda"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        assert_eq!(app.selected().composer.text, "one  ");
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.selected().composer.text, "");
+    }
+
+    #[test]
+    fn command_arrows_move_to_line_boundaries() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("first\nsecond");
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER));
+        assert_eq!(app.selected().composer.cursor_row_col(), (1, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(app.selected().composer.cursor_row_col(), (1, 6));
+    }
+
+    #[test]
+    fn shifted_command_and_option_arrows_select_composer_text() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("one two\nthree");
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::SUPER,
+        ));
+        assert_eq!(
+            app.selected().composer.selection_range(),
+            Some((8, app.selected().composer.text.len()))
+        );
+        assert_eq!(app.selected_composer_text(), Some("three"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "one two\nx");
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.selected().composer.selection_range(), Some((8, 9)));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "one two\n");
+    }
+
+    #[test]
+    fn plain_arrows_collapse_composer_selections() {
+        let mut composer = Composer::default();
+        composer.insert_str("one two");
+        composer.select_word_left();
+        assert_eq!(composer.selection_range(), Some((4, 7)));
+
+        composer.move_left();
+        assert_eq!(composer.cursor, 4);
+        assert_eq!(composer.selection_range(), None);
+
+        composer.select_word_right();
+        composer.move_right();
+        assert_eq!(composer.cursor, 7);
+        assert_eq!(composer.selection_range(), None);
     }
 
     #[test]
@@ -1138,6 +2286,31 @@ mod tests {
     }
 
     #[test]
+    fn clicking_conversation_rows_selects_visible_and_scrolled_items() {
+        let conversations = (0..20)
+            .map(|index| state(&format!("talk-{index}")))
+            .collect();
+        let (mut app, _) = app_with(conversations);
+        let area = Rect::new(0, 0, 100, 30);
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(app.handle_mouse(click(5), area), MouseAction::Redraw);
+        assert_eq!(app.selected, 1);
+
+        app.selected = 19;
+        assert_eq!(app.handle_mouse(click(2), area), MouseAction::Redraw);
+        assert_eq!(app.selected, 7);
+
+        assert_eq!(app.handle_mouse(click(1), area), MouseAction::Ignored);
+        assert_eq!(app.selected, 7);
+    }
+
+    #[test]
     fn cli_options_match_the_line_client_surface() {
         // --user rides along so the test never depends on ambient $USER
         // (the cargo worker's environment has none).
@@ -1160,6 +2333,8 @@ mod tests {
     #[test]
     fn from_commit_rejects_conflicting_conversation_options() {
         assert!(Args::parse(&[
+            "--user".into(),
+            "tester".into(),
             "--from".into(),
             "5ec3751".into(),
             "--base".into(),
@@ -1167,6 +2342,8 @@ mod tests {
         ])
         .is_err());
         assert!(Args::parse(&[
+            "--user".into(),
+            "tester".into(),
             "--from".into(),
             "5ec3751".into(),
             "-c".into(),
@@ -1183,6 +2360,94 @@ mod tests {
     }
 
     #[test]
+    fn activity_browser_selects_and_scrolls_full_details() {
+        let mut conversation = state("talk-1");
+        conversation.activities = vec![activity(1), activity(2), activity(3)];
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Activity);
+        assert_eq!(app.selected().activity_selection, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().activity_selection, Some(1));
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.selected().activity_detail_scroll, 8);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 60,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.handle_mouse(wheel, area), MouseAction::Redraw);
+        assert_eq!(app.selected().activity_detail_scroll, 11);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().activity_selection, Some(2));
+        assert_eq!(app.selected().activity_detail_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, View::Chat);
+    }
+
+    #[test]
+    fn live_activity_uses_tool_specific_verbs_and_concise_summaries() {
+        let mut activity = activity(1);
+        activity.name = "read".to_string();
+        activity.summary = "read crates/caos/src/chat.rs".to_string();
+        activity.state = ActivityState::Running;
+
+        assert_eq!(activity.running_verb(), "Reading");
+        assert_eq!(activity.running_summary(), "crates/caos/src/chat.rs");
+
+        activity.name = "bash".to_string();
+        activity.summary = "$ cargo test".to_string();
+        assert_eq!(activity.running_verb(), "Running");
+        assert_eq!(activity.running_summary(), "$ cargo test");
+
+        activity.name = "cat".to_string();
+        activity.summary = "cat README.md".to_string();
+        assert_eq!(activity.running_verb(), "Reading");
+        assert_eq!(activity.running_summary(), "README.md");
+
+        activity.name = "unknown".to_string();
+        activity.summary = "unknown something".to_string();
+        assert_eq!(activity.running_verb(), "Running");
+    }
+
+    #[test]
+    fn new_activity_follows_only_a_selection_at_the_tail() {
+        let mut conversation = state("talk-1");
+        conversation.activities = vec![activity(1), activity(2)];
+        conversation.activity_selection = Some(0);
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.on_turn_event(
+            0,
+            TurnEvent::ToolCall {
+                step_commit: "3".repeat(40),
+                tool_use_id: "tool-3".to_string(),
+                name: "bash".to_string(),
+                summary: "third".to_string(),
+            },
+        );
+        assert_eq!(app.selected().activity_selection, Some(0));
+
+        app.selected_mut().activity_selection = Some(2);
+        app.on_turn_event(
+            0,
+            TurnEvent::ToolCall {
+                step_commit: "4".repeat(40),
+                tool_use_id: "tool-4".to_string(),
+                name: "bash".to_string(),
+                summary: "fourth".to_string(),
+            },
+        );
+        assert_eq!(app.selected().activity_selection, Some(3));
+    }
+
+    #[test]
     fn paragraph_scroll_counts_wrapped_visual_rows() {
         let paragraph = Paragraph::new(
             "this single logical line wraps across several visual rows in a narrow viewport",
@@ -1192,6 +2457,146 @@ mod tests {
         let tail = paragraph_scroll(&paragraph, area, 0);
         assert!(tail > 0);
         assert!(paragraph_scroll(&paragraph, area, 2) < tail);
+    }
+
+    #[test]
+    fn transcript_uses_all_space_above_the_composer() {
+        let terminal = Rect::new(0, 0, 100, 30);
+        let mut conversation = state("talk-1");
+        assert!(content_contains(&conversation, terminal, 27, 1));
+        assert!(content_contains(&conversation, terminal, 99, 25));
+        assert!(!content_contains(&conversation, terminal, 25, 12));
+        assert!(!content_contains(&conversation, terminal, 27, 26));
+
+        conversation.composer.insert_str("one\ntwo\nthree");
+        assert!(content_contains(&conversation, terminal, 99, 23));
+        assert!(!content_contains(&conversation, terminal, 99, 24));
+    }
+
+    #[test]
+    fn live_activity_reserves_space_below_the_transcript() {
+        let terminal = Rect::new(0, 0, 100, 30);
+        let mut conversation = state("talk-1");
+        assert!(transcript_contains(&conversation, terminal, 27, 22));
+
+        conversation.running = true;
+        assert!(!transcript_contains(&conversation, terminal, 27, 23));
+        assert!(transcript_contains(&conversation, terminal, 27, 22));
+    }
+
+    #[test]
+    fn live_activity_distinguishes_system_and_model_phases() {
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.status = "preparing turn".to_string();
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Chugging…"));
+
+        app.on_turn_event(0, TurnEvent::PhaseStarted(TurnPhase::Model));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Thinking…"));
+        assert!(!rendered.contains("Chugging…"));
+    }
+
+    #[test]
+    fn live_activity_indicator_pulses_while_busy() {
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("· Chugging…"));
+
+        app.advance_animation();
+        app.advance_animation();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("✽ Chugging…"));
+    }
+
+    #[test]
+    fn mouse_drag_selects_visible_transcript_text_for_copy() {
+        let mut selected = state("talk-1");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text: "hello".to_string(),
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 27, 2), area),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 29, 2), area),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 29, 2), area),
+            MouseAction::Copy("You".to_string())
+        );
+        app.note_copy("You");
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        for column in 27..=29 {
+            let cell = terminal.backend().buffer().cell((column, 2)).unwrap();
+            assert_eq!(cell.bg, Color::Cyan);
+            assert_eq!(cell.fg, Color::Black);
+        }
+        let footer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(footer.ends_with(" 3 chars copied "));
     }
 
     #[test]
@@ -1212,6 +2617,7 @@ mod tests {
         selected.activities = vec![Activity {
             id: "tool-1".to_string(),
             step_commit: "c".repeat(40),
+            name: "bash".to_string(),
             summary: "$ cargo test".to_string(),
             detail: "12 tests passed".to_string(),
             state: ActivityState::Running,
@@ -1235,13 +2641,16 @@ mod tests {
         assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
         assert!(rendered.contains("Please run the tests"));
-        assert!(rendered.contains("ccccccc"));
+        assert!(rendered.contains("Running…"));
         assert!(rendered.contains("$ cargo test"));
+        assert!(rendered.contains("Ctrl+T expands"));
         assert!(rendered.contains("follow-up"));
-        assert!(rendered.contains("cancellation is not available"));
+        assert!(rendered.contains("Shift+Enter/^J newline"));
+        assert!(!rendered.contains("Alt+Enter"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(app.activity_expanded);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Activity);
+        assert_eq!(app.selected().activity_selection, Some(0));
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let expanded: String = terminal
             .backend()
@@ -1250,6 +2659,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
+        assert!(expanded.contains("ccccccc"));
+        assert!(expanded.contains("$ cargo test"));
         assert!(expanded.contains("12 tests passed"));
 
         app.selected_mut().running = false;
@@ -1267,6 +2678,110 @@ mod tests {
         assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));
         assert!(app.selected().status.contains("press Ctrl+P again"));
         assert!(!app.selected().publishing);
+    }
+
+    #[test]
+    fn transcript_renders_markdown_emphasis_styles() {
+        let mut selected = state("markdown");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent,
+            commit: None,
+            text: "plain **bold** and _italic_".to_string(),
+        });
+        let (app, _) = app_with(vec![selected]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let width = terminal.backend().buffer().area.width as usize;
+        let row = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("plain bold and italic")
+            })
+            .unwrap();
+        let transcript_row = &row[26..];
+        let rendered: String = transcript_row.iter().map(|cell| cell.symbol()).collect();
+        let bold = transcript_row
+            .windows("bold".len())
+            .position(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>() == "bold")
+            .unwrap();
+        let italic = transcript_row
+            .windows("italic".len())
+            .position(|cells| {
+                cells.iter().map(|cell| cell.symbol()).collect::<String>() == "italic"
+            })
+            .unwrap();
+        assert!(transcript_row[bold].modifier.contains(Modifier::BOLD));
+        assert!(!transcript_row[bold].modifier.contains(Modifier::ITALIC));
+        assert!(transcript_row[italic].modifier.contains(Modifier::ITALIC));
+        assert!(!rendered.contains("**"));
+        assert!(!rendered.contains("_italic_"));
+    }
+
+    #[test]
+    fn conversation_list_renders_titles_and_latest_message_previews_without_ids() {
+        let internal_id = "0123456789abcdef0123456789abcdef01234567";
+        let mut selected = ConversationState::new(
+            internal_id.to_string(),
+            "Readable title".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        selected.transcript = vec![
+            TranscriptEntry {
+                role: EntryRole::Human,
+                commit: None,
+                text: "Latest\n  human\tmessage".to_string(),
+            },
+            TranscriptEntry {
+                role: EntryRole::Notice,
+                commit: None,
+                text: "internal failure".to_string(),
+            },
+        ];
+        assert_eq!(selected.latest_message_preview(), "Latest human message");
+        let (app, _) = app_with(vec![selected, state("Empty title")]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered_rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let sidebar_rows: Vec<String> = rendered_rows
+            .iter()
+            .map(|row| row.chars().take(26).collect())
+            .collect();
+        let title_row = sidebar_rows
+            .iter()
+            .position(|row| row.starts_with('│') && row.contains("Readable title"))
+            .unwrap();
+        assert!(
+            sidebar_rows[title_row + 1].contains("Latest human"),
+            "{:?}",
+            &sidebar_rows[title_row..title_row + 3]
+        );
+        let empty_title_row = sidebar_rows
+            .iter()
+            .position(|row| row.starts_with('│') && row.contains("Empty title"))
+            .unwrap();
+        assert!(sidebar_rows[empty_title_row + 1].contains("New conversation"));
+        let sidebar = sidebar_rows.join("\n");
+        assert!(!sidebar.contains(internal_id));
+        assert!(!sidebar.contains("internal failure"));
     }
 
     #[test]
@@ -1295,7 +2810,8 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        app.repo_dir = throwaway_repo("ctrl-w");
+        let dir = throwaway_repo("ctrl-w");
+        app.repo_dir = dir.clone();
         app.selected = 1;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -1316,6 +2832,7 @@ mod tests {
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
         assert!(app.selected().status.contains("new virtual conversation"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1333,7 +2850,13 @@ mod tests {
 
     #[test]
     fn title_command_does_not_change_conversation_identity() {
-        let (mut app, _) = app_with(vec![state("stable-id")]);
+        let conversation = ConversationState::new_virtual(
+            "stable-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        let (mut app, _) = app_with(vec![conversation]);
         app.selected_mut()
             .composer
             .insert_str("/title Mutable title");
@@ -1341,6 +2864,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.selected().id, "stable-id");
+        assert_eq!(app.selected().title, "Mutable title");
+        app.selected_mut()
+            .apply_automatic_title("This prompt must not replace it");
         assert_eq!(app.selected().title, "Mutable title");
     }
 
@@ -1362,7 +2888,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_blocks_edits_and_ctrl_q_toggles_changes() {
+    fn selection_lock_blocks_edits_and_ctrl_q_toggles_changes() {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Diff);
@@ -1370,15 +2896,15 @@ mod tests {
         assert_eq!(app.view, View::Chat);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
-        assert!(app.copy_mode);
+        assert!(app.selection_locked);
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(app.selected().composer.text.is_empty());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!app.copy_mode);
+        assert!(!app.selection_locked);
     }
 
     #[test]
-    fn ctrl_t_shows_the_selected_chat_tool_set() {
+    fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
             source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
@@ -1390,6 +2916,13 @@ mod tests {
         }));
         let (mut app, _) = app_with(vec![conversation]);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Activity);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.view, View::Tools);
 
         let backend = TestBackend::new(100, 30);
@@ -1409,7 +2942,10 @@ mod tests {
         assert!(rendered.contains("Build everything the tree defines."));
         assert!(rendered.contains("[/cas/std/bash]"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.view, View::Chat);
     }
 }

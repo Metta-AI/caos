@@ -1,19 +1,55 @@
 //! Terminal rendering.
 
-use ratatui_core::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui_core::buffer::Buffer;
+use ratatui_core::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::terminal::Frame;
 use ratatui_core::text::{Line, Span};
+use ratatui_core::widgets::Widget;
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-use super::{short_hash, ActivityState, App, ConversationState, EntryRole, View};
+use super::{
+    short_hash, ActivityState, App, Command, ConversationState, EntryRole, TranscriptPoint, View,
+};
+use caos::chat::TurnPhase;
+
+pub(super) const ACTIVITY_INDICATORS: [&str; 4] = ["·", "✦", "✽", "✦"];
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
-    let area = frame.area();
-    let activity_height = if app.activity_expanded { 10 } else { 3 };
+    let state = app.selected();
+    let areas = layout(state, app.view == View::Chat, frame.area());
+
+    render_header(app, state, frame, areas.header);
+    render_conversations(app, frame, areas.sidebar);
+    match app.view {
+        View::Chat => render_chat(state, app.animation_frame, frame, areas.content),
+        View::Activity => render_activity_browser(state, frame, areas.content),
+        View::Diff => render_diff(state, frame, areas.content),
+        View::Tools => render_tools(state, frame, areas.content),
+    }
+    render_composer(
+        state,
+        app.view,
+        !app.selection_locked,
+        frame,
+        areas.composer,
+    );
+    render_footer(app, frame, areas.footer);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Areas {
+    header: Rect,
+    sidebar: Rect,
+    content: Rect,
+    composer: Rect,
+    footer: Rect,
+}
+
+fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -26,26 +62,78 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(26), Constraint::Min(40)])
         .split(outer[1]);
+    let input_height = state.composer.text.split('\n').count().clamp(1, 8) as u16;
+    let command_height = if show_commands {
+        state.composer.command_matches().len() as u16
+    } else {
+        0
+    };
     let conversation = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Length(activity_height),
-            Constraint::Length(6),
+            Constraint::Length(input_height + command_height + 2),
         ])
         .split(body[1]);
-    let state = app.selected();
-
-    render_header(app, state, frame, outer[0]);
-    render_conversations(app, frame, body[0]);
-    match app.view {
-        View::Chat => render_transcript(state, frame, conversation[0]),
-        View::Diff => render_diff(state, frame, conversation[0]),
-        View::Tools => render_tools(state, frame, conversation[0]),
+    Areas {
+        header: outer[0],
+        sidebar: body[0],
+        content: conversation[0],
+        composer: conversation[1],
+        footer: outer[2],
     }
-    render_activity(state, app.activity_expanded, frame, conversation[1]);
-    render_composer(state, app.view, !app.copy_mode, frame, conversation[2]);
-    render_footer(app.copy_mode, frame, outer[2]);
+}
+
+pub(super) fn content_contains(
+    state: &ConversationState,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> bool {
+    layout(state, false, area)
+        .content
+        .contains(Position::new(column, row))
+}
+
+fn conversation_list_offset(selected: usize, count: usize, height: u16) -> usize {
+    let visible = (height as usize / 2).max(1);
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(count.saturating_sub(visible))
+}
+
+pub(super) fn conversation_at(app: &App, terminal: Rect, column: u16, row: u16) -> Option<usize> {
+    let areas = layout(app.selected(), app.view == View::Chat, terminal);
+    let inner = Block::default().borders(Borders::ALL).inner(areas.sidebar);
+    let position = Position::new(column, row);
+    if !inner.contains(position) {
+        return None;
+    }
+    let offset = conversation_list_offset(app.selected, app.conversations.len(), inner.height);
+    let index = offset + ((row - inner.y) / 2) as usize;
+    (index < app.conversations.len()).then_some(index)
+}
+
+fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
+    if !state.running && !state.publishing {
+        return (area, None);
+    }
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+    (split[0], Some(split[1]))
+}
+
+pub(super) fn transcript_contains(
+    state: &ConversationState,
+    terminal: Rect,
+    column: u16,
+    row: u16,
+) -> bool {
+    let (transcript, _) = chat_areas(state, layout(state, true, terminal).content);
+    transcript.contains(Position::new(column, row))
 }
 
 fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
@@ -56,11 +144,12 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     } else {
         "idle"
     };
-    let view = if app.copy_mode {
-        "copy"
+    let view = if app.selection_locked {
+        "selection lock"
     } else {
         match app.view {
             View::Chat => "chat",
+            View::Activity => "activity",
             View::Diff => "diff",
             View::Tools => "tools",
         }
@@ -110,22 +199,28 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             } else {
                 (" ", Color::DarkGray)
             };
-            let hash = state
-                .current_hash()
-                .or(state.turn_options.base.as_deref())
-                .map(short_hash)
-                .unwrap_or("new");
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::raw(state.title.clone()),
-                Span::styled(
-                    format!("  {}  {hash}", short_hash(&state.id)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::raw(state.title.clone()),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        state.latest_message_preview(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                ]),
+            ])
         })
         .collect();
-    let mut selected = ListState::default().with_selected(Some(app.selected));
+    let inner_height = Block::default().borders(Borders::ALL).inner(area).height;
+    let offset = conversation_list_offset(app.selected, app.conversations.len(), inner_height);
+    let mut selected = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(app.selected));
     frame.render_stateful_widget(
         List::new(items)
             .block(
@@ -144,7 +239,71 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+fn render_chat(
+    state: &ConversationState,
+    animation_frame: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let (transcript, activity) = chat_areas(state, area);
+    render_transcript(state, frame, transcript);
+    if let Some(activity) = activity {
+        render_live_activity(state, animation_frame, frame, activity);
+    }
+}
+
+fn render_live_activity(
+    state: &ConversationState,
+    animation_frame: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let (verb, summary) = if state.publishing {
+        ("Publishing", state.status.as_str())
+    } else if let Some(activity) = state.running_activity() {
+        (activity.running_verb(), activity.running_summary())
+    } else {
+        (
+            match state.turn_phase {
+                TurnPhase::System => "Chugging",
+                TurnPhase::Model => "Thinking",
+            },
+            state.status.as_str(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{} {verb}…", ACTIVITY_INDICATORS[animation_frame]),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {summary}"), Style::default().fg(Color::DarkGray)),
+            Span::styled("  Ctrl+T expands", Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(Block::default().title(" Activity ").borders(Borders::ALL)),
+        area,
+    );
+}
+
 fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let paragraph = transcript_paragraph(state);
+    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    frame.render_widget(
+        paragraph
+            .block(
+                Block::default()
+                    .title(" Conversation ")
+                    .borders(Borders::ALL),
+            )
+            .scroll((scroll, 0)),
+        area,
+    );
+    render_transcript_selection(state, frame, area);
+}
+
+fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if state.transcript.is_empty() {
         lines.push(Line::styled(
@@ -169,82 +328,308 @@ fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rec
             ));
         }
         lines.push(Line::from(heading));
-        lines.extend(entry.text.lines().map(|line| Line::raw(line.to_string())));
+        lines.extend(entry.text.lines().map(inline_markdown_line));
         lines.push(Line::raw(""));
     }
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
-    let paragraph = paragraph
-        .block(
-            Block::default()
-                .title(" Conversation ")
-                .borders(Borders::ALL),
-        )
-        .scroll((scroll, 0));
-    frame.render_widget(paragraph, area);
+    Paragraph::new(lines).wrap(Wrap { trim: false })
 }
 
-fn render_activity(state: &ConversationState, expanded: bool, frame: &mut Frame<'_>, area: Rect) {
-    let mut lines = Vec::new();
-    if expanded {
-        lines.push(Line::from(vec![
-            Span::styled("status  ", Style::default().fg(Color::Yellow)),
-            Span::raw(state.status.clone()),
-        ]));
-        for item in &state.activities {
-            let (mark, color) = activity_mark(item.state);
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::styled(
-                    format!("{}  ", short_hash(&item.step_commit)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(item.summary.clone()),
-            ]));
-            lines.extend(item.detail.lines().map(|line| {
-                Line::styled(format!("    {line}"), Style::default().fg(Color::DarkGray))
-            }));
-        }
-    } else {
-        let mut spans = vec![
-            Span::styled("status  ", Style::default().fg(Color::Yellow)),
-            Span::raw(state.status.clone()),
-        ];
-        if let Some(item) = state.activities.last() {
-            let (mark, color) = activity_mark(item.state);
-            spans.extend([
-                Span::raw("    "),
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::styled(
-                    format!("{}  ", short_hash(&item.step_commit)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(item.summary.clone()),
-            ]);
-            let detail = first_line(&item.detail);
-            if !detail.is_empty() {
-                spans.push(Span::styled(
-                    format!(" — {detail}"),
-                    Style::default().fg(Color::DarkGray),
-                ));
+fn inline_markdown_line(text: &str) -> Line<'static> {
+    Line::from(inline_markdown_spans(text, Style::default()))
+}
+
+fn inline_markdown_spans(text: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut index = 0;
+
+    while index < text.len() {
+        let rest = &text[index..];
+        if let Some(after_tick) = rest.strip_prefix('`') {
+            if let Some(end) = after_tick.find('`') {
+                let end = index + end + 2;
+                plain.push_str(&text[index..end]);
+                index = end;
+                continue;
             }
         }
-        lines.push(Line::from(spans));
+        if rest.starts_with("**")
+            && text[index + 2..]
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_whitespace())
+        {
+            if let Some(end) =
+                find_closing_marker(text, index + 2, "**", |before, _| !before.is_whitespace())
+            {
+                push_plain(&mut spans, &mut plain, style);
+                spans.extend(inline_markdown_spans(
+                    &text[index + 2..end],
+                    style.add_modifier(Modifier::BOLD),
+                ));
+                index = end + 2;
+                continue;
+            }
+        }
+        if rest.starts_with('_') && underscore_can_open(text, index) {
+            if let Some(end) = find_closing_marker(text, index + 1, "_", |before, after| {
+                !before.is_whitespace()
+                    && before != '_'
+                    && after.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+            }) {
+                push_plain(&mut spans, &mut plain, style);
+                spans.extend(inline_markdown_spans(
+                    &text[index + 1..end],
+                    style.add_modifier(Modifier::ITALIC),
+                ));
+                index = end + 1;
+                continue;
+            }
+        }
+
+        let ch = rest.chars().next().expect("index is within text");
+        plain.push(ch);
+        index += ch.len_utf8();
     }
-    let title = if expanded {
-        " Activity (Ctrl+A collapse) "
-    } else {
-        " Activity (Ctrl+A expand) "
+
+    push_plain(&mut spans, &mut plain, style);
+    spans
+}
+
+fn find_closing_marker(
+    text: &str,
+    mut index: usize,
+    marker: &str,
+    can_close: impl Fn(char, Option<char>) -> bool,
+) -> Option<usize> {
+    let content_start = index;
+    while index < text.len() {
+        let rest = &text[index..];
+        if let Some(after_tick) = rest.strip_prefix('`') {
+            if let Some(end) = after_tick.find('`') {
+                index += end + 2;
+                continue;
+            }
+        }
+        if index > content_start && rest.starts_with(marker) {
+            let before = text[..index]
+                .chars()
+                .next_back()
+                .expect("closing marker follows content");
+            let after = text[index + marker.len()..].chars().next();
+            if can_close(before, after) {
+                return Some(index);
+            }
+        }
+        let ch = rest.chars().next().expect("index is within text");
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn underscore_can_open(text: &str, index: usize) -> bool {
+    let before = text[..index].chars().next_back();
+    let after = text[index + 1..].chars().next();
+    before.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        && after.is_some_and(|ch| !ch.is_whitespace() && ch != '_')
+}
+
+fn push_plain(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
+    if !plain.is_empty() {
+        spans.push(Span::styled(std::mem::take(plain), style));
+    }
+}
+
+fn transcript_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn transcript_scroll(state: &ConversationState, area: Rect) -> u16 {
+    paragraph_scroll(&transcript_paragraph(state), area, state.scroll_from_bottom)
+}
+
+pub(super) fn transcript_point(
+    state: &ConversationState,
+    terminal: Rect,
+    column: u16,
+    row: u16,
+) -> Option<TranscriptPoint> {
+    let (area, _) = chat_areas(state, layout(state, true, terminal).content);
+    let inner = transcript_inner(area);
+    let position = Position::new(column, row);
+    if !inner.contains(position) {
+        return None;
+    }
+    let point = TranscriptPoint {
+        row: row - inner.y,
+        column: column - inner.x,
     };
+    let absolute_row = transcript_scroll(state, area).saturating_add(point.row);
+    let line_count = transcript_paragraph(state).line_count(inner.width);
+    ((absolute_row as usize) < line_count).then_some(point)
+}
+
+pub(super) fn transcript_selection_text(
+    state: &ConversationState,
+    terminal: Rect,
+) -> Option<String> {
+    let selection = state.transcript_selection?;
+    let area = layout(state, true, terminal).content;
+    let inner = transcript_inner(area);
+    if inner.is_empty() {
+        return None;
+    }
+    let paragraph = transcript_paragraph(state);
+    let line_count = paragraph.line_count(inner.width).min(u16::MAX as usize) as u16;
+    let mut buffer = Buffer::empty(Rect::new(0, 0, inner.width, line_count));
+    paragraph.render(buffer.area, &mut buffer);
+
+    let scroll = transcript_scroll(state, area);
+    let (start, end) = selection.ordered();
+    let mut rows = Vec::new();
+    for selected_row in start.row..=end.row {
+        let absolute_row = scroll.saturating_add(selected_row);
+        if absolute_row >= line_count {
+            break;
+        }
+        let start_column = if selected_row == start.row {
+            start.column
+        } else {
+            0
+        };
+        let end_column = if selected_row == end.row {
+            end.column
+        } else {
+            inner.width.saturating_sub(1)
+        };
+        let mut text = String::new();
+        for column in start_column..=end_column.min(inner.width.saturating_sub(1)) {
+            if let Some(cell) = buffer.cell((column, absolute_row)) {
+                text.push_str(cell.symbol());
+            }
+        }
+        rows.push(text.trim_end().to_string());
+    }
+    let text = rows.join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn render_transcript_selection(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let Some(selection) = state.transcript_selection else {
+        return;
+    };
+    let inner = transcript_inner(area);
+    let (start, end) = selection.ordered();
+    for row in start.row..=end.row.min(inner.height.saturating_sub(1)) {
+        let start_column = if row == start.row { start.column } else { 0 };
+        let end_column = if row == end.row {
+            end.column
+        } else {
+            inner.width.saturating_sub(1)
+        };
+        for column in start_column..=end_column.min(inner.width.saturating_sub(1)) {
+            if let Some(cell) = frame
+                .buffer_mut()
+                .cell_mut((inner.x + column, inner.y + row))
+            {
+                cell.set_fg(Color::Black).set_bg(Color::Cyan);
+            }
+        }
+    }
+}
+
+fn render_activity_browser(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+    let items: Vec<ListItem<'_>> = state
+        .activities
+        .iter()
+        .map(|activity| {
+            let (mark, color) = activity_mark(activity.state);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(
+                    format!("{}  ", short_hash(&activity.step_commit)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(activity.summary.clone()),
+            ]))
+        })
+        .collect();
+    let mut selection = ListState::default().with_selected(state.activity_selection);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(format!(" Activity — {} ", state.status))
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        panes[0],
+        &mut selection,
+    );
+
+    let lines = state
+        .activity_selection
+        .and_then(|selected| state.activities.get(selected))
+        .map(|activity| {
+            let (mark, color) = activity_mark(activity.state);
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        short_hash(&activity.step_commit).to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(format!("  {}", activity.summary)),
+                ]),
+                Line::raw(""),
+            ];
+            if activity.detail.is_empty() {
+                lines.push(Line::styled(
+                    "Waiting for the tool result.",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                lines.extend(
+                    activity
+                        .detail
+                        .lines()
+                        .map(|line| Line::raw(line.to_string())),
+                );
+            }
+            lines
+        })
+        .unwrap_or_else(|| {
+            vec![Line::styled(
+                "No activity for this turn.",
+                Style::default().fg(Color::DarkGray),
+            )]
+        });
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let line_count = paragraph.line_count(area.width.saturating_sub(2));
-    let visible = area.height.saturating_sub(2) as usize;
-    let scroll = line_count.saturating_sub(visible).min(u16::MAX as usize) as u16;
+    let line_count = paragraph.line_count(panes[1].width.saturating_sub(2));
+    let visible = panes[1].height.saturating_sub(2) as usize;
+    let max_scroll = line_count.saturating_sub(visible);
+    let scroll = state
+        .activity_detail_scroll
+        .min(max_scroll)
+        .min(u16::MAX as usize) as u16;
     frame.render_widget(
         paragraph
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" Detail (PgUp/PgDn or wheel; Esc returns) ")
+                    .borders(Borders::ALL),
+            )
             .scroll((scroll, 0)),
-        area,
+        panes[1],
     );
 }
 
@@ -381,46 +766,140 @@ fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let title = if state.running {
-        " Prompt (turn running; cancellation is not available) "
-    } else if state.publishing {
-        " Prompt (publishing PR) "
-    } else if view == View::Tools {
-        " Prompt (tool view; Ctrl+T returns) "
-    } else if view == View::Diff {
-        " Prompt (changes view; Ctrl+Q returns) "
+    let commands = if view == View::Chat {
+        state.composer.command_matches()
     } else {
-        " Prompt (Enter sends, Alt+Enter/Ctrl+J adds a line) "
+        Vec::new()
     };
     let (row, column) = state.composer.cursor_row_col();
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let command_height = commands.len().min(inner.height as usize) as u16;
+    let composer_height = inner.height.saturating_sub(command_height);
+    let composer_area = Rect::new(
+        inner.x.saturating_add(2),
+        inner.y,
+        inner.width.saturating_sub(2),
+        composer_height,
+    );
+    let command_area = Rect::new(
+        inner.x.saturating_add(2),
+        inner.y.saturating_add(composer_height),
+        inner.width.saturating_sub(2),
+        command_height,
+    );
+    let inner_height = composer_height as usize;
     let vertical_scroll = row.saturating_sub(inner_height.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(state.composer.text.as_str())
-            .block(Block::default().title(title).borders(Borders::ALL))
+        Paragraph::new(composer_lines(&state.composer))
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
-        area,
+        composer_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            ">",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(inner.x, inner.y, 1, 1),
+    );
+    render_command_menu(
+        &commands,
+        state.composer.command_selection,
+        frame,
+        command_area,
     );
     if view == View::Chat && show_cursor {
         let cursor_row = row.saturating_sub(vertical_scroll);
-        let x = area.x.saturating_add(1).saturating_add(column as u16);
-        let y = area.y.saturating_add(1).saturating_add(cursor_row as u16);
-        if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
+        let x = composer_area.x.saturating_add(column as u16);
+        let y = composer_area.y.saturating_add(cursor_row as u16);
+        if x < composer_area.right() && y < composer_area.bottom() {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
 }
 
-fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
-    let footer = if copy_mode {
+fn composer_lines(composer: &super::Composer) -> Vec<Line<'_>> {
+    let selection = composer.selection_range();
+    let selection_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let mut offset = 0;
+    composer
+        .text
+        .split('\n')
+        .map(|line| {
+            let line_start = offset;
+            let line_end = line_start + line.len();
+            offset = line_end + 1;
+            let Some((selection_start, selection_end)) = selection else {
+                return Line::raw(line);
+            };
+            let selected_start = selection_start.clamp(line_start, line_end);
+            let selected_end = selection_end.clamp(line_start, line_end);
+            if selected_start >= selected_end {
+                return Line::raw(line);
+            }
+            Line::from(vec![
+                Span::raw(&composer.text[line_start..selected_start]),
+                Span::styled(
+                    &composer.text[selected_start..selected_end],
+                    selection_style,
+                ),
+                Span::raw(&composer.text[selected_end..line_end]),
+            ])
+        })
+        .collect()
+}
+
+fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame<'_>, area: Rect) {
+    let lines = commands.iter().enumerate().map(|(index, command)| {
+        let marker = if index == selected { "> " } else { "  " };
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         Line::styled(
-            " Copy mode: drag to select, use terminal copy, ^Y/Esc resumes",
+            format!("{marker}{} — {}", command.usage, command.description),
+            style,
+        )
+    });
+    frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
+}
+
+fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let footer = if app.selection_locked {
+        Line::styled(
+            " Selection lock: redraws paused, ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
+    } else if app.view == View::Activity {
+        Line::raw(
+            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
+        )
     } else {
-        Line::raw(" ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
+        Line::raw(
+            " Enter sends  Shift+Enter/^J newline  Wheel scrolls  Drag selects+copies  ^T activity  ^Q diff  ^C quit",
+        )
     };
     frame.render_widget(Paragraph::new(footer), area);
+    if let Some(chars) = app.copied_chars {
+        let noun = if chars == 1 { "char" } else { "chars" };
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {chars} {noun} copied "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
 pub(crate) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, from_bottom: usize) -> u16 {
@@ -436,17 +915,54 @@ pub(crate) fn scroll_offset(line_count: usize, height: u16, from_bottom: usize) 
         .min(u16::MAX as usize) as u16
 }
 
-fn first_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
-    const LIMIT: usize = 120;
-    let mut chars = line.chars();
-    let shortened: String = chars.by_ref().take(LIMIT).collect();
-    if chars.next().is_some() {
-        format!("{shortened}…")
-    } else {
-        shortened
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_markdown_styles_bold_italic_and_nested_emphasis() {
+        assert_eq!(
+            inline_markdown_line("plain **bold _and italic_**"),
+            Line::from(vec![
+                Span::raw("plain "),
+                Span::styled("bold ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "and italic",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn inline_markdown_preserves_unmatched_and_intraword_markers() {
+        assert_eq!(
+            inline_markdown_line("**open _still open snake_case __literal__"),
+            Line::raw("**open _still open snake_case __literal__")
+        );
+    }
+
+    #[test]
+    fn inline_markdown_does_not_parse_markers_inside_backticks() {
+        assert_eq!(
+            inline_markdown_line("`**not bold** _not italic_` and **bold**"),
+            Line::from(vec![
+                Span::raw("`**not bold** _not italic_` and "),
+                Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
+            ])
+        );
+    }
+
+    #[test]
+    fn composer_selection_is_highlighted() {
+        let mut composer = super::super::Composer::default();
+        composer.insert_str("one two");
+        composer.select_word_left();
+
+        let lines = composer_lines(&composer);
+
+        assert_eq!(lines[0].spans[1].content, "two");
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Black));
+        assert_eq!(lines[0].spans[1].style.bg, Some(Color::Cyan));
     }
 }
