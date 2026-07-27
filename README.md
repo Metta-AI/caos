@@ -527,31 +527,18 @@ the cache key, never hidden inside a memoized computation.
 
 ## Local testing
 
-Run the dev stack with `caosd` (`nix run .#caosd -- <cmd>` in this repo, or just
-`caosd <cmd>` wherever `caos-tools` is on PATH — it works from any directory,
-including a tree that only imports this flake):
+Build the stack with `nix build`
+
+Run the dev stack with `results/bin/caosd up`
 
 ```bash
-caosd up      # bring the stack up + publish all of std, then return
+caosd up      # bring the stack up + publish all of std, then return. Updates it if already running
 caosd logs    # follow the running stack's logs (Ctrl-C returns; stack stays up)
 caosd down    # stop it (Redis + registry volumes and the server repo are kept)
 caosd reset   # stop and wipe those volumes + the server repo for a clean slate
 ```
 
-`caosd up` is idempotent and fast on a warm stack (~3s: images already loaded,
-the std publish is a cache hit), so re-running it just reconverges the stack to
-current. It loads the `caos-server`/`caos-runnerd` images and brings up four
-services via `docker compose`: `caos-server` (`:9090`, its dedicated bare repo
-mounted at `/git`), `caos-runnerd` (the generic runner, with the docker socket),
-`caos-redis`, and `caos-registry`. Redis and the registry persist across restarts
-(named volumes); the server's bare repo persists under `CAOS_DATA`.
-
-Building and testing run IN caos, as tools: `caos-tools/*.sh` are worker
-scripts (the same ones an LLM agent invokes), and `caos-cli run-tool` fires one as
-a caos job over this repo's tree against the running stack (it never
-starts or restarts the stack — `caosd up` that yourself, once). Every
-level is cached: an unchanged test never re-runs, a warm unchanged suite
-is one cache hit (~1s), and editing one test re-runs only its job.
+Testing is a bit of a mess at the moment, because we build things again inside caos first. This will be fixed soon
 
 ```bash
 caos-cli run-tool build      # compile + link, per-crate, cached
