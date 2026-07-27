@@ -104,6 +104,7 @@ in
     muslCCEnvName
     muslCCEnv
     deps
+    craneLib
     ;
 
   # The image root shared by both consumers: only the two recorded paths. The

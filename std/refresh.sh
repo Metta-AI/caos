@@ -63,8 +63,7 @@ derive_lock() { # <out> <input name>...
 }
 
 # Generate the whole redundant set under $tmp, mirroring the repo layout.
-mkdir -p "$tmp/std/runner" "$tmp/std/bash" "$tmp/std/testenv" "$tmp/std/cargo"
-derive_lock "$tmp/std/runner/flake.lock" nixpkgs
+mkdir -p "$tmp/std/bash" "$tmp/std/testenv" "$tmp/std/cargo"
 derive_lock "$tmp/std/bash/flake.lock" nixpkgs
 derive_lock "$tmp/std/testenv/flake.lock" nixpkgs
 derive_lock "$tmp/std/cargo/flake.lock" nixpkgs rust-overlay crane
@@ -73,28 +72,37 @@ cp std/bash/worker "$tmp/std/testenv/worker"
 
 cp Cargo.toml Cargo.lock rust-toolchain.toml "$tmp/std/cargo/"
 # Every crate is a workspace member (Cargo.toml), so the glob is the member
-# list. Manifests plus empty stubs at each crate's real target paths: cargo
-# only sees an autodiscovered target if its file EXISTS, and crane's
-# mkDummySrc detects targets the same way, then copies its own dummy content
-# over them — so presence is all that matters, never the source itself.
+# list. Two crates ride with REAL source — worker-cargo (std/cargo's
+# /worker, compiled in-flake) and worker-common (its path dep) — so their
+# edits re-key the tree and pay the one cold rebake. Everything else is a
+# manifest plus empty stubs at each crate's real target paths: cargo only
+# sees an autodiscovered target if its file EXISTS, and crane's mkDummySrc
+# detects targets the same way, then copies its own dummy content over them
+# — so presence is all that matters, never the source itself.
 for m in crates/*/Cargo.toml; do
   c=$(dirname "$m")
   d="$tmp/std/cargo/crates/$(basename "$c")"
   mkdir -p "$d"
   cp "$m" "$d/"
-  for f in "$c"/src/main.rs "$c"/src/lib.rs "$c"/src/bin/*.rs; do
-    [ -e "$f" ] || continue
-    rel=${f#"$c"/}
-    mkdir -p "$d/$(dirname "$rel")"
-    : > "$d/$rel"
-  done
+  case "$(basename "$c")" in
+  worker-cargo | worker-common)
+    cp -R "$c/src" "$d/src"
+    ;;
+  *)
+    for f in "$c"/src/main.rs "$c"/src/lib.rs "$c"/src/bin/*.rs; do
+      [ -e "$f" ] || continue
+      rel=${f#"$c"/}
+      mkdir -p "$d/$(dirname "$rel")"
+      : > "$d/$rel"
+    done
+    ;;
+  esac
 done
 
 # The maintained set: the plain files, plus std/cargo/crates compared/replaced
 # as a whole DIRECTORY so a crate deleted from the workspace fails the check
 # as a stale vendored copy instead of lingering.
-files="std/runner/flake.lock
-std/bash/flake.lock
+files="std/bash/flake.lock
 std/testenv/flake.lock
 std/cargo/flake.lock
 std/testenv/worker

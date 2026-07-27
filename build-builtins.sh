@@ -3,16 +3,15 @@
 # `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
 #
 # Entries come in three forms (see the is_*_entry predicates below):
-#   streamed  (flake-builder)            nix-built, composed onto its stock
-#                                        base and pushed to the registry; the
-#                                        entry is a curry over the digest ref
-#   flake     (runner, cargo,            flake trees — complete worker images,
-#              bash, testenv)            /worker included; bash/testenv ARE
-#                                        their checked-in std/<name> dirs,
-#                                        runner/cargo stage their nix-built
-#                                        /worker binary onto the checked-in
-#                                        files (std/<name>/stage-tree.sh); the
-#                                        flake-builder images them on first use
+#   streamed  (flake-builder, runner)    host-nix-built core, composed with
+#                                        `docker build` and pushed to the
+#                                        registry; the entry is a curry over
+#                                        the digest ref
+#   flake     (cargo, bash, testenv)     literal checked-in std/<name> dirs —
+#                                        complete worker images, /worker
+#                                        included (cargo compiles its own
+#                                        in-flake); the flake-builder images
+#                                        each tree on first use
 #   curry     (bin_names)                curry(runner, worker1=<binary>) — the
 #                                        compiled workers ride the shared
 #                                        runner pool
@@ -29,21 +28,19 @@ PROJECT=$PWD
 names=("$@")
 [ ${#names[@]} -eq 0 ] && names=(runner cargo bash testenv flake-builder)
 
-# std entries that are FLAKE TREES (design/flake-images.md): published as a
-# plain git tree the server's flake-builder images on first use.
-is_flake_entry() { case "$1" in runner | cargo | bash | testenv) return 0 ;; *) return 1 ;; esac; }
-# Flake entries whose checked-in std/<name> directory IS the published tree
-# (part 2, literal trees): flake.nix + flake.lock + worker, copied whole —
-# nothing generated (tests/std-lint verifies the checked-in redundancies).
-# The rest (runner, cargo) still stage their nix-built /worker binary onto
-# the checked-in files via std/<name>/stage-tree.sh.
-is_literal_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac; }
+# std entries that are FLAKE TREES (design/flake-images.md, part 2): the
+# checked-in std/<name> directory IS the published tree, copied whole —
+# nothing generated (std/refresh.sh maintains the checked-in redundancies,
+# tests/std-lint verifies them). The server's flake-builder images each
+# tree on first use.
+is_flake_entry() { case "$1" in cargo | bash | testenv) return 0 ;; *) return 1 ;; esac; }
 # std entries whose image is STREAMED to the registry instead of imported into
-# git (design/flake-images.md): the nix tarball's layers are composed onto the
-# stock base with `docker build` and pushed; the std entry is a tiny curry
-# node over the digest ref, so no layer bytes ever enter git. Today that's the
-# flake-builder — the one remaining digest-referenced bootstrap image.
-is_streamed_entry() { case "$1" in flake-builder) return 0 ;; *) return 1 ;; esac; }
+# git (design/flake-images.md): host-nix-built core, composed with `docker
+# build` and pushed; the std entry is a tiny curry node over the digest ref,
+# so no layer bytes ever enter git. The flake-builder (the bootstrap image,
+# composed onto stock nixos/nix) and the runner (the pooled interpreter —
+# self-contained, FROM scratch).
+is_streamed_entry() { case "$1" in flake-builder | runner) return 0 ;; *) return 1 ;; esac; }
 image_names=()
 for name in "${names[@]}"; do
   is_flake_entry "$name" || image_names+=("$name")
@@ -102,18 +99,17 @@ for name in "${image_names[@]}"; do
   [ -n "${img_path[$name]:-}" ] || { echo "build-builtins: no image built for $name" >&2; exit 1; }
 done
 
-# The worker binaries: staged into flake trees as their /worker (runner's
-# interpreter, cargo's worker) and published as curries over runner
-# (bin_names below). Prebuilt store paths arrive via CAOS_BUILTIN_BINS (how
-# caosd avoids runtime nix), else they're nix-built here — the staged set
-# rides in `stage_bins`, so a default publish always builds them.
+# The worker binaries published as curries over runner (bin_names below).
+# Prebuilt store paths arrive via CAOS_BUILTIN_BINS (how caosd avoids
+# runtime nix), else they're nix-built here. Nothing is staged into flake
+# trees anymore: runner's /worker bakes into its streamed image, cargo's
+# compiles in-flake from the vendored source.
 bin_names=(bash-tool llm-step rgrep rustc hello file-count dirs-only deep-deps)
-stage_bins=(runner cargo)
 if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
   bin_paths=$CAOS_BUILTIN_BINS
 else
   attrs=()
-  for b in "${bin_names[@]}" "${stage_bins[@]}"; do attrs+=(".#worker-$b"); done
+  for b in "${bin_names[@]}"; do attrs+=(".#worker-$b"); done
   echo "building worker binaries..." >&2
   if ! bin_paths=$(nix build "${attrs[@]}" --no-link --print-out-paths); then
     echo "build-builtins: nix build failed" >&2; exit 1
@@ -153,10 +149,17 @@ for name in "${image_names[@]}"; do
     mkdir "$ctx"
     tar -xzf "$tarball" -C "$ctx"
     cfg=$(jq -r '.[0].Config' "$ctx/manifest.json")
+    # The flake-builder composes onto stock nixos/nix (pinned by digest in
+    # images/nix-base.ref) so nix and its store stay stock registry layers,
+    # shared with every other consumer. The runner is self-contained — its
+    # nix-built userland IS the image — so it builds FROM scratch.
+    case "$name" in
+    flake-builder) from=$(cat "$PROJECT/images/nix-base.ref") ;;
+    runner) from=scratch ;;
+    *) echo "build-builtins: no stream base for $name" >&2; exit 1 ;;
+    esac
     {
-      # The stock base (pinned by digest in images/nix-base.ref) — nix and its
-      # store stay stock registry layers, shared with every other consumer.
-      printf 'FROM %s\n' "$(cat "$PROJECT/images/nix-base.ref")"
+      printf 'FROM %s\n' "$from"
       jq -r '.[0].Layers[] | "ADD \(.) /"' "$ctx/manifest.json"
       jq -r '.config.Env[]? | "ENV \(.)"' "$ctx/$cfg"
       printf 'ENTRYPOINT %s\n' "$(jq -c '.config.Entrypoint' "$ctx/$cfg")"
@@ -181,15 +184,10 @@ done
 for name in "${names[@]}"; do
   is_flake_entry "$name" || continue
   rm -rf "${CLIENT:?}/$name"
-  if is_literal_entry "$name"; then
-    cp -R "$PROJECT/std/$name" "$CLIENT/$name"
-    # PROJECT may be a read-only store copy (caosd); writable so the next
-    # publish's rm -rf works.
-    chmod -R u+w "$CLIENT/$name"
-  else
-    # shellcheck disable=SC2086
-    "$PROJECT/std/$name/stage-tree.sh" "$PROJECT" "$CLIENT/$name" $bin_paths
-  fi
+  cp -R "$PROJECT/std/$name" "$CLIENT/$name"
+  # PROJECT may be a read-only store copy (caosd); writable so the next
+  # publish's rm -rf works.
+  chmod -R u+w "$CLIENT/$name"
   git -C "$CLIENT" add "$name"
   hash_of[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
   echo "$name: flake tree ${hash_of[$name]}" >&2

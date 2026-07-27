@@ -189,14 +189,14 @@
           mkdir -p usr/bin
           [ -e usr/bin/env ] || ln -s /bin/env usr/bin/env
         '';
-        # No worker images live here anymore, bar the flake-builder below.
-        # Every other std entry is a flake tree (std/{runner,cargo,bash,
-        # testenv} — design/flake-images.md), each defining its own /worker
-        # (bash/testenv: their checked-in ./worker script; runner/cargo:
-        # their staged interpreter binaries), or a curry(runner,
-        # worker1=<static musl binary>) over one (builtinWorkerBins below).
-        # std/runner is the pooled bin-worker base; the old debian-delta
-        # `base` entry had no consumers and is gone.
+        # Two worker images live here — the host-built streamed core: the
+        # flake-builder (below) and the runner (workerRunnerImage). Every
+        # other std entry is a literal checked-in flake tree (std/{cargo,
+        # bash,testenv} — design/flake-images.md part 2), each defining its
+        # own /worker, or a curry(runner, worker1=<static musl binary>)
+        # (builtinWorkerBins below). std/runner is the pooled bin-worker
+        # base; the old debian-delta `base` entry had no consumers and is
+        # gone.
 
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
         # — the one image the flake path can't build (it IS the flake path),
@@ -252,6 +252,54 @@
               "CAOS_WORKER_UID=0"
               "CAOS_WORKER_GID=0"
             ];
+          };
+          fakeRootCommands = installWorkerFiles;
+        };
+
+        # std/runner as HOST-BUILT streamed core (design/flake-images.md,
+        # part 2): the pooled interpreter IMAGE every compiled worker runs
+        # on — not a worker itself (its /worker awaits a worker1; the
+        # workers are the curries over it).
+        # worker-runner is the in-image half of the runner-pool protocol
+        # — it versions with the client and the protocol, not with std
+        # content — so the host builds this image like the flake-builder's
+        # and build-builtins.sh streams it; the std entry is a curry over
+        # the digest. Unlike the flake-builder there is no stock base: the
+        # userland is nix-built, so the compose is FROM scratch and the
+        # whole (small) closure pushes once per change, memoized on the
+        # tarball's store path. The caos additions bake in here
+        # (workerBaseRoot + installWorkerFiles) — streamed images never pass
+        # through the flake path's stack stage.
+        workerRunnerRoot = pkgs.runCommand "caos-worker-runner-worker-root" { } ''
+          mkdir -p $out
+          install -m 755 ${worker-runner}/bin/worker-runner $out/worker
+        '';
+        workerRunnerImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-runner";
+          tag = "latest";
+          # bash provides /bin/sh too. The userland is what compiled workers
+          # — and the commands bash-tool runs for the agent — see at runtime.
+          contents = [
+            workerRunnerRoot
+            workerBaseRoot
+            linuxPkgs.bash
+            linuxPkgs.coreutils
+            linuxPkgs.diffutils
+            linuxPkgs.gnugrep
+            linuxPkgs.gnused
+            linuxPkgs.findutils
+            linuxPkgs.gnutar
+            linuxPkgs.gzip
+          ];
+          config = {
+            # runnerd forces the entrypoint anyway; set it so the streamed
+            # compose (which renders config.Entrypoint into a Dockerfile)
+            # always has one.
+            Entrypoint = [
+              "/bin/caos"
+              "runner"
+            ];
+            Env = [ "PATH=/bin" ];
           };
           fakeRootCommands = installWorkerFiles;
         };
@@ -555,19 +603,21 @@
         builtinWorkerImages = [
           # Streamed to the registry by build-builtins.sh, never git-imported.
           workerFlakeBuilderImage
+          workerRunnerImage
         ];
 
         # The worker binaries build-builtins.sh needs at publish — curried
-        # onto std/runner (the agent harness, rustc, the example workers) or
-        # staged into flake trees as their /worker (worker-runner, worker-
-        # cargo). Handed over prebuilt so caosd needs no runtime nix. It finds
-        # each binary under /bin, so these may share one consolidated output.
+        # onto std/runner (the agent harness, rustc, the example workers) and
+        # published whole as refs/caos/bins (the build/test tools' input).
+        # Handed over prebuilt so caosd needs no runtime nix. It finds each
+        # binary under /bin, so these may share one consolidated output.
         builtinWorkerBins = [
           worker-bash-tool
           worker-llm-step
           worker-rgrep
-          # Staged INTO flake trees as their /worker (std/cargo, std/runner —
-          # see the stage-tree.sh scripts), not published as curries.
+          # Not curries: these ride only in refs/caos/bins — the test
+          # suite's own image pipeline stages them (std's runner bakes its
+          # /worker in workerRunnerImage; std/cargo compiles its own).
           worker-cargo
           worker-runner
           # Published as curry(runner, worker1) with the cargo ref and the
@@ -809,6 +859,7 @@
           # ref would float with the global registry).
           skopeo = linuxPkgs.skopeo;
           caos-worker-flake-builder-docker = workerFlakeBuilderImage;
+          caos-worker-runner-docker = workerRunnerImage;
         };
 
         apps = {
