@@ -42,5 +42,9 @@ xattr = "1"
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
+# Full-screen terminal client used only by the `caos-cli` binary.
+ratatui-core = { version = "0.1.2", features = ["std"] }
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-widgets = { version = "0.3.2", default-features = false, features = ["std", "unstable-rendered-line-info"] }
 # Minimal HTTP *server* for `caos serve` (the warm-pool worker mode): the same
 # pure-Rust, static-friendly lib the caos server uses.

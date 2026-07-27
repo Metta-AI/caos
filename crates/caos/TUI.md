@@ -1,6 +1,6 @@
-# caos-tui
+# `caos tui`
 
-`caos-tui` is a full-screen terminal client for the CAOS agent harness. It uses
+`caos tui` is a full-screen terminal client for the CAOS agent harness. It uses
 the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
@@ -17,17 +17,25 @@ CAOS server:
 
 ```bash
 git remote add caos http://localhost:9090
-nix build .#caos-tui
-./result/bin/caos-tui
+nix build
+./result/bin/caos tui
 ```
 
-During development, it can also be launched with `cargo run -p caos-tui`.
+During development, launch it with `cargo run -p caos --bin caos-cli -- tui`.
 
 ```text
-caos-tui                  continue the most recent conversation
-caos-tui --new            start a fresh conversation
-caos-tui --from 5ec3751   branch from a completed turn
+caos tui                  continue the most recent conversation
+caos tui --user alice     use alice's active conversation list
+caos tui --new            start a fresh conversation
+caos tui --from 5ec3751   branch from a completed turn
+caos tui --list-archived  list archived conversation IDs and titles
+caos tui --unarchive ID   restore one conversation to the active list
 ```
+
+`--user` defaults to `$USER`. Active and archived membership is stored on the
+CAOS server under `refs/caos/users/<user>/conversations/{active,archived}/`,
+not in local TUI state. Existing local conversation refs are imported the first
+time that user opens the TUI.
 
 ## Controls
 
@@ -37,6 +45,7 @@ caos-tui --from 5ec3751   branch from a completed turn
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
+| `Ctrl+W` | Archive the selected conversation for this user |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Show the tools available to the selected conversation |
 | `Ctrl+A` | Expand or collapse live Activity above the prompt |
@@ -50,9 +59,17 @@ caos-tui --from 5ec3751   branch from a completed turn
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
-TUI. Activity entries show the durable hashes of internal harness steps for
-inspection; those step trees contain harness metadata and are not branch
-points.
+TUI. Enter `/title <new title>` to change the shared title without changing the
+conversation ID or HEAD. Activity entries show the durable hashes of internal
+harness steps for inspection; those step trees contain harness metadata and are
+not branch points.
+
+Archiving atomically moves only the selected user's membership ref from
+`active` to `archived`; it does not move the conversation HEAD or affect other
+users. A running or publishing conversation must finish first. Closing an
+unsent virtual conversation simply discards it. Use `--list-archived` and
+`--unarchive <conversation-id>` outside the full-screen UI to recover old
+conversations.
 
 `Ctrl+Y` releases mouse capture and freezes redraws so terminal-native text
 selection remains stable. Drag across any visible text, use the terminal's

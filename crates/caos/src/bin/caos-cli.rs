@@ -11,7 +11,7 @@
 //! (compute, with the result checked out to any host path, or a file result
 //! streamed to stdout when no path is given), `curry` (bind args to an image,
 //! printing the curried ref), `import-image` (get a docker image into caos,
-//! printing its hash), and `talk`/`chat` (agent conversations — see
+//! printing its hash), and `talk`/`tui`/`chat` (agent conversations — see
 //! design/agent-harness.md; `talk` is the everyday surface, `chat` the
 //! explicit one-turn form). The object-level commands (`get`/`put`/…) live
 //! only in the worker `caos`, which runs inside a sandbox with a real `/cas`.
@@ -21,6 +21,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use caos::{prog_name, GitTransport};
+
+mod tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -122,6 +124,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // `--new` starts another); with no prompt on a terminal it loops, one
         // turn per line. Flag parsing (and usage) lives in `caos::cli_talk`.
         Some("talk") => caos::cli_talk(&transport()?, &args[2..]),
+        Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation: mint the human commit, run llm-step over it, print
         // progress, advance `refs/caos/conversations/<name>` on success. Flag
@@ -157,6 +160,7 @@ fn usage(args: &[String]) -> String {
          {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
+         {prog} tui [--new | --from <commit>] [options]\n  \
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
          {prog} run-tool <script | name> [--name=value ...]"
     )

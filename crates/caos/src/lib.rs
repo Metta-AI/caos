@@ -1,5 +1,5 @@
 //! caos client library: the engine shared by the worker, line-oriented CLI,
-//! and richer clients such as `caos-tui`.
+//! and richer clients such as `caos tui`.
 //!
 //! The package provides two binaries (see the crate's `bin/`):
 //!

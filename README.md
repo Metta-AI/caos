@@ -110,8 +110,7 @@ flake-builder) or a `curry(std/runner, worker1=<binary>)` over the runner —
 see `design/flake-images.md`. The `caos-server` image is not minimal: it bundles
 the `docker` client, `git`, and `tar`, and expects the host's docker socket.
 
-> Docker images are Linux-only. On macOS, build the `*-docker` outputs via a
-> remote/linux builder; the binaries and dev shell build natively.
+> On macOS, see [Building on macOS](BUILDING_ON_MACOS.md).
 
 ## The big picture
 
@@ -135,7 +134,8 @@ its hash, so identical work is deduplicated and memoized.
 
 One daemon (`crates/server`), image `caos-server`, serving everything over a
 single URL. It backs onto a git repository it **owns** (mounted at `/git`); in
-dev, `caosd up` creates a dedicated bare repo for it (see [local testing](#local-testing)).
+dev, `caosd up` creates a dedicated bare repo for it under `CAOS_DATA` (see
+[local testing](#local-testing)).
 
 It serves requests **concurrently — one thread per request** — so a worker can
 fetch objects while its own `/run` is in flight, and several top-level runs can

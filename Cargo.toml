@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/caos",
-    "crates/caos-tui",
     "crates/runnerd",
     "crates/server",
     "crates/worker-common",

@@ -255,10 +255,16 @@ Two verbs and a full-screen client over one turn engine (implemented —
   piped stdin the whole of it is one prompt.
 - **`caos-cli chat <name> [-m <message>]`** — the explicit, scriptable
   one-turn form (message from `-m` or stdin).
-- **`caos-tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
+- **`caos tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
   own crate. It consumes structured `TurnEvent`s from the same engine,
-  reconstructs durable history from conversation refs, and presents independent
-  virtual conversations in a left sidebar. Every conversation retains its own
+  reconstructs durable history from server-indexed conversation refs, and
+  presents independent virtual conversations in a left sidebar. A stable
+  conversation ID addresses `refs/caos/conversations/<id>/head`; its mutable
+  title lives at the sibling `title` ref. Per-user active and archived membership
+  lives under `refs/caos/users/<user>/conversations/{active,archived}/`, with
+  `--user` defaulting to `$USER`. `Ctrl+W` atomically archives for that user
+  without changing HEAD or another user's state; `--list-archived` and
+  `--unarchive` recover old conversations. Every conversation retains its own
   transcript, prompt, activity, diff, and running worker thread, so turns can
   advance concurrently while the user switches between them. Live status and
   tool activity sit in a collapsible strip above the multiline prompt; each
@@ -348,7 +354,7 @@ deadlines are comfortable; the top-level pending timeout
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
    published by build-builtins.sh so a turn needs nothing built or committed
    locally. **Done** (same files; `tests/chat-online` is the UX spec).
-7. Structured client events + `caos-tui` — presentation-independent turn
+7. Structured client events + `caos tui` — presentation-independent turn
    events, durable history/diff readers, multiline composer, task switching,
    live activity, workspace review, and confirmed clean-checkout apply. **Done**
-   (`crates/caos-tui`; unit tests plus the existing chat integration suite).
+   (`crates/caos/src/bin/tui`; unit tests plus the existing chat integration suite).
