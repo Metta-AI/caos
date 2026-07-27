@@ -12,7 +12,8 @@ use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TerminalEvent,
+    Event as TerminalEvent, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui_crossterm::crossterm::execute;
 use ratatui_crossterm::crossterm::terminal::{
@@ -61,7 +62,22 @@ fn run_app(
                 TerminalEvent::Key(key) => {
                     app.clear_copy_notice();
                     let was_locked = app.selection_locked();
-                    app.handle_key(key);
+                    let selected_text = if !app.selection_locked()
+                        && key.kind == KeyEventKind::Press
+                        && key.modifiers.contains(KeyModifiers::SUPER)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        app.selected_composer_text().map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    if let Some(text) = selected_text {
+                        copy_to_clipboard(terminal.backend_mut(), &text)
+                            .map_err(|error| format!("copying composer selection: {error}"))?;
+                        app.note_copy(&text);
+                    } else {
+                        app.handle_key(key);
+                    }
                     if was_locked != app.selection_locked() {
                         set_mouse_capture(terminal.backend_mut(), !app.selection_locked())
                             .map_err(|error| {
@@ -117,13 +133,15 @@ fn enter_screen(writer: &mut impl io::Write) -> io::Result<()> {
         writer,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )
 }
 
 fn leave_screen(writer: &mut impl io::Write) -> io::Result<()> {
     execute!(
         writer,
+        PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
@@ -270,6 +288,9 @@ mod tests {
         assert!(output.find("\u{1b}[?2004h") < output.find("\u{1b}[?2004l"));
         assert!(output.contains("\u{1b}[?1000h"));
         assert!(output.contains("\u{1b}[?1000l"));
+        assert!(output.contains("\u{1b}[>1u"));
+        assert!(output.contains("\u{1b}[<1u"));
+        assert!(output.find("\u{1b}[>1u") < output.find("\u{1b}[<1u"));
     }
 
     #[test]

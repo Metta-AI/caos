@@ -792,7 +792,7 @@ fn render_composer(
     let inner_height = composer_height as usize;
     let vertical_scroll = row.saturating_sub(inner_height.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(state.composer.text.as_str())
+        Paragraph::new(composer_lines(&state.composer))
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         composer_area,
     );
@@ -819,6 +819,37 @@ fn render_composer(
             frame.set_cursor_position(Position::new(x, y));
         }
     }
+}
+
+fn composer_lines(composer: &super::Composer) -> Vec<Line<'_>> {
+    let selection = composer.selection_range();
+    let selection_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let mut offset = 0;
+    composer
+        .text
+        .split('\n')
+        .map(|line| {
+            let line_start = offset;
+            let line_end = line_start + line.len();
+            offset = line_end + 1;
+            let Some((selection_start, selection_end)) = selection else {
+                return Line::raw(line);
+            };
+            let selected_start = selection_start.clamp(line_start, line_end);
+            let selected_end = selection_end.clamp(line_start, line_end);
+            if selected_start >= selected_end {
+                return Line::raw(line);
+            }
+            Line::from(vec![
+                Span::raw(&composer.text[line_start..selected_start]),
+                Span::styled(
+                    &composer.text[selected_start..selected_end],
+                    selection_style,
+                ),
+                Span::raw(&composer.text[selected_end..line_end]),
+            ])
+        })
+        .collect()
 }
 
 fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame<'_>, area: Rect) {
@@ -920,5 +951,18 @@ mod tests {
                 Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
             ])
         );
+    }
+
+    #[test]
+    fn composer_selection_is_highlighted() {
+        let mut composer = super::super::Composer::default();
+        composer.insert_str("one two");
+        composer.select_word_left();
+
+        let lines = composer_lines(&composer);
+
+        assert_eq!(lines[0].spans[1].content, "two");
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Black));
+        assert_eq!(lines[0].spans[1].style.bg, Some(Color::Cyan));
     }
 }
