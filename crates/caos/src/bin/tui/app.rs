@@ -77,25 +77,51 @@ struct Activity {
     state: ActivityState,
 }
 
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPaste {
+    placeholder: String,
+    content: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Composer {
     text: String,
     cursor: usize,
+    pending_pastes: Vec<PendingPaste>,
     command_selection: usize,
     command_menu_dismissed: bool,
 }
 
 impl Composer {
     fn insert_char(&mut self, ch: char) {
+        self.snap_cursor_after_placeholder();
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.reset_command_menu();
     }
 
     fn insert_str(&mut self, text: &str) {
+        self.snap_cursor_after_placeholder();
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.reset_command_menu();
+    }
+
+    fn insert_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let char_count = text.chars().count();
+        if char_count > LARGE_PASTE_CHAR_THRESHOLD {
+            let placeholder = self.next_paste_placeholder(char_count);
+            self.insert_str(&placeholder);
+            self.pending_pastes.push(PendingPaste {
+                placeholder,
+                content: text,
+            });
+        } else {
+            self.insert_str(&text);
+        }
     }
 
     fn backspace(&mut self) {
@@ -107,26 +133,39 @@ impl Composer {
             .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
-        self.text.drain(previous..self.cursor);
-        self.cursor = previous;
-        self.reset_command_menu();
+        self.delete_range(previous, self.cursor);
     }
 
     fn delete(&mut self) {
         let Some(ch) = self.text[self.cursor..].chars().next() else {
             return;
         };
-        self.text.drain(self.cursor..self.cursor + ch.len_utf8());
-        self.reset_command_menu();
+        self.delete_range(self.cursor, self.cursor + ch.len_utf8());
     }
 
     fn move_left(&mut self) {
+        if let Some((start, _)) = self
+            .paste_ranges()
+            .into_iter()
+            .find(|(start, end)| self.cursor > *start && self.cursor <= *end)
+        {
+            self.cursor = start;
+            return;
+        }
         if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
             self.cursor = index;
         }
     }
 
     fn move_right(&mut self) {
+        if let Some((_, end)) = self
+            .paste_ranges()
+            .into_iter()
+            .find(|(start, end)| self.cursor >= *start && self.cursor < *end)
+        {
+            self.cursor = end;
+            return;
+        }
         if let Some(ch) = self.text[self.cursor..].chars().next() {
             self.cursor += ch.len_utf8();
         }
@@ -142,15 +181,12 @@ impl Composer {
 
     fn delete_word_left(&mut self) {
         let start = self.word_left();
-        self.text.drain(start..self.cursor);
-        self.cursor = start;
-        self.reset_command_menu();
+        self.delete_range(start, self.cursor);
     }
 
     fn delete_word_right(&mut self) {
         let end = self.word_right();
-        self.text.drain(self.cursor..end);
-        self.reset_command_menu();
+        self.delete_range(self.cursor, end);
     }
 
     fn word_left(&self) -> usize {
@@ -226,6 +262,7 @@ impl Composer {
             (target_start, target_end)
         };
         self.cursor = byte_at_column(&self.text, target.0, target.1, column);
+        self.snap_cursor_after_placeholder();
     }
 
     fn cursor_row_col(&self) -> (usize, usize) {
@@ -241,14 +278,102 @@ impl Composer {
     }
 
     fn take_message(&mut self) -> Option<String> {
-        let message = self.text.trim().to_string();
+        let message = self.expanded_text().trim().to_string();
         if message.is_empty() {
             return None;
         }
+        self.clear();
+        Some(message)
+    }
+
+    fn clear(&mut self) -> bool {
+        if self.text.is_empty() && self.pending_pastes.is_empty() {
+            return false;
+        }
         self.text.clear();
         self.cursor = 0;
+        self.pending_pastes.clear();
         self.reset_command_menu();
-        Some(message)
+        true
+    }
+
+    fn expanded_text(&self) -> String {
+        let mut ranges: Vec<_> = self
+            .pending_pastes
+            .iter()
+            .filter_map(|paste| {
+                self.text
+                    .find(&paste.placeholder)
+                    .map(|start| (start, start + paste.placeholder.len(), &paste.content))
+            })
+            .collect();
+        ranges.sort_by_key(|(start, _, _)| *start);
+
+        let mut expanded = String::new();
+        let mut previous = 0;
+        for (start, end, content) in ranges {
+            expanded.push_str(&self.text[previous..start]);
+            expanded.push_str(content);
+            previous = end;
+        }
+        expanded.push_str(&self.text[previous..]);
+        expanded
+    }
+
+    fn next_paste_placeholder(&self, char_count: usize) -> String {
+        let base = format!("[Pasted text: {char_count} chars]");
+        if !self.text.contains(&base) {
+            return base;
+        }
+        let mut ordinal = 2;
+        loop {
+            let candidate = format!("[Pasted text: {char_count} chars #{ordinal}]");
+            if !self.text.contains(&candidate) {
+                return candidate;
+            }
+            ordinal += 1;
+        }
+    }
+
+    fn paste_ranges(&self) -> Vec<(usize, usize)> {
+        self.pending_pastes
+            .iter()
+            .filter_map(|paste| {
+                self.text
+                    .find(&paste.placeholder)
+                    .map(|start| (start, start + paste.placeholder.len()))
+            })
+            .collect()
+    }
+
+    fn snap_cursor_after_placeholder(&mut self) {
+        if let Some((_, end)) = self
+            .paste_ranges()
+            .into_iter()
+            .find(|(start, end)| self.cursor > *start && self.cursor < *end)
+        {
+            self.cursor = end;
+        }
+    }
+
+    fn delete_range(&mut self, mut start: usize, mut end: usize) {
+        loop {
+            let original = (start, end);
+            for (paste_start, paste_end) in self.paste_ranges() {
+                if start < paste_end && end > paste_start {
+                    start = start.min(paste_start);
+                    end = end.max(paste_end);
+                }
+            }
+            if (start, end) == original {
+                break;
+            }
+        }
+        self.text.drain(start..end);
+        self.cursor = start;
+        self.pending_pastes
+            .retain(|paste| self.text.contains(&paste.placeholder));
+        self.reset_command_menu();
     }
 
     fn command_token(&self) -> Option<&str> {
@@ -623,7 +748,7 @@ impl App {
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        self.selected_mut().composer.insert_str(text);
+        self.selected_mut().composer.insert_paste(text);
     }
 
     fn start_turn(&mut self) {
@@ -824,7 +949,9 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            if !self.selected_mut().composer.clear() {
+                self.should_quit = true;
+            }
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
@@ -1344,6 +1471,107 @@ mod tests {
         composer.move_right();
         composer.delete();
         assert_eq!(composer.text, "ab\nx");
+    }
+
+    #[test]
+    fn pasted_newlines_are_inserted_without_submitting() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.insert_paste("first\r\nsecond\rthird");
+
+        assert_eq!(app.selected().composer.text, "first\nsecond\nthird");
+        assert!(app.selected().transcript.is_empty());
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn large_pastes_expand_only_when_the_message_is_taken() {
+        let mut composer = Composer::default();
+        let pasted = format!("first line\n{}", "λ".repeat(LARGE_PASTE_CHAR_THRESHOLD));
+
+        composer.insert_paste(&pasted);
+
+        assert_eq!(composer.pending_pastes.len(), 1);
+        assert_eq!(
+            composer.text,
+            format!(
+                "[Pasted text: {} chars]",
+                LARGE_PASTE_CHAR_THRESHOLD + "first line\n".chars().count()
+            )
+        );
+        assert!(!composer.text.contains("first line"));
+        assert_eq!(composer.take_message().as_deref(), Some(pasted.as_str()));
+        assert!(composer.text.is_empty());
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn multiple_large_pastes_keep_distinct_placeholders_and_expand_in_text_order() {
+        let mut composer = Composer::default();
+        let first = "a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        let second = "b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+
+        composer.insert_paste(&first);
+        composer.insert_str(" between ");
+        composer.insert_paste(&second);
+
+        assert!(composer.text.contains(&format!(
+            "[Pasted text: {} chars]",
+            LARGE_PASTE_CHAR_THRESHOLD + 1
+        )));
+        assert!(composer.text.contains(&format!(
+            "[Pasted text: {} chars #2]",
+            LARGE_PASTE_CHAR_THRESHOLD + 1
+        )));
+        assert_eq!(
+            composer.take_message().unwrap(),
+            format!("{first} between {second}")
+        );
+    }
+
+    #[test]
+    fn paste_placeholders_move_and_delete_as_atomic_text() {
+        let mut composer = Composer::default();
+        let pasted = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        composer.insert_str("before ");
+        let placeholder_start = composer.cursor;
+        composer.insert_paste(&pasted);
+        let placeholder_end = composer.cursor;
+        composer.insert_str(" after");
+
+        composer.cursor = placeholder_end;
+        composer.move_left();
+        assert_eq!(composer.cursor, placeholder_start);
+        composer.move_right();
+        assert_eq!(composer.cursor, placeholder_end);
+
+        composer.backspace();
+        assert_eq!(composer.text, "before  after");
+        assert!(composer.pending_pastes.is_empty());
+
+        composer.cursor = "before ".len();
+        composer.insert_paste(&pasted);
+        composer.cursor = "before ".len();
+        composer.delete();
+        assert_eq!(composer.text, "before  after");
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_clears_drafts_and_pending_pastes_before_exiting() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut()
+            .composer
+            .insert_paste(&"x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!app.should_quit());
+        assert!(app.selected().composer.text.is_empty());
+        assert!(app.selected().composer.pending_pastes.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
     }
 
     #[test]

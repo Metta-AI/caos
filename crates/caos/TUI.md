@@ -61,7 +61,7 @@ time that user opens the TUI.
 | `Ctrl+L` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
-| `Ctrl+C` | Exit |
+| `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
@@ -80,6 +80,14 @@ usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
 or Enter to complete it with a trailing space. Typing arguments closes the
 menu. Escape dismisses it without changing the prompt. An unrecognized
 slash-prefixed prompt is sent normally.
+
+Bracketed paste mode keeps pasted newlines inside the prompt instead of
+submitting partial lines. Pastes over 1,000 characters are kept out of the
+editable buffer and shown as an atomic `[Pasted text: N chars]` placeholder.
+The full text, including newlines, replaces the placeholder when the prompt is
+sent. Backspace or Delete removes the whole placeholder. Press `Ctrl+C` to
+clear a draft and any stored paste content; press it again on the empty prompt
+to exit.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other
