@@ -99,9 +99,11 @@ fn parse_posted_object(body: &[u8]) -> Result<(gix::object::Kind, &[u8]), HttpEr
 /// cache keys — are identical no matter who builds the request.
 pub(crate) fn store_git_blob(config: &Config, content: &[u8]) -> Result<gix::ObjectId, String> {
     let repo = config.repo.to_thread_local();
-    repo.write_blob(content)
-        .map(|id| id.detach())
-        .map_err(|e| format!("writing blob: {e}"))
+    match repo.write_blob(content) {
+        Ok(id) => Ok(id.detach()),
+        Err(e) => stored_despite(&repo, gix::objs::Kind::Blob, content)
+            .ok_or_else(|| format!("writing blob: {e}")),
+    }
 }
 
 /// Encode `entries` as a git tree (sorted into git's required order) and store
@@ -112,9 +114,32 @@ pub(crate) fn store_git_tree(
 ) -> Result<gix::ObjectId, String> {
     entries.sort();
     let repo = config.repo.to_thread_local();
-    repo.write_object(&gix::objs::Tree { entries })
-        .map(|id| id.detach())
-        .map_err(|e| format!("writing tree: {e}"))
+    let tree = gix::objs::Tree { entries };
+    match repo.write_object(&tree) {
+        Ok(id) => Ok(id.detach()),
+        Err(e) => {
+            use gix::objs::WriteTo;
+            let mut data = Vec::new();
+            tree.write_to(&mut data)
+                .map_err(|e| format!("encoding tree: {e}"))?;
+            stored_despite(&repo, gix::objs::Kind::Tree, &data)
+                .ok_or_else(|| format!("writing tree: {e}"))
+        }
+    }
+}
+
+/// The content-addressed escape for a failed object write: concurrent requests
+/// writing the SAME object race on the loose-object rename, and gix (except on
+/// Windows) surfaces the losing racer's persist failure even though the winner
+/// stored the content — observed under the suite's cold parallel load. Exists
+/// means written; return the id iff the object is genuinely in the store now.
+fn stored_despite(
+    repo: &gix::Repository,
+    kind: gix::objs::Kind,
+    data: &[u8],
+) -> Option<gix::ObjectId> {
+    let id = gix::objs::compute_hash(repo.object_hash(), kind, data).ok()?;
+    repo.has_object(&id).then_some(id)
 }
 
 /// Fetch and parse a git tree from the in-process object database.
