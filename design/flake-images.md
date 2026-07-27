@@ -15,10 +15,14 @@ deliberately docker's, with no new concepts beyond it.
    (both required: an unlocked flake has no stable identity). Nix builds the
    image; caos memoizes the build (below).
 
-**caos adds its layer to every image it builds from a flake**: the setuid
+**Every runnable image carries the *caos additions***: the setuid
 `/bin/caos` client, the `worker` user (uid 1000), a writable `/tmp`, and
-`/usr/bin/env`. These are the *caos additions* — the things that either change
-with every caos build (the client) or can't ride a git tree (setuid).
+`/usr/bin/env` — the things that change with every caos build (the client)
+or that an image build can't produce (setuid). For a flake, caos itself
+adds them (the stack stage below); a git-docker tree carries them authored
+in by its producer (the suite's image jobs do), with `<name>.caosmeta`
+sidecars encoding what git modes can't — the convert applies the sidecars
+either way.
 
 **A flake defines everything about the image except the caos additions.**
 `/worker` — the executable `caos runner` execs — included. caos NEVER
@@ -85,7 +89,9 @@ The flake trees are **generated at publish** (`std/<name>/stage-tree.sh`)
 because a flake can only read its own tree, and resolution cannot strip a
 tree (only the flake knows which files its build reads). Each generator
 assembles exactly the build's inputs — and nothing else, so the tree's hash
-(= the image's cache key) never moves for irrelevant edits:
+(= the image's cache key) never moves for irrelevant edits. (Part 2 below
+replaces generation with literal checked-in trees; this is how it works
+today.)
 
 - **`runner`**: flake + lock + the `worker-runner` interpreter binary.
 - **`bash` / `testenv`**: flake + lock + `images/bash-worker.sh` as
@@ -122,13 +128,93 @@ it's written down.
 
 ## Bootstrap
 
-The flake-builder is the one image that can't be a flake (it's what builds
-flakes). It's host-nix-built as a thin layer set over stock `nixos/nix`
+The flake-builder is the one image that can't be *built* by the flake path
+— resolution would recurse into itself. (Nothing stops its *definition*
+from being a flake tree; the grounding is about who runs the build, not
+the notation.) It's host-nix-built as a thin layer set over stock `nixos/nix`
 (pinned by digest in `images/nix-base.ref`) and **streamed**: composed with
 `docker build` (ADD extracts each layer as root, preserving the setuid
 caos), pushed, memoized on the tarball's store path. Exactly one image is
 referenced by digest; everything else may be a flake — so resolution never
 re-enters the flake branch for the builder, and the recursion is grounded.
+
+## Part 2: literal trees, worker-built binaries (direction, not built)
+
+The agreed next pass. The principle: **a simpler build and a stronger
+check** — the build generates nothing, and `run-tool test` verifies every
+redundancy the simplification introduces.
+
+**Every std flake tree becomes a literal checked-in directory**,
+resolvable straight from the repo by hash — no generation step, which is
+also what keeps bootstrap simple. Per tree:
+
+- Every `flake.lock` is **checked in**; `derive-lock.sh` inverts into a
+  check that each std lock's nodes match the root's (a refresh script
+  reruns on pin bumps). Drift becomes impossible to miss instead of
+  impossible to create.
+- **`bash` / `testenv`** check the worker script into the flake directory.
+  A flake reads only its own tree, so that's two copies (plus the suite's
+  image jobs as a third consumer) and an equality check.
+- **`runner`** builds its `/worker` from source in-tree: worker-runner +
+  worker-common have zero external deps, so the flake vendors the two
+  crates and builds them purely, no network. The tree re-keys on their
+  source — rare and correct.
+- **`cargo`** checks in copies of the workspace manifests, `Cargo.lock`,
+  `rust-toolchain.toml`, and the target stubs, with a
+  match-the-workspace check and a refresh script.
+
+With that, `build-builtins.sh`, the `stage-tree.sh` generators, and
+`derive-lock.sh` all go; publish collapses to "hash the checked-in trees,
+build the curries."
+
+**`images/` dissolves into `std/*`** — every std entry gets its
+directory, the flake-builder included:
+
+- `std/flake-builder/` becomes a literal checked-in flake tree like every
+  other (`flake.nix` + lock + the stage script as `./worker`), making
+  concrete that only *who builds it* is special: the host nix-builds this
+  one tree, applies the caos additions itself (the same additions the
+  stack stage applies to everything else), and streams the result. With
+  the image fully flake-defined, `images/nix-base.ref` goes — the nix
+  userland pins in the tree's own lock. (If pushing the full nix closure
+  per pin bump bites, the compose-onto-stock-base trick can return, with
+  the pin riding in `std/flake-builder/`.)
+- `images/bash-worker.sh` → the checked-in `std/bash` / `std/testenv`
+  worker copies above; the suite's image jobs reference the `std/bash`
+  copy until they unify.
+- `images/debian-base.ref` dies with the suite's second pipeline (Open
+  items below).
+
+**Workers build the curry binaries.** The host builds only the core — the
+`caos` client, `caosd`, the cli, and the flake-builder image (`nix build`
+from a blank slate is canonical; `nix develop` + stateful cargo is the dev
+loop). Everything else std needs is built by workers, each defined as a
+flake, a curry, or the result of calling another worker:
+
+- worker-common-only binaries are exactly `std/rustc`'s input shape (one
+  `.rs` + worker-common): compiled in-caos, curried onto runner, memoized
+  per source edit.
+- `llm-step` and `rgrep` carry crates.io deps (`serde_json`/`minreq`/
+  `regex`), which rustc refuses — they need the cargo-backed path.
+  Collapsing the cargo/rustc pair into one "build worker" is the remaining
+  open design here.
+
+**Test fixtures leave std.** `file-count`, `dirs-only`, `deep-deps` have
+no consumers outside their own tests, and `hello` none outside
+`examples/consumer` — they're tests in disguise. Tests define their own
+workers: carry the fixture's `.rs` and call `std/rustc`, or carry a flake
+and invoke the flake-builder for a fixture image. std keeps only entries
+with real consumers: `flake-builder, runner, cargo, bash, testenv, rustc,
+bash-tool, llm-step, rgrep`.
+
+**caos does not build caos.** The core builds from the host, from a blank
+nix slate — for an immature project, reasoning about which features the
+*builder* stack has versus the tree under test is a tax on every change.
+caos-in-caos stays what it is today: a test workload
+(design/cargo-workers.md) proving caos builds real projects, never the dev
+build path. (An earlier direction — std generated by tree-transformation
+workers over a seeded stack — is superseded: literal trees need no
+transformation at all.)
 
 ## Open items
 
@@ -136,7 +222,7 @@ re-enters the flake branch for the builder, and the recursion is grounded.
 - The nested test stack builds its own runner/bash/cargo images from the
   tree under test (delta-over-pinned-debian, `caos-tools/lib/`) — a second
   image pipeline, and a userland (debian) that production std no longer
-  uses. Unify onto the flake path when std-as-transformation lands.
+  uses. Unify onto the flake path once std trees are literal (Part 2).
 - Boundary caching for two-level images (a cheap worker layer over an
   expensive base, both flake-defined) — today `std/cargo` accepts a full
   rebake when its `/worker` changes.
