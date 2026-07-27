@@ -52,9 +52,13 @@ cold=$((t3 - t2))
 echo "  ok: per-crate check clean (${cold}ms cold)" >&2
 
 # Edit one leaf crate: its jobs (and orchestration) re-run; every other
-# member's compile is a cache hit. The tripwire is wall-clock: an edit run
-# far cheaper than the cold one. (The remaining cost is the orchestration
-# jobs, which are whole-tree-keyed by design.)
+# member's compile is a cache hit. The tripwire is wall-clock: a broken
+# cache re-checks every crate and lands near the cold time (ratio ~1); a
+# working one pays the whole-tree-keyed orchestration jobs plus ONE small
+# crate. Compiles are cheap enough (dev profile) that orchestration
+# dominates the edit run — measured ~0.48 cold-ratio on an idle machine,
+# worse under suite parallelism — so the threshold is 3/4, not the compile
+# margin itself.
 echo "// tripwire edit" >> ws/crates/worker-rgrep/src/main.rs
 commit "edit one crate"
 t4=$(ms)
@@ -63,5 +67,5 @@ t5=$(ms)
 [ "$(cat r3/exit)" = "0" ] || fail "edited mode=all check failed: $(tail -c 2000 r3/stderr)"
 edit=$((t5 - t4))
 echo "  ok: one-crate edit checked (${edit}ms vs ${cold}ms cold)" >&2
-[ "$edit" -lt $((cold / 2)) ] \
+[ "$edit" -lt $((cold * 3 / 4)) ] \
   || fail "one-crate edit (${edit}ms) not much cheaper than cold (${cold}ms) — per-crate caching regressed"
