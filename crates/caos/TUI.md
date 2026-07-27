@@ -44,6 +44,9 @@ time that user opens the TUI.
 |---|---|
 | `Enter` | Send the prompt |
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
+| `Tab` | Complete the selected slash command |
+| `Up` / `Down` | Select a visible slash-command match |
+| `Escape` | Dismiss slash-command matches |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation |
 | `Ctrl+W` | Archive the selected conversation for this user |
@@ -69,6 +72,12 @@ A fresh conversation starts with a temporary `talk-N` title. Its first prompt
 automatically becomes a whitespace-collapsed title of at most 60 characters.
 Using `/title` before the first prompt keeps that explicit title instead.
 Existing conversations are never automatically retitled.
+
+Typing `/` at the start of the prompt shows matching slash commands and their
+usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
+or Enter to complete it with a trailing space. Typing arguments closes the
+menu. Escape dismisses it without changing the prompt. An unrecognized
+slash-prefixed prompt is sent normally.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other

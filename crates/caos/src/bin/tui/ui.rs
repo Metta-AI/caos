@@ -9,7 +9,7 @@ use ratatui_widgets::borders::Borders;
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-use super::{short_hash, ActivityState, App, ConversationState, EntryRole, View};
+use super::{short_hash, ActivityState, App, Command, ConversationState, EntryRole, View};
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -394,23 +394,63 @@ fn render_composer(
     } else {
         " Prompt (Enter sends, Alt+Enter/Ctrl+J adds a line) "
     };
+    let commands = if view == View::Chat {
+        state.composer.command_matches()
+    } else {
+        Vec::new()
+    };
     let (row, column) = state.composer.cursor_row_col();
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let command_height = commands.len().min(inner.height as usize) as u16;
+    let composer_height = inner.height.saturating_sub(command_height);
+    let composer_area = Rect::new(inner.x, inner.y, inner.width, composer_height);
+    let command_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(composer_height),
+        inner.width,
+        command_height,
+    );
+    let inner_height = composer_height as usize;
     let vertical_scroll = row.saturating_sub(inner_height.saturating_sub(1));
     frame.render_widget(
         Paragraph::new(state.composer.text.as_str())
-            .block(Block::default().title(title).borders(Borders::ALL))
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
-        area,
+        composer_area,
+    );
+    render_command_menu(
+        &commands,
+        state.composer.command_selection,
+        frame,
+        command_area,
     );
     if view == View::Chat && show_cursor {
         let cursor_row = row.saturating_sub(vertical_scroll);
-        let x = area.x.saturating_add(1).saturating_add(column as u16);
-        let y = area.y.saturating_add(1).saturating_add(cursor_row as u16);
-        if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
+        let x = composer_area.x.saturating_add(column as u16);
+        let y = composer_area.y.saturating_add(cursor_row as u16);
+        if x < composer_area.right() && y < composer_area.bottom() {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
+}
+
+fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame<'_>, area: Rect) {
+    let lines = commands.iter().enumerate().map(|(index, command)| {
+        let marker = if index == selected { "> " } else { "  " };
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Line::styled(
+            format!("{marker}{} — {}", command.usage, command.description),
+            style,
+        )
+    });
+    frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
 }
 
 fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
@@ -420,7 +460,9 @@ fn render_footer(copy_mode: bool, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else {
-        Line::raw(" ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit")
+        Line::raw(
+            " ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^Y copy  ^C quit",
+        )
     };
     frame.render_widget(Paragraph::new(footer), area);
 }
