@@ -538,20 +538,23 @@ caosd down    # stop it (Redis + registry volumes and the server repo are kept)
 caosd reset   # stop and wipe those volumes + the server repo for a clean slate
 ```
 
-Testing is a bit of a mess at the moment, because we build things again inside caos first. This will be fixed soon
-
 ```bash
-caos-cli run-tool build      # compile + link, per-crate, cached
-caos-cli run-tool test       # build + the whole test suite
+caos-cli run-tool build      # the worker images, from the deployed binaries
+caos-cli run-tool test       # images + the whole test suite
 caos-cli run-tool test --only="unit rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
 CAOS_SALT=$(date +%s) caos-cli run-tool test   # force a re-run (retry a flake)
 ```
 
+Compiling is nix's job: `caosd up` publishes the nix-built workspace
+binaries as `refs/caos/bins`, `run-tool` resolves that ref and passes its
+hash as `--bins`, and nothing recompiles inside caos. (After a Rust edit:
+`nix build && caosd up`, then test.)
+
 The test tool runs the suite worker (`tests/lib/suite.sh`, carried by this
-tree): build the workspace via `caos-tools/build.sh`, build the worker
-images from the caos-built binaries, fan out one job per
-`tests/<name>/cli.sh`, summarize. A test is a directory `tests/<name>/`
+tree): build the worker images from the published binaries via
+`caos-tools/build.sh`, fan out one job per `tests/<name>/cli.sh`,
+summarize. A test is a directory `tests/<name>/`
 with a `cli.sh`, which runs inside a testenv worker, cwd'd into a client
 repo with the test tree at `./test` and `$CAOS_CLI` set, driving
 computations through `caos-cli` against a nested caos stack built from

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build stage 2c (the `then` of the toolchain bake): --result is the deps
-# base's digest ref. Stack the cargo worker delta — caos + the /worker
-# trampoline, both from the fresh bins — onto it (the same image job that
+# base's digest ref. Stack the cargo worker delta — caos + worker-runner as
+# /worker, both from the nix-built bins — onto it (the same image job that
 # built the runner and bash images) and run-then into the final assembly.
 set -euo pipefail
 

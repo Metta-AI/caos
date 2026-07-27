@@ -29,8 +29,10 @@ for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
 done
 caos put /tmp/build-ws /cas/build-ws
 
+caos get /cas/args/bins
 build=$(caos curry /cas/std/bash -- \
-  "--worker1:@=/cas/args/workspace/caos-tools/build.sh")
+  "--worker1:@=/cas/args/workspace/caos-tools/build.sh" \
+  "--bins=$(cat /cas/args/bins)")
 
 fwd=(
   "--build_ws:@=/cas/build-ws"

@@ -1,47 +1,76 @@
 #!/usr/bin/env bash
-#@doc Build EVERYTHING the tree defines: compile the workspace per-crate
-#@doc (unchanged crates are cache hits; a compile error surfaces in seconds),
-#@doc link the binaries, build the worker images, and produce the toolchain
-#@doc image. Succeeds with the artifact tree {report, bin/, images/}; fails
-#@doc with the diagnostics of whichever stage broke.
+#@doc Build the tree's worker images from the nix-built binaries: the
+#@doc runner/bash images, the toolchain deps bake, and the cargo worker
+#@doc image. Compiling is nix's job — the deploy (caosd up) publishes the
+#@doc binaries as refs/caos/bins and run-tool passes the hash as --bins.
+#@doc Succeeds with the artifact tree {report, bin/, images/}.
 #
-# THE build worker: a workspace tree in (--in, run-then or a tool call), the
-# ARTIFACT TREE out — {report, bin/<name>, images/{runner,bash,cargo}} (image
-# refs as registry-digest blobs). Runs in a bash worker; every stage script
-# comes from the tree itself (caos-tools/lib/), so the tool is self-contained
-# and a host runner, an agent invocation, and the test suite all fire it the
-# same way, sharing every job in the cache.
+# THE build worker: a workspace tree in (--in, run-then or a tool call)
+# plus the deploy's published bin tree (--bins, a hash), the ARTIFACT TREE
+# out — {report, bin/<name>, images/{runner,bash,cargo}} (image refs as
+# registry-digest blobs). Runs in a bash worker; every stage script comes
+# from the tree itself (caos-tools/lib/), so the tool is self-contained
+# and a host runner, an agent invocation, and the test suite all fire it
+# the same way, sharing every job in the cache.
 #
 # The chain (each link a run-then continuation, no worker slot held):
-#   1. (this script) prune to what cargo reads -> the per-crate workspace
-#      build (std/cargo --mode=all);
-#   2. lib/build-stage2.sh: check the compile, fan out the base-image jobs
-#      (runner, bash, nix-builder) from pinned stock bases + the fresh bins;
-#   3. lib/build-stage2b.sh: bake the toolchain deps base (nix, in the
+#   1. (this script) materialize the bin tree, fan out the base-image
+#      jobs (runner, bash, nix-builder) from pinned stock bases + those
+#      binaries (lib/image-build.sh);
+#   2. lib/build-stage2b.sh: bake the toolchain deps base (nix, in the
 #      builder; registry-memoized by the bake tree's content hash);
-#   4. lib/build-stage2c.sh: stack the cargo worker image onto it;
-#   5. lib/build-final.sh: assemble the artifact tree.
+#   3. lib/build-stage2c.sh: stack the cargo worker image onto it;
+#   4. lib/build-final.sh: assemble the artifact tree.
 set -euo pipefail
 
+if [ ! -e /cas/args/bins ]; then
+  echo "build: no --bins. The deploy publishes the nix-built binaries as" >&2
+  echo "build: refs/caos/bins (caosd up); run-tool passes the hash along." >&2
+  exit 1
+fi
+# --bins is the published bin TREE's hash (canonical runtime names, see
+# build-builtins.sh): materialize it — recorded hashes, no bytes move.
+caos get /cas/args/bins
+caos get-hash "$(cat /cas/args/bins)" /cas/bin
 caos get /cas/args/in
+caos get /cas/args/in/images
 caos get /cas/args/in/caos-tools
 caos get /cas/args/in/caos-tools/lib
 LIB=/cas/args/in/caos-tools/lib
 
-# The pruned tree — just what cargo reads — keys the compile, so non-Rust
-# edits never re-key it or anything downstream of the bin tree. Symlinks +
-# `caos put` reuse recorded hashes; no bytes move.
-mkdir /tmp/bw
-for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
-  [ -e "/cas/args/in/$e" ] && ln -s "/cas/args/in/$e" "/tmp/bw/$e"
-done
-caos put /tmp/bw /cas/bw
+# The base-image jobs. An image job's key is exactly (builder script, base
+# ref, file contents) — unchanged binaries mean an instant hit and no
+# build.
+spec() { # <name> <base ref blob> <worker source path>
+  mkdir -p "/tmp/imgs/$1/files/usr/bin"
+  ln -s "$2" "/tmp/imgs/$1/base"
+  ln -s /cas/bin/caos "/tmp/imgs/$1/files/usr/bin/caos"
+  ln -s "$3" "/tmp/imgs/$1/files/worker"
+}
+spec runner /cas/args/in/images/debian-base.ref /cas/bin/worker-runner
+spec bash /cas/args/in/images/debian-base.ref /cas/args/in/images/bash-worker.sh
+spec nixbuilder /cas/args/in/images/nix-base.ref /cas/args/in/images/bash-worker.sh
 
-# Static musl (runs on any base) at the default dev profile — the one profile
-# the deps bake carries, so only workspace crates recompile per edit. dev keeps
-# debug_assert!/overflow checks live in the produced bins and test binaries.
-cargo=$(caos curry /cas/std/cargo -- --cmd=build --mode=all \
-  "--target=$(uname -m)-unknown-linux-musl")
-stage2=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/build-stage2.sh" \
-  "--workspace:@=/cas/args/in")
-caos run-then /cas/bw -- --run="$cargo" --then="$stage2"
+# runner and bash are part of the test stack but nixbuilder is part of the
+# host stack and is used to build other parts of the test stack. As such,
+# it should have the host caos binary, not the test caos binary. This has
+# the fortunate side effect of making the cache key for nixbuilder stable
+# across changes to the test stack's caos, which is desirable because if we
+# rebuild nixbuilder we also have to rebuild anything that it builds,
+# including the toolchain, which is very slow.
+#
+# The tested caos is layered onto the toolchain image separately
+# (build-stage2c), so nothing host leaks into the test world. (runner/bash
+# above DO carry the tested caos — they're the nested stack's own images.)
+rm /tmp/imgs/nixbuilder/files/usr/bin/caos
+cp /bin/caos /tmp/imgs/nixbuilder/files/usr/bin/caos
+
+# The bake must run as root: the builder image's nix store is root-owned.
+# Same per-image containment grant testenv carries.
+echo "CAOS_WORKER_UID=0" > /tmp/imgs/nixbuilder/env
+caos put /tmp/imgs /cas/imgs
+
+imgmap=$(caos curry /cas/std/testenv -- "--worker1:@=$LIB/image-build.sh")
+stage2b=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/build-stage2b.sh" \
+  "--workspace:@=/cas/args/in" "--bins:@=/cas/bin")
+caos map-then /cas/imgs -- --map="$imgmap" --then="$stage2b"

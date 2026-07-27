@@ -18,9 +18,9 @@ git -C "$CAOS_PROJECT" archive HEAD | tar -x -C ws
 commit "workspace snapshot"
 
 echo "== cargo test of the workspace, per-crate, in a caos worker ==" >&2
-# Target musl like `build` (caos-tools/build.sh): that's the one profile the
-# deps bake carries, so tests reuse it instead of recompiling the dep graph on
-# the host. musl statics run in the Linux worker, so `cargo test` still runs them.
+# Target musl: that's the one target the deps bake carries, so tests reuse
+# it instead of recompiling the dep graph. musl statics run in the Linux
+# worker, so `cargo test` still runs them.
 "$CAOS_CLI" run /cas/std/cargo r1 -- --tree:@=ws --cmd=test --mode=all \
   "--target=$(uname -m)-unknown-linux-musl"
 if [ "$(cat r1/exit)" != "0" ]; then

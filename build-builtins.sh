@@ -227,6 +227,41 @@ if [ -n "${hash_of[runner]:-}" ]; then
   done
 fi
 
+# The full nix-built binary set, published as refs/caos/bins — what the
+# build/test tools (caos-tools/*.sh) consume instead of recompiling the
+# workspace in-caos: run-tool resolves this ref and passes its hash as
+# --bins. Canonical runtime names; kept OUT of the std tree so binary
+# churn (a server edit) never re-keys std consumers. The workspace builds
+# as one derivation, so any built path's bin/ carries every binary —
+# existence is the honest lookup, same as bin_path above. Staged in
+# CLIENT like everything else (only git-tracked paths can be hashed).
+rm -rf "${CLIENT:?}/bins"
+mkdir "$CLIENT/bins"
+stage_tool_bin() { # <name>
+  local p
+  # shellcheck disable=SC2086
+  for p in $bin_paths; do
+    if [ -x "$p/bin/$1" ]; then
+      install -m 755 "$p/bin/$1" "$CLIENT/bins/$1"
+      return 0
+    fi
+  done
+  echo "build-builtins: no binary $1 in the built paths" >&2
+  exit 1
+}
+for n in caos caos-cli server runnerd llm-stub; do stage_tool_bin "$n"; done
+# shellcheck disable=SC2086
+for p in $bin_paths; do
+  for w in "$p"/bin/worker-*; do
+    [ -e "$w" ] && install -m 755 "$w" "$CLIENT/bins/$(basename "$w")"
+  done
+done
+git -C "$CLIENT" add bins
+bins_tree=$(git -C "$CLIENT" write-tree --prefix=bins/)
+git -C "$CLIENT" push -q --force caos "$bins_tree:refs/caos/bins"
+git -C "$CLIENT" update-ref refs/caos/bins "$bins_tree"
+echo "refs/caos/bins -> $bins_tree (published to $SERVER_URL)" >&2
+
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so
 # there's no commit to wrap it) and publish it to the server under refs/caos/std
 # in one push, which uploads every builtin image the server doesn't already have.

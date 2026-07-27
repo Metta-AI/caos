@@ -18,10 +18,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ms() { date +%s%3N; } # epoch milliseconds
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-# Target musl, exactly like the `build` tool (caos-tools/build.sh): that is the
-# one profile the deps bake carries, so a check reuses it instead of recompiling
-# the dep graph. A host build has no bake to reuse and no consumer — every test
-# runs in the Linux stack, where musl statics run fine.
+# Target musl: that is the one target the deps bake carries, so a check
+# reuses it instead of recompiling the dep graph. A host build has no bake
+# to reuse and no consumer — every test runs in the Linux stack, where musl
+# statics run fine.
 tgt="$(uname -m)-unknown-linux-musl"
 
 # The caos workspace source, as git records it (tracked files only — target/,

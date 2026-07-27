@@ -7,5 +7,7 @@
 
 # Before committing
 
-- Build and test with `caos-cli run-tool test`
+- Build and deploy with `nix build && caosd up` (the deploy publishes the
+  binaries as `refs/caos/bins`), then test with `caos-cli run-tool test` —
+  binaries are never rebuilt inside caos
 - If this doesn't catch everything, we need to add it to the above step
