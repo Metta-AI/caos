@@ -1582,7 +1582,7 @@ mod tests {
     use super::*;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
-    use ratatui_core::style::Color;
+    use ratatui_core::style::{Color, Modifier};
     use ratatui_core::terminal::Terminal;
     use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
@@ -2234,6 +2234,52 @@ mod tests {
         assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));
         assert!(app.selected().status.contains("press Ctrl+P again"));
         assert!(!app.selected().publishing);
+    }
+
+    #[test]
+    fn transcript_renders_markdown_emphasis_styles() {
+        let mut selected = state("markdown");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent,
+            commit: None,
+            text: "plain **bold** and _italic_".to_string(),
+        });
+        let (app, _) = app_with(vec![selected]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let width = terminal.backend().buffer().area.width as usize;
+        let row = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("plain bold and italic")
+            })
+            .unwrap();
+        let transcript_row = &row[26..];
+        let rendered: String = transcript_row.iter().map(|cell| cell.symbol()).collect();
+        let bold = transcript_row
+            .windows("bold".len())
+            .position(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>() == "bold")
+            .unwrap();
+        let italic = transcript_row
+            .windows("italic".len())
+            .position(|cells| {
+                cells.iter().map(|cell| cell.symbol()).collect::<String>() == "italic"
+            })
+            .unwrap();
+        assert!(transcript_row[bold].modifier.contains(Modifier::BOLD));
+        assert!(!transcript_row[bold].modifier.contains(Modifier::ITALIC));
+        assert!(transcript_row[italic].modifier.contains(Modifier::ITALIC));
+        assert!(!rendered.contains("**"));
+        assert!(!rendered.contains("_italic_"));
     }
 
     #[test]
