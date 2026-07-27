@@ -1,7 +1,7 @@
 //! Terminal rendering.
 
 use ratatui_core::buffer::Buffer;
-use ratatui_core::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui_core::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::terminal::Frame;
 use ratatui_core::text::{Line, Span};
@@ -17,8 +17,8 @@ use super::{
 use caos::chat::TurnPhase;
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
-    let areas = layout(frame.area());
     let state = app.selected();
+    let areas = layout(state, app.view == View::Chat, frame.area());
 
     render_header(app, state, frame, areas.header);
     render_conversations(app, frame, areas.sidebar);
@@ -35,7 +35,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         frame,
         areas.composer,
     );
-    render_footer(app.selection_locked, app.view, frame, areas.footer);
+    render_footer(app, frame, areas.footer);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +47,7 @@ struct Areas {
     footer: Rect,
 }
 
-fn layout(area: Rect) -> Areas {
+fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -60,9 +60,18 @@ fn layout(area: Rect) -> Areas {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(26), Constraint::Min(40)])
         .split(outer[1]);
+    let input_height = state.composer.text.split('\n').count().clamp(1, 8) as u16;
+    let command_height = if show_commands {
+        state.composer.command_matches().len() as u16
+    } else {
+        0
+    };
     let conversation = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(6)])
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(input_height + command_height + 2),
+        ])
         .split(body[1]);
     Areas {
         header: outer[0],
@@ -73,8 +82,15 @@ fn layout(area: Rect) -> Areas {
     }
 }
 
-pub(super) fn content_contains(area: Rect, column: u16, row: u16) -> bool {
-    layout(area).content.contains(Position::new(column, row))
+pub(super) fn content_contains(
+    state: &ConversationState,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> bool {
+    layout(state, false, area)
+        .content
+        .contains(Position::new(column, row))
 }
 
 fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
@@ -94,7 +110,7 @@ pub(super) fn transcript_contains(
     column: u16,
     row: u16,
 ) -> bool {
-    let (transcript, _) = chat_areas(state, layout(terminal).content);
+    let (transcript, _) = chat_areas(state, layout(state, true, terminal).content);
     transcript.contains(Position::new(column, row))
 }
 
@@ -402,7 +418,7 @@ pub(super) fn transcript_point(
     column: u16,
     row: u16,
 ) -> Option<TranscriptPoint> {
-    let (area, _) = chat_areas(state, layout(terminal).content);
+    let (area, _) = chat_areas(state, layout(state, true, terminal).content);
     let inner = transcript_inner(area);
     let position = Position::new(column, row);
     if !inner.contains(position) {
@@ -422,7 +438,7 @@ pub(super) fn transcript_selection_text(
     terminal: Rect,
 ) -> Option<String> {
     let selection = state.transcript_selection?;
-    let area = layout(terminal).content;
+    let area = layout(state, true, terminal).content;
     let inner = transcript_inner(area);
     if inner.is_empty() {
         return None;
@@ -714,35 +730,27 @@ fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let title = if state.running {
-        " Prompt (turn running; cancellation is not available) "
-    } else if state.publishing {
-        " Prompt (publishing PR) "
-    } else if view == View::Tools {
-        " Prompt (tool view; Ctrl+Shift+T returns) "
-    } else if view == View::Activity {
-        " Prompt (activity view; Ctrl+T/Esc returns) "
-    } else if view == View::Diff {
-        " Prompt (changes view; Ctrl+Q returns) "
-    } else {
-        " Prompt (Enter sends, Alt+Enter/Ctrl+J adds a line) "
-    };
     let commands = if view == View::Chat {
         state.composer.command_matches()
     } else {
         Vec::new()
     };
     let (row, column) = state.composer.cursor_row_col();
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let command_height = commands.len().min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
-    let composer_area = Rect::new(inner.x, inner.y, inner.width, composer_height);
+    let composer_area = Rect::new(
+        inner.x.saturating_add(2),
+        inner.y,
+        inner.width.saturating_sub(2),
+        composer_height,
+    );
     let command_area = Rect::new(
-        inner.x,
+        inner.x.saturating_add(2),
         inner.y.saturating_add(composer_height),
-        inner.width,
+        inner.width.saturating_sub(2),
         command_height,
     );
     let inner_height = composer_height as usize;
@@ -751,6 +759,15 @@ fn render_composer(
         Paragraph::new(state.composer.text.as_str())
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         composer_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            ">",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(inner.x, inner.y, 1, 1),
     );
     render_command_menu(
         &commands,
@@ -786,22 +803,36 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
     frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
 }
 
-fn render_footer(selection_locked: bool, view: View, frame: &mut Frame<'_>, area: Rect) {
-    let footer = if selection_locked {
+fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let footer = if app.selection_locked {
         Line::styled(
             " Selection lock: redraws paused, ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
-    } else if view == View::Activity {
+    } else if app.view == View::Activity {
         Line::raw(
             " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
         )
     } else {
         Line::raw(
-            " Wheel scrolls  Drag selects+copies  ^Y native selection  ^T activity  ^⇧T tools  ^Q diff  ^C quit",
+            " Enter sends  Shift+Enter/^J newline  Wheel scrolls  Drag selects+copies  ^T activity  ^Q diff  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);
+    if let Some(chars) = app.copied_chars {
+        let noun = if chars == 1 { "char" } else { "chars" };
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {chars} {noun} copied "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
 pub(crate) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, from_bottom: usize) -> u16 {
