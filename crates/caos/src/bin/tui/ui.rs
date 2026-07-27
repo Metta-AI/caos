@@ -1,15 +1,19 @@
 //! Terminal rendering.
 
+use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::terminal::Frame;
 use ratatui_core::text::{Line, Span};
+use ratatui_core::widgets::Widget;
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-use super::{short_hash, ActivityState, App, Command, ConversationState, EntryRole, View};
+use super::{
+    short_hash, ActivityState, App, Command, ConversationState, EntryRole, TranscriptPoint, View,
+};
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let areas = layout(frame.area());
@@ -71,7 +75,7 @@ fn layout(area: Rect) -> Areas {
     }
 }
 
-pub(crate) fn content_contains(area: Rect, column: u16, row: u16) -> bool {
+pub(super) fn content_contains(area: Rect, column: u16, row: u16) -> bool {
     layout(area).content.contains(Position::new(column, row))
 }
 
@@ -174,6 +178,22 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let paragraph = transcript_paragraph(state);
+    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    frame.render_widget(
+        paragraph
+            .block(
+                Block::default()
+                    .title(" Conversation ")
+                    .borders(Borders::ALL),
+            )
+            .scroll((scroll, 0)),
+        area,
+    );
+    render_transcript_selection(state, frame, area);
+}
+
+fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if state.transcript.is_empty() {
         lines.push(Line::styled(
@@ -201,16 +221,105 @@ fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rec
         lines.extend(entry.text.lines().map(|line| Line::raw(line.to_string())));
         lines.push(Line::raw(""));
     }
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
-    let paragraph = paragraph
-        .block(
-            Block::default()
-                .title(" Conversation ")
-                .borders(Borders::ALL),
-        )
-        .scroll((scroll, 0));
-    frame.render_widget(paragraph, area);
+    Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
+fn transcript_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn transcript_scroll(state: &ConversationState, area: Rect) -> u16 {
+    paragraph_scroll(&transcript_paragraph(state), area, state.scroll_from_bottom)
+}
+
+pub(super) fn transcript_point(
+    state: &ConversationState,
+    terminal: Rect,
+    column: u16,
+    row: u16,
+) -> Option<TranscriptPoint> {
+    let area = layout(terminal).content;
+    let inner = transcript_inner(area);
+    let position = Position::new(column, row);
+    if !inner.contains(position) {
+        return None;
+    }
+    let point = TranscriptPoint {
+        row: row - inner.y,
+        column: column - inner.x,
+    };
+    let absolute_row = transcript_scroll(state, area).saturating_add(point.row);
+    let line_count = transcript_paragraph(state).line_count(inner.width);
+    ((absolute_row as usize) < line_count).then_some(point)
+}
+
+pub(super) fn transcript_selection_text(
+    state: &ConversationState,
+    terminal: Rect,
+) -> Option<String> {
+    let selection = state.transcript_selection?;
+    let area = layout(terminal).content;
+    let inner = transcript_inner(area);
+    if inner.is_empty() {
+        return None;
+    }
+    let paragraph = transcript_paragraph(state);
+    let line_count = paragraph.line_count(inner.width).min(u16::MAX as usize) as u16;
+    let mut buffer = Buffer::empty(Rect::new(0, 0, inner.width, line_count));
+    paragraph.render(buffer.area, &mut buffer);
+
+    let scroll = transcript_scroll(state, area);
+    let (start, end) = selection.ordered();
+    let mut rows = Vec::new();
+    for selected_row in start.row..=end.row {
+        let absolute_row = scroll.saturating_add(selected_row);
+        if absolute_row >= line_count {
+            break;
+        }
+        let start_column = if selected_row == start.row {
+            start.column
+        } else {
+            0
+        };
+        let end_column = if selected_row == end.row {
+            end.column
+        } else {
+            inner.width.saturating_sub(1)
+        };
+        let mut text = String::new();
+        for column in start_column..=end_column.min(inner.width.saturating_sub(1)) {
+            if let Some(cell) = buffer.cell((column, absolute_row)) {
+                text.push_str(cell.symbol());
+            }
+        }
+        rows.push(text.trim_end().to_string());
+    }
+    let text = rows.join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn render_transcript_selection(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let Some(selection) = state.transcript_selection else {
+        return;
+    };
+    let inner = transcript_inner(area);
+    let (start, end) = selection.ordered();
+    for row in start.row..=end.row.min(inner.height.saturating_sub(1)) {
+        let start_column = if row == start.row { start.column } else { 0 };
+        let end_column = if row == end.row {
+            end.column
+        } else {
+            inner.width.saturating_sub(1)
+        };
+        for column in start_column..=end_column.min(inner.width.saturating_sub(1)) {
+            if let Some(cell) = frame
+                .buffer_mut()
+                .cell_mut((inner.x + column, inner.y + row))
+            {
+                cell.set_fg(Color::Black).set_bg(Color::Cyan);
+            }
+        }
+    }
 }
 
 fn render_activity(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
@@ -461,7 +570,7 @@ fn render_footer(selection_locked: bool, frame: &mut Frame<'_>, area: Rect) {
         )
     } else {
         Line::raw(
-            " Wheel scrolls  Shift+drag selects  ^Y selection lock  ^Up/Dn chat  ^A activity  ^Q diff  ^C quit",
+            " Wheel scrolls  Drag selects+copies  ^Y native selection  ^Up/Dn chat  ^A activity  ^Q diff  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);
