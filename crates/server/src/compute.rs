@@ -843,11 +843,10 @@ fn resolve_image(
             format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
         ));
     }
-    // A process-mode backend (design/cargo-workers.md, phase 3) runs worker
-    // *binaries* — its runner reads the job's `bin` arg and ignores the image
-    // ref — so a git image passes through unconverted: no OCI convert, no
-    // registry round-trip, no registry at all. The docker backend keeps
-    // converting (the default).
+    // The nested test stack (tests/lib/run-nested.sh) runs on images the
+    // outer suite already built and pushed, so its server passes git images
+    // through unconverted: no OCI convert, no registry round-trip. The
+    // default keeps converting.
     if std::env::var("CAOS_IMAGE_RESOLVE").as_deref() == Ok("none") {
         return Ok(image.to_string());
     }

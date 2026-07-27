@@ -214,17 +214,19 @@
           [ -e usr/bin/env ] || ln -s /bin/env usr/bin/env
         '';
         # No worker images live here anymore, bar the flake-builder below.
-        # Every other std entry is a flake tree (std/{runner,cargo,
-        # bash-base,testenv-base} — design/flake-images.md) or a
-        # curry(<base>, bin=…) over one: the script workers bind
-        # images/bash-worker.sh, the binary workers (agent harness, examples,
-        # cargo/rustc) their static musl binaries (builtinWorkerBins below).
-        # std/runner is the pooled bin-worker base; the old debian-delta
-        # `base` entry had no consumers and is gone.
+        # Every other std entry is a flake tree (std/{runner,cargo,bash,
+        # testenv} — design/flake-images.md), each staging its own /worker
+        # (bash/testenv: images/bash-worker.sh; runner/cargo: their
+        # interpreter binaries), or a curry(runner, worker1=<static musl
+        # binary>) over one (builtinWorkerBins below). std/runner is the
+        # pooled bin-worker base; the old debian-delta `base` entry had no
+        # consumers and is gone.
 
-        # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin.
-        # One self-contained worker — nix + skopeo + jq + caos + the runner
-        # trampoline — whose one `--stage` script (images/flake-builder.sh)
+        # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
+        # — the one image the flake path can't build (it IS the flake path),
+        # so the host builds it; its definition just lives here rather than in
+        # a flake tree. One self-contained worker — nix + skopeo + jq + caos —
+        # whose one `--stage` script (images/flake-builder.sh)
         # `nix build`s a flake's `#caosImage`, streams the CLEAN image to the
         # registry, then stacks a caos runner delta. build-builtins.sh composes
         # this tarball onto stock `docker://nixos/nix` with `docker build` and
@@ -293,7 +295,7 @@
         };
 
         # The DEPS-ONLY cargo base (phase D2): the bake + env, WITHOUT caos or
-        # the /worker trampoline — those are stacked on by the suite's image
+        # a /worker — those are stacked on by the suite's image
         # jobs from the freshly caos-built binaries (the D1 delta-over-base
         # move). So this image is keyed on (toolchain, manifests, lockfile)
         # alone, and the expensive in-caos nix bake that produces it re-runs
@@ -785,16 +787,10 @@
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
-          # The cargo worker (std/cargo's /worker) and the rustc
+          # The staged /worker binaries (std/runner, std/cargo) and the rustc
           # orchestrator (curry(runner, worker1)) — build-builtins.sh needs
           # the binaries exposed.
-          inherit worker-cargo worker-rustc;
-          # The runner interpreter binary, exposed for the process-mode
-          # backend (it becomes each chroot slot's /worker; tests/proc-stack).
-          inherit worker-runner;
-          # The pure-Rust example workers' binaries, exposed for the inner
-          # process-mode suite (curry(dummy, bin); tests/suite-in-caos).
-          inherit worker-file-count worker-dirs-only worker-deep-deps;
+          inherit worker-runner worker-cargo worker-rustc;
 
           # The generated compose file, for driving the stack by hand
           # (`docker compose -f $(nix build --print-out-paths .#docker-compose)
