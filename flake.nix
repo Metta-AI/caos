@@ -196,14 +196,21 @@
 
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
         # — the one image the flake path can't build (it IS the flake path),
-        # so the host builds it. Its DEFINITION lives in its std directory
-        # (std/flake-builder/{image.nix, flake.nix, worker} — self-contained:
-        # nix, certs, tools, the /worker stage script), imported here and
-        # wrapped with the caos additions; build-builtins.sh streams the
+        # so the host builds it. Its DEFINITION is std/flake-builder's own
+        # flake (self-contained: nix, certs, tools, the /worker stage
+        # script): we call its outputs function directly — the standard
+        # subflake call, no path-input lock churn — passing OUR nixpkgs
+        # (tests/std-lint pins the subflake's lock to the same revision),
+        # and consume lib.<system>.imageDef, the image's ingredients. The
+        # wrap below adds the caos additions; build-builtins.sh streams the
         # tarball FROM scratch, like the runner's. The stage script
-        # `nix build`s a flake's `#caosImage`, streams the CLEAN image to the
-        # registry, then stacks a caos runner delta.
-        flakeBuilderDef = import ./std/flake-builder/image.nix { pkgs = linuxPkgs; };
+        # `nix build`s a flake's `#caosImage`, streams the CLEAN image to
+        # the registry, then stacks a caos runner delta.
+        flakeBuilderDef =
+          ((import ./std/flake-builder/flake.nix).outputs {
+            self = null;
+            inherit nixpkgs;
+          }).lib.${linuxSystem}.imageDef;
         workerFlakeBuilderImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-flake-builder";
           tag = "latest";
@@ -888,3 +895,5 @@
       }
     );
 }
+
+# drv-probe comment
