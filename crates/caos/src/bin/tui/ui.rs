@@ -21,14 +21,11 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
 
     render_header(app, state, frame, areas.header);
     render_conversations(app, frame, areas.sidebar);
-    if app.activity_expanded {
-        render_activity(state, frame, areas.content);
-    } else {
-        match app.view {
-            View::Chat => render_transcript(state, frame, areas.content),
-            View::Diff => render_diff(state, frame, areas.content),
-            View::Tools => render_tools(state, frame, areas.content),
-        }
+    match app.view {
+        View::Chat => render_transcript(state, frame, areas.content),
+        View::Activity => render_activity_browser(state, frame, areas.content),
+        View::Diff => render_diff(state, frame, areas.content),
+        View::Tools => render_tools(state, frame, areas.content),
     }
     render_composer(
         state,
@@ -37,7 +34,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         frame,
         areas.composer,
     );
-    render_footer(app.selection_locked, frame, areas.footer);
+    render_footer(app.selection_locked, app.view, frame, areas.footer);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +89,7 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     } else {
         match app.view {
             View::Chat => "chat",
+            View::Activity => "activity",
             View::Diff => "diff",
             View::Tools => "tools",
         }
@@ -322,40 +320,98 @@ fn render_transcript_selection(state: &ConversationState, frame: &mut Frame<'_>,
     }
 }
 
-fn render_activity(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
-    let mut lines = vec![Line::from(vec![
-        Span::styled("status  ", Style::default().fg(Color::Yellow)),
-        Span::raw(state.status.clone()),
-    ])];
-    for item in &state.activities {
-        let (mark, color) = activity_mark(item.state);
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark} "), Style::default().fg(color)),
-            Span::styled(
-                format!("{}  ", short_hash(&item.step_commit)),
-                Style::default().fg(Color::DarkGray),
+fn render_activity_browser(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+    let items: Vec<ListItem<'_>> = state
+        .activities
+        .iter()
+        .map(|activity| {
+            let (mark, color) = activity_mark(activity.state);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(
+                    format!("{}  ", short_hash(&activity.step_commit)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(activity.summary.clone()),
+            ]))
+        })
+        .collect();
+    let mut selection = ListState::default().with_selected(state.activity_selection);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(format!(" Activity — {} ", state.status))
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(item.summary.clone()),
-        ]));
-        lines.extend(
-            item.detail
-                .lines()
-                .map(|line| Line::raw(format!("    {line}"))),
-        );
-    }
+        panes[0],
+        &mut selection,
+    );
+
+    let lines = state
+        .activity_selection
+        .and_then(|selected| state.activities.get(selected))
+        .map(|activity| {
+            let (mark, color) = activity_mark(activity.state);
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        short_hash(&activity.step_commit).to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(format!("  {}", activity.summary)),
+                ]),
+                Line::raw(""),
+            ];
+            if activity.detail.is_empty() {
+                lines.push(Line::styled(
+                    "Waiting for the tool result.",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                lines.extend(
+                    activity
+                        .detail
+                        .lines()
+                        .map(|line| Line::raw(line.to_string())),
+                );
+            }
+            lines
+        })
+        .unwrap_or_else(|| {
+            vec![Line::styled(
+                "No activity for this turn.",
+                Style::default().fg(Color::DarkGray),
+            )]
+        });
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let line_count = paragraph.line_count(area.width.saturating_sub(2));
-    let visible = area.height.saturating_sub(2) as usize;
-    let scroll = line_count.saturating_sub(visible).min(u16::MAX as usize) as u16;
+    let line_count = paragraph.line_count(panes[1].width.saturating_sub(2));
+    let visible = panes[1].height.saturating_sub(2) as usize;
+    let max_scroll = line_count.saturating_sub(visible);
+    let scroll = state
+        .activity_detail_scroll
+        .min(max_scroll)
+        .min(u16::MAX as usize) as u16;
     frame.render_widget(
         paragraph
             .block(
                 Block::default()
-                    .title(" Activity (Ctrl+A returns) ")
+                    .title(" Detail (PgUp/PgDn or wheel; Esc returns) ")
                     .borders(Borders::ALL),
             )
             .scroll((scroll, 0)),
-        area,
+        panes[1],
     );
 }
 
@@ -498,6 +554,8 @@ fn render_composer(
         " Prompt (publishing PR) "
     } else if view == View::Tools {
         " Prompt (tool view; Ctrl+T returns) "
+    } else if view == View::Activity {
+        " Prompt (activity view; Ctrl+A/Esc returns) "
     } else if view == View::Diff {
         " Prompt (changes view; Ctrl+Q returns) "
     } else {
@@ -562,11 +620,15 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
     frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
 }
 
-fn render_footer(selection_locked: bool, frame: &mut Frame<'_>, area: Rect) {
+fn render_footer(selection_locked: bool, view: View, frame: &mut Frame<'_>, area: Rect) {
     let footer = if selection_locked {
         Line::styled(
             " Selection lock: redraws paused, ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
+        )
+    } else if view == View::Activity {
+        Line::raw(
+            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^A/Esc return  ^Up/Dn chat  ^C quit",
         )
     } else {
         Line::raw(

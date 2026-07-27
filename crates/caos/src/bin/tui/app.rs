@@ -46,6 +46,7 @@ fn automatic_title(prompt: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Chat,
+    Activity,
     Diff,
     Tools,
 }
@@ -526,6 +527,8 @@ struct ConversationState {
     publishing: bool,
     scroll_from_bottom: usize,
     transcript_selection: Option<TranscriptSelection>,
+    activity_selection: Option<usize>,
+    activity_detail_scroll: usize,
 }
 
 impl ConversationState {
@@ -545,6 +548,8 @@ impl ConversationState {
             publishing: false,
             scroll_from_bottom: 0,
             transcript_selection: None,
+            activity_selection: None,
+            activity_detail_scroll: 0,
         }
     }
 
@@ -612,6 +617,23 @@ impl ConversationState {
             .map(|entry| collapse_whitespace(&entry.text))
             .unwrap_or_else(|| "New conversation".to_string())
     }
+
+    fn push_activity(&mut self, activity: Activity) {
+        let followed_tail = self
+            .activity_selection
+            .is_none_or(|selected| selected + 1 == self.activities.len());
+        self.activities.push(activity);
+        if followed_tail {
+            self.activity_selection = Some(self.activities.len() - 1);
+            self.activity_detail_scroll = 0;
+        }
+    }
+
+    fn ensure_activity_selection(&mut self) {
+        if self.activity_selection.is_none() && !self.activities.is_empty() {
+            self.activity_selection = Some(self.activities.len() - 1);
+        }
+    }
 }
 
 enum UiMessage {
@@ -650,7 +672,6 @@ pub(crate) struct App {
     should_quit: bool,
     selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
-    activity_expanded: bool,
     selecting_transcript: bool,
     view: View,
     tx: Sender<UiMessage>,
@@ -752,7 +773,6 @@ impl App {
             should_quit: false,
             selection_locked: false,
             confirm_action: None,
-            activity_expanded: false,
             selecting_transcript: false,
             view: View::Chat,
             tx,
@@ -785,7 +805,7 @@ impl App {
     }
 
     pub(crate) fn showing_transcript(&self) -> bool {
-        self.view == View::Chat && !self.activity_expanded
+        self.view == View::Chat
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
@@ -794,6 +814,20 @@ impl App {
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
         match mouse.kind {
+            MouseEventKind::ScrollUp
+                if self.view == View::Activity
+                    && ui::content_contains(area, mouse.column, mouse.row) =>
+            {
+                self.scroll_activity_details_up(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollDown
+                if self.view == View::Activity
+                    && ui::content_contains(area, mouse.column, mouse.row) =>
+            {
+                self.scroll_activity_details_down(3);
+                MouseAction::Redraw
+            }
             MouseEventKind::ScrollUp
                 if self.showing_transcript()
                     && ui::content_contains(area, mouse.column, mouse.row) =>
@@ -885,6 +919,8 @@ impl App {
                 text: message.clone(),
             });
             state.activities.clear();
+            state.activity_selection = None;
+            state.activity_detail_scroll = 0;
             state.running = true;
             state.status = "starting turn".to_string();
             state.scroll_from_bottom = 0;
@@ -1008,7 +1044,7 @@ impl App {
                 summary,
                 ..
             } => {
-                state.activities.push(Activity {
+                state.push_activity(Activity {
                     id: tool_use_id,
                     step_commit,
                     summary,
@@ -1034,7 +1070,7 @@ impl App {
                     };
                     activity.detail = content;
                 } else {
-                    state.activities.push(Activity {
+                    state.push_activity(Activity {
                         id: tool_use_id.clone(),
                         step_commit,
                         summary: format!("result {tool_use_id}"),
@@ -1088,7 +1124,7 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             self.view = match self.view {
-                View::Chat | View::Tools => View::Diff,
+                View::Chat | View::Activity | View::Tools => View::Diff,
                 View::Diff => View::Chat,
             };
             self.selected_mut().scroll_from_bottom = 0;
@@ -1097,7 +1133,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
             self.view = match self.view {
                 View::Tools => View::Chat,
-                View::Chat | View::Diff => View::Tools,
+                View::Chat | View::Activity | View::Diff => View::Tools,
             };
             self.selected_mut().scroll_from_bottom = 0;
             if self.view == View::Tools {
@@ -1106,7 +1142,12 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-            self.activity_expanded = !self.activity_expanded;
+            self.view = if self.view == View::Activity {
+                View::Chat
+            } else {
+                self.selected_mut().ensure_activity_selection();
+                View::Activity
+            };
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
@@ -1137,6 +1178,17 @@ impl App {
             } else {
                 self.selected_mut().status =
                     "finish this conversation's operation before reloading".to_string();
+            }
+            return;
+        }
+        if self.view == View::Activity {
+            match key.code {
+                KeyCode::Esc => self.view = View::Chat,
+                KeyCode::Up => self.select_activity(-1),
+                KeyCode::Down => self.select_activity(1),
+                KeyCode::PageUp => self.scroll_activity_details_up(8),
+                KeyCode::PageDown => self.scroll_activity_details_down(8),
+                _ => {}
             }
             return;
         }
@@ -1216,6 +1268,34 @@ impl App {
         let state = self.selected_mut();
         state.transcript_selection = None;
         state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(rows);
+    }
+
+    fn select_activity(&mut self, amount: isize) {
+        let state = self.selected_mut();
+        if state.activities.is_empty() {
+            state.activity_selection = None;
+            return;
+        }
+        let selected = state
+            .activity_selection
+            .unwrap_or(state.activities.len() - 1);
+        let next = selected
+            .saturating_add_signed(amount)
+            .min(state.activities.len() - 1);
+        if next != selected {
+            state.activity_selection = Some(next);
+            state.activity_detail_scroll = 0;
+        }
+    }
+
+    fn scroll_activity_details_up(&mut self, rows: usize) {
+        let state = self.selected_mut();
+        state.activity_detail_scroll = state.activity_detail_scroll.saturating_sub(rows);
+    }
+
+    fn scroll_activity_details_down(&mut self, rows: usize) {
+        let state = self.selected_mut();
+        state.activity_detail_scroll = state.activity_detail_scroll.saturating_add(rows);
     }
 
     fn start_from_hash(&mut self, hash: &str) {
@@ -1547,6 +1627,16 @@ mod tests {
         dir
     }
 
+    fn activity(number: usize) -> Activity {
+        Activity {
+            id: format!("tool-{number}"),
+            step_commit: format!("{number:040x}"),
+            summary: format!("tool summary {number}"),
+            detail: format!("detail line {number}\n{}", "more detail\n".repeat(20)),
+            state: ActivityState::Succeeded,
+        }
+    }
+
     fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
         let (tx, rx) = mpsc::channel();
         (
@@ -1558,7 +1648,6 @@ mod tests {
                 should_quit: false,
                 selection_locked: false,
                 confirm_action: None,
-                activity_expanded: false,
                 selecting_transcript: false,
                 view: View::Chat,
                 tx: tx.clone(),
@@ -1948,6 +2037,69 @@ mod tests {
     }
 
     #[test]
+    fn activity_browser_selects_and_scrolls_full_details() {
+        let mut conversation = state("talk-1");
+        conversation.activities = vec![activity(1), activity(2), activity(3)];
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Activity);
+        assert_eq!(app.selected().activity_selection, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().activity_selection, Some(1));
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.selected().activity_detail_scroll, 8);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 60,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.handle_mouse(wheel, area), MouseAction::Redraw);
+        assert_eq!(app.selected().activity_detail_scroll, 11);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().activity_selection, Some(2));
+        assert_eq!(app.selected().activity_detail_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, View::Chat);
+    }
+
+    #[test]
+    fn new_activity_follows_only_a_selection_at_the_tail() {
+        let mut conversation = state("talk-1");
+        conversation.activities = vec![activity(1), activity(2)];
+        conversation.activity_selection = Some(0);
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.on_turn_event(
+            0,
+            TurnEvent::ToolCall {
+                step_commit: "3".repeat(40),
+                tool_use_id: "tool-3".to_string(),
+                name: "bash".to_string(),
+                summary: "third".to_string(),
+            },
+        );
+        assert_eq!(app.selected().activity_selection, Some(0));
+
+        app.selected_mut().activity_selection = Some(2);
+        app.on_turn_event(
+            0,
+            TurnEvent::ToolCall {
+                step_commit: "4".repeat(40),
+                tool_use_id: "tool-4".to_string(),
+                name: "bash".to_string(),
+                summary: "fourth".to_string(),
+            },
+        );
+        assert_eq!(app.selected().activity_selection, Some(3));
+    }
+
+    #[test]
     fn paragraph_scroll_counts_wrapped_visual_rows() {
         let paragraph = Paragraph::new(
             "this single logical line wraps across several visual rows in a narrow viewport",
@@ -2053,7 +2205,8 @@ mod tests {
         assert!(rendered.contains("cancellation is not available"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(app.activity_expanded);
+        assert_eq!(app.view, View::Activity);
+        assert_eq!(app.selected().activity_selection, Some(0));
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let expanded: String = terminal
             .backend()

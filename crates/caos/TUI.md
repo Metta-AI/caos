@@ -54,9 +54,13 @@ time that user opens the TUI.
 | `Ctrl+W` | Archive the selected conversation for this user |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Show the tools available to the selected conversation |
-| `Ctrl+A` | Show or hide full-height live Activity above the prompt |
-| `PageUp` / `PageDown` | Scroll by rendered rows |
+| `Ctrl+A` | Enter or leave the Activity browser |
+| `Up` / `Down` in Activity | Select the previous or next activity entry |
+| `PageUp` / `PageDown` in Activity | Scroll the selected activity's full details |
+| `Escape` in Activity | Return to the conversation |
+| `PageUp` / `PageDown` in conversation | Scroll by rendered rows |
 | Mouse wheel over the transcript | Scroll the conversation by rendered rows |
+| Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over visible transcript text | Select and copy rendered text |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` twice | Load the selected conversation into the working tree |
@@ -89,6 +93,13 @@ The full text, including newlines, replaces the placeholder when the prompt is
 sent. Backspace or Delete removes the whole placeholder. Press `Ctrl+C` to
 clear a draft and any stored paste content; press it again on the empty prompt
 to exit.
+
+`Ctrl+A` opens a focused Activity browser in all space above the composer.
+Up and Down select durable harness steps; the pane beside the list shows the
+selected step's complete result. Scroll long results with PageUp, PageDown, or
+the mouse wheel. Escape or `Ctrl+A` returns to the conversation. If the
+selection is already on the newest step, new activity remains selected. Moving
+to an older step pauses that tail-follow behavior.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other
