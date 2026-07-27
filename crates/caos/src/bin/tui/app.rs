@@ -21,6 +21,25 @@ fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
 }
 
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn automatic_title(prompt: &str) -> String {
+    const MAX_CHARS: usize = 60;
+
+    let title = collapse_whitespace(prompt);
+    if title.chars().count() <= MAX_CHARS {
+        return title;
+    }
+
+    title
+        .chars()
+        .take(MAX_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Chat,
@@ -188,6 +207,7 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    automatic_title: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
@@ -205,6 +225,7 @@ impl ConversationState {
         Self {
             id,
             title,
+            automatic_title: false,
             turn_options,
             transcript: Vec::new(),
             activities: Vec::new(),
@@ -216,6 +237,12 @@ impl ConversationState {
             publishing: false,
             scroll_from_bottom: 0,
         }
+    }
+
+    fn new_virtual(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
+        let mut state = Self::new(id, title, turn_options, status);
+        state.automatic_title = true;
+        state
     }
 
     fn reload(&mut self, transport: &GitTransport) {
@@ -258,6 +285,22 @@ impl ConversationState {
 
     fn is_busy(&self) -> bool {
         self.running || self.publishing
+    }
+
+    fn apply_automatic_title(&mut self, prompt: &str) {
+        if self.automatic_title {
+            self.title = automatic_title(prompt);
+            self.automatic_title = false;
+        }
+    }
+
+    fn latest_message_preview(&self) -> String {
+        self.transcript
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.role, EntryRole::Human | EntryRole::Agent))
+            .map(|entry| collapse_whitespace(&entry.text))
+            .unwrap_or_else(|| "New conversation".to_string())
     }
 }
 
@@ -370,7 +413,7 @@ impl App {
             };
             states.insert(
                 0,
-                ConversationState::new(
+                ConversationState::new_virtual(
                     id.clone(),
                     selected_name.clone(),
                     args.turn,
@@ -453,6 +496,7 @@ impl App {
         }
         {
             let state = self.selected_mut();
+            state.apply_automatic_title(&message);
             state.transcript.push(TranscriptEntry {
                 role: EntryRole::Human,
                 commit: None,
@@ -810,8 +854,10 @@ impl App {
             .as_deref()
             .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
             .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
-        self.conversations
-            .insert(0, ConversationState::new(id, title, options, status));
+        self.conversations.insert(
+            0,
+            ConversationState::new_virtual(id, title, options, status),
+        );
         self.selected = 0;
         self.view = View::Chat;
         self.confirm_action = None;
@@ -848,7 +894,7 @@ impl App {
                     return;
                 }
             };
-            Some(ConversationState::new(
+            Some(ConversationState::new_virtual(
                 id,
                 title,
                 self.selected().turn_options.clone(),
@@ -900,8 +946,10 @@ impl App {
                 return;
             }
         }
-        self.selected_mut().title = title.to_string();
-        self.selected_mut().status = format!("renamed conversation to {title:?}");
+        let state = self.selected_mut();
+        state.title = title.to_string();
+        state.automatic_title = false;
+        state.status = format!("renamed conversation to {title:?}");
     }
 
     fn load_selected_tool_set(&mut self) {
@@ -1111,6 +1159,36 @@ mod tests {
     }
 
     #[test]
+    fn automatic_titles_collapse_whitespace_and_limit_unicode_scalars() {
+        assert_eq!(
+            automatic_title("  Review\t the\nλ parser  "),
+            "Review the λ parser"
+        );
+        assert_eq!(automatic_title(&"界".repeat(60)), "界".repeat(60));
+        assert_eq!(
+            automatic_title(&"界".repeat(61)),
+            format!("{}…", "界".repeat(59))
+        );
+    }
+
+    #[test]
+    fn only_new_virtual_conversations_take_their_first_prompt_as_title() {
+        let mut virtual_conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        virtual_conversation.apply_automatic_title("First prompt");
+        virtual_conversation.apply_automatic_title("Second prompt");
+        assert_eq!(virtual_conversation.title, "First prompt");
+
+        let mut existing = state("Existing title");
+        existing.apply_automatic_title("A later prompt");
+        assert_eq!(existing.title, "Existing title");
+    }
+
+    #[test]
     fn conversation_selection_is_sticky_or_fresh() {
         let conversations = vec![summary("recent"), summary("talk-1")];
         assert_eq!(
@@ -1270,6 +1348,64 @@ mod tests {
     }
 
     #[test]
+    fn conversation_list_renders_titles_and_latest_message_previews_without_ids() {
+        let internal_id = "0123456789abcdef0123456789abcdef01234567";
+        let mut selected = ConversationState::new(
+            internal_id.to_string(),
+            "Readable title".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        selected.transcript = vec![
+            TranscriptEntry {
+                role: EntryRole::Human,
+                commit: None,
+                text: "Latest\n  human\tmessage".to_string(),
+            },
+            TranscriptEntry {
+                role: EntryRole::Notice,
+                commit: None,
+                text: "internal failure".to_string(),
+            },
+        ];
+        assert_eq!(selected.latest_message_preview(), "Latest human message");
+        let (app, _) = app_with(vec![selected, state("Empty title")]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered_rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let sidebar_rows: Vec<String> = rendered_rows
+            .iter()
+            .map(|row| row.chars().take(26).collect())
+            .collect();
+        let title_row = sidebar_rows
+            .iter()
+            .position(|row| row.starts_with('│') && row.contains("Readable title"))
+            .unwrap();
+        assert!(
+            sidebar_rows[title_row + 1].contains("Latest human"),
+            "{:?}",
+            &sidebar_rows[title_row..title_row + 3]
+        );
+        let empty_title_row = sidebar_rows
+            .iter()
+            .position(|row| row.starts_with('│') && row.contains("Empty title"))
+            .unwrap();
+        assert!(sidebar_rows[empty_title_row + 1].contains("New conversation"));
+        let sidebar = sidebar_rows.join("\n");
+        assert!(!sidebar.contains(internal_id));
+        assert!(!sidebar.contains("internal failure"));
+    }
+
+    #[test]
     fn switching_conversations_keeps_background_turn_state() {
         let mut first = state("talk-1");
         first.running = true;
@@ -1333,7 +1469,13 @@ mod tests {
 
     #[test]
     fn title_command_does_not_change_conversation_identity() {
-        let (mut app, _) = app_with(vec![state("stable-id")]);
+        let conversation = ConversationState::new_virtual(
+            "stable-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        let (mut app, _) = app_with(vec![conversation]);
         app.selected_mut()
             .composer
             .insert_str("/title Mutable title");
@@ -1341,6 +1483,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.selected().id, "stable-id");
+        assert_eq!(app.selected().title, "Mutable title");
+        app.selected_mut()
+            .apply_automatic_title("This prompt must not replace it");
         assert_eq!(app.selected().title, "Mutable title");
     }
 

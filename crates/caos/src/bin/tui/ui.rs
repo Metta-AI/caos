@@ -110,19 +110,21 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             } else {
                 (" ", Color::DarkGray)
             };
-            let hash = state
-                .current_hash()
-                .or(state.turn_options.base.as_deref())
-                .map(short_hash)
-                .unwrap_or("new");
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::raw(state.title.clone()),
-                Span::styled(
-                    format!("  {}  {hash}", short_hash(&state.id)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::raw(state.title.clone()),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        state.latest_message_preview(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                ]),
+            ])
         })
         .collect();
     let mut selected = ListState::default().with_selected(Some(app.selected));

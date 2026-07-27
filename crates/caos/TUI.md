@@ -5,10 +5,11 @@ the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
 The interface keeps independent virtual conversations in a left sidebar. Each
-has its own durable history, multiline prompt, live activity, completed-turn
-hashes, and workspace diff. Turns continue running when another conversation
-is selected, so several agent workspaces can advance concurrently without
-touching the working checkout.
+two-row entry shows its title and latest user or agent message without exposing
+the internal conversation ID. Each conversation has its own durable history,
+multiline prompt, live activity, completed-turn hashes, and workspace diff.
+Turns continue running when another conversation is selected, so several agent
+workspaces can advance concurrently without touching the working checkout.
 
 ## Build and run
 
@@ -63,6 +64,11 @@ TUI. Enter `/title <new title>` to change the shared title without changing the
 conversation ID or HEAD. Activity entries show the durable hashes of internal
 harness steps for inspection; those step trees contain harness metadata and are
 not branch points.
+
+A fresh conversation starts with a temporary `talk-N` title. Its first prompt
+automatically becomes a whitespace-collapsed title of at most 60 characters.
+Using `/title` before the first prompt keeps that explicit title instead.
+Existing conversations are never automatically retitled.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other
