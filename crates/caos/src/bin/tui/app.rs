@@ -1053,6 +1053,27 @@ mod tests {
         )
     }
 
+    /// A throwaway git repo for transport-touching paths, so no test depends
+    /// on cwd being a repo — the cargo worker's is not.
+    fn throwaway_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "caos-cli-tui-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+        dir
+    }
+
     fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
         let (tx, rx) = mpsc::channel();
         (
@@ -1118,13 +1139,18 @@ mod tests {
 
     #[test]
     fn cli_options_match_the_line_client_surface() {
+        // --user rides along so the test never depends on ambient $USER
+        // (the cargo worker's environment has none).
         let args = Args::parse(&[
+            "--user".into(),
+            "tester".into(),
             "--from".into(),
             "5ec3751".into(),
             "--model".into(),
             "test-model".into(),
         ])
         .unwrap();
+        assert_eq!(args.user, "tester");
         assert!(args.new_conversation);
         assert_eq!(args.from_commit.as_deref(), Some("5ec3751"));
         assert_eq!(args.turn.model.as_deref(), Some("test-model"));
@@ -1267,6 +1293,9 @@ mod tests {
     #[test]
     fn ctrl_w_removes_virtual_conversations_and_replaces_the_last_one() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        // Replacing the last conversation mints a fresh id through the
+        // transport, so point the app at a real (scratch) repo.
+        app.repo_dir = throwaway_repo("ctrl-w");
         app.selected = 1;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -1319,22 +1348,7 @@ mod tests {
     fn reload_surfaces_history_errors_instead_of_showing_an_empty_chat() {
         // A throwaway repo so the transport discovers a real working tree; the
         // conversation itself is absent, which is the error we're asserting on.
-        // (Don't depend on cwd being a repo — the cargo worker's is not.)
-        let dir = std::env::temp_dir().join(format!(
-            "caos-cli-tui-reload-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
+        let dir = throwaway_repo("reload");
 
         let mut conversation = state("missing-conversation-for-reload-test");
         let transport = GitTransport::discover(&dir).unwrap();

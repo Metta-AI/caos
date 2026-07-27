@@ -15,14 +15,17 @@ pub(crate) struct Args {
 
 impl Args {
     pub(crate) fn parse(raw: &[String]) -> Result<Self, String> {
-        Self::parse_with_default_user(raw, default_user()?)
+        Self::parse_with_default_user(raw, std::env::var("USER").ok())
     }
 
-    fn parse_with_default_user(raw: &[String], default_user: String) -> Result<Self, String> {
-        let mut parsed = Self {
-            user: default_user,
-            ..Self::default()
-        };
+    /// `default_user` is only consulted when `--user` is absent, so `--user`
+    /// works (and tests run) without `$USER` in the environment.
+    fn parse_with_default_user(
+        raw: &[String],
+        default_user: Option<String>,
+    ) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        let mut user_flag: Option<String> = None;
         let mut args = raw.iter();
         while let Some(arg) = args.next() {
             let value = |args: &mut std::slice::Iter<'_, String>, flag: &str| {
@@ -31,7 +34,7 @@ impl Args {
                     .ok_or_else(|| format!("{flag} needs a value\n{}", usage()))
             };
             match arg.as_str() {
-                "--user" => parsed.user = value(&mut args, arg)?,
+                "--user" => user_flag = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
                 "-c" | "--conversation" => parsed.conversation = Some(value(&mut args, arg)?),
@@ -49,6 +52,9 @@ impl Args {
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }
         }
+        parsed.user = user_flag
+            .or(default_user)
+            .ok_or_else(|| "--user is required when $USER is not set".to_string())?;
         if parsed.turn.system.is_some() && parsed.turn.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
         }
@@ -89,44 +95,49 @@ pub(crate) fn usage() -> String {
         .to_string()
 }
 
-fn default_user() -> Result<String, String> {
-    std::env::var("USER").map_err(|_| "--user is required when $USER is not set".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::Args;
 
     #[test]
     fn user_defaults_to_the_supplied_username_and_can_be_overridden() {
-        let default = Args::parse_with_default_user(&[], "alice".to_string()).unwrap();
+        let default = Args::parse_with_default_user(&[], Some("alice".to_string())).unwrap();
         assert_eq!(default.user, "alice");
 
         let explicit = Args::parse_with_default_user(
             &["--user".to_string(), "bob".to_string()],
-            "alice".to_string(),
+            Some("alice".to_string()),
         )
         .unwrap();
         assert_eq!(explicit.user, "bob");
+
+        let no_ambient =
+            Args::parse_with_default_user(&["--user".to_string(), "bob".to_string()], None)
+                .unwrap();
+        assert_eq!(no_ambient.user, "bob");
+
+        assert!(Args::parse_with_default_user(&[], None).is_err());
     }
 
     #[test]
     fn archive_management_is_non_interactive_and_exclusive() {
-        let list =
-            Args::parse_with_default_user(&["--list-archived".to_string()], "alice".to_string())
-                .unwrap();
+        let list = Args::parse_with_default_user(
+            &["--list-archived".to_string()],
+            Some("alice".to_string()),
+        )
+        .unwrap();
         assert!(list.list_archived);
 
         let restore = Args::parse_with_default_user(
             &["--unarchive".to_string(), "abc123".to_string()],
-            "alice".to_string(),
+            Some("alice".to_string()),
         )
         .unwrap();
         assert_eq!(restore.unarchive.as_deref(), Some("abc123"));
 
         assert!(Args::parse_with_default_user(
             &["--list-archived".to_string(), "--new".to_string(),],
-            "alice".to_string(),
+            Some("alice".to_string()),
         )
         .is_err());
     }
