@@ -57,7 +57,7 @@ time that user opens the TUI.
 | `Ctrl+A` | Show or hide full-height live Activity above the prompt |
 | `PageUp` / `PageDown` | Scroll by rendered rows |
 | Mouse wheel over the transcript | Scroll the conversation by rendered rows |
-| `Shift`+mouse drag | Use the terminal's native selection when supported |
+| Mouse drag over visible transcript text | Select and copy rendered text |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` twice | Load the selected conversation into the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
@@ -101,13 +101,16 @@ The transcript fills the conversation pane above the fixed composer. Use
 `PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
 Scrolling up pauses tail-follow until the viewport returns to the bottom.
 
-Mouse-wheel routing requires terminal mouse capture, which also intercepts
-ordinary drag selection. Hold `Shift` while dragging if the terminal supports
-the conventional native-selection override. For a reliable native selection,
-press `Ctrl+Y`: CAOS releases mouse capture and freezes redraws, so dragging and
-the terminal's normal copy shortcut (`Cmd+C` on macOS or usually
-`Ctrl+Shift+C` elsewhere) work without moving output. Press `Ctrl+Y` or
-`Escape` to resume.
+Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
+selection for the current transcript viewport. Drag across rendered transcript
+text to highlight it and copy automatically on mouse release. macOS uses
+`pbcopy`; other environments receive the same text through the standard OSC 52
+terminal clipboard sequence.
+
+For native terminal selection, press `Ctrl+Y`. CAOS releases mouse capture and
+freezes redraws, so dragging and the terminal's normal copy shortcut (`Cmd+C`
+on macOS or usually `Ctrl+Shift+C` elsewhere) work without moving output.
+Press `Ctrl+Y` or `Escape` to resume.
 
 ## Workspace safety
 

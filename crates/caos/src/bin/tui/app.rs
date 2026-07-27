@@ -9,7 +9,10 @@ use caos::chat::{
     TurnEvent, TurnOptions, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
-use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui_core::layout::Rect;
+use ratatui_crossterm::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use super::args::Args;
 use super::workspace::{load_conversation_workspace, publish_conversation_pr};
@@ -83,6 +86,28 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 struct PendingPaste {
     placeholder: String,
     content: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TranscriptPoint {
+    row: u16,
+    column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptSelection {
+    anchor: TranscriptPoint,
+    head: TranscriptPoint,
+}
+
+impl TranscriptSelection {
+    fn ordered(self) -> (TranscriptPoint, TranscriptPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -500,6 +525,7 @@ struct ConversationState {
     running: bool,
     publishing: bool,
     scroll_from_bottom: usize,
+    transcript_selection: Option<TranscriptSelection>,
 }
 
 impl ConversationState {
@@ -518,6 +544,7 @@ impl ConversationState {
             running: false,
             publishing: false,
             scroll_from_bottom: 0,
+            transcript_selection: None,
         }
     }
 
@@ -556,6 +583,7 @@ impl ConversationState {
             }
         }
         self.scroll_from_bottom = 0;
+        self.transcript_selection = None;
     }
 
     fn current_hash(&self) -> Option<&str> {
@@ -607,6 +635,13 @@ enum ConfirmAction {
     Publish,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MouseAction {
+    Ignored,
+    Redraw,
+    Copy(String),
+}
+
 pub(crate) struct App {
     repo_dir: PathBuf,
     user: String,
@@ -616,6 +651,7 @@ pub(crate) struct App {
     selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
     activity_expanded: bool,
+    selecting_transcript: bool,
     view: View,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
@@ -717,6 +753,7 @@ impl App {
             selection_locked: false,
             confirm_action: None,
             activity_expanded: false,
+            selecting_transcript: false,
             view: View::Chat,
             tx,
             rx,
@@ -755,6 +792,70 @@ impl App {
         self.selected_mut().composer.insert_paste(text);
     }
 
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp
+                if self.showing_transcript()
+                    && ui::content_contains(area, mouse.column, mouse.row) =>
+            {
+                self.selected_mut().transcript_selection = None;
+                self.scroll_up(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollDown
+                if self.showing_transcript()
+                    && ui::content_contains(area, mouse.column, mouse.row) =>
+            {
+                self.selected_mut().transcript_selection = None;
+                self.scroll_down(3);
+                MouseAction::Redraw
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.showing_transcript() => {
+                let Some(point) =
+                    ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
+                else {
+                    return MouseAction::Ignored;
+                };
+                self.selected_mut().transcript_selection = Some(TranscriptSelection {
+                    anchor: point,
+                    head: point,
+                });
+                self.selecting_transcript = true;
+                MouseAction::Redraw
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting_transcript => {
+                if let Some(point) =
+                    ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
+                {
+                    self.selected_mut()
+                        .transcript_selection
+                        .as_mut()
+                        .expect("dragging starts with a transcript selection")
+                        .head = point;
+                    MouseAction::Redraw
+                } else {
+                    MouseAction::Ignored
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selecting_transcript => {
+                if let Some(point) =
+                    ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
+                {
+                    self.selected_mut()
+                        .transcript_selection
+                        .as_mut()
+                        .expect("dragging starts with a transcript selection")
+                        .head = point;
+                }
+                self.selecting_transcript = false;
+                ui::transcript_selection_text(self.selected(), area)
+                    .map(MouseAction::Copy)
+                    .unwrap_or(MouseAction::Redraw)
+            }
+            _ => MouseAction::Ignored,
+        }
+    }
+
     fn start_turn(&mut self) {
         if self.selected().is_busy() {
             self.selected_mut().status =
@@ -787,6 +888,7 @@ impl App {
             state.running = true;
             state.status = "starting turn".to_string();
             state.scroll_from_bottom = 0;
+            state.transcript_selection = None;
         }
 
         let tx = self.tx.clone();
@@ -898,6 +1000,7 @@ impl App {
                     text,
                 });
                 state.scroll_from_bottom = 0;
+                state.transcript_selection = None;
             }
             TurnEvent::ToolCall {
                 step_commit,
@@ -1105,11 +1208,13 @@ impl App {
 
     pub(crate) fn scroll_up(&mut self, rows: usize) {
         let state = self.selected_mut();
+        state.transcript_selection = None;
         state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(rows);
     }
 
     pub(crate) fn scroll_down(&mut self, rows: usize) {
         let state = self.selected_mut();
+        state.transcript_selection = None;
         state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(rows);
     }
 
@@ -1397,6 +1502,7 @@ mod tests {
     use super::*;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
+    use ratatui_core::style::Color;
     use ratatui_core::terminal::Terminal;
     use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
@@ -1453,6 +1559,7 @@ mod tests {
                 selection_locked: false,
                 confirm_action: None,
                 activity_expanded: false,
+                selecting_transcript: false,
                 view: View::Chat,
                 tx: tx.clone(),
                 rx,
@@ -1859,6 +1966,46 @@ mod tests {
         assert!(content_contains(terminal, 99, 22));
         assert!(!content_contains(terminal, 25, 12));
         assert!(!content_contains(terminal, 27, 23));
+    }
+
+    #[test]
+    fn mouse_drag_selects_visible_transcript_text_for_copy() {
+        let mut selected = state("talk-1");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text: "hello".to_string(),
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 27, 2), area),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 29, 2), area),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 29, 2), area),
+            MouseAction::Copy("You".to_string())
+        );
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        for column in 27..=29 {
+            let cell = terminal.backend().buffer().cell((column, 2)).unwrap();
+            assert_eq!(cell.bg, Color::Cyan);
+            assert_eq!(cell.fg, Color::Black);
+        }
     }
 
     #[test]

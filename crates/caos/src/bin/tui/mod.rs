@@ -1,4 +1,6 @@
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use caos::chat::{
@@ -10,7 +12,7 @@ use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TerminalEvent, MouseEventKind,
+    Event as TerminalEvent,
 };
 use ratatui_crossterm::crossterm::execute;
 use ratatui_crossterm::crossterm::terminal::{
@@ -22,10 +24,7 @@ mod app;
 mod args;
 mod workspace;
 
-use app::{
-    ui::{self, render},
-    App, View,
-};
+use app::{ui::render, App, MouseAction, View};
 use args::{usage, Args};
 
 const TICK: Duration = Duration::from_millis(50);
@@ -70,19 +69,14 @@ fn run_app(
                         .size()
                         .map_err(|error| format!("reading terminal size: {error}"))?;
                     let area = Rect::new(0, 0, size.width, size.height);
-                    if app.showing_transcript()
-                        && ui::content_contains(area, mouse.column, mouse.row)
-                    {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                app.scroll_up(3);
-                                changed = true;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                app.scroll_down(3);
-                                changed = true;
-                            }
-                            _ => {}
+                    match app.handle_mouse(mouse, area) {
+                        MouseAction::Ignored => {}
+                        MouseAction::Redraw => changed = true,
+                        MouseAction::Copy(text) => {
+                            copy_to_clipboard(terminal.backend_mut(), &text).map_err(|error| {
+                                format!("copying transcript selection: {error}")
+                            })?;
+                            changed = true;
                         }
                     }
                 }
@@ -127,6 +121,63 @@ fn set_mouse_capture(writer: &mut impl io::Write, enabled: bool) -> io::Result<(
     } else {
         execute!(writer, DisableMouseCapture)
     }
+}
+
+fn copy_to_clipboard(writer: &mut impl Write, text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if copy_with_pbcopy(text)? {
+        return Ok(());
+    }
+
+    write_osc52(writer, text)
+}
+
+fn write_osc52(writer: &mut impl Write, text: &str) -> io::Result<()> {
+    write!(
+        writer,
+        "\u{1b}]52;c;{}\u{7}",
+        base64_encode(text.as_bytes())
+    )?;
+    writer.flush()
+}
+
+#[cfg(target_os = "macos")]
+fn copy_with_pbcopy(text: &str) -> io::Result<bool> {
+    let mut child = match Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    child
+        .stdin
+        .take()
+        .expect("pbcopy was started with piped stdin")
+        .write_all(text.as_bytes())?;
+    child.wait().map(|status| status.success())
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let bits = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        encoded.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+        encoded.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[((bits >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[(bits & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 pub(crate) fn run(raw: &[String]) -> Result<(), String> {
@@ -224,5 +275,18 @@ mod tests {
         assert!(selection_lock_allows_redraw(false, true));
         assert!(!selection_lock_allows_redraw(true, true));
         assert!(selection_lock_allows_redraw(true, false));
+    }
+
+    #[test]
+    fn osc52_clipboard_payload_uses_base64() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+
+        let mut output = Vec::new();
+        write_osc52(&mut output, "selected text").unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, "\u{1b}]52;c;c2VsZWN0ZWQgdGV4dA==\u{7}");
     }
 }
