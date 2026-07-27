@@ -28,10 +28,16 @@ caosd
 git init                              # if this tree isn't a repo yet
 git remote add caos http://localhost:9090
 
-# 3. Run a builtin from the published library by its /cas/std/<name> path — the
-#    same path workers use. CAOS_CAS_DIR is where results land:
+# 3. Build your own worker from Rust source with the published std/rustc,
+#    then run it — hello.rs (next to this README) is the whole worker.
+#    CAOS_CAS_DIR is where results land. (Builtins run the same way by
+#    their /cas/std/<name> path, e.g. /cas/std/bash-tool.)
 export CAOS_CAS_DIR=/tmp/cas
-caos-cli run /cas/std/hello "$CAOS_CAS_DIR/out" -- --greeting=hi
+git add hello.rs && git commit -m "my worker"
+builder=$(caos-cli curry /cas/std/rustc -- --runner:@=/cas/std/runner)
+caos-cli run "$builder" img -- --src:@=hello.rs
+git add img && git commit -m "built worker"
+caos-cli run "$(git rev-parse HEAD:img)" "$CAOS_CAS_DIR/out" -- --greeting=hi
 ```
 
 ## Updating the stdlib

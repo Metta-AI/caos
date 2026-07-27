@@ -84,7 +84,7 @@ Publishing (`build-builtins.sh`, run by `caosd up`) has three entry forms:
 | streamed | `flake-builder` | nix-built, composed onto stock `nixos/nix` with `docker build`, pushed; the entry is a curry over the digest ref — no layer bytes in git |
 | literal flake tree | `bash`, `testenv` | the checked-in `std/<name>` directory, copied whole — `{flake.nix, flake.lock, worker}`, nothing generated |
 | staged flake tree | `runner`, `cargo` | the checked-in files + the nix-built `/worker` binary staged on top (`std/<name>/stage-tree.sh`) |
-| curry | `bash-tool`, `llm-step`, `rgrep`, `rustc`, `hello`, `file-count`, `dirs-only`, `deep-deps` | `curry(runner, worker1=<binary>)` |
+| curry | `bash-tool`, `llm-step`, `rgrep`, `rustc` | `curry(runner, worker1=<binary>)` |
 
 A flake can only read its own tree, and resolution cannot strip a tree
 (only the flake knows which files its build reads) — so each std tree
@@ -220,12 +220,14 @@ flake, a curry, or the result of calling another worker:
   Collapsing the cargo/rustc pair into one "build worker" is the remaining
   open design here.
 
-**Test fixtures leave std.** `file-count`, `dirs-only`, `deep-deps` have
-no consumers outside their own tests, and `hello` none outside
-`examples/consumer` — they're tests in disguise. Tests define their own
-workers: carry the fixture's `.rs` and call `std/rustc`, or carry a flake
-and invoke the flake-builder for a fixture image. std keeps only entries
-with real consumers: `flake-builder, runner, cargo, bash, testenv, rustc,
+**Test fixtures leave std** (DONE, phase B). `file-count`, `dirs-only`,
+`deep-deps` had no consumers outside their own tests, and `hello` none
+outside `examples/consumer` — tests in disguise. Each test now carries its
+fixture's `.rs` (`tests/<name>/worker.rs`) and builds it with `std/rustc`
+at test start (memoized: one compile per source edit); `hello.rs` rides in
+`examples/consumer/` the same way. A test needing a fixture *image* can
+carry a flake and invoke the flake-builder. std holds only entries with
+real consumers: `flake-builder, runner, cargo, bash, testenv, rustc,
 bash-tool, llm-step, rgrep`.
 
 **caos does not build caos.** The core builds from the host, from a blank

@@ -10,15 +10,24 @@
 # recompute on edits, and cycle detection. The fixture map (a -> {b,c}, b -> {d},
 # c -> {d}, d -> {}) lives as real files under packages/. The recursion runs as
 # server-resolved map-then promises, deps mapped in parallel.
+# The worker is a TEST FIXTURE, not a std entry: this test carries its source
+# (./worker.rs) and builds it with std/rustc — memoized, so the compile
+# happens once per source edit, not per run.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # The CLI ingests only git-tracked paths, so commit the map before each deepen.
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
+echo "== build the fixture worker from its source ==" >&2
+builder=$("$CAOS_CLI" curry /cas/std/rustc -- --runner:@=/cas/std/runner)
+"$CAOS_CLI" run "$builder" img -- --src:@=test/worker.rs
+commit "built deep-deps"
+worker=$(git rev-parse HEAD:img)
+
 # Deepen a package map (a dir) and check the result tree out.
 deepen() { # <pkgs-dir> <out-dir>
-  "$CAOS_CLI" run /cas/std/deep-deps "$2" -- --mode=all --packages:@="$1"
+  "$CAOS_CLI" run "$worker" "$2" -- --mode=all --packages:@="$1"
 }
 
 # A writable copy of the fixture map we edit across phases.

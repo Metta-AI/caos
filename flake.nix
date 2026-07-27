@@ -129,10 +129,6 @@
         caos = workspaceBins;
         server = workspaceBins;
         runnerd = workspaceBins;
-        worker-hello = workspaceBins;
-        worker-file-count = workspaceBins;
-        worker-dirs-only = workspaceBins;
-        worker-deep-deps = workspaceBins;
         worker-rustc = workspaceBins;
         worker-runner = workspaceBins;
         worker-cargo = workspaceBins;
@@ -589,10 +585,6 @@
           # Published as curry(runner, worker1) with the cargo ref and the
           # worker-common source curried in.
           worker-rustc
-          worker-hello
-          worker-file-count
-          worker-dirs-only
-          worker-deep-deps
         ];
 
         # The dev stack's control command. Subcommands:

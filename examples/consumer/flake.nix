@@ -30,7 +30,10 @@
       # server as its `caos` remote — that remote URL *is* the server, so
       # there's no CAOS_SERVER_URL to set:
       #   git remote add caos http://localhost:9090
-      #   caos-cli run /cas/std/hello out -- --greeting=hi
+      # then build + run your own worker (see README.md; hello.rs here is
+      # the whole worker):
+      #   caos-cli run "$(caos-cli curry /cas/std/rustc -- \
+      #     --runner:@=/cas/std/runner)" img -- --src:@=hello.rs
       devShells.${system}.default = pkgs.mkShell {
         # One package, both commands (caos-cli + caosd) on PATH.
         packages = [ caosPkgs.caos-tools ];

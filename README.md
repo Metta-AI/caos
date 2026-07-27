@@ -37,7 +37,7 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `worker-common` | — | Shared library for the Rust workers. |
-| `worker-hello`, `worker-file-count`, `worker-dirs-only`, `worker-deep-deps`, `worker-rustc` | — (run as `curry(runner, worker1)`) | Example/built-in workers. See [workers](#workers). |
+| `worker-rustc` | — (run as `curry(runner, worker1)`) | Builds a worker from Rust source. See [workers](#workers). |
 | `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, worker1)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
 | `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (one flake tree: pinned toolchain + pre-compiled deps + this binary as `/worker`, imaged on first use — see `std/cargo/` and `design/flake-images.md`) — the agent's `build`/`test` tools. See `design/cargo-workers.md`. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
@@ -483,21 +483,20 @@ the compiled workers below ride one shared image: each is
 writes `/cas/out`. The Rust workers share `worker-common` (arg helpers,
 `caos`/`map_then`/`caos curry` wrappers, result staging).
 
-- **`worker-hello`** — a leaf example: gathers its `/cas/args` entries into a
-  result tree.
-- **`worker-file-count`** — counts the leaf files under `--in`, recursing with
-  itself through map-then: a tree records `{in, map: file-count, then:
-  file-count}` and exits; called back with `--children` it sums the counts; a
-  file counts as `1`. One image, three positions — the shape any structural
-  fold takes here. Identical subtrees are memoized, so a count is incremental
-  in the changed nodes; siblings count in parallel.
-- **`worker-dirs-only`** — keeps only a node's directory children, dropping
-  files. Compose by filtering first and recursing over the result.
-- **`worker-deep-deps`** — computes transitive dependencies by self-recursion:
-  `deepen` resolves a package's `DEPS` against the map (pure CAS linking) and
-  map-thens *itself* over the resolved deps, finishing with a node builder
-  keyed only on the package and its subgraph — so recompute is O(changed
-  package + its dependents).
+The example workers are TEST FIXTURES, not std entries: each test carries
+its worker's source (`tests/<name>/worker.rs`, single-file, linking only
+`worker-common`) and builds it with `std/rustc` at test start — memoized,
+one compile per source edit. `hello.rs` in `examples/consumer/` shows the
+same flow for consumers. The fixtures worth reading:
+
+- **file-count** (`tests/file-count/worker.rs`) — counts the leaf files
+  under `--in`, recursing with itself through map-then: one image, three
+  positions — the shape any structural fold takes here. Identical subtrees
+  are memoized; siblings count in parallel.
+- **dirs-only** (`tests/dirs-only/worker.rs`) — keeps only a node's
+  directory children, dropping files.
+- **deep-deps** (`tests/deep-deps/worker.rs`) — transitive dependencies by
+  self-recursion; recompute is O(changed package + its dependents).
 - **`worker-rustc`** — builds a runnable worker from a Rust source file, as
   pure orchestration over the cargo worker: it lays out a project (the source
   plus the curried-in `worker-common` tree), tail-calls the cargo worker to
@@ -522,7 +521,7 @@ the cache key, never hidden inside a memoized computation.
 
 ```bash
 ./build-builtins.sh                 # publish all built-ins to refs/caos/std
-./build-builtins.sh file-count deep-deps  # publish a subset
+./build-builtins.sh bash testenv    # publish a subset
 ```
 
 ## Local testing
