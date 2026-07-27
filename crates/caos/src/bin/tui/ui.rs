@@ -12,8 +12,40 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use super::{short_hash, ActivityState, App, Command, ConversationState, EntryRole, View};
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
-    let area = frame.area();
-    let activity_height = if app.activity_expanded { 10 } else { 3 };
+    let areas = layout(frame.area());
+    let state = app.selected();
+
+    render_header(app, state, frame, areas.header);
+    render_conversations(app, frame, areas.sidebar);
+    if app.activity_expanded {
+        render_activity(state, frame, areas.content);
+    } else {
+        match app.view {
+            View::Chat => render_transcript(state, frame, areas.content),
+            View::Diff => render_diff(state, frame, areas.content),
+            View::Tools => render_tools(state, frame, areas.content),
+        }
+    }
+    render_composer(
+        state,
+        app.view,
+        !app.selection_locked,
+        frame,
+        areas.composer,
+    );
+    render_footer(app.selection_locked, frame, areas.footer);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Areas {
+    header: Rect,
+    sidebar: Rect,
+    content: Rect,
+    composer: Rect,
+    footer: Rect,
+}
+
+fn layout(area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -28,30 +60,19 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         .split(outer[1]);
     let conversation = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),
-            Constraint::Length(activity_height),
-            Constraint::Length(6),
-        ])
+        .constraints([Constraint::Min(6), Constraint::Length(6)])
         .split(body[1]);
-    let state = app.selected();
-
-    render_header(app, state, frame, outer[0]);
-    render_conversations(app, frame, body[0]);
-    match app.view {
-        View::Chat => render_transcript(state, frame, conversation[0]),
-        View::Diff => render_diff(state, frame, conversation[0]),
-        View::Tools => render_tools(state, frame, conversation[0]),
+    Areas {
+        header: outer[0],
+        sidebar: body[0],
+        content: conversation[0],
+        composer: conversation[1],
+        footer: outer[2],
     }
-    render_activity(state, app.activity_expanded, frame, conversation[1]);
-    render_composer(
-        state,
-        app.view,
-        !app.selection_locked,
-        frame,
-        conversation[2],
-    );
-    render_footer(app.selection_locked, frame, outer[2]);
+}
+
+pub(crate) fn content_contains(area: Rect, column: u16, row: u16) -> bool {
+    layout(area).content.contains(Position::new(column, row))
 }
 
 fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
@@ -192,65 +213,38 @@ fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rec
     frame.render_widget(paragraph, area);
 }
 
-fn render_activity(state: &ConversationState, expanded: bool, frame: &mut Frame<'_>, area: Rect) {
-    let mut lines = Vec::new();
-    if expanded {
+fn render_activity(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("status  ", Style::default().fg(Color::Yellow)),
+        Span::raw(state.status.clone()),
+    ])];
+    for item in &state.activities {
+        let (mark, color) = activity_mark(item.state);
         lines.push(Line::from(vec![
-            Span::styled("status  ", Style::default().fg(Color::Yellow)),
-            Span::raw(state.status.clone()),
+            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{}  ", short_hash(&item.step_commit)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(item.summary.clone()),
         ]));
-        for item in &state.activities {
-            let (mark, color) = activity_mark(item.state);
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::styled(
-                    format!("{}  ", short_hash(&item.step_commit)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(item.summary.clone()),
-            ]));
-            lines.extend(item.detail.lines().map(|line| {
-                Line::styled(format!("    {line}"), Style::default().fg(Color::DarkGray))
-            }));
-        }
-    } else {
-        let mut spans = vec![
-            Span::styled("status  ", Style::default().fg(Color::Yellow)),
-            Span::raw(state.status.clone()),
-        ];
-        if let Some(item) = state.activities.last() {
-            let (mark, color) = activity_mark(item.state);
-            spans.extend([
-                Span::raw("    "),
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::styled(
-                    format!("{}  ", short_hash(&item.step_commit)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(item.summary.clone()),
-            ]);
-            let detail = first_line(&item.detail);
-            if !detail.is_empty() {
-                spans.push(Span::styled(
-                    format!(" — {detail}"),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-        lines.push(Line::from(spans));
+        lines.extend(
+            item.detail
+                .lines()
+                .map(|line| Line::raw(format!("    {line}"))),
+        );
     }
-    let title = if expanded {
-        " Activity (Ctrl+A collapse) "
-    } else {
-        " Activity (Ctrl+A expand) "
-    };
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let line_count = paragraph.line_count(area.width.saturating_sub(2));
     let visible = area.height.saturating_sub(2) as usize;
     let scroll = line_count.saturating_sub(visible).min(u16::MAX as usize) as u16;
     frame.render_widget(
         paragraph
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" Activity (Ctrl+A returns) ")
+                    .borders(Borders::ALL),
+            )
             .scroll((scroll, 0)),
         area,
     );
@@ -467,7 +461,7 @@ fn render_footer(selection_locked: bool, frame: &mut Frame<'_>, area: Rect) {
         )
     } else {
         Line::raw(
-            " Drag selects  ^Y lock  ^Up/Dn chat  ^N new  ^Q diff  ^T tools  ^A activity  ^L load  ^P PR  ^C quit",
+            " Wheel scrolls  Shift+drag selects  ^Y selection lock  ^Up/Dn chat  ^A activity  ^Q diff  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);
@@ -484,19 +478,4 @@ pub(crate) fn scroll_offset(line_count: usize, height: u16, from_bottom: usize) 
         .saturating_sub(visible)
         .saturating_sub(from_bottom)
         .min(u16::MAX as usize) as u16
-}
-
-fn first_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
-    const LIMIT: usize = 120;
-    let mut chars = line.chars();
-    let shortened: String = chars.by_ref().take(LIMIT).collect();
-    if chars.next().is_some() {
-        format!("{shortened}…")
-    } else {
-        shortened
-    }
 }

@@ -6,9 +6,11 @@ use caos::chat::{
     UserConversationStatus,
 };
 use caos::GitTransport;
+use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TerminalEvent, MouseEventKind,
 };
 use ratatui_crossterm::crossterm::execute;
 use ratatui_crossterm::crossterm::terminal::{
@@ -20,7 +22,10 @@ mod app;
 mod args;
 mod workspace;
 
-use app::{ui::render, App, View};
+use app::{
+    ui::{self, render},
+    App, View,
+};
 use args::{usage, Args};
 
 const TICK: Duration = Duration::from_millis(50);
@@ -46,6 +51,12 @@ fn run_app(
                 TerminalEvent::Key(key) => {
                     let was_locked = app.selection_locked();
                     app.handle_key(key);
+                    if was_locked != app.selection_locked() {
+                        set_mouse_capture(terminal.backend_mut(), !app.selection_locked())
+                            .map_err(|error| {
+                                format!("switching terminal selection mode: {error}")
+                            })?;
+                    }
                     changed |= selection_lock_allows_redraw(was_locked, app.selection_locked());
                 }
                 TerminalEvent::Paste(text)
@@ -53,6 +64,27 @@ fn run_app(
                 {
                     app.insert_paste(&text);
                     changed = true;
+                }
+                TerminalEvent::Mouse(mouse) if !app.selection_locked() => {
+                    let size = terminal
+                        .size()
+                        .map_err(|error| format!("reading terminal size: {error}"))?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    if app.showing_transcript()
+                        && ui::content_contains(area, mouse.column, mouse.row)
+                    {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.scroll_up(3);
+                                changed = true;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.scroll_down(3);
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 TerminalEvent::Resize(_, _) if !app.selection_locked() => changed = true,
                 _ => {}
@@ -72,11 +104,29 @@ fn selection_lock_allows_redraw(was_locked: bool, is_locked: bool) -> bool {
 }
 
 fn enter_screen(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(writer, EnterAlternateScreen, EnableBracketedPaste)
+    execute!(
+        writer,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
 }
 
 fn leave_screen(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(writer, DisableBracketedPaste, LeaveAlternateScreen)
+    execute!(
+        writer,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
+}
+
+fn set_mouse_capture(writer: &mut impl io::Write, enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(writer, EnableMouseCapture)
+    } else {
+        execute!(writer, DisableMouseCapture)
+    }
 }
 
 pub(crate) fn run(raw: &[String]) -> Result<(), String> {
@@ -141,7 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_lifecycle_enables_bracketed_paste_without_mouse_capture() {
+    fn terminal_lifecycle_enables_input_modes_and_restores_the_terminal() {
         let mut output = Vec::new();
         enter_screen(&mut output).unwrap();
         leave_screen(&mut output).unwrap();
@@ -152,11 +202,20 @@ mod tests {
         assert!(output.contains("\u{1b}[?2004h"));
         assert!(output.contains("\u{1b}[?2004l"));
         assert!(output.find("\u{1b}[?2004h") < output.find("\u{1b}[?2004l"));
-        assert!(!output.contains("\u{1b}[?1000h"));
-        assert!(!output.contains("\u{1b}[?1002h"));
-        assert!(!output.contains("\u{1b}[?1003h"));
-        assert!(!output.contains("\u{1b}[?1006h"));
-        assert!(!output.contains("\u{1b}[?1015h"));
+        assert!(output.contains("\u{1b}[?1000h"));
+        assert!(output.contains("\u{1b}[?1000l"));
+    }
+
+    #[test]
+    fn selection_mode_releases_and_restores_mouse_capture() {
+        let mut output = Vec::new();
+        set_mouse_capture(&mut output, false).unwrap();
+        set_mouse_capture(&mut output, true).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let disabled = output.find("\u{1b}[?1000l").unwrap();
+        let enabled = output.rfind("\u{1b}[?1000h").unwrap();
+        assert!(disabled < enabled);
     }
 
     #[test]

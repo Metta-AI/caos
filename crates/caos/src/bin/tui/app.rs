@@ -747,6 +747,10 @@ impl App {
         self.view
     }
 
+    pub(crate) fn showing_transcript(&self) -> bool {
+        self.view == View::Chat && !self.activity_expanded
+    }
+
     pub(crate) fn insert_paste(&mut self, text: &str) {
         self.selected_mut().composer.insert_paste(text);
     }
@@ -1396,7 +1400,7 @@ mod tests {
     use ratatui_core::terminal::Terminal;
     use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-    use super::ui::{paragraph_scroll, render, scroll_offset};
+    use super::ui::{content_contains, paragraph_scroll, render, scroll_offset};
 
     fn summary(id: &str) -> UserConversationSummary {
         UserConversationSummary {
@@ -1849,6 +1853,15 @@ mod tests {
     }
 
     #[test]
+    fn transcript_uses_all_space_above_the_composer() {
+        let terminal = Rect::new(0, 0, 100, 30);
+        assert!(content_contains(terminal, 27, 1));
+        assert!(content_contains(terminal, 99, 22));
+        assert!(!content_contains(terminal, 25, 12));
+        assert!(!content_contains(terminal, 27, 23));
+    }
+
+    #[test]
     fn full_layout_renders_chat_activity_and_prompt() {
         let mut selected = state("review-api");
         selected.transcript = vec![
@@ -1889,8 +1902,6 @@ mod tests {
         assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
         assert!(rendered.contains("Please run the tests"));
-        assert!(rendered.contains("ccccccc"));
-        assert!(rendered.contains("$ cargo test"));
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("cancellation is not available"));
 
@@ -1904,6 +1915,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
+        assert!(expanded.contains("ccccccc"));
+        assert!(expanded.contains("$ cargo test"));
         assert!(expanded.contains("12 tests passed"));
 
         app.selected_mut().running = false;
