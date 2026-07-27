@@ -1,0 +1,14 @@
+[package]
+name = "worker-rustc"
+version = "0.1.0"
+edition = "2021"
+
+# The "rust worker builder": a worker that compiles a Rust source file into a new
+# caos worker image. It shells out to the cargo/rustc baked into its image.
+
+[[bin]]
+name = "worker-rustc"
+path = "src/main.rs"
+
+[dependencies]
+worker-common = { path = "../worker-common" }

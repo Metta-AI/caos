@@ -375,7 +375,9 @@ image jobs key on (builder script, base ref, file contents): unchanged
 binaries are an instant hit, no build. These are the first worker images
 whose caos binary is itself caos-built. The bash `/worker` entrypoint moved
 to `images/bash-worker.sh` (tracked git data; the flake `readFile`s the
-same file — one source of truth). run-all no longer runs `load-*` or the
+same file — one source of truth; it lives at `std/bash/worker` since the
+literal-tree pass, design/flake-images.md part 2). run-all no longer runs
+`load-*` or the
 stacked-runner build; the ONE host-produced image left is the cargo
 toolchain base (pinned toolchain + baked deps — genuinely needs nix; phase
 D2 gives it a nix-capable builder job). Gotcha: the slimmed moby client has

@@ -1,0 +1,17 @@
+[package]
+name = "worker-rgrep"
+version = "0.1.0"
+edition = "2021"
+
+# Recursive grep as a structural fold (design/agent-harness.md): one job per
+# directory, results as a sparse tree, cached per (subtree hash, pattern).
+# Builds to a static binary that runs as curry(runner, bin) in the shared
+# runner pool.
+[dependencies]
+worker-common = { path = "../worker-common" }
+# The pattern language (what models mean by "grep"). Pure Rust, stays static.
+regex = "1"
+
+[[bin]]
+name = "worker-rgrep"
+path = "src/main.rs"

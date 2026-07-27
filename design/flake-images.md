@@ -82,33 +82,40 @@ Publishing (`build-builtins.sh`, run by `caosd up`) has three entry forms:
 | form | entries | what ships |
 |---|---|---|
 | streamed | `flake-builder` | nix-built, composed onto stock `nixos/nix` with `docker build`, pushed; the entry is a curry over the digest ref — no layer bytes in git |
-| flake tree | `runner`, `cargo`, `bash`, `testenv` | a generated tree: the checked-in flake + a derived lock + whatever the build reads |
+| literal flake tree | `bash`, `testenv` | the checked-in `std/<name>` directory, copied whole — `{flake.nix, flake.lock, worker}`, nothing generated |
+| staged flake tree | `runner`, `cargo` | the checked-in files + the nix-built `/worker` binary staged on top (`std/<name>/stage-tree.sh`) |
 | curry | `bash-tool`, `llm-step`, `rgrep`, `rustc`, `hello`, `file-count`, `dirs-only`, `deep-deps` | `curry(runner, worker1=<binary>)` |
 
-The flake trees are **generated at publish** (`std/<name>/stage-tree.sh`)
-because a flake can only read its own tree, and resolution cannot strip a
-tree (only the flake knows which files its build reads). Each generator
-assembles exactly the build's inputs — and nothing else, so the tree's hash
-(= the image's cache key) never moves for irrelevant edits. (Part 2 below
-replaces generation with literal checked-in trees; this is how it works
-today.)
+A flake can only read its own tree, and resolution cannot strip a tree
+(only the flake knows which files its build reads) — so each std tree
+carries exactly the build's inputs and nothing else, and its hash (= the
+image's cache key) never moves for irrelevant edits. The literal trees ARE
+their `std/<name>` directories; the staged trees add only the one thing
+that cannot be checked in, a nix-built binary.
 
-- **`runner`**: flake + lock + the `worker-runner` interpreter binary.
-- **`bash` / `testenv`**: flake + lock + `images/bash-worker.sh` as
-  `./worker` (one source of truth with the test suite's image jobs).
-  testenv adds git/redis/the docker client and the `CAOS_WORKER_UID=0`
-  grant — per-image containment policy for nested-stack jobs.
-- **`cargo`**: flake + lock + the workspace's manifests, `Cargo.lock`,
-  `rust-toolchain.toml`, empty stubs at each crate's real target paths
-  (cargo and crane's `mkDummySrc` detect autodiscovered targets by file
-  presence), and the `worker-cargo` binary. No source — a source edit never
-  re-keys the toolchain bake; a worker-cargo/worker_common edit does, and
-  pays one cold rebake.
+- **`runner`**: flake + lock + the `worker-runner` interpreter binary
+  (staged).
+- **`bash` / `testenv`**: flake + lock + the script runner as `./worker` —
+  `std/bash/worker` is the source of truth, `std/testenv/worker` a
+  byte-identical checked-in copy, and the test suite's image jobs read the
+  `std/bash` copy. testenv adds git/redis/the docker client and the
+  `CAOS_WORKER_UID=0` grant — per-image containment policy for
+  nested-stack jobs.
+- **`cargo`**: flake + lock + checked-in copies of the workspace's
+  manifests, `Cargo.lock`, `rust-toolchain.toml`, empty stubs at each
+  crate's real target paths (cargo and crane's `mkDummySrc` detect
+  autodiscovered targets by file presence), and the staged `worker-cargo`
+  binary. No source — a source edit never re-keys the toolchain bake; a
+  worker-cargo/worker_common edit does, and pays one cold rebake.
 
-Every `flake.lock` is **derived from the main flake.lock** at publish
-(`std/lib/derive-lock.sh`), so a std flake's pins structurally cannot drift
-from the root's — which keeps `std/cargo`'s rustc the exact compiler that
-builds caos (the caos-in-caos suite depends on that). `std/cargo`'s bake
+Every `flake.lock` is **derived from the main flake.lock** — checked in,
+not generated: `std/refresh.sh` (re)writes each std lock from the root
+lock's nodes, and `tests/std-lint` runs the same script in `--check` mode
+(re-derive, byte-compare), so a std flake's pins cannot drift from the
+root's unnoticed — which keeps `std/cargo`'s rustc the exact compiler that
+builds caos (the caos-in-caos suite depends on that). The same
+refresh/check pair covers every checked-in redundancy: the testenv worker
+copy and `std/cargo`'s vendored workspace inputs. `std/cargo`'s bake
 machinery lives in `std/cargo/bake.nix`, imported by BOTH that flake and the
 root flake (for `cargoDepsImage`, the suite's deps-only base) — one
 definition, no drift.
@@ -138,34 +145,46 @@ caos), pushed, memoized on the tarball's store path. Exactly one image is
 referenced by digest; everything else may be a flake — so resolution never
 re-enters the flake branch for the builder, and the recursion is grounded.
 
-## Part 2: literal trees, worker-built binaries (direction, not built)
+## Part 2: literal trees, worker-built binaries (phase A shipped)
 
 The agreed next pass. The principle: **a simpler build and a stronger
 check** — the build generates nothing, and `run-tool test` verifies every
 redundancy the simplification introduces.
 
-**Every std flake tree becomes a literal checked-in directory**,
-resolvable straight from the repo by hash — no generation step, which is
-also what keeps bootstrap simple. Per tree:
+**Phase A (SHIPPED, 2026-07): literal checked-in std trees.** One script,
+`std/refresh.sh`, regenerates every checked-in redundancy from its source
+of truth; `tests/std-lint` runs the SAME script in `--check` mode
+(regenerate, byte-compare) inside the suite, so the check cannot drift
+from the generator. Drift becomes impossible to miss instead of impossible
+to create. Per tree:
 
-- Every `flake.lock` is **checked in**; `derive-lock.sh` inverts into a
-  check that each std lock's nodes match the root's (a refresh script
-  reruns on pin bumps). Drift becomes impossible to miss instead of
-  impossible to create.
-- **`bash` / `testenv`** check the worker script into the flake directory.
-  A flake reads only its own tree, so that's two copies (plus the suite's
-  image jobs as a third consumer) and an equality check.
+- Every `flake.lock` is **checked in**, derived from the root lock by the
+  refresh script (which replaced `std/lib/derive-lock.sh`); rerun it on
+  pin bumps.
+- **`bash` / `testenv`** carry the worker script in the flake directory —
+  `std/bash/worker` the source of truth, `std/testenv/worker` a verified
+  byte-identical copy (a flake reads only its own tree), the suite's image
+  jobs (`caos-tools/build.sh`) the third consumer, reading the `std/bash`
+  copy. Their `stage-tree.sh` generators are GONE: the two directories ARE
+  their published trees, copied whole by `build-builtins.sh`. `jq` joined
+  their userlands (the lock check needs it; generally useful).
+- **`cargo`** checks in copies of the workspace manifests, `Cargo.lock`,
+  `rust-toolchain.toml`, and the target stubs, refresh-generated and
+  lint-verified; its `stage-tree.sh` shrank to staging only the
+  `worker-cargo` binary onto the checked-in files.
+
+**Still open in this pass:**
+
 - **`runner`** builds its `/worker` from source in-tree: worker-runner +
   worker-common have zero external deps, so the flake vendors the two
   crates and builds them purely, no network. The tree re-keys on their
-  source — rare and correct.
-- **`cargo`** checks in copies of the workspace manifests, `Cargo.lock`,
-  `rust-toolchain.toml`, and the target stubs, with a
-  match-the-workspace check and a refresh script.
+  source — rare and correct. (Vendor-vs-move is undecided; until then its
+  `stage-tree.sh` stages the nix-built binary onto the checked-in
+  flake + lock.)
+- **`worker-cargo`'s binary origin** — same question, deferred with it.
 
-With that, `build-builtins.sh`, the `stage-tree.sh` generators, and
-`derive-lock.sh` all go; publish collapses to "hash the checked-in trees,
-build the curries."
+With those, the remaining `stage-tree.sh` generators go too; publish
+collapses to "hash the checked-in trees, build the curries."
 
 **`images/` dissolves into `std/*`** — every std entry gets its
 directory, the flake-builder included:
@@ -180,8 +199,8 @@ directory, the flake-builder included:
   per pin bump bites, the compose-onto-stock-base trick can return, with
   the pin riding in `std/flake-builder/`.)
 - `images/bash-worker.sh` → the checked-in `std/bash` / `std/testenv`
-  worker copies above; the suite's image jobs reference the `std/bash`
-  copy until they unify.
+  worker copies above (DONE, phase A); the suite's image jobs reference
+  the `std/bash` copy until they unify.
 - `images/debian-base.ref` dies with the suite's second pipeline (Open
   items below).
 

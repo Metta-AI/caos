@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/caos",
+    "crates/runnerd",
+    "crates/server",
+    "crates/worker-common",
+    "crates/worker-hello",
+    "crates/worker-file-count",
+    "crates/worker-dirs-only",
+    "crates/worker-deep-deps",
+    "crates/worker-rustc",
+    "crates/worker-runner",
+    "crates/worker-cargo",
+    "crates/worker-bash-tool",
+    "crates/worker-llm-step",
+    "crates/worker-rgrep",
+    "crates/llm-stub",
+]
+
+# Name for crane's workspace-level derivations (fmt/test) so it doesn't warn
+# about a missing package name at the workspace root.
+[workspace.metadata.crane]
+name = "caos-workspace"
+
+# A version at the workspace root so crane's workspace-level derivations
+# (fmt/test, the dev shell) don't fall back to a placeholder and warn. Members
+# set their own version; this is just the root manifest's.
+[workspace.package]
+version = "0.1.0"
+
+# Shared across every workspace member so all binaries get the same small,
+# static release build.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -6,9 +6,12 @@
 #   streamed  (flake-builder)            nix-built, composed onto its stock
 #                                        base and pushed to the registry; the
 #                                        entry is a curry over the digest ref
-#   flake     (runner, cargo,            generated flake trees (each
-#              bash, testenv)            std/<name>/stage-tree.sh) — complete
-#                                        worker images, /worker included; the
+#   flake     (runner, cargo,            flake trees — complete worker images,
+#              bash, testenv)            /worker included; bash/testenv ARE
+#                                        their checked-in std/<name> dirs,
+#                                        runner/cargo stage their nix-built
+#                                        /worker binary onto the checked-in
+#                                        files (std/<name>/stage-tree.sh); the
 #                                        flake-builder images them on first use
 #   curry     (bin_names)                curry(runner, worker1=<binary>) — the
 #                                        compiled workers ride the shared
@@ -26,11 +29,15 @@ PROJECT=$PWD
 names=("$@")
 [ ${#names[@]} -eq 0 ] && names=(runner cargo bash testenv flake-builder)
 
-# std entries that are FLAKE TREES (design/flake-images.md): published as the
-# generated tree itself (std/<name>/stage-tree.sh — the flake, a derived
-# lock, and whatever the image build reads, /worker's executable included).
-# The server's flake-builder images them on first use.
+# std entries that are FLAKE TREES (design/flake-images.md): published as a
+# plain git tree the server's flake-builder images on first use.
 is_flake_entry() { case "$1" in runner | cargo | bash | testenv) return 0 ;; *) return 1 ;; esac; }
+# Flake entries whose checked-in std/<name> directory IS the published tree
+# (part 2, literal trees): flake.nix + flake.lock + worker, copied whole —
+# nothing generated (tests/std-lint verifies the checked-in redundancies).
+# The rest (runner, cargo) still stage their nix-built /worker binary onto
+# the checked-in files via std/<name>/stage-tree.sh.
+is_literal_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac; }
 # std entries whose image is STREAMED to the registry instead of imported into
 # git (design/flake-images.md): the nix tarball's layers are composed onto the
 # stock base with `docker build` and pushed; the std entry is a tiny curry
@@ -163,19 +170,26 @@ for name in "${image_names[@]}"; do
   echo "$name: streamed -> curry ${hash_of[$name]}" >&2
 done
 
-# The flake-tree std entries (design/flake-images.md): each is a GENERATED
-# tree — the checked-in flake, a lock derived from the main flake.lock, and
-# whatever the image build reads (cargo's manifests, each worker image's
-# /worker executable) — published as a plain git tree. The server's
-# flake-builder images it on first use, memoized in the registry on the
-# tree's own hash, so re-publishing an unchanged tree costs nothing. Staged
-# inside CLIENT (like worker-common below) because only git-tracked paths can
-# be hashed here.
+# The flake-tree std entries (design/flake-images.md): bash/testenv are
+# LITERAL — the checked-in std/<name> directory is the published tree,
+# copied whole; runner/cargo stage their nix-built /worker binary onto the
+# checked-in files (std/<name>/stage-tree.sh). Either way the server's
+# flake-builder images the tree on first use, memoized in the registry on
+# the tree's own hash, so re-publishing an unchanged tree costs nothing.
+# Staged inside CLIENT (like worker-common below) because only git-tracked
+# paths can be hashed here.
 for name in "${names[@]}"; do
   is_flake_entry "$name" || continue
   rm -rf "${CLIENT:?}/$name"
-  # shellcheck disable=SC2086
-  "$PROJECT/std/$name/stage-tree.sh" "$PROJECT" "$CLIENT/$name" $bin_paths
+  if is_literal_entry "$name"; then
+    cp -R "$PROJECT/std/$name" "$CLIENT/$name"
+    # PROJECT may be a read-only store copy (caosd); writable so the next
+    # publish's rm -rf works.
+    chmod -R u+w "$CLIENT/$name"
+  else
+    # shellcheck disable=SC2086
+    "$PROJECT/std/$name/stage-tree.sh" "$PROJECT" "$CLIENT/$name" $bin_paths
+  fi
   git -C "$CLIENT" add "$name"
   hash_of[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
   echo "$name: flake tree ${hash_of[$name]}" >&2

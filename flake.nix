@@ -183,7 +183,7 @@
           chmod 4755 bin/caos
           mkdir -p tmp
           chmod 1777 tmp
-          # /usr/bin/env, for env-shebang worker scripts (images/bash-worker.sh
+          # /usr/bin/env, for env-shebang worker scripts (std/bash/worker
           # runs on these nix-rooted images AND on nixos/nix, which has env but
           # no /bin/bash — the env shebang is the portable meeting point).
           mkdir -p usr/bin
@@ -191,12 +191,12 @@
         '';
         # No worker images live here anymore, bar the flake-builder below.
         # Every other std entry is a flake tree (std/{runner,cargo,bash,
-        # testenv} — design/flake-images.md), each staging its own /worker
-        # (bash/testenv: images/bash-worker.sh; runner/cargo: their
-        # interpreter binaries), or a curry(runner, worker1=<static musl
-        # binary>) over one (builtinWorkerBins below). std/runner is the
-        # pooled bin-worker base; the old debian-delta `base` entry had no
-        # consumers and is gone.
+        # testenv} — design/flake-images.md), each defining its own /worker
+        # (bash/testenv: their checked-in ./worker script; runner/cargo:
+        # their staged interpreter binaries), or a curry(runner,
+        # worker1=<static musl binary>) over one (builtinWorkerBins below).
+        # std/runner is the pooled bin-worker base; the old debian-delta
+        # `base` entry had no consumers and is gone.
 
         # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
         # — the one image the flake path can't build (it IS the flake path),
@@ -261,9 +261,9 @@
         # the published std/cargo flake (finding B, design/flake-images.md)
         # — the flake-builder images that tree into the base std/cargo curries
         # onto, so nothing here rides the std publish. The published flake's
-        # lock is derived from THIS flake's lock at publish (stage-tree.sh), so
-        # both sides evaluate the same expression against the same pins and
-        # cannot drift.
+        # lock is derived from THIS flake's lock (std/refresh.sh writes the
+        # checked-in copy; tests/std-lint verifies it), so both sides evaluate
+        # the same expression against the same pins and cannot drift.
         cargoBake = import ./std/cargo/bake.nix {
           pkgs = linuxPkgs;
           inherit crane src;
@@ -599,9 +599,9 @@
         # persistent state — server repo, publish client repo, redis, registry.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          # jq: build-builtins.sh derives the std flakes' flake.locks from this
-          # flake's lock at publish (std/cargo/stage-tree.sh). tar: it
-          # unpacks the flake-builder tarball to stream it to the registry.
+          # jq: build-builtins.sh parses the flake-builder tarball's image
+          # manifest when streaming it to the registry. tar: it unpacks
+          # that tarball for the same streaming step.
           # docker rides in from the host PATH (caosd already requires it).
           # util-linux: setsid, so a hung compose up dies as a whole group.
           runtimeInputs = [

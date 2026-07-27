@@ -99,6 +99,14 @@ for d in /cas/args/workspace/tests/*/; do
       # these, exactly like the compile itself.
       ln -s /cas/args/build_ws "/tmp/sel/$t/workspace"
       ;;
+    std-lint)
+      # The literal-tree lints check the checked-in std copies against
+      # their sources of truth ACROSS the tree (std/, the root flake.lock,
+      # the workspace manifests), so this test gets the whole workspace —
+      # and honestly re-keys on any edit to it. It's a fast lint (no
+      # compiles), so that trade is fine.
+      ln -s /cas/args/workspace "/tmp/sel/$t/workspace"
+      ;;
     chat-online)
       # The real-API key, when the suite was given one: same key, same cache
       # key — only this test re-keys when it rotates. Without one the test's

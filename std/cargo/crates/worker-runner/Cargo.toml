@@ -1,0 +1,14 @@
+[package]
+name = "worker-runner"
+version = "0.1.0"
+edition = "2021"
+
+# A generic runner: it receives a compiled worker binary as the `bin` arg and
+# execs it. Glue over the `caos` CLI lives in worker-common; this crate is just
+# the trampoline, so it builds to a tiny static binary.
+[dependencies]
+worker-common = { path = "../worker-common" }
+
+[[bin]]
+name = "worker-runner"
+path = "src/main.rs"

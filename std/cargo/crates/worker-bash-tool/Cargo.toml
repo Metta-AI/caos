@@ -1,0 +1,16 @@
+[package]
+name = "worker-bash-tool"
+version = "0.1.0"
+edition = "2021"
+
+# The agent harness's bounded bash tool (see design/agent-harness.md): runs a
+# shell command over a workspace tree with only the *declared* paths
+# materialized. Only worker-common, so it builds to a small static binary that
+# runs as curry(runner, bin) in the shared runner pool (whose debian base
+# provides the /bin/sh the command needs).
+[dependencies]
+worker-common = { path = "../worker-common" }
+
+[[bin]]
+name = "worker-bash-tool"
+path = "src/main.rs"

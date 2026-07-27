@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# (env shebang: the flake bases this runs on (bash-base, testenv-base) have
+# std/bash/worker is the SOURCE OF TRUTH for this script; std/testenv/worker
+# is a byte-identical checked-in copy (a flake reads only its own tree —
+# std/refresh.sh syncs it, tests/std-lint verifies), and the suite's image
+# jobs (caos-tools/build.sh) read the std/bash copy.
+# (env shebang: the flake images this defines (std/bash, std/testenv) have
 # bash at /bin/bash, but the nix-builder images have only the nix profile's —
 # /usr/bin/env, which the flake-builder's caos delta guarantees, is the
 # portable meeting point.)

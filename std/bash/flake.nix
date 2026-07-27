@@ -1,16 +1,19 @@
 {
   # std/bash (design/flake-images.md): the script worker — a complete
-  # interpreter worker image. /worker is the script runner
-  # (images/bash-worker.sh, copied into this tree at publish): it fetches the
-  # `worker1` arg — the script, the next executable in the chain — and runs
-  # it with bash. The contents are the shell and file tools a worker script
-  # leans on. Curry a script on (`--worker1:@=…`) and run it like any image.
+  # interpreter worker image. /worker is the script runner (./worker,
+  # checked in right here — the source of truth; std/testenv carries a
+  # byte-identical copy): it fetches the `worker1` arg — the script, the
+  # next executable in the chain — and runs it with bash. The contents are
+  # the shell and file tools a worker script leans on. Curry a script on
+  # (`--worker1:@=…`) and run it like any image.
   #
   # The contract (images/flake-builder.sh): a flake defines everything about
   # the image except the caos additions. /worker included.
   #
-  # The published tree is GENERATED (stage-tree.sh): this file, a flake.lock
-  # derived from the main flake.lock, and the script runner.
+  # This directory IS the published tree (literal trees, part 2): flake.nix,
+  # flake.lock (derived from the main flake.lock by std/refresh.sh), worker
+  # — build-builtins.sh copies it whole, and tests/std-lint verifies the
+  # checked-in redundancies.
   description = "caos std/bash — the script worker: shell + file tools, /worker runs `worker1`";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -39,6 +42,9 @@
             pkgs.diffutils
             pkgs.gnugrep
             pkgs.findutils
+            # JSON plumbing for worker scripts — std/refresh.sh's lock
+            # derivation (the std-lint suite check) among them.
+            pkgs.jq
           ];
           config = {
             Env = [ "PATH=/bin" ];

@@ -1,0 +1,28 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+# Minimal synchronous HTTP server: no async runtime, no TLS, pure Rust — same
+# as object-server.
+tiny_http = "0.12"
+# Serve and read the git object database in-process (storage is merged in here).
+# `parallel` makes gix's shared pointers `Arc`, so `ThreadSafeRepository` is
+# genuinely `Send + Sync` — needed because storage is served on the per-request
+# worker threads. Pure-Rust, static-musl, like the other crates.
+gix = { version = "0.84", default-features = false, features = ["sha1", "parallel"] }
+# Minimal blocking HTTP client (plain HTTP, no TLS) for fetching git objects from
+# the object server and pushing blobs/manifests to the registry. Same config as
+# the client crate.
+minreq = { version = "2", default-features = false }
+# SHA-256 for docker/OCI content digests (layer tars, config, manifest).
+sha2 = "0.10"
+# Read/patch the image config JSON (recompute rootfs.diff_ids) and build the OCI
+# manifest.
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }

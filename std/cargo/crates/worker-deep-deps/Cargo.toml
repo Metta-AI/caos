@@ -1,0 +1,13 @@
+[package]
+name = "worker-deep-deps"
+version = "0.1.0"
+edition = "2021"
+
+# The CAS glue lives in worker-common; this crate adds only the deep-deps logic,
+# so it still builds to a tiny static binary needing no shell or coreutils.
+[dependencies]
+worker-common = { path = "../worker-common" }
+
+[[bin]]
+name = "worker-deep-deps"
+path = "src/main.rs"
