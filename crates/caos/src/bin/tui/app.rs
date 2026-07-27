@@ -710,6 +710,7 @@ pub(crate) struct App {
     confirm_action: Option<ConfirmAction>,
     selecting_transcript: bool,
     copied_chars: Option<usize>,
+    animation_frame: usize,
     view: View,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
@@ -812,6 +813,7 @@ impl App {
             confirm_action: None,
             selecting_transcript: false,
             copied_chars: None,
+            animation_frame: 0,
             view: View::Chat,
             tx,
             rx,
@@ -846,6 +848,14 @@ impl App {
         self.copied_chars = Some(text.chars().count());
     }
 
+    pub(crate) fn has_visible_animation(&self) -> bool {
+        self.selected().is_busy()
+    }
+
+    pub(crate) fn advance_animation(&mut self) {
+        self.animation_frame = (self.animation_frame + 1) % ui::ACTIVITY_INDICATORS.len();
+    }
+
     pub(crate) fn view(&self) -> View {
         self.view
     }
@@ -859,6 +869,12 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some(index) = ui::conversation_at(self, area, mouse.column, mouse.row) {
+                self.select(index);
+                return MouseAction::Redraw;
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp
                 if self.view == View::Activity
@@ -1419,7 +1435,11 @@ impl App {
 
     fn select_relative(&mut self, amount: isize) {
         let len = self.conversations.len() as isize;
-        self.selected = (self.selected as isize + amount).rem_euclid(len) as usize;
+        self.select((self.selected as isize + amount).rem_euclid(len) as usize);
+    }
+
+    fn select(&mut self, index: usize) {
+        self.selected = index;
         self.confirm_action = None;
         if self.view == View::Tools {
             self.load_selected_tool_set();
@@ -1703,6 +1723,7 @@ mod tests {
                 confirm_action: None,
                 selecting_transcript: false,
                 copied_chars: None,
+                animation_frame: 0,
                 view: View::Chat,
                 tx: tx.clone(),
                 rx,
@@ -2060,6 +2081,31 @@ mod tests {
     }
 
     #[test]
+    fn clicking_conversation_rows_selects_visible_and_scrolled_items() {
+        let conversations = (0..20)
+            .map(|index| state(&format!("talk-{index}")))
+            .collect();
+        let (mut app, _) = app_with(conversations);
+        let area = Rect::new(0, 0, 100, 30);
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(app.handle_mouse(click(5), area), MouseAction::Redraw);
+        assert_eq!(app.selected, 1);
+
+        app.selected = 19;
+        assert_eq!(app.handle_mouse(click(2), area), MouseAction::Redraw);
+        assert_eq!(app.selected, 7);
+
+        assert_eq!(app.handle_mouse(click(1), area), MouseAction::Ignored);
+        assert_eq!(app.selected, 7);
+    }
+
+    #[test]
     fn cli_options_match_the_line_client_surface() {
         // --user rides along so the test never depends on ambient $USER
         // (the cargo worker's environment has none).
@@ -2082,6 +2128,8 @@ mod tests {
     #[test]
     fn from_commit_rejects_conflicting_conversation_options() {
         assert!(Args::parse(&[
+            "--user".into(),
+            "tester".into(),
             "--from".into(),
             "5ec3751".into(),
             "--base".into(),
@@ -2089,6 +2137,8 @@ mod tests {
         ])
         .is_err());
         assert!(Args::parse(&[
+            "--user".into(),
+            "tester".into(),
             "--from".into(),
             "5ec3751".into(),
             "-c".into(),
@@ -2259,6 +2309,37 @@ mod tests {
             .collect();
         assert!(rendered.contains("Thinking…"));
         assert!(!rendered.contains("Chugging…"));
+    }
+
+    #[test]
+    fn live_activity_indicator_pulses_while_busy() {
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("· Chugging…"));
+
+        app.advance_animation();
+        app.advance_animation();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("✽ Chugging…"));
     }
 
     #[test]
@@ -2524,7 +2605,8 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        app.repo_dir = throwaway_repo("ctrl-w");
+        let dir = throwaway_repo("ctrl-w");
+        app.repo_dir = dir.clone();
         app.selected = 1;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -2545,6 +2627,7 @@ mod tests {
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
         assert!(app.selected().status.contains("new virtual conversation"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
