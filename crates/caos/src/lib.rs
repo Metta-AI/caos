@@ -71,8 +71,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // We own `.caos-dev` (it's gitignored, per-checkout scratch); create it so a
     // fresh clone — or a tree whose `.caos-dev` was wiped — checks out here rather
     // than failing when the atomic-replace temp file can't find its parent dir.
-    std::fs::create_dir_all(".caos-dev")
-        .map_err(|e| format!("creating .caos-dev: {e}"))?;
+    std::fs::create_dir_all(".caos-dev").map_err(|e| format!("creating .caos-dev: {e}"))?;
     if let Err(e) = std::fs::remove_dir_all(&out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("clearing {out}: {e}"));
@@ -2396,7 +2395,7 @@ fn std_tree() -> Result<String, String> {
 /// bindings are folded in and `base` stays a plain (docker/git) image, so the
 /// result is canonical (`curry (curry img a) b` == `curry img a b`) — and
 /// STRICT: rebinding an already-bound name is refused, not overridden (see
-/// [`curry_object`]).
+/// `curry_object`).
 pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let image = resolve_run_image(t, &cas, image)?;

@@ -279,6 +279,12 @@ pub fn job(cmd: &str) -> Result<(), String> {
             name.clone(),
             "--all-targets".into(),
         ]],
+        "doc" => vec![vec![
+            "doc".into(),
+            "-p".into(),
+            name.clone(),
+            "--no-deps".into(),
+        ]],
         other => return Err(format!("unknown job cmd {other:?}")),
     };
     // Cross/profile flags apply to every run — dep artifacts included, so a
