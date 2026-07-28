@@ -20,7 +20,7 @@
   pkgs,
   crane,
   src,
-  toolchainFile,
+  toolchain,
 }:
 let
   muslTarget =
@@ -29,14 +29,13 @@ let
     else
       "x86_64-unknown-linux-musl";
 
-  # `minimal` (rustc+cargo+host std — no clippy/rustfmt/rust-src in the image)
-  # at the channel the workspace's rust-toolchain.toml names, resolved by the
-  # caller's rust-overlay — so the version always matches the toolchain that
-  # builds caos (which the caos-in-caos suite depends on). The musl std rides
-  # along so produced binaries can be static.
-  channel = (builtins.fromTOML (builtins.readFile toolchainFile)).toolchain.channel;
-  byChannel = if channel == "stable" then pkgs.rust-bin.stable.latest else pkgs.rust-bin.stable.${channel};
-  toolchain = byChannel.minimal.override { targets = [ muslTarget ]; };
+  # The toolchain comes from the CALLER, and that is the whole point: the root
+  # flake passes the same one it builds the workspace with, so this bake and
+  # the root's cargoArtifacts are ONE derivation instead of two compiles of
+  # the same ~176 crates. (They used to differ only by minimal-vs-default,
+  # a --workspace flag, pname, and the postInstall below — none of which
+  # changes what is compiled, but cargo fingerprints on the exact compiler
+  # build, so the work happened twice.)
   craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
 
   # The vendored crates.io sources for Cargo.lock, plus crane's
@@ -69,7 +68,11 @@ let
   deps = craneLib.buildDepsOnly (
     {
       inherit src;
-      pname = "caos-cargo-musl";
+      # Must match the root flake's commonArgs exactly — pname is part of the
+      # derivation name, so a different one is a different build of the same
+      # crates. This whole attrset is kept field-for-field identical to
+      # commonArgs for that reason.
+      pname = "caos-workspace";
       version = "0.1.0";
       strictDeps = true;
       cargoVendorDir = vendor;

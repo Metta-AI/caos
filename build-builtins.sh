@@ -33,14 +33,17 @@ names=("$@")
 # nothing generated (std/refresh.sh maintains the checked-in redundancies,
 # tests/std-lint verifies them). The server's flake-builder images each
 # tree on first use.
-is_flake_entry() { case "$1" in cargo | bash | testenv) return 0 ;; *) return 1 ;; esac; }
+is_flake_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac; }
 # std entries whose image is STREAMED to the registry instead of imported into
 # git (design/flake-images.md): host-nix-built core, composed with `docker
 # build` and pushed; the std entry is a tiny curry node over the digest ref,
 # so no layer bytes ever enter git. The flake-builder (the bootstrap image)
 # and the runner (the pooled interpreter) — both self-contained, FROM
-# scratch.
-is_streamed_entry() { case "$1" in flake-builder | runner) return 0 ;; *) return 1 ;; esac; }
+# scratch — plus cargo, whose image the root flake builds from the same
+# `src` and toolchain as the binaries (so its deps are cargoArtifacts, not a
+# second compile of them); a streamed image needs no self-contained tree,
+# which is what retired std/cargo's vendored manifests and crate stubs.
+is_streamed_entry() { case "$1" in flake-builder | runner | cargo) return 0 ;; *) return 1 ;; esac; }
 image_names=()
 for name in "${names[@]}"; do
   is_flake_entry "$name" || image_names+=("$name")

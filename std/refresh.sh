@@ -16,11 +16,14 @@
 #   std/testenv/worker
 #       a copy of std/bash/worker (the source of truth): a flake reads only
 #       its own tree, so each flake carries the script.
-#   std/cargo/{Cargo.toml,Cargo.lock,rust-toolchain.toml,crates/**}
-#       the workspace's manifests, lockfile, toolchain file, and EMPTY stubs
-#       at each crate's real target paths (cargo and crane's mkDummySrc
-#       detect autodiscovered targets by file presence) — no source, so a
-#       source edit never re-keys std/cargo's toolchain bake.
+#
+# std/cargo used to vendor the workspace's manifests, lockfile, toolchain
+# file and per-crate target stubs here too — because a PUBLISHED flake tree
+# is resolved from its own tree alone, so it had to be self-contained. Its
+# image is now host-built and streamed from the root flake (which passes its
+# own `src` and toolchain, so the bake IS cargoArtifacts rather than a second
+# compile of the same crates), and a streamed image needs no such tree. Only
+# the derived lock remains.
 #
 # Usage: std/refresh.sh          rewrite the checked-in copies
 #        std/refresh.sh --check  verify them (a diff per mismatch, exit 1)
@@ -71,53 +74,18 @@ derive_lock "$tmp/std/flake-builder/flake.lock" nixpkgs
 
 cp std/bash/worker "$tmp/std/testenv/worker"
 
-cp Cargo.toml Cargo.lock rust-toolchain.toml "$tmp/std/cargo/"
-# Every crate is a workspace member (Cargo.toml), so the glob is the member
-# list. Two crates ride with REAL source — worker-cargo (std/cargo's
-# /worker, compiled in-flake) and worker-common (its path dep) — so their
-# edits re-key the tree and pay the one cold rebake. Everything else is a
-# manifest plus empty stubs at each crate's real target paths: cargo only
-# sees an autodiscovered target if its file EXISTS, and crane's mkDummySrc
-# detects targets the same way, then copies its own dummy content over them
-# — so presence is all that matters, never the source itself.
-for m in crates/*/Cargo.toml; do
-  c=$(dirname "$m")
-  d="$tmp/std/cargo/crates/$(basename "$c")"
-  mkdir -p "$d"
-  cp "$m" "$d/"
-  case "$(basename "$c")" in
-  worker-cargo | worker-common)
-    cp -R "$c/src" "$d/src"
-    ;;
-  *)
-    for f in "$c"/src/main.rs "$c"/src/lib.rs "$c"/src/bin/*.rs; do
-      [ -e "$f" ] || continue
-      rel=${f#"$c"/}
-      mkdir -p "$d/$(dirname "$rel")"
-      : > "$d/$rel"
-    done
-    ;;
-  esac
-done
-
-# The maintained set: the plain files, plus std/cargo/crates compared/replaced
-# as a whole DIRECTORY so a crate deleted from the workspace fails the check
-# as a stale vendored copy instead of lingering.
+# The maintained set.
 files="std/bash/flake.lock
 std/testenv/flake.lock
 std/cargo/flake.lock
 std/flake-builder/flake.lock
-std/testenv/worker
-std/cargo/Cargo.toml
-std/cargo/Cargo.lock
-std/cargo/rust-toolchain.toml"
+std/testenv/worker"
 
 if [ "$check" = 1 ]; then
   fail=0
   while IFS= read -r f; do
     diff -u "$f" "$tmp/$f" || fail=1
   done <<< "$files"
-  diff -ru std/cargo/crates "$tmp/std/cargo/crates" || fail=1
   if [ "$fail" != 0 ]; then
     echo "std/refresh.sh --check: checked-in std copies are stale (diffs above); run std/refresh.sh" >&2
     exit 1
@@ -127,7 +95,5 @@ else
   while IFS= read -r f; do
     cp "$tmp/$f" "$f"
   done <<< "$files"
-  rm -rf std/cargo/crates
-  cp -R "$tmp/std/cargo/crates" std/cargo/crates
   echo "std/refresh.sh: checked-in std copies rewritten" >&2
 fi

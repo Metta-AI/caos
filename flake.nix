@@ -38,7 +38,35 @@
 
         # Toolchain is pinned via ./rust-toolchain.toml + the flake.lock'd
         # rust-overlay revision, so every build uses the same compiler.
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        #
+        # `minimal` plus exactly the two extensions that do work: clippy and
+        # rustfmt, for the checks below and for any caos-tool that runs them
+        # in-worker. NOT the `default` profile — measured, its extras over
+        # minimal are rust-std-aarch64-unknown-linux-musl (135 MiB, and this
+        # flake deliberately never arch-crosses) and rust-src (51 MiB,
+        # IDE-only — rust-toolchain.toml says as much), against 31 MiB for
+        # clippy+rustfmt. The dev shell adds rust-src back, so nothing is lost
+        # where it is wanted. Binaries are identical either way: rustc and the
+        # musl std are the SAME component derivations in every profile, and the
+        # aggregate is a link farm that cannot influence codegen.
+        #
+        # Parameterised on the package set because the cargo worker image is
+        # Linux (linuxPkgs) while the host build is the host's. On Linux those
+        # are one derivation, which is what collapses the bake and
+        # cargoArtifacts into a single compile.
+        rustChannel = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+        mkRustToolchain =
+          p:
+          (if rustChannel == "stable" then p.rust-bin.stable.latest else p.rust-bin.stable.${rustChannel})
+          .minimal.override
+            {
+              extensions = [
+                "clippy"
+                "rustfmt"
+              ];
+              targets = [ muslTarget ];
+            };
+        rustToolchain = mkRustToolchain pkgs;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         src = craneLib.cleanCargoSource ./.;
@@ -69,6 +97,24 @@
           "CARGO_TARGET_${muslEnvTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes";
         };
 
+        # A musl C cross-compiler: rustc links musl self-contained, but
+        # C-carrying deps compile via cc-rs, which needs a real musl cc. It
+        # must be set identically here and in the bake below — it is part of
+        # the fingerprint, so a mismatch is the difference between one dep
+        # build and two. (Same expression as std/cargo/bake.nix, evaluated
+        # against each side's own package set: on Linux they are one
+        # derivation, on macOS the image's is built Linux-hosted by the remote
+        # builder, which is what BUILDING_ON_MACOS.md sets up.)
+        muslCrossCC =
+          if pkgs.stdenv.hostPlatform.isAarch64 then
+            pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+          else
+            pkgs.pkgsCross.musl64.stdenv.cc;
+        muslCCEnv = {
+          "CC_${builtins.replaceStrings [ "-" ] [ "_" ] muslTarget}" =
+            "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
+        };
+
         commonArgs = {
           inherit src;
           strictDeps = true;
@@ -77,6 +123,25 @@
           # same way every time.
           pname = "caos-workspace";
           version = "0.1.0";
+
+          # These three exist to make cargoArtifacts and the cargo worker's
+          # bake (std/cargo/bake.nix, called below with this same `src` and
+          # toolchain) the SAME derivation. They used to differ only by these
+          # and the toolchain profile — never by what was compiled — so the
+          # same ~176 dependencies were built twice: once here for the
+          # binaries, once inside caos for the worker image.
+          cargoExtraArgs = "--locked --workspace";
+
+          # The two absolute paths cargo fingerprints against. The worker must
+          # materialize the workspace at exactly these locations: build-script
+          # executables and their OUT_DIRs are keyed on the target dir too.
+          postInstall = ''
+            wsroot=$(pwd -P)
+            echo -n "$wsroot" > $out/ws-root
+            targetdir="''${CARGO_TARGET_DIR:-target}"
+            case "$targetdir" in /*) ;; *) targetdir="$wsroot/$targetdir" ;; esac
+            echo -n "$targetdir" > $out/target-dir
+          '';
 
           CARGO_BUILD_TARGET = muslTarget;
 
@@ -99,7 +164,8 @@
           # buildInputs = [ ];
           # nativeBuildInputs = [ ];
         }
-        // crossLinkerEnv;
+        // crossLinkerEnv
+        // muslCCEnv;
 
         # Build the compute/runtime workspace dependencies once and cache them
         # separately from the crates.
@@ -274,17 +340,44 @@
         };
 
         # The cargo toolchain + workspace-deps bake (design/cargo-workers.md,
-        # phases 0–1): ONE definition in std/cargo/bake.nix, shared with
-        # the published std/cargo flake (finding B, design/flake-images.md)
-        # — the flake-builder images that tree into the base std/cargo curries
-        # onto, so nothing here rides the std publish. The published flake's
-        # lock is derived from THIS flake's lock (std/refresh.sh writes the
-        # checked-in copy; tests/std-lint verifies it), so both sides evaluate
-        # the same expression against the same pins and cannot drift.
+        # phases 0–1): ONE definition in std/cargo/bake.nix, called with THIS
+        # flake's `src` and toolchain. That is what makes `cargoBake.deps` and
+        # `cargoArtifacts` the same derivation instead of two compiles of the
+        # same ~176 crates — the bake used to resolve its own `minimal`
+        # toolchain, and cargo fingerprints on the exact compiler build.
         cargoBake = import ./std/cargo/bake.nix {
           pkgs = linuxPkgs;
           inherit crane src;
-          toolchainFile = ./rust-toolchain.toml;
+          toolchain = mkRustToolchain linuxPkgs;
+        };
+
+        # std/cargo as HOST-BUILT streamed core, like std/flake-builder and
+        # std/runner: we call the subflake's outputs directly — the standard
+        # subflake call, no path-input lock churn — passing OUR nixpkgs,
+        # rust-overlay and crane, plus the workspace source, the shared
+        # toolchain, and the already-compiled worker-cargo. Nothing resolves
+        # std/cargo as a flake TREE any more, which is what let its vendored
+        # copies of the manifests, lockfile and crate stubs go: a published
+        # tree must be self-contained, a streamed image need not be.
+        cargoDef =
+          ((import ./std/cargo/flake.nix).outputs {
+            self = null;
+            inherit nixpkgs rust-overlay crane;
+          }).lib.${linuxSystem}.imageFor
+            {
+              inherit src;
+              toolchain = mkRustToolchain linuxPkgs;
+              workerCargo = worker-cargo;
+            };
+        workerCargoImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-worker-cargo";
+          tag = "latest";
+          contents = cargoDef.contents ++ [ workerBaseRoot ];
+          config = cargoDef.config;
+          # Streamed images bake the caos additions in — they never pass
+          # through the flake path's stack stage, which is where a
+          # flake-resolved image would have got them.
+          fakeRootCommands = cargoDef.fakeRootCommands + installWorkerFiles;
         };
 
         # The DEPS-ONLY cargo base (phase D2): the bake + env, WITHOUT caos or
@@ -573,6 +666,7 @@
           # Streamed to the registry by build-builtins.sh, never git-imported.
           workerFlakeBuilderImage
           workerRunnerImage
+          workerCargoImage
         ];
 
         # The worker binaries build-builtins.sh needs at publish — curried
@@ -825,6 +919,7 @@
           skopeo = linuxPkgs.skopeo;
           caos-worker-flake-builder-docker = workerFlakeBuilderImage;
           caos-worker-runner-docker = workerRunnerImage;
+          caos-worker-cargo-docker = workerCargoImage;
         };
 
         apps = {
@@ -880,6 +975,10 @@
           packages = [
             pkgs.cargo-watch
             pkgs.rust-analyzer
+            # rust-src is IDE-only (stdlib source for navigation), so it rides
+            # here rather than in the build toolchain — where it would land in
+            # every worker image for 51 MiB of nothing.
+            pkgs.rust-bin.stable.latest.rust-src
             # NOTE: `caosd` is deliberately NOT on the dev-shell PATH. It used to
             # be a launcher that ran `nix run .#caosd` against the live tree, so
             # every `caosd up` silently rebuilt the image closure from whatever
