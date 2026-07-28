@@ -69,7 +69,32 @@
         rustToolchain = mkRustToolchain pkgs;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        # The cargo source, WITHOUT ./tests. cleanCargoSource sweeps in every
+        # Cargo.toml in the tree, and crane's mkDummySrc keeps them, so the
+        # suite's cargo fixtures — tests/cargo-check/{broken,mini} and
+        # tests/cargo-crates/ws — landed in the DEPENDENCY cache key. They
+        # contribute nothing to it: ws declares its own [workspace], the other
+        # two have no dependencies at all, and none is a member here. Yet
+        # editing one rebuilt all ~176 deps.
+        #
+        # They are runtime DATA, not source: the suite hands those directories
+        # to the cargo worker as trees to check, delivered over caos by
+        # `--in:@=.` (cli_run_tool), never compiled by this build. Nothing
+        # under crates/ reaches into them — no crates/*/tests, no include_*,
+        # no path reference — so dropping them costs the compile nothing and
+        # makes this key exactly (manifests, lockfile, toolchain).
+        src = craneLib.cleanCargoSource (
+          pkgs.lib.cleanSourceWith {
+            src = ./.;
+            name = "source";
+            filter =
+              path: _type:
+              let
+                rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+              in
+              rel != "tests" && !(pkgs.lib.hasPrefix "tests/" rel);
+          }
+        );
 
         # Build for musl so the binary is fully static (crt-static is on by
         # default for musl targets) — its runtime closure is just itself.
@@ -961,12 +986,15 @@
           );
 
           fmt = craneLib.cargoFmt { inherit src; };
-        }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          # cargoTest builds *and runs* the test binaries, which are musl/Linux —
-          # they can't execute on a macOS host, so this check is Linux-only.
-          # On macOS, run tests in the dev shell with `cargo test` (native target).
-          test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+          # No `test` check here: the unit tests are run through
+          # `caos-cli run-tool test` (tests/unit), inside the cargo worker,
+          # and that is the only place they can pass. Several of them spawn
+          # git — git_transport_tests, chat::tests — and the worker's PATH
+          # carries it (bake.env includes gitMinimal, for exactly this
+          # reason), whereas a nix builder gets whatever commonArgs declares,
+          # which is nothing. A cargoTest check here was silently red rather
+          # than telling anyone; one runner for the tests, and it is the one
+          # with the environment they need.
         };
 
         devShells.default = craneLib.devShell {

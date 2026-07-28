@@ -70,8 +70,14 @@ Enter a shell with the pinned `rustc`, `cargo`, `clippy`, `rustfmt`, plus
 nix develop
 ```
 
-Inside it, use Cargo as normal (`cargo build`, `cargo run`, `cargo test`). Run
-lint/format/test the way CI does with `nix flake check`.
+Inside it, use Cargo as normal (`cargo build`, `cargo run`, `cargo test`).
+`nix flake check` runs clippy, rustfmt and the doc build.
+
+**Tests run through caos, not through nix**: `caos-cli run-tool test` (see
+[local testing](#local-testing)) runs the unit tests and every integration
+suite. That is the only place the unit tests can pass — several spawn `git`,
+which the cargo worker's PATH carries and a nix builder's does not — so it is
+the signal to trust before committing.
 
 > Nix flakes only see files **tracked by git** (uncommitted edits to tracked
 > files are included, but new files are not). After adding a new source file,
