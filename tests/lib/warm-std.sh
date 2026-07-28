@@ -32,6 +32,6 @@ CAOS_REGISTRY_HTTP=caos-registry:5000 \
 
 mkdir -p /tmp/out
 cp /tmp/publish.log /tmp/out/publish.log
-grep -E "^(runner|flake-builder|cargo|bash|testenv|rustc):" /tmp/publish.log \
+grep -E "^(runner|flake-builder|cargo|bash|rustc):" /tmp/publish.log \
   > /tmp/out/report || true
 cat /tmp/out/report >&2

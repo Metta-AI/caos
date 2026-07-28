@@ -3,14 +3,13 @@
 # `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
 #
 # Entries come in three forms (see the is_*_entry predicates below):
-#   streamed  (flake-builder, runner)    host-nix-built core, composed with
-#                                        `docker build` and pushed to the
+#   streamed  (flake-builder, runner,    host-nix-built core, composed with
+#              cargo)                    `docker build` and pushed to the
 #                                        registry; the entry is a curry over
 #                                        the digest ref
-#   flake     (cargo, bash, testenv)     literal checked-in std/<name> dirs —
+#   flake     (bash)                     literal checked-in std/<name> dirs —
 #                                        complete worker images, /worker
-#                                        included (cargo compiles its own
-#                                        in-flake); the flake-builder images
+#                                        included; the flake-builder images
 #                                        each tree on first use
 #   curry     (bin_names)                curry(runner, worker1=<binary>) — the
 #                                        compiled workers ride the shared
@@ -26,14 +25,14 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(runner cargo bash testenv flake-builder)
+[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder)
 
 # std entries that are FLAKE TREES (design/flake-images.md, part 2): the
 # checked-in std/<name> directory IS the published tree, copied whole —
 # nothing generated (std/refresh.sh maintains the checked-in redundancies,
 # tests/std-lint verifies them). The server's flake-builder images each
 # tree on first use.
-is_flake_entry() { case "$1" in bash | testenv) return 0 ;; *) return 1 ;; esac; }
+is_flake_entry() { case "$1" in bash) return 0 ;; *) return 1 ;; esac; }
 # std entries whose image is STREAMED to the registry instead of imported into
 # git (design/flake-images.md): host-nix-built core, composed with `docker
 # build` and pushed; the std entry is a tiny curry node over the digest ref,
@@ -238,12 +237,11 @@ for name in "${image_names[@]}"; do
   echo "$name: streamed -> curry ${hash_of[$name]}" >&2
 done
 
-# The flake-tree std entries (design/flake-images.md): bash/testenv are
-# LITERAL — the checked-in std/<name> directory is the published tree,
-# copied whole; runner/cargo stage their nix-built /worker binary onto the
-# checked-in files (std/<name>/stage-tree.sh). Either way the server's
-# flake-builder images the tree on first use, memoized in the registry on
-# the tree's own hash, so re-publishing an unchanged tree costs nothing.
+# The flake-tree std entries (design/flake-images.md): bash is LITERAL —
+# the checked-in std/<name> directory is the published tree, copied whole,
+# nothing generated. The server's flake-builder images the tree on first
+# use, memoized in the registry on the tree's own hash, so re-publishing an
+# unchanged tree costs nothing.
 # Staged inside CLIENT (like worker-common below) because only git-tracked
 # paths can be hashed here.
 for name in "${names[@]}"; do

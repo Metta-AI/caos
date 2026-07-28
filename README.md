@@ -110,9 +110,9 @@ nix run .#load-caos-runnerd
 ```
 
 Only ONE worker image remains nix-built here: the `flake-builder`. Every std
-worker is a flake-built worker image (`std/runner`, `std/cargo`, `std/bash`,
-`std/testenv` — complete flakes in `std/`, imaged on demand by the
-flake-builder) or a `curry(std/runner, worker1=<binary>)` over the runner —
+worker is a flake-built worker image (`std/runner`, `std/cargo`, `std/bash` —
+complete flakes in `std/`, imaged on demand by the flake-builder) or a
+`curry(std/runner, worker1=<binary>)` over the runner —
 see `design/flake-images.md`. The `caos-server` image is not minimal: it bundles
 the `docker` client, `git`, and `tar`, and expects the host's docker socket.
 
@@ -527,7 +527,7 @@ the cache key, never hidden inside a memoized computation.
 
 ```bash
 ./build-builtins.sh                 # publish all built-ins to refs/caos/std
-./build-builtins.sh bash testenv    # publish a subset
+./build-builtins.sh bash cargo      # publish a subset
 ```
 
 ## Local testing
@@ -560,7 +560,7 @@ The test tool runs the suite worker (`tests/lib/suite.sh`, carried by this
 tree): build the worker images from the published binaries via
 `caos-tools/build.sh`, fan out one job per `tests/<name>/cli.sh`,
 summarize. A test is a directory `tests/<name>/`
-with a `cli.sh`, which runs inside a testenv worker, cwd'd into a client
+with a `cli.sh`, which runs inside a test-stack worker, cwd'd into a client
 repo with the test tree at `./test` and `$CAOS_CLI` set, driving
 computations through `caos-cli` against a nested caos stack built from
 your edited tree. New tests are picked up automatically. Results — every

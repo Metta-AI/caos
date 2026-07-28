@@ -1,8 +1,7 @@
 {
   # std/bash (design/flake-images.md): the script worker — a complete
   # interpreter worker image. /worker is the script runner (./worker,
-  # checked in right here — the source of truth; std/testenv carries a
-  # byte-identical copy): it fetches the `worker1` arg — the script, the
+  # checked in right here): it fetches the `worker1` arg — the script, the
   # next executable in the chain — and runs it with bash. The contents are
   # the shell and file tools a worker script leans on. Curry a script on
   # (`--worker1:@=…`) and run it like any image.
