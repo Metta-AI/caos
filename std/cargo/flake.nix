@@ -82,21 +82,65 @@
             mkdir -p $out
             install -m 755 ${workerCargo}/bin/worker-cargo $out/worker
           '';
-        in
-        pkgs.dockerTools.buildLayeredImage {
-          name = "cargo";
-          tag = "latest";
-          contents = [
-            workerRoot
-            bake.rootEnv
-          ];
-          config = {
-            # No Entrypoint: runnerd forces `/bin/caos runner`, which execs
-            # /worker. The /bin on bake.env's PATH is the caos the delta
-            # stacks in.
-            Env = bake.env;
+
+          # What #caosImage's build CONSUMES but doesn't produce: the dep bake
+          # (~176 crates, minutes), the pinned toolchain, the vendored sources.
+          # All three are keyed on manifests + Cargo.lock — crane's mkDummySrc
+          # discards source content — so a worker-cargo edit, which re-keys
+          # this whole tree, leaves them untouched. That gap is the point:
+          # published under their own memo, the rebake stops following the
+          # tree. See design/flake-deps-image.md.
+          # Liberal on purpose: a path that turns out not to be needed costs
+          # image size, a path that IS needed and missing costs a build. The
+          # vendored sources especially — without them cargo refetches
+          # crates.io — and muslCrossCC, a cross toolchain the binary cache
+          # doesn't reliably carry. The rest is what bake.env references, so
+          # it's in caosImage's closure anyway.
+          depsClosure = pkgs.closureInfo {
+            rootPaths = [
+              bake.deps
+              bake.toolchain
+              bake.vendor
+              bake.muslCrossCC
+              pkgs.stdenv.cc
+              pkgs.gitMinimal
+            ];
           };
-          fakeRootCommands = bake.inflate;
+        in
+        {
+          caosImage = pkgs.dockerTools.buildLayeredImage {
+            name = "cargo";
+            tag = "latest";
+            contents = [
+              workerRoot
+              bake.rootEnv
+            ];
+            config = {
+              # No Entrypoint: runnerd forces `/bin/caos runner`, which execs
+              # /worker. The /bin on bake.env's PATH is the caos the delta
+              # stacks in.
+              Env = bake.env;
+            };
+            fakeRootCommands = bake.inflate;
+          };
+
+          # NOT a runnable image and deliberately not shaped like one: no
+          # config, no /worker, no caos. The flake-builder unpacks it into its
+          # own store and never starts a container from it, which is what
+          # keeps every caos binary out of its key. buildLayeredImage carries
+          # the whole closure in behind the registration file; includeNixDB is
+          # NOT set, because its db.sqlite would replace the consuming store's
+          # own — the registration merges instead, via nix-store --load-db.
+          depsImage = pkgs.dockerTools.buildLayeredImage {
+            name = "cargo-deps";
+            tag = "latest";
+            contents = [
+              (pkgs.runCommand "cargo-deps-registration" { } ''
+                mkdir -p $out
+                cp ${depsClosure}/registration $out/caos-deps-registration
+              '')
+            ];
+          };
         };
     in
     {
@@ -104,9 +148,8 @@
         map
           (system: {
             name = system;
-            value = {
-              caosImage = forSystem system;
-            };
+            # forSystem yields both images — #caosImage and #depsImage.
+            value = forSystem system;
           })
           [
             "x86_64-linux"

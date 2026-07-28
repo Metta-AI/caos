@@ -49,7 +49,16 @@
               pkgs.cacert
               pkgs.bashInteractive
               pkgs.coreutils
+              # coreutils carries neither of these. grep is the
+              # homeless-shelter retry's error match — without it that retry
+              # dies "grep: command not found" instead of resuming, which
+              # only shows up on a COLD build of a flake whose builder writes
+              # $HOME (testenv's go-built docker client).
+              pkgs.gnugrep
               pkgs.gzip
+              # A deps image arrives as layer tarballs to unpack into the
+              # store (design/flake-deps-image.md); coreutils has no tar.
+              pkgs.gnutar
               pkgs.skopeo
               pkgs.jq
             ];
