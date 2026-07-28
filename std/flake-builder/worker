@@ -8,9 +8,7 @@
 #   build: `nix build` the flake's #caosImage, stream it to the registry, and
 #     return the CLEAN image as {ref, config} — no caos in it. Keyed on the
 #     flake tree alone (registry tag flake-<H>), so a caos change never rebuilds
-#     it (see design/flake-images.md). On a miss, an optional #depsImage is
-#     primed into the store first, under its OWN memo — see prime_deps and
-#     design/flake-deps-image.md.
+#     it (see design/flake-images.md).
 #   stack: emit a git-docker delta {base: docker://<clean>, config.json,
 #     layer00: the caos ADDITIONS — /bin/caos setuid, /tmp, the user db,
 #     /usr/bin/env}. The server converts that (one caos layer on a docker
@@ -27,6 +25,12 @@ set -euo pipefail
 # skopeo (and nix) resolve $HOME; the worker runs as root in a minimal container
 # where a uid-0 lookup can fail, so set it to the world-writable /tmp it owns.
 export HOME=/tmp
+# skopeo stages PULLED blobs on disk under /var/tmp, which this minimal
+# image does not have — the push direction streams and never needed it, so
+# this only shows up on a deps-<D> hit. This containers/image build ignores
+# $TMPDIR for that path (measured: exporting it changed nothing), so make
+# the directory it actually opens.
+mkdir -p /var/tmp
 
 fail() { echo "FLAKE BUILDER FAIL: $*" >&2; exit 1; }
 
@@ -66,13 +70,13 @@ build)
   # for this. So: retry, removing the litter, but ONLY on that exact error —
   # completed drvs stay in the store, so each retry makes monotonic progress
   # and a genuinely broken flake still fails on its first real error.
-  nix_build() { # <flake attr> <out-link>
+  nix_build_flake() {
     while :; do
       rm -rf /homeless-shelter
       # The pipeline (pipefail is on) keeps the full log flowing to stderr
       # while capturing a copy to grep; `-o` carries the result, stdout is
       # empty.
-      if nixf build -L "path:/tmp/ws#$1" -o "$2" 2>&1 | tee /tmp/nix-err >&2; then
+      if nixf build -L "path:/tmp/ws#caosImage" -o /tmp/img 2>&1 | tee /tmp/nix-err >&2; then
         return 0
       fi
       grep -q "homeless-shelter" /tmp/nix-err || return 1
@@ -81,74 +85,71 @@ build)
   }
   sk() { skopeo --insecure-policy "$@"; }
 
-  # Stream a built image tarball (nix gzips it) to a registry tag.
-  push_image() { # <out-link> <tag>
-    gunzip -c "$(readlink -f "$1")" > /tmp/push.tar
-    sk copy --dest-tls-verify=false "docker-archive:/tmp/push.tar" "docker://$2" >&2 \
-      || fail "push to the registry: $2"
-  }
-
-  # The DEPS stage (design/flake-deps-image.md). A flake MAY expose #depsImage:
-  # the build-time store paths its #caosImage build consumes but doesn't
-  # produce — for std/cargo, the dep bake and the toolchain. Its key is that
-  # derivation, not this tree, so it survives every source edit the tree hash
-  # cannot. We're already on the flake-<H> miss path here, i.e. already
-  # committed to a full build, so the eval costs nothing we weren't spending.
-  #
-  # The image is NEVER RUN — it's unpacked into this container's store. That's
-  # what keeps caos out of its key: making it runnable would mean stacking the
-  # additions, and the caos binary would re-key it on every caos build.
-  # includeNixDB is deliberately not used (it would replace our db.sqlite);
-  # the closure's registration rides as a file and merges via --load-db.
-  #
-  # On a MISS we build it right here, so its paths are local for the
-  # #caosImage build that follows and nothing is transferred — the cold path
-  # is today's single build plus one push.
-  prime_deps() {
-    local drv D dtag manifest layer
-    drv=$(nixf eval --raw "path:/tmp/ws#depsImage.drvPath" 2>/dev/null) || {
-      echo "flake-build: flake exposes no #depsImage" >&2
+  # The SECOND memo (design/flake-deps-image.md). flake-<H> is keyed on the
+  # tree, so one source byte is a total miss that restarts from whatever
+  # /nix/store this image shipped. #depsImage carries the build-time store
+  # paths #caosImage's build consumes but does not produce — its drvPath
+  # moves only when the manifests, lockfile, or pins do, so it survives
+  # exactly the edits the tree hash cannot. On a miss we make that closure
+  # valid in this store (unpack a hit, or build it right here) before
+  # #caosImage builds; nix then skips every derivation whose output is
+  # already valid.
+  seed_deps() {
+    local drv D dtag layer
+    if ! drv=$(nixf eval --raw "path:/tmp/ws#depsImage.drvPath" 2>/tmp/deps-eval.err); then
+      # No such output is the ordinary case (most flakes have none); anything
+      # else is a real evaluation failure and must not be swallowed.
+      grep -q "does not provide attribute" /tmp/deps-eval.err || {
+        cat /tmp/deps-eval.err >&2
+        fail "evaluating #depsImage.drvPath"
+      }
+      echo "flake-build: no #depsImage in this flake" >&2
       return 0
-    }
-    # The store hash of the drv, which is what varies: <hash>-<name>.drv.
-    D=${drv##*/}
+    fi
+    D=$(basename "$drv")
     D=${D%%-*}
     dtag="caos-registry:5000/caos:deps-$D"
 
     if ! sk inspect --tls-verify=false "docker://$dtag" >/dev/null 2>&1; then
       echo "flake-build: deps miss for $dtag; building it here" >&2
-      nix_build depsImage /tmp/depsimg || fail "nix build of path:/tmp/ws#depsImage"
-      push_image /tmp/depsimg "$dtag"
+      nixf build "path:/tmp/ws#depsImage" -o /tmp/deps \
+        || fail "nix build of path:/tmp/ws#depsImage"
+      gunzip -c "$(readlink -f /tmp/deps)" > /tmp/deps.tar
+      sk copy --dest-tls-verify=false "docker-archive:/tmp/deps.tar" "docker://$dtag" >&2 \
+        || fail "pushing $dtag"
+      # Built in THIS container: the paths are already valid here, and the
+      # cold path is today's single build plus one push.
       return 0
     fi
 
     echo "flake-build: deps hit for $dtag" >&2
-    # OCI layout, so the blob paths are spec'd rather than transport-defined.
-    sk copy --src-tls-verify=false "docker://$dtag" "oci:/tmp/deps:d" >&2 \
+    sk copy --src-tls-verify=false "docker://$dtag" "docker-archive:/tmp/deps.tar" >&2 \
       || fail "fetching $dtag"
-    manifest=/tmp/deps/blobs/sha256/$(
-      jq -r '.manifests[0].digest' /tmp/deps/index.json | cut -d: -f2
-    )
-    # Unpack straight into / — these ARE /nix/store paths. GNU tar detects
-    # each layer's compression; root (CAOS_WORKER_UID=0) writes the store.
-    for layer in $(jq -r '.layers[].digest' "$manifest" | cut -d: -f2); do
-      tar -xf "/tmp/deps/blobs/sha256/$layer" -C / \
-        || fail "unpacking deps layer $layer"
+    mkdir /tmp/deps-x
+    tar -xf /tmp/deps.tar -C /tmp/deps-x || fail "unpacking the deps archive"
+    # Layers straight into / — this is a store transplant, not a root
+    # filesystem (the image is deliberately not runnable). GNU tar
+    # auto-detects each layer's compression.
+    for layer in $(jq -r '.[0].Layers[]' /tmp/deps-x/manifest.json); do
+      tar -xf "/tmp/deps-x/$layer" -C / || fail "unpacking layer $layer"
     done
-    # Present isn't enough: nix skips a derivation iff its output path is
-    # VALID. Merge the closure's registration into our db.
-    nix-store --load-db < /caos-deps-registration \
-      || fail "registering the deps closure"
+    # The closure is PRESENT but not REGISTERED, and nix skips a derivation
+    # only when its output is valid in the db. closureInfo's registration
+    # rides as a plain file (a db.sqlite would replace ours, not merge).
+    [ -e /caos-deps-registration ] || fail "$dtag carries no /caos-deps-registration"
+    nix-store --load-db < /caos-deps-registration || fail "loading the deps registration"
   }
 
   # Already built for this exact flake tree? (The tag is the content hash.)
   if digest=$(sk inspect --tls-verify=false --format '{{.Digest}}' "docker://$tag" 2>/dev/null); then
     echo "flake-build: registry hit for $tag" >&2
   else
-    prime_deps
-    nix_build caosImage /tmp/img \
+    seed_deps
+    nix_build_flake \
       || fail "nix build of path:/tmp/ws#caosImage (does the flake expose packages.<system>.caosImage?)"
-    push_image /tmp/img "$tag"
+    gunzip -c "$(readlink -f /tmp/img)" > /tmp/img.tar
+    sk copy --dest-tls-verify=false "docker-archive:/tmp/img.tar" "docker://$tag" >&2 \
+      || fail "push to the registry"
     digest=$(sk inspect --tls-verify=false --format '{{.Digest}}' "docker://$tag") \
       || fail "reading the pushed digest"
   fi

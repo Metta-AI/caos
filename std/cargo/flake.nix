@@ -76,9 +76,14 @@
               bake.rootEnv
             ];
             config = {
-              # No Entrypoint: runnerd forces `/bin/caos runner`, which execs
-              # /worker. The /bin on bake.env's PATH is the caos the delta
-              # stacks in.
+              # runnerd forces the entrypoint anyway; set it so the streamed
+              # compose (which renders config.Entrypoint into a Dockerfile)
+              # always has one — same reason the runner image sets it.
+              Entrypoint = [
+                "/bin/caos"
+                "runner"
+              ];
+              # The /bin on this PATH is the caos the additions layer brings.
               Env = bake.env;
             };
             fakeRootCommands = bake.inflate;

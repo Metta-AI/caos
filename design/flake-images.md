@@ -139,16 +139,26 @@ The flake-builder is the one image that can't be *built* by the flake path
 — resolution would recurse into itself. (Nothing stops its *definition*
 from being a flake tree; the grounding is about who runs the build, not
 the notation — and its definition IS a flake:
-`std/flake-builder/{flake.nix, flake.lock, image.nix, worker}`, whose clean
+`std/flake-builder/{flake.nix, flake.lock, worker}`, whose clean
 `#caosImage` carries everything but the caos additions.) It's host-nix-built
 SELF-CONTAINED — nix, CA certs, and tools from its own nixpkgs, the closure
 registered in the store db (`includeNixDB`) so in-image builds work — and
-**streamed**: the root flake imports `image.nix`, wraps in the caos
-additions, and build-builtins composes the ~100MB tarball `FROM scratch`
-(ADD extracts each layer as root, preserving the setuid caos), pushes it,
-memoized on the tarball's store path. The runner streams the same way. So
+**streamed with the additions COMPOSED ON**: the root flake takes the
+clean `#caosImage` as-is (calling the subflake's outputs function), and
+build-builtins stacks the caos additions over it as a CONTENT-KEYED tar
+layer (`FROM scratch`, ADD per layer — extraction as root preserves the
+setuid caos), pushes, and memoizes on (clean tarball store path, composed
+binaries' content). That is the same clean-image + additions-delta shape
+the stack stage gives every flake image — one additions model, two
+encodings (a git tree with `.caosmeta` sidecars in the stack stage; a
+mode-carrying tar here). The runner streams the same way, its `/worker`
+(worker-runner) riding as a second content-keyed layer — the host is that
+image's author. Because the clean images depend on nothing from the
+workspace and the deltas key on the binaries' BYTES, a Rust edit that
+leaves them bit-identical re-streams nothing and re-keys nothing
+downstream (verified: a server-only edit is a registry hit for both). So
 resolution never re-enters the flake branch for the builder, and the
-recursion is grounded. (The stock-base pins now live with their only
+recursion is grounded. (The stock-base pins live with their only
 consumer: `caos-tools/{nix,debian}-base.ref`, the test suite's own image
 pipeline, until it unifies onto the flake path.)
 
