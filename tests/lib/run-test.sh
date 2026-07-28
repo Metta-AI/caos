@@ -5,11 +5,14 @@
 # with CAOS_SERVER_URL aimed at them.
 #
 # This script lives ENTIRELY in the inner world: `caos-cli` on PATH is the
-# tested client and CAOS_SERVER_URL is the stack it brought up. There is no
-# reaching the outer stack from here and no need to — both clients read the
-# same CAOS_SERVER_URL, so the interpreter materialized this job's args
-# before flipping the env, and publishes the result tree we leave at
-# /tmp/out afterwards.
+# TESTED client — a different build from the host's, in general, which is why
+# it must be the one every test command goes through — and CAOS_SERVER_URL is
+# the stack it brought up. Nothing here reaches the outer stack, and nothing
+# needs to: the interpreter materialized this job's args before flipping the
+# env and publishes the tree we leave at /tmp/out afterwards. Do not reach for
+# /bin/caos to "get at the outer stack" — that is the host's client, and using
+# it here would either 404 (its calls go to the inner server too) or, worse,
+# quietly run host code where the tested code was the point.
 #
 # The inner std is published by the tree's OWN build-builtins.sh — the same
 # script the host runs — so every std image is built by this stack from this

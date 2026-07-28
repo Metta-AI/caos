@@ -58,11 +58,24 @@ distinction is exactly the distinction between the two stacks:
   else, with `CAOS_STD` and `CAOS_SALT` scrubbed (the outer run's values must
   not reach the inner client — `cargo-workers.md`, phase 3).
 
-**They are not told apart by which binary you spell.** Both read the same
-`CAOS_SERVER_URL`, so under the flipped environment even `/bin/caos` talks to
-the inner stack — measured: it asked the inner server for an outer object and
-got a 404. The separation is the ENV, and it can only exist around the
-`worker1` call. So the interpreter:
+**Keeping them straight is two independent choices, and both matter.** *Which
+binary* decides whose semantics and protocol you speak: the outer server and
+runnerd are the host's, while the tested client is the thing under test and
+may differ from the host's in any way — that is the entire point of building
+it, so the two are interchangeable only by coincidence, never by assumption.
+*Which URL* decides which server that binary then talks to.
+
+The failure modes are asymmetric. Right binary, wrong URL fails loudly:
+`/bin/caos` under the flipped environment asks the inner server for an outer
+object and 404s (measured — this is how the first cut broke). Right URL,
+wrong binary fails **silently**: a host client driving the test stack passes
+every test until the tree under test changes the client, and then it is
+quietly testing the wrong thing.
+
+So neither is left to discipline. `/caos/bin` is never on the ambient `PATH`
+(the image sets `PATH=/bin`), so nothing outside the call site can reach the
+tested client; and `worker1` is given no outer work to do. Concretely the
+interpreter:
 
 1. materializes every arg (`caos get -r /cas/args`) while the environment is
    still the outer one,

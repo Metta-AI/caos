@@ -14,13 +14,32 @@
 #   /caos/bin/*   what the tree under test built. These go on PATH for
 #                 worker1 ONLY, at the call site.
 #
-# The two are NOT told apart by which binary you spell: both read the same
-# CAOS_SERVER_URL, so under the flipped env even /bin/caos talks to the inner
-# stack (it asks for an outer object and gets a 404 — measured). The
-# separation is the ENV, and it exists only around the worker1 call. Hence
-# the shape below: materialize every arg first, run worker1 in the inner
-# world, publish its /tmp/out afterwards — worker1 never needs an outer
-# client, which is why it cannot accidentally hold the wrong one.
+# Keeping them straight is TWO independent choices, and both matter:
+#
+#   which BINARY   whose semantics and protocol you speak. The outer server
+#                  and runnerd are the host's, so outer work must use the
+#                  host's client; the tested client is the thing under test
+#                  and may differ from it in any way at all — that is the
+#                  point of building it. Do not assume they are interchangeable
+#                  because they happen to agree today.
+#   which URL      which server that binary then talks to. Both clients read
+#                  the same CAOS_SERVER_URL (one variable, different values:
+#                  the runner injects the outer server's address, $INNER is
+#                  the stack below), so the env alone does not say which
+#                  client is running.
+#
+# Getting the binary right and the URL wrong fails loudly: /bin/caos under the
+# flipped env asks the INNER server for an outer object and 404s (measured).
+# Getting the URL right and the binary wrong fails SILENTLY — a host client
+# driving the test stack passes until the tree under test changes the client,
+# and then it tests the wrong thing.
+#
+# Both are safe here by construction rather than by discipline:
+#   - /caos/bin is never on the ambient PATH (the image sets PATH=/bin), so
+#     nothing in this script can reach the tested client by accident;
+#   - worker1 never needs an outer client, because the args are materialized
+#     below before the env flips and its /tmp/out is published after, so it
+#     has no outer work left to do with the wrong one.
 #
 # The inner runnerd delegates every worker to the OUTER engine through the
 # granted socket, as siblings sharing this container's netns — no second
