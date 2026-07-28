@@ -288,6 +288,7 @@ impl Transport for HttpTransport {
         let url = format!("{}/object/", self.base.trim_end_matches('/'));
         let response = minreq::post(&url)
             .with_body(body)
+            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
             .send()
             .map_err(|e| format!("POST {url}: {e}"))?;
         if !(200..300).contains(&response.status_code) {
@@ -753,6 +754,7 @@ pub fn server_url() -> Result<String, String> {
 /// HTTP GET returning the raw response body. Non-2xx responses are errors.
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
     let response = minreq::get(url)
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
         .send()
         .map_err(|e| format!("GET {url}: {e}"))?;
     if !(200..300).contains(&response.status_code) {
@@ -2587,6 +2589,7 @@ fn request_compute_streamed(
 ) -> Result<(String, String), String> {
     let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
     let mut response = minreq::get(&stream_url)
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
         .send_lazy()
         .map_err(|e| format!("GET {stream_url}: {e}"))?;
     if !(200..300).contains(&response.status_code) {

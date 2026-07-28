@@ -156,6 +156,7 @@ fn poll(config: &Config) -> Result<Option<Job>, String> {
     let url = format!("{}/runner/poll", config.server_url.trim_end_matches('/'));
     let mut req = minreq::post(&url)
         .with_header("content-type", "application/json")
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
         .with_timeout(POLL_TTL.as_secs() + 15)
         .with_body(body.to_string());
     if let Some(token) = &config.token {
@@ -264,6 +265,7 @@ fn post_failure(config: &Config, job: &Job, error: &str, log: &str) -> Result<()
     let url = format!("{}/runner/result", config.server_url.trim_end_matches('/'));
     let mut req = minreq::post(&url)
         .with_header("content-type", "application/json")
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
         .with_timeout(30)
         .with_body(body.to_string());
     if let Some(token) = &config.token {

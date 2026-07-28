@@ -41,7 +41,9 @@ fail() {
 # in the image, which IS the tree under test.
 
 TEST=/cas/args/in/test
-[ -d "$TEST" ] || fail "no test tree at $TEST"
+[ -d "$TEST" ] || fail "no test tree at $TEST
+  /cas/args:    $(ls -A /cas/args 2>&1 | tr '\n' ' ')
+  /cas/args/in: $(ls -A /cas/args/in 2>&1 | tr '\n' ' ')"
 
 # The inner std, published by the tree's own publisher. REGISTRY_HTTP: the
 # docker daemon this delegates to is the OUTER one, for which the registry is

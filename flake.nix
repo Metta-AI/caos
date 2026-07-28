@@ -282,10 +282,25 @@
           # inner suite hands to its jobs, not a worker.
           "llm-stub"
         ];
+        # The test stack's binaries carry their WORLD (crates/caos-world): the
+        # same workspace build, tagged, so a client built here cannot drive
+        # the outer stack and the host's cannot drive this one. It is a
+        # separate derivation from workspaceBins, but no extra work in
+        # practice — each context builds the one flavor it needs, and both
+        # share cargoArtifacts.
+        testWorkspaceBins = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "--workspace";
+            doCheck = false;
+            CAOS_WORLD = "test";
+          }
+        );
         testStackRoot = pkgs.runCommand "caos-test-stack-root" { } ''
           mkdir -p $out/caos/bin $out/caos/images $out/caos/tree
           for b in ${pkgs.lib.concatStringsSep " " testStackBins}; do
-            cp ${workspaceBins}/bin/$b $out/caos/bin/$b
+            cp ${testWorkspaceBins}/bin/$b $out/caos/bin/$b
           done
           # Store BASENAMES intact: build-builtins.sh maps a tarball back to
           # its builtin by the caos-worker-<name> baked into the path.

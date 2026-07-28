@@ -1,0 +1,13 @@
+[package]
+name = "caos-world"
+version = "0.1.0"
+edition = "2021"
+
+# The build's WORLD tag, shared by the three crates that speak the server
+# protocol (caos, server, runnerd). One definition so they cannot disagree
+# about what world they are in — the same reason std/cargo/bake.nix is one
+# file with two consumers. No dependencies.
+
+[lib]
+name = "caos_world"
+path = "src/lib.rs"

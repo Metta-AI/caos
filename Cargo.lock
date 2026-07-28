@@ -101,6 +101,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 name = "caos"
 version = "0.1.0"
 dependencies = [
+ "caos-world",
  "flate2",
  "gix",
  "minreq",
@@ -111,6 +112,10 @@ dependencies = [
  "tar",
  "xattr",
 ]
+
+[[package]]
+name = "caos-world"
+version = "0.1.0"
 
 [[package]]
 name = "castaway"
@@ -1584,6 +1589,7 @@ dependencies = [
 name = "runnerd"
 version = "0.1.0"
 dependencies = [
+ "caos-world",
  "minreq",
  "serde_json",
 ]
@@ -1731,6 +1737,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "caos-world",
  "gix",
  "minreq",
  "serde",
