@@ -1,6 +1,6 @@
 # The test stack as an image — design note
 
-**Status:** agreed, not yet built. Closes the second-pipeline open item in
+**Status:** SHIPPED. Closes the second-pipeline open item in
 `flake-images.md` and supersedes the nested-stack half of
 `cargo-workers.md` (phases 3–4 stay as history). Depends on
 `flake-deps-image.md`. Read the image/worker/flake contract in
@@ -141,23 +141,54 @@ tree's `build-builtins.sh`. Two reasons, in order of weight:
    resolution is server-side. Reproducing it client-side would duplicate
    server logic on a guess — a mechanism invented to serve an unmeasured
    optimization.
-2. The overhead it was meant to avoid does not show up. A full 19-test suite
-   runs in **~7 minutes wall clock** with 16 stacks concurrent, each doing a
-   complete std publish. Per-test bring-up is not the bottleneck.
+2. The overhead it was meant to avoid does not show up — *against a warm
+   registry*. A full suite runs in **~7 minutes wall clock** with 16 stacks
+   concurrent, each doing a complete std publish.
 
-If it ever becomes one, the fix is the original plan, and it needs a real
-digest-extraction seam first.
+**And then the cold case proved the original instinct right.** Against a COLD
+registry — which is what a `std/refresh.sh` re-key produces — all nineteen
+stacks start together, all miss the same memo, and all bake the toolchain.
+Each test stack is an outer worker holding an outer runner slot for its whole
+life, so the pool fills with 20-minute jobs and whatever is still queued dies
+on the pending timeout: `no runner for req (waited 900s)`, after 38 minutes.
+Measuring only the warm case measured the one case where the difference cannot
+appear.
 
-## The socket grant becomes per-image
+**So: warm once, then fan out.** Stage 3 runs `tests/lib/warm-std.sh` in a
+single stack and stage 4 fans out. That is this note's original build-std-once
+design *minus the digest-passing*, which turned out to be unnecessary: the
+registry is already the sharing mechanism, so nothing has to be handed to
+anyone — it just has to be warm. No digest-extraction seam required, and each
+test still publishes its own std, built by its own stack.
+
+## The socket grant is per-image (DONE)
 
 The inner runnerd delegates to the outer engine through a bind-mounted socket,
 as `cargo-workers.md` phase 4 established — nested podman remains the wrong
 trade. What changes is who gets the socket. Today `CAOS_RUNNER_SOCKET` grants
 it to **every** worker in the pool, which the compose file flags as coarse.
-Now there is exactly one image that hosts a stack, so the grant becomes a
-property that image declares in its own env, the same shape as the existing
-`CAOS_WORKER_UID=0` containment grant, and runnerd honors it per-image. That
-closes phase 4's "refine the socket grant from pool-wide to per-image".
+Now there is exactly one image that hosts a stack, so the grant is a property
+that image declares in its own env — `CAOS_GRANT_ENGINE_SOCKET=1`, the same
+shape as the existing `CAOS_WORKER_UID=0` — and runnerd honours it per-image.
+That closes phase 4's "refine the socket grant from pool-wide to per-image".
+
+runnerd reads it from the IMAGE's config, never from the job or its args, so a
+caller cannot talk its way into the grant; only an image's author can, and
+images are content-addressed. Inspection needs the image present, so a miss
+pulls first (what `run` would have done anyway), and answers are memoized per
+ref. Any inspection failure reads as *no grant*: the wrong answer here is a
+silent loss of containment, so the default has to be the safe one.
+`CAOS_RUNNER_SOCKET` on the pool now means "this pool MAY grant the socket",
+not "every worker gets it".
+
+Coverage is asymmetric, deliberately. The positive path is exercised by every
+test — the interpreter dies on `${CAOS_ENGINE_SOCKET:?}` — and the suite logs
+exactly one grant per run. The negative path cannot be asserted from inside
+the suite, because tests run in a test stack whose inner runnerd has no socket
+to grant at all; it is verified by hand (an ordinary `std/bash` worker on the
+outer stack reports `CAOS_ENGINE_SOCKET=<unset>` and no socket at
+`/run/caos/engine.sock`). Asserting it in CI would need a test that runs on
+the OUTER stack, a shape the suite does not have.
 
 ## Cache keys
 
@@ -231,10 +262,10 @@ optimization.
    `tests/lib/run-test.sh`.
 4. **DONE** — deleted the second pipeline, the `.ref` pins, `run-nested.sh`,
    and the manifests.
-5. **Open** — per-image socket grant in runnerd, declared via image env.
-   Today's pool-wide `CAOS_RUNNER_SOCKET` still hands the socket to every
-   worker; now that exactly one image hosts a stack, the grant can move into
-   that image's env like `CAOS_WORKER_UID=0` does.
+5. **DONE** — per-image socket grant in runnerd, declared via image env.
+   `CAOS_RUNNER_SOCKET` on the pool now means "may grant", not "grants to
+   everyone"; the test stack is the only image that asks. Verified: one
+   grant logged across a full 20-test suite.
 
 Measured on the way: the test stack builds in caos in **4m32s** cold from a
 bare container (dep bake, workspace compile, ~400MB image assembly and push);

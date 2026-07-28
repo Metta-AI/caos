@@ -364,6 +364,12 @@
               # grant the flake-builder and testenv carry.
               "CAOS_WORKER_UID=0"
               "CAOS_WORKER_GID=0"
+              # The engine socket, declared the same way: this image hosts a
+              # caos stack whose own runnerd launches siblings on the outer
+              # engine, so it needs the socket runnerd was handing to EVERY
+              # worker before this existed. Only an image can ask — the grant
+              # is read from the image's config, never from a job or its args.
+              "CAOS_GRANT_ENGINE_SOCKET=1"
             ];
           };
         };
@@ -630,12 +636,14 @@
               networks: [caos-net]
               environment:
                 CAOS_DOCKER_NETWORK: caos-net
-                # Pass the engine socket through to workers that ask for it, so a
-                # worker's own inner runnerd can launch sibling containers via the
-                # same engine (phase 4, design/cargo-workers.md). The host socket
-                # (bind source resolves on the host, docker-out-of-docker) is
-                # mounted into each worker at /run/caos/engine.sock. Coarse for now
-                # — every worker gets it; a per-image grant is future work.
+                # The engine socket runnerd may grant, so a worker's own inner
+                # runnerd can launch sibling containers via the same engine
+                # (phase 4, design/cargo-workers.md). The host socket (bind
+                # source resolves on the host, docker-out-of-docker) is mounted
+                # at /run/caos/engine.sock — but ONLY into images that declare
+                # CAOS_GRANT_ENGINE_SOCKET=1, which today is the test stack
+                # alone. Setting this here says "this pool may grant it", not
+                # "every worker gets it".
                 CAOS_RUNNER_SOCKET: /var/run/docker.sock
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
