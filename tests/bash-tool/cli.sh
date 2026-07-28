@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a testenv worker — the suite's per-test job
-# (tests/lib/run-nested.sh).
+# set, INSIDE a test stack — the suite's per-test job
+# (tests/lib/run-test.sh).
 #
 # Exercises the bounded bash tool (worker-bash-tool, design/agent-harness.md):
 # a command over a workspace tree with only the *declared* paths materialized.

@@ -261,6 +261,122 @@
           '';
         };
 
+        # ---- The test stack (design/test-stack-image.md) ----
+        # THE image this flake defines. Handed to std/flake-builder, this tree
+        # yields one image that hosts a COMPLETE caos stack built from itself:
+        # the binaries, the userland the stack shells out to, the tree's own
+        # clean core images, and an interpreter /worker that brings the stack
+        # up and then runs `worker1` against it. The suite runs it once per
+        # test; `caos-tools/build.sh` collapses to building it.
+        #
+        # The caos ADDITIONS (setuid /bin/caos, the user db, /tmp) are not
+        # here: the flake-builder's stack stage composes them, from ITS caos —
+        # the host's — which is right, because this image runs as a worker on
+        # the OUTER stack. The tested caos lives at /caos/bin and reaches
+        # worker1 by PATH, set at the call site (test-stack/worker).
+        testStackBins = [
+          "caos" "caos-cli" "server" "runnerd"
+          "worker-cargo" "worker-runner" "worker-rustc"
+          "worker-bash-tool" "worker-llm-step" "worker-rgrep"
+          # The llm-step tests' scripted API stand-in — a test helper the
+          # inner suite hands to its jobs, not a worker.
+          "llm-stub"
+        ];
+        testStackRoot = pkgs.runCommand "caos-test-stack-root" { } ''
+          mkdir -p $out/caos/bin $out/caos/images $out/caos/tree
+          for b in ${pkgs.lib.concatStringsSep " " testStackBins}; do
+            cp ${workspaceBins}/bin/$b $out/caos/bin/$b
+          done
+          # Store BASENAMES intact: build-builtins.sh maps a tarball back to
+          # its builtin by the caos-worker-<name> baked into the path.
+          cp ${workerFlakeBuilderImage} \
+            $out/caos/images/${baseNameOf "${workerFlakeBuilderImage}"}
+          cp ${workerRunnerImage} \
+            $out/caos/images/${baseNameOf "${workerRunnerImage}"}
+          cp -R ${./std} $out/caos/tree/std
+          # std/rustc is curry(runner, worker1=worker-rustc, cargo=<ref>,
+          # worker_common=<source tree>) — the publisher stages that source,
+          # so the tree needs it alongside std/.
+          mkdir -p $out/caos/tree/crates
+          cp -R ${./crates/worker-common} $out/caos/tree/crates/worker-common
+          install -m 755 ${./build-builtins.sh} $out/caos/tree/build-builtins.sh
+          install -m 755 ${./test-stack/worker} $out/worker
+        '';
+        testStackImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-test-stack";
+          tag = "latest";
+          contents = [
+            testStackRoot
+            # The userland the stack itself shells out to: git (the server's
+            # smart-HTTP transport and the publish client), skopeo + certs
+            # (registry copies), redis (the private inner result cache), the
+            # docker client (the inner runnerd delegating to the outer
+            # engine), and a shell + the usual tools for the scripts that run
+            # here.
+            linuxPkgs.bashInteractive
+            linuxPkgs.coreutils
+            # cmp/diff: the tests compare cached results byte for byte, and
+            # std/refresh.sh --check re-derives and diffs every checked-in
+            # std copy. This image is now the environment every test runs in,
+            # so it inherits what std/testenv carried.
+            linuxPkgs.diffutils
+            linuxPkgs.gnugrep
+            linuxPkgs.gnused
+            linuxPkgs.findutils
+            linuxPkgs.gnutar
+            linuxPkgs.gzip
+            linuxPkgs.curl
+            linuxPkgs.jq
+            # build-builtins.sh reads the registry's manifest digest out of a
+            # curl -I with awk, and coreutils has none.
+            linuxPkgs.gawk
+            linuxPkgs.gitMinimal
+            linuxPkgs.redis
+            linuxPkgs.skopeo
+            linuxPkgs.cacert
+            (if pkgs.stdenv.hostPlatform.isLinux then
+              linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
+            else
+              linuxPkgs.docker-client)
+          ];
+          config = {
+            Entrypoint = [ "/bin/caos" "runner" ];
+            Env = [
+              "PATH=/bin"
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+              # Root: this worker starts daemons, owns an inner git dir, and
+              # drives the engine socket — the same per-image containment
+              # grant the flake-builder and testenv carry.
+              "CAOS_WORKER_UID=0"
+              "CAOS_WORKER_GID=0"
+            ];
+          };
+        };
+
+        # The test stack's deps memo (design/flake-deps-image.md). Everything
+        # here is SOURCE-INDEPENDENT — the dep bake rides crane's dummy
+        # sources, and the two core images depend on nothing from the
+        # workspace — so a caos edit leaves this derivation where it is and
+        # the builder starts from a warm store.
+        testStackDepsRegistration = pkgs.runCommand "caos-test-stack-deps-registration" { } ''
+          mkdir -p $out
+          cp ${
+            pkgs.closureInfo {
+              rootPaths = [
+                cargoArtifacts
+                rustToolchain
+                workerFlakeBuilderImage
+                workerRunnerImage
+              ];
+            }
+          }/registration $out/caos-deps-registration
+        '';
+        testStackDepsImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-test-stack-deps";
+          tag = "latest";
+          contents = [ testStackDepsRegistration ];
+        };
+
         # The caos server: storage *and* compute in one process (it serves
         # /object from a git repo and /run by matching jobs to polling runners —
         # it runs no containers itself; that's runnerd's job). It shells out to
@@ -771,6 +887,14 @@
           skopeo = linuxPkgs.skopeo;
           caos-worker-flake-builder-docker = workerFlakeBuilderImage;
           caos-worker-runner-docker = workerRunnerImage;
+
+          # The flake-builder contract's two names (design/flake-images.md,
+          # design/flake-deps-image.md): handed THIS tree, the builder builds
+          # #caosImage — the test stack — and seeds itself from #depsImage
+          # first. Nothing on the host's dev path builds these; `nix build`
+          # still yields the pinned host tools.
+          caosImage = testStackImage;
+          depsImage = testStackDepsImage;
         };
 
         apps = {

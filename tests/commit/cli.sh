@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a testenv worker — the suite's per-test job
-# (tests/lib/run-nested.sh).
+# set, INSIDE a test stack — the suite's per-test job
+# (tests/lib/run-test.sh).
 #
 # Round-trips a first-class commit: the client passes HEAD as a `:commit=` arg
 # (unpeeled — the worker sees the commit, not its tree); a source-built worker

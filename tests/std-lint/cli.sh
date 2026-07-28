@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a testenv worker — the suite's per-test job
-# (tests/lib/run-nested.sh).
+# set, INSIDE a test stack — the suite's per-test job
+# (tests/lib/run-test.sh).
 #
 # The literal-tree lints (design/flake-images.md, part 2): std's checked-in
 # redundancies must match what std/refresh.sh regenerates from their sources

@@ -136,11 +136,18 @@ declare -A hash_of
 # bytes unchanged is a registry hit: no re-stream, no curry movement, no
 # downstream re-keying.
 REGISTRY=localhost:5000 # the compose stack's registry, host-published (caosd)
+# The same registry as THIS SCRIPT reaches it over HTTP. On the host the two
+# names coincide. Inside the test stack (design/test-stack-image.md) they do
+# not: the docker daemon we drive is the outer one, which resolves
+# localhost:5000, while we run in a container on caos-net and must call it
+# caos-registry:5000. The refs we mint stay $REGISTRY — they are for the
+# daemon, not for us.
+REGISTRY_HTTP=${CAOS_REGISTRY_HTTP:-$REGISTRY}
 manifest_digest() { # <repo:tag> -> the registry's manifest digest, or empty
   curl -fsSI \
     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
     -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-    "http://$REGISTRY/v2/caos/manifests/$1" 2>/dev/null \
+    "http://$REGISTRY_HTTP/v2/caos/manifests/$1" 2>/dev/null \
     | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" {print $2}'
 }
 tool_bin() { # <name> -> the path of bin/<name> among the built paths
@@ -239,7 +246,12 @@ done
 for name in "${names[@]}"; do
   is_flake_entry "$name" || continue
   rm -rf "${CLIENT:?}/$name"
-  cp -R "$PROJECT/std/$name" "$CLIENT/$name"
+  # -L: PROJECT may be an image layout whose files are SYMLINKS into the nix
+  # store (the test stack, design/test-stack-image.md). Copying those verbatim
+  # would publish a tree of links to store paths no other container has — the
+  # flake-builder then finds no flake.nix. Dereference, so what is published
+  # is always the content. On the host every entry is already a real file.
+  cp -RL "$PROJECT/std/$name" "$CLIENT/$name"
   # PROJECT may be a read-only store copy (caosd); writable so the next
   # publish's rm -rf works.
   chmod -R u+w "$CLIENT/$name"
@@ -277,7 +289,7 @@ if [ -n "${hash_of[runner]:-}" ]; then
     if [ "$b" = rustc ]; then
       [ -n "${hash_of[cargo]:-}" ] || continue
       rm -rf "$CLIENT/worker-common"
-      cp -R "$PROJECT/crates/worker-common" "$CLIENT/worker-common"
+      cp -RL "$PROJECT/crates/worker-common" "$CLIENT/worker-common"
       # PROJECT may be a read-only store copy (caosd); writable so the next
       # publish's rm -rf works.
       chmod -R u+w "$CLIENT/worker-common"

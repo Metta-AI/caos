@@ -53,14 +53,26 @@ distinction is exactly the distinction between the two stacks:
   by the host from the host's binary. This is what makes the image a worker on
   the *outer* stack: the interpreter uses it to fetch args and `caos put` the
   result, and it is what the ambient environment resolves to throughout.
-- the **tested** `caos` / `caos-cli`, wherever the flake put them. The
-  interpreter never puts these on its own `PATH`. It sets them at the call
-  site and nowhere else:
+- the **tested** `caos` / `caos-cli` at `/caos/bin`. The interpreter never
+  puts these on its own `PATH`. It sets them at the call site and nowhere
+  else, with `CAOS_STD` and `CAOS_SALT` scrubbed (the outer run's values must
+  not reach the inner client — `cargo-workers.md`, phase 3).
 
-      PATH=<tested bin>:$PATH CAOS_SERVER_URL=http://127.0.0.1 exec /cas/args/worker1
+**They are not told apart by which binary you spell.** Both read the same
+`CAOS_SERVER_URL`, so under the flipped environment even `/bin/caos` talks to
+the inner stack — measured: it asked the inner server for an outer object and
+got a 404. The separation is the ENV, and it can only exist around the
+`worker1` call. So the interpreter:
 
-  with `CAOS_STD` and `CAOS_SALT` scrubbed (the outer run's values must not
-  reach the inner client — `cargo-workers.md`, phase 3).
+1. materializes every arg (`caos get -r /cas/args`) while the environment is
+   still the outer one,
+2. runs `worker1` with `PATH` / `CAOS_SERVER_URL` / `DOCKER_HOST` set at the
+   call site,
+3. publishes `worker1`'s `/tmp/out` as the job's result afterwards.
+
+`worker1` therefore never needs an outer client, which is why it cannot hold
+the wrong one. That is one documented divergence from `std/bash`, whose
+`worker1` does its own `caos put /cas/out`.
 
 The same split propagates for free. The baked `std/flake-builder` image
 carries the **tested** caos as its gateway, because the root flake composed it
@@ -103,19 +115,25 @@ own pushes and the inner server's pulls use `caos-registry:5000`; but any image
 it asks the **outer** engine to run must be named `localhost:5000`, because
 that daemon pulls host-side. One process now touches both halves.
 
-## Std is built once per suite
+## Std is published per test — measured, not assumed
 
-Building std inside *every* per-test stack would fire a flake-builder job per
-entry per test — nineteen tests paying container starts to probe registry
-memos. Instead `test.sh` runs one `curry(testStack, worker1=build-std.sh)`
-job first: a test stack whose worker1 builds all of std against its own inner
-stack and returns the digests as a tree. Each per-test job then publishes its
-inner std directly from those digests, which is as cheap as today's
-`mktree` + curry.
+This note originally specified a `build-std.sh` job: build std once per suite,
+hand each test the digests. That was written to avoid nineteen tests each
+firing a flake-builder job per std entry just to probe registry memos.
 
-Std is still built *by* the test stack, running the tested caos. The outer job
-is only the scheduling wrapper, and its result is memoized by the ordinary job
-cache like any other.
+**Built instead:** each per-test stack publishes its own std by running the
+tree's `build-builtins.sh`. Two reasons, in order of weight:
+
+1. Handing a test a *digest* requires extracting a resolved image digest, and
+   resolution is server-side. Reproducing it client-side would duplicate
+   server logic on a guess — a mechanism invented to serve an unmeasured
+   optimization.
+2. The overhead it was meant to avoid does not show up. A full 19-test suite
+   runs in **~7 minutes wall clock** with 16 stacks concurrent, each doing a
+   complete std publish. Per-test bring-up is not the bottleneck.
+
+If it ever becomes one, the fix is the original plan, and it needs a real
+digest-extraction seam first.
 
 ## The socket grant becomes per-image
 
@@ -159,6 +177,21 @@ optimization.
 
 ## Costs and edges
 
+- **Anything published into git must be dereferenced.** `buildLayeredImage`
+  links `contents` into the image root, so the tree at `/caos/tree` is
+  symlinks into `/nix/store/…-caos-test-stack-root/…`. Those resolve fine for
+  reading here, but `build-builtins.sh` copies std trees into a client repo
+  and `git add`s them — copied verbatim, the publish produces a tree of links
+  to store paths no other container has, and the flake-builder then reports
+  "no flake.nix in the flake tree". Hence `cp -RL` at both staging sites. The
+  tell was there earlier and worth remembering: the inner `cargo` tree hash
+  never matched the host's for the same files. Tarballs and binaries are
+  unaffected — they are read and executed in place, never copied into a tree.
+- **The image's userland is the publisher's userland.** `build-builtins.sh`
+  runs *inside* the test stack now, so every command it shells out to has to
+  be in the image — `gawk` was missing (coreutils has no `awk`) — and every
+  tree it stages has to be there too, which is why `crates/worker-common`
+  rides alongside `std/` (`std/rustc` curries that source in).
 - **Setuid in a baked tarball.** The baked flake-builder needs a setuid
   `/bin/caos`. `build-builtins.sh` composes additions with docker partly
   because nix strips setuid when it seals a store path;
@@ -176,11 +209,20 @@ optimization.
 
 ## Sequence
 
-1. `depsImage`: the second memo in the flake-builder's `build` stage, and
-   `depsImage` outputs on `std/cargo` and the root flake.
-2. Root flake `#caosImage` = the test stack: stack binaries, userland, the
-   baked flake-builder, and the interpreter `/worker`.
-3. Per-image socket grant in runnerd, declared via image env.
-4. `build-std.sh`, and the rewritten `build.sh` / `test.sh` / `suite*.sh`.
-5. Delete the second pipeline, the `.ref` pins, `run-nested.sh`, and the
-   manifests.
+1. **DONE** — `depsImage`: the second memo in the flake-builder's `build`
+   stage, with `std/cargo` as its first consumer (`flake-deps-image.md`).
+2. **DONE** — root flake `#caosImage` = the test stack (binaries, userland,
+   the baked flake-builder, the interpreter `/worker`) and `#depsImage` over
+   the source-independent half.
+3. **DONE** — the rewritten `build.sh` / `test.sh` / `suite*.sh` and
+   `tests/lib/run-test.sh`.
+4. **DONE** — deleted the second pipeline, the `.ref` pins, `run-nested.sh`,
+   and the manifests.
+5. **Open** — per-image socket grant in runnerd, declared via image env.
+   Today's pool-wide `CAOS_RUNNER_SOCKET` still hands the socket to every
+   worker; now that exactly one image hosts a stack, the grant can move into
+   that image's env like `CAOS_WORKER_UID=0` does.
+
+Measured on the way: the test stack builds in caos in **4m32s** cold from a
+bare container (dep bake, workspace compile, ~400MB image assembly and push);
+a full 19-test suite runs in **~7 minutes**.

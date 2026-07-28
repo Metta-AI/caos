@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# The test stack's /worker (design/test-stack-image.md) — the ROOT flake's
+# #caosImage is this image, so this is the one /worker the caos tree itself
+# defines. It is an interpreter in the flake-images.md sense (read the next
+# executable from `worker1` and run it), except that before running it, it
+# brings up a COMPLETE caos stack built from the tree under test, inside this
+# container.
+#
+# TWO CAOSES LIVE HERE:
+#   /bin/caos     the setuid gateway the HOST composed as this image's caos
+#                 additions — this image's own worker-side client, talking to
+#                 the OUTER stack. It is what the ambient environment
+#                 resolves to, and what every `caos` in THIS script is.
+#   /caos/bin/*   what the tree under test built. These go on PATH for
+#                 worker1 ONLY, at the call site.
+#
+# The two are NOT told apart by which binary you spell: both read the same
+# CAOS_SERVER_URL, so under the flipped env even /bin/caos talks to the inner
+# stack (it asks for an outer object and gets a 404 — measured). The
+# separation is the ENV, and it exists only around the worker1 call. Hence
+# the shape below: materialize every arg first, run worker1 in the inner
+# world, publish its /tmp/out afterwards — worker1 never needs an outer
+# client, which is why it cannot accidentally hold the wrong one.
+#
+# The inner runnerd delegates every worker to the OUTER engine through the
+# granted socket, as siblings sharing this container's netns — no second
+# nesting level (design/cargo-workers.md, phase 4). Publishing std is NOT
+# this script's job: worker1 does it (tests/lib/run-test.sh), so the policy
+# lives in the tree, not the image.
+#
+# What the image lays out for worker1, all fixed paths:
+#   /caos/bin       the tree's binaries (caos, caos-cli, server, runnerd,
+#                   worker-*) — the CAOS_BUILTIN_BINS root build-builtins.sh
+#                   wants, so the caos it composes into inner images is the
+#                   tested one
+#   /caos/images    the tree's clean core image tarballs, store basenames
+#                   intact (build-builtins.sh maps them back by name)
+#   /caos/tree      build-builtins.sh and the std/ flake trees it publishes
+set -euo pipefail
+
+LOGS="/tmp/redis.log /tmp/server.log /tmp/runnerd.log"
+fail() {
+  echo "TEST STACK FAIL: $*" >&2
+  for l in $LOGS; do
+    [ -e "$l" ] || continue
+    echo "--- $l" >&2
+    cat "$l" >&2
+  done
+  exit 1
+}
+
+# Materialize EVERY arg while the environment is still the outer one. This is
+# what makes the call-site env flip below sufficient: worker1 runs entirely
+# in the inner world and never needs the outer stack, because both clients
+# read the same CAOS_SERVER_URL and a `caos get` under the flipped env would
+# ask the INNER server for an outer object (it 404s — measured).
+caos get -r /cas/args
+
+# The OUTER run's std and salt must not reach the inner client (the phase-3
+# isolation lesson). Scrubbed here, so nothing worker1 starts inherits them.
+unset CAOS_STD CAOS_SALT
+
+SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
+[ -S "$SOCK" ] || fail "engine socket $SOCK is not a socket"
+
+INNER=http://127.0.0.1
+
+# The inner result cache: a PRIVATE redis that starts empty and dies with the
+# job. The incrementality tests assert real memoization, so a shared cache
+# poisons them — unlike the registry, which is content-keyed and shared on
+# purpose.
+redis-server --port 6390 --save '' >/tmp/redis.log 2>&1 &
+for _ in $(seq 1 20); do
+  redis-cli -p 6390 ping >/dev/null 2>&1 && break
+  sleep 0.5
+done
+redis-cli -p 6390 ping >/dev/null 2>&1 || fail "inner redis never came up"
+
+# The inner server. Its registry settings need no overriding: this container
+# sits on caos-net, so the default push URL (caos-registry:5000) is reachable
+# here, and the default pull host (localhost:5000) is the name the OUTER
+# docker daemon resolves — which is exactly the split this stack needs.
+mkdir -p /tmp/inner-git
+CAOS_GIT_DIR=/tmp/inner-git CAOS_REDIS_ADDR=127.0.0.1:6390 \
+  CAOS_PENDING_TIMEOUT_SECS=900 \
+  /caos/bin/server >/tmp/server.log 2>&1 &
+ok=""
+for _ in $(seq 1 30); do
+  if git ls-remote "$INNER" >/dev/null 2>&1; then ok=1; break; fi
+  sleep 1
+done
+[ -n "$ok" ] || fail "inner server never came up"
+
+# The inner runnerd: its docker client talks to the OUTER engine, and each
+# sibling joins THIS container's netns so the inner server on 127.0.0.1 is
+# the address every worker already expects.
+CAOS_SERVER_URL=$INNER CAOS_DOCKER_BIN=docker DOCKER_HOST="unix://$SOCK" \
+  CAOS_DOCKER_NETWORK="container:$(cat /etc/hostname)" CAOS_RUNNER_SLOTS=6 \
+  /caos/bin/runnerd >/tmp/runnerd.log 2>&1 &
+sleep 1
+grep -q "slots, server" /tmp/runnerd.log || fail "inner runnerd did not start"
+
+# worker1 gets the inner stack; this script keeps the outer one. Everything
+# it needs to talk to the stack above is set HERE and nowhere else.
+PATH=/caos/bin:$PATH \
+CAOS_SERVER_URL=$INNER \
+CAOS_CLI=/caos/bin/caos-cli \
+DOCKER_HOST="unix://$SOCK" \
+  bash /cas/args/worker1
+
+# The result, back under the OUTER environment: worker1 leaves its result
+# tree at /tmp/out and this script publishes it. That is the contract here —
+# unlike std/bash, worker1 does not `caos put /cas/out` itself, because it
+# has no outer client to do it with.
+if [ -e /tmp/out ]; then
+  caos put /tmp/out /cas/out
+elif [ ! -e /cas/out ]; then
+  : > /tmp/caos-empty-out
+  caos put /tmp/caos-empty-out /cas/out
+fi

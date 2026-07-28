@@ -843,7 +843,7 @@ fn resolve_image(
             format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
         ));
     }
-    // The nested test stack (tests/lib/run-nested.sh) runs on images the
+    // The nested test stack (tests/lib/run-test.sh) runs on images the
     // outer suite already built and pushed, so its server passes git images
     // through unconverted: no OCI convert, no registry round-trip. The
     // default keeps converting.

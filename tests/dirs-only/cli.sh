@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a testenv worker — the suite's per-test job
-# (tests/lib/run-nested.sh).
+# set, INSIDE a test stack — the suite's per-test job
+# (tests/lib/run-test.sh).
 #
 # Exercises the dirs-only worker, a filter that keeps only a node's directory
 # children and drops its files. The fixture tree/ holds 6 files across nested

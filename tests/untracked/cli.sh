@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a testenv worker — the suite's per-test job
-# (tests/lib/run-nested.sh).
+# set, INSIDE a test stack — the suite's per-test job
+# (tests/lib/run-test.sh).
 #
 # Proves caos-cli ingests only git-tracked files (the nix-flakes rule). The
 # harness committed test/ before this script runs, so the file dropped here

@@ -139,7 +139,7 @@ fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
 /// description) with the description from its `#@doc ` lines. Resolved fresh
 /// from the CURRENT workspace every round, so an agent that adds, edits, or
 /// removes a tool sees the change on its next request. Reserved names are
-/// skipped loudly; subdirectories (caos-tools/lib/) are helpers, not tools.
+/// skipped loudly; subdirectories are helpers, not tools.
 pub fn tree_tools(ws: &str) -> Result<Vec<(String, String)>, String> {
     let Some(dir) = tree_tools_dir(ws)? else {
         return Ok(Vec::new());
