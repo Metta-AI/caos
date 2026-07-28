@@ -29,6 +29,7 @@ caos tui                  continue the most recent conversation
 caos tui --user alice     use alice's active conversation list
 caos tui --new            start a fresh conversation
 caos tui --from 5ec3751   branch from a completed turn
+caos tui --tools tools/   add the tracked worker tools in tools/
 caos tui --list-archived  list archived conversation IDs and titles
 caos tui --unarchive ID   restore one conversation to the active list
 ```
@@ -37,6 +38,56 @@ caos tui --unarchive ID   restore one conversation to the active list
 CAOS server under `refs/caos/users/<user>/conversations/{active,archived}/`,
 not in local TUI state. Existing local conversation refs are imported the first
 time that user opens the TUI.
+
+## Worker tools
+
+`--tools <source>` selects a worker-tool set for every conversation opened in
+that TUI session. The source can be a Git-tracked directory, a
+`/cas/std/<name>` tool set, or a 40-character tool-set tree hash. It has one
+direct child per model-facing tool:
+
+```text
+tools/
+└── example/
+    ├── image
+    └── tool.json
+```
+
+`tool.json` is the same tool definition passed to the Anthropic API:
+
+```json
+{
+  "name": "example",
+  "description": "What the tool does.",
+  "input_schema": {"type": "object", "properties": {}}
+}
+```
+
+The directory name must match `name`. `image` is the Caos-only executor
+binding and names an already-runnable worker: `/cas/std/<name>`, a 40-character
+Git image or curry hash, or a `docker://` reference. Tool names use ASCII
+letters, digits, `_`, or `-` and cannot replace the harness's always-available
+tools.
+
+Every selected worker receives the model call's input object directly as the
+run input, with execution context passed separately:
+
+```text
+/cas/args/in          model-supplied JSON blob
+/cas/args/workspace/  current workspace tree
+```
+
+The workspace is not part of `tool.json` or `input_schema`. A worker returns a
+tree containing `result.json`:
+
+```json
+{"content":"text returned to the model","is_error":false}
+```
+
+An optional `workspace/` in the result advances the conversation workspace;
+without one, the workspace is unchanged. A returned workspace may not contain
+the harness-reserved top-level `.caos` entry. `Ctrl+Shift+T` shows both these
+selected workers and the workspace's dynamic `caos-tools/*.sh` tools.
 
 ## Controls
 

@@ -687,13 +687,6 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  read, ls, write, edit  — inline workspace operations"),
         Line::raw("  bash                  — commands in the workspace sandbox"),
         Line::raw("  grep                  — cached regular-expression search"),
-        Line::raw(""),
-        Line::styled(
-            "Project tools",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
     ];
     match &state.tool_set {
         None => lines.push(Line::styled(
@@ -705,35 +698,44 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Red),
         )),
         Some(Ok(set)) => {
-            lines.push(Line::from(vec![
-                Span::styled("  source  ", Style::default().fg(Color::DarkGray)),
-                Span::raw(set.source.clone()),
-            ]));
-            if set.tools.is_empty() {
-                lines.push(Line::styled(
-                    "  No additional tools.",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            for tool in &set.tools {
+            for source in &set.sources {
                 lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    source.label.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {}", tool.name),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  [{}]", tool_image_label(&tool.image)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled("  source  ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(source.source.clone()),
                 ]));
-                lines.extend(
-                    tool.docs
-                        .lines()
-                        .map(|line| Line::raw(format!("    {line}"))),
-                );
+                if source.tools.is_empty() {
+                    lines.push(Line::styled(
+                        "  No tools.",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                for tool in &source.tools {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {}", tool.name),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  [{}]", tool_image_label(&tool.image)),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                    lines.extend(
+                        tool.description
+                            .lines()
+                            .map(|line| Line::raw(format!("    {line}"))),
+                    );
+                }
             }
         }
     }

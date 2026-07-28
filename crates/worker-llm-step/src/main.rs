@@ -32,6 +32,7 @@
 //! design/agent-harness.md; the constants below are the load-bearing bits.
 
 mod api;
+mod bundle;
 mod progress;
 mod tools;
 
@@ -73,6 +74,8 @@ struct Config {
     model: String,
     base_url: String,
     conversation: Option<String>,
+    /// Optional host-selected worker-tool set.
+    worker_tools: Option<String>,
 }
 
 impl Config {
@@ -87,6 +90,9 @@ impl Config {
             base_url: read_arg_opt("base_url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             conversation: read_arg_opt("conversation")?,
+            worker_tools: Path::new(&arg("worker_tools"))
+                .exists()
+                .then(|| arg("worker_tools")),
         })
     }
 }
@@ -147,11 +153,21 @@ fn callback(cfg: &Config) -> Result<(), String> {
     let current_id = read_arg("current_id")?;
 
     // Fold the tool's outcome into a tool_result block the model will see,
-    // and establish the workspace the queue continues over: bash results
-    // carry the post-command workspace as `tree`; a grep result is a sparse
-    // match tree, NOT a workspace — the pre-grep workspace rode our curry.
+    // and establish the workspace the queue continues over.
     let current_tool = read_arg_opt("current_tool")?.unwrap_or_else(|| "bash".to_string());
     let ws = match current_tool.as_str() {
+        "worker" => {
+            let (block, returned_workspace) = bundle::result(&current_id, &arg("result"))?;
+            results.push(block);
+            match returned_workspace {
+                Some(workspace) => workspace,
+                None => {
+                    let ws = arg("ws");
+                    caos(["get", &ws])?;
+                    ws
+                }
+            }
+        }
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
             results.push(tools::grep_result_block(
@@ -200,6 +216,7 @@ fn drive(
     mut results: Vec<Value>,
 ) -> Result<(), String> {
     let mut queue = queue.to_vec();
+    let worker_tools = bundle::load(cfg.worker_tools.as_deref())?;
     while let Some(call) = queue.first().cloned() {
         let name = call["name"].as_str().unwrap_or("");
         if name == "bash" {
@@ -229,6 +246,9 @@ fn drive(
                 }
             }
         }
+        if let Some(tool) = worker_tools.iter().find(|tool| tool.name == name) {
+            return launch_worker_tool(tool, &call, &ws, step_path, &queue[1..], &results);
+        }
         // A tree tool? Resolved in the CURRENT workspace at invocation time,
         // so a call made right after an edit runs the edited script.
         if !tools::is_inline(name) && cfg.tools_image.is_some() {
@@ -248,7 +268,8 @@ fn drive(
         if !tools::is_inline(name) {
             return Err(format!(
                 "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, \
-                 write, edit; plus this workspace's caos-tools/*.sh)"
+                 write, edit; plus selected worker tools and this workspace's \
+                 caos-tools/*.sh)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -535,6 +556,39 @@ fn launch_tree_tool(
     run_then(ws, &curried, Some(&me))
 }
 
+/// Launch a host-selected tool through the common worker-tool ABI. The model's
+/// input is the run's opaque input blob; the current workspace is a separate
+/// curried execution-context argument. The worker owns validation and result
+/// presentation.
+fn launch_worker_tool(
+    tool: &bundle::Tool,
+    call: &Value,
+    ws: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let dir = scratch("worker-tool-in")?;
+    let input = call.get("input").cloned().unwrap_or_else(|| json!({}));
+    let input_file = dir.join("input.json");
+    fs::write(&input_file, input.to_string())
+        .map_err(|error| format!("writing worker tool input: {error}"))?;
+    let input_path = fresh("worker-tool-in");
+    caos(["put", path(&input_file), &input_path])?;
+    let worker = caos_curry(&tool.image, &[("workspace", Arg::Path(ws))])?;
+    let me = self_curry(
+        step_path,
+        pending,
+        results,
+        id,
+        &[("current_tool", Arg::Lit("worker")), ("ws", Arg::Path(ws))],
+    )?;
+    run_then(&input_path, &worker, Some(&me))
+}
+
 /// Rebuild ourselves as `curry(image, bin, <config>, <loop state>)` — a
 /// source-built worker is curry(runner, bin) and gets unwrapped into args, so
 /// "ourselves" is that same curry rebuilt from our own args (content-addressed,
@@ -572,6 +626,7 @@ fn self_curry(
         "conversation",
         "grep_image",
         "tools_image",
+        "worker_tools",
     ]
     .iter()
     .map(|name| (*name, arg(name)))
@@ -705,8 +760,7 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
-/// The full tool registry: bash, grep and the cargo tools (the sub-run tools)
-/// plus the inline file tools (`tools.rs`).
+/// The full tool registry: built-ins, host-selected workers, and project tools.
 fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
@@ -719,6 +773,15 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
         for (name, doc) in tools::tree_tools(ws)? {
             tools.push(tools::tree_tool_declaration(&name, &doc));
         }
+    }
+    for tool in bundle::load(cfg.worker_tools.as_deref())? {
+        if tools.iter().any(|entry| entry["name"] == tool.name) {
+            return Err(format!(
+                "worker tool {:?} conflicts with an already registered tool",
+                tool.name
+            ));
+        }
+        tools.push(tool.declaration());
     }
     Ok(tools)
 }

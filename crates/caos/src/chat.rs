@@ -29,7 +29,8 @@ use serde_json::Value;
 
 use super::{
     curry_object, entry_name, fetch_blob_string, fetch_tree_entries, prepare_request,
-    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    request_compute, resolve_cli_image, unwrap_curry, GitTransport, HttpTransport, Transport,
+    CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -103,32 +104,68 @@ pub struct TurnOptions {
     pub llm_step_bin: Option<String>,
     pub bash_tool_bin: Option<String>,
     pub rgrep_bin: Option<String>,
+    pub tools: Option<String>,
 }
 
-/// One project-defined tool available to the selected conversation.
+/// One model-facing tool available to the selected conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolDescription {
     pub name: String,
-    pub docs: String,
+    pub description: String,
     pub image: String,
+    pub input_schema: Option<String>,
 }
 
-/// Project-defined tools for a turn. The harness's built-ins are separate and
-/// are identified as such by clients.
+/// Tools from one independently configured source.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolSetDescription {
+pub struct ToolSourceDescription {
+    pub label: String,
     pub source: String,
     pub tools: Vec<ToolDescription>,
 }
 
-/// Describe the project tools visible to a conversation's current workspace.
-/// Existing conversations use their virtual head; new conversations use their
-/// configured base (or `HEAD`). Only the `caos-tools/*.sh` blobs are read.
+/// Additional tools visible to a turn. Harness built-ins are rendered
+/// separately because they do not come from either source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolSetDescription {
+    pub sources: Vec<ToolSourceDescription>,
+}
+
+/// Describe project-owned scripts and the selected worker-tool set.
 pub fn describe_tool_set(
     t: &GitTransport,
     conversation: &str,
     options: &TurnOptions,
 ) -> Result<ToolSetDescription, String> {
+    let project = read_project_tools(t, conversation, options)?;
+    let configured = read_configured_tools(t, options)?;
+    let mut sources = vec![project];
+    if let Some(configured) = configured {
+        let project_names: HashSet<&str> = sources[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        if let Some(tool) = configured
+            .tools
+            .iter()
+            .find(|tool| project_names.contains(tool.name.as_str()))
+        {
+            return Err(format!(
+                "worker tool {:?} conflicts with a project tool",
+                tool.name
+            ));
+        }
+        sources.push(configured);
+    }
+    Ok(ToolSetDescription { sources })
+}
+
+fn read_project_tools(
+    t: &GitTransport,
+    conversation: &str,
+    options: &TurnOptions,
+) -> Result<ToolSourceDescription, String> {
     use gix::objs::tree::EntryKind;
 
     let conversation_ref = format!("{CONV_REF_PREFIX}{conversation}");
@@ -139,7 +176,8 @@ pub fn describe_tool_set(
     };
     let source = format!("{root}:caos-tools");
     let Some(tree) = rev_parse_opt(t, &source)? else {
-        return Ok(ToolSetDescription {
+        return Ok(ToolSourceDescription {
+            label: "Project tools".to_string(),
             source,
             tools: Vec::new(),
         });
@@ -161,23 +199,243 @@ pub fn describe_tool_set(
             continue;
         }
         let script = fetch_blob_string(t, &entry.oid.to_string())?;
-        let docs: Vec<&str> = script
+        let description: Vec<&str> = script
             .lines()
             .filter_map(|line| line.strip_prefix("#@doc").map(str::trim))
             .collect();
-        let docs = if docs.is_empty() {
+        let description = if description.is_empty() {
             format!("Project tool caos-tools/{filename} (no #@doc description).")
         } else {
-            docs.join(" ")
+            description.join(" ")
         };
         tools.push(ToolDescription {
             name: name.to_string(),
-            docs,
+            description,
             image: TOOLS_IMAGE.to_string(),
+            input_schema: None,
         });
     }
     tools.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ToolSetDescription { source, tools })
+    Ok(ToolSourceDescription {
+        label: "Project tools".to_string(),
+        source,
+        tools,
+    })
+}
+
+const WORKER_TOOL_MEMBERS: &[&str] = &["image", "tool.json"];
+
+fn read_configured_tools(
+    t: &GitTransport,
+    options: &TurnOptions,
+) -> Result<Option<ToolSourceDescription>, String> {
+    match &options.tools {
+        Some(source) if source.starts_with("/cas/std/") => {
+            let hash = resolve_cli_image(t, source)?;
+            let remote = HttpTransport {
+                base: t.server_url()?,
+            };
+            Ok(Some(ToolSourceDescription {
+                label: "Selected worker tools".to_string(),
+                source: source.clone(),
+                tools: read_worker_tools(&remote, &hash)?,
+            }))
+        }
+        Some(source) => {
+            let oid = worker_tool_set_hash(t, source)?;
+            Ok(Some(ToolSourceDescription {
+                label: "Selected worker tools".to_string(),
+                source: source.clone(),
+                tools: read_worker_tools(t, &oid)?,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+fn read_worker_tools(t: &dyn Transport, root: &str) -> Result<Vec<ToolDescription>, String> {
+    use gix::objs::tree::EntryKind;
+
+    let entries = fetch_tree_entries(t, root)?
+        .ok_or_else(|| format!("worker tool-set object {root} is not a tree"))?;
+    let mut tools = Vec::new();
+    for entry in entries {
+        let name = String::from_utf8(entry_name(&entry).to_vec())
+            .map_err(|_| "worker tool name is not UTF-8".to_string())?;
+        validate_worker_tool_name(&name)?;
+        if entry.mode.kind() != EntryKind::Tree {
+            return Err(format!("worker tool {name:?} is not a directory"));
+        }
+        let children = fetch_tree_entries(t, &entry.oid.to_string())?
+            .ok_or_else(|| format!("worker tool {name:?} is not a tree"))?;
+        if children.len() != WORKER_TOOL_MEMBERS.len()
+            || !children.iter().all(|entry| {
+                WORKER_TOOL_MEMBERS
+                    .iter()
+                    .any(|member| entry_name(entry) == member.as_bytes())
+            })
+        {
+            return Err(format!(
+                "worker tool {name:?} must contain exactly {}",
+                WORKER_TOOL_MEMBERS
+                    .iter()
+                    .map(|member| format!("`{member}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let leaf = |leaf: &str| -> Result<String, String> {
+            let entry = children
+                .iter()
+                .find(|entry| entry_name(entry) == leaf.as_bytes())
+                .ok_or_else(|| format!("worker tool {name:?} has no {leaf:?} file"))?;
+            fetch_blob_string(t, &entry.oid.to_string())
+        };
+        let image = leaf("image")?.trim().to_string();
+        let declaration_text = leaf("tool.json")?;
+        let declaration: Value = serde_json::from_str(&declaration_text)
+            .map_err(|error| format!("worker tool {name:?} has invalid tool.json: {error}"))?;
+        let object = declaration
+            .as_object()
+            .ok_or_else(|| format!("worker tool {name:?} tool.json is not an object"))?;
+        let expected: HashSet<&str> = ["name", "description", "input_schema"]
+            .into_iter()
+            .collect();
+        if object.len() != expected.len()
+            || !object.keys().all(|key| expected.contains(key.as_str()))
+        {
+            return Err(format!(
+                "worker tool {name:?} tool.json must contain exactly `name`, `description`, and \
+                 `input_schema`"
+            ));
+        }
+        let declared_name = object["name"]
+            .as_str()
+            .ok_or_else(|| format!("worker tool {name:?} has no string `name`"))?;
+        if declared_name != name {
+            return Err(format!(
+                "worker tool directory {name:?} does not match tool.json name {declared_name:?}"
+            ));
+        }
+        let description = object["description"]
+            .as_str()
+            .ok_or_else(|| format!("worker tool {name:?} has no string `description`"))?
+            .trim()
+            .to_string();
+        let schema = object["input_schema"].clone();
+        if description.is_empty() || image.is_empty() {
+            return Err(format!(
+                "worker tool {name:?} has an empty description or image"
+            ));
+        }
+        if !schema.is_object() || schema["type"] != "object" {
+            return Err(format!(
+                "worker tool {name:?} input_schema must be an object with type `object`"
+            ));
+        }
+        tools.push(ToolDescription {
+            name,
+            description,
+            image,
+            input_schema: Some(schema.to_string()),
+        });
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tools)
+}
+
+fn validate_worker_tool_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!(
+            "invalid worker tool name {name:?}; use 1-64 ASCII letters, digits, `_`, or `-`"
+        ));
+    }
+    if ["bash", "grep", "read", "ls", "write", "edit"].contains(&name) {
+        return Err(format!(
+            "worker tool {name:?} conflicts with an always-available tool"
+        ));
+    }
+    Ok(())
+}
+
+fn worker_tool_set_hash(t: &GitTransport, source: &str) -> Result<String, String> {
+    use gix::objs::tree::EntryKind;
+
+    if source.starts_with("/cas/std/") {
+        return resolve_cli_image(t, source);
+    }
+    if source.len() == 40 && source.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let (kind, _) = t.get_object(source)?;
+        if kind != "tree" {
+            return Err(format!("worker tool set {source} is a {kind}, not a tree"));
+        }
+        return Ok(source.to_string());
+    }
+    let (mode, oid) = t
+        .ingest_path(source)?
+        .ok_or_else(|| format!("cannot read worker tools from {source:?}"))?;
+    if mode.kind() != EntryKind::Tree {
+        return Err(format!("worker tools path {source:?} is not a directory"));
+    }
+    Ok(oid.to_string())
+}
+
+/// Validate the selected tool set before minting a turn. Image hashes named
+/// inside metadata blobs are not part of the tool-set tree's Git closure, so
+/// they are pushed explicitly.
+fn prepare_worker_tools(t: &GitTransport, options: &TurnOptions) -> Result<Option<String>, String> {
+    let Some(configured) = read_configured_tools(t, options)? else {
+        return Ok(None);
+    };
+    let source = options
+        .tools
+        .as_deref()
+        .expect("configured worker tools have a source");
+    let tool_set = worker_tool_set_hash(t, source)?;
+    if !source.starts_with("/cas/std/") {
+        t.ensure_pushed(&tool_set)?;
+    }
+    for tool in configured.tools {
+        let image = tool.image.as_str();
+        if image.starts_with("/cas/std/") {
+            resolve_cli_image(t, image)
+                .map_err(|error| format!("worker tool {:?}: {error}", tool.name))?;
+        } else if let Some(reference) = image.strip_prefix("docker://") {
+            if reference.is_empty() {
+                return Err(format!(
+                    "worker tool {:?} has an empty docker image reference",
+                    tool.name
+                ));
+            }
+        } else if image.len() == 40 && image.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let (kind, _) = t
+                .get_object(image)
+                .map_err(|error| format!("worker tool {:?} image {image}: {error}", tool.name))?;
+            if kind != "tree" {
+                return Err(format!(
+                    "worker tool {:?} image {image} is a {kind}, not a tree",
+                    tool.name
+                ));
+            }
+            t.ensure_pushed(image)?;
+            let (base, _) = unwrap_curry(t, image)?;
+            if base.len() == 40 && base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                t.ensure_pushed(&base)?;
+            }
+        } else {
+            return Err(format!(
+                "worker tool {:?} has invalid image reference {image:?}; use /cas/std/<name>, \
+                 a 40-character Git image hash, or docker://<reference>",
+                tool.name
+            ));
+        }
+    }
+    Ok(Some(tool_set))
 }
 
 /// Structured progress from one turn. Frontends decide how to render these;
@@ -307,13 +565,14 @@ struct ChatArgs {
     llm_step_bin: Option<String>,
     bash_tool_bin: Option<String>,
     rgrep_bin: Option<String>,
+    tools: Option<String>,
     log: bool,
 }
 
 fn usage(verb: Verb) -> String {
     let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
          [--model <model>] [--base-url <url>] [--llm-step-bin <path>] \
-         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--log]";
+         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--tools <path>] [--log]";
     match verb {
         Verb::Chat => format!(
             "usage: chat <name> [-m <message>] {common}\n\
@@ -345,6 +604,7 @@ impl ChatArgs {
             llm_step_bin: None,
             bash_tool_bin: None,
             rgrep_bin: None,
+            tools: None,
             log: false,
         };
         let mut positional: Option<String> = None;
@@ -366,6 +626,7 @@ impl ChatArgs {
                 "--llm-step-bin" => a.llm_step_bin = Some(value(arg)?),
                 "--bash-tool-bin" => a.bash_tool_bin = Some(value(arg)?),
                 "--rgrep-bin" => a.rgrep_bin = Some(value(arg)?),
+                "--tools" => a.tools = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other}\n{}", usage(verb)))
@@ -409,6 +670,7 @@ impl ChatArgs {
             llm_step_bin: self.llm_step_bin.clone(),
             bash_tool_bin: self.bash_tool_bin.clone(),
             rgrep_bin: self.rgrep_bin.clone(),
+            tools: self.tools.clone(),
         }
     }
 }
@@ -965,6 +1227,7 @@ fn turn(
     let llm_bin = worker_bin(options.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV);
     let bash_bin = worker_bin(options.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV);
     let rgrep_bin = worker_bin(options.rgrep_bin.as_deref(), RGREP_BIN_ENV);
+    let worker_tools = prepare_worker_tools(t, options)?;
     let system = match (&options.system, &options.system_file) {
         (Some(text), _) => text.clone(),
         (None, Some(path)) => {
@@ -1069,6 +1332,9 @@ fn turn(
     ];
     if let Some(tools) = &tools_image {
         kvs.push(format!("--tools_image={tools}"));
+    }
+    if let Some(tool_set) = worker_tools {
+        kvs.push(format!("--worker_tools:tree={tool_set}"));
     }
     if let Some(model) = &options.model {
         kvs.push(format!("--model={model}"));
@@ -1524,6 +1790,13 @@ fn history_from_head(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tools_selects_a_worker_tool_set() {
+        let args =
+            ChatArgs::parse(Verb::Talk, &["--tools".to_string(), "my-tools".to_string()]).unwrap();
+        assert_eq!(args.turn_options().tools.as_deref(), Some("my-tools"));
+    }
     use std::path::Path;
 
     fn git(dir: &Path, args: &[&str]) -> String {

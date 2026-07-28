@@ -48,6 +48,7 @@ impl Args {
                 "--llm-step-bin" => parsed.turn.llm_step_bin = Some(value(&mut args, arg)?),
                 "--bash-tool-bin" => parsed.turn.bash_tool_bin = Some(value(&mut args, arg)?),
                 "--rgrep-bin" => parsed.turn.rgrep_bin = Some(value(&mut args, arg)?),
+                "--tools" => parsed.turn.tools = Some(value(&mut args, arg)?),
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }
@@ -91,7 +92,8 @@ impl Args {
 pub(crate) fn usage() -> String {
     "usage: caos tui [--user <id>] [--list-archived | --unarchive <conversation-id>] \
      [--new | --from <commit>] [--base <revspec>] \
-     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
+     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>] \
+     [--tools <path>]"
         .to_string()
 }
 
@@ -140,5 +142,15 @@ mod tests {
             Some("alice".to_string()),
         )
         .is_err());
+    }
+
+    #[test]
+    fn tools_selects_a_worker_tool_set() {
+        let parsed = Args::parse_with_default_user(
+            &["--tools".to_string(), "agent-tools".to_string()],
+            Some("alice".to_string()),
+        )
+        .unwrap();
+        assert_eq!(parsed.turn.tools.as_deref(), Some("agent-tools"));
     }
 }

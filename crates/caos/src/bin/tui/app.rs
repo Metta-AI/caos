@@ -2907,11 +2907,15 @@ mod tests {
     fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
-            tools: vec![caos::chat::ToolDescription {
-                name: "build".to_string(),
-                docs: "Build everything the tree defines.".to_string(),
-                image: "/cas/std/bash".to_string(),
+            sources: vec![caos::chat::ToolSourceDescription {
+                label: "Project tools".to_string(),
+                source: "refs/caos/conversations/talk-1:caos-tools".to_string(),
+                tools: vec![caos::chat::ToolDescription {
+                    name: "build".to_string(),
+                    description: "Build everything the tree defines.".to_string(),
+                    image: "/cas/std/bash".to_string(),
+                    input_schema: None,
+                }],
             }],
         }));
         let (mut app, _) = app_with(vec![conversation]);

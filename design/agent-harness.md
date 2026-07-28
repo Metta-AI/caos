@@ -83,7 +83,7 @@ already contains one.
 ## The step loop
 
 `llm-step` worker arguments (as implemented; the worker itself ships as
-`curry(runner, bin=worker-llm-step)` in the shared runner pool, not as its
+`curry(runner, worker1=worker-llm-step)` in the shared runner pool, not as its
 own image):
 
 - `head:commit=` — the human-turn commit to answer (the conversation head);
@@ -91,7 +91,8 @@ own image):
   tool registry — just bash for now, an image ref), and optionally `model`
   (default `claude-opus-4-8`), `base_url` (default
   `https://api.anthropic.com`; tests point it at a stub), `conversation`
-  (names the progress ref);
+  (names the progress ref), and `worker_tools` (an optional selected
+  worker-tool set);
 - continuation state, curried by the worker itself between tool calls:
   `step:commit=` (the newest step commit), `pending` / `results` (JSON arrays
   of the remaining `tool_use` blocks and the collected `tool_result` blocks),
@@ -138,6 +139,16 @@ Tool classes:
   enforced: both workers currently run as `curry(runner, bin)` in the shared
   runner pool, whose containers all sit on the compute network — a per-image
   egress fence is future work.)
+- **Selected worker tools** (`--tools <source>`): a tracked tree, std entry, or
+  tree hash with one directory per tool, each containing an exact
+  Anthropic-compatible `tool.json` (`name`, `description`, `input_schema`) and
+  a Caos-only `image` executor binding. llm-step advertises `tool.json`
+  unchanged, launches the image through run-then with the model's JSON input
+  as `/cas/args/in` and the current tree separately as `/cas/args/workspace`,
+  and accepts `{result.json, workspace/?}`. `result.json` contains string
+  `content` plus boolean `is_error`; an optional workspace advances the turn.
+  The selected tree and continuation state are curried into llm-step, so the
+  same definitions survive every tool callback.
 
 **The whole tree is never materialized — by any tool, ever.** No FUSE, no
 "fetch everything" escape hatch. Every tool is either *bounded* or
@@ -289,12 +300,13 @@ identity is that ref — the only mutable thing, owned by the client. Shared
 flags: `--base <revspec>` (a new conversation's base commit, default `HEAD` —
 refused if its tree carries a top-level `.caos`), `--system <text>` /
 `--system-file <path>` (default: a short coding-agent prompt), `--model`,
-`--base-url`, and `--log` (print the conversation so far — the first-parent
-walk — and run nothing). The API key comes only from `$ANTHROPIC_API_KEY`
+`--base-url`, `--tools <source>`, and `--log` (print the conversation so far —
+the first-parent walk — and run nothing). The API key comes only from
+`$ANTHROPIC_API_KEY`
 (checked before anything is minted).
 
 The workers come ready-made from the published library: `/cas/std/bash-tool`
-and `/cas/std/llm-step` are `curry(runner, bin=<static binary>)` nodes
+and `/cas/std/llm-step` are `curry(runner, worker1=<static binary>)` nodes
 (published by build-builtins.sh next to the images), so a turn needs nothing
 built or committed locally — the bash curry rides as a literal image ref and
 the per-turn state (key, system, model…) is curried onto the llm-step curry
