@@ -352,34 +352,6 @@
           fakeRootCommands = cargoDef.fakeRootCommands;
         };
 
-        # The DEPS-ONLY cargo base (phase D2): the bake + env, WITHOUT caos or
-        # a /worker — those are stacked on by the suite's image
-        # jobs from the freshly caos-built binaries (the D1 delta-over-base
-        # move). So this image is keyed on (toolchain, manifests, lockfile)
-        # alone, and the expensive in-caos nix bake that produces it re-runs
-        # only when those change — never on a source edit.
-        cargoDepsImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-cargo-deps";
-          tag = "latest";
-          # bash + coreutils (+ the /bin/sh link below): a bare nix-rooted
-          # image has neither a shell nor chmod/ln, and the suite's image job
-          # stacks the delta with Dockerfile RUN steps that need both.
-          contents = [
-            cargoBake.rootEnv
-            linuxPkgs.bashInteractive
-            linuxPkgs.coreutils
-          ];
-          config = {
-            Env = cargoBake.env;
-          };
-          fakeRootCommands = cargoBake.inflate + ''
-            ln -sf bash bin/sh
-            # Workers (uid 1000) scratch under /tmp; a bare nix root has none.
-            mkdir -p tmp
-            chmod 1777 tmp
-          '';
-        };
-
         # ---- The test stack (design/test-stack-image.md) ----
         # THE image this flake defines. Handed to std/flake-builder, this tree
         # yields one image that hosts a COMPLETE caos stack built from itself:
@@ -1028,12 +1000,6 @@
           # Image tarballs (build with `nix build`, then `docker load < result`).
           caos-server-docker = serverImage;
           caos-runnerd-docker = runnerdImage;
-          caos-worker-cargo-deps-docker = cargoDepsImage;
-          # skopeo, from OUR locked nixpkgs — the in-caos bake job pushes its
-          # image to the registry with it (`nix shell path:<ws>#skopeo`), and
-          # taking it from the flake keeps the job pure (a bare `nixpkgs#`
-          # ref would float with the global registry).
-          skopeo = linuxPkgs.skopeo;
           caos-worker-flake-builder-docker = workerFlakeBuilderImage;
           caos-worker-runner-docker = workerRunnerImage;
           # The cargo worker, host-built and streamed like the flake-builder
