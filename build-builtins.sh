@@ -104,7 +104,7 @@ done
 # runtime nix), else they're nix-built here. Nothing is staged into flake
 # trees anymore: runner's /worker bakes into its streamed image, cargo's
 # compiles in-flake from the vendored source.
-bin_names=(bash-tool llm-step rgrep rustc)
+bin_names=(bash-tool llm-step rgrep glob rustc)
 if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
   bin_paths=$CAOS_BUILTIN_BINS
 else
@@ -231,6 +231,19 @@ if [ -n "${hash_of[runner]:-}" ]; then
     echo "$b: curry ${hash_of[$b]}" >&2
     names+=("$b")
   done
+fi
+
+# Standard model-facing worker tools. The checked-in tree is usable directly
+# with `--tools toolsets/coding`; publish the same bytes as
+# `/cas/std/coding-tools` for clients that do not have this checkout.
+if [ -n "${hash_of[glob]:-}" ]; then
+  rm -rf "${CLIENT:?}/coding-tools"
+  cp -R "$PROJECT/toolsets/coding" "$CLIENT/coding-tools"
+  chmod -R u+w "$CLIENT/coding-tools"
+  git -C "$CLIENT" add coding-tools
+  hash_of[coding-tools]=$(git -C "$CLIENT" write-tree --prefix=coding-tools/)
+  names+=(coding-tools)
+  echo "coding-tools: tree ${hash_of[coding-tools]}" >&2
 fi
 
 # The full nix-built binary set, published as refs/caos/bins — what the

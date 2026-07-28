@@ -1,0 +1,17 @@
+{
+  "name": "glob",
+  "description": "Find files in the workspace by glob pattern. Returns sorted workspace-relative paths. `*` does not cross `/`; use `**` to search recursively (for example `crates/**/*.rs`). Prefer this over `find` or shell expansion via bash.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Glob pattern relative to the workspace root."
+      }
+    },
+    "required": [
+      "pattern"
+    ],
+    "additionalProperties": false
+  }
+}

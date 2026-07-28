@@ -1,0 +1,15 @@
+[package]
+name = "worker-glob"
+version = "0.1.0"
+edition = "2021"
+
+# Glob workspace paths as a decomposed tree fold. The model-facing entry point
+# implements the generic worker-tool ABI and renders the sparse fold result.
+[dependencies]
+globset = "0.4"
+serde_json = "1"
+worker-common = { path = "../worker-common" }
+
+[[bin]]
+name = "worker-glob"
+path = "src/main.rs"

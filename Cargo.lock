@@ -1043,6 +1043,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "globset"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2232,6 +2245,15 @@ dependencies = [
 [[package]]
 name = "worker-common"
 version = "0.1.0"
+
+[[package]]
+name = "worker-glob"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "serde_json",
+ "worker-common",
+]
 
 [[package]]
 name = "worker-llm-step"
