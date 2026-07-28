@@ -59,6 +59,9 @@
                 # stock nixos/nix base carried it; self-contained must too.
                 pkgs.gnugrep
                 pkgs.gzip
+                # The deps memo (design/flake-deps-image.md) unpacks image
+                # layers into the store; coreutils has no tar.
+                pkgs.gnutar
                 pkgs.skopeo
                 pkgs.jq
               ];

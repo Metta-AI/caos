@@ -1,8 +1,8 @@
 # depsImage: incremental flake builds — design note
 
-**Status:** proposed. Extends `flake-images.md` (the image/worker/flake
-contract) — read that first. This note proposes a second memo for the
-flake-builder's `build` stage.
+**Status:** implemented — the `build` stage carries the second memo, and
+`std/cargo` is the first flake to expose `#depsImage`. Extends
+`flake-images.md` (the image/worker/flake contract) — read that first.
 
 ## Problem
 
@@ -111,6 +111,27 @@ sidesteps the question entirely.
   runs with `CAOS_WORKER_UID=0`.
 - `gnutar` joins the flake-builder image: `coreutils` has no `tar`, and the
   layers arrive as tarballs. GNU tar auto-detects the layer's compression.
+- **`/var/tmp` must exist in the flake-builder image.** skopeo stages *pulled*
+  blobs on disk there, and a minimal nix image has no `/var/tmp`, so a
+  `deps-<D>` hit died on `creating temporary on-disk layer`. The push
+  direction streams and never noticed, so only the hit path shows it. This
+  containers/image build ignores `$TMPDIR` for that path (measured: exporting
+  it changed nothing), so the worker makes the directory itself.
+
+## Measured
+
+On `std/cargo`, one comment appended to `crates/worker-cargo/src/decompose.rs`
+(a real `flake-<H>` miss — the published tree hash moved), against a warm
+`deps-<D>`:
+
+| | |
+|---|---|
+| cold: flake miss, deps miss | **303s** |
+| flake miss, deps hit | **140s** |
+
+`depsImage.drvPath` held at `id4n9bvw…` across that edit while
+`caosImage.drvPath` moved `yvjzsxwx…` → `flfs3jbw…` — the property the whole
+note rests on, on the flake that motivated it.
 
 ## What it unlocks
 
@@ -126,3 +147,12 @@ stub machinery becomes an optimization rather than a requirement.
 A **warm flake-builder runner** would keep `/nix/store` hot in-process across
 jobs, making even a `deps-<D>` hit free. Orthogonal to this note and composes
 with it.
+
+**Seeding the layer tarballs, not just the outputs.** Most of the remaining
+140s is not compilation. `dockerTools` builds one `.tar.gz` derivation per
+store path, and a fresh builder container has to re-tar and gzip every layer
+of the ~3.4GB closure even though none of their contents changed. Those
+per-layer derivations are as source-independent as the bake itself, so putting
+them in `depsImage`'s `rootPaths` would make a hit skip the re-tarring too.
+This matters more as images grow — the test-stack image
+(`test-stack-image.md`) is larger than `std/cargo`.

@@ -82,21 +82,57 @@
             mkdir -p $out
             install -m 755 ${workerCargo}/bin/worker-cargo $out/worker
           '';
-        in
-        pkgs.dockerTools.buildLayeredImage {
-          name = "cargo";
-          tag = "latest";
-          contents = [
-            workerRoot
-            bake.rootEnv
+
+          # The deps memo (design/flake-deps-image.md). The expensive half of
+          # this flake is source-INDEPENDENT — bake.deps is buildDepsOnly over
+          # crane's dummy sources — so a memo keyed on its derivation survives
+          # the worker-cargo / worker-common edits that re-key this tree.
+          #
+          # NOT a runtime environment: what belongs here is derivation
+          # OUTPUTS, since nix skips a derivation iff its output path is valid
+          # in the store. The registration rides as a plain file (an
+          # includeNixDB db.sqlite would replace the consuming store's rather
+          # than merge into it) and the builder merges it with
+          # `nix-store --load-db`.
+          depsRoots = [
+            bake.deps
+            bake.vendor
+            bake.toolchain
+            bake.muslCrossCC
+            pkgs.stdenv.cc
           ];
-          config = {
-            # No Entrypoint: runnerd forces `/bin/caos runner`, which execs
-            # /worker. The /bin on bake.env's PATH is the caos the delta
-            # stacks in.
-            Env = bake.env;
+          depsRegistration = pkgs.runCommand "cargo-deps-registration" { } ''
+            mkdir -p $out
+            cp ${pkgs.closureInfo { rootPaths = depsRoots; }}/registration \
+              $out/caos-deps-registration
+          '';
+        in
+        {
+          caosImage = pkgs.dockerTools.buildLayeredImage {
+            name = "cargo";
+            tag = "latest";
+            contents = [
+              workerRoot
+              bake.rootEnv
+            ];
+            config = {
+              # No Entrypoint: runnerd forces `/bin/caos runner`, which execs
+              # /worker. The /bin on bake.env's PATH is the caos the delta
+              # stacks in.
+              Env = bake.env;
+            };
+            fakeRootCommands = bake.inflate;
           };
-          fakeRootCommands = bake.inflate;
+
+          # Not runnable, by design: no entrypoint, no /worker, no caos, no
+          # setuid. The flake-builder unpacks it into its own store and never
+          # starts a container from it — which is what keeps every caos
+          # version out of this memo's key.
+          depsImage = pkgs.dockerTools.buildLayeredImage {
+            name = "cargo-deps";
+            tag = "latest";
+            contents = [ depsRegistration ];
+          };
         };
     in
     {
@@ -104,9 +140,7 @@
         map
           (system: {
             name = system;
-            value = {
-              caosImage = forSystem system;
-            };
+            value = forSystem system;
           })
           [
             "x86_64-linux"
