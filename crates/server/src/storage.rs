@@ -139,7 +139,7 @@ fn stored_despite(
     data: &[u8],
 ) -> Option<gix::ObjectId> {
     let id = gix::objs::compute_hash(repo.object_hash(), kind, data).ok()?;
-    repo.has_object(&id).then_some(id)
+    repo.has_object(id).then_some(id)
 }
 
 /// Fetch and parse a git tree from the in-process object database.

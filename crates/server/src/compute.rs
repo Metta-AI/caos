@@ -255,7 +255,6 @@ fn run_req_inner(
 /// `(status, message)` — a plain-data [`HttpError`] that can be cloned to every
 /// waiter.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_dispatch(
     config: &Config,
     req: &str,
@@ -333,10 +332,13 @@ fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
     FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Every parked waiter, as (its ancestor stack, the request it waits on) —
-/// the edges of the waits-for graph `park_would_deadlock` walks.
-fn parked() -> &'static Mutex<Vec<(Vec<String>, String)>> {
-    static PARKED: OnceLock<Mutex<Vec<(Vec<String>, String)>>> = OnceLock::new();
+/// One parked waiter: its ancestor stack, and the request it waits on — an
+/// edge of the waits-for graph `park_would_deadlock` walks.
+type ParkedEdge = (Vec<String>, String);
+
+/// Every parked waiter, as the edges of that graph.
+fn parked() -> &'static Mutex<Vec<ParkedEdge>> {
+    static PARKED: OnceLock<Mutex<Vec<ParkedEdge>>> = OnceLock::new();
     PARKED.get_or_init(|| Mutex::new(Vec::new()))
 }
 

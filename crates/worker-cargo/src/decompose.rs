@@ -273,6 +273,12 @@ pub fn job(cmd: &str) -> Result<(), String> {
         ]],
         "build" => vec![vec!["build".into(), "-p".into(), name.clone()]],
         "test" => vec![vec!["test".into(), "-p".into(), name.clone()]],
+        "clippy" => vec![vec![
+            "clippy".into(),
+            "-p".into(),
+            name.clone(),
+            "--all-targets".into(),
+        ]],
         other => return Err(format!("unknown job cmd {other:?}")),
     };
     // Cross/profile flags apply to every run — dep artifacts included, so a
@@ -286,6 +292,12 @@ pub fn job(cmd: &str) -> Result<(), String> {
         if let Some(p) = &profile {
             argv.push("--profile".into());
             argv.push(p.clone());
+        }
+        // After every other flag: `-D warnings` sits past a `--` separator.
+        if cmd == "clippy" {
+            argv.push("--".into());
+            argv.push("-D".into());
+            argv.push("warnings".into());
         }
     }
     let started = std::time::SystemTime::now();

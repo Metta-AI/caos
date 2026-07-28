@@ -87,11 +87,23 @@ fn flat(cmd: &str) -> Result<(), String> {
         "check" => vec!["check", "--workspace", "--all-targets"],
         "build" => vec!["build", "--workspace"],
         "test" => vec!["test", "--workspace"],
-        other => return Err(format!("unknown cmd {other:?} (want check|build|test)")),
+        "clippy" => vec!["clippy", "--workspace", "--all-targets"],
+        other => {
+            return Err(format!(
+                "unknown cmd {other:?} (want check|build|test|clippy)"
+            ))
+        }
     };
     argv.extend(["--profile", &profile]);
     if let Some(t) = &target {
         argv.extend(["--target", t]);
+    }
+    // `-D warnings` rides after a `--` separator, so it must be appended
+    // last — after the profile/target flags above. clippy-driver comes from
+    // the image's toolchain (bake.env's PATH), which carries the clippy
+    // component for exactly this.
+    if cmd == "clippy" {
+        argv.extend(["--", "-D", "warnings"]);
     }
 
     // The workspace tree: run-then's `in`, or a direct `--tree` arg.
@@ -165,9 +177,17 @@ pub(crate) fn run_cargo(argv: &[&str], ws: &str) -> Result<std::process::Output,
     }
     fs::copy(&vendor_config, &config).map_err(|e| format!("copying vendor config: {e}"))?;
 
+    // `--offline` is OURS, so it goes before any `--`: everything past that
+    // separator belongs to the tool cargo drives (clippy's `-D warnings`),
+    // and appending blind would hand it to clippy-driver, which rejects it.
+    let (head, tail) = match argv.iter().position(|a| *a == "--") {
+        Some(i) => (&argv[..i], &argv[i..]),
+        None => (argv, &argv[argv.len()..]),
+    };
     Command::new("cargo")
-        .args(argv)
+        .args(head)
         .arg("--offline")
+        .args(tail)
         .env("CARGO_TARGET_DIR", target_dir()?)
         .current_dir(ws)
         .output()

@@ -29,4 +29,19 @@ if [ "$(cat r1/exit)" != "0" ]; then
   echo "---- stderr ----" >&2; cat r1/stderr >&2
   fail "unit tests failed"
 fi
+
+# Clippy, same decomposition, same baked deps — so it re-lints only the
+# crates an edit touched. It runs HERE rather than as a nix check because
+# this is the only runner anyone invokes: `nix flake check` has no CI behind
+# it, and clippy had no coverage at all until this. `-D warnings` is applied
+# worker-side (worker-cargo), so a lint is a job failure, not a warning.
+echo "== cargo clippy of the workspace, per-crate, in a caos worker ==" >&2
+"$CAOS_CLI" run /cas/std/cargo r2 -- --tree:@=ws --cmd=clippy --mode=all \
+  "--target=$(uname -m)-unknown-linux-musl"
+if [ "$(cat r2/exit)" != "0" ]; then
+  echo "== cargo clippy FAILED (exit $(cat r2/exit)) — full output ==" >&2
+  echo "---- stdout ----" >&2; cat r2/stdout >&2
+  echo "---- stderr ----" >&2; cat r2/stderr >&2
+  fail "clippy failed"
+fi
 echo "unit: ALL PASS" >&2
