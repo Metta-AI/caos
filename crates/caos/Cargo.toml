@@ -48,3 +48,6 @@ ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["
 ratatui-widgets = { version = "0.3.2", default-features = false, features = ["std", "unstable-rendered-line-info"] }
 # Minimal HTTP *server* for `caos serve` (the warm-pool worker mode): the same
 # pure-Rust, static-friendly lib the caos server uses.
+
+[dependencies.caos-world]
+path = "../caos-world"

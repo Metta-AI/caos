@@ -235,6 +235,25 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
     if git::is_git_path(&path) {
         return git::serve(config, request);
     }
+    // The WORLD guard (design/test-stack-image.md): a caos client built for
+    // the other world must not drive this stack. The dangerous crossing is
+    // silent — a host client against the test stack passes until the tree
+    // under test changes the client, and then the suite is exercising host
+    // code where the tested code was the point. Requests without the header
+    // pass: git smart-HTTP returned above, and health probes are plain curl.
+    if let Some(client) = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(caos_world::WORLD_HEADER))
+        .map(|header| header.value.as_str().to_string())
+    {
+        if client != caos_world::WORLD {
+            return request.respond(
+                Response::from_string(caos_world::mismatch(caos_world::WORLD, &client) + "\n")
+                    .with_status_code(StatusCode(400)),
+            );
+        }
+    }
     if request.method() == &Method::Get {
         if let Some(id) = path
             .strip_prefix("/trace/")

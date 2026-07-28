@@ -27,10 +27,12 @@
 //! (default `caos-net`), `CAOS_DOCKER_BIN` (default `docker`),
 //! `CAOS_DOCKER_ARGS` (global flags before `run`, e.g.
 //! `--remote --url unix://…` for the socket-delegation backend), and
-//! `CAOS_RUNNER_SOCKET` (an engine socket to bind-mount into every worker).
+//! `CAOS_RUNNER_SOCKET` (an engine socket, granted only to images that declare
+//! `CAOS_GRANT_ENGINE_SOCKET=1` in their own config env).
 
+use std::collections::HashMap;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The caos binary inside every compute image, forced as the entrypoint.
@@ -39,6 +41,13 @@ const CAOS_BIN: &str = "/bin/caos";
 /// Fixed in-container path where a granted engine socket is bind-mounted
 /// (`CAOS_RUNNER_SOCKET`); advertised to the worker as `CAOS_ENGINE_SOCKET`.
 const ENGINE_SOCKET_PATH: &str = "/run/caos/engine.sock";
+
+/// An image declares in its own config env that it hosts a caos stack and
+/// needs the engine socket (design/test-stack-image.md). Same shape as the
+/// `CAOS_WORKER_UID=0` root grant: the image states what containment it needs,
+/// and the runner decides whether to honour it. Before this, every worker in
+/// the pool got the socket because one image needed it.
+const SOCKET_GRANT_ENV: &str = "CAOS_GRANT_ENGINE_SOCKET";
 
 /// How long each generic poll hangs. Purely a reconnect cadence — a generic
 /// runner never idles out, it just polls again.
@@ -58,12 +67,17 @@ struct Config {
     /// engine's API socket (the sibling/socket-delegation backend,
     /// design/cargo-workers.md phase 4) instead of running a nested runtime.
     docker_args: Vec<String>,
-    /// If set, bind-mount this engine socket into every worker container
-    /// (`-v <sock>:<sock>`). The OUTER runnerd sets it to hand a granted
-    /// worker the socket its own inner runnerd will delegate to. This is a
-    /// coarse pool-level grant (every worker this runnerd launches gets it);
-    /// only set it on a runnerd whose workers are trusted with the engine.
+    /// The engine socket this runnerd can grant. It is bind-mounted only into
+    /// worker containers whose IMAGE asks for it (`SOCKET_GRANT_ENV` in the
+    /// image's own config env) — the socket is root-equivalent over this
+    /// engine, so it is a per-image grant, declared by the image the same way
+    /// `CAOS_WORKER_UID=0` declares its root grant. Unset here means no worker
+    /// can be granted it at all, whatever the image claims.
     socket: Option<String>,
+    /// Memo for `image_wants_socket`: image ref -> declared. Refs are
+    /// content-addressed, so a cached answer cannot go stale, and the same
+    /// handful of images run over and over.
+    socket_grant: Mutex<HashMap<String, bool>>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -105,6 +119,7 @@ fn main() {
             .split_whitespace()
             .map(str::to_string)
             .collect(),
+        socket_grant: Mutex::new(HashMap::new()),
         socket: std::env::var("CAOS_RUNNER_SOCKET")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -119,6 +134,68 @@ fn main() {
         threads.push(std::thread::spawn(move || slot_loop(&config, slot)));
     }
     slot_loop(&config, 0);
+}
+
+/// Does this image ASK for the engine socket (`SOCKET_GRANT_ENV` in its config
+/// env)? Read from the image itself, not from the job or its args, so a caller
+/// cannot talk its way into the grant — only the image's author can, and the
+/// image is content-addressed.
+///
+/// `image inspect` needs the image present, and `run` is what normally pulls
+/// it, so a miss pulls first. Both answers are memoized per ref: a wrong
+/// answer here is a silent loss of containment, so the failure mode is chosen
+/// deliberately — anything that goes wrong reads as "no grant".
+fn image_wants_socket(config: &Config, image_ref: &str) -> bool {
+    if let Some(known) = config
+        .socket_grant
+        .lock()
+        .expect("socket grant memo")
+        .get(image_ref)
+    {
+        return *known;
+    }
+    let inspect = |args: &[&str]| {
+        Command::new(&config.docker_bin)
+            .args(&config.docker_args)
+            .args(args)
+            .output()
+    };
+    let mut out = inspect(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{range .Config.Env}}{{println .}}{{end}}",
+        image_ref,
+    ]);
+    if !matches!(&out, Ok(o) if o.status.success()) {
+        // Not pulled yet: `run` would have fetched it, so fetch it here.
+        let _ = inspect(&["pull", image_ref]);
+        out = inspect(&[
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            image_ref,
+        ]);
+    }
+    let wants = match &out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|line| line.trim() == format!("{SOCKET_GRANT_ENV}=1")),
+        _ => {
+            eprintln!("caos-runnerd: cannot inspect {image_ref}; no engine socket granted");
+            false
+        }
+    };
+    if wants {
+        eprintln!("caos-runnerd: {image_ref} declares {SOCKET_GRANT_ENV}; granting engine socket");
+    }
+    config
+        .socket_grant
+        .lock()
+        .expect("socket grant memo")
+        .insert(image_ref.to_string(), wants);
+    wants
 }
 
 /// One slot: poll for a job, run its container, wait for the container to die,
@@ -156,6 +233,7 @@ fn poll(config: &Config) -> Result<Option<Job>, String> {
     let url = format!("{}/runner/poll", config.server_url.trim_end_matches('/'));
     let mut req = minreq::post(&url)
         .with_header("content-type", "application/json")
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
         .with_timeout(POLL_TTL.as_secs() + 15)
         .with_body(body.to_string());
     if let Some(token) = &config.token {
@@ -205,13 +283,15 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         .arg("--rm")
         .args(["--network", &config.network]);
     if let Some(sock) = &config.socket {
-        // Hand the worker the engine socket so its own inner runnerd can
-        // delegate sibling containers to this engine (phase 4). Bind it at a
-        // fixed in-container path and advertise that path, so the worker never
-        // needs to know the host socket's location.
-        command
-            .args(["-v", &format!("{sock}:{ENGINE_SOCKET_PATH}")])
-            .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")]);
+        if image_wants_socket(config, &job.image_ref) {
+            // Hand THIS worker the engine socket so its own inner runnerd can
+            // delegate sibling containers to this engine (phase 4). Bind it at
+            // a fixed in-container path and advertise that path, so the worker
+            // never needs to know the host socket's location.
+            command
+                .args(["-v", &format!("{sock}:{ENGINE_SOCKET_PATH}")])
+                .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")]);
+        }
     }
     let out = command
         .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])
@@ -264,6 +344,7 @@ fn post_failure(config: &Config, job: &Job, error: &str, log: &str) -> Result<()
     let url = format!("{}/runner/result", config.server_url.trim_end_matches('/'));
     let mut req = minreq::post(&url)
         .with_header("content-type", "application/json")
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
         .with_timeout(30)
         .with_body(body.to_string());
     if let Some(token) = &config.token {
