@@ -121,13 +121,20 @@ trap 'rm -rf "$WORK"' EXIT
 
 declare -A hash_of
 
-# The streamed std entries (design/flake-images.md): compose the nix tarball's
-# layers onto the stock nixos/nix base with `docker build` — ADD extracts each
-# layer.tar as root, preserving the setuid caos — push the result to the local
-# registry, and publish the std entry as a curry node over the digest ref
-# (`base` = docker://<host-facing ref>; runnerd's docker pulls it directly).
-# The registry tag, keyed on the tarball's immutable store path, is the memo:
-# an unchanged image re-publishes with one HEAD request and no build.
+# The streamed std entries (design/flake-images.md): the nix tarball is the
+# CLEAN image — no caos, no user db, no /tmp. The compose stacks the caos
+# additions on top as a CONTENT-KEYED tar layer (and, for the runner, its
+# /worker the same way): the same clean-image + additions-delta shape the
+# stack stage gives every flake image. `docker build` ADD extracts each tar
+# as root, preserving the setuid caos; the result is pushed and the std
+# entry published as a curry node over the digest ref (`base` =
+# docker://<host-facing ref>; runnerd's docker pulls it directly).
+#
+# The registry tag — the memo — keys on (clean tarball store path, the
+# composed binaries' CONTENT). The clean images depend on nothing from the
+# workspace, so a Rust edit that leaves the client's (and worker-runner's)
+# bytes unchanged is a registry hit: no re-stream, no curry movement, no
+# downstream re-keying.
 REGISTRY=localhost:5000 # the compose stack's registry, host-published (caosd)
 manifest_digest() { # <repo:tag> -> the registry's manifest digest, or empty
   curl -fsSI \
@@ -136,10 +143,58 @@ manifest_digest() { # <repo:tag> -> the registry's manifest digest, or empty
     "http://$REGISTRY/v2/caos/manifests/$1" 2>/dev/null \
     | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" {print $2}'
 }
+tool_bin() { # <name> -> the path of bin/<name> among the built paths
+  local p
+  # shellcheck disable=SC2086
+  for p in $bin_paths; do
+    if [ -x "$p/bin/$1" ]; then
+      echo "$p/bin/$1"
+      return 0
+    fi
+  done
+  echo "build-builtins: no binary $1 in the built paths" >&2
+  exit 1
+}
+# A deterministic tar of a staged directory: sorted, epoch mtimes, root-
+# owned — identical content always tars to identical bytes, so the tars
+# can serve as content keys.
+dtar() { # <dir> <out.tar>
+  tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    -C "$1" -cf "$2" .
+}
+caos_bin=$(tool_bin caos)
+runner_bin=$(tool_bin worker-runner)
+# The caos additions as one staged layer: the setuid client, the worker
+# user db, a writable /tmp, /usr/bin/env (env-shebang scripts; every
+# streamed userland has /bin/env). setuid needs no privilege here — the
+# staging file is ours, tar records the mode, ADD extracts it as root.
+ADDITIONS="$WORK/additions"
+mkdir -p "$ADDITIONS/bin" "$ADDITIONS/tmp" "$ADDITIONS/usr/bin" "$ADDITIONS/etc"
+install -m 755 "$caos_bin" "$ADDITIONS/bin/caos"
+chmod 4755 "$ADDITIONS/bin/caos"
+chmod 1777 "$ADDITIONS/tmp"
+ln -s /bin/env "$ADDITIONS/usr/bin/env"
+printf 'root:x:0:0:root:/root:/sbin/nologin\nworker:x:1000:1000:caos worker:/tmp:/sbin/nologin\n' \
+  > "$ADDITIONS/etc/passwd"
+printf 'root:x:0:\nworker:x:1000:\n' > "$ADDITIONS/etc/group"
+dtar "$ADDITIONS" "$WORK/additions.tar"
+# The runner's /worker, its own layer: worker-runner is the pool protocol's
+# in-image half, and the host is this image's author.
+WORKERDIR="$WORK/runner-worker"
+mkdir -p "$WORKERDIR"
+install -m 755 "$runner_bin" "$WORKERDIR/worker"
+dtar "$WORKERDIR" "$WORK/runner-worker.tar"
+
 for name in "${image_names[@]}"; do
   is_streamed_entry "$name" || continue
   tarball=${img_path[$name]}
-  stag="$name-$(printf '%s' "$tarball" | sha1sum | cut -c1-12)"
+  extra_tars=(additions.tar)
+  [ "$name" = runner ] && extra_tars+=(runner-worker.tar)
+  content_key=$tarball
+  for t in "${extra_tars[@]}"; do
+    content_key="$content_key:$(sha1sum < "$WORK/$t" | cut -d' ' -f1)"
+  done
+  stag="$name-$(printf '%s' "$content_key" | sha1sum | cut -c1-12)"
   digest=$(manifest_digest "$stag" || true)
   if [ -n "$digest" ]; then
     echo "$name: registry hit for $stag" >&2
@@ -148,13 +203,19 @@ for name in "${image_names[@]}"; do
     ctx="$WORK/stream-$name"
     mkdir "$ctx"
     tar -xzf "$tarball" -C "$ctx"
+    for t in "${extra_tars[@]}"; do
+      cp "$WORK/$t" "$ctx/$t"
+    done
     cfg=$(jq -r '.[0].Config' "$ctx/manifest.json")
-    # Both streamed images are self-contained — their nix-built closures
-    # ARE the images — so they compose FROM scratch; nothing stock rides
-    # underneath.
+    # The clean images are self-contained — their nix-built closures ARE
+    # the base — so the compose is FROM scratch: the clean layers, then
+    # the content-keyed deltas.
     {
       printf 'FROM scratch\n'
       jq -r '.[0].Layers[] | "ADD \(.) /"' "$ctx/manifest.json"
+      for t in "${extra_tars[@]}"; do
+        printf 'ADD %s /\n' "$t"
+      done
       jq -r '.config.Env[]? | "ENV \(.)"' "$ctx/$cfg"
       printf 'ENTRYPOINT %s\n' "$(jq -c '.config.Entrypoint' "$ctx/$cfg")"
     } > "$ctx/Dockerfile"

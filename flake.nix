@@ -110,9 +110,9 @@
         # whole-tree `src`, so any edit re-keyed and rebuilt every one of them —
         # the split bought no incrementality while paying the per-binary compile
         # + link N times over. A single `--workspace` build does the shared work
-        # once and parallelizes across cores. Images stay single-binary: their
-        # roots copy one *named* binary out of this output's /bin (see workerRoot
-        # / installWorkerFiles), so nothing extra ever lands in an image.
+        # once and parallelizes across cores. Images stay single-binary: each
+        # consumer copies one *named* binary out of this output's /bin, so
+        # nothing extra ever lands in an image.
         workspaceBins = craneLib.buildPackage (
           commonArgs
           // {
@@ -150,107 +150,54 @@
         # the server image's tools come from linuxPkgs — substituted prebuilt from
         # the binary cache.
 
-        # Worker images carry the `caos` binary (the worker-side client) at
-        # `/bin/caos`. The `/cas` directory is *not* baked in — the `caos` runner
-        # creates it at runtime (so a mounted, empty /cas volume works too).
-        #
-        # This store path holds only what needs *no* special permissions: the user
-        # database. `caos` itself can't live here — it must be setuid-root (so a
-        # non-root worker can mutate the root-owned /cas through it, and only
-        # through it), and Nix strips the setuid bit when it seals a store path.
-        # So caos (and a writable /tmp) are installed per-image by
-        # `installWorkerFiles` below, which runs while the image layer is built.
-        workerBaseRoot = pkgs.runCommand "caos-worker-base-root" { } ''
-          mkdir -p $out/etc
-          printf 'root:x:0:0:root:/root:/sbin/nologin\n' > $out/etc/passwd
-          printf 'worker:x:1000:1000:caos worker:/tmp:/sbin/nologin\n' >> $out/etc/passwd
-          printf 'root:x:0:\nworker:x:1000:\n' > $out/etc/group
-        '';
-
-        # Commands run while assembling a worker image's layer (under fakeroot, so
-        # everything is recorded as root-owned): install caos as a setuid-root
-        # binary and create the world-writable /tmp the unprivileged worker needs
-        # (it can't create one under the root-owned /). `bin` is always a real
-        # directory here (the base image makes it; the others get it from
-        # bash/coreutils), so the copy lands as a real file the chmod can mark.
-        installWorkerFiles = ''
-          mkdir -p bin
-          cp ${caos}/bin/caos bin/caos
-          chmod 4755 bin/caos
-          mkdir -p tmp
-          chmod 1777 tmp
-          # /usr/bin/env, for env-shebang worker scripts (std/bash/worker
-          # runs on these nix-rooted images AND on nixos/nix, which has env but
-          # no /bin/bash — the env shebang is the portable meeting point).
-          mkdir -p usr/bin
-          [ -e usr/bin/env ] || ln -s /bin/env usr/bin/env
-        '';
         # Two worker images live here — the host-built streamed core: the
         # flake-builder (below) and the runner (workerRunnerImage). Every
         # other std entry is a literal checked-in flake tree (std/{cargo,
         # bash,testenv} — design/flake-images.md part 2), each defining its
         # own /worker, or a curry(runner, worker1=<static musl binary>)
-        # (builtinWorkerBins below). std/runner is the pooled bin-worker
-        # base; the old debian-delta `base` entry had no consumers and is
-        # gone.
+        # (builtinWorkerBins below).
+        #
+        # Both are built CLEAN — no caos, no user db, no /tmp. The caos
+        # additions (and the runner's /worker) are composed on at publish
+        # by build-builtins.sh as CONTENT-KEYED tar layers over these
+        # images: the same clean-image + additions-delta shape the stack
+        # stage gives every flake image, and the reason a workspace rebuild
+        # that leaves the binaries' bytes unchanged re-streams nothing.
+        # (Nix could not bake the additions anyway — it strips setuid when
+        # it seals a store path — and nix-side baking keyed them on store
+        # PATHS, which rename on every rebuild.)
 
-        # The flake-builder (design/flake-images.md): the SOLE bootstrap builtin
-        # — the one image the flake path can't build (it IS the flake path),
-        # so the host builds it. Its DEFINITION is std/flake-builder's own
-        # flake (self-contained: nix, certs, tools, the /worker stage
-        # script): we call its outputs function directly — the standard
-        # subflake call, no path-input lock churn — passing OUR nixpkgs
-        # (tests/std-lint pins the subflake's lock to the same revision),
-        # and consume lib.<system>.imageDef, the image's ingredients. The
-        # wrap below adds the caos additions; build-builtins.sh streams the
-        # tarball FROM scratch, like the runner's. The stage script
-        # `nix build`s a flake's `#caosImage`, streams the CLEAN image to
-        # the registry, then stacks a caos runner delta.
-        flakeBuilderDef =
+        # The flake-builder (design/flake-images.md): the SOLE bootstrap
+        # builtin — the one image the flake path can't build (it IS the
+        # flake path), so the host builds it. Its definition is
+        # std/flake-builder's own flake, taken AS-IS: we call its outputs
+        # function directly — the standard subflake call, no path-input
+        # lock churn — passing OUR nixpkgs (tests/std-lint pins the
+        # subflake's lock to the same revision). Its clean #caosImage is
+        # exactly what streams.
+        workerFlakeBuilderImage =
           ((import ./std/flake-builder/flake.nix).outputs {
             self = null;
             inherit nixpkgs;
-          }).lib.${linuxSystem}.imageDef;
-        workerFlakeBuilderImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-flake-builder";
-          tag = "latest";
-          contents = [
-            flakeBuilderDef.root
-            workerBaseRoot
-          ];
-          config = flakeBuilderDef.config;
-          # The in-image `nix build` needs the closure registered in the
-          # store db, not just present under /nix/store.
-          includeNixDB = true;
-          fakeRootCommands = installWorkerFiles;
-        };
+          }).packages.${linuxSystem}.caosImage;
 
         # std/runner as HOST-BUILT streamed core (design/flake-images.md,
         # part 2): the pooled interpreter IMAGE every compiled worker runs
         # on — not a worker itself (its /worker awaits a worker1; the
-        # workers are the curries over it).
-        # worker-runner is the in-image half of the runner-pool protocol
-        # — it versions with the client and the protocol, not with std
-        # content — so the host builds this image like the flake-builder's
-        # and build-builtins.sh streams it; the std entry is a curry over
-        # the digest. Unlike the flake-builder there is no stock base: the
-        # userland is nix-built, so the compose is FROM scratch and the
-        # whole (small) closure pushes once per change, memoized on the
-        # tarball's store path. The caos additions bake in here
-        # (workerBaseRoot + installWorkerFiles) — streamed images never pass
-        # through the flake path's stack stage.
-        workerRunnerRoot = pkgs.runCommand "caos-worker-runner-worker-root" { } ''
-          mkdir -p $out
-          install -m 755 ${worker-runner}/bin/worker-runner $out/worker
-        '';
+        # workers are the curries over it). worker-runner is the in-image
+        # half of the runner-pool protocol — it versions with the client
+        # and the protocol, not with std content — so the host builds and
+        # streams this image; the std entry is a curry over the digest.
+        # The image here is the USERLAND ONLY: /worker rides in at publish
+        # as a content-keyed layer next to the additions (build-builtins),
+        # so this derivation depends on nothing from the workspace and a
+        # Rust edit never re-keys it.
         workerRunnerImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-runner";
           tag = "latest";
           # bash provides /bin/sh too. The userland is what compiled workers
           # — and the commands bash-tool runs for the agent — see at runtime.
           contents = [
-            workerRunnerRoot
-            workerBaseRoot
             linuxPkgs.bash
             linuxPkgs.coreutils
             linuxPkgs.diffutils
@@ -270,7 +217,6 @@
             ];
             Env = [ "PATH=/bin" ];
           };
-          fakeRootCommands = installWorkerFiles;
         };
 
         # The cargo toolchain + workspace-deps bake (design/cargo-workers.md,
