@@ -6,8 +6,7 @@
 # The literal-tree lints (design/flake-images.md, part 2): std's checked-in
 # redundancies must match what std/refresh.sh regenerates from their sources
 # of truth — each std flake.lock re-derives byte-identically from the root
-# flake.lock, std/testenv/worker equals std/bash/worker, and std/cargo's
-# vendored manifests/lockfile/toolchain/target stubs match the workspace.
+# flake.lock.
 # The check IS the generator run in --check mode (one script, one code
 # path), so the lint cannot drift from what a refresh would write. The
 # workspace arrives in this test's wrapper, staged as $CAOS_PROJECT

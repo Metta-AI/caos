@@ -243,8 +243,8 @@
 
         # Two worker images live here — the host-built streamed core: the
         # flake-builder (below) and the runner (workerRunnerImage). Every
-        # other std entry is a literal checked-in flake tree (std/{cargo,
-        # bash,testenv} — design/flake-images.md part 2), each defining its
+        # other std entry is a literal checked-in flake tree (std/bash —
+        # design/flake-images.md part 2), each defining its
         # own /worker, or a curry(runner, worker1=<static musl binary>)
         # (builtinWorkerBins below).
         #
@@ -457,8 +457,7 @@
             linuxPkgs.coreutils
             # cmp/diff: the tests compare cached results byte for byte, and
             # std/refresh.sh --check re-derives and diffs every checked-in
-            # std copy. This image is now the environment every test runs in,
-            # so it inherits what std/testenv carried.
+            # std copy. This image is the environment every test runs in.
             linuxPkgs.diffutils
             linuxPkgs.gnugrep
             linuxPkgs.gnused
@@ -486,7 +485,7 @@
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               # Root: this worker starts daemons, owns an inner git dir, and
               # drives the engine socket — the same per-image containment
-              # grant the flake-builder and testenv carry.
+              # grant the flake-builder carries.
               "CAOS_WORKER_UID=0"
               "CAOS_WORKER_GID=0"
               # The engine socket, declared the same way: this image hosts a
@@ -882,12 +881,6 @@
 
             case "''${1:-up}" in
             up)
-              # Install THIS deploy's client next to the stack state: the
-              # client and the stack are one trust boundary (the old,
-              # known-good caos), and consumers that build nothing — the
-              # test runner — find it at $CAOS_DATA/bin/caos-cli.
-              mkdir -p "$CAOS_DATA/bin"
-              install -m 755 ${caos-cli}/bin/caos-cli "$CAOS_DATA/bin/caos-cli"
               # Load the server/runnerd images only when this exact build isn't
               # already in docker. We tag the loaded image with a hash of its
               # (immutable) nix store path; the tag's presence means "this build is
@@ -1125,5 +1118,3 @@
       }
     );
 }
-
-# drv-probe comment

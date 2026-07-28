@@ -7,15 +7,12 @@
 # drift from the generator. tests/std-lint runs the check in the suite.
 #
 # What it maintains:
-#   std/{runner,bash,testenv,cargo}/flake.lock
+#   std/{bash,cargo,flake-builder}/flake.lock
 #       derived from the ROOT flake.lock: the named input nodes copied
 #       verbatim (locked revs + originals + follows edges) under a root
 #       naming just those inputs — a std flake's pins structurally cannot
 #       drift from the root's (std/cargo keeps the exact rustc that builds
 #       caos; the caos-in-caos suite depends on that). Rerun on pin bumps.
-#   std/testenv/worker
-#       a copy of std/bash/worker (the source of truth): a flake reads only
-#       its own tree, so each flake carries the script.
 #
 # std/cargo used to vendor the workspace's manifests, lockfile, toolchain
 # file and per-crate target stubs here too — because a PUBLISHED flake tree
@@ -66,20 +63,15 @@ derive_lock() { # <out> <input name>...
 }
 
 # Generate the whole redundant set under $tmp, mirroring the repo layout.
-mkdir -p "$tmp/std/bash" "$tmp/std/testenv" "$tmp/std/cargo" "$tmp/std/flake-builder"
+mkdir -p "$tmp/std/bash" "$tmp/std/cargo" "$tmp/std/flake-builder"
 derive_lock "$tmp/std/bash/flake.lock" nixpkgs
-derive_lock "$tmp/std/testenv/flake.lock" nixpkgs
 derive_lock "$tmp/std/cargo/flake.lock" nixpkgs rust-overlay crane
 derive_lock "$tmp/std/flake-builder/flake.lock" nixpkgs
 
-cp std/bash/worker "$tmp/std/testenv/worker"
-
 # The maintained set.
 files="std/bash/flake.lock
-std/testenv/flake.lock
 std/cargo/flake.lock
-std/flake-builder/flake.lock
-std/testenv/worker"
+std/flake-builder/flake.lock"
 
 if [ "$check" = 1 ]; then
   fail=0

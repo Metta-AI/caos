@@ -77,7 +77,7 @@
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               # Root: the nix store is root-owned (the same per-image
-              # containment grant the test nixbuilder and testenv carry).
+              # containment grant the test stack carries).
               "CAOS_WORKER_UID=0"
               "CAOS_WORKER_GID=0"
             ];
