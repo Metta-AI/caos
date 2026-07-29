@@ -3,10 +3,13 @@
 # `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
 #
 # Entries come in three forms (see the is_*_entry predicates below):
-#   streamed  (flake-builder, runner,    host-nix-built core, composed with
-#              cargo)                    `docker build` and pushed to the
-#                                        registry; the entry is a curry over
-#                                        the digest ref
+#   delta     (flake-builder, runner,    the host-nix-built CLEAN image goes
+#              cargo)                    to the registry once, keyed on its
+#                                        store path; the entry is a git-docker
+#                                        tree {base, config.json, layer<NN>}
+#                                        the server stacks and pushes on first
+#                                        use — the same shape std/flake-builder
+#                                        emits
 #   flake     (bash)                     literal checked-in std/<name> dirs —
 #                                        complete worker images, /worker
 #                                        included; the flake-builder images
@@ -19,7 +22,8 @@
 # caos refs/caos/std` and resolve it locally to reach the library.
 #
 # Usage: ./build-builtins.sh [name ...]   (default: all)
-# Requires the dev server running and git + jq + docker on PATH.
+# Requires the dev server running and git + skopeo + curl on PATH. No docker:
+# this script composes no images — it pushes clean ones and describes deltas.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT=$PWD
@@ -33,16 +37,11 @@ names=("$@")
 # tests/std-lint verifies them). The server's flake-builder images each
 # tree on first use.
 is_flake_entry() { case "$1" in bash) return 0 ;; *) return 1 ;; esac; }
-# std entries whose image is STREAMED to the registry instead of imported into
-# git (design/flake-images.md): host-nix-built core, composed with `docker
-# build` and pushed; the std entry is a tiny curry node over the digest ref,
-# so no layer bytes ever enter git. The flake-builder (the bootstrap image)
-# and the runner (the pooled interpreter) — both self-contained, FROM
-# scratch — plus cargo, whose image the root flake builds from the same
-# `src` and toolchain as the binaries (so its deps are cargoArtifacts, not a
-# second compile of them); a streamed image needs no self-contained tree,
-# which is what retired std/cargo's vendored manifests and crate stubs.
-is_streamed_entry() { case "$1" in flake-builder | runner | cargo) return 0 ;; *) return 1 ;; esac; }
+# Everything else is a DELTA entry: the flake-builder (the bootstrap image),
+# the runner (the pooled interpreter) — both self-contained nix closures — and
+# cargo, whose image the root flake builds from the same `src` and toolchain as
+# the binaries (so its deps are cargoArtifacts, not a second compile of them).
+# The partition is exactly two-way, so "not a flake entry" IS the predicate.
 image_names=()
 for name in "${names[@]}"; do
   is_flake_entry "$name" || image_names+=("$name")
@@ -123,34 +122,35 @@ trap 'rm -rf "$WORK"' EXIT
 
 declare -A hash_of
 
-# The streamed std entries (design/flake-images.md): the nix tarball is the
-# CLEAN image — no caos, no user db, no /tmp. The compose stacks the caos
-# additions on top as a CONTENT-KEYED tar layer (and, for the runner, its
-# /worker the same way): the same clean-image + additions-delta shape the
-# stack stage gives every flake image. `docker build` ADD extracts each tar
-# as root, preserving the setuid caos; the result is pushed and the std
-# entry published as a curry node over the digest ref (`base` =
-# docker://<host-facing ref>; runnerd's docker pulls it directly).
-#
-# The registry tag — the memo — keys on (clean tarball store path, the
-# composed binaries' CONTENT). The clean images depend on nothing from the
-# workspace, so a Rust edit that leaves the client's (and worker-runner's)
-# bytes unchanged is a registry hit: no re-stream, no curry movement, no
-# downstream re-keying.
 REGISTRY=localhost:5000 # the compose stack's registry, host-published (caosd)
 # The same registry as THIS SCRIPT reaches it over HTTP. On the host the two
 # names coincide. Inside the test stack (design/test-stack-image.md) they do
-# not: the docker daemon we drive is the outer one, which resolves
-# localhost:5000, while we run in a container on caos-net and must call it
-# caos-registry:5000. The refs we mint stay $REGISTRY — they are for the
-# daemon, not for us.
+# not: we run in a container on caos-net and must call it caos-registry:5000.
 REGISTRY_HTTP=${CAOS_REGISTRY_HTTP:-$REGISTRY}
-manifest_digest() { # <repo:tag> -> the registry's manifest digest, or empty
-  curl -fsSI \
+# How the SERVER reaches the same registry: it pulls a delta's `base` with
+# skopeo from inside its own container, where the registry is a service on
+# the docker network. Mirrors the server's own CAOS_REGISTRY_PUSH_URL default.
+REGISTRY_BASE_HOST=${CAOS_REGISTRY_BASE_HOST:-caos-registry:5000}
+# <repo:tag> -> the registry's manifest digest, or empty when the tag is absent.
+# ABSENT AND BROKEN ARE DIFFERENT: a 404 is the ordinary first-push case and
+# returns empty, but an unreachable registry or any other status is fatal —
+# swallowing those would silently re-push (or worse, mint a `base` ref for an
+# image nothing can pull).
+manifest_digest() { # <repo:tag>
+  local url headers status
+  url="http://$REGISTRY_HTTP/v2/caos/manifests/$1"
+  headers=$(curl -sSI \
     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
     -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-    "http://$REGISTRY_HTTP/v2/caos/manifests/$1" 2>/dev/null \
-    | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" {print $2}'
+    "$url") || { echo "build-builtins: registry unreachable: $url" >&2; exit 1; }
+  status=$(printf '%s\n' "$headers" | awk 'NR==1 {print $2}')
+  case "$status" in
+    200) printf '%s\n' "$headers" \
+           | tr -d '\r' \
+           | awk 'tolower($1)=="docker-content-digest:" {print $2}' ;;
+    404) ;;
+    *) echo "build-builtins: registry returned $status for $url" >&2; exit 1 ;;
+  esac
 }
 tool_bin() { # <name> -> the path of bin/<name> among the built paths
   local p
@@ -164,77 +164,104 @@ tool_bin() { # <name> -> the path of bin/<name> among the built paths
   echo "build-builtins: no binary $1 in the built paths" >&2
   exit 1
 }
-# A deterministic tar of a staged directory: sorted, epoch mtimes, root-
-# owned — identical content always tars to identical bytes, so the tars
-# can serve as content keys.
-dtar() { # <dir> <out.tar>
-  tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-    -C "$1" -cf "$2" .
-}
 caos_bin=$(tool_bin caos)
 runner_bin=$(tool_bin worker-runner)
-# The caos additions as one staged layer: the setuid client, the worker
-# user db, a writable /tmp, /usr/bin/env (env-shebang scripts; every
-# streamed userland has /bin/env). setuid needs no privilege here — the
-# staging file is ours, tar records the mode, ADD extracts it as root.
-ADDITIONS="$WORK/additions"
-mkdir -p "$ADDITIONS/bin" "$ADDITIONS/tmp" "$ADDITIONS/usr/bin" "$ADDITIONS/etc"
-install -m 755 "$caos_bin" "$ADDITIONS/bin/caos"
-chmod 4755 "$ADDITIONS/bin/caos"
-chmod 1777 "$ADDITIONS/tmp"
-ln -s /bin/env "$ADDITIONS/usr/bin/env"
+
+# The caos additions, staged as a git-docker LAYER TREE — the same shape
+# std/flake-builder's stack stage emits, so both image paths in this tree
+# compose deltas exactly one way. The server rebuilds the layer tar from
+# this at convert time and applies the `<name>.caosmeta` sidecars for the
+# modes git cannot record (setuid, sticky).
+#
+# Staged inside CLIENT because only git-tracked paths can be hashed here.
+ADD=$CLIENT/layer-additions
+rm -rf "${ADD:?}"
+mkdir -p "$ADD/bin" "$ADD/usr/bin" "$ADD/etc"
+install -m 755 "$caos_bin" "$ADD/bin/caos"
+# setuid needs no privilege here: the sidecar is data, and the SERVER (root)
+# applies the mode when it rebuilds the layer.
+printf '{"mode":"4755","uid":0,"gid":0}' > "$ADD/bin/caos.caosmeta"
+# /usr/bin/env for env-shebang scripts; every streamed userland has /bin/env.
+ln -s /bin/env "$ADD/usr/bin/env"
 printf 'root:x:0:0:root:/root:/sbin/nologin\nworker:x:1000:1000:caos worker:/tmp:/sbin/nologin\n' \
-  > "$ADDITIONS/etc/passwd"
-printf 'root:x:0:\nworker:x:1000:\n' > "$ADDITIONS/etc/group"
-dtar "$ADDITIONS" "$WORK/additions.tar"
+  > "$ADD/etc/passwd"
+printf 'root:x:0:\nworker:x:1000:\n' > "$ADD/etc/group"
+# The world-writable /tmp is an EMPTY directory, which git cannot record at
+# all — so its 1777 sidecar is staged here and the directory itself is
+# spliced into the tree below as the empty tree.
+printf '{"mode":"1777","uid":0,"gid":0}' > "$ADD/tmp.caosmeta"
+git -C "$CLIENT" add layer-additions
+EMPTY_TREE=$(git -C "$CLIENT" mktree </dev/null)
+additions_tree=$(
+  {
+    git -C "$CLIENT" ls-tree "$(git -C "$CLIENT" write-tree --prefix=layer-additions/)"
+    printf '040000 tree %s\ttmp\n' "$EMPTY_TREE"
+  } | git -C "$CLIENT" mktree
+)
+
 # The runner's /worker, its own layer: worker-runner is the pool protocol's
 # in-image half, and the host is this image's author.
-WORKERDIR="$WORK/runner-worker"
-mkdir -p "$WORKERDIR"
-install -m 755 "$runner_bin" "$WORKERDIR/worker"
-dtar "$WORKERDIR" "$WORK/runner-worker.tar"
+RW=$CLIENT/layer-runner
+rm -rf "${RW:?}"
+mkdir -p "$RW"
+install -m 755 "$runner_bin" "$RW/worker"
+git -C "$CLIENT" add layer-runner
+runner_tree=$(git -C "$CLIENT" write-tree --prefix=layer-runner/)
 
+# The streamed std entries (design/one-stack-image.md): the nix tarball is the
+# CLEAN image — no caos, no user db, no /tmp — and it goes to the registry
+# ONCE, keyed on its store path ALONE. The clean images depend on nothing in
+# the workspace, so a Rust edit never re-pushes one.
+#
+# The std entry itself is a git-docker delta {base, config.json, layer<NN>}:
+# the server stacks our layers on that base and pushes the result the first
+# time something runs it, memoized in redis by the tree's hash. So no layer
+# bytes of the CLEAN image ever enter git, and this script does no image
+# composition at all — no docker, no build context, no manifest surgery.
 for name in "${image_names[@]}"; do
-  is_streamed_entry "$name" || continue
   tarball=${img_path[$name]}
-  extra_tars=(additions.tar)
-  [ "$name" = runner ] && extra_tars+=(runner-worker.tar)
-  content_key=$tarball
-  for t in "${extra_tars[@]}"; do
-    content_key="$content_key:$(sha1sum < "$WORK/$t" | cut -d' ' -f1)"
-  done
-  stag="$name-$(printf '%s' "$content_key" | sha1sum | cut -c1-12)"
-  digest=$(manifest_digest "$stag" || true)
+  ctag="clean-$name-$(printf '%s' "$tarball" | sha1sum | cut -c1-12)"
+  digest=$(manifest_digest "$ctag")
   if [ -n "$digest" ]; then
-    echo "$name: registry hit for $stag" >&2
+    echo "$name: registry hit for $ctag" >&2
   else
-    echo "$name: composing + streaming $stag..." >&2
-    ctx="$WORK/stream-$name"
-    mkdir "$ctx"
-    tar -xzf "$tarball" -C "$ctx"
-    for t in "${extra_tars[@]}"; do
-      cp "$WORK/$t" "$ctx/$t"
-    done
-    cfg=$(jq -r '.[0].Config' "$ctx/manifest.json")
-    # The clean images are self-contained — their nix-built closures ARE
-    # the base — so the compose is FROM scratch: the clean layers, then
-    # the content-keyed deltas.
-    {
-      printf 'FROM scratch\n'
-      jq -r '.[0].Layers[] | "ADD \(.) /"' "$ctx/manifest.json"
-      for t in "${extra_tars[@]}"; do
-        printf 'ADD %s /\n' "$t"
-      done
-      jq -r '.config.Env[]? | "ENV \(.)"' "$ctx/$cfg"
-      printf 'ENTRYPOINT %s\n' "$(jq -c '.config.Entrypoint' "$ctx/$cfg")"
-    } > "$ctx/Dockerfile"
-    docker build -t "$REGISTRY/caos:$stag" "$ctx" >&2
-    docker push "$REGISTRY/caos:$stag" >&2
-    digest=$(manifest_digest "$stag")
-    [ -n "$digest" ] || { echo "build-builtins: no digest for pushed $stag" >&2; exit 1; }
+    echo "$name: streaming clean image $ctag..." >&2
+    # skopeo's docker-archive transport reads an uncompressed tar; nix hands
+    # us .tar.gz.
+    gunzip -c "$tarball" > "$WORK/$name.tar"
+    skopeo --insecure-policy copy --dest-tls-verify=false \
+      "docker-archive:$WORK/$name.tar" "docker://$REGISTRY_HTTP/caos:$ctag" >&2
+    rm -f "$WORK/$name.tar"
+    digest=$(manifest_digest "$ctag")
+    [ -n "$digest" ] || { echo "build-builtins: no digest for pushed $ctag" >&2; exit 1; }
   fi
-  hash_of[$name]=$(cd "$CLIENT" && "$caos" curry "docker://$REGISTRY/caos@$digest" --)
-  echo "$name: streamed -> curry ${hash_of[$name]}" >&2
+
+  img=$CLIENT/img-$name
+  rm -rf "${img:?}"
+  mkdir -p "$img"
+  # `base` is read by the SERVER, which pulls it with skopeo from inside its
+  # own container (crates/server/src/compute.rs, fetch_base) — so it carries
+  # the on-network registry name, not the host-published one the docker
+  # daemon uses.
+  printf 'docker://%s/caos@%s' "$REGISTRY_BASE_HOST" "$digest" > "$img/base"
+  # The clean image's own OCI config, verbatim: it already names the runner
+  # entrypoint and its PATH, because its flake said so.
+  skopeo --insecure-policy inspect --tls-verify=false --config \
+    "docker://$REGISTRY_HTTP/caos:$ctag" > "$img/config.json"
+  git -C "$CLIENT" add "img-$name"
+  hash_of[$name]=$(
+    {
+      git -C "$CLIENT" ls-tree "$(git -C "$CLIENT" write-tree --prefix="img-$name/")"
+      printf '040000 tree %s\tlayer00\n' "$additions_tree"
+      # Not `[ ... ] && printf`: this is the block's last command, so under
+      # `set -e -o pipefail` a false test would fail the whole substitution
+      # for every entry that is not the runner.
+      if [ "$name" = runner ]; then
+        printf '040000 tree %s\tlayer01\n' "$runner_tree"
+      fi
+    } | git -C "$CLIENT" mktree
+  )
+  echo "$name: git-docker delta ${hash_of[$name]} over $ctag" >&2
 done
 
 # The flake-tree std entries (design/flake-images.md): bash is LITERAL —

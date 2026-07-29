@@ -828,13 +828,15 @@
         # persistent state — server repo, publish client repo, redis, registry.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          # jq: build-builtins.sh parses the flake-builder tarball's image
-          # manifest when streaming it to the registry. tar: it unpacks
-          # that tarball for the same streaming step.
+          # skopeo + gzip: build-builtins.sh pushes each CLEAN image straight
+          # from its nix tarball to the registry (gunzip because skopeo's
+          # docker-archive transport wants an uncompressed tar). It no longer
+          # needs jq or tar — it composes no images, so there is no manifest to
+          # parse and no build context to unpack.
           # docker rides in from the host PATH (caosd already requires it).
           # util-linux: setsid, so a hung compose up dies as a whole group.
           runtimeInputs = [
-            pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.jq pkgs.gnutar
+            pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.skopeo pkgs.gzip
             pkgs.util-linux
           ];
           text = ''
