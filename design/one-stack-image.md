@@ -298,8 +298,13 @@ tags. What is unresolved is whether the delta emit belongs in
    therefore a registry binary in the stack image, where compose used the stock
    `registry:2`. The biggest single step, and the one that pays off even if
    nothing after it lands.
-4. **`std-build` / `std-check`** — split the publish out of `serve`; `up`
-   pushes, the test runner calls `std-check` before the fan-out.
+4. **`std-build` / `std-check`** — DONE. The publish is a function `up` calls
+   and `std-build` exposes alone; `std-check` walks `refs/caos/std`, reads each
+   delta entry's `base` digest and confirms the registry still has it, naming
+   which of the registry's two names it checked. `up` publishes rather than
+   checking (a person should get a working stack, not homework), so
+   `std-check` is the gate for anything running against a stack it did not
+   just bring up — `AGENTS.md` says so.
 5. **The seed** — `std-build` in the flake's seed derivation; `warm-std.sh` and
    `run-test.sh`'s publish block delete.
 

@@ -672,6 +672,14 @@
         #   caosd reset  stop and wipe CAOS_DATA state for a clean slate.
         #   caosd logs   follow the running stack's logs (Ctrl-C returns; the stack
         #                keeps running).
+        #   caosd std-build  publish std to a running stack and return. What `up`
+        #                does after bring-up; separate so it can be run alone.
+        #   caosd std-check  verify the registry still holds everything std NAMES,
+        #                and fail loudly if not. `up` PUBLISHES rather than
+        #                checking — convenience for a person, who should get a
+        #                working stack and not homework — so this is the strict
+        #                gate for anything that runs against a stack it did not
+        #                just bring up (design/one-stack-image.md).
         # `up` hands build-builtins.sh a prebuilt caos-cli, the flake's worker
         # images, and a writable client repo (all via env) so it needs neither
         # `nix` nor a writable repo root — hence it runs from any directory,
@@ -724,6 +732,66 @@
               # docker's stderr to /dev/null would discard the entire diagnosis.
               docker logs "$NAME" 2>&1 >&2 || true
               exit 1
+            }
+
+            CLIENT=$CAOS_DATA/publish-client-repo
+
+            # Publish std to this stack: build-builtins.sh with the flake's own
+            # prebuilt images and binaries, so nothing is nix-built at runtime.
+            std_build() {
+              echo "==> publishing stdlib (build-builtins.sh)" >&2
+              CAOS_SERVER_URL=http://localhost:9090 \
+              CAOS_CLI=${caos-cli}/bin/caos-cli \
+              CAOS_CLIENT_REPO="$CLIENT" \
+              CAOS_BUILTIN_IMAGES="${
+                pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
+              }" \
+              CAOS_BUILTIN_BINS="${
+                pkgs.lib.concatMapStringsSep " " toString builtinWorkerBins
+              }" \
+                bash ${self}/build-builtins.sh >/dev/null
+            }
+
+            # Does the registry still hold everything std NAMES? A delta entry's
+            # `base` is a digest ref, and a wiped registry leaves std pointing at
+            # blobs that are gone — which otherwise surfaces as every test
+            # failing deep inside the fan-out rather than as one clear statement
+            # here (design/one-stack-image.md).
+            #
+            # Checked through localhost:5000 — the name the DOCKER DAEMON pulls
+            # with. std's refs spell the same registry caos-registry:5000, which
+            # is how the SERVER reaches it; one registry, two names, so the check
+            # says which one it used.
+            std_check() {
+              local reg=localhost:5000 tree missing=0 oid name base digest code
+              [ -d "$CLIENT" ] \
+                || { echo "caosd: no client repo at $CLIENT — run 'caosd std-build'" >&2; exit 1; }
+              tree=$(git -C "$CLIENT" rev-parse --verify -q refs/caos/std) \
+                || { echo "caosd: no refs/caos/std — run 'caosd std-build'" >&2; exit 1; }
+              echo "==> checking std ($tree) against the registry at $reg" >&2
+              while read -r _ _ oid name; do
+                # Only delta entries carry a `base`; a flake tree names no image.
+                base=$(git -C "$CLIENT" cat-file -p "$oid:base" 2>/dev/null) || continue
+                digest=''${base##*@}
+                [ "$digest" != "$base" ] || continue
+                code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                  "http://$reg/v2/caos/manifests/$digest") \
+                  || { echo "caosd: registry unreachable at $reg" >&2; exit 1; }
+                if [ "$code" = 200 ]; then
+                  echo "  ok       $name -> $digest" >&2
+                else
+                  echo "  MISSING  $name -> $digest (HTTP $code)" >&2
+                  missing=1
+                fi
+              done < <(git -C "$CLIENT" ls-tree "$tree")
+              if [ "$missing" != 0 ]; then
+                echo "caosd: std names images this registry no longer has." >&2
+                echo "       The registry was wiped; run 'caosd std-build'." >&2
+                exit 1
+              fi
+              echo "==> std is intact" >&2
             }
 
             case "''${1:-up}" in
@@ -789,17 +857,7 @@
               done
               [ -n "$ok" ] || die "caos-server never answered on :9090"
 
-              echo "==> publishing stdlib (build-builtins.sh)" >&2
-              CAOS_SERVER_URL=http://localhost:9090 \
-              CAOS_CLI=${caos-cli}/bin/caos-cli \
-              CAOS_CLIENT_REPO="$CAOS_DATA/publish-client-repo" \
-              CAOS_BUILTIN_IMAGES="${
-                pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
-              }" \
-              CAOS_BUILTIN_BINS="${
-                pkgs.lib.concatMapStringsSep " " toString builtinWorkerBins
-              }" \
-                bash ${self}/build-builtins.sh >/dev/null
+              std_build
 
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
               ;;
@@ -818,9 +876,15 @@
               # container's.
               tail -n +1 -f "$CAOS_DATA"/stack/logs/*.log
               ;;
+            std-build)
+              std_build
+              ;;
+            std-check)
+              std_check
+              ;;
             *)
               echo "caosd: unknown command '$1'" >&2
-              echo "usage: caosd [up|down|reset|logs]" >&2
+              echo "usage: caosd [up|down|reset|logs|std-build|std-check]" >&2
               exit 2
               ;;
             esac
