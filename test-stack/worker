@@ -57,7 +57,7 @@
 #   /caos/tree      build-builtins.sh and the std/ flake trees it publishes
 set -euo pipefail
 
-LOGS="/tmp/redis.log /tmp/server.log /tmp/runnerd.log"
+LOGS="/tmp/serve.log /tmp/redis.log /tmp/server.log /tmp/runnerd.log"
 fail() {
   echo "TEST STACK FAIL: $*" >&2
   for l in $LOGS; do
@@ -84,40 +84,44 @@ SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
 
 INNER=http://127.0.0.1
 
-# The inner result cache: a PRIVATE redis that starts empty and dies with the
-# job. The incrementality tests assert real memoization, so a shared cache
-# poisons them — unlike the registry, which is content-keyed and shared on
-# purpose.
-redis-server --port 6390 --save '' >/tmp/redis.log 2>&1 &
-for _ in $(seq 1 20); do
-  redis-cli -p 6390 ping >/dev/null 2>&1 && break
-  sleep 0.5
-done
-redis-cli -p 6390 ping >/dev/null 2>&1 || fail "inner redis never came up"
-
-# The inner server. Its registry settings need no overriding: this container
-# sits on caos-net, so the default push URL (caos-registry:5000) is reachable
-# here, and the default pull host (localhost:5000) is the name the OUTER
-# docker daemon resolves — which is exactly the split this stack needs.
-mkdir -p /tmp/inner-git
-CAOS_GIT_DIR=/tmp/inner-git CAOS_REDIS_ADDR=127.0.0.1:6390 \
-  CAOS_PENDING_TIMEOUT_SECS=900 \
-  /caos/bin/server >/tmp/server.log 2>&1 &
-ok=""
-for _ in $(seq 1 30); do
-  if git ls-remote "$INNER" >/dev/null 2>&1; then ok=1; break; fi
+# The inner stack itself is `caosd serve` (design/one-stack-image.md) — the
+# ONE bring-up in the tree, shared with the host and seed placements, so this
+# script no longer carries a second copy of how a stack starts. What stays
+# here is what only this placement knows:
+#
+#   - the result cache is PRIVATE and non-persistent (REDIS_PERSIST=no): it
+#     starts empty and dies with the job, because the incrementality tests
+#     assert real memoization and a cache outliving a test's stack poisons
+#     them — unlike the registry, which is content-keyed and shared on purpose
+#   - runnerd's docker client talks to the OUTER engine over the granted
+#     socket, and each sibling joins THIS container's netns, so the inner
+#     server on 127.0.0.1 is the address every worker already expects
+#
+# Its registry settings need no overriding: this container sits on caos-net,
+# so the default push URL (caos-registry:5000) is reachable here, and the
+# default pull host (localhost:5000) is the name the OUTER docker daemon
+# resolves — which is exactly the split this stack needs.
+#
+# It runs in the BACKGROUND because worker1 is what this job is for. serve
+# dies as a group, so watching its pid is enough to know the stack is alive.
+CAOS_STACK_STATE=/tmp/stack \
+CAOS_STACK_LOGS=/tmp \
+CAOS_STACK_READY=/tmp/stack.ready \
+CAOS_STACK_BIN=/caos/bin \
+CAOS_STACK_REDIS_PORT=6390 \
+CAOS_STACK_REDIS_PERSIST=no \
+CAOS_RUNNER_SLOTS=6 \
+CAOS_PENDING_TIMEOUT_SECS=900 \
+DOCKER_HOST="unix://$SOCK" \
+CAOS_DOCKER_NETWORK="container:$(cat /etc/hostname)" \
+  bash /caos/stack/serve >/tmp/serve.log 2>&1 &
+SERVE=$!
+for _ in $(seq 1 60); do
+  [ -e /tmp/stack.ready ] && break
+  kill -0 "$SERVE" 2>/dev/null || fail "the inner stack died during bring-up"
   sleep 1
 done
-[ -n "$ok" ] || fail "inner server never came up"
-
-# The inner runnerd: its docker client talks to the OUTER engine, and each
-# sibling joins THIS container's netns so the inner server on 127.0.0.1 is
-# the address every worker already expects.
-CAOS_SERVER_URL=$INNER CAOS_DOCKER_BIN=docker DOCKER_HOST="unix://$SOCK" \
-  CAOS_DOCKER_NETWORK="container:$(cat /etc/hostname)" CAOS_RUNNER_SLOTS=6 \
-  /caos/bin/runnerd >/tmp/runnerd.log 2>&1 &
-sleep 1
-grep -q "slots, server" /tmp/runnerd.log || fail "inner runnerd did not start"
+[ -e /tmp/stack.ready ] || fail "the inner stack never came up"
 
 # worker1 gets the inner stack; this script keeps the outer one. Everything
 # it needs to talk to the stack above is set HERE and nowhere else.

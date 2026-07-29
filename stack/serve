@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# THE caos stack (design/one-stack-image.md): start the daemon group, wait
+# until it is serving, then supervise it. This is the one bring-up in the
+# tree — `caosd serve` is this script, and every placement runs it:
+#
+#   test   the stack image's /worker starts it, runs worker1 against it,
+#          and stops it (test-stack/worker)
+#   host   `caosd up` runs the stack image with this as its command
+#   seed   the flake's seed derivation runs it to publish std
+#
+# The container is the CALLER's decision, not this script's. It configures
+# itself from the environment and nothing else, so it is correct wherever it
+# is put — which is the whole point: there is no second bring-up to drift
+# against.
+#
+# DIES AS A GROUP. A half-dead stack is not something anyone should have to
+# diagnose, so any member's death takes the rest down and exits non-zero.
+# Callers that need to keep working (the test placement) run this in the
+# background and watch both the ready file and this process.
+#
+# Configuration, all environment:
+#   CAOS_STACK_STATE   dir holding the server's git repo (required)
+#   CAOS_STACK_LOGS    dir for <member>.log (required)
+#   CAOS_STACK_READY   file to touch once every member is serving (optional)
+#   CAOS_STACK_BIN     dir holding `server` and `runnerd` (required)
+#   CAOS_STACK_REDIS_PORT     redis port (required)
+#   CAOS_STACK_REDIS_PERSIST  "yes" for an appendonly cache, "no" to keep it
+#                             in memory and lose it with the process
+#   CAOS_RUNNER_SLOTS         runnerd's concurrency
+#   CAOS_PENDING_TIMEOUT_SECS how long a job waits for a runner to exist
+#
+# Passed through to runnerd untouched, because they are the caller's business:
+# DOCKER_HOST (which engine), CAOS_DOCKER_NETWORK (which netns workers join),
+# CAOS_RUNNER_SOCKET (the socket this pool MAY grant, per-image).
+set -euo pipefail
+
+: "${CAOS_STACK_STATE:?serve needs CAOS_STACK_STATE}"
+: "${CAOS_STACK_LOGS:?serve needs CAOS_STACK_LOGS}"
+: "${CAOS_STACK_BIN:?serve needs CAOS_STACK_BIN}"
+: "${CAOS_STACK_REDIS_PORT:?serve needs CAOS_STACK_REDIS_PORT}"
+: "${CAOS_STACK_REDIS_PERSIST:?serve needs CAOS_STACK_REDIS_PERSIST (yes|no)}"
+
+# The server self-bootstraps an empty repo on first boot, but the directory
+# has to be there for it to bootstrap into.
+mkdir -p "$CAOS_STACK_STATE/git" "$CAOS_STACK_LOGS"
+
+# The server always listens on :80 and always reaches redis on loopback: every
+# placement puts the group in one netns, so there is no address to negotiate.
+# Workers join that same netns (CAOS_DOCKER_NETWORK), which is why they can
+# use this URL verbatim.
+SERVER_URL=http://127.0.0.1
+REDIS_ADDR=127.0.0.1:$CAOS_STACK_REDIS_PORT
+
+pids=()
+names=()
+
+fail() {
+  echo "caosd serve: $*" >&2
+  exit 1
+}
+
+# Start a member, remember it, and name it for the supervisor's diagnostics.
+start() { # <name> <command...>
+  local name=$1
+  shift
+  "$@" >"$CAOS_STACK_LOGS/$name.log" 2>&1 &
+  pids+=("$!")
+  names+=("$name")
+}
+
+# --- redis: the result cache -------------------------------------------------
+redis_args=(--port "$CAOS_STACK_REDIS_PORT")
+if [ "$CAOS_STACK_REDIS_PERSIST" = yes ]; then
+  # appendonly keeps it durable to a hard kill, not just a clean shutdown-save.
+  redis_args+=(--dir "$CAOS_STACK_STATE/redis" --appendonly yes)
+  mkdir -p "$CAOS_STACK_STATE/redis"
+else
+  # No persistence: the cache starts empty and dies with this process. The
+  # incrementality tests assert real memoization, so a cache that outlives a
+  # test's stack would poison them.
+  redis_args+=(--save '')
+fi
+start redis redis-server "${redis_args[@]}"
+for _ in $(seq 1 20); do
+  redis-cli -p "$CAOS_STACK_REDIS_PORT" ping >/dev/null 2>&1 && break
+  sleep 0.5
+done
+redis-cli -p "$CAOS_STACK_REDIS_PORT" ping >/dev/null 2>&1 \
+  || fail "redis never came up"
+
+# --- server ------------------------------------------------------------------
+start server env \
+  CAOS_GIT_DIR="$CAOS_STACK_STATE/git" \
+  CAOS_REDIS_ADDR="$REDIS_ADDR" \
+  CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
+  "$CAOS_STACK_BIN/server"
+ok=""
+for _ in $(seq 1 30); do
+  if git ls-remote "$SERVER_URL" >/dev/null 2>&1; then ok=1; break; fi
+  sleep 1
+done
+[ -n "$ok" ] || fail "server never came up"
+
+# --- runnerd -----------------------------------------------------------------
+start runnerd env \
+  CAOS_SERVER_URL="$SERVER_URL" \
+  CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
+  CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
+  "$CAOS_STACK_BIN/runnerd"
+sleep 1
+grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" \
+  || fail "runnerd did not start"
+
+# Not `[ ... ] && ...`: under `set -e` a false test would make that list the
+# script's last status and exit 0 right here, silently skipping the supervisor.
+if [ -n "${CAOS_STACK_READY:-}" ]; then
+  : > "$CAOS_STACK_READY"
+fi
+echo "caosd serve: ${names[*]} up on $SERVER_URL" >&2
+
+# --- supervise ---------------------------------------------------------------
+# `wait -n` returns when the FIRST member exits — which, since none of them is
+# supposed to exit, always means something is wrong. Name it, take the rest
+# down, and fail.
+wait -n
+for i in "${!pids[@]}"; do
+  kill -0 "${pids[$i]}" 2>/dev/null || dead=${names[$i]}
+done
+kill "${pids[@]}" 2>/dev/null || true
+wait 2>/dev/null || true
+fail "${dead:-a member} exited — the stack is down (see $CAOS_STACK_LOGS)"

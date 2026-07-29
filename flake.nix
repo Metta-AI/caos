@@ -440,6 +440,10 @@
           mkdir -p $out/caos/tree/crates
           cp -R ${./crates/worker-common} $out/caos/tree/crates/worker-common
           install -m 755 ${./build-builtins.sh} $out/caos/tree/build-builtins.sh
+          # The one bring-up (design/one-stack-image.md): /worker starts the
+          # stack with it, exactly as `caosd up` and the seed derivation do.
+          mkdir -p $out/caos/stack
+          install -m 755 ${./stack/serve} $out/caos/stack/serve
           install -m 755 ${./test-stack/worker} $out/worker
         '';
         testStackImage = pkgs.dockerTools.buildLayeredImage {
