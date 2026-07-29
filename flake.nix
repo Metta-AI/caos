@@ -416,44 +416,118 @@
             CAOS_WORLD = "test";
           }
         );
+        # The SEED (design/one-stack-image.md, "The seed"): std published at
+        # image build time, as a server repo the test stack starts from. This
+        # is `build-builtins.sh` run against a two-member stack — redis and
+        # the server, no runnerd — whose git dir is $out.
+        #
+        # It runs no workers, which is the whole reason it is legal here:
+        # publishing is `caos curry` bookkeeping plus image pushes
+        # (crates/caos/src/lib.rs, cli_curry), so it needs a server and a
+        # registry write but no engine socket and no grant widening.
+        #
+        # WHERE THIS BUILDS is the load-bearing fact. #caosImage is built by
+        # exactly one thing — std/flake-builder's build stage, inside caos —
+        # and a flake-builder job cannot run without a stack, which IS a
+        # registry at caos-registry:5000. That container's nix is deliberately
+        # unsandboxed (std/flake-builder/worker), so a builder has its network.
+        # Nothing on the host's path builds this: `nix build` yields caosd,
+        # whose hostStackImage is unseeded and publishes at `up` time.
+        #
+        # The clean core images push under a tag keyed on their STORE PATH, so
+        # the ones this seed pushes are byte-identical to the host's and the
+        # push is a registry hit whenever `caosd up` got there first.
+        seededGit = linuxPkgs.runCommand "caos-seeded-git" {
+          nativeBuildInputs = with linuxPkgs; [
+            bash coreutils gitMinimal redis skopeo curl gawk gzip cacert
+          ];
+        } ''
+          export HOME=$TMPDIR
+          state=$TMPDIR/stack
+
+          # The one bring-up, in its third placement. Background, because this
+          # derivation's work is what runs AGAINST the stack; serve dies as a
+          # group, so watching its pid is enough.
+          CAOS_STACK_STATE=$state \
+          CAOS_STACK_LOGS=$TMPDIR/logs \
+          CAOS_STACK_READY=$TMPDIR/ready \
+          CAOS_STACK_BIN=${testWorkspaceBins}/bin \
+          CAOS_STACK_REDIS_PORT=6391 \
+          CAOS_STACK_REDIS_PERSIST=no \
+          CAOS_STACK_REGISTRY=no \
+          CAOS_STACK_RUNNERD=no \
+            bash ${./stack/serve} > $TMPDIR/serve.log 2>&1 &
+          serve=$!
+          for _ in $(seq 1 60); do
+            [ -e $TMPDIR/ready ] && break
+            kill -0 $serve 2>/dev/null || { cat $TMPDIR/serve.log >&2; exit 1; }
+            sleep 1
+          done
+          [ -e $TMPDIR/ready ] || { cat $TMPDIR/serve.log >&2; exit 1; }
+
+          # The registry is the stack this build is running INSIDE — reached by
+          # the name that resolves on caos-net, which is also the name the
+          # server will pull a delta's `base` with.
+          CAOS_SERVER_URL=http://127.0.0.1 \
+          CAOS_CLI=${testWorkspaceBins}/bin/caos-cli \
+          CAOS_CLIENT_REPO=$TMPDIR/client \
+          CAOS_REGISTRY_HTTP=caos-registry:5000 \
+          CAOS_BUILTIN_IMAGES="${workerFlakeBuilderImage} ${workerRunnerImage} ${workerCargoImage}" \
+          CAOS_BUILTIN_BINS=${testWorkspaceBins} \
+            bash ${self}/build-builtins.sh >&2
+
+          # The stack goes down before $out is read: the server holds the repo
+          # open, and a half-written pack is not something to bake into an
+          # image.
+          kill $serve
+          wait $serve || true
+          cp -R $state/git $out
+        '';
+
         # The stack root, parameterised on WHICH BUILD of the binaries it
         # carries (design/one-stack-image.md). One image definition, two
         # worlds: the host's stack runs the `host` build, a test stack runs
         # the `test` build, and crates/caos-world makes a client of one
-        # unable to drive the other. Everything else — the userland, the
-        # clean core tarballs, the tree, the one bring-up — is identical,
-        # which is the point: the host stack IS a test stack that persists.
-        mkStackRoot = { name, bins }: pkgs.runCommand "caos-${name}-stack-root" { } ''
-          mkdir -p $out/caos/bin $out/caos/images $out/caos/tree
+        # unable to drive the other. Everything else — the userland, the one
+        # bring-up — is identical, which is the point: the host stack IS a
+        # test stack that persists. The one asymmetry is the seed below.
+        # NOTE the parens around the script: `runCommand n {} '''' + s` binds as
+        # `(runCommand n {} '''') + s`, which concatenates the DERIVATION with
+        # the string and yields a store path with the script text glued onto
+        # the end. It builds, and the layer builder then reports a missing
+        # `<path># The seeded server repo...`.
+        mkStackRoot = { name, bins, seed ? null }: pkgs.runCommand "caos-${name}-stack-root" { } (''
+          mkdir -p $out/caos/bin
           for b in ${pkgs.lib.concatStringsSep " " testStackBins}; do
             cp ${bins}/bin/$b $out/caos/bin/$b
           done
-          # Store BASENAMES intact: build-builtins.sh maps a tarball back to
-          # its builtin by the caos-worker-<name> baked into the path.
-          cp ${workerFlakeBuilderImage} \
-            $out/caos/images/${baseNameOf "${workerFlakeBuilderImage}"}
-          cp ${workerRunnerImage} \
-            $out/caos/images/${baseNameOf "${workerRunnerImage}"}
-          # cargo is a streamed core too now, not a flake tree, so its clean
-          # tarball has to ride here like the other two — the inner
-          # build-builtins.sh composes and streams it, and has no nix to
-          # build it from the tree.
-          cp ${workerCargoImage} \
-            $out/caos/images/${baseNameOf "${workerCargoImage}"}
-          cp -R ${./std} $out/caos/tree/std
-          # std/rustc is curry(runner, worker1=worker-rustc, cargo=<ref>,
-          # worker_common=<source tree>) — the publisher stages that source,
-          # so the tree needs it alongside std/.
-          mkdir -p $out/caos/tree/crates
-          cp -R ${./crates/worker-common} $out/caos/tree/crates/worker-common
-          install -m 755 ${./build-builtins.sh} $out/caos/tree/build-builtins.sh
+          # NO /caos/images and NO /caos/tree. They existed so that a stack
+          # could run build-builtins.sh from inside itself — the clean core
+          # tarballs to push, std/ and crates/worker-common to publish. Nothing
+          # publishes at runtime any more: the test stack is seeded at build
+          # time and the host publishes from the store (caosd std_build), so
+          # ~250 MB of tarballs and a copy of the tree came out of both images.
+          #
           # The one bring-up (design/one-stack-image.md): /worker starts the
           # stack with it, exactly as `caosd up` and the seed derivation do.
           mkdir -p $out/caos/stack
           install -m 755 ${./stack/serve} $out/caos/stack/serve
           install -m 755 ${./test-stack/worker} $out/worker
-        '';
-        testStackRoot = mkStackRoot { name = "test"; bins = testWorkspaceBins; };
+        '' + pkgs.lib.optionalString (seed != null) ''
+          # The seeded server repo (design/one-stack-image.md): this stack
+          # starts with std already published, so no placement that runs this
+          # image has to publish it.
+          cp -R ${seed} $out/caos/seed-git
+        '');
+        # The test stack is SEEDED; the host stack is not. `nix build` runs on
+        # the host, in a sandbox with no network and no stack — it could not
+        # build the seed, and does not need to: `caosd up` publishes, which is
+        # the convenience a person running it should get anyway.
+        testStackRoot = mkStackRoot {
+          name = "test";
+          bins = testWorkspaceBins;
+          seed = seededGit;
+        };
         hostStackRoot = mkStackRoot { name = "host"; bins = workspaceBins; };
         # The userland a caos stack shells out to, shared by both worlds.
         stackUserland = [
@@ -843,6 +917,7 @@
                   -e CAOS_STACK_REDIS_PORT=6379 \
                   -e CAOS_STACK_REDIS_PERSIST=yes \
                   -e CAOS_STACK_REGISTRY=yes \
+                  -e CAOS_STACK_RUNNERD=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                   -e CAOS_DOCKER_NETWORK="$NET" \
                   -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \

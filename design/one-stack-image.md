@@ -175,21 +175,31 @@ placement writes `$CAOS_DATA/logs/` and `caosd logs` tails them.
 
 ## The seed
 
-`std-build` is callable from the flake's seed derivation, so std can be
-published *at image build time* and baked into the image as a git dir:
+std is published *at image build time* and baked into the image as a git dir:
 
 ```nix
 seededGit = runCommand "caos-seeded-git" { } ''
-  CAOS_GIT_DIR=$out caosd serve --seed &
-  bash ${./build-builtins.sh}
+  CAOS_STACK_RUNNERD=no ... bash ${./stack/serve} &   # redis + server
+  bash ${self}/build-builtins.sh
+  kill $serve; cp -R $state/git $out
 '';
 ```
 
-`#caosImage` carries `$out`; a placement points `CAOS_GIT_DIR` at it instead of
-creating an empty one. The binaries doing the publishing are the ones the same
-flake just built, so "the inner std is published by the tree's own
-`build-builtins.sh`" holds more strictly than today — provably once per tree
-rather than once per test.
+`#caosImage` carries `$out` as `/caos/seed-git`; `serve` copies it into an
+empty state dir at bring-up (`CAOS_STACK_SEED_GIT`), because the store path is
+read-only and the server writes to its repo. Only an *absent* repo is seeded —
+a persistent stack's own is the newer truth — so the knob is safe to set in any
+placement. The binaries doing the publishing are the ones the same flake just
+built, so "the inner std is published by the tree's own `build-builtins.sh`"
+holds more strictly than before: provably once per tree rather than once per
+test.
+
+**Two directories leave both images with it.** `/caos/images` (the clean core
+tarballs) and `/caos/tree` (`build-builtins.sh`, `std/`, `crates/worker-common`)
+existed *only* so a stack could publish from inside itself. Nothing publishes
+at runtime any more — the test stack is seeded, and the host publishes from the
+nix store — so ~250 MB of tarballs and a copy of the tree come out of the stack
+image. The seed is not a size regression; it is a net reduction.
 
 This works because **`build-builtins.sh` runs no workers.** `cli_curry`
 (`crates/caos/src/lib.rs:2411`) resolves the image, constructs tree entries and
@@ -260,7 +270,11 @@ that, and it is unchanged by any of this.
   stop being two separately-built images
 - `load_once`, `check_current`/`stale`, `compose_up`, `compose_up_diagnose` and
   the `docker load` content-tag memo in `caosd`
-- `tests/lib/warm-std.sh` entirely, and `run-test.sh`'s publish block
+- `tests/lib/warm-std.sh` entirely, and `run-test.sh`'s publish block — and
+  with them the suite stage that existed to serialize the first publish, so
+  `suite-stage4.sh` folds back into `suite-stage3.sh`
+- `/caos/images` and `/caos/tree` from the stack image: with nothing publishing
+  at runtime, the clean tarballs and the tree copy have no reader
 - the second bring-up: `test-stack/worker`'s daemon section becomes
   `caosd serve`
 
@@ -320,8 +334,13 @@ tags. What is unresolved is whether the delta emit belongs in
    checking (a person should get a working stack, not homework), so
    `std-check` is the gate for anything running against a stack it did not
    just bring up — `AGENTS.md` says so.
-5. **The seed** — `std-build` in the flake's seed derivation; `warm-std.sh` and
-   `run-test.sh`'s publish block delete.
+5. **The seed** — DONE. `serve` gained two knobs (`CAOS_STACK_RUNNERD`, so the
+   seed's group is redis + server; `CAOS_STACK_SEED_GIT`, so a placement can
+   ship a prebuilt repo) and a TERM trap, so a requested shutdown takes the
+   members down instead of orphaning them. `warm-std.sh`, `run-test.sh`'s
+   publish block, and `/caos/{images,tree}` all deleted — and with the warm-up
+   gone there was no work left between the build and the fan-out, so
+   `suite-stage4.sh` folded into `suite-stage3.sh` and the suite lost a stage.
 
 Steps 1–3 stand alone: they buy the single bring-up and the deletions without
 touching how std is published. 4–5 are what make `build-builtins.sh` a

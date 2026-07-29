@@ -43,18 +43,17 @@
 #
 # The inner runnerd delegates every worker to the OUTER engine through the
 # granted socket, as siblings sharing this container's netns — no second
-# nesting level (design/cargo-workers.md, phase 4). Publishing std is NOT
-# this script's job: worker1 does it (tests/lib/run-test.sh), so the policy
-# lives in the tree, not the image.
+# nesting level (design/cargo-workers.md, phase 4). NOBODY publishes std at
+# runtime: it was published once, by this tree's own build-builtins.sh, when
+# this image was built, and rides here as /caos/seed-git.
 #
 # What the image lays out for worker1, all fixed paths:
 #   /caos/bin       the tree's binaries (caos, caos-cli, server, runnerd,
-#                   worker-*) — the CAOS_BUILTIN_BINS root build-builtins.sh
-#                   wants, so the caos it composes into inner images is the
+#                   worker-*), so the caos every inner image carries is the
 #                   tested one
-#   /caos/images    the tree's clean core image tarballs, store basenames
-#                   intact (build-builtins.sh maps them back by name)
-#   /caos/tree      build-builtins.sh and the std/ flake trees it publishes
+#   /caos/seed-git  the seeded server repo: refs/caos/std and refs/caos/bins,
+#                   already published (design/one-stack-image.md)
+#   /caos/stack     the one bring-up
 set -euo pipefail
 
 LOGS="/tmp/serve.log /tmp/redis.log /tmp/server.log /tmp/runnerd.log"
@@ -96,6 +95,12 @@ INNER=http://127.0.0.1
 #   - runnerd's docker client talks to the OUTER engine over the granted
 #     socket, and each sibling joins THIS container's netns, so the inner
 #     server on 127.0.0.1 is the address every worker already expects
+#   - the server repo is SEEDED from /caos/seed-git, so this stack comes up
+#     with refs/caos/std and refs/caos/bins already published. The publisher
+#     was the tree's own build-builtins.sh, run once when this image was built
+#     (design/one-stack-image.md, "The seed") — so "the inner std is published
+#     by the tree's own publisher" now holds once per tree instead of once per
+#     test, and no test pays for the publish at all.
 #
 # Its registry settings need no overriding: this container sits on caos-net,
 # so the default push URL (caos-registry:5000) is reachable here, and the
@@ -111,6 +116,8 @@ CAOS_STACK_BIN=/caos/bin \
 CAOS_STACK_REDIS_PORT=6390 \
 CAOS_STACK_REDIS_PERSIST=no \
 CAOS_STACK_REGISTRY=no \
+CAOS_STACK_RUNNERD=yes \
+CAOS_STACK_SEED_GIT=/caos/seed-git \
 CAOS_RUNNER_SLOTS=6 \
 CAOS_PENDING_TIMEOUT_SECS=900 \
 DOCKER_HOST="unix://$SOCK" \

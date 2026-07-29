@@ -32,6 +32,17 @@
 #                             content-addressed registry shared across tests
 #                             cannot leak behaviour, only work, and sharing it
 #                             is what stops every test rebaking the toolchain.
+#   CAOS_STACK_RUNNERD        "yes" to run runnerd, "no" for a placement that
+#                             dispatches no jobs. The seed is the "no": it only
+#                             PUBLISHES, and build-builtins.sh runs no workers,
+#                             which is what makes the seed legal inside the
+#                             flake-builder container (it holds no engine socket
+#                             grant, and does not need one).
+#   CAOS_STACK_SEED_GIT       optional: a prebuilt server repo to start from.
+#                             std published at image build time rides in the
+#                             image as one of these (design/one-stack-image.md,
+#                             "The seed"), so a fresh stack has std without
+#                             publishing it.
 #   CAOS_RUNNER_SLOTS         runnerd's concurrency
 #   CAOS_PENDING_TIMEOUT_SECS how long a job waits for a runner to exist
 #
@@ -46,10 +57,31 @@ set -euo pipefail
 : "${CAOS_STACK_REDIS_PORT:?serve needs CAOS_STACK_REDIS_PORT}"
 : "${CAOS_STACK_REDIS_PERSIST:?serve needs CAOS_STACK_REDIS_PERSIST (yes|no)}"
 : "${CAOS_STACK_REGISTRY:?serve needs CAOS_STACK_REGISTRY (yes|no)}"
+: "${CAOS_STACK_RUNNERD:?serve needs CAOS_STACK_RUNNERD (yes|no)}"
 
 # The server self-bootstraps an empty repo on first boot, but the directory
 # has to be there for it to bootstrap into.
 mkdir -p "$CAOS_STACK_STATE/git" "$CAOS_STACK_LOGS"
+
+# A seeded repo, if this placement ships one: the test stack's std is
+# published once per tree, at image build time, rather than once per test
+# (design/one-stack-image.md, "The seed"). HEAD is the probe because that is
+# what the server's own `gix::open` check turns on — no HEAD, no repo — and
+# only an ABSENT repo is seeded: a persistent stack's own is the newer truth.
+#
+# `cp -RL`, and the L is load-bearing. An image built by dockerTools lays its
+# contents down as an lndir SYMLINK FARM, so every file here is a link into
+# /nix/store. Copying those verbatim gives a repo whose HEAD is a symlink, and
+# git's validate_headref only accepts a symlinked HEAD when the target starts
+# with `refs/` — so `git -C <dir> config` reports "not in a git directory" and
+# every request answers "Not a git repository", while gix opens it happily and
+# the server comes up anyway. Dereference, and the copy is real files the
+# server can also write to (hence the chmod: the store is read-only).
+if [ -n "${CAOS_STACK_SEED_GIT:-}" ] && [ ! -e "$CAOS_STACK_STATE/git/HEAD" ]; then
+  echo "caosd serve: seeding the server repo from $CAOS_STACK_SEED_GIT" >&2
+  cp -RL "$CAOS_STACK_SEED_GIT/." "$CAOS_STACK_STATE/git/"
+  chmod -R u+w "$CAOS_STACK_STATE/git"
+fi
 
 # The server always listens on :80 and always reaches redis on loopback: every
 # placement puts the group in one netns, so there is no address to negotiate.
@@ -65,6 +97,17 @@ fail() {
   echo "caosd serve: $*" >&2
   exit 1
 }
+
+# A REQUESTED shutdown, as opposed to a member dying: take the group down and
+# exit 0. Without this, killing serve orphans redis and the server — they are
+# children of this shell, not of its caller — and the seed derivation would
+# copy a git dir still open by a live server.
+shutdown() {
+  kill "${pids[@]}" 2>/dev/null || true
+  wait 2>/dev/null || true
+  exit 0
+}
+trap shutdown TERM INT
 
 # Start a member, remember it, and name it for the supervisor's diagnostics.
 start() { # <name> <command...>
@@ -131,20 +174,22 @@ for _ in $(seq 1 30); do
 done
 [ -n "$ok" ] || fail "server never came up"
 
-# --- runnerd -----------------------------------------------------------------
+# --- runnerd: the compute half, when this placement dispatches jobs ----------
 # runnerd hands its OWN CAOS_SERVER_URL to every worker it launches
 # (crates/runnerd/src/main.rs). Where workers share this netns — the test
 # placement, `container:<self>` — loopback is right for both. On the host they
 # get their own netns on a bridge, so runnerd must advertise a name that
 # resolves there; it also resolves from in here, via the stack's alias.
-start runnerd env \
-  CAOS_SERVER_URL="${CAOS_STACK_RUNNER_SERVER_URL:-$SERVER_URL}" \
-  CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
-  CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
-  "$CAOS_STACK_BIN/runnerd"
-sleep 1
-grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" \
-  || fail "runnerd did not start"
+if [ "$CAOS_STACK_RUNNERD" = yes ]; then
+  start runnerd env \
+    CAOS_SERVER_URL="${CAOS_STACK_RUNNER_SERVER_URL:-$SERVER_URL}" \
+    CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
+    CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
+    "$CAOS_STACK_BIN/runnerd"
+  sleep 1
+  grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" \
+    || fail "runnerd did not start"
+fi
 
 # Not `[ ... ] && ...`: under `set -e` a false test would make that list the
 # script's last status and exit 0 right here, silently skipping the supervisor.

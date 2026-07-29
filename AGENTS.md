@@ -21,6 +21,23 @@ Every script here runs with it, and two constructs quietly break under it.
   from broken explicitly — a swallowed error here silently hides an unreachable
   service.
 
+# Nix
+
+- **Everything an image's `contents` puts on disk is a SYMLINK into
+  `/nix/store`.** `dockerTools` lays contents down with `lndir`, which mirrors
+  directories and symlinks files. So `cp -R` out of an image layout copies
+  links, not content, and the copy is read-only and store-shaped. Use `cp -RL`
+  — `build-builtins.sh` learned this for published flake trees, and `serve`
+  learned it again for the seeded git dir, where a symlinked `HEAD` made git
+  call a perfectly good repo "not a git repository" (`validate_headref` accepts
+  a symlinked HEAD only if the target starts with `refs/`) while gix opened it
+  and the server started anyway.
+- **`runCommand name {} '' … '' + s` parses as `(runCommand name {} '' … '') + s`.**
+  That concatenates the DERIVATION with the string, so you get a store path
+  with your script text glued to the end — and it evaluates, builds, and fails
+  much later with something like `<store-path># my comment: No such file or
+  directory`. Parenthesize the whole script when appending to it.
+
 # Before committing
 
 - Build and deploy with `nix build && caosd up` (the deploy publishes the

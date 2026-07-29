@@ -15,10 +15,12 @@
 # quietly run host code where the tested code was the point.
 #
 # The inner std is published by the tree's OWN build-builtins.sh — the same
-# script the host runs — so every std image is built by this stack from this
-# tree. The expensive half is memoized in the host's registry by content
-# (each std flake keyed on its tree hash), so the first suite pays the builds
-# and every later one is a tag hit.
+# script the host runs — but ONCE, when the image was built (the seed,
+# design/one-stack-image.md), not once per test. So nothing here publishes:
+# the stack /worker brought up already answers refs/caos/std. The expensive
+# half is still memoized in the host's registry by content (each std flake
+# keyed on its tree hash), so the first suite pays the builds and every later
+# one is a tag hit.
 #
 # The test's OUTCOME is a value, not a job error: the result tree carries the
 # verdict, the test's full output and the inner stack's logs, so one failing
@@ -28,7 +30,7 @@ set -euo pipefail
 
 fail() {
   echo "RUN-TEST FAIL: $*" >&2
-  for l in /tmp/server.log /tmp/runnerd.log /tmp/publish.log; do
+  for l in /tmp/server.log /tmp/runnerd.log; do
     [ -e "$l" ] || continue
     echo "--- $l" >&2
     cat "$l" >&2
@@ -44,18 +46,6 @@ TEST=/cas/args/in/test
 [ -d "$TEST" ] || fail "no test tree at $TEST
   /cas/args:    $(ls -A /cas/args 2>&1 | tr '\n' ' ')
   /cas/args/in: $(ls -A /cas/args/in 2>&1 | tr '\n' ' ')"
-
-# The inner std, published by the tree's own publisher. REGISTRY_HTTP: the
-# docker daemon this delegates to is the OUTER one, for which the registry is
-# localhost:5000, while this container is on caos-net and must call it
-# caos-registry:5000 — one registry, two names (design/test-stack-image.md).
-CAOS_CLI=/caos/bin/caos-cli \
-CAOS_CLIENT_REPO=/tmp/publish-client-repo \
-CAOS_BUILTIN_IMAGES="$(echo /caos/images/*.tar.gz)" \
-CAOS_BUILTIN_BINS=/caos \
-CAOS_REGISTRY_HTTP=caos-registry:5000 \
-  bash /caos/tree/build-builtins.sh >/tmp/publish.log 2>&1 \
-  || fail "publishing the inner std"
 
 # The client repo the test's cli.sh snapshots from, staged exactly as
 # tests/run.sh does: the test tree's contents at ./test.
@@ -99,12 +89,12 @@ else
 fi
 cat /tmp/test.out >&2
 
-# The COMPLETE record rides in the result tree — the test's full output, the
-# std publish, and the inner stack's logs — so the suite result holds
-# everything a debugger, human or agent, would want to read. No streaming, no
-# archaeology: address the byte you need by path.
+# The COMPLETE record rides in the result tree — the test's full output and
+# the inner stack's logs — so the suite result holds everything a debugger,
+# human or agent, would want to read. No streaming, no archaeology: address
+# the byte you need by path.
 cp /tmp/test.out /tmp/out/output
-for log in server runnerd redis publish; do
+for log in server runnerd redis serve; do
   # `|| continue`, not `&& cp`: this loop is the last statement in the
   # script, so under set -e a missing final log would fail the whole job.
   [ -e "/tmp/$log.log" ] || continue
