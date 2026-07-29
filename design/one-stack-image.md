@@ -98,21 +98,33 @@ tests assert real memoization and a shared result cache poisons them.
 workers — see "The seed" below. That is what makes the seed legal inside the
 flake-builder container, which holds no socket grant.
 
-### The netns knob
+### The netns knob — and why `caos-net` stays
 
-Workers must share a netns with the server that dispatched them. `runnerd`
-already takes `CAOS_DOCKER_NETWORK` (`crates/runnerd/src/main.rs:115`) and the
-test stack already sets it to `container:<self>`. With the daemons always in a
-container, **every placement sets it the same way**, and `caos-net` disappears
-along with the container-name addressing (`http://caos-server`) that only ever
-existed to serve compose.
+An earlier draft of this note claimed every placement could set
+`CAOS_DOCKER_NETWORK` (`crates/runnerd/src/main.rs:115`) to `container:<self>`,
+so workers share the stack's netns and `caos-net` disappears. **That is wrong,
+and the reason is worth keeping.**
 
-That also collapses a naming split for the host: with the registry inside the
-group and its port published, `localhost:5000` is correct both from inside and
-from the engine pulling host-side. The split survives only for the test
-placement, which reaches the host registry across a netns boundary — so
-`CAOS_REGISTRY_HTTP` stays, with exactly one consumer instead of being a
-general parameter.
+`server` binds `[::]:80` (`crates/server/src/main.rs:53`). A test stack is a
+*worker* that runs its own server on that port, and it can only do so because
+`--network caos-net` gives it its **own** netns. Point the host's runnerd at
+`container:<host-stack>` and every test stack would share the host stack's
+netns, where `:80` is already bound — the inner server could not come up at
+all.
+
+So the knob genuinely differs by placement, and that is the honest shape:
+
+- **host** — workers get their own netns on a bridge (`caos-net`), and reach
+  the stack by name. The stack container carries **two aliases**,
+  `caos-server` and `caos-registry`, so every name that resolves today keeps
+  resolving; nothing about worker addressing changes.
+- **test** — `container:<self>`, as today: an inner stack's workers share the
+  netns of the stack that dispatched them, one nesting level only.
+
+The registry naming split therefore survives in full: the docker daemon pulls
+host-side (`localhost:5000`), the server pulls on the network
+(`caos-registry:5000`). `CAOS_REGISTRY_HTTP` and `CAOS_REGISTRY_BASE_HOST` both
+stay. What collapses is not the addressing — it is the *bring-up*.
 
 ## caosd's surface
 
@@ -221,7 +233,6 @@ and let `std-build` (or, for a human, `up`) be the explicit repair.
   stop being two separately-built images
 - `load_once`, `check_current`/`stale`, `compose_up`, `compose_up_diagnose` and
   the `docker load` content-tag memo in `caosd`
-- `caos-net` and container-name addressing (`http://caos-server`)
 - `tests/lib/warm-std.sh` entirely, and `run-test.sh`'s publish block
 - the second bring-up: `test-stack/worker`'s daemon section becomes
   `caosd serve`
@@ -268,9 +279,13 @@ tags. What is unresolved is whether the delta emit belongs in
    `test-stack/worker` calls it. No behaviour change, and the suite proves it.
 2. **skopeo conversion** — `build-builtins.sh`'s streamed path off `docker
    build`. Verifiable through the existing `caosd up` path alone.
-3. **`caosd up` runs the image** — compose, both daemon images and `caos-net`
-   delete. The biggest single step, and the one that pays off even if nothing
-   after it lands.
+3. **`caosd up` runs the image** — compose and both daemon images delete;
+   `caos-net` and the worker addressing on it stay. Needs two things this note
+   did not originally account for: a registry *member* in `serve` (the host
+   placement runs one, and the group is the only thing left to run it in), and
+   therefore a registry binary in the stack image, where compose used the stock
+   `registry:2`. The biggest single step, and the one that pays off even if
+   nothing after it lands.
 4. **`std-build` / `std-check`** — split the publish out of `serve`; `up`
    pushes, the test runner calls `std-check` before the fan-out.
 5. **The seed** — `std-build` in the flake's seed derivation; `warm-std.sh` and
