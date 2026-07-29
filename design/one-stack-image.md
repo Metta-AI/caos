@@ -237,20 +237,20 @@ failure that buys:
 than a speculative fallback: assert the invariant, die with a specific message,
 and let `std-build` (or, for a human, `up`) be the explicit repair.
 
-**And it is sharper than "a function of registry contents."** The seed
-derivation does not merely *read* the registry — it PUSHES to one, so it needs
-a reachable, writable registry at build time. That is a dependency on a running
-service, not on data.
+**The build-time registry is not a new dependency.** The seed derivation pushes
+as well as reads, so it needs a reachable, writable registry while it runs —
+but that is already guaranteed by where the build happens, not hoped for.
+`#caosImage` is built by exactly one thing, `std/flake-builder`'s `build` stage
+(`std/flake-builder/worker:79`), inside caos: a flake-builder job cannot run
+without a stack, and a stack *is* a registry at `caos-registry:5000`. That
+container's nix is deliberately unsandboxed (`--option sandbox false`,
+`worker:59-63`), so a builder has its network. Nothing builds this attribute
+host-side.
 
-It is survivable only because of where the build happens: `#caosImage` is built
-by `std/flake-builder` INSIDE caos, whose nix is deliberately unsandboxed
-(`--option sandbox false`, `std/flake-builder/worker:59-63`) in a container on
-the network, where `caos-registry:5000` resolves. It is NOT survivable under a
-plain `nix build .#caosImage` on the host, which sandboxes and has no such
-registry — so adding the seed makes that attribute build only from inside caos.
-Whether that is acceptable, or whether the seed should be a separate output
-that the image consumes, is the first thing to settle in step 5 — before any
-code.
+What survives is only the memo hazard above: the *result* is keyed on the tree
+hash, so a seeded image cached against a registry that is later wiped still
+hits the memo while naming blobs that are gone. `std-check` is the answer to
+that, and it is unchanged by any of this.
 
 ## What this deletes
 
