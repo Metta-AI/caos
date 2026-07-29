@@ -416,10 +416,17 @@
             CAOS_WORLD = "test";
           }
         );
-        testStackRoot = pkgs.runCommand "caos-test-stack-root" { } ''
+        # The stack root, parameterised on WHICH BUILD of the binaries it
+        # carries (design/one-stack-image.md). One image definition, two
+        # worlds: the host's stack runs the `host` build, a test stack runs
+        # the `test` build, and crates/caos-world makes a client of one
+        # unable to drive the other. Everything else — the userland, the
+        # clean core tarballs, the tree, the one bring-up — is identical,
+        # which is the point: the host stack IS a test stack that persists.
+        mkStackRoot = { name, bins }: pkgs.runCommand "caos-${name}-stack-root" { } ''
           mkdir -p $out/caos/bin $out/caos/images $out/caos/tree
           for b in ${pkgs.lib.concatStringsSep " " testStackBins}; do
-            cp ${testWorkspaceBins}/bin/$b $out/caos/bin/$b
+            cp ${bins}/bin/$b $out/caos/bin/$b
           done
           # Store BASENAMES intact: build-builtins.sh maps a tarball back to
           # its builtin by the caos-worker-<name> baked into the path.
@@ -446,12 +453,11 @@
           install -m 755 ${./stack/serve} $out/caos/stack/serve
           install -m 755 ${./test-stack/worker} $out/worker
         '';
-        testStackImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-test-stack";
-          tag = "latest";
-          contents = [
-            testStackRoot
-            # The userland the stack itself shells out to: git (the server's
+        testStackRoot = mkStackRoot { name = "test"; bins = testWorkspaceBins; };
+        hostStackRoot = mkStackRoot { name = "host"; bins = workspaceBins; };
+        # The userland a caos stack shells out to, shared by both worlds.
+        stackUserland = [
+            # git (the server's
             # smart-HTTP transport and the publish client), skopeo + certs
             # (registry copies), redis (the private inner result cache), the
             # docker client (the inner runnerd delegating to the outer
@@ -475,30 +481,49 @@
             linuxPkgs.gawk
             linuxPkgs.gitMinimal
             linuxPkgs.redis
+            # The image cache, a member of the group in whichever placement
+            # owns one (stack/serve). Replaces compose's stock `registry:2`.
+            linuxPkgs.distribution
             linuxPkgs.skopeo
             linuxPkgs.cacert
             (if pkgs.stdenv.hostPlatform.isLinux then
               linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
             else
               linuxPkgs.docker-client)
-          ];
+        ];
+        stackEnv = [
+          "PATH=/bin"
+          "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+          # Root: this image starts daemons, owns a git dir, and drives the
+          # engine socket — the same per-image containment grant the
+          # flake-builder carries.
+          "CAOS_WORKER_UID=0"
+          "CAOS_WORKER_GID=0"
+          # The engine socket, declared the same way: this image hosts a caos
+          # stack whose own runnerd launches siblings on the engine, so it
+          # needs the socket runnerd was handing to EVERY worker before this
+          # existed. Only an image can ask — the grant is read from the
+          # image's config, never from a job or its args.
+          "CAOS_GRANT_ENGINE_SOCKET=1"
+        ];
+        testStackImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-test-stack";
+          tag = "latest";
+          contents = [ testStackRoot ] ++ stackUserland;
           config = {
             Entrypoint = [ "/bin/caos" "runner" ];
-            Env = [
-              "PATH=/bin"
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-              # Root: this worker starts daemons, owns an inner git dir, and
-              # drives the engine socket — the same per-image containment
-              # grant the flake-builder carries.
-              "CAOS_WORKER_UID=0"
-              "CAOS_WORKER_GID=0"
-              # The engine socket, declared the same way: this image hosts a
-              # caos stack whose own runnerd launches siblings on the outer
-              # engine, so it needs the socket runnerd was handing to EVERY
-              # worker before this existed. Only an image can ask — the grant
-              # is read from the image's config, never from a job or its args.
-              "CAOS_GRANT_ENGINE_SOCKET=1"
-            ];
+            Env = stackEnv;
+          };
+        };
+        # The same image in the `host` world, which `caosd up` runs directly —
+        # so its entrypoint is the stack itself, not the runner protocol.
+        hostStackImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-stack";
+          tag = "latest";
+          contents = [ hostStackRoot ] ++ stackUserland;
+          config = {
+            Entrypoint = [ "/caos/stack/serve" ];
+            Env = stackEnv;
           };
         };
 

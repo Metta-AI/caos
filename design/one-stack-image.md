@@ -126,6 +126,18 @@ host-side (`localhost:5000`), the server pulls on the network
 (`caos-registry:5000`). `CAOS_REGISTRY_HTTP` and `CAOS_REGISTRY_BASE_HOST` both
 stay. What collapses is not the addressing — it is the *bring-up*.
 
+**runnerd's server URL is two values, not one.** `runnerd` passes *its own*
+`CAOS_SERVER_URL` to every worker it launches
+(`crates/runnerd/src/main.rs:297`). In the test placement those coincide:
+runnerd and its workers share one netns, so `http://127.0.0.1` is right for
+both. On the host they do not — workers sit on the bridge in their own netns,
+where loopback is their own. So the host placement must hand runnerd
+`http://caos-server` (which resolves to the stack container from the bridge
+*and* from inside the group, via the alias), while `serve`'s own health checks
+stay on loopback. `serve` therefore needs the runnerd-facing URL as a separate
+knob with the loopback default — otherwise every worker on the host would be
+handed an address that reaches nothing.
+
 ## caosd's surface
 
 ```

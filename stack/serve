@@ -26,6 +26,12 @@
 #   CAOS_STACK_REDIS_PORT     redis port (required)
 #   CAOS_STACK_REDIS_PERSIST  "yes" for an appendonly cache, "no" to keep it
 #                             in memory and lose it with the process
+#   CAOS_STACK_REGISTRY       "yes" to run a registry in the group, "no" to use
+#                             someone else's. The host placement runs one; the
+#                             test placement deliberately does not — a
+#                             content-addressed registry shared across tests
+#                             cannot leak behaviour, only work, and sharing it
+#                             is what stops every test rebaking the toolchain.
 #   CAOS_RUNNER_SLOTS         runnerd's concurrency
 #   CAOS_PENDING_TIMEOUT_SECS how long a job waits for a runner to exist
 #
@@ -39,6 +45,7 @@ set -euo pipefail
 : "${CAOS_STACK_BIN:?serve needs CAOS_STACK_BIN}"
 : "${CAOS_STACK_REDIS_PORT:?serve needs CAOS_STACK_REDIS_PORT}"
 : "${CAOS_STACK_REDIS_PERSIST:?serve needs CAOS_STACK_REDIS_PERSIST (yes|no)}"
+: "${CAOS_STACK_REGISTRY:?serve needs CAOS_STACK_REGISTRY (yes|no)}"
 
 # The server self-bootstraps an empty repo on first boot, but the directory
 # has to be there for it to bootstrap into.
@@ -87,6 +94,26 @@ for _ in $(seq 1 20); do
 done
 redis-cli -p "$CAOS_STACK_REDIS_PORT" ping >/dev/null 2>&1 \
   || fail "redis never came up"
+
+# --- registry: the image cache, when this placement owns one -----------------
+if [ "$CAOS_STACK_REGISTRY" = yes ]; then
+  mkdir -p "$CAOS_STACK_STATE/registry"
+  cat > "$CAOS_STACK_STATE/registry.yml" <<YML
+version: 0.1
+storage:
+  filesystem:
+    rootdirectory: $CAOS_STACK_STATE/registry
+http:
+  addr: :5000
+YML
+  start registry registry serve "$CAOS_STACK_STATE/registry.yml"
+  ok=""
+  for _ in $(seq 1 30); do
+    if curl -sS -o /dev/null "http://127.0.0.1:5000/v2/"; then ok=1; break; fi
+    sleep 1
+  done
+  [ -n "$ok" ] || fail "registry never came up"
+fi
 
 # --- server ------------------------------------------------------------------
 start server env \
