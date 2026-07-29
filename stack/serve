@@ -129,8 +129,13 @@ done
 [ -n "$ok" ] || fail "server never came up"
 
 # --- runnerd -----------------------------------------------------------------
+# runnerd hands its OWN CAOS_SERVER_URL to every worker it launches
+# (crates/runnerd/src/main.rs). Where workers share this netns — the test
+# placement, `container:<self>` — loopback is right for both. On the host they
+# get their own netns on a bridge, so runnerd must advertise a name that
+# resolves there; it also resolves from in here, via the stack's alias.
 start runnerd env \
-  CAOS_SERVER_URL="$SERVER_URL" \
+  CAOS_SERVER_URL="${CAOS_STACK_RUNNER_SERVER_URL:-$SERVER_URL}" \
   CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
   CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
   "$CAOS_STACK_BIN/runnerd"

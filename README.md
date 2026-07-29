@@ -95,26 +95,22 @@ Binaries are statically linked against `musl` — no shared-library dependencies
 Docker images (crates are unprefixed; images carry a `caos-` prefix):
 
 ```bash
-nix build .#caos-server-docker            # image tarball at ./result
-nix build .#caos-worker-flake-builder-docker
+nix build .#caos-worker-flake-builder-docker   # image tarball at ./result
 
 docker load < result
 ```
 
-Or build and load into the local docker daemon in one step (streamed, nothing
-large written to the Nix store):
-
-```bash
-nix run .#load-caos-server
-nix run .#load-caos-runnerd
-```
+**The stack itself is one image** (`design/one-stack-image.md`): redis, the
+registry, the server and runnerd run as a process group inside a single
+container, started by `caosd serve`. `caosd up` runs that image; the test suite
+runs the same image in the `test` world, so the suite exercises the stack the
+host actually runs rather than an approximation of it.
 
 Only ONE worker image remains nix-built here: the `flake-builder`. Every std
 worker is a flake-built worker image (`std/runner`, `std/cargo`, `std/bash` —
 complete flakes in `std/`, imaged on demand by the flake-builder) or a
 `curry(std/runner, worker1=<binary>)` over the runner —
-see `design/flake-images.md`. The `caos-server` image is not minimal: it bundles
-the `docker` client, `git`, and `tar`, and expects the host's docker socket.
+see `design/flake-images.md`.
 
 > On macOS, see [Building on macOS](BUILDING_ON_MACOS.md).
 
