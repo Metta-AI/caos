@@ -70,20 +70,40 @@ build)
   # for this. So: retry, removing the litter, but ONLY on that exact error —
   # completed drvs stay in the store, so each retry makes monotonic progress
   # and a genuinely broken flake still fails on its first real error.
-  nix_build_flake() {
+  #
+  # PARAMETERISED ON THE ATTRIBUTE, because the litter is a property of
+  # unsandboxed nix, not of which output you asked for. It wrapped only
+  # #caosImage while the go build happened to live under that attribute;
+  # moving the docker client into #depsImage's closure (where it belongs — it
+  # is source-independent) put a go build under the OTHER nix build, and the
+  # deps build died on exactly the error this exists to absorb.
+  nix_build_flake() { # <attr> <out-link>
     while :; do
       rm -rf /homeless-shelter
       # The pipeline (pipefail is on) keeps the full log flowing to stderr
       # while capturing a copy to grep; `-o` carries the result, stdout is
       # empty.
-      if nixf build -L "path:/tmp/ws#caosImage" -o /tmp/img 2>&1 | tee /tmp/nix-err >&2; then
+      if nixf build -L "path:/tmp/ws#$1" -o "$2" 2>&1 | tee /tmp/nix-err >&2; then
         return 0
       fi
       grep -q "homeless-shelter" /tmp/nix-err || return 1
-      echo "flake-build: homeless-shelter litter; resuming the build" >&2
+      echo "flake-build: homeless-shelter litter; resuming $1" >&2
     done
   }
   sk() { skopeo --insecure-policy "$@"; }
+
+  # TWO cold evaluations happen here — `#depsImage.drvPath` below, then
+  # another inside `nix build path:…#caosImage` — and a `path:` flake gets no
+  # eval cache, so neither is free (the first samples at ~18s in here).
+  #
+  # TRIED AND REVERTED, INCONCLUSIVE (2026-07-29): collapsing them into one
+  # `builtins.getFlake` + `--impure` eval returning both drvPaths, then
+  # building `<drv>^out` so nix never re-enters the evaluator. It is CORRECT
+  # (identical drvPath either way, verified) and it did not measurably help:
+  # 2m53 with it, against 2m20 and 3m04 on two runs of the tree WITHOUT it.
+  # Run-to-run spread on this workload is ~45s, so a single A/B says nothing —
+  # reverted for being extra machinery with no demonstrated win, not for being
+  # slower. Anyone retrying this needs repeated runs, not one of each.
 
   # The SECOND memo (design/flake-deps-image.md). flake-<H> is keyed on the
   # tree, so one source byte is a total miss that restarts from whatever
@@ -112,7 +132,7 @@ build)
 
     if ! sk inspect --tls-verify=false "docker://$dtag" >/dev/null 2>&1; then
       echo "flake-build: deps miss for $dtag; building it here" >&2
-      nixf build "path:/tmp/ws#depsImage" -o /tmp/deps \
+      nix_build_flake depsImage /tmp/deps \
         || fail "nix build of path:/tmp/ws#depsImage"
       gunzip -c "$(readlink -f /tmp/deps)" > /tmp/deps.tar
       sk copy --dest-tls-verify=false "docker-archive:/tmp/deps.tar" "docker://$dtag" >&2 \
@@ -145,7 +165,7 @@ build)
     echo "flake-build: registry hit for $tag" >&2
   else
     seed_deps
-    nix_build_flake \
+    nix_build_flake caosImage /tmp/img \
       || fail "nix build of path:/tmp/ws#caosImage (does the flake expose packages.<system>.caosImage?)"
     gunzip -c "$(readlink -f /tmp/img)" > /tmp/img.tar
     sk copy --dest-tls-verify=false "docker-archive:/tmp/img.tar" "docker://$tag" >&2 \

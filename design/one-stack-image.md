@@ -57,13 +57,42 @@ caosd up      host convenience: start the stack image as a container
 call `serve` directly, because they are already inside a container and starting
 another one would be the only thing they gained.
 
-**The image is the same one either way.** The root flake's
-`packages.<system>.caosImage` already contains a complete caos stack built from
-the tree — the binaries, the userland the daemons shell out to (git, redis,
-skopeo, the docker client, diffutils, gawk), and the tree's clean core image
-tarballs. `up` runs that image. The suite runs that image. The host stack
-becomes a test stack that persists, which is the whole point: the suite stops
-approximating the host and starts running it.
+**One image definition either way.** The root flake's `mkStackRoot` builds a
+complete caos stack from the tree — the userland the daemons shell out to (git,
+redis, skopeo, the docker client, diffutils, gawk) and the one bring-up — and
+both worlds are that definition. `up` runs it. The suite runs it. The host
+stack becomes a test stack that persists, which is the whole point: the suite
+stops approximating the host and starts running it.
+
+**Where the binaries come from is the host's one asymmetry**, and it is forced
+by placement, not preference. A test stack runs as a *worker* on the outer
+stack, so nothing can hand it a directory: it carries its binaries at
+`/caos/bin`, plus the `/worker` interpreter that starts it. The host stack has
+`caosd` standing right next to it, so `up` stages into `$CAOS_DATA/stack/bin` —
+through the `/state` mount it already has — and points `CAOS_STACK_BIN` there.
+`serve` reads them from a directory either way; that is what `CAOS_STACK_BIN`
+is for.
+
+It stages **exactly `server` and `runnerd`**, which is `serve`'s own documented
+contract for that directory, and it compares them by BYTES rather than by store
+path — the same key `build-builtins.sh` uses for its image deltas. A workspace
+rebuild renames every store path but usually changes neither file, so editing a
+*worker* leaves the daemons untouched and `up` has only the std publish to do.
+Everything else the workspace builds reaches the stack as `refs/caos/bins` and
+the std curries, published from the store; nothing else travels through
+`/state/bin`.
+
+Staged, not bind-mounted from `/nix/store`: on macOS the engine is a VM that
+cannot see the host store, while `$CAOS_DATA` is already shared with it.
+
+The point is the dev loop. Binaries in the image made the host image a function
+of the workspace, so a one-line Rust edit re-keyed 181 MB of userland — `nix
+build` re-tarred and re-gzipped it (~12s) and `up` re-ran `docker load` (~10s)
+to move 61 MB the image shares with nothing. Out of the image, the host stack
+image is a function of the tree's *scripts and userland* alone: `load_once`
+hits, and `up` only recreates the container, which it must do regardless
+because `server` and `runnerd` are already-running processes. `up` recreates
+on either trigger — a rebuilt image or freshly staged binaries.
 
 ### macOS is not a special case
 

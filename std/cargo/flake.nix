@@ -2,8 +2,16 @@
   # std/cargo (design/flake-images.md): the whole-tree cargo worker — check/
   # build/test over a workspace — as a worker image: the pinned rust
   # toolchain + the caos workspace's dependencies pre-compiled for
-  # (musl, dev), with /worker = the worker-cargo binary. rustc borrows this
-  # entry (its curried `cargo` ref) for its compile step.
+  # (musl, dev). rustc borrows this entry (its curried `cargo` ref) for its
+  # compile step.
+  #
+  # NO /worker here. It is exactly the runner's arrangement, for exactly the
+  # runner's reason: worker-cargo is a WORKSPACE binary, and baking it into
+  # this image would make a 3.4 GB nix closure re-key on every Rust edit —
+  # a re-tar + re-gzip in `nix build` and a gunzip + registry push in
+  # `caosd up`, for a 5 MB file. build-builtins.sh composes it on at publish
+  # as a content-keyed layer over this CLEAN image, so what re-keys on an
+  # edit is the layer.
   #
   # HOST-BUILT, like std/flake-builder and std/runner: this file is the
   # DEFINITION, the root flake calls its outputs directly and builds the
@@ -49,15 +57,15 @@
     in
     {
       # The image, as a function of what only the caller knows: the workspace
-      # source, the toolchain it is being built with, and the already-compiled
-      # worker-cargo binary. The caller passing its OWN toolchain is what
-      # makes this bake and its cargoArtifacts one derivation.
+      # source and the toolchain it is being built with. The caller passing
+      # its OWN toolchain is what makes this bake and its cargoArtifacts one
+      # derivation. Note what is NOT an argument: the worker binary — see the
+      # header.
       lib = forEach (system: {
         imageFor =
           {
             src,
             toolchain,
-            workerCargo,
           }:
           let
             pkgs = import nixpkgs {
@@ -65,14 +73,9 @@
               overlays = [ (import rust-overlay) ];
             };
             bake = import ./bake.nix { inherit pkgs crane src toolchain; };
-            workerRoot = pkgs.runCommand "cargo-worker-root" { } ''
-              mkdir -p $out
-              install -m 755 ${workerCargo}/bin/worker-cargo $out/worker
-            '';
           in
           {
             contents = [
-              workerRoot
               bake.rootEnv
             ];
             config = {

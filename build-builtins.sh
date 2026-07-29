@@ -165,7 +165,21 @@ tool_bin() { # <name> -> the path of bin/<name> among the built paths
   exit 1
 }
 caos_bin=$(tool_bin caos)
-runner_bin=$(tool_bin worker-runner)
+
+# Which workspace binary is a streamed image's `/worker`. These images are
+# HOST-BUILT and the host is their author, so their interpreter is composed on
+# here rather than baked into the nix image — the clean image then depends on
+# nothing in the workspace and is pushed once, keyed on its store path alone,
+# while the binary rides as a layer keyed on its BYTES. flake-builder is
+# absent because its /worker comes from its own flake, not from this
+# workspace.
+worker_bin_of() { # <std name> -> the workspace binary that is its /worker, or empty
+  case "$1" in
+    runner) echo worker-runner ;;
+    cargo) echo worker-cargo ;;
+    *) ;;
+  esac
+}
 
 # The caos additions, staged as a git-docker LAYER TREE — the same shape
 # std/flake-builder's stack stage emits, so both image paths in this tree
@@ -199,14 +213,25 @@ additions_tree=$(
   } | git -C "$CLIENT" mktree
 )
 
-# The runner's /worker, its own layer: worker-runner is the pool protocol's
-# in-image half, and the host is this image's author.
-RW=$CLIENT/layer-runner
-rm -rf "${RW:?}"
-mkdir -p "$RW"
-install -m 755 "$runner_bin" "$RW/worker"
-git -C "$CLIENT" add layer-runner
-runner_tree=$(git -C "$CLIENT" write-tree --prefix=layer-runner/)
+# Each streamed image's /worker, its own layer. worker-runner is the pool
+# protocol's in-image half; worker-cargo is what the cargo image is FOR — and
+# neither belongs in the nix closure it runs on. The cargo image is 3.4 GB of
+# toolchain and baked deps, so baking a 5 MB binary into it made every Rust
+# edit re-tar and re-gzip all of it under `nix build` and then gunzip and
+# re-push it under `caosd up` (design/flake-images.md listed exactly this as
+# the open boundary-caching item).
+declare -A worker_tree
+for name in "${image_names[@]}"; do
+  wb=$(worker_bin_of "$name")
+  if [ -n "$wb" ]; then
+    WD=$CLIENT/layer-worker-$name
+    rm -rf "${WD:?}"
+    mkdir -p "$WD"
+    install -m 755 "$(tool_bin "$wb")" "$WD/worker"
+    git -C "$CLIENT" add "layer-worker-$name"
+    worker_tree[$name]=$(git -C "$CLIENT" write-tree --prefix="layer-worker-$name/")
+  fi
+done
 
 # The streamed std entries (design/one-stack-image.md): the nix tarball is the
 # CLEAN image — no caos, no user db, no /tmp — and it goes to the registry
@@ -255,9 +280,9 @@ for name in "${image_names[@]}"; do
       printf '040000 tree %s\tlayer00\n' "$additions_tree"
       # Not `[ ... ] && printf`: this is the block's last command, so under
       # `set -e -o pipefail` a false test would fail the whole substitution
-      # for every entry that is not the runner.
-      if [ "$name" = runner ]; then
-        printf '040000 tree %s\tlayer01\n' "$runner_tree"
+      # for every entry that carries no /worker of its own.
+      if [ -n "${worker_tree[$name]:-}" ]; then
+        printf '040000 tree %s\tlayer01\n' "${worker_tree[$name]}"
       fi
     } | git -C "$CLIENT" mktree
   )

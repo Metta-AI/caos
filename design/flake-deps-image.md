@@ -107,6 +107,35 @@ sidesteps the question entirely.
 - Divergence is safe. If `deps-<D>` does not cover everything `caosImage` needs,
   the build just builds the remainder — a miss, not corruption. So a flake can
   be liberal about what it puts in `rootPaths`.
+  **Be liberal, then — an under-filled `rootPaths` is silent.** Nothing fails,
+  nothing warns; the builder just quietly does the work again, and the only
+  symptom is a slow tool. The root flake's list was
+  `(cargoArtifacts, toolchain, flake-builder, runner)` for a year and read as
+  complete. Measured against a warm `deps-<D>`, the builder still had to
+  produce **809** store paths: 747 fetched from `cache.nixos.org` and **62
+  built from source in the container**. Two of those dominated —
+  `docker-29.5.3`, because `stackUserland` takes it with
+  `.override { buildxSupport = false; composeSupport = false; }` and an
+  overridden derivation is in no binary cache (a full Go compile, observed at
+  300% CPU); and `caos-worker-cargo.tar.gz`, a 3.4 GB closure to tar and gzip,
+  pulled in because the seed pushes the three clean core images. Naming
+  `stackUserland`, `builtinWorkerImages` and the seed's own tools brought it to
+  60 must-build paths, all of them cheap (hooks, `conf.json`, dummy manifests),
+  and nix skips even those wherever the consuming output is already valid.
+  **The check is mechanical**, so run it rather than reasoning about it:
+
+  ```sh
+  nix-store -qR --include-outputs $(nix eval --raw .#caosImage.drvPath) \
+    | grep -v '\.drv$' | sort -u > need
+  reg=$(nix-store -qR $(nix eval --raw .#depsImage.drvPath) \
+    | grep 'deps-registration.*\.drv$')
+  nix-store -qR $(nix-store -q --outputs "$reg") | sort -u > have
+  comm -23 need have    # everything the builder still has to produce
+  ```
+
+  Note `nix path-info -r` on the deps **tarball** answers a different question
+  (its scanned references) and reports far too little — go through the
+  registration derivation, as above.
 - Unpacking writes `/nix/store`, so it needs root. The flake-builder already
   runs with `CAOS_WORKER_UID=0`.
 - `gnutar` joins the flake-builder image: `coreutils` has no `tar`, and the
@@ -148,11 +177,39 @@ A **warm flake-builder runner** would keep `/nix/store` hot in-process across
 jobs, making even a `deps-<D>` hit free. Orthogonal to this note and composes
 with it.
 
-**Seeding the layer tarballs, not just the outputs.** Most of the remaining
-140s is not compilation. `dockerTools` builds one `.tar.gz` derivation per
-store path, and a fresh builder container has to re-tar and gzip every layer
-of the ~3.4GB closure even though none of their contents changed. Those
-per-layer derivations are as source-independent as the bake itself, so putting
-them in `depsImage`'s `rootPaths` would make a hit skip the re-tarring too.
-This matters more as images grow — the test-stack image
-(`test-stack-image.md`) is larger than `std/cargo`.
+~~**Seeding the layer tarballs, not just the outputs.** `dockerTools` builds
+one `.tar.gz` derivation per store path, and a fresh builder container has to
+re-tar and gzip every layer of the ~3.4GB closure.~~ **Retracted (2026-07-29)
+— that is not what the current `dockerTools` does.** `buildLayeredImage` is
+`streamLayeredImage` piped into `pigz`: the per-store-path split lives in
+`layers.json` (computed once by `auto-layer.py`) and the tarring happens
+inside the *stream script*, so there is exactly ONE `.tar.gz` derivation per
+image, not one per layer. Verified on the whole tree — a full image build is
+six derivations (`customisation-layer`, `excludePaths`, `layers.json`,
+`conf.json`, `stream-…`, `…tar.gz`). There is nothing per-layer to seed.
+
+What was really left of that time is covered above: the `rootPaths` list was
+incomplete, so a Go toolchain build and a 3.4 GB tar+gzip ran on every build.
+
+**Still adjacent:** a **warm flake-builder runner** keeping `/nix/store` hot
+across jobs would make even a `deps-<D>` hit free — the transplant
+(`skopeo copy` + untar the closure into `/`) is now the largest fixed cost of
+a build, and it exists only because each job starts from a cold store.
+
+**Two cold flake evaluations — tried collapsing, inconclusive.** The stage runs
+`nix eval …#depsImage.drvPath` and then `nix build …#caosImage`, and a `path:`
+flake gets no eval cache, so this tree (which instantiates nixpkgs twice, for
+host and Linux) is evaluated from scratch twice; the first samples at ~18s
+in-container. The obvious fix — one `builtins.getFlake` + `--impure` eval
+returning both `drvPath`s, then `nix build <drv>^out` so nix never re-enters
+the evaluator — was implemented and reverted. It is *correct* (identical
+drvPath either way, verified); it simply did not measurably help.
+
+**And that is the more useful finding: this workload's run-to-run spread is
+~45s.** Two runs of the *identical* tree and builder gave 2m20 and 3m04; the
+single-eval variant gave 2m53, i.e. inside that band. A one-run A/B here
+proves nothing, and the numbers in this note that come from single runs
+(including the table above) should be read with that error bar. Structural
+evidence — "this derivation is no longer built at all", checked with the
+`comm -23 need have` recipe above — is worth more than a stopwatch, and is how
+the `rootPaths` fix was actually confirmed.

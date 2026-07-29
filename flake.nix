@@ -325,11 +325,11 @@
         # std/cargo as HOST-BUILT streamed core, like std/flake-builder and
         # std/runner: we call the subflake's outputs directly — the standard
         # subflake call, no path-input lock churn — passing OUR nixpkgs,
-        # rust-overlay and crane, plus the workspace source, the shared
-        # toolchain, and the already-compiled worker-cargo. Nothing resolves
-        # std/cargo as a flake TREE any more, which is what let its vendored
-        # copies of the manifests, lockfile and crate stubs go: a published
-        # tree must be self-contained, a streamed image need not be.
+        # rust-overlay and crane, plus the workspace source and the shared
+        # toolchain. Nothing resolves std/cargo as a flake TREE any more,
+        # which is what let its vendored copies of the manifests, lockfile and
+        # crate stubs go: a published tree must be self-contained, a streamed
+        # image need not be.
         cargoDef =
           ((import ./std/cargo/flake.nix).outputs {
             self = null;
@@ -338,15 +338,16 @@
             {
               inherit src;
               toolchain = mkRustToolchain linuxPkgs;
-              workerCargo = worker-cargo;
             };
         workerCargoImage = pkgs.dockerTools.buildLayeredImage {
           name = "caos-worker-cargo";
           tag = "latest";
-          # CLEAN, like the other streamed cores: no caos, no user db, no
-          # /tmp. build-builtins composes the additions on as a content-keyed
-          # layer at publish. Unlike the runner, /worker rides in the clean
-          # image itself (workerRoot) — worker-cargo is what this image is.
+          # CLEAN, exactly like the runner: no caos, no user db, no /tmp — and
+          # no /worker. build-builtins composes the additions AND worker-cargo
+          # on as content-keyed layers at publish. This image is 3.4 GB of
+          # toolchain and baked deps; it must depend on nothing in the
+          # workspace, or every Rust edit re-tars and re-gzips all of it and
+          # then pushes it again.
           contents = cargoDef.contents;
           config = cargoDef.config;
           fakeRootCommands = cargoDef.fakeRootCommands;
@@ -437,10 +438,14 @@
         # The clean core images push under a tag keyed on their STORE PATH, so
         # the ones this seed pushes are byte-identical to the host's and the
         # push is a registry hit whenever `caosd up` got there first.
+        # Named, because the deps memo below has to name it too: whatever this
+        # derivation builds WITH is a build-time input of #caosImage, and the
+        # memo's whole job is to carry those (design/flake-deps-image.md).
+        seedTools = with linuxPkgs; [
+          bash coreutils gitMinimal redis skopeo curl gawk gzip cacert
+        ];
         seededGit = linuxPkgs.runCommand "caos-seeded-git" {
-          nativeBuildInputs = with linuxPkgs; [
-            bash coreutils gitMinimal redis skopeo curl gawk gzip cacert
-          ];
+          nativeBuildInputs = seedTools;
         } ''
           export HOME=$TMPDIR
           state=$TMPDIR/stack
@@ -490,17 +495,24 @@
         # the `test` build, and crates/caos-world makes a client of one
         # unable to drive the other. Everything else — the userland, the one
         # bring-up — is identical, which is the point: the host stack IS a
-        # test stack that persists. The one asymmetry is the seed below.
+        # test stack that persists.
+        #
+        # `bins = null` is the HOST asymmetry, and it is what keeps the dev
+        # loop short. A test stack must carry its binaries: it runs as a
+        # worker on the outer stack, where nothing can hand it a directory.
+        # The host's cannot be handed one either — `caosd` is running right
+        # next to it and stages them through the state mount it already has
+        # (see stage_bins). Baking them in instead made a 181 MB image re-key
+        # on every Rust edit, so `nix build` re-tarred and re-gzipped the
+        # whole userland and `caosd up` re-ran `docker load`, all to move
+        # binaries the image shares with nothing.
+        #
         # NOTE the parens around the script: `runCommand n {} '''' + s` binds as
         # `(runCommand n {} '''') + s`, which concatenates the DERIVATION with
         # the string and yields a store path with the script text glued onto
         # the end. It builds, and the layer builder then reports a missing
         # `<path># The seeded server repo...`.
-        mkStackRoot = { name, bins, seed ? null }: pkgs.runCommand "caos-${name}-stack-root" { } (''
-          mkdir -p $out/caos/bin
-          for b in ${pkgs.lib.concatStringsSep " " testStackBins}; do
-            cp ${bins}/bin/$b $out/caos/bin/$b
-          done
+        mkStackRoot = { name, bins ? null, seed ? null }: pkgs.runCommand "caos-${name}-stack-root" { } (''
           # NO /caos/images and NO /caos/tree. They existed so that a stack
           # could run build-builtins.sh from inside itself — the clean core
           # tarballs to push, std/ and crates/worker-common to publish. Nothing
@@ -512,6 +524,13 @@
           # stack with it, exactly as `caosd up` and the seed derivation do.
           mkdir -p $out/caos/stack
           install -m 755 ${./stack/serve} $out/caos/stack/serve
+        '' + pkgs.lib.optionalString (bins != null) ''
+          mkdir -p $out/caos/bin
+          for b in ${pkgs.lib.concatStringsSep " " testStackBins}; do
+            cp ${bins}/bin/$b $out/caos/bin/$b
+          done
+          # The test placement's interpreter. It runs the tree's own binaries
+          # out of /caos/bin, so it rides with them or not at all.
           install -m 755 ${./test-stack/worker} $out/worker
         '' + pkgs.lib.optionalString (seed != null) ''
           # The seeded server repo (design/one-stack-image.md): this stack
@@ -528,7 +547,9 @@
           bins = testWorkspaceBins;
           seed = seededGit;
         };
-        hostStackRoot = mkStackRoot { name = "host"; bins = workspaceBins; };
+        # No `bins`: caosd stages them into the state mount at `up`, so this
+        # image — and therefore the `docker load` — is source-independent.
+        hostStackRoot = mkStackRoot { name = "host"; };
         # The userland a caos stack shells out to, shared by both worlds.
         stackUserland = [
             # git (the server's
@@ -606,11 +627,41 @@
           };
         };
 
-        # The test stack's deps memo (design/flake-deps-image.md). Everything
-        # here is SOURCE-INDEPENDENT — the dep bake rides crane's dummy
-        # sources, and the two core images depend on nothing from the
-        # workspace — so a caos edit leaves this derivation where it is and
-        # the builder starts from a warm store.
+        # The test stack's deps memo (design/flake-deps-image.md): the
+        # build-time store paths #caosImage's build CONSUMES but does not
+        # produce. Everything here is SOURCE-INDEPENDENT — the dep bake rides
+        # crane's dummy sources, the core images depend on nothing from the
+        # workspace, and the userland is stock nixpkgs — so a caos edit leaves
+        # this derivation where it is and the builder starts from a warm
+        # store.
+        #
+        # The list was (cargoArtifacts, toolchain, flake-builder, runner) and
+        # that was INCOMPLETE, which cost most of a `run-tool build`. Measured
+        # on this tree, against a warm deps-<D>, the builder still had to
+        # produce 809 store paths — 747 fetched from cache.nixos.org over the
+        # network, and 62 with no cache entry at all, i.e. compiled from
+        # source in the container. The two that mattered:
+        #
+        #   docker-29.5.3   stackUserland's `.override { buildxSupport =
+        #                   false; composeSupport = false; }`. An overridden
+        #                   derivation is not in any binary cache, so this is
+        #                   a full Go compile — observed at 300% CPU inside
+        #                   the builder — on EVERY build.
+        #   caos-worker-cargo.tar.gz
+        #                   the seed pushes the three clean core images, so
+        #                   their tarballs are inputs. This one is 3.4 GB of
+        #                   closure; producing it is a whole-closure tar +
+        #                   pigz.
+        #
+        # The note this implements says a flake "can be liberal about what it
+        # puts in rootPaths" — divergence costs a rebuild, never corruption.
+        # So: be liberal, and derive the list from the same bindings the image
+        # actually uses, rather than restating it.
+        #
+        # NOTE the cargo image only became eligible when its /worker moved out
+        # to a publish-time layer. While worker-cargo was baked in, naming that
+        # image here would have made this memo re-key on every Rust edit —
+        # which is precisely the thing it exists to survive.
         testStackDepsRegistration = pkgs.runCommand "caos-test-stack-deps-registration" { } ''
           mkdir -p $out
           cp ${
@@ -618,9 +669,10 @@
               rootPaths = [
                 cargoArtifacts
                 rustToolchain
-                workerFlakeBuilderImage
-                workerRunnerImage
-              ];
+              ]
+              ++ builtinWorkerImages
+              ++ stackUserland
+              ++ seedTools;
             }
           }/registration $out/caos-deps-registration
         '';
@@ -770,9 +822,11 @@
           # parse and no build context to unpack.
           # docker rides in from the host PATH (caosd already requires it).
           # util-linux: setsid, so a hung compose up dies as a whole group.
+          # diffutils: cmp, which decides whether the stack's staged server
+          # and runnerd actually changed (stage_bins).
           runtimeInputs = [
             pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.skopeo pkgs.gzip
-            pkgs.util-linux
+            pkgs.util-linux pkgs.diffutils
           ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
@@ -809,6 +863,51 @@
             }
 
             CLIENT=$CAOS_DATA/publish-client-repo
+
+            # The binaries the stack's daemons run. They are NOT in the image
+            # (hostStackRoot): baking them in re-keyed 181 MB of userland on
+            # every Rust edit, so `nix build` re-tarred it and `up` re-loaded
+            # it to move 61 MB the image shares with nothing.
+            #
+            # STAGED THROUGH THE STATE MOUNT, not bind-mounted from the store:
+            # on macOS the engine is a VM that cannot see the host's
+            # /nix/store (BUILDING_ON_MACOS.md), while $CAOS_DATA is already
+            # shared with it — this is the one path that works in both places.
+            # EXACTLY the two binaries serve runs — its own documented
+            # contract is "CAOS_STACK_BIN: dir holding `server` and
+            # `runnerd`". Everything else the workspace builds reaches the
+            # stack as refs/caos/bins and the std curries, from the store,
+            # never through here.
+            BINSRC=${workspaceBins}/bin
+            BINDIR=$CAOS_DATA/stack/bin
+            STACK_BINS=(server runnerd)
+
+            # Compared by BYTES, not by store path — the same way
+            # build-builtins keys its image deltas. A workspace rebuild
+            # renames every store path but usually changes neither of these
+            # two files, and then there is nothing to stage and no reason to
+            # restart the daemons: editing a worker leaves `up` with only the
+            # std publish to do.
+            bins_staged() {
+              local b
+              for b in "''${STACK_BINS[@]}"; do
+                cmp -s "$BINSRC/$b" "$BINDIR/$b" || return 1
+              done
+            }
+
+            # Staged via a temp dir and renamed: a half-copied /state/bin is
+            # what a restarting stack would try to come up from.
+            stage_bins() {
+              echo "==> staging server + runnerd into $BINDIR" >&2
+              local b
+              rm -rf "$BINDIR.new"
+              mkdir -p "$BINDIR.new"
+              for b in "''${STACK_BINS[@]}"; do
+                install -m 755 "$BINSRC/$b" "$BINDIR.new/$b"
+              done
+              rm -rf "$BINDIR"
+              mv "$BINDIR.new" "$BINDIR"
+            }
 
             # Publish std to this stack: build-builtins.sh with the flake's own
             # prebuilt images and binaries, so nothing is nix-built at runtime.
@@ -878,13 +977,26 @@
               docker network inspect "$NET" >/dev/null 2>&1 \
                 || docker network create "$NET" >/dev/null
 
-              # Recreate only when the running container is on a different
-              # image than the build just loaded; an unchanged `up` is a no-op.
+              # Stage before the container decision: whether the binaries
+              # moved is half of it.
+              if bins_staged; then
+                echo "==> server + runnerd are byte-identical — nothing to stage" >&2
+                fresh_bins=""
+              else
+                stage_bins
+                fresh_bins=1
+              fi
+
+              # Recreate when the running container is on a different image
+              # than the build just loaded, OR when the binaries under it just
+              # changed — server and runnerd are already-running processes, so
+              # restaging alone does not deploy them. An unchanged `up` is
+              # still a no-op.
               want=$(docker image inspect -f '{{.Id}}' caos-stack:latest)
               have=$(docker inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)
               running=$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)
-              if [ -n "$have" ] && [ "$have" != "$want" ]; then
-                echo "==> recreating onto the rebuilt image" >&2
+              if [ -n "$have" ] && { [ "$have" != "$want" ] || [ -n "$fresh_bins" ]; }; then
+                echo "==> recreating onto the rebuilt stack" >&2
                 docker rm -f "$NAME" >/dev/null
                 have=""
               elif [ -n "$have" ] && [ "$running" != true ]; then
@@ -897,7 +1009,6 @@
               fi
               if [ -z "$have" ]; then
                 echo "==> starting the stack (redis, registry, server, runnerd)" >&2
-                mkdir -p "$CAOS_DATA/stack"
                 # Two aliases, one container: every name that resolved under
                 # compose still resolves — workers reach the server as
                 # `caos-server`, and the server pulls a delta's `base` as
@@ -913,7 +1024,7 @@
                   -v /var/run/docker.sock:/var/run/docker.sock \
                   -e CAOS_STACK_STATE=/state \
                   -e CAOS_STACK_LOGS=/state/logs \
-                  -e CAOS_STACK_BIN=/caos/bin \
+                  -e CAOS_STACK_BIN=/state/bin \
                   -e CAOS_STACK_REDIS_PORT=6379 \
                   -e CAOS_STACK_REDIS_PERSIST=yes \
                   -e CAOS_STACK_REGISTRY=yes \

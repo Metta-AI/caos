@@ -151,12 +151,16 @@ setuid caos), pushes, and memoizes on (clean tarball store path, composed
 binaries' content). That is the same clean-image + additions-delta shape
 the stack stage gives every flake image — one additions model, two
 encodings (a git tree with `.caosmeta` sidecars in the stack stage; a
-mode-carrying tar here). The runner streams the same way, its `/worker`
-(worker-runner) riding as a second content-keyed layer — the host is that
-image's author. Because the clean images depend on nothing from the
-workspace and the deltas key on the binaries' BYTES, a Rust edit that
-leaves them bit-identical re-streams nothing and re-keys nothing
-downstream (verified: a server-only edit is a registry hit for both). So
+mode-carrying tar here). The runner and cargo stream the same way, their
+`/worker` (worker-runner, worker-cargo) riding as a second content-keyed
+layer — the host is those images' author. Because the clean images depend
+on nothing from the workspace and the deltas key on the binaries' BYTES, a
+Rust edit that leaves them bit-identical re-streams nothing and re-keys
+nothing downstream (verified: a server-only edit is a registry hit for
+both). Cargo is where that is worth the most: its clean image is 3.4 GB of
+toolchain and baked deps, and while its 5 MB `/worker` was baked in,
+*every* Rust edit re-tarred and re-gzipped all of it under `nix build`
+(~25s) and then gunzipped and re-pushed it under `caosd up` (~16s). So
 resolution never re-enters the flake branch for the builder, and the
 recursion is grounded. (The stock-base pins live with their only
 consumer: `caos-tools/{nix,debian}-base.ref`, the test suite's own image
@@ -259,9 +263,14 @@ transformation at all.)
   tree under test (delta-over-pinned-debian, `caos-tools/lib/`) — a second
   image pipeline, and a userland (debian) that production std no longer
   uses. Unify onto the flake path once std trees are literal (Part 2).
-- Boundary caching for two-level images (a cheap worker layer over an
+- ~~Boundary caching for two-level images (a cheap worker layer over an
   expensive base, both flake-defined) — today `std/cargo` accepts a full
-  rebake when its `/worker` changes.
+  rebake when its `/worker` changes.~~ **Closed (2026-07-29)**: not by
+  caching the boundary but by removing it — `std/cargo`'s image is CLEAN
+  like the runner's, and `/worker` is composed on at publish as a
+  content-keyed layer (Bootstrap, above). The bake is keyed on (toolchain,
+  manifests, lockfile) and nothing else, so no Rust edit rebakes or
+  re-pushes it.
 - Registry credentials: local HTTP today; curry a token as a bound arg when
   auth arrives.
 
