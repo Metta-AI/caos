@@ -808,10 +808,18 @@
               # image than the build just loaded; an unchanged `up` is a no-op.
               want=$(docker image inspect -f '{{.Id}}' caos-stack:latest)
               have=$(docker inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)
+              running=$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)
               if [ -n "$have" ] && [ "$have" != "$want" ]; then
                 echo "==> recreating onto the rebuilt image" >&2
                 docker rm -f "$NAME" >/dev/null
                 have=""
+              elif [ -n "$have" ] && [ "$running" != true ]; then
+                # EXISTS BUT STOPPED — what a host or sandbox restart leaves
+                # behind. Its state is all in the bind mount, so starting it is
+                # enough; only checking existence here made `up` skip the run
+                # and then time out waiting, unrecoverably.
+                echo "==> starting the existing stack container" >&2
+                docker start "$NAME" >/dev/null
               fi
               if [ -z "$have" ]; then
                 echo "==> starting the stack (redis, registry, server, runnerd)" >&2

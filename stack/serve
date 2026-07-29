@@ -109,7 +109,10 @@ YML
   start registry registry serve "$CAOS_STACK_STATE/registry.yml"
   ok=""
   for _ in $(seq 1 30); do
-    if curl -sS -o /dev/null "http://127.0.0.1:5000/v2/"; then ok=1; break; fi
+    # -s, not -sS: every attempt before the registry is listening would
+    # otherwise print a connection error, and a retry loop's noise reads like
+    # a failure in the logs the FIRST real failure dumps.
+    if curl -s -o /dev/null "http://127.0.0.1:5000/v2/"; then ok=1; break; fi
     sleep 1
   done
   [ -n "$ok" ] || fail "registry never came up"
