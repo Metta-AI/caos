@@ -237,6 +237,21 @@ failure that buys:
 than a speculative fallback: assert the invariant, die with a specific message,
 and let `std-build` (or, for a human, `up`) be the explicit repair.
 
+**And it is sharper than "a function of registry contents."** The seed
+derivation does not merely *read* the registry — it PUSHES to one, so it needs
+a reachable, writable registry at build time. That is a dependency on a running
+service, not on data.
+
+It is survivable only because of where the build happens: `#caosImage` is built
+by `std/flake-builder` INSIDE caos, whose nix is deliberately unsandboxed
+(`--option sandbox false`, `std/flake-builder/worker:59-63`) in a container on
+the network, where `caos-registry:5000` resolves. It is NOT survivable under a
+plain `nix build .#caosImage` on the host, which sandboxes and has no such
+registry — so adding the seed makes that attribute build only from inside caos.
+Whether that is acceptable, or whether the seed should be a separate output
+that the image consumes, is the first thing to settle in step 5 — before any
+code.
+
 ## What this deletes
 
 - the compose file (~110 lines of `flake.nix`)
