@@ -601,14 +601,78 @@
           # image's config, never from a job or its args.
           "CAOS_GRANT_ENGINE_SOCKET=1"
         ];
-        testStackImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-test-stack";
+        # THE image this flake defines (`#caosImage`, the flake-builder
+        # contract): the ENVIRONMENT a test stack is built and run in — never
+        # the stack itself.
+        #
+        # It carries no workspace binaries, no seed, and no source, which is
+        # the whole point: its inputs are the toolchain, the manifests and the
+        # lockfile, so `caos-tools/build.sh` can hand the flake-builder a
+        # REDUCED tree (flake + locks + manifests + zero-byte target stubs) and
+        # get a registry hit on every source edit. Verified: the reduced tree
+        # yields a byte-identical dep-bake derivation to the full tree, from
+        # 220 KB instead of 164 files.
+        #
+        # That retires `#depsImage` entirely. The deps memo existed only to
+        # carry a source-independent closure across a tree hash that moved on
+        # every edit; with the tree hash held still, there is nothing to carry.
+        #
+        # Both halves ride here because the build stage does both jobs in this
+        # one image: `cargoBake` to COMPILE the passed-in source, and
+        # `stackUserland` because the image it assembles must run a stack (and
+        # because cargo-check / cargo-self / rust-worker want a toolchain
+        # anyway). The assembled stack image bases on this one and adds only
+        # binaries, `serve`, `/worker` and the seed.
+        # /worker: the std/bash contract verbatim — fetch `worker1` and run it
+        # with bash. That is what lets caos-tools/build.sh be ONE staged
+        # script: stage 1 reduces the tree and tail-calls the flake-builder,
+        # stage 2 is `curry(<this image>, worker1=build.sh, stage=2, …)` and so
+        # runs the SAME script with the toolchain and the baked deps in scope.
+        # Copied rather than shared because std/bash is a published tree and
+        # this is a nix-built image; tests/std-lint keeps literal copies honest
+        # elsewhere in the tree for the same reason.
+        builderWorker = pkgs.runCommand "caos-builder-worker" { } ''
+          mkdir -p $out
+          install -m 755 ${./std/bash/worker} $out/worker
+        '';
+        # The three CLEAN core images, as tarballs at a fixed path. std names
+        # them (runner, cargo, flake-builder), and the stage that publishes std
+        # runs in THIS image — so unlike the old arrangement, where the stack
+        # image carried them so a stack could publish from inside itself, they
+        # belong to the builder and never reach the assembled stack image.
+        #
+        # Safe for the reduced-tree key precisely because all three are
+        # source-independent: their /worker binaries ride as content-keyed
+        # publish-time layers, not baked in. Adding anything workspace-derived
+        # here would re-key the builder on every edit and undo the whole point.
+        builderImages = pkgs.runCommand "caos-builder-images" { } ''
+          mkdir -p $out/caos/images
+          ${pkgs.lib.concatMapStringsSep "\n" (i: "cp ${i} $out/caos/images/$(basename ${i})") builtinWorkerImages}
+        '';
+        builderImage = pkgs.dockerTools.buildLayeredImage {
+          name = "caos-test-stack-builder";
           tag = "latest";
-          contents = [ testStackRoot ] ++ stackUserland;
+          contents = [ builderWorker builderImages cargoBake.rootEnv ] ++ stackUserland;
           config = {
             Entrypoint = [ "/bin/caos" "runner" ];
-            Env = stackEnv;
+            # cargoBake.env's PATH already ends in /bin (where the caos
+            # additions land), so the stack-side vars append cleanly.
+            Env = cargoBake.env ++ [
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+              # Root, and the engine socket: the assembled stack image inherits
+              # this config, and it hosts a stack whose runnerd launches
+              # siblings. Only an image can ask for the socket.
+              "CAOS_WORKER_UID=0"
+              "CAOS_WORKER_GID=0"
+              "CAOS_GRANT_ENGINE_SOCKET=1"
+            ];
           };
+          fakeRootCommands = cargoBake.inflate + ''
+            ln -sf bash bin/sh
+            # Workers scratch under /tmp; a bare nix root has none.
+            mkdir -p tmp
+            chmod 1777 tmp
+          '';
         };
         # The same image in the `host` world, which `caosd up` runs directly —
         # so its entrypoint is the stack itself, not the runner protocol.
@@ -625,61 +689,6 @@
             Entrypoint = [ "/bin/bash" "/caos/stack/serve" ];
             Env = stackEnv;
           };
-        };
-
-        # The test stack's deps memo (design/flake-deps-image.md): the
-        # build-time store paths #caosImage's build CONSUMES but does not
-        # produce. Everything here is SOURCE-INDEPENDENT — the dep bake rides
-        # crane's dummy sources, the core images depend on nothing from the
-        # workspace, and the userland is stock nixpkgs — so a caos edit leaves
-        # this derivation where it is and the builder starts from a warm
-        # store.
-        #
-        # The list was (cargoArtifacts, toolchain, flake-builder, runner) and
-        # that was INCOMPLETE, which cost most of a `run-tool build`. Measured
-        # on this tree, against a warm deps-<D>, the builder still had to
-        # produce 809 store paths — 747 fetched from cache.nixos.org over the
-        # network, and 62 with no cache entry at all, i.e. compiled from
-        # source in the container. The two that mattered:
-        #
-        #   docker-29.5.3   stackUserland's `.override { buildxSupport =
-        #                   false; composeSupport = false; }`. An overridden
-        #                   derivation is not in any binary cache, so this is
-        #                   a full Go compile — observed at 300% CPU inside
-        #                   the builder — on EVERY build.
-        #   caos-worker-cargo.tar.gz
-        #                   the seed pushes the three clean core images, so
-        #                   their tarballs are inputs. This one is 3.4 GB of
-        #                   closure; producing it is a whole-closure tar +
-        #                   pigz.
-        #
-        # The note this implements says a flake "can be liberal about what it
-        # puts in rootPaths" — divergence costs a rebuild, never corruption.
-        # So: be liberal, and derive the list from the same bindings the image
-        # actually uses, rather than restating it.
-        #
-        # NOTE the cargo image only became eligible when its /worker moved out
-        # to a publish-time layer. While worker-cargo was baked in, naming that
-        # image here would have made this memo re-key on every Rust edit —
-        # which is precisely the thing it exists to survive.
-        testStackDepsRegistration = pkgs.runCommand "caos-test-stack-deps-registration" { } ''
-          mkdir -p $out
-          cp ${
-            pkgs.closureInfo {
-              rootPaths = [
-                cargoArtifacts
-                rustToolchain
-              ]
-              ++ builtinWorkerImages
-              ++ stackUserland
-              ++ seedTools;
-            }
-          }/registration $out/caos-deps-registration
-        '';
-        testStackDepsImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-test-stack-deps";
-          tag = "latest";
-          contents = [ testStackDepsRegistration ];
         };
 
 
@@ -1118,13 +1127,17 @@
           # its image comes from here (see the cargoDef call above).
           caos-worker-cargo-docker = workerCargoImage;
 
-          # The flake-builder contract's two names (design/flake-images.md,
-          # design/flake-deps-image.md): handed THIS tree, the builder builds
-          # #caosImage — the test stack — and seeds itself from #depsImage
-          # first. Nothing on the host's dev path builds these; `nix build`
-          # still yields the pinned host tools.
-          caosImage = testStackImage;
-          depsImage = testStackDepsImage;
+          # The flake-builder contract (design/flake-images.md): handed a tree,
+          # the builder builds `#caosImage`. What this flake defines under that
+          # name is now the BUILD ENVIRONMENT, not the test stack — the stack
+          # is assembled from compiled binaries by caos-tools/build.sh, which
+          # is what lets the tree handed here be the reduced one.
+          #
+          # `#depsImage` is GONE, not renamed. It carried a source-independent
+          # closure across a tree hash that moved on every source edit; the
+          # reduced tree holds that hash still, so there is nothing left to
+          # carry. (design/flake-deps-image.md is retired with it.)
+          caosImage = builderImage;
         };
 
         apps = {

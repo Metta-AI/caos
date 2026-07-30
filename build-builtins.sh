@@ -359,40 +359,17 @@ if [ -n "${hash_of[runner]:-}" ]; then
   done
 fi
 
-# The full nix-built binary set, published as refs/caos/bins — what the
-# build/test tools (caos-tools/*.sh) consume instead of recompiling the
-# workspace in-caos: run-tool resolves this ref and passes its hash as
-# --bins. Canonical runtime names; kept OUT of the std tree so binary
-# churn (a server edit) never re-keys std consumers. The workspace builds
-# as one derivation, so any built path's bin/ carries every binary —
-# existence is the honest lookup, same as bin_path above. Staged in
-# CLIENT like everything else (only git-tracked paths can be hashed).
-rm -rf "${CLIENT:?}/bins"
-mkdir "$CLIENT/bins"
-stage_tool_bin() { # <name>
-  local p
-  # shellcheck disable=SC2086
-  for p in $bin_paths; do
-    if [ -x "$p/bin/$1" ]; then
-      install -m 755 "$p/bin/$1" "$CLIENT/bins/$1"
-      return 0
-    fi
-  done
-  echo "build-builtins: no binary $1 in the built paths" >&2
-  exit 1
-}
-for n in caos caos-cli server runnerd llm-stub; do stage_tool_bin "$n"; done
-# shellcheck disable=SC2086
-for p in $bin_paths; do
-  for w in "$p"/bin/worker-*; do
-    [ -e "$w" ] && install -m 755 "$w" "$CLIENT/bins/$(basename "$w")"
-  done
-done
-git -C "$CLIENT" add bins
-bins_tree=$(git -C "$CLIENT" write-tree --prefix=bins/)
-git -C "$CLIENT" push -q --force caos "$bins_tree:refs/caos/bins"
-git -C "$CLIENT" update-ref refs/caos/bins "$bins_tree"
-echo "refs/caos/bins -> $bins_tree (published to $SERVER_URL)" >&2
+# refs/caos/bins is GONE (2026-07-30). It carried the HOST's nix-built binaries
+# into caos so in-caos tools would not have to compile the workspace themselves
+# — `run-tool` resolved the ref and passed its hash as `--bins`. The suite has
+# compiled from source for some time now (tests/lib/suite.sh: "There is no
+# --bins anymore: the tree under test is compiled from source"), so the ref had
+# no reader left; only this publisher and the auto-arg in cli_run_tool.
+#
+# Deleting it removes a staging pass that copied ~61 MB of binaries into the
+# client worktree just to hash them — the largest single piece of the publish's
+# cost, and pure duplication, since git dedups those blobs against the curries
+# that already carry the same bytes.
 
 # Assemble the {name: image} tree (a ref can name any object; std is a tree, so
 # there's no commit to wrap it) and publish it to the server under refs/caos/std

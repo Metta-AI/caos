@@ -79,18 +79,11 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
         }
     }
     let mut all: Vec<String> = vec![format!("--worker1:@={script}"), "--in:@=.".to_string()];
-    // The deploy's nix-built binaries ride along for tools that consume them
-    // (the build/test tools build the tree's images from them instead of
-    // recompiling the workspace in-caos): `caosd up` publishes the bin tree
-    // as refs/caos/bins, and its hash passes as a literal — tools
-    // materialize it with `caos get-hash`. An explicit --bins wins; a stack
-    // that never published the ref simply gets no --bins (tools that need
-    // it say so).
-    if !kvs.iter().any(|kv| kv.starts_with("--bins")) {
-        if let Ok(hash) = bins_tree() {
-            all.push(format!("--bins={hash}"));
-        }
-    }
+    // No `--bins`. It used to carry the deploy's nix-built binaries in as a
+    // literal hash, so build/test tools could assemble images from them rather
+    // than recompile the workspace in-caos. Nothing reads it any more — the
+    // suite compiles the tree under test from source — so passing it only
+    // coupled every tool invocation to a ref the stack may not even have.
     all.extend(kvs.iter().cloned());
     cli_run(t, "/cas/std/bash", Some(&out), None, &all)?;
     eprintln!("1126 {name}: result checked out at {out}");
@@ -2332,25 +2325,6 @@ fn resolve_std_image(t: &dyn Transport, name: &str) -> Result<String, String> {
         .find(|e| entry_name(e) == name.as_bytes())
         .map(|e| e.oid.to_string())
         .ok_or_else(|| format!("no builtin {name:?} in {DEFAULT_STD_REF}"))
-}
-
-/// The deploy's binary tree hash from `refs/caos/bins` (published by
-/// build-builtins.sh alongside std): the nix-built workspace binaries under
-/// their runtime names. Same resolution shape as [`std_tree`] — local ref
-/// first, else just the root hash from the remote's advertisement.
-fn bins_tree() -> Result<String, String> {
-    const BINS_REF: &str = "refs/caos/bins";
-    if let Ok(hash) = resolve_ref(BINS_REF) {
-        return Ok(hash);
-    }
-    let advertised = git_capture(&["ls-remote", CAOS_REMOTE, BINS_REF], None)?;
-    let hash = advertised
-        .split_whitespace()
-        .next()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| format!("{BINS_REF} not found on the `{CAOS_REMOTE}` remote"))?
-        .to_string();
-    Ok(hash)
 }
 
 /// The std library tree hash from the built-ins ref ([`STD_REF_ENV`], default
