@@ -88,15 +88,23 @@ fn flat(cmd: &str) -> Result<(), String> {
         "build" => vec!["build", "--workspace"],
         "test" => vec!["test", "--workspace"],
         "clippy" => vec!["clippy", "--workspace", "--all-targets"],
+        // --no-deps: we lint OUR docs, not the dependency graph's. Deps'
+        // rustdoc warnings are not ours to fix and would cost minutes.
+        "doc" => vec!["doc", "--workspace", "--no-deps"],
+        // fmt is purely syntactic: no dep graph, no codegen, so none of the
+        // build flags below apply and cargo-fmt rejects them outright.
+        "fmt" => vec!["fmt", "--all", "--check"],
         other => {
             return Err(format!(
-                "unknown cmd {other:?} (want check|build|test|clippy)"
+                "unknown cmd {other:?} (want check|build|test|clippy|doc|fmt)"
             ))
         }
     };
-    argv.extend(["--profile", &profile]);
-    if let Some(t) = &target {
-        argv.extend(["--target", t]);
+    if cmd != "fmt" {
+        argv.extend(["--profile", &profile]);
+        if let Some(t) = &target {
+            argv.extend(["--target", t]);
+        }
     }
     // `-D warnings` rides after a `--` separator, so it must be appended
     // last — after the profile/target flags above. clippy-driver comes from
@@ -117,12 +125,25 @@ fn flat(cmd: &str) -> Result<(), String> {
     }
     caos(["get", "-r", &tree])?; // the whole source tree, in full
 
-    // Materialize it at the baked workspace root, beside the pre-compiled
-    // target/. Fresh mtimes (fs::copy stamps now) keep cargo honest: newer
-    // than every baked fingerprint, so workspace crates always recompile
-    // while the deps stay fresh (their vendored sources sit at store epoch).
-    let ws = ws_root()?;
-    materialize(Path::new(&tree), Path::new(&ws))?;
+    // fmt reads the TREE, not the baked workspace root. It needs no deps and
+    // no target/, and the baked root is not a clean checkout: materialize
+    // copies the tree over it without pruning, so crane's dummy sources from
+    // the bake survive underneath. One of those — crates/runnerd/src/lib.rs,
+    // a crate that has only a main.rs — is invisible to check/build/test
+    // (an empty lib compiles fine) but `cargo fmt --all` autodiscovers it as
+    // a lib target and reports a diff in a file the tree does not contain.
+    let ws = if cmd == "fmt" {
+        tree.clone()
+    } else {
+        // Materialize at the baked workspace root, beside the pre-compiled
+        // target/. Fresh mtimes (fs::copy stamps now) keep cargo honest:
+        // newer than every baked fingerprint, so workspace crates always
+        // recompile while the deps stay fresh (their vendored sources sit at
+        // store epoch).
+        let ws = ws_root()?;
+        materialize(Path::new(&tree), Path::new(&ws))?;
+        ws
+    };
 
     let out = run_cargo(&argv, &ws)?;
     let exit = exit_code(&out.status);
@@ -184,14 +205,23 @@ pub(crate) fn run_cargo(argv: &[&str], ws: &str) -> Result<std::process::Output,
         Some(i) => (&argv[..i], &argv[i..]),
         None => (argv, &argv[argv.len()..]),
     };
-    Command::new("cargo")
-        .args(head)
-        .arg("--offline")
-        .args(tail)
+    let mut cmd = Command::new("cargo");
+    cmd.args(head);
+    // cargo-fmt is not a build command — it has no notion of --offline and
+    // errors on it. Everything else vendors, so it needs the flag.
+    if head.first() != Some(&"fmt") {
+        cmd.arg("--offline");
+    }
+    cmd.args(tail)
         .env("CARGO_TARGET_DIR", target_dir()?)
-        .current_dir(ws)
-        .output()
-        .map_err(|e| format!("running cargo: {e}"))
+        .current_dir(ws);
+    // rustdoc lints arrive by env, not argv — and ONLY for `doc`: cargo test
+    // runs doctests through rustdoc too, so setting this unconditionally
+    // would deny-warnings the test path as a side effect.
+    if head.first() == Some(&"doc") {
+        cmd.env("RUSTDOCFLAGS", "-D warnings");
+    }
+    cmd.output().map_err(|e| format!("running cargo: {e}"))
 }
 
 /// Stage the build's executables into `res/bin/<name>` — what a

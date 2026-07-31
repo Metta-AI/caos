@@ -61,4 +61,29 @@ if [ "$clippy_ok" = 0 ] || [ ! -e r2/exit ] || [ "$(cat r2/exit)" != "0" ]; then
   report clippy r2
   fail "clippy failed"
 fi
+
+# Rustdoc, same decomposition again. `-D warnings` is applied worker-side
+# (RUSTDOCFLAGS, scoped to this cmd so doctests are unaffected), and
+# --no-deps keeps it to our own docs.
+echo "== cargo doc of the workspace, per-crate, in a caos worker ==" >&2
+"$CAOS_CLI" run /cas/std/cargo r3 -- --tree:@=ws --cmd=doc --mode=all \
+  "--target=$(uname -m)-unknown-linux-musl"
+if [ "$(cat r3/exit)" != "0" ]; then
+  echo "== cargo doc FAILED (exit $(cat r3/exit)) — full output ==" >&2
+  echo "---- stdout ----" >&2; cat r3/stdout >&2
+  echo "---- stderr ----" >&2; cat r3/stderr >&2
+  fail "doc failed"
+fi
+
+# rustfmt. Flat, not --mode=all: formatting is syntactic, so there is no
+# dep graph to decompose over and nothing to gain from per-crate keys —
+# `cargo fmt --all --check` reads the tree and stops.
+echo "== cargo fmt --check of the workspace, in a caos worker ==" >&2
+"$CAOS_CLI" run /cas/std/cargo r4 -- --tree:@=ws --cmd=fmt
+if [ "$(cat r4/exit)" != "0" ]; then
+  echo "== cargo fmt FAILED (exit $(cat r4/exit)) — full output ==" >&2
+  echo "---- stdout ----" >&2; cat r4/stdout >&2
+  echo "---- stderr ----" >&2; cat r4/stderr >&2
+  fail "fmt failed"
+fi
 echo "unit: ALL PASS" >&2

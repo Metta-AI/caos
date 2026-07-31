@@ -34,10 +34,12 @@ fn run() -> Result<(), String> {
     // bare io error from the copy.
     let meta = std::fs::metadata(&bin).map_err(|e| format!("reading worker binary {bin}: {e}"))?;
     if !meta.is_file() {
-        return Err("the `worker1` arg is not a regular file — `worker1` names the next \
+        return Err(
+            "the `worker1` arg is not a regular file — `worker1` names the next \
              executable in the chain; a colliding caller arg overrides the curried \
              one, so rename the caller's arg"
-            .to_string());
+                .to_string(),
+        );
     }
     let dir = scratch("run")?;
     let exe = dir.join("worker");

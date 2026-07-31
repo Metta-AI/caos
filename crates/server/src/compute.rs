@@ -281,7 +281,8 @@ fn run_dispatch(
     // server thread until a runner posts the result; capacity is runner-side
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
-        let image_ref = resolve_image(config, image, std, salt, &child_stack, trace_id).map_err(fail)?;
+        let image_ref =
+            resolve_image(config, image, std, salt, &child_stack, trace_id).map_err(fail)?;
         // Reuse the args tree the tracer already read, else read it now.
         let arg_entries = match traced_arg_entries {
             Some(entries) => entries,

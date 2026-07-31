@@ -1,12 +1,14 @@
-# The ONE cargo toolchain + workspace-deps bake (design/cargo-workers.md,
-# design/flake-images.md finding B), shared by its two consumers:
+# The cargo toolchain + workspace-deps bake (design/cargo-workers.md,
+# design/flake-images.md finding B). ONE consumer now: the root flake, which
+# calls std/cargo/flake.nix's lib.imageFor with the cleaned workspace as
+# `src` and its own toolchain, so this bake IS cargoArtifacts rather than a
+# second compile of the same crates.
 #
-#   - std/cargo/flake.nix — the published std flake; `src` is its own
-#     generated tree (manifests + stubs, no source; stage-tree.sh).
-#   - the root flake's cargoDepsImage — the test suite's D2 deps-only base;
-#     `src` is the cleaned workspace.
-#
-# One definition means the two cannot diverge; each caller supplies its own
+# It used to have two — the published std/cargo flake tree built itself from
+# vendored manifests and stubs, and the root built a separate deps-only base
+# for the suite's retired D2 pipeline. Both are gone: std/cargo is a
+# host-built streamed core, and the suite builds the test stack image
+# (design/test-stack-image.md) instead. The caller supplies its own
 # locked inputs (the published flake's lock is derived from the root's at
 # publish, so both resolve the same nixpkgs/rust-overlay/crane).
 #
@@ -107,6 +109,7 @@ let
       # want their DEPENDENCIES resolved and compiled under each member's
       # feature set. The dummy members' own artifacts are discarded with the
       # rest of the workspace crates' when the real build runs.
+      #
       # jq by store path rather than nativeBuildInputs: crane sets that itself
       # (cargo, the toolchain, the vendor hooks), and replacing it here would
       # take the build's own tools out with it. Interpolating the derivation

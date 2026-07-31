@@ -353,34 +353,6 @@
           fakeRootCommands = cargoDef.fakeRootCommands;
         };
 
-        # The DEPS-ONLY cargo base (phase D2): the bake + env, WITHOUT caos or
-        # a /worker — those are stacked on by the suite's image
-        # jobs from the freshly caos-built binaries (the D1 delta-over-base
-        # move). So this image is keyed on (toolchain, manifests, lockfile)
-        # alone, and the expensive in-caos nix bake that produces it re-runs
-        # only when those change — never on a source edit.
-        cargoDepsImage = pkgs.dockerTools.buildLayeredImage {
-          name = "caos-worker-cargo-deps";
-          tag = "latest";
-          # bash + coreutils (+ the /bin/sh link below): a bare nix-rooted
-          # image has neither a shell nor chmod/ln, and the suite's image job
-          # stacks the delta with Dockerfile RUN steps that need both.
-          contents = [
-            cargoBake.rootEnv
-            linuxPkgs.bashInteractive
-            linuxPkgs.coreutils
-          ];
-          config = {
-            Env = cargoBake.env;
-          };
-          fakeRootCommands = cargoBake.inflate + ''
-            ln -sf bash bin/sh
-            # Workers (uid 1000) scratch under /tmp; a bare nix root has none.
-            mkdir -p tmp
-            chmod 1777 tmp
-          '';
-        };
-
         # ---- The stack root ----
         # Everything the host's stack image adds over its userland, which is
         # now just the one bring-up. It carries NO binaries: caosd stages
@@ -970,12 +942,6 @@
           inherit worker-runner worker-cargo worker-rustc;
 
           # Image tarballs (build with `nix build`, then `docker load < result`).
-          caos-worker-cargo-deps-docker = cargoDepsImage;
-          # skopeo, from OUR locked nixpkgs — the in-caos bake job pushes its
-          # image to the registry with it (`nix shell path:<ws>#skopeo`), and
-          # taking it from the flake keeps the job pure (a bare `nixpkgs#`
-          # ref would float with the global registry).
-          skopeo = linuxPkgs.skopeo;
           caos-worker-flake-builder-docker = workerFlakeBuilderImage;
           caos-worker-runner-docker = workerRunnerImage;
           # The cargo worker, host-built and streamed like the flake-builder
@@ -1005,41 +971,21 @@
 
         };
 
-        checks = {
-          inherit caos server runnerd;
-
-          clippy = craneLib.cargoClippy (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-            }
-          );
-
-          doc = craneLib.cargoDoc (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoExtraArgs = "--locked --workspace";
-              RUSTDOCFLAGS = "-D warnings";
-            }
-          );
-
-          fmt = craneLib.cargoFmt { inherit src; };
-          # No `test` check here: the unit tests are run through
-          # `caos-cli run-tool test` (tests/unit), inside the cargo worker,
-          # and that is the only place they can pass. Several of them spawn
-          # git — git_transport_tests, chat::tests — and the worker's PATH
-          # carries it (bake.env includes gitMinimal, for exactly this
-          # reason), whereas a nix builder gets whatever commonArgs declares,
-          # which is nothing. A cargoTest check here was silently red rather
-          # than telling anyone; one runner for the tests, and it is the one
-          # with the environment they need.
-        };
+        # No `checks` output at all. test, clippy, doc and fmt all run in
+        # tests/unit, through the cargo worker, and `caos-cli run-tool test`
+        # is the only runner anyone invokes — there is no CI here, and
+        # CLAUDE.md's pre-commit step is nix build + caosd up + run-tool test.
+        #
+        # Every one of them had a reason to move, and the tests had the
+        # sharpest: git_transport_tests and chat::tests spawn git, which the
+        # worker's PATH carries (bake.env's gitMinimal) and a nix builder's
+        # does not, so that check had been silently red — on origin/main and
+        # before a56df5a. `doc` was red too, on two rustdoc links. A check
+        # nobody runs is a check that goes quietly red; one runner, and it is
+        # the one with the environment the work needs.
 
         devShells.default = craneLib.devShell {
           # Brings the pinned toolchain (rustc, cargo, clippy, rustfmt) onto PATH.
-          checks = self.checks.${system};
           packages = [
             pkgs.cargo-watch
             pkgs.rust-analyzer

@@ -268,7 +268,7 @@ pub trait Transport {
 
     /// Is this object already stored? Cheap — no content crosses the wire.
     ///
-    /// This is what makes [`store`] prune: a tree the store already holds is a
+    /// This is what makes `store` prune: a tree the store already holds is a
     /// tree whose whole subgraph it holds (git's closure invariant), so the
     /// walk stops there and nothing below it is read or sent.
     fn has_object(&self, hash: &str) -> Result<bool, String>;
@@ -2575,7 +2575,7 @@ fn std_tree() -> Result<String, String> {
 /// bindings are folded in and `base` stays a plain (docker/git) image, so the
 /// result is canonical (`curry (curry img a) b` == `curry img a b`) — and
 /// STRICT: rebinding an already-bound name is refused, not overridden (see
-/// [`curry_object`]).
+/// `curry_object`).
 pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let image = resolve_run_image(t, &cas, image)?;
