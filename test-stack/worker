@@ -87,7 +87,7 @@ INNER=http://127.0.0.1
 # std used to be baked into this image (/caos/seed-git), which meant the image
 # moved whenever any worker binary did, and every test re-keyed on every worker
 # edit. It arrives as an arg instead, and the caller hands each job only the
-# entries that job uses (tests/lib/suite-stage3.sh) — so what re-keys a test is
+# entries that job uses (caos-tools/test.sh, stage3) — so what re-keys a test is
 # what the test actually reaches for.
 #
 # Seeding is a git FETCH of the tree's closure from the outer server, not a

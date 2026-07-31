@@ -101,6 +101,10 @@ Run `time result/bin/caos-cli run-tool test`
 - In the future, The code will be written in go, including scripts, which SHALL be run by `go run`
 - Comments should focus on decisions that a naive reader might undo instead of narrating the journey that a bot took to arrive at a solution
 
+## Worker scripts
+
+- Workers shall be written in a single file that covers all the stages of the worker. That is, when a worker calls map-then or run-then, the next next stage should be in the same file. The worker shall use a `stage` argument to track which stage it is up to
+
 # Server
 
 - Has a local git repo

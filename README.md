@@ -552,8 +552,8 @@ binaries as `refs/caos/bins`, `run-tool` resolves that ref and passes its
 hash as `--bins`, and nothing recompiles inside caos. (After a Rust edit:
 `nix build && caosd up`, then test.)
 
-The test tool runs the suite worker (`tests/lib/suite.sh`, carried by this
-tree): build the worker images from the published binaries via
+The test tool (`caos-tools/test.sh`, carried by this tree) is the suite
+worker, in three stages of one script: build the worker images via
 `caos-tools/build.sh`, fan out one job per `tests/<name>/cli.sh`,
 summarize. A test is a directory `tests/<name>/`
 with a `cli.sh`, which runs inside a test-stack worker, cwd'd into a client

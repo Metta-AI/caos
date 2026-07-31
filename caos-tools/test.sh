@@ -6,33 +6,327 @@
 #@doc tree. Nothing is handed in from the host: the stack under test is
 #@doc compiled from these sources, inside workers.
 #
-# The test worker: the workspace tree in (--in), the suite result out
-# ({report, results/<test>/...}). A thin tail call into the suite worker
-# (tests/lib/suite.sh) carried BY that same tree — so the suite that runs is
-# the one the tree defines, and its first act is running the build worker
-# (caos-tools/build.sh), sharing its job with `build` calls. Optional args
-# pass through: --api-key (chat-online's real turn), --only (a test-name
-# filter), --test-salt (re-run every test, reusing the build — see below).
+# THE test suite, as a caos worker (design/test-stack-image.md). Its interface
+# is a TOOL's interface: the workspace tree as --in, and optionally an API key
+# and a test filter — every script it runs comes from the workspace itself, so
+# the suite tests exactly the harness the tree carries. Keyed on all of it: a
+# full-suite cache hit means literally nothing changed; salt to force. The
+# result is {report, results/<test>/...}.
+#
+# THREE STAGES, one script, selected by a curried --stage (the
+# caos-tools/build.sh pattern).
+#
+#   suite      (default) run-then THE BUILD TOOL (caos-tools/build.sh — the
+#              same job an agent's `build` call fires, sharing its cache),
+#              whose result is the TEST STACK IMAGE
+#   stage3     the image's ref is only knowable once the build has run, so
+#              fanning out over it needs its own stage: one job per
+#              tests/<name>/cli.sh, each running that image with the per-test
+#              runner (tests/lib/run-test.sh) as worker1
+#   summarize  the `then` of the fan-out — assemble the report
+#
+# Test = build + run tests, literally. There is no --bins: the tree under test
+# is compiled from source inside the build job, so nothing crosses from the
+# host but the tree.
 set -euo pipefail
 
-caos get /cas/args/in
-caos get /cas/args/in/tests
-caos get /cas/args/in/tests/lib
+fail() { echo "TEST FAIL: $*" >&2; exit 1; }
 
-extra=()
-[ -e /cas/args/api-key ] && extra+=("--api-key:@=/cas/args/api-key")
-[ -e /cas/args/only ] && extra+=("--only:@=/cas/args/only")
-# --test-salt: re-run the TESTS without re-running anything else. CAOS_SALT
-# cannot do this — it threads into every sub-run, so it re-keys the reduce, the
-# compile, the std publish and the image alongside the tests (measured: 47s
-# against 35s), and fills the cache with entries nothing will hit again. This
-# one rides only in each per-test wrapper, so the build stays a cache hit.
-#
-# It exists because the alternative people reach for is editing a tracked file
-# to bust the key — which is how `# rekey <timestamp>` once ended up committed
-# to tests/lib/run-test.sh.
-if [ -e /cas/args/test-salt ]; then extra+=("--test-salt:@=/cas/args/test-salt"); fi
-suite=$(caos curry /cas/std/bash -- \
-  "--worker1:@=/cas/args/in/tests/lib/suite.sh" \
-  "--workspace:@=/cas/args/in" "${extra[@]}")
-caos run-then /cas/args/in -- --run="$suite"
+# Args are lazy placeholders — fetch before reading. The initial invocation
+# carries no --stage, so the fetch fails and we default to the first stage.
+stage=suite
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+
+case "$stage" in
+
+suite)
+  caos get /cas/args/in
+  caos get /cas/args/in/caos-tools
+
+  # The pruned tree — just what cargo reads — feeds the wrapper tests
+  # (cargo-self, unit), whose jobs must not re-key on non-Rust edits.
+  mkdir /tmp/build-ws
+  for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
+    if [ -e "/cas/args/in/$e" ]; then ln -s "/cas/args/in/$e" "/tmp/build-ws/$e"; fi
+  done
+  caos put /tmp/build-ws /cas/build-ws
+
+  build=$(caos curry /cas/std/bash -- \
+    "--worker1:@=/cas/args/in/caos-tools/build.sh") || fail "currying the build tool"
+
+  # `stage3` reads the workspace as /cas/args/in: run-then hands its `then` the
+  # same --in it ran over, so the tree needs no second binding.
+  fwd=("--worker1:@=/cas/args/worker1" --stage=stage3 "--build-ws:@=/cas/build-ws")
+  if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
+  if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
+  # --test-salt: re-run the TESTS without re-running anything else. CAOS_SALT
+  # cannot do this — it threads into every sub-run, so it re-keys the reduce, the
+  # compile, the std publish and the image alongside the tests (measured: 47s
+  # against 35s), and fills the cache with entries nothing will hit again. This
+  # one rides only in each per-test wrapper, so the build stays a cache hit.
+  #
+  # It exists because the alternative people reach for is editing a tracked file
+  # to bust the key — which is how `# rekey <timestamp>` once ended up committed
+  # to tests/lib/run-test.sh.
+  if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
+
+  stage3=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the fan-out stage"
+  caos run-then /cas/args/in -- --run="$build" --then="$stage3"
+  ;;
+
+stage3)
+  # The `then` of the build tool: --result is THE TEST STACK IMAGE
+  # (design/test-stack-image.md). Curry the per-test runner onto it, select the
+  # tests, and map-then over them — one stack per test, each carrying the
+  # binaries and a SEEDED std, so nothing has to be handed in.
+  #
+  # There used to be a stage between this and the build: a single job that
+  # published std into the host registry before the fan-out, because nineteen
+  # stacks starting on a cold registry all missed the same memo and all baked
+  # the toolchain, filling the outer pool with 20-minute jobs until whatever was
+  # still queued died on the pending timeout (`no runner for req (waited 900s)`,
+  # measured). That whole stage is gone: std is published ONCE, when the image
+  # is built (design/one-stack-image.md, "The seed"), so there is no cold-start
+  # herd left to serialize.
+  #
+  # Per-test jobs key on (the image digest, the test's own tree, the runner
+  # script). A source edit moves the image and re-keys every test, which is
+  # what a binaries change already did. The std-manifest closure rules are
+  # gone with the wrapper: there is no longer a per-test choice of which
+  # binaries and images ride along, because they all ride in the one image.
+  caos get /cas/args/result
+  # One level further: the per-test subsets below symlink to individual entries,
+  # so `std` and `bin` must exist as placeholders for `caos put` to resolve them
+  # by recorded hash. Placeholders only — no content is fetched here.
+  caos get /cas/args/result/std
+  caos get /cas/args/result/bin
+  caos get /cas/args/in
+  caos get /cas/args/in/tests
+  caos get /cas/args/in/tests/lib
+
+  # The per-test map worker is curried HERE, where the image is a genuine
+  # --result tree. Passing the image itself as a curried arg to a later stage
+  # does not work: `caos curry /cas/args/<argname>` curries over the arg NODE,
+  # so the resulting worker inherits this job's own bindings (observed: a map
+  # job whose args were `image in worker1`, running as uid 1000 because the
+  # image's root grant was not in play either).
+  #
+  # run-test.sh is the one stage of the suite that is NOT this file, and cannot
+  # be: it runs INSIDE the test stack, under an env where `caos` is the TESTED
+  # client aimed at the inner server, so it can neither fetch this file's args
+  # nor reach the outer stack (test-stack/worker materializes its args before
+  # flipping the env).
+  map=$(caos curry /cas/args/result/image -- \
+    "--worker1:@=/cas/args/in/tests/lib/run-test.sh") || fail "currying the per-test runner"
+
+  # The test selection: every tests/<name> with a cli.sh — or just the names in
+  # --only (a filtered suite; its per-test jobs share their cache with full
+  # runs). Each child is a wrapper {test, workspace?, api-key?} carrying only
+  # what that test needs beyond the image. Symlinks into the args materialize
+  # nothing — `caos put` resolves them to recorded hashes.
+  only=""
+  if [ -e /cas/args/only ]; then
+    caos get /cas/args/only
+    only=" $(cat /cas/args/only) "
+  fi
+
+  # --test-salt rides in EVERY per-test wrapper and nowhere else, so a fresh
+  # value re-runs all the tests and leaves the build a cache hit. Nothing reads
+  # the file: its presence in the wrapper is what moves the per-test key. Do not
+  # "clean up" the unused write — it is the whole mechanism.
+  salt=""
+  if [ -e /cas/args/test-salt ]; then
+    caos get /cas/args/test-salt
+    salt=$(cat /cas/args/test-salt)
+  fi
+
+  mkdir /tmp/sel
+  for d in /cas/args/in/tests/*/; do
+    t=$(basename "$d")
+    if [ -n "$only" ]; then
+      case "$only" in *" $t "*) ;; *) continue ;; esac
+    fi
+    caos get "/cas/args/in/tests/$t"
+    [ -e "/cas/args/in/tests/$t/cli.sh" ] || continue
+    mkdir -p "/tmp/sel/$t"
+    ln -s "/cas/args/in/tests/$t" "/tmp/sel/$t/test"
+    if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
+
+    # WHAT THIS TEST REACHES FOR, and nothing else. `uses-std` names the
+    # /cas/std entries its jobs resolve; `uses-bin` the binaries it copies out
+    # of CAOS_BIN_DIR to build its own curries. Each becomes a subtree of
+    # symlinks into the build result, so the wrapper carries those entries BY
+    # HASH — `caos put` resolves a symlink into /cas to its recorded hash, so
+    # not one byte moves here.
+    #
+    # This is the whole mechanism. std used to be baked into the image, so any
+    # worker binary moved the image and re-keyed all twenty tests; now a test's
+    # key holds what it named. A worker-rgrep edit moves std/rgrep and
+    # bin/worker-rgrep, which two tests name — the other eighteen are hits.
+    #
+    # Undeclared is UNAVAILABLE, deliberately: an unnamed std entry will not
+    # resolve and an unnamed binary will not copy. Both fail loudly inside the
+    # test, where a wrong declaration can only cost a red run, never a stale
+    # green one. It cost four rounds of red to get these lists right, and every
+    # one was the same rule:
+    #
+    #   THE GIT CLOSURE COVERS TREE REFERENCES AND NOTHING ELSE.
+    #
+    # Fetching a std entry brings its subtrees, so a curry's `args` ride along.
+    # Three things do NOT, and each has to be named explicitly:
+    #
+    #   - A CURRY'S BASE. `std/rgrep/base` is a BLOB holding the base image's
+    #     hash, not a reference to it, so declaring `rgrep` without `runner`
+    #     yields "object not found" on the runner tree.
+    #   - A HASH BOUND AS A LITERAL. `std/rustc` binds `--cargo=<hash>` the same
+    #     way, so rustc needs `cargo`.
+    #   - A NAME THE SERVER LOOKS UP. `std/bash` is a flake tree, and running one
+    #     makes the server resolve `flake-builder` BY NAME — "std library has no
+    #     flake-builder".
+    #
+    # And grep the CLIENT too, not just the test: `caos-cli talk` resolves
+    # runner/bash-tool/llm-step/rgrep/bash from constants in chat.rs, and a Rust
+    # worker builds its path with `std_image("bash")` (tests/commit) — neither
+    # shows up in a search for /cas/std in the test directory.
+    mkdir -p "/tmp/sel/$t/std" "/tmp/sel/$t/bin"
+    if [ -e "$d/uses-std" ]; then
+      caos get "/cas/args/in/tests/$t/uses-std"
+      for e in $(cat "$d/uses-std"); do
+        ln -s "/cas/args/result/std/$e" "/tmp/sel/$t/std/$e"
+      done
+    fi
+    if [ -e "$d/uses-bin" ]; then
+      caos get "/cas/args/in/tests/$t/uses-bin"
+      for e in $(cat "$d/uses-bin"); do
+        ln -s "/cas/args/result/bin/$e" "/tmp/sel/$t/bin/$e"
+      done
+    fi
+
+    case "$t" in
+      cargo-self | unit)
+        # Dogfood the tree under test — the PRUNED build tree (what cargo
+        # reads, the compile's own input), so only Rust-relevant edits re-key
+        # these, exactly like the compile itself.
+        ln -s /cas/args/build-ws "/tmp/sel/$t/workspace"
+        ;;
+      std-lint)
+        # The literal-tree lints check the checked-in std copies against their
+        # sources of truth ACROSS the tree, so this test gets the whole
+        # workspace and honestly re-keys on any edit to it. It is a fast lint,
+        # so that trade is fine.
+        ln -s /cas/args/in "/tmp/sel/$t/workspace"
+        ;;
+      chat-online)
+        # The real-API key, when the suite was given one: same key, same cache
+        # key — only this test re-keys when it rotates. Without one the test's
+        # cli.sh self-skips.
+        if [ -e /cas/args/api-key ]; then
+          caos get /cas/args/api-key
+          cp /cas/args/api-key /tmp/sel/chat-online/api-key
+        fi
+        ;;
+    esac
+  done
+  caos put /tmp/sel /cas/sel
+
+  # The build's own elapsed seconds ride into the summariser so the report can
+  # show them. Curried HERE because the summariser is the `then` of the map — it
+  # receives --children and nothing else.
+  #
+  # --start-time is the clock for the test phase, and it is taken HERE, one line
+  # before the fan-out fires, because this is the last point that certainly runs
+  # when the tests might. The summariser subtracts it from its own `now`.
+  #
+  # The phase cannot be recovered from the tests themselves: a test's start and
+  # end are files in its RESULT, so a cache hit replays the pair from whenever it
+  # last ran, and min/max across twenty records then spans back to that run (2306s
+  # against a 38s invocation, seen). Measured across two jobs that really ran, the
+  # number is right in both directions — a fan-out of cache hits is genuinely
+  # quick, and says so.
+  #
+  # A timestamp in args means the summariser never caches. That is the point: it
+  # is one cheap container, and it only runs at all when this stage does.
+  then_img=$(caos curry /cas/std/bash -- \
+    "--worker1:@=/cas/args/worker1" --stage=summarize \
+    "--build-time:@=/cas/args/result/time" "--start-time=$(date +%s)") \
+    || fail "currying the summarize stage"
+  caos map-then /cas/sel -- --map="$map" --then="$then_img"
+  ;;
+
+summarize)
+  # Every test job's result tree arrives under --children (by test name):
+  # {verdict, output, server.log, runnerd.log, ...} — the complete record.
+  # Assemble the report — one PASS/FAIL line per test, ending in an OK/FAILED
+  # banner — and carry the children through verbatim as `results` (a symlink
+  # put: recorded-hash reuse, no bytes move). The suite job itself always
+  # SUCCEEDS with a report; the caller decides what a FAILED banner means.
+  # Failures are values here so one broken test never hides the others.
+  caos get /cas/args/children
+  caos get /cas/args/build-time
+  caos get /cas/args/start-time
+  mkdir -p /tmp/rep
+  passn=0 failn=0
+  {
+    # Collected first, printed after: the column width is only known once every
+    # child has been read.
+    names=() marks=() times=()
+    width=0
+    for c in /cas/args/children/*; do
+      t=$(basename "$c")
+      caos get "/cas/args/children/$t"
+      caos get "/cas/args/children/$t/verdict"
+      # The test's own wall time, so the report says which test is the long
+      # pole. A suite is as slow as its slowest test once the pool is saturated,
+      # and that fact was previously only reachable by correlating inner redis
+      # logs by hand.
+      caos get "/cas/args/children/$t/seconds"
+      s=$(cat "$c/seconds")
+      if grep -q "^RUN-TEST: PASS" "$c/verdict"; then
+        mark="✓"; passn=$((passn + 1))
+      else
+        mark="✗"; failn=$((failn + 1))
+      fi
+      names+=("$t"); marks+=("$mark"); times+=("$s")
+      # `if`, not `[ … ] && …`: this is the last command in the loop body, where
+      # a false test would end the loop AND the script under `set -e`.
+      if [ ${#t} -gt "$width" ]; then width=${#t}; fi
+    done
+
+    # The build and the tests as two comparable lines, the tests indented beneath
+    # theirs. The test phase is now minus the stamp stage3 took as it fired the
+    # fan-out: measured across two jobs that ran, never recovered from cached
+    # values.
+    echo "build ($(cat /cas/args/build-time)s)"
+    echo "tests ($(($(date +%s) - $(cat /cas/args/start-time)))s)"
+    # A mark rather than a word, and no colour: this report is a VALUE in a git
+    # tree, so a worker cannot know whether whoever eventually reads it is a
+    # terminal, and ANSI escapes would be baked into the artifact and into every
+    # log that ever prints it.
+    for i in "${!names[@]}"; do
+      printf '  %s %-*s %4s\n' "${marks[$i]}" "$width" "${names[$i]}" "${times[$i]}s"
+    done
+    echo
+    if [ "$failn" -eq 0 ]; then
+      echo "SUITE OK: $passn/$((passn + failn)) passed"
+    else
+      echo "SUITE FAILED: $passn/$((passn + failn)) passed"
+    fi
+    # A duration is a property of a RUN; a result is a property of its INPUTS.
+    # Caching the one inside the other means an unchanged test replays whatever
+    # it happened to cost when it last actually ran — which is the number you
+    # will keep seeing until something re-keys it, however much faster the tests
+    # have since become. Said out loud, because it read as "the tests are still
+    # slow" the first time a report replayed times measured while the engine was
+    # unpacking a new image across twenty concurrent stacks.
+    echo "(times are each test's LAST ACTUAL RUN; an unchanged test is a cache"
+    echo " hit and replays the time it recorded then."
+    echo " Pass \`--test-salt=\$(date --iso=s)\` to rerun all tests)"
+  } > /tmp/rep/report
+  ln -s /cas/args/children /tmp/rep/results
+  caos put /tmp/rep /cas/out
+  ;;
+
+*)
+  fail "unknown --stage: $stage"
+  ;;
+esac

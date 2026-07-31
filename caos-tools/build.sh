@@ -272,7 +272,7 @@ make)
   ts "published std"
 
   # std LEAVES this stage as a value, not baked into the image, so a caller can
-  # hand each job only the entries it needs (tests/lib/suite-stage3.sh).
+  # hand each job only the entries it needs (caos-tools/test.sh, stage3).
   #
   # It was published into the seed stack's repo, so move it the way values move:
   # push the closure to the outer server (a bare tree to a ref, as

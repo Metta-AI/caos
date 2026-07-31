@@ -362,8 +362,8 @@ fi
 # refs/caos/bins is GONE (2026-07-30). It carried the HOST's nix-built binaries
 # into caos so in-caos tools would not have to compile the workspace themselves
 # — `run-tool` resolved the ref and passed its hash as `--bins`. The suite has
-# compiled from source for some time now (tests/lib/suite.sh: "There is no
-# --bins anymore: the tree under test is compiled from source"), so the ref had
+# compiled from source for some time now (caos-tools/test.sh: "There is no
+# --bins: the tree under test is compiled from source"), so the ref had
 # no reader left; only this publisher and the auto-arg in cli_run_tool.
 #
 # Deleting it removes a staging pass that copied ~61 MB of binaries into the

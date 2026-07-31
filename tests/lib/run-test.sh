@@ -1,8 +1,14 @@
 #!/bin/bash
-# The per-test worker1 (design/test-stack-image.md). Runs INSIDE a test
-# stack: the image's /worker has already brought up the inner server,
-# runnerd and a private redis, and put the tree's binaries first on PATH
-# with CAOS_SERVER_URL aimed at them.
+# The per-test worker1 (design/test-stack-image.md), mapped over by
+# caos-tools/test.sh's stage3. Runs INSIDE a test stack: the image's /worker
+# has already brought up the inner server, runnerd and a private redis, and put
+# the tree's binaries first on PATH with CAOS_SERVER_URL aimed at them.
+#
+# It is the ONE stage of the suite that does not live in caos-tools/test.sh
+# with the others, and cannot: everything below runs in the inner world, where
+# `caos` is the tested client aimed at the inner server, so the stage-dispatch
+# line at the top of that file — a `caos get` of its own args — would ask the
+# INNER server for an outer object and 404.
 #
 # This script lives ENTIRELY in the inner world: `caos-cli` on PATH is the
 # TESTED client — a different build from the host's, in general, which is why
