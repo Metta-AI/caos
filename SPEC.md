@@ -11,7 +11,7 @@ A WorkRequest is:
 
 A WorkResult is a git object, containing whatever the worker chose to return
 
-WorkRequest should contain ArgsSet, stack, trace id, etc #todo
+WorkRequest contains ArgsSet, stack, trace id, etc #todo
 - The ArgsSet is the cache key
 
 Also note in calling that rebinding existing args is an error #todo
@@ -84,6 +84,11 @@ If these become slow:
 
 # Codebase
 
+## Before committing
+
+Run `time result/bin/caos-cli run-tool test`
+
+## General
 - A root-level flake.nix and flake.lock SHALL install all of the dependencies needed to build the code
 - For now, the code is written in Rust. This was probably a mistake:
     - Rust can fetch dependencies just based on a cargo file, but it won't compile them without top-level sources. This is the difference between roughly 3 seconds and 12 seconds to compile cold. Go doesn't have this problem
@@ -108,6 +113,7 @@ If these become slow:
 
 - `run-tool` does not fetch the output of the tool that it runs. It just prints the hash and the stdout part
 - `caos put` checks whether the server has each object while descending the tree, to avoid putting things that are already there
+- Mentions of `refs/caos/bins` are inconsistent. Does it still exist?
 
 # From agents
 
