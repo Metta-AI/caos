@@ -44,15 +44,15 @@
 # The inner runnerd delegates every worker to the OUTER engine through the
 # granted socket, as siblings sharing this container's netns — no second
 # nesting level (design/cargo-workers.md, phase 4). NOBODY publishes std at
-# runtime: it was published once, by this tree's own build-builtins.sh, when
-# this image was built, and rides here as /caos/seed-git.
+# runtime: this tree's own build-builtins.sh published it once, when the image
+# was built, and the caller hands that result in as an arg (the seed below).
 #
 # What the image lays out for worker1, all fixed paths:
-#   /caos/bin       the tree's binaries (caos, caos-cli, server, runnerd,
-#                   worker-*), so the caos every inner image carries is the
-#                   tested one
-#   /caos/seed-git  the seeded server repo: refs/caos/std and refs/caos/bins,
-#                   already published (design/one-stack-image.md)
+#   /caos/bin       the binaries a STACK needs (caos, caos-cli, server,
+#                   runnerd), so the caos every inner image carries is the
+#                   tested one. The WORKER binaries are NOT here — they ride in
+#                   the caller's wrapper, per job, so that editing one does not
+#                   move this image and re-key every test that runs it.
 #   /caos/stack     the one bring-up
 set -euo pipefail
 
@@ -83,6 +83,40 @@ SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
 
 INNER=http://127.0.0.1
 
+# ---- the seed, from the CALLER's std ----------------------------------------
+# std used to be baked into this image (/caos/seed-git), which meant the image
+# moved whenever any worker binary did, and every test re-keyed on every worker
+# edit. It arrives as an arg instead, and the caller hands each job only the
+# entries that job uses (tests/lib/suite-stage3.sh) — so what re-keys a test is
+# what the test actually reaches for.
+#
+# Seeding is a git FETCH of the tree's closure from the outer server, not a
+# publish: build-builtins already did the expensive half (building and pushing
+# the core images) once, at image build time, and the registry still holds it.
+# What is left is moving a few objects. Measured on the whole of std, 9.3 MB:
+# 0.69s; per entry 73-250ms. That is why this can be per-stack again.
+#
+# It has to happen HERE, before the env flips, because $CAOS_SERVER_URL is the
+# outer server only until then.
+STD_HASH=$(caos hash /cas/args/in/std) || fail "no std in the wrapper — the caller hands each job the entries it uses"
+SEED=/tmp/seed-git
+git init -q --bare "$SEED" || fail "creating the seed repo"
+# A job that named no std entries gets the EMPTY TREE, which is a real and
+# expected answer (tests/chat-online and tests/std-lint reach for nothing) —
+# and the one tree that cannot be fetched, because git synthesizes it rather
+# than storing it. Write it locally instead; the ref still has to exist, or
+# the stack comes up with no refs/caos/std at all.
+if [ "$STD_HASH" = "$(git -C "$SEED" hash-object -t tree /dev/null)" ]; then
+  git -C "$SEED" hash-object -w -t tree /dev/null >/dev/null \
+    || fail "writing the empty tree"
+else
+  git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
+    "$CAOS_SERVER_URL" "$STD_HASH" \
+    || fail "fetching std $STD_HASH from the outer server"
+fi
+git -C "$SEED" update-ref refs/caos/std "$STD_HASH" \
+  || fail "pointing refs/caos/std at $STD_HASH"
+
 # The inner stack itself is `caosd serve` (design/one-stack-image.md) — the
 # ONE bring-up in the tree, shared with the host and seed placements, so this
 # script no longer carries a second copy of how a stack starts. What stays
@@ -95,12 +129,10 @@ INNER=http://127.0.0.1
 #   - runnerd's docker client talks to the OUTER engine over the granted
 #     socket, and each sibling joins THIS container's netns, so the inner
 #     server on 127.0.0.1 is the address every worker already expects
-#   - the server repo is SEEDED from /caos/seed-git, so this stack comes up
-#     with refs/caos/std and refs/caos/bins already published. The publisher
-#     was the tree's own build-builtins.sh, run once when this image was built
-#     (design/one-stack-image.md, "The seed") — so "the inner std is published
-#     by the tree's own publisher" now holds once per tree instead of once per
-#     test, and no test pays for the publish at all.
+#   - the server repo is SEEDED from $SEED, built above out of the std THIS
+#     job was handed. The publisher is still the tree's own build-builtins.sh,
+#     run once when the image was built (design/one-stack-image.md, "The
+#     seed"); a test pays only for moving a few git objects, never a publish.
 #
 # Its registry settings need no overriding: this container sits on caos-net,
 # so the default push URL (caos-registry:5000) is reachable here, and the
@@ -117,7 +149,7 @@ CAOS_STACK_REDIS_PORT=6390 \
 CAOS_STACK_REDIS_PERSIST=no \
 CAOS_STACK_REGISTRY=no \
 CAOS_STACK_RUNNERD=yes \
-CAOS_STACK_SEED_GIT=/caos/seed-git \
+CAOS_STACK_SEED_GIT=$SEED \
 CAOS_RUNNER_SLOTS=6 \
 CAOS_PENDING_TIMEOUT_SECS=900 \
 DOCKER_HOST="unix://$SOCK" \

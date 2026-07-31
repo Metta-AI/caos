@@ -21,6 +21,11 @@
 set -euo pipefail
 
 caos get /cas/args/result
+# One level further: the per-test subsets below symlink to individual entries,
+# so `std` and `bin` must exist as placeholders for `caos put` to resolve them
+# by recorded hash. Placeholders only — no content is fetched here.
+caos get /cas/args/result/std
+caos get /cas/args/result/bin
 caos get /cas/args/workspace
 caos get /cas/args/workspace/tests
 caos get /cas/args/workspace/tests/lib
@@ -32,7 +37,7 @@ LIB=/cas/args/workspace/tests/lib
 # so the resulting worker inherits this job's own bindings (observed: a map
 # job whose args were `image in worker1`, running as uid 1000 because the
 # image's root grant was not in play either).
-map=$(caos curry /cas/args/result -- "--worker1:@=$LIB/run-test.sh")
+map=$(caos curry /cas/args/result/image -- "--worker1:@=$LIB/run-test.sh")
 
 # The test selection: every tests/<name> with a cli.sh — or just the names in
 # --only (a filtered suite; its per-test jobs share their cache with full
@@ -66,6 +71,57 @@ for d in /cas/args/workspace/tests/*/; do
   mkdir -p "/tmp/sel/$t"
   ln -s "/cas/args/workspace/tests/$t" "/tmp/sel/$t/test"
   if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
+
+  # WHAT THIS TEST REACHES FOR, and nothing else. `uses-std` names the
+  # /cas/std entries its jobs resolve; `uses-bin` the binaries it copies out
+  # of CAOS_BIN_DIR to build its own curries. Each becomes a subtree of
+  # symlinks into the build result, so the wrapper carries those entries BY
+  # HASH — `caos put` resolves a symlink into /cas to its recorded hash, so
+  # not one byte moves here.
+  #
+  # This is the whole mechanism. std used to be baked into the image, so any
+  # worker binary moved the image and re-keyed all twenty tests; now a test's
+  # key holds what it named. A worker-rgrep edit moves std/rgrep and
+  # bin/worker-rgrep, which two tests name — the other eighteen are hits.
+  #
+  # Undeclared is UNAVAILABLE, deliberately: an unnamed std entry will not
+  # resolve and an unnamed binary will not copy. Both fail loudly inside the
+  # test, where a wrong declaration can only cost a red run, never a stale
+  # green one. It cost four rounds of red to get these lists right, and every
+  # one was the same rule:
+  #
+  #   THE GIT CLOSURE COVERS TREE REFERENCES AND NOTHING ELSE.
+  #
+  # Fetching a std entry brings its subtrees, so a curry's `args` ride along.
+  # Three things do NOT, and each has to be named explicitly:
+  #
+  #   - A CURRY'S BASE. `std/rgrep/base` is a BLOB holding the base image's
+  #     hash, not a reference to it, so declaring `rgrep` without `runner`
+  #     yields "object not found" on the runner tree.
+  #   - A HASH BOUND AS A LITERAL. `std/rustc` binds `--cargo=<hash>` the same
+  #     way, so rustc needs `cargo`.
+  #   - A NAME THE SERVER LOOKS UP. `std/bash` is a flake tree, and running one
+  #     makes the server resolve `flake-builder` BY NAME — "std library has no
+  #     flake-builder".
+  #
+  # And grep the CLIENT too, not just the test: `caos-cli talk` resolves
+  # runner/bash-tool/llm-step/rgrep/bash from constants in chat.rs, and a Rust
+  # worker builds its path with `std_image("bash")` (tests/commit) — neither
+  # shows up in a search for /cas/std in the test directory.
+  mkdir -p "/tmp/sel/$t/std" "/tmp/sel/$t/bin"
+  if [ -e "$d/uses-std" ]; then
+    caos get "/cas/args/workspace/tests/$t/uses-std"
+    for e in $(cat "$d/uses-std"); do
+      ln -s "/cas/args/result/std/$e" "/tmp/sel/$t/std/$e"
+    done
+  fi
+  if [ -e "$d/uses-bin" ]; then
+    caos get "/cas/args/workspace/tests/$t/uses-bin"
+    for e in $(cat "$d/uses-bin"); do
+      ln -s "/cas/args/result/bin/$e" "/tmp/sel/$t/bin/$e"
+    done
+  fi
+
   case "$t" in
     cargo-self | unit)
       # Dogfood the tree under test — the PRUNED build tree (what cargo

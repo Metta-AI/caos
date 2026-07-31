@@ -70,7 +70,22 @@ fi
 # shell out to host nix); CAOS_STUB_HOST points workers at in-job stub
 # servers — siblings share this container's netns, so localhost is the
 # stub's address, not the engine host.
-export CAOS_BIN_DIR=/caos/bin
+#
+# The binaries arrive in the wrapper — only the ones this test declared in
+# uses-bin — but they cannot be RUN from /cas: materialized content is
+# read-only and owner-only by design, so a test that execs one straight out of
+# the CAS gets "Permission denied" (llm-stub, measured). They used to live at
+# /caos/bin inside the image, mode 755, which is why nothing noticed. Stage a
+# real executable copy and point CAOS_BIN_DIR at that, so the contract tests
+# see is exactly what it was.
+mkdir -p /tmp/bin
+if [ -d /cas/args/in/bin ]; then
+  for b in /cas/args/in/bin/*; do
+    [ -e "$b" ] || continue
+    install -m 755 "$b" "/tmp/bin/$(basename "$b")"
+  done
+fi
+export CAOS_BIN_DIR=/tmp/bin
 export CAOS_STUB_HOST=127.0.0.1
 # A real-API test's key arrives in its wrapper (chat-online; absent = its
 # cli.sh self-skips).

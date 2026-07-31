@@ -1,0 +1,1 @@
+runner rustc cargo bash flake-builder

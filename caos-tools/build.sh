@@ -262,36 +262,77 @@ make)
   CAOS_BUILTIN_BINS="$STAGED" \
     bash "$wsroot/build-builtins.sh" >&2 || fail "publishing std"
 
+  # The std tree the seed stack just published, as a hash.
+  STD=$(git -C "$state/git" rev-parse refs/caos/std) || fail "no refs/caos/std in the seed repo"
+
   # Down before the repo is read: the server holds it open, and a half-written
-  # pack is not something to bake into an image.
+  # pack is not something to hand on.
   kill "$serve" 2>/dev/null || true
   wait "$serve" 2>/dev/null || true
   ts "published std"
 
+  # std LEAVES this stage as a value, not baked into the image, so a caller can
+  # hand each job only the entries it needs (tests/lib/suite-stage3.sh). Moving
+  # it means moving OBJECTS: a caos tree cannot round-trip through a git
+  # worktree, because git has no representation for an empty directory and std
+  # has three of them — runner/cargo/flake-builder each carry an empty
+  # `layer00/tmp` whose 1777 mode rides in a sibling .caosmeta. Both `git
+  # archive` and `git add` drop them silently (measured: the tree comes back
+  # 5b659e1d… instead of f81c1c86…).
+  #
+  # So: push the closure to the outer server (a bare tree pushed to a ref, the
+  # same trick GitTransport::ensure_pushed uses), then take a PLACEHOLDER of it
+  # — one object, no content — and symlink that into the result. `caos put`
+  # resolves a symlink into /cas to its recorded hash, so the tree rides on by
+  # identity and not one byte of it is copied.
+  git -C "$state/git" push --quiet "$CAOS_SERVER_URL" "$STD:refs/caos/std-built-$STD" \
+    || fail "pushing the published std to the outer server"
+  caos get-hash "$STD" /cas/std-built || fail "materializing the std placeholder"
+  ts "handed std over ($STD)"
+
   # ---- 3. assemble ---------------------------------------------------------
-  # The builder's delta {base, config.json, layer00} plus one layer: everything
-  # the stack image adds over the environment it was built in.
-  IMG=/tmp/image
-  rm -rf "$IMG"; mkdir -p "$IMG"
+  # {image, std, bin} — the three things a caller needs, separately, so that
+  # what re-keys a job is what that job actually uses. The image holds only what
+  # bringing a stack up requires; the worker binaries are in `bin`; std is the
+  # value above. A one-line edit to a leaf worker leaves the IMAGE untouched
+  # (measured: 1 of 11 binaries changes, and the four in the image are not it).
+  OUT=/tmp/out
+  rm -rf "$OUT"; mkdir -p "$OUT"
+  ln -s /cas/std-built "$OUT/std"
+
+  IMG=$OUT/image
+  mkdir -p "$IMG"
   cp /cas/args/builder/base "$IMG/base"
   cp /cas/args/builder/config.json "$IMG/config.json"
   if [ -d /cas/args/builder/layer00 ]; then cp -RL /cas/args/builder/layer00 "$IMG/layer00"; fi
 
+  # The binaries a STACK needs to come up, and nothing else: `serve` starts
+  # server and runnerd, and the image's caos is the tested one every inner
+  # image carries. The worker binaries used to ride here too, which is what
+  # made every worker edit move the image and re-key all twenty tests.
   L=$IMG/layer01
   mkdir -p "$L/caos/bin" "$L/caos/stack"
-  for b in caos caos-cli server runnerd worker-cargo worker-runner worker-rustc \
-           worker-bash-tool worker-llm-step worker-rgrep llm-stub; do
+  for b in caos caos-cli server runnerd; do
     install -m 755 "$BIN/$b" "$L/caos/bin/$b" || fail "no binary $b"
+  done
+
+  # The worker and helper binaries, as their own value. Tests that build their
+  # own curries copy these (CAOS_BIN_DIR); a test gets only the ones it names.
+  mkdir -p "$OUT/bin"
+  for b in worker-cargo worker-runner worker-rustc worker-bash-tool \
+           worker-llm-step worker-rgrep llm-stub; do
+    install -m 755 "$BIN/$b" "$OUT/bin/$b" || fail "no binary $b"
   done
   install -m 755 "$wsroot/stack/serve" "$L/caos/stack/serve"
   install -m 755 "$wsroot/test-stack/worker" "$L/worker"
-  # std, published above — so no placement that runs this image has to publish
-  # it, and no test pays for it.
-  cp -RL "$state/git" "$L/caos/seed-git"
-  ts "assembled the image tree"
+  # NO /caos/seed-git. std arrives as an arg now and the stack's /worker seeds
+  # from it, so which entries a stack has is the CALLER's choice — which is the
+  # entire point: a test that never touches std/rgrep no longer re-keys when
+  # rgrep changes.
+  ts "assembled the result tree"
 
-  caos put "$IMG" /cas/out
-  ts "put the image tree"
+  caos put "$OUT" /cas/out
+  ts "put the result tree"
   ;;
 
 *)
