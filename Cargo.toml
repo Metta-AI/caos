@@ -32,3 +32,17 @@ version = "0.1.0"
 strip = true
 lto = true
 codegen-units = 1
+
+# DEPENDENCIES are optimized even in the dev profile; the workspace is not.
+# The dev loop compiles the 12 workspace crates on every edit (~4s) and never
+# recompiles the ~176 dependencies — they are baked into the builder image once
+# — so this buys speed where it costs nothing.
+#
+# It is not a micro-optimisation here. Every hash caos takes goes through
+# `sha1-checked` (git's collision-detecting SHA-1, a hard dependency of
+# gix-hash), and unoptimized it ran at 43 MB/s: `caos put` of the 218 MB stack
+# image spent 5.0 of its 5.3s hashing pass in SHA-1 alone, against 0.27s for
+# the same bytes through coreutils' sha1sum. zlib, minreq and gix's own
+# plumbing are all dependencies too.
+[profile.dev.package."*"]
+opt-level = 2
