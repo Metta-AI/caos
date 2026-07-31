@@ -2,7 +2,7 @@
 //! orchestration over the cargo worker (design/cargo-workers.md, "rustc
 //! re-layered on cargo"). No toolchain lives here: given `--src` (a single
 //! .rs file) it lays out a cargo project as CAS links — the source as
-//! `src/main.rs`, the `--worker_common` crate tree linked in, a generated
+//! `src/main.rs`, the `--worker-common` crate tree linked in, a generated
 //! manifest — and tail-calls the cargo worker (`--cargo`, typically the
 //! std/cargo curry) to compile it musl-static in release. The `finish`
 //! continuation takes the built binary and emits at `/cas/out` a ready-to-run
@@ -12,7 +12,7 @@
 //! eventually).
 //!
 //! So building a worker is itself a worker — memoized end to end: this run on
-//! `(src, runner, cargo, worker_common)` — the bound `cargo` and `worker_common`
+//! `(src, runner, cargo, worker-common)` — the bound `cargo` and `worker-common`
 //! are its LINKER INPUTS, wired in at publish (build-builtins.sh; see
 //! design/flake-images.md "rustc: the worker factory") — the inner compile on
 //! the project tree. rustc itself runs as
@@ -56,19 +56,19 @@ fn run() -> Result<(), String> {
 /// Lay out the project (pure linking — nothing is fetched) and tail into the
 /// cargo worker; `finish` gets the compile's result.
 fn start() -> Result<(), String> {
-    for required in ["src", "runner", "worker_common"] {
+    for required in ["src", "runner", "worker-common"] {
         if !Path::new(&arg(required)).exists() {
             return Err(format!("--{required} is required"));
         }
     }
     // The cargo worker's image ref rides as a literal (a hash string, read as
-    // content), unlike `runner`/`worker_common` which ride as tree references.
+    // content), unlike `runner`/`worker-common` which ride as tree references.
     let cargo = read_arg("cargo")?;
 
     let proj = scratch("proj")?;
     fs::create_dir(proj.join("src")).map_err(|e| format!("creating src dir: {e}"))?;
     link(arg("src"), proj.join("src/main.rs"))?;
-    link(arg("worker_common"), proj.join("worker-common"))?;
+    link(arg("worker-common"), proj.join("worker-common"))?;
     fs::write(proj.join("Cargo.toml"), CARGO_TOML).map_err(|e| format!("writing manifest: {e}"))?;
     caos(["put", path(&proj), "/cas/proj"])?;
 
@@ -82,7 +82,7 @@ fn start() -> Result<(), String> {
     )?;
     // Ourselves, in the `finish` position: rebuild our own curry (the runner
     // image with our bin re-bound) plus what finish needs. `cargo` and
-    // `worker_common` deliberately don't ride — finish's cache key is just
+    // `worker-common` deliberately don't ride — finish's cache key is just
     // (bin, runner, result).
     let bin = arg("worker1");
     let runner = arg("runner");

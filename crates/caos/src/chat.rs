@@ -1061,20 +1061,20 @@ fn turn(
     let tools_image = resolve_cli_image(t, TOOLS_IMAGE).ok();
 
     let mut kvs = vec![
-        format!("--api_key={api_key}"),
+        format!("--api-key={api_key}"),
         format!("--system={system}"),
-        format!("--bash_image={bash_image}"),
-        format!("--grep_image={grep_image}"),
+        format!("--bash-image={bash_image}"),
+        format!("--grep-image={grep_image}"),
         format!("--conversation={name}"),
     ];
     if let Some(tools) = &tools_image {
-        kvs.push(format!("--tools_image={tools}"));
+        kvs.push(format!("--tools-image={tools}"));
     }
     if let Some(model) = &options.model {
         kvs.push(format!("--model={model}"));
     }
     if let Some(url) = &options.base_url {
-        kvs.push(format!("--base_url={url}"));
+        kvs.push(format!("--base-url={url}"));
     }
     // Per-turn state currying: onto the std llm-step curry (layers flatten, so
     // the result is exactly curry(runner, bin, <state>)), or onto the runner

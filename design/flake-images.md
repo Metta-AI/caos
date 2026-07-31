@@ -125,9 +125,9 @@ definition, no drift.
 `std/rustc` compiles ONE worker's source and wraps it as a worker. It is
 pure orchestration — no toolchain in its image — published as
 `curry(runner, worker1=worker-rustc, cargo=<std/cargo's tree>,
-worker_common=<crates/worker-common>)`. The bound args are its linker
+worker-common=<crates/worker-common>)`. The bound args are its linker
 inputs: it lays the user source out as a cargo project linking
-`worker_common`, `run-then`s the compile into the `cargo` ref, and its
+`worker-common`, `run-then`s the compile into the `cargo` ref, and its
 output is `curry(<caller-supplied runner ref>, worker1=<built binary>)` — a
 worker returning a worker. The wiring is invisible at the call site by
 design (callers pass only `--src` and `--runner`); this section is where

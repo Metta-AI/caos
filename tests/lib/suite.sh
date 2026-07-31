@@ -35,12 +35,12 @@ build=$(caos curry /cas/std/bash -- \
   "--worker1:@=/cas/args/workspace/caos-tools/build.sh")
 
 fwd=(
-  "--build_ws:@=/cas/build-ws"
+  "--build-ws:@=/cas/build-ws"
   "--workspace:@=/cas/args/workspace"
 )
-[ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
+[ -e /cas/args/api-key ] && fwd+=("--api-key:@=/cas/args/api-key")
 [ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
-if [ -e /cas/args/test_salt ]; then fwd+=("--test_salt:@=/cas/args/test_salt"); fi
+if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
 
 stage3=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/suite-stage3.sh" "${fwd[@]}")
 caos run-then /cas/args/workspace -- --run="$build" --then="$stage3"

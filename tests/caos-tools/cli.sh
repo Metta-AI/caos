@@ -70,9 +70,9 @@ stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
 tools_img=$("$CAOS_CLI" curry /cas/std/bash --)
 llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
-  --api_key=test-key --system:@=system.txt --bash_image="$bash_tool" \
-  --tools_image="$tools_img" --model=test-model \
-  --base_url="http://$stub_host:$port" --conversation="$conv")
+  --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
+  --tools-image="$tools_img" --model=test-model \
+  --base-url="http://$stub_host:$port" --conversation="$conv")
 "$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"

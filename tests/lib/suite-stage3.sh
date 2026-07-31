@@ -36,7 +36,7 @@ map=$(caos curry /cas/args/result -- "--worker1:@=$LIB/run-test.sh")
 
 # The test selection: every tests/<name> with a cli.sh — or just the names in
 # --only (a filtered suite; its per-test jobs share their cache with full
-# runs). Each child is a wrapper {test, workspace?, api_key?} carrying only
+# runs). Each child is a wrapper {test, workspace?, api-key?} carrying only
 # what that test needs beyond the image. Symlinks into the args materialize
 # nothing — `caos put` resolves them to recorded hashes.
 only=""
@@ -45,14 +45,14 @@ if [ -e /cas/args/only ]; then
   only=" $(cat /cas/args/only) "
 fi
 
-# --test_salt rides in EVERY per-test wrapper and nowhere else, so a fresh
+# --test-salt rides in EVERY per-test wrapper and nowhere else, so a fresh
 # value re-runs all the tests and leaves the build a cache hit. Nothing reads
 # the file: its presence in the wrapper is what moves the per-test key. Do not
 # "clean up" the unused write — it is the whole mechanism.
 salt=""
-if [ -e /cas/args/test_salt ]; then
-  caos get /cas/args/test_salt
-  salt=$(cat /cas/args/test_salt)
+if [ -e /cas/args/test-salt ]; then
+  caos get /cas/args/test-salt
+  salt=$(cat /cas/args/test-salt)
 fi
 
 mkdir /tmp/sel
@@ -71,7 +71,7 @@ for d in /cas/args/workspace/tests/*/; do
       # Dogfood the tree under test — the PRUNED build tree (what cargo
       # reads, the compile's own input), so only Rust-relevant edits re-key
       # these, exactly like the compile itself.
-      ln -s /cas/args/build_ws "/tmp/sel/$t/workspace"
+      ln -s /cas/args/build-ws "/tmp/sel/$t/workspace"
       ;;
     std-lint)
       # The literal-tree lints check the checked-in std copies against their
@@ -84,9 +84,9 @@ for d in /cas/args/workspace/tests/*/; do
       # The real-API key, when the suite was given one: same key, same cache
       # key — only this test re-keys when it rotates. Without one the test's
       # cli.sh self-skips.
-      if [ -e /cas/args/api_key ]; then
-        caos get /cas/args/api_key
-        cp /cas/args/api_key /tmp/sel/chat-online/api_key
+      if [ -e /cas/args/api-key ]; then
+        caos get /cas/args/api-key
+        cp /cas/args/api-key /tmp/sel/chat-online/api-key
       fi
       ;;
   esac

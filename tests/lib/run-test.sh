@@ -38,7 +38,7 @@ fail() {
   exit 1
 }
 
-# The map child: {test, workspace?, api_key?}, already materialized by the
+# The map child: {test, workspace?, api-key?}, already materialized by the
 # interpreter. Binaries and images no longer ride in the wrapper — they are
 # in the image, which IS the tree under test.
 
@@ -74,8 +74,8 @@ export CAOS_BIN_DIR=/caos/bin
 export CAOS_STUB_HOST=127.0.0.1
 # A real-API test's key arrives in its wrapper (chat-online; absent = its
 # cli.sh self-skips).
-if [ -e /cas/args/in/api_key ]; then
-  ANTHROPIC_API_KEY=$(cat /cas/args/in/api_key)
+if [ -e /cas/args/in/api-key ]; then
+  ANTHROPIC_API_KEY=$(cat /cas/args/in/api-key)
   export ANTHROPIC_API_KEY
 fi
 

@@ -347,7 +347,7 @@ if [ -n "${hash_of[runner]:-}" ]; then
       # publish's rm -rf works.
       chmod -R u+w "$CLIENT/worker-common"
       git -C "$CLIENT" add worker-common
-      extra=("--cargo=${hash_of[cargo]}" "--worker_common:@=worker-common")
+      extra=("--cargo=${hash_of[cargo]}" "--worker-common:@=worker-common")
     fi
     # Ingestion only accepts git-tracked worktree paths, so stage a copy of
     # the binary in the client repo (overwritten on every publish).

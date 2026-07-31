@@ -95,7 +95,7 @@ pub fn declarations() -> Vec<Value> {
     ]
 }
 
-/// The grep tool's registry entry (present only when a `grep_image` is
+/// The grep tool's registry entry (present only when a `grep-image` is
 /// curried — see `Config`). It runs as the rgrep fold sub-run; this module
 /// contributes the declaration, the pre-launch validation, and the
 /// transcript-boundary rendering of its sparse result tree.

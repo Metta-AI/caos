@@ -76,8 +76,8 @@ bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
-  --api_key=test-key --system:@=system.txt --bash_image="$bash_tool" \
-  --model=test-model --base_url="http://$stub_host:$port" \
+  --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
+  --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")
 
 "$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit

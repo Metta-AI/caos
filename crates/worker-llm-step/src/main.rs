@@ -17,9 +17,9 @@
 //! tools (read/ls/write/edit — `tools.rs`) execute in-process, advancing the
 //! workspace with no sub-run; only `bash` exits into a run-then sub-run.
 //!
-//! Curried configuration: `api_key`, `system` (the system prompt), `bash_image`
+//! Curried configuration: `api-key`, `system` (the system prompt), `bash-image`
 //! (the sub-run tool's image), and optionally `model` (default
-//! `claude-opus-4-8`), `base_url` (default `https://api.anthropic.com`;
+//! `claude-opus-4-8`), `base-url` (default `https://api.anthropic.com`;
 //! overridable so tests can point it at a stub), and `conversation` (a name;
 //! when present, each minted step pushes `refs/caos/conversations/<name>-progress`
 //! and each API attempt updates `refs/caos/conversations/<name>-status` — see
@@ -78,13 +78,13 @@ struct Config {
 impl Config {
     fn read() -> Result<Config, String> {
         Ok(Config {
-            api_key: read_arg("api_key")?,
+            api_key: read_arg("api-key")?,
             system: read_arg("system")?,
-            bash_image: read_arg("bash_image")?,
-            grep_image: read_arg_opt("grep_image")?,
-            tools_image: read_arg_opt("tools_image")?,
+            bash_image: read_arg("bash-image")?,
+            grep_image: read_arg_opt("grep-image")?,
+            tools_image: read_arg_opt("tools-image")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
-            base_url: read_arg_opt("base_url")?
+            base_url: read_arg_opt("base-url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             conversation: read_arg_opt("conversation")?,
         })
@@ -144,13 +144,13 @@ fn callback(cfg: &Config) -> Result<(), String> {
     );
     let pending = parse_blocks(&read_arg("pending")?, "pending")?;
     let mut results = parse_blocks(&read_arg("results")?, "results")?;
-    let current_id = read_arg("current_id")?;
+    let current_id = read_arg("current-id")?;
 
     // Fold the tool's outcome into a tool_result block the model will see,
     // and establish the workspace the queue continues over: bash results
     // carry the post-command workspace as `tree`; a grep result is a sparse
     // match tree, NOT a workspace — the pre-grep workspace rode our curry.
-    let current_tool = read_arg_opt("current_tool")?.unwrap_or_else(|| "bash".to_string());
+    let current_tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
     let ws = match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -454,7 +454,7 @@ fn launch(
         pending,
         results,
         id,
-        &[("current_tool", Arg::Lit("bash"))],
+        &[("current-tool", Arg::Lit("bash"))],
     )?;
     run_then(&in_path, &cfg.bash_image, Some(&me))
 }
@@ -492,7 +492,7 @@ fn launch_grep(
         results,
         id,
         &[
-            ("current_tool", Arg::Lit("grep")),
+            ("current-tool", Arg::Lit("grep")),
             ("ws", Arg::Path(ws)),
             ("scope", Arg::Lit(scope_prefix)),
         ],
@@ -530,7 +530,7 @@ fn launch_tree_tool(
         pending,
         results,
         id,
-        &[("current_tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
+        &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
     )?;
     run_then(ws, &curried, Some(&me))
 }
@@ -552,26 +552,26 @@ fn self_curry(
 
     let bin = arg("worker1");
     let head = arg("head");
-    let api_key = arg("api_key");
+    let api_key = arg("api-key");
     let system = arg("system");
-    let bash_image = arg("bash_image");
+    let bash_image = arg("bash-image");
     let mut kvs: Vec<(&str, Arg)> = vec![
         ("worker1", Arg::Path(&bin)),
         ("head", Arg::Path(&head)),
-        ("api_key", Arg::Path(&api_key)),
+        ("api-key", Arg::Path(&api_key)),
         ("system", Arg::Path(&system)),
-        ("bash_image", Arg::Path(&bash_image)),
+        ("bash-image", Arg::Path(&bash_image)),
         ("step", Arg::Path(step_path)),
         ("pending", Arg::Lit(&pending_json)),
         ("results", Arg::Lit(&results_json)),
-        ("current_id", Arg::Lit(current_id)),
+        ("current-id", Arg::Lit(current_id)),
     ];
     let optional: Vec<(&str, String)> = [
         "model",
-        "base_url",
+        "base-url",
         "conversation",
-        "grep_image",
-        "tools_image",
+        "grep-image",
+        "tools-image",
     ]
     .iter()
     .map(|name| (*name, arg(name)))

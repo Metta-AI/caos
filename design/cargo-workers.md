@@ -305,7 +305,7 @@ bin-workers (file-count, dirs-only, deep-deps, rgrep), the bash tests
 (symlinks, untracked, run-then), the toolchain tests (cargo-check,
 cargo-crates, cargo-self, commit, rust-worker — the cargo base image rides by
 ID like the others; the inner std carries build-builtins' full shape including
-`rustc = curry(runner, bin, cargo, worker_common)`), and the stub tests
+`rustc = curry(runner, bin, cargo, worker-common)`), and the stub tests
 (bash-tool, llm-step, chat-offline — helper binaries come from the job's
 `bins` tree via `CAOS_BIN_DIR` instead of host nix, and `CAOS_STUB_HOST`
 points workers at in-job stubs: siblings share the job's netns, so the stub
@@ -438,7 +438,7 @@ repo (`GitTransport::discover`) rather than assuming cwd is one. `run-tool`
 also prints a failing test's WHOLE output now, not a 40-line tail.
 
 Two shapes worth keeping: **per-test extras ride in that test's map child**
-as a wrapper tree ({test, workspace} for cargo-self, {test, api_key} for
+as a wrapper tree ({test, workspace} for cargo-self, {test, api-key} for
 chat-online), built with symlinks + `caos put` (recorded-hash reuse — no
 bytes move), so nobody else re-keys on them. And **test outcomes are
 values**: run-nested puts a PASS/FAIL verdict (failures carry the cli.sh

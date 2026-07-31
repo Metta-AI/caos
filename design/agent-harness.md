@@ -87,9 +87,9 @@ already contains one.
 own image):
 
 - `head:commit=` — the human-turn commit to answer (the conversation head);
-- curried config: `api_key`, `system` (the system prompt), `bash_image` (the
+- curried config: `api-key`, `system` (the system prompt), `bash-image` (the
   tool registry — just bash for now, an image ref), and optionally `model`
-  (default `claude-opus-4-8`), `base_url` (default
+  (default `claude-opus-4-8`), `base-url` (default
   `https://api.anthropic.com`; tests point it at a stub), `conversation`
   (names the progress ref);
 - continuation state, curried by the worker itself between tool calls:
