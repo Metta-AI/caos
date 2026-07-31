@@ -1,1 +1,42 @@
-AGENTS.md
+Read ./SPEC.md
+
+# Shell, under `set -euo pipefail`
+
+Every script here runs with it, and two constructs quietly break under it.
+
+- **`[ cond ] && action` exits the script when the condition is false**, if that
+  list is the last command in its scope (a function, a loop body, a `{ }` block,
+  the script). Write `if`. This is not hypothetical: it is the single largest
+  source of bugs in this tree's shell — `build-builtins.sh` still carries three
+  latent instances, one of which makes `./build-builtins.sh <name>` exit 1
+  before doing anything.
+- **`pipefail` makes a pipeline fail on its LEFTMOST failure**, not its last
+  command. `curl -f ... | awk` returns curl's 22 on a 404, so a lookup whose
+  "absent" answer is a 404 dies instead of returning empty. Distinguish absent
+  from broken explicitly — a swallowed error here silently hides an unreachable
+  service.
+
+# Nix
+
+- **Everything an image's `contents` puts on disk is a SYMLINK into
+  `/nix/store`.** `dockerTools` lays contents down with `lndir`, which mirrors
+  directories and symlinks files. So `cp -R` out of an image layout copies
+  links, not content, and the copy is read-only and store-shaped. Use `cp -RL`
+  — `build-builtins.sh` learned this for published flake trees, and `serve`
+  learned it again for the seeded git dir, where a symlinked `HEAD` made git
+  call a perfectly good repo "not a git repository" (`validate_headref` accepts
+  a symlinked HEAD only if the target starts with `refs/`) while gix opened it
+  and the server started anyway.
+- **`runCommand name {} '' … '' + s` parses as `(runCommand name {} '' … '') + s`.**
+  That concatenates the DERIVATION with the string, so you get a store path
+  with your script text glued to the end — and it evaluates, builds, and fails
+  much later with something like `<store-path># my comment: No such file or
+  directory`. Parenthesize the whole script when appending to it.
+
+# Before committing
+
+- **Never read a gate's exit status through a pipe.** `caosd up 2>&1 | tail`
+  reports `tail`'s status, so a failed deploy looks like a pass — that happened,
+  and the next step ran against a stack that was not up. Use
+  `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
+- If this doesn't catch everything, we need to add it to the above step

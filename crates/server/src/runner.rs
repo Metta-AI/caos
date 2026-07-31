@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::HttpError;
 
 /// A runner's required args / a job's args-tree top level: name → git oid.
-type ArgSet = BTreeMap<String, String>;
+type ArgTree = BTreeMap<String, String>;
 
 /// How long a job may sit unclaimed before the dispatch fails 503. New capacity
 /// may register meanwhile (a kicked runner's parent, a fresh runnerd slot).
@@ -84,10 +84,10 @@ struct ParkedPoll {
     /// Monotone arrival id — ties between equally specific polls go to the
     /// largest (LIFO: concentrate work on a hot runner, let the tail idle out).
     id: u64,
-    required: ArgSet,
+    required: ArgTree,
     /// The required sets of the runner's ancestors (outermost first). A pending
     /// job nothing matches kicks the deepest poll whose lineage could serve it.
-    lineage: Vec<ArgSet>,
+    lineage: Vec<ArgTree>,
     /// Stops matching here — the TTL minus a margin, so a job isn't handed to
     /// a connection the runner is about to abandon.
     matchable_until: Instant,
@@ -116,7 +116,7 @@ struct Job {
     /// Docker-pullable image reference (always sent; warm runners ignore it).
     image_ref: String,
     /// The args tree's top-level name → oid map, what `required` matches against.
-    arg_entries: ArgSet,
+    arg_entries: ArgTree,
     /// Current rendezvous nonce; refreshed on requeue (first post per nonce wins).
     nonce: String,
     phase: Phase,
@@ -173,7 +173,7 @@ fn new_nonce(id: u64) -> String {
 
 /// Does `required` match a job with `arg_entries`? Every required (name, oid)
 /// must equal the job's entry of that name — pure oid equality.
-fn matches(required: &ArgSet, arg_entries: &ArgSet) -> bool {
+fn matches(required: &ArgTree, arg_entries: &ArgTree) -> bool {
     required
         .iter()
         .all(|(name, oid)| arg_entries.get(name) == Some(oid))
@@ -199,7 +199,7 @@ fn payload(job: &Job) -> String {
 /// through the runner rendezvous, blocking until a runner posts its result.
 pub(crate) fn dispatch(
     req: &str,
-    arg_entries: ArgSet,
+    arg_entries: ArgTree,
     image_ref: &str,
 ) -> Result<String, HttpError> {
     let (outcome_tx, outcome_rx) = mpsc::channel();
@@ -367,11 +367,11 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
     check_auth(authorization)?;
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| HttpError::new(400, format!("invalid poll json: {e}")))?;
-    let required = arg_set(&v["required"])?;
+    let required = arg_tree(&v["required"])?;
     let lineage = match &v["lineage"] {
         serde_json::Value::Null => Vec::new(),
         serde_json::Value::Array(sets) => {
-            sets.iter().map(arg_set).collect::<Result<Vec<_>, _>>()?
+            sets.iter().map(arg_tree).collect::<Result<Vec<_>, _>>()?
         }
         _ => return Err(HttpError::new(400, "lineage must be an array")),
     };
@@ -427,7 +427,7 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
 
 /// The oldest pending job this poll's required set matches (respecting a
 /// requeue's defer-generic window), if any.
-fn best_pending(st: &State, required: &ArgSet) -> Option<u64> {
+fn best_pending(st: &State, required: &ArgTree) -> Option<u64> {
     let now = Instant::now();
     st.jobs
         .iter()
@@ -448,10 +448,10 @@ fn reply_job(payload: &str) -> Result<Vec<u8>, HttpError> {
     Ok(format!(r#"{{"job":{payload}}}"#).into_bytes())
 }
 
-/// Parse a JSON object of string → string into an [`ArgSet`].
-fn arg_set(v: &serde_json::Value) -> Result<ArgSet, HttpError> {
+/// Parse a JSON object of string → string into an [`ArgTree`].
+fn arg_tree(v: &serde_json::Value) -> Result<ArgTree, HttpError> {
     match v {
-        serde_json::Value::Null => Ok(ArgSet::new()),
+        serde_json::Value::Null => Ok(ArgTree::new()),
         serde_json::Value::Object(map) => map
             .iter()
             .map(|(k, v)| {
