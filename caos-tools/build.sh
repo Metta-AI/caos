@@ -83,10 +83,36 @@ reduce)
   # (validate_target) — it cannot ingest an arbitrary host path.
   caos put "$R" /cas/reduced
 
-  # The full source rides into `launch` as a curried arg so `make` can reach it:
-  # run-then passes only --in (here, the reduced tree) and --result.
+  # THE BUILD'S OWN INPUTS, and nothing else. `make` compiles the workspace,
+  # runs build-builtins.sh (which reads std/ and crates/worker-common), and
+  # installs stack/serve and test-stack/worker into the image. It reads
+  # nothing else in the tree.
+  #
+  # It used to get the WHOLE tree, so a one-line edit to tests/<name>/cli.sh —
+  # or to a design doc, or this comment — recompiled the workspace,
+  # republished std and reassembled the 218 MB image before running the test
+  # that changed: 9.7s of a 16.9s single-test run, traced. Which is also why a
+  # test edit re-keyed every OTHER test: the image digest is in every per-test
+  # key.
+  #
+  # MODES ARE PRESERVED, for the same reason the reduction preserves them: a
+  # 644 copy of the 755 std/bash/worker is a different image derivation.
+  #
+  # Same safety argument as the reduction above, and it is why this is worth
+  # doing by hand: prune something `make` needs and it FAILS on a missing
+  # path. There is no way to get a stale image out of a too-small src.
+  S=/tmp/src
+  rm -rf "$S"; mkdir -p "$S"
+  for e in Cargo.toml Cargo.lock rust-toolchain.toml \
+           crates std stack test-stack build-builtins.sh; do
+    if [ -e "$e" ]; then cp -RL --preserve=mode "$e" "$S/$e"; fi
+  done
+  caos put "$S" /cas/src
+
+  # The build source rides into `launch` as a curried arg so `make` can reach
+  # it: run-then passes only --in (here, the reduced tree) and --result.
   launch=$(caos curry /cas/std/bash -- \
-    "--worker1:@=/cas/args/worker1" --stage=launch "--src:@=/cas/args/in") \
+    "--worker1:@=/cas/args/worker1" --stage=launch "--src:@=/cas/src") \
     || fail "currying the launch stage"
 
   caos run-then /cas/reduced -- --run=/cas/std/flake-builder --then="$launch"
