@@ -45,7 +45,8 @@ passn=0 failn=0
   # slow" the first time a report replayed times measured while the engine was
   # unpacking a new image across twenty concurrent stacks.
   echo "(times are each test's LAST ACTUAL RUN; an unchanged test is a cache"
-  echo " hit and replays the time it recorded then)"
+  echo " hit and replays the time it recorded then."
+  echo " Pass \`--test_salt=\$(date --iso=s)\` to rerun all tests)"
 } > /tmp/rep/report
 ln -s /cas/args/children /tmp/rep/results
 caos put /tmp/rep /cas/out
