@@ -84,42 +84,25 @@ let
       CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
       CARGO_BUILD_TARGET = muslTarget;
       cargoExtraArgs = "--locked --workspace";
-      # PER-MEMBER FEATURE RESOLUTIONS, warmed here.
+      # PER-MEMBER FEATURE RESOLUTIONS. `--workspace` unifies features across
+      # every member; `-p <member>` resolves a NARROWER set, so the same
+      # dependency gets different flags, a different fingerprint, and is
+      # recompiled. Without this loop every per-crate job (decompose.rs
+      # `mode=all`) re-checks the whole dep graph.
       #
-      # `--workspace` unifies features across every member; `-p <member>`
-      # resolves a NARROWER set, so the same dependency gets different feature
-      # flags, a different fingerprint, and is recompiled. The bake above warms
-      # only the `--workspace` resolution, so every per-crate job
-      # (decompose.rs `mode=all`, which runs `cargo <cmd> -p <member>`) missed
-      # it and re-checked the dep graph.
+      # Three commands, and `doc` is deliberately not a fourth: rustdoc consumes
+      # the same dependency artifacts rustc does, so `check` already warms
+      # everything `cargo doc --no-deps -p <member>` needs.
       #
-      # Measured on the same tree, `cargo check` cold: flat `--workspace` is
-      # 9.8s with 12 Checking and 0 Compiling — the bake fully reused; per-crate
-      # is ~25s with 114 Checking and 10 Compiling. The extra 102 are
-      # dependencies, re-checked because of this. Reproduced in isolation on
-      # the host: `cargo check --workspace` then `cargo check -p worker-rgrep`
-      # re-checks regex and regex-automata.
+      # The members are crane's DUMMY sources, and that is the point — their
+      # dependencies are the target; their own artifacts are discarded when the
+      # real build runs.
       #
-      # Three commands because three artifact kinds with three fingerprints:
-      # check produces .rmeta, clippy its own metadata, test the dev-dependency
-      # graph and the harness. `unit` runs test and clippy per-crate, and
-      # `build`/`cargo-self` run check.
+      # jq by store path, NOT nativeBuildInputs: crane sets that attribute
+      # itself, so assigning it here takes the build's own tools out with it.
       #
-      # The members here are crane's DUMMY sources, which is exactly right: we
-      # want their DEPENDENCIES resolved and compiled under each member's
-      # feature set. The dummy members' own artifacts are discarded with the
-      # rest of the workspace crates' when the real build runs.
-      #
-      # jq by store path rather than nativeBuildInputs: crane sets that itself
-      # (cargo, the toolchain, the vendor hooks), and replacing it here would
-      # take the build's own tools out with it. Interpolating the derivation
-      # is enough to make it a build input.
-      #
-      # No `|| true` on the cargo calls. `cargo build --workspace` has already
-      # succeeded on these same dummy sources, so a check/clippy/test that
-      # fails here means something is wrong with the bake, and a warm that
-      # silently "did not warm" is exactly the silent full rebuild this whole
-      # file exists to prevent.
+      # No `|| true`: a warm that silently does not warm is the silent full
+      # rebuild this file exists to prevent.
       postBuild = ''
         for m in $(cargo metadata --no-deps --format-version 1 --offline \
                      | ${pkgs.jq}/bin/jq -r '.packages[].name'); do
