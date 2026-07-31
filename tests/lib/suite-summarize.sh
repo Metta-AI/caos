@@ -37,6 +37,15 @@ passn=0 failn=0
   else
     echo "SUITE FAILED: $passn/$((passn + failn)) passed"
   fi
+  # A duration is a property of a RUN; a result is a property of its INPUTS.
+  # Caching the one inside the other means an unchanged test replays whatever
+  # it happened to cost when it last actually ran — which is the number you
+  # will keep seeing until something re-keys it, however much faster the tests
+  # have since become. Said out loud, because it read as "the tests are still
+  # slow" the first time a report replayed times measured while the engine was
+  # unpacking a new image across twenty concurrent stacks.
+  echo "(times are each test's LAST ACTUAL RUN; an unchanged test is a cache"
+  echo " hit and replays the time it recorded then)"
 } > /tmp/rep/report
 ln -s /cas/args/children /tmp/rep/results
 caos put /tmp/rep /cas/out
