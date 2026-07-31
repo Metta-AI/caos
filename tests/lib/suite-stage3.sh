@@ -149,5 +149,23 @@ for d in /cas/args/workspace/tests/*/; do
 done
 caos put /tmp/sel /cas/sel
 
-then_img=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/suite-summarize.sh")
+# The build's own elapsed seconds ride into the summariser so the report can
+# show them. Curried HERE because the summariser is the `then` of the map — it
+# receives --children and nothing else.
+#
+# --start-time is the clock for the test phase, and it is taken HERE, one line
+# before the fan-out fires, because this is the last point that certainly runs
+# when the tests might. The summariser subtracts it from its own `now`.
+#
+# The phase cannot be recovered from the tests themselves: a test's start and
+# end are files in its RESULT, so a cache hit replays the pair from whenever it
+# last ran, and min/max across twenty records then spans back to that run (2306s
+# against a 38s invocation, seen). Measured across two jobs that really ran, the
+# number is right in both directions — a fan-out of cache hits is genuinely
+# quick, and says so.
+#
+# A timestamp in args means the summariser never caches. That is the point: it
+# is one cheap container, and it only runs at all when this stage does.
+then_img=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/suite-summarize.sh" \
+  "--build-time:@=/cas/args/result/time" "--start-time=$(date +%s)")
 caos map-then /cas/sel -- --map="$map" --then="$then_img"

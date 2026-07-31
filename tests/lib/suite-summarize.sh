@@ -9,9 +9,15 @@
 set -euo pipefail
 
 caos get /cas/args/children
+caos get /cas/args/build-time
+caos get /cas/args/start-time
 mkdir -p /tmp/rep
 passn=0 failn=0
 {
+  # Collected first, printed after: the column width is only known once every
+  # child has been read.
+  names=() marks=() times=()
+  width=0
   for c in /cas/args/children/*; do
     t=$(basename "$c")
     caos get "/cas/args/children/$t"
@@ -20,16 +26,31 @@ passn=0 failn=0
     # pole. A suite is as slow as its slowest test once the pool is saturated,
     # and that fact was previously only reachable by correlating inner redis
     # logs by hand.
-    secs=""
-    if [ -e "$c/seconds" ]; then
-      caos get "/cas/args/children/$t/seconds"
-      secs=" ($(cat "$c/seconds")s)"
-    fi
+    caos get "/cas/args/children/$t/seconds"
+    s=$(cat "$c/seconds")
     if grep -q "^RUN-TEST: PASS" "$c/verdict"; then
-      echo "PASS tests/$t$secs"; passn=$((passn + 1))
+      mark="✓"; passn=$((passn + 1))
     else
-      echo "FAIL tests/$t$secs"; failn=$((failn + 1))
+      mark="✗"; failn=$((failn + 1))
     fi
+    names+=("$t"); marks+=("$mark"); times+=("$s")
+    # `if`, not `[ … ] && …`: this is the last command in the loop body, where
+    # a false test would end the loop AND the script under `set -e`.
+    if [ ${#t} -gt "$width" ]; then width=${#t}; fi
+  done
+
+  # The build and the tests as two comparable lines, the tests indented beneath
+  # theirs. The test phase is now minus the stamp stage3 took as it fired the
+  # fan-out: measured across two jobs that ran, never recovered from cached
+  # values.
+  echo "build ($(cat /cas/args/build-time)s)"
+  echo "tests ($(($(date +%s) - $(cat /cas/args/start-time)))s)"
+  # A mark rather than a word, and no colour: this report is a VALUE in a git
+  # tree, so a worker cannot know whether whoever eventually reads it is a
+  # terminal, and ANSI escapes would be baked into the artifact and into every
+  # log that ever prints it.
+  for i in "${!names[@]}"; do
+    printf '  %s %-*s %4s\n' "${marks[$i]}" "$width" "${names[$i]}" "${times[$i]}s"
   done
   echo
   if [ "$failn" -eq 0 ]; then

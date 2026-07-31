@@ -325,6 +325,20 @@ make)
   # rgrep changes.
   ts "assembled the result tree"
 
+  # This stage's elapsed seconds, as a FOURTH output. Callers that want to
+  # report it read it; the per-test wrappers never carry it, so a build whose
+  # image/std/bin come out identical but took a different time re-keys stage3
+  # and the summariser (one cheap container each) and leaves every test a hit.
+  #
+  # Only this stage's own time — reduce and launch are ~2s of container churn
+  # before it, and the client's own `time` covers the whole tool. A START time
+  # cannot be curried forward to total them up: args are the cache key, so a
+  # timestamp in `make`'s args would mean `make` never caches again.
+  #
+  # Replayed on a cache hit, like every other duration in a result: it says
+  # what this build cost when it last actually ran.
+  echo "$SECONDS" > "$OUT/time"
+
   caos put "$OUT" /cas/out
   ts "put the result tree"
   ;;

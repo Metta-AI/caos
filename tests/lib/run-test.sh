@@ -97,11 +97,12 @@ fi
 cp -r "$TEST" ./test
 git add -A && git commit -qm testtree
 mkdir /tmp/out
-# The test's own wall time, in the record. Without it the only observable is
-# the whole suite, and a span in the trace cannot tell waiting from working —
-# a per-test job's span starts when the fan-out fires, so under an 8-slot pool
-# twelve of twenty spans are mostly queue. `SECONDS` covers cli.sh only, which
-# is the number you want when asking which test is the long pole.
+# This test's own elapsed, for its line in the report — which test is the long
+# pole. Only a DURATION: absolute times were here once, so the summariser could
+# reconstruct the phase as max(end) - min(start), and that cannot work. They are
+# files in the result, so a cache hit replays the pair from whenever the test
+# last ran and the span reaches back to that run. The phase is stamped by
+# stage3 instead, across jobs that really ran.
 t0=$SECONDS
 if bash test/cli.sh >/tmp/test.out 2>&1; then
   echo "RUN-TEST: PASS" > /tmp/out/verdict
