@@ -101,19 +101,9 @@ INNER=http://127.0.0.1
 STD_HASH=$(caos hash /cas/args/in/std) || fail "no std in the wrapper — the caller hands each job the entries it uses"
 SEED=/tmp/seed-git
 git init -q --bare "$SEED" || fail "creating the seed repo"
-# A job that named no std entries gets the EMPTY TREE, which is a real and
-# expected answer (tests/chat-online and tests/std-lint reach for nothing) —
-# and the one tree that cannot be fetched, because git synthesizes it rather
-# than storing it. Write it locally instead; the ref still has to exist, or
-# the stack comes up with no refs/caos/std at all.
-if [ "$STD_HASH" = "$(git -C "$SEED" hash-object -t tree /dev/null)" ]; then
-  git -C "$SEED" hash-object -w -t tree /dev/null >/dev/null \
-    || fail "writing the empty tree"
-else
-  git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
-    "$CAOS_SERVER_URL" "$STD_HASH" \
-    || fail "fetching std $STD_HASH from the outer server"
-fi
+git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
+  "$CAOS_SERVER_URL" "$STD_HASH" \
+  || fail "fetching std $STD_HASH from the outer server"
 git -C "$SEED" update-ref refs/caos/std "$STD_HASH" \
   || fail "pointing refs/caos/std at $STD_HASH"
 

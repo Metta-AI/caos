@@ -272,19 +272,13 @@ make)
   ts "published std"
 
   # std LEAVES this stage as a value, not baked into the image, so a caller can
-  # hand each job only the entries it needs (tests/lib/suite-stage3.sh). Moving
-  # it means moving OBJECTS: a caos tree cannot round-trip through a git
-  # worktree, because git has no representation for an empty directory and std
-  # has three of them — runner/cargo/flake-builder each carry an empty
-  # `layer00/tmp` whose 1777 mode rides in a sibling .caosmeta. Both `git
-  # archive` and `git add` drop them silently (measured: the tree comes back
-  # 5b659e1d… instead of f81c1c86…).
+  # hand each job only the entries it needs (tests/lib/suite-stage3.sh).
   #
-  # So: push the closure to the outer server (a bare tree pushed to a ref, the
-  # same trick GitTransport::ensure_pushed uses), then take a PLACEHOLDER of it
-  # — one object, no content — and symlink that into the result. `caos put`
-  # resolves a symlink into /cas to its recorded hash, so the tree rides on by
-  # identity and not one byte of it is copied.
+  # It was published into the seed stack's repo, so move it the way values move:
+  # push the closure to the outer server (a bare tree to a ref, as
+  # GitTransport::ensure_pushed does), then symlink a PLACEHOLDER of it into the
+  # result. `caos put` resolves a symlink into /cas to its recorded hash, so the
+  # tree rides on by identity and nothing is materialized.
   git -C "$state/git" push --quiet "$CAOS_SERVER_URL" "$STD:refs/caos/std-built-$STD" \
     || fail "pushing the published std to the outer server"
   caos get-hash "$STD" /cas/std-built || fail "materializing the std placeholder"
