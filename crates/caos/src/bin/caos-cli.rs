@@ -135,6 +135,16 @@ fn run(args: &[String]) -> Result<(), String> {
         // job over this repo's tree: what an agent's tool invocation does,
         // callable by hand. See `caos::cli_run_tool` for the result conventions.
         Some("run-tool") => caos::cli_run_tool(&transport()?, &args[2..]),
+        // `get <hash> <path>` — check a result out on the host, the escape
+        // hatch from laziness. `run-tool` prints a hash and materializes
+        // nothing, which is right for the common case and useless when you
+        // want to read a test's full record (its output, the inner stack's
+        // logs). Objects it already has cost nothing, so checking out a
+        // 218 MB image you have most of is a local write, not a download.
+        Some("get") => match &args[2..] {
+            [hash, path] => caos::cli_get(&transport()?, hash, path),
+            _ => Err(usage(args)),
+        },
         _ => Err(usage(args)),
     }
 }
@@ -162,6 +172,7 @@ fn usage(args: &[String]) -> String {
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
          {prog} tui [--new | --from <commit>] [options]\n  \
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
-         {prog} run-tool <script | name> [--name=value ...]"
+         {prog} run-tool <script | name> [--name=value ...]\n  \
+         {prog} get <hash> <path>"
     )
 }

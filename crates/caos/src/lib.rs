@@ -50,7 +50,8 @@ pub use chat::{cli_chat, cli_talk};
 /// small blobs, read one object at a time. It used to check the whole result
 /// out under `.caos-dev/tool-<name>`, which for `build` meant fetching and
 /// writing a 218 MB stack image nobody reads: ~19s of a 38s run on a one-line
-/// worker edit. Anything that wants the tree can `caos-cli run <hash> <path>`.
+/// worker edit. When you do want the tree — a failing test's inner stack logs,
+/// say — `caos-cli get <hash> <path>` checks it out.
 ///
 /// Conventions on the result: a `report` file is printed (a FAILED banner
 /// fails the command), and failing `results/<name>/` records show their full
@@ -142,6 +143,33 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
     if text.contains("FAILED") {
         return Err(format!("{name} reported FAILED"));
     }
+    Ok(())
+}
+
+/// `get <hash> <path>` — check an existing result out on the host, as ordinary
+/// rw files. The counterpart to `run-tool` materializing nothing: it prints a
+/// hash, and this is how you then read the thing. Costs only the objects the
+/// working repo is missing.
+pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> {
+    let (kind, _) = t.get_object(hash)?;
+    let root = match kind.as_str() {
+        "tree" => gix::objs::tree::EntryKind::Tree,
+        _ => gix::objs::tree::EntryKind::Blob,
+    };
+    let target = PathBuf::from(path);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+    }
+    if let Err(e) = std::fs::remove_dir_all(&target) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("clearing {path}: {e}"));
+        }
+    }
+    checkout(t, &target, hash, root)?;
+    eprintln!("{kind} {hash} -> {path}");
     Ok(())
 }
 

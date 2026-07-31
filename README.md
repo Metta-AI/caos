@@ -563,7 +563,8 @@ your edited tree. New tests are picked up automatically. Results — every
 test's verdict, full output, and the inner stack's logs — land as a git
 tree pinned on the server. `run-tool` materializes none of it: it prints the
 result hash, then reads just the report (and any failing test's output) one
-object at a time. To get the whole tree on disk, `caos-cli run <hash> <path>`.
+object at a time. To get the whole tree on disk — a failing test's full output
+and inner stack logs — `caos-cli get <hash> <path>`.
 
 ## Notes
 
