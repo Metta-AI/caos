@@ -28,6 +28,19 @@ pub(crate) fn get_object(config: &Config, hash: &str) -> Result<Vec<u8>, HttpErr
     Ok(out)
 }
 
+/// `HEAD /object/<hash>` — 200 if the object is stored, 404 if not, and no body
+/// either way. The cheap existence question a client asks before uploading:
+/// `caos put` uses it to prune whole subtrees it would otherwise re-send (a
+/// stored tree's descendants are stored too — this repo never GCs).
+pub(crate) fn head_object(config: &Config, hash: &str) -> Result<Vec<u8>, HttpError> {
+    let repo = config.repo.to_thread_local();
+    let id = gix::ObjectId::from_hex(hash.as_bytes())
+        .map_err(|err| HttpError::new(400, format!("invalid hash: {err}")))?;
+    repo.find_header(id)
+        .map_err(|err| HttpError::new(404, format!("object not found: {err}")))?;
+    Ok(Vec::new())
+}
+
 /// `POST /object/` — store a serialized object (`<type> <size>\0<content>`) and
 /// return its hash (hex + `\n`). The type and size come from the body's header.
 pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpError> {

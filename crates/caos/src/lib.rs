@@ -43,11 +43,18 @@ pub use chat::{cli_chat, cli_talk};
 /// agent's tool invocation does. The bash worker gets the tracked worktree
 /// (dirty edits included) as `--in`, plus the extra args verbatim. A bare
 /// name resolves to `caos-tools/<name>.sh` — the project's tree-defined
-/// tool directory. The result is checked out under `.caos-dev/tool-<name>`.
+/// tool directory.
+///
+/// NOTHING IS MATERIALIZED. The result stays on the server and only its hash
+/// comes back, plus whatever the report conventions below print — a handful of
+/// small blobs, read one object at a time. It used to check the whole result
+/// out under `.caos-dev/tool-<name>`, which for `build` meant fetching and
+/// writing a 218 MB stack image nobody reads: ~19s of a 38s run on a one-line
+/// worker edit. Anything that wants the tree can `caos-cli run <hash> <path>`.
 ///
 /// Conventions on the result: a `report` file is printed (a FAILED banner
-/// fails the command), and failing `results/<name>/` records show the tail
-/// of their `output`. Everything else just gets the printed result hash.
+/// fails the command), and failing `results/<name>/` records show their full
+/// `output`. Everything else just gets the printed result hash.
 pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     let (tool, kvs) = match args {
         [tool, kvs @ ..] => (tool, kvs),
@@ -67,17 +74,6 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
         .unwrap_or("tool")
         .to_string();
 
-    let out = format!(".caos-dev/tool-{name}");
-    // We own `.caos-dev` (it's gitignored, per-checkout scratch); create it so a
-    // fresh clone — or a tree whose `.caos-dev` was wiped — checks out here rather
-    // than failing when the atomic-replace temp file can't find its parent dir.
-    std::fs::create_dir_all(".caos-dev")
-        .map_err(|e| format!("creating .caos-dev: {e}"))?;
-    if let Err(e) = std::fs::remove_dir_all(&out) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(format!("clearing {out}: {e}"));
-        }
-    }
     let mut all: Vec<String> = vec![format!("--worker1:@={script}"), "--in:@=.".to_string()];
     // No `--bins`. It used to carry the deploy's nix-built binaries in as a
     // literal hash, so build/test tools could assemble images from them rather
@@ -85,45 +81,66 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // suite compiles the tree under test from source — so passing it only
     // coupled every tool invocation to a ref the stack may not even have.
     all.extend(kvs.iter().cloned());
-    cli_run(t, "/cas/std/bash", Some(&out), None, &all)?;
-    eprintln!("1126 {name}: result checked out at {out}");
+    let image = resolve_cli_image(t, "/cas/std/bash")?;
+    let (kind, result) = run_request(t, &image, None, None, &all)?;
+    // The result's identity, on stdout, so a script can thread it onward — the
+    // same "<kind> <hash>" line `caos-cli run` prints.
+    println!("{kind} {result}");
+    eprintln!("1126 {name}: {result}");
+    report_conventions(t, &name, &result)
+}
 
-    let report = Path::new(&out).join("report");
-    if report.is_file() {
-        let text = std::fs::read_to_string(&report)
-            .map_err(|e| format!("reading {}: {e}", report.display()))?;
-        eprintln!();
-        eprint!("{text}");
-        let results = Path::new(&out).join("results");
-        if results.is_dir() {
-            for entry in std::fs::read_dir(&results)
-                .map_err(|e| format!("reading {}: {e}", results.display()))?
-            {
-                let dir = entry.map_err(|e| format!("results entry: {e}"))?.path();
-                let verdict = dir.join("verdict");
-                let passed = std::fs::read_to_string(&verdict)
-                    .map(|v| v.contains("PASS"))
-                    .unwrap_or(true);
-                if passed {
-                    continue;
-                }
-                let rec = dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-                eprintln!("\n---- {rec} (full output; also in results/{rec}) ----");
-                if let Ok(output) = std::fs::read_to_string(dir.join("output")) {
-                    eprint!("{output}");
-                    if !output.ends_with('\n') {
-                        eprintln!();
-                    }
+/// Print a tool result's report conventions, reading ONLY the objects they
+/// name: the top tree, a `report` blob, and — for each `results/<rec>` whose
+/// `verdict` is not a PASS — that record's `output`. A tool with no `report`
+/// (`build` returns an image) costs exactly one object.
+fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(), String> {
+    let Some(entries) = fetch_tree_entries(t, result)? else {
+        return Ok(());
+    };
+    let find = |entries: &[gix::objs::tree::Entry], want: &str| {
+        entries
+            .iter()
+            .find(|e| entry_name(e) == want.as_bytes())
+            .map(|e| e.oid.to_string())
+    };
+    let Some(report) = find(&entries, "report") else {
+        return Ok(());
+    };
+    // The report is printed verbatim, so read the blob rather than
+    // fetch_blob_string (which trims).
+    let (_, text) = t.get_object(&report)?;
+    let text = String::from_utf8(text).map_err(|_| format!("{name}'s report is not UTF-8"))?;
+    eprintln!();
+    eprint!("{text}");
+
+    if let Some(results) = find(&entries, "results") {
+        for rec in fetch_tree_entries(t, &results)?.unwrap_or_default() {
+            let rec_name = String::from_utf8_lossy(entry_name(&rec)).into_owned();
+            let Some(fields) = fetch_tree_entries(t, &rec.oid.to_string())? else {
+                continue;
+            };
+            // No verdict is not a failure — the record shape is the tool's.
+            let passed = match find(&fields, "verdict") {
+                Some(v) => fetch_blob_string(t, &v)?.contains("PASS"),
+                None => true,
+            };
+            if passed {
+                continue;
+            }
+            eprintln!("\n---- {rec_name} (full output; also at results/{rec_name}) ----");
+            if let Some(output) = find(&fields, "output") {
+                let (_, bytes) = t.get_object(&output)?;
+                let output = String::from_utf8_lossy(&bytes);
+                eprint!("{output}");
+                if !output.ends_with('\n') {
+                    eprintln!();
                 }
             }
         }
-        if text.contains("FAILED") {
-            return Err(format!("{name} reported FAILED"));
-        }
+    }
+    if text.contains("FAILED") {
+        return Err(format!("{name} reported FAILED"));
     }
     Ok(())
 }
@@ -221,6 +238,13 @@ pub trait Transport {
     /// Fetch a git object's `(kind, content)` by hex hash.
     fn get_object(&self, hash: &str) -> Result<(String, Vec<u8>), String>;
 
+    /// Is this object already stored? Cheap — no content crosses the wire.
+    ///
+    /// This is what makes [`store`] prune: a tree the store already holds is a
+    /// tree whose whole subgraph it holds (git's closure invariant), so the
+    /// walk stops there and nothing below it is read or sent.
+    fn has_object(&self, hash: &str) -> Result<bool, String>;
+
     /// Ensure the server's repo holds the object graph reachable from `hash`.
     /// HTTP: a no-op — objects were already POSTed as they were built. Git: push
     /// it (under a content-addressed `refs/caos/req/<hash>`) so a subsequent
@@ -303,6 +327,24 @@ impl Transport for HttpTransport {
         Ok((kind.to_string(), content.to_vec()))
     }
 
+    fn has_object(&self, hash: &str) -> Result<bool, String> {
+        // HEAD, so a 37 MB binary costs a status line to ask about. The server
+        // answers 200 or 404 with no body.
+        let url = format!("{}/object/{hash}", self.base.trim_end_matches('/'));
+        let response = minreq::head(&url)
+            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+            .send()
+            .map_err(|e| format!("HEAD {url}: {e}"))?;
+        match response.status_code {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            code => Err(format!(
+                "HEAD {url}: server returned {code} {}",
+                response.reason_phrase
+            )),
+        }
+    }
+
     fn server_url(&self) -> Result<String, String> {
         Ok(self.base.clone())
     }
@@ -324,8 +366,8 @@ pub const CAOS_REMOTE: &str = "caos";
 pub struct GitTransport {
     /// The discovered working repo, cached for local reads/writes.
     repo: gix::Repository,
-    /// Its git directory, to re-open a fresh handle after a `git fetch` (the
-    /// cached `repo`'s odb won't see a pack written behind its back).
+    /// Its git directory, to reach the real index when staging into a
+    /// throwaway one (`hash_dir`).
     git_dir: PathBuf,
     /// Canonical working-tree root used by every subprocess Git operation.
     /// Keeping it here prevents a transport from silently switching repos if
@@ -413,16 +455,48 @@ impl Transport for GitTransport {
             return Ok((object.kind.to_string(), object.data.clone()));
         }
         // Missing locally — it's on the server (e.g. a computation result, which
-        // lives there unreferenced). Fetch it by bare hash, then read it from a
-        // fresh handle: the cached `repo` won't pick up the pack `git fetch` just
-        // wrote.
-        self.fetch_object(hash)?;
-        let repo = gix::open(&self.git_dir)
-            .map_err(|e| format!("reopening {}: {e}", self.git_dir.display()))?;
-        let object = repo
-            .find_object(oid)
-            .map_err(|e| format!("object {hash} not found after fetch: {e}"))?;
-        Ok((object.kind.to_string(), object.data.clone()))
+        // lives there unreferenced). ONE object over the HTTP object API, not
+        // `git fetch <hash>`, which would pull the object's whole CLOSURE.
+        //
+        // That distinction is the client's laziness, and it is worth real time.
+        // A caller walking a tree (`checkout`) asks for the root, then only for
+        // the children it doesn't already have — so an unchanged subtree stops
+        // the walk dead. `git fetch` cannot do that: these results are raw
+        // TREES, not commits, so git has nothing to negotiate with and the
+        // server packs the entire graph every time. Measured on `run-tool
+        // build` after a one-line worker edit, where 1 of 11 binaries actually
+        // changes: 218 MB re-packed, re-indexed and re-inflated (~23s of a 38s
+        // run) to deliver 12 MB of new bytes.
+        //
+        // `fetch_object`/`fetch_object_negotiated` stay for the COMMIT case
+        // (chat turns), where a closure fetch is what you want and git has a
+        // tip to negotiate against. Those write a PACK, which the cached `repo`
+        // handle's odb will not see — so re-open before concluding the object
+        // is absent, or every read after a chat's closure fetch would go back
+        // over the wire one object at a time for objects already on disk.
+        if let Ok(repo) = gix::open(&self.git_dir) {
+            if let Ok(object) = repo.find_object(oid) {
+                return Ok((object.kind.to_string(), object.data.clone()));
+            }
+        }
+        let url = format!("{}/object/{hash}", self.server_url()?.trim_end_matches('/'));
+        let serialized = http_get(&url)?;
+        let (kind, content) = parse_object(&serialized)?;
+        // Write it into the local repo so the next ask — and the next run — is
+        // a local hit. put_object validates that the bytes hash to `hash`.
+        let stored = self.put_object(kind, content)?;
+        if stored != oid {
+            return Err(format!("{url} returned an object hashing to {stored}"));
+        }
+        Ok((kind.to_string(), content.to_vec()))
+    }
+
+    fn has_object(&self, hash: &str) -> Result<bool, String> {
+        // LOCAL presence, deliberately: this transport's `put_object` writes
+        // locally too, and `ensure_pushed` moves the graph to the server in one
+        // negotiated push. So "already stored" here means "already in the
+        // working repo", which is exactly what lets `store` skip re-reading it.
+        Ok(self.repo.find_object(parse_oid(hash)?).is_ok())
     }
 
     fn ensure_pushed(&self, hash: &str) -> Result<(), String> {
@@ -1383,59 +1457,162 @@ pub fn cas_hash(path: &str) -> Result<(), String> {
 /// (mode + oid) that refers to it. `cas_real` is the canonical CAS root, used to
 /// reuse the recorded hash of a symlink that resolves into the CAS; pass `None`
 /// (e.g. `import-image`) to always store symlinks as git symlinks.
+///
+/// TWO PASSES, and the second one prunes. [`hash_path`] computes every id
+/// locally, touching no network; [`send`] then walks top-down and stops at the
+/// first object the store already has — which, by git's closure invariant,
+/// means it has everything below it too. So re-storing a tree that moved by one
+/// file sends one blob and the trees on its path, not the tree.
+///
+/// The old single pass posted every object as it hashed it. `caos-tools/build.sh`
+/// puts a ~218 MB stack image on every run of which ~206 MB is byte-identical to
+/// the last one (1 of 11 binaries actually changes on a one-line worker edit),
+/// and it sent all of it, every time.
 fn store(
     t: &dyn Transport,
     cas_real: Option<&Path>,
     path: &Path,
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+    let hashed = hash_path(cas_real, path)?;
+    send(t, &hashed)?;
+    Ok((hashed.mode, hashed.oid))
+}
+
+/// A locally hashed source path: its git identity, plus what [`send`] needs to
+/// store the object if the store turns out not to have it. File CONTENT is not
+/// held — a blob is re-read from disk only when it is actually sent.
+struct Hashed {
+    mode: gix::objs::tree::EntryMode,
+    oid: gix::ObjectId,
+    body: Body,
+}
+
+enum Body {
+    /// In the store by construction — a hash reused from the CAS, which is
+    /// where it came from. Nothing to send, and nothing below it to walk.
+    Stored,
+    /// A regular file, re-read from this path to send.
+    File(PathBuf),
+    /// A symlink, whose blob *is* the link target.
+    Link(Vec<u8>),
+    /// A directory: its encoded tree bytes and its children.
+    Dir(Vec<u8>, Vec<Hashed>),
+}
+
+/// Hash `path` into git objects without storing anything. Same shape rules as
+/// [`store`]: symlinks into the CAS reuse their recorded hash, other symlinks
+/// are blobs holding the link target, directories are trees.
+fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
     use gix::objs::tree::EntryKind;
 
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let ft = meta.file_type();
 
     if ft.is_symlink() {
-        // A symlink that resolves into the CAS: reuse the hash recorded there
-        // instead of re-reading the target.
         if let Some(cas_real) = cas_real {
             if let Ok(canon) = path.canonicalize() {
                 if canon != cas_real && canon.starts_with(cas_real) {
-                    return cas_entry(&canon);
+                    let (mode, oid) = cas_entry(&canon)?;
+                    return Ok(Hashed {
+                        mode,
+                        oid,
+                        body: Body::Stored,
+                    });
                 }
             }
         }
-        // Otherwise store it as a git symlink: a blob holding the link target.
         let link = std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let oid = post_object(t, "blob", link.as_os_str().as_bytes())?;
-        return Ok((EntryKind::Link.into(), oid));
+        let target = link.as_os_str().as_bytes().to_vec();
+        let oid = hash_bytes("blob", &target)?;
+        return Ok(Hashed {
+            mode: EntryKind::Link.into(),
+            oid,
+            body: Body::Link(target),
+        });
     }
 
     if ft.is_dir() {
         let mut entries = Vec::new();
+        let mut children = Vec::new();
         for dirent in std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
             let dirent = dirent.map_err(|e| format!("{}: {e}", path.display()))?;
-            let (mode, oid) = store(t, cas_real, &dirent.path())?;
+            let child = hash_path(cas_real, &dirent.path())?;
             entries.push(gix::objs::tree::Entry {
-                mode,
+                mode: child.mode,
                 filename: dirent.file_name().into_vec().into(),
-                oid,
+                oid: child.oid,
             });
+            children.push(child);
         }
-        let oid = post_tree(t, entries)?;
-        return Ok((EntryKind::Tree.into(), oid));
+        // Git requires tree entries in a specific order; Entry's Ord implements it.
+        entries.sort();
+        let mut buf = Vec::new();
+        gix::objs::Tree { entries }
+            .write_to(&mut buf)
+            .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
+        let oid = hash_bytes("tree", &buf)?;
+        return Ok(Hashed {
+            mode: EntryKind::Tree.into(),
+            oid,
+            body: Body::Dir(buf, children),
+        });
     }
 
     if ft.is_file() {
         let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let oid = post_object(t, "blob", &data)?;
+        let oid = hash_bytes("blob", &data)?;
         let kind = if meta.permissions().mode() & 0o111 != 0 {
             EntryKind::BlobExecutable
         } else {
             EntryKind::Blob
         };
-        return Ok((kind.into(), oid));
+        return Ok(Hashed {
+            mode: kind.into(),
+            oid,
+            body: Body::File(path.to_path_buf()),
+        });
     }
 
     Err(format!("unsupported file type: {}", path.display()))
+}
+
+/// Store everything under `h` that the transport doesn't already have. A hit
+/// prunes the whole subtree: caos only ever writes a tree AFTER the objects it
+/// names, and the server's repo has GC disabled, so a stored tree's descendants
+/// are stored too.
+fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
+    if matches!(h.body, Body::Stored) || t.has_object(&h.oid.to_string())? {
+        return Ok(());
+    }
+    let stored = match &h.body {
+        Body::Stored => unreachable!("filtered above"),
+        Body::Link(target) => t.put_object("blob", target)?,
+        Body::File(path) => {
+            let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            t.put_object("blob", &data)?
+        }
+        Body::Dir(encoded, children) => {
+            for child in children {
+                send(t, child)?;
+            }
+            t.put_object("tree", encoded)?
+        }
+    };
+    if stored != h.oid {
+        return Err(format!(
+            "stored object hashes to {stored}, not the {} computed locally",
+            h.oid
+        ));
+    }
+    Ok(())
+}
+
+/// The git object id `kind`/`data` would have, computed locally — no store.
+fn hash_bytes(kind: &str, data: &[u8]) -> Result<gix::ObjectId, String> {
+    let object_kind = gix::object::Kind::from_bytes(kind.as_bytes())
+        .map_err(|e| format!("unknown object kind {kind}: {e}"))?;
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, object_kind, data)
+        .map_err(|e| format!("hashing a {kind}: {e}"))
 }
 
 /// Tree entry referencing an existing CAS object at `canon` (already

@@ -561,7 +561,9 @@ repo with the test tree at `./test` and `$CAOS_CLI` set, driving
 computations through `caos-cli` against a nested caos stack built from
 your edited tree. New tests are picked up automatically. Results — every
 test's verdict, full output, and the inner stack's logs — land as a git
-tree pinned on the server and checked out under `.caos-dev/tool-test/`.
+tree pinned on the server. `run-tool` materializes none of it: it prints the
+result hash, then reads just the report (and any failing test's output) one
+object at a time. To get the whole tree on disk, `caos-cli run <hash> <path>`.
 
 ## Notes
 

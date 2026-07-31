@@ -3,6 +3,7 @@
 //! Storage (a tiny HTTP front-end over a git object database mounted at `/git`):
 //!
 //! * `GET  /object/<hash>` — return the serialized object (`<type> <size>\0…`).
+//! * `HEAD /object/<hash>` — 200/404, no body: is it stored? (`put` prunes on it.)
 //! * `POST /object/` — store the serialized object in the body, return its hash.
 //!
 //! Compute:
@@ -306,6 +307,10 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
         Method::Get if path == "/run" => compute::run(config, &query),
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
+            _ => Err(HttpError::new(404, "not found")),
+        },
+        Method::Head => match path.strip_prefix("/object/") {
+            Some(hash) if !hash.is_empty() => storage::head_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),
         },
         Method::Post if path == "/object/" || path == "/object" => {
