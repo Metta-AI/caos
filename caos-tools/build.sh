@@ -121,8 +121,15 @@ make)
   # `target/` already inflated as real files at the path the bake recorded, and
   # the stack userland for the image this assembles.
   #
+  # A PHASE CLOCK, because this stage is the whole cost of a warm `run-tool
+  # build` and the compile is the small half of it. Without these lines the
+  # only observable is one opaque container lifetime, and the two expensive
+  # phases (git-writing 167 MB of binaries, then hashing them again into the
+  # result) look exactly like a slow compile.
+  ts() { echo "build: [${SECONDS}s] $*" >&2; }
   caos get -r /cas/args/src
   caos get -r /cas/args/builder
+  ts "fetched src + builder"
 
   # ---- 1. compile ----------------------------------------------------------
   # AT THE RECORDED PATH. The bake fingerprints on the absolute workspace root
@@ -144,7 +151,33 @@ make)
   # object id where it wanted a 400. Only crates/caos-world reads it, so the
   # dependency bake is unaffected.
   export CAOS_WORLD=test
-  cargo build --workspace --locked >&2 || fail "cargo build"
+  # The other half of the bake's contract, and it is not optional: bake.env
+  # points CARGO_HOME at a writable /tmp/cargo and leaves CAOS_VENDOR_CONFIG
+  # for the worker to install there ("a writable home; the worker copies the
+  # vendor config here"). Without it cargo resolves from crates.io rather than
+  # the vendored sources, every dependency re-fingerprints, and all ~176
+  # rebuild — silently, which is exactly what the guard below caught.
+  mkdir -p "${CARGO_HOME:?bake.env should set CARGO_HOME}"
+  cp "${CAOS_VENDOR_CONFIG:?bake.env should set CAOS_VENDOR_CONFIG}" \
+     "$CARGO_HOME/config.toml"
+  cargo build --workspace --locked 2>&1 | tee /tmp/compile.log >&2 \
+    || fail "cargo build"
+
+  # A STANDING GUARD, not a report. If the workspace does not materialize at the
+  # exact path the bake fingerprinted — `pwd -P` at bake time, and the same
+  # target dir, because build-script executables and their OUT_DIRs are keyed on
+  # it too — cargo silently rebuilds all ~176 dependencies. Measured on the
+  # host: 12.6s of a 15.0s cold build, against 2.4s for the workspace alone.
+  # There is no error, just a slow build, which is precisely the kind of thing
+  # that goes unnoticed for a year. So assert it instead: this only ever
+  # compiles the workspace, because a lockfile or toolchain change moves the
+  # REDUCED tree and rebuilds the builder image (and its bake) first.
+  n=$(grep -c '^ *Compiling' /tmp/compile.log || true)
+  ts "compiled $n crates"
+  [ "$n" -le 24 ] || fail "compiled $n crates — the dependency bake was NOT reused.
+  The workspace must materialize at \$(cat /ws-root)=$wsroot with
+  CARGO_TARGET_DIR=\$(cat /target-dir)=$targetdir; one of those no longer
+  matches what the bake recorded."
   BIN=$targetdir/$CARGO_BUILD_TARGET/debug
   [ -x "$BIN/caos-cli" ] || fail "no caos-cli at $BIN after the build"
 
@@ -161,6 +194,7 @@ make)
     [ -x "$b" ] && [ -f "$b" ] && install -m 755 "$b" "$STAGED/bin/$(basename "$b")"
   done
   [ -x "$STAGED/bin/caos" ] || fail "no caos binary staged from $BIN"
+  ts "staged binaries"
 
   # ---- 2. publish std ------------------------------------------------------
   # Reuses build-builtins.sh against a two-member stack (redis + server; no
@@ -188,6 +222,7 @@ make)
     sleep 1
   done
   [ -e /tmp/seed-ready ] || { cat /tmp/seed-serve.log >&2; fail "seed stack never came up"; }
+  ts "seed stack up"
 
   # The registry is the OUTER stack's, reached by the name that resolves on
   # caos-net — which is also the name the inner server will pull a delta's
@@ -205,6 +240,7 @@ make)
   # pack is not something to bake into an image.
   kill "$serve" 2>/dev/null || true
   wait "$serve" 2>/dev/null || true
+  ts "published std"
 
   # ---- 3. assemble ---------------------------------------------------------
   # The builder's delta {base, config.json, layer00} plus one layer: everything
@@ -226,8 +262,10 @@ make)
   # std, published above — so no placement that runs this image has to publish
   # it, and no test pays for it.
   cp -RL "$state/git" "$L/caos/seed-git"
+  ts "assembled the image tree"
 
   caos put "$IMG" /cas/out
+  ts "put the image tree"
   ;;
 
 *)
