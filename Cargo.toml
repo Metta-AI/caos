@@ -46,3 +46,18 @@ codegen-units = 1
 # plumbing are all dependencies too.
 [profile.dev.package."*"]
 opt-level = 2
+
+# ...but NOT build scripts and proc macros, which are compiled to RUN AT BUILD
+# TIME and are never reused from the bake — `cargo check` of the workspace
+# compiles ten of them every run (syn, serde_derive, thiserror-impl, …). At
+# opt-level 2 that compile is several times more expensive, and it is a FIXED
+# cost paid by every job, so it lands on both sides of tests/cargo-self's
+# cold-vs-edit ratio and pushes it toward 1. That is how the first version of
+# this stanza broke that test: 0.58 -> 0.77 against a 0.75 threshold, with
+# per-crate caching working perfectly (traced: a one-crate edit is 16 hits /
+# 21 misses and 1.1s against 23s cold).
+#
+# opt-level 0 is the dev default; this states it because the `*` override above
+# would otherwise catch them.
+[profile.dev.build-override]
+opt-level = 0
