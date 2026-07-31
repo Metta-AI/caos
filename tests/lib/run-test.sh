@@ -82,11 +82,18 @@ fi
 cp -r "$TEST" ./test
 git add -A && git commit -qm testtree
 mkdir /tmp/out
+# The test's own wall time, in the record. Without it the only observable is
+# the whole suite, and a span in the trace cannot tell waiting from working —
+# a per-test job's span starts when the fan-out fires, so under an 8-slot pool
+# twelve of twenty spans are mostly queue. `SECONDS` covers cli.sh only, which
+# is the number you want when asking which test is the long pole.
+t0=$SECONDS
 if bash test/cli.sh >/tmp/test.out 2>&1; then
   echo "RUN-TEST: PASS" > /tmp/out/verdict
 else
   echo "RUN-TEST: FAIL" > /tmp/out/verdict
 fi
+echo $((SECONDS - t0)) > /tmp/out/seconds
 cat /tmp/test.out >&2
 
 # The COMPLETE record rides in the result tree — the test's full output and

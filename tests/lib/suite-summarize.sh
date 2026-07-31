@@ -16,10 +16,19 @@ passn=0 failn=0
     t=$(basename "$c")
     caos get "/cas/args/children/$t"
     caos get "/cas/args/children/$t/verdict"
+    # The test's own wall time, so the report says which test is the long
+    # pole. A suite is as slow as its slowest test once the pool is saturated,
+    # and that fact was previously only reachable by correlating inner redis
+    # logs by hand.
+    secs=""
+    if [ -e "$c/seconds" ]; then
+      caos get "/cas/args/children/$t/seconds"
+      secs=" ($(cat "$c/seconds")s)"
+    fi
     if grep -q "^RUN-TEST: PASS" "$c/verdict"; then
-      echo "PASS tests/$t"; passn=$((passn + 1))
+      echo "PASS tests/$t$secs"; passn=$((passn + 1))
     else
-      echo "FAIL tests/$t"; failn=$((failn + 1))
+      echo "FAIL tests/$t$secs"; failn=$((failn + 1))
     fi
   done
   echo
