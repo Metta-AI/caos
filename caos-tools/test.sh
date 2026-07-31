@@ -12,7 +12,7 @@
 # the one the tree defines, and its first act is running the build worker
 # (caos-tools/build.sh), sharing its job with `build` calls. Optional args
 # pass through: --api_key (chat-online's real turn), --only (a test-name
-# filter).
+# filter), --test_salt (re-run every test, reusing the build — see below).
 set -euo pipefail
 
 caos get /cas/args/in
@@ -22,6 +22,16 @@ caos get /cas/args/in/tests/lib
 extra=()
 [ -e /cas/args/api_key ] && extra+=("--api_key:@=/cas/args/api_key")
 [ -e /cas/args/only ] && extra+=("--only:@=/cas/args/only")
+# --test_salt: re-run the TESTS without re-running anything else. CAOS_SALT
+# cannot do this — it threads into every sub-run, so it re-keys the reduce, the
+# compile, the std publish and the image alongside the tests (measured: 47s
+# against 35s), and fills the cache with entries nothing will hit again. This
+# one rides only in each per-test wrapper, so the build stays a cache hit.
+#
+# It exists because the alternative people reach for is editing a tracked file
+# to bust the key — which is how `# rekey <timestamp>` once ended up committed
+# to tests/lib/run-test.sh.
+if [ -e /cas/args/test_salt ]; then extra+=("--test_salt:@=/cas/args/test_salt"); fi
 suite=$(caos curry /cas/std/bash -- \
   "--worker1:@=/cas/args/in/tests/lib/suite.sh" \
   "--workspace:@=/cas/args/in" "${extra[@]}")

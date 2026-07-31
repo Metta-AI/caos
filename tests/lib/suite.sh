@@ -40,6 +40,7 @@ fwd=(
 )
 [ -e /cas/args/api_key ] && fwd+=("--api_key:@=/cas/args/api_key")
 [ -e /cas/args/only ] && fwd+=("--only:@=/cas/args/only")
+if [ -e /cas/args/test_salt ]; then fwd+=("--test_salt:@=/cas/args/test_salt"); fi
 
 stage3=$(caos curry /cas/std/bash -- "--worker1:@=$LIB/suite-stage3.sh" "${fwd[@]}")
 caos run-then /cas/args/workspace -- --run="$build" --then="$stage3"

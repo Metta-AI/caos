@@ -45,6 +45,16 @@ if [ -e /cas/args/only ]; then
   only=" $(cat /cas/args/only) "
 fi
 
+# --test_salt rides in EVERY per-test wrapper and nowhere else, so a fresh
+# value re-runs all the tests and leaves the build a cache hit. Nothing reads
+# the file: its presence in the wrapper is what moves the per-test key. Do not
+# "clean up" the unused write — it is the whole mechanism.
+salt=""
+if [ -e /cas/args/test_salt ]; then
+  caos get /cas/args/test_salt
+  salt=$(cat /cas/args/test_salt)
+fi
+
 mkdir /tmp/sel
 for d in /cas/args/workspace/tests/*/; do
   t=$(basename "$d")
@@ -55,6 +65,7 @@ for d in /cas/args/workspace/tests/*/; do
   [ -e "/cas/args/workspace/tests/$t/cli.sh" ] || continue
   mkdir -p "/tmp/sel/$t"
   ln -s "/cas/args/workspace/tests/$t" "/tmp/sel/$t/test"
+  if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
   case "$t" in
     cargo-self | unit)
       # Dogfood the tree under test — the PRUNED build tree (what cargo
