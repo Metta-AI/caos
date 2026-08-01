@@ -13,7 +13,7 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use super::{
     short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, TranscriptPoint,
-    View,
+    View, COMMANDS,
 };
 use caos::chat::TurnPhase;
 
@@ -36,6 +36,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         View::Activity => render_activity_browser(state, frame, areas.content),
         View::Diff => render_diff(state, frame, areas.content),
         View::Tools => render_tools(state, frame, areas.content),
+        View::Help => render_help(frame, areas.content),
     }
     render_composer(
         state,
@@ -159,6 +160,7 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
             View::Activity => "activity",
             View::Diff => "diff",
             View::Tools => "tools",
+            View::Help => "help",
         }
     };
     let running = app
@@ -772,6 +774,52 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+fn render_help(frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![
+        Line::styled(
+            "Keyboard shortcuts",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw("  Ctrl+?          toggle this help"),
+        Line::raw("  Enter           send the prompt"),
+        Line::raw("  Shift+Enter/^J  insert a newline"),
+        Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
+        Line::raw("  Ctrl+W          delete the previous word"),
+        Line::raw("  Ctrl+K          delete to the end of the line"),
+        Line::raw("  Ctrl+L          check out the conversation commit locally"),
+        Line::raw("  Ctrl+P twice    publish a clean branch and open a PR"),
+        Line::raw("  Ctrl+N          start a new conversation"),
+        Line::raw("  Esc             focus the conversation list"),
+        Line::raw("  Ctrl+E          archive from the conversation list"),
+        Line::raw("  Ctrl+Up/Down    switch conversations"),
+        Line::raw("  Ctrl+T          toggle activity details"),
+        Line::raw("  Ctrl+Shift+T    toggle available tools"),
+        Line::raw("  Ctrl+Q          toggle the workspace diff"),
+        Line::raw("  Ctrl+Y          pause redraws for native terminal selection"),
+        Line::raw("  Ctrl+C          clear the prompt, then quit"),
+        Line::raw(""),
+        Line::styled(
+            "Slash commands",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    lines.extend(
+        COMMANDS
+            .iter()
+            .map(|command| Line::raw(format!("  {:<24} {}", command.usage, command.description))),
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" Help ").borders(Borders::ALL)),
+        area,
+    );
+}
+
 fn tool_image_label(image: &str) -> &str {
     if image.len() >= 40 && image.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         short_hash(image)
@@ -905,9 +953,11 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw(
             " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
         )
+    } else if app.view == View::Help {
+        Line::raw(" Help: Ctrl+?/Esc returns  ^C quit")
     } else {
         Line::raw(
-            " Enter sends  Shift+Enter/^J newline  ^A/^E line ends  ^W del word  Esc focuses list  ^T activity  ^C quit",
+            " Enter sends  Shift+Enter/^J newline  ^A/^E line ends  ^W del word  Esc focuses list  ^? help  ^T activity  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);

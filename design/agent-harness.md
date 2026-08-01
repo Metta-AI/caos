@@ -275,7 +275,8 @@ Two verbs and a full-screen client over one turn engine (implemented —
   page keys and the mouse wheel. `Ctrl+Y` temporarily releases mouse capture
   and freezes redraws for native terminal text selection. `Ctrl+L` checks out
   the selected conversation commit as a detached HEAD after requiring a clean
-  host checkout. Double `Ctrl+P` publishes the
+  host checkout. `Ctrl+?` opens the keyboard and slash-command reference.
+  Double `Ctrl+P` publishes the
   selected workspace without checking it out: it advances a clean
   `caos/<conversation>` snapshot branch, pushes to `origin`, and opens or finds
   its PR through `gh`. Merely opening, running, switching, or publishing
