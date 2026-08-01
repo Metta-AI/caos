@@ -35,6 +35,10 @@ stub_bin=$CAOS_BIN_DIR/llm-stub
 # the turn untouched.
 mkdir -p ws/notes
 echo "hello notes" > ws/notes/todo.txt
+# An executable file the turn never touches: it must round-trip as 100755
+# through the agent harness (staging resolves it by hash), not decay to 100644.
+printf '#!/bin/sh\necho hi\n' > ws/run.sh
+chmod +x ws/run.sh
 echo "You are a coding agent operating on a git workspace." > system.txt
 commit "workspace + worker binaries"
 
@@ -98,6 +102,8 @@ echo "  ok: [human, step3] parents; 3 steps rooted at the human turn" >&2
 echo "== trees: workspace advanced, .caos only in step trees ==" >&2
 [ "$(git show "$turn:out.txt")" = "hi" ] || fail "out.txt missing from the turn tree"
 [ "$(git show "$turn:notes/todo.txt")" = "hello notes" ] || fail "untouched subtree lost"
+[ "$(git ls-tree "$turn" run.sh | cut -d' ' -f1)" = "100755" ] \
+  || fail "untouched executable did not round-trip as 100755"
 git rev-parse -q --verify "$turn:.caos" >/dev/null && fail ".caos leaked into the turn tree"
 for s in "$step1" "$step2" "$step3"; do
   git rev-parse -q --verify "$s:.caos/step.json" >/dev/null || fail "step $s has no step.json"

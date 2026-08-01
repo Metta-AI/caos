@@ -219,6 +219,14 @@ const HASH_XATTR: &str = "user.caos.hash";
 /// still after fetching, since a materialized commit is a file holding the raw
 /// commit object). Absent otherwise: a directory is a tree, a file a blob.
 const KIND_XATTR: &str = "user.caos.kind";
+/// xattr recording git's executable bit, which lives on the tree *entry* that
+/// named a blob rather than in the blob object — so it can't be recovered from
+/// a bare hash when a placeholder is later fetched. Set (to `1`) whenever the
+/// entry is an executable blob, on the placeholder and on the loaded file
+/// alike. It is metadata only: a placeholder's *permissions* stay owner-only
+/// with no exec bit, and the `+x` mode bit is added only once the file is
+/// fetched (see [`write_file`]). Absent means a plain, non-executable blob.
+const EXEC_XATTR: &str = "user.caos.exec";
 /// xattr used only by the startup support probe.
 const PROBE_XATTR: &str = "user.caos.probe";
 
@@ -1140,6 +1148,14 @@ fn is_loaded(path: &Path) -> bool {
 /// object: headers, blank line, message) is additionally kind-tagged so the
 /// loaded file stays distinguishable from a blob (see [`KIND_XATTR`]).
 fn write_file(target: &Path, hash: &str, kind: &str, data: &[u8]) -> Result<(), String> {
+    // Git's executable bit was recorded as an xattr on the placeholder (it isn't
+    // in the blob object). Read it before we replace the placeholder: now that
+    // the file is being fetched, it becomes a real +x mode bit, and the xattr
+    // rides along so a re-put / cas_entry reference still sees it as executable.
+    // A top-level get-hash/put target has no placeholder, so exec stays false.
+    let exec = xattr::get(target, EXEC_XATTR)
+        .map(|v| v.is_some())
+        .unwrap_or(false);
     atomically(target, |tmp| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1153,8 +1169,16 @@ fn write_file(target: &Path, hash: &str, kind: &str, data: &[u8]) -> Result<(), 
             xattr::set(tmp, KIND_XATTR, b"commit")
                 .map_err(|e| format!("setting {KIND_XATTR} on {}: {e}", tmp.display()))?;
         }
-        // Fetched content: world-readable, writable by no one.
-        set_mode(tmp, MODE_FETCHED_FILE)
+        // Fetched content: world-readable, writable by no one — plus git's exec
+        // bit (mode and xattr) when the placeholder recorded it.
+        let mode = if exec {
+            xattr::set(tmp, EXEC_XATTR, b"1")
+                .map_err(|e| format!("setting {EXEC_XATTR} on {}: {e}", tmp.display()))?;
+            MODE_FETCHED_FILE | 0o111
+        } else {
+            MODE_FETCHED_FILE
+        };
+        set_mode(tmp, mode)
     })
 }
 
@@ -1209,6 +1233,13 @@ fn write_tree(
             if entry.mode.kind() == EntryKind::Commit {
                 xattr::set(&child, KIND_XATTR, b"commit")
                     .map_err(|e| format!("setting {KIND_XATTR} on {}: {e}", child.display()))?;
+            }
+            // Git's executable bit isn't in the blob object, so record it as an
+            // xattr — the placeholder's permissions stay owner-only; the exec
+            // bit becomes a real mode bit only when the file is fetched.
+            if entry.mode.kind() == EntryKind::BlobExecutable {
+                xattr::set(&child, EXEC_XATTR, b"1")
+                    .map_err(|e| format!("setting {EXEC_XATTR} on {}: {e}", child.display()))?;
             }
             set_mode(&child, placeholder_mode)?;
         }
@@ -1656,10 +1687,23 @@ fn cas_entry(canon: &Path) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId)
         EntryKind::Tree
     } else if result_kind(canon)? == "commit" {
         EntryKind::Commit
+    } else if is_executable(canon) {
+        // The exec bit `write_tree`/`write_file` preserved on this CAS node —
+        // so an executable blob round-trips as one, not a plain blob.
+        EntryKind::BlobExecutable
     } else {
         EntryKind::Blob
     };
     Ok((kind.into(), parse_oid(&read_hash(canon)?)?))
+}
+
+/// Whether the CAS node at `path` is an executable blob — recorded by
+/// [`write_tree`]/[`write_file`] as the [`EXEC_XATTR`], not as a mode bit (a
+/// placeholder's permissions carry no exec bit), so this reads the xattr.
+fn is_executable(path: &Path) -> bool {
+    xattr::get(path, EXEC_XATTR)
+        .map(|v| v.is_some())
+        .unwrap_or(false)
 }
 
 /// `import-image <docker-archive>` — store a docker-archive image (the kind `nix

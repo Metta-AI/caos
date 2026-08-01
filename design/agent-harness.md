@@ -157,8 +157,9 @@ Tool classes:
   with them in `paths`" hint. Staging resolves the placeholder symlinks back
   to their recorded hashes, so untouched subtrees round-trip without a read.
   (No hard materialization budget for now; enforcement can come later if
-  models abuse `paths`. Known limitation: CAS blobs materialize without
-  git's exec bit, so declared files round-trip as mode 100644.)
+  models abuse `paths`. The CAS carries git's exec bit on blobs — it rides on
+  the materialized node's own mode — so declared files round-trip with their
+  mode preserved, executables included.)
 - **grep** (decomposed; implemented — `crates/worker-rgrep`, the `grep`
   tool): an rgrep worker on the file-count model, one job per directory. It
   greps the files at its own level, map-thens over a synthetic tree of just

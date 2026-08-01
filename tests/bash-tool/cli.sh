@@ -26,6 +26,10 @@ mkdir -p ws/a/b
 echo one > ws/a/one.txt
 echo two > ws/a/b/two.txt
 echo top > ws/top.txt
+# An executable file, to prove the exec bit round-trips both ways: as an
+# undeclared placeholder (resolved by hash) and as a declared, loaded copy.
+printf '#!/bin/sh\necho hi\n' > ws/run.sh
+chmod +x ws/run.sh
 
 # The tool binary, bound into the shared runner — from the harness-provided
 # bins (CAOS_BIN_DIR: the caos-built binaries the suite threads in).
@@ -67,5 +71,13 @@ echo "== a failing command is a value, not a run error ==" >&2
 grep -q "oops" r4/stderr || fail "stderr not captured"
 [ "$(snap r4/tree)" = "$(git rev-parse "$base:ws")" ] || fail "failed run mangled the tree"
 echo "  ok: exit 7 + stderr returned as a value" >&2
+
+echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
+"$CAOS_CLI" run "$tool" r5 -- --tree:@=ws --cmd='./run.sh' --paths='run.sh'
+[ "$(cat r5/exit)" = "0" ] || fail "exec run: exit $(cat r5/exit)"
+[ "$(cat r5/stdout)" = "hi" ] || fail "declared file was not executable: $(cat r5/stdout)"
+[ "$(snap r5/tree)" = "$(git rev-parse "$base:ws")" ] \
+  || fail "exec bit lost round-tripping a declared/loaded file"
+echo "  ok: ./run.sh ran and the 100755 mode round-tripped" >&2
 
 echo "bash-tool: ALL PASS" >&2

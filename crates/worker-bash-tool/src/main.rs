@@ -28,9 +28,10 @@
 //! Only infrastructure failures (a fetch failing, the staging put failing)
 //! error the run.
 //!
-//! Known limitation: the CAS materializes blobs without git's executable bit,
-//! so a round-trip through this tool drops the exec bit on files under
-//! *declared* paths (undeclared subtrees round-trip untouched, by hash).
+//! The CAS carries git's executable bit on blobs (it rides on the materialized
+//! node's own mode), so a round-trip through this tool preserves the exec bit
+//! on files under declared paths as well as on the undeclared subtrees that
+//! round-trip untouched by hash.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -186,7 +187,15 @@ fn mirror(src: &Path, dst: &Path) -> Result<(), String> {
             mirror(&entry, &target)?;
         } else {
             fs::copy(&entry, &target).map_err(|e| format!("copying {}: {e}", entry.display()))?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            // A writable copy, keeping git's exec bit (the CAS node carries it)
+            // so an executable file stays executable — for the command that runs
+            // here and for the `caos put` that stages it back.
+            let mode = if meta.permissions().mode() & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode))
                 .map_err(|e| format!("chmod {}: {e}", target.display()))?;
         }
     }
