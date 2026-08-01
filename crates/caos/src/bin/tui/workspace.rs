@@ -6,8 +6,8 @@ use caos::chat::WorkspaceDiff;
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
-/// the TUI chooses when to mutate the checkout and requires confirmation before
-/// calling it. Rather than applying the base-to-head diff as unstaged changes,
+/// the TUI chooses when to mutate the checkout. Rather than applying the
+/// base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
 pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> Result<(), String> {
@@ -50,6 +50,93 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
         capture_required("git", &["commit", "--quiet", "-m", message], cwd)?;
     }
     capture_required("git", &["rev-parse", "HEAD^{tree}"], cwd)
+}
+
+/// Merge `target` into the selected virtual conversation and advance its local
+/// engine ref. The synthetic human/agent pair keeps the conversation's
+/// first-parent transcript structure intact while the human commit records the
+/// target as its second parent.
+pub(crate) fn sync_conversation(
+    conversation: &str,
+    target: &str,
+    cwd: &Path,
+) -> Result<String, String> {
+    let conversation_ref = format!("refs/caos/conversations/{conversation}");
+    let head = capture_required("git", &["rev-parse", "--verify", &conversation_ref], cwd)?;
+    let target_commit = capture_required(
+        "git",
+        &["rev-parse", "--verify", &format!("{target}^{{commit}}")],
+        cwd,
+    )?;
+    let ancestor = command_output(
+        "git",
+        &["merge-base", "--is-ancestor", &target_commit, &head],
+        cwd,
+    )?;
+    if ancestor.status.success() {
+        return Ok(head);
+    }
+    if ancestor.status.code() != Some(1) {
+        require_success("git", ancestor)?;
+    }
+    let tree = merge_tree(&head, &target_commit, cwd)?;
+    let author = capture_required("git", &["config", "user.name"], cwd)?;
+    if author == "caos-agent" {
+        return Err(
+            "your git author name is \"caos-agent\", which is reserved for agent commits"
+                .to_string(),
+        );
+    }
+    let human = capture_required(
+        "git",
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-p",
+            &target_commit,
+            "-m",
+            &format!("/sync {target}"),
+        ],
+        cwd,
+    )?;
+    let synced = capture_required(
+        "git",
+        &[
+            "-c",
+            "user.name=caos-agent",
+            "-c",
+            "user.email=caos@caos",
+            "commit-tree",
+            &tree,
+            "-p",
+            &human,
+            "-m",
+            &format!("Synced {target} into the conversation."),
+        ],
+        cwd,
+    )?;
+    capture_required(
+        "git",
+        &["update-ref", &conversation_ref, &synced, &head],
+        cwd,
+    )?;
+    Ok(synced)
+}
+
+fn merge_tree(head: &str, target: &str, cwd: &Path) -> Result<String, String> {
+    let output = command_output("git", &["merge-tree", "--write-tree", head, target], cwd)?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let detail = [output.stdout, output.stderr]
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!("sync has merge conflicts:\n{detail}"))
 }
 
 /// Publish the virtual workspace as a clean branch without checking it out.
@@ -300,6 +387,105 @@ mod tests {
         assert_eq!(
             capture_required("git", &["show", "-s", "--format=%s", "HEAD"], &dir).unwrap(),
             "fold in my edits"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sync_merges_the_target_and_records_a_conversation_turn() {
+        let dir = temp_repo("sync-test");
+        let base = commit_file(&dir, "base\n", "base");
+        capture_required("git", &["switch", "-c", "conversation"], &dir).unwrap();
+        std::fs::write(dir.join("conversation.txt"), "conversation\n").unwrap();
+        capture_required("git", &["add", "conversation.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "conversation"], &dir).unwrap();
+        let conversation_human = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+        let conversation_tree =
+            capture_required("git", &["rev-parse", "HEAD^{tree}"], &dir).unwrap();
+        let conversation_head = capture_required(
+            "git",
+            &[
+                "-c",
+                "user.name=caos-agent",
+                "-c",
+                "user.email=caos@caos",
+                "commit-tree",
+                &conversation_tree,
+                "-p",
+                &conversation_human,
+                "-m",
+                "Conversation response.",
+            ],
+            &dir,
+        )
+        .unwrap();
+        capture_required(
+            "git",
+            &[
+                "update-ref",
+                "refs/caos/conversations/talk-1",
+                &conversation_head,
+            ],
+            &dir,
+        )
+        .unwrap();
+        capture_required("git", &["switch", "--detach", &base], &dir).unwrap();
+        std::fs::write(dir.join("target.txt"), "target\n").unwrap();
+        capture_required("git", &["add", "target.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "target"], &dir).unwrap();
+        let target = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+
+        let synced = sync_conversation("talk-1", &target, &dir).unwrap();
+        assert_eq!(
+            capture_required(
+                "git",
+                &["rev-parse", "refs/caos/conversations/talk-1"],
+                &dir
+            )
+            .unwrap(),
+            synced
+        );
+        assert_eq!(
+            capture_required("git", &["show", "-s", "--format=%an", &synced], &dir).unwrap(),
+            "caos-agent"
+        );
+        let human = capture_required("git", &["rev-parse", &format!("{synced}^")], &dir).unwrap();
+        assert_eq!(
+            capture_required("git", &["rev-parse", &format!("{human}^1")], &dir).unwrap(),
+            conversation_head
+        );
+        assert_eq!(
+            capture_required("git", &["rev-parse", &format!("{human}^2")], &dir).unwrap(),
+            target
+        );
+        assert_eq!(
+            capture_required(
+                "git",
+                &["show", &format!("{synced}:conversation.txt")],
+                &dir
+            )
+            .unwrap(),
+            "conversation"
+        );
+        assert_eq!(
+            capture_required("git", &["show", &format!("{synced}:target.txt")], &dir).unwrap(),
+            "target"
+        );
+        assert_eq!(sync_conversation("talk-1", &target, &dir).unwrap(), synced);
+        let transport = caos::GitTransport::discover(&dir).unwrap();
+        assert_eq!(
+            caos::chat::conversation_history(&transport, "talk-1")
+                .unwrap()
+                .into_iter()
+                .map(|turn| turn.message)
+                .collect::<Vec<_>>(),
+            [
+                "conversation",
+                "Conversation response.",
+                &format!("/sync {target}"),
+                &format!("Synced {target} into the conversation."),
+            ]
         );
 
         std::fs::remove_dir_all(dir).unwrap();

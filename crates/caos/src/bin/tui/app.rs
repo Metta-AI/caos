@@ -16,7 +16,9 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{commit_working_tree, load_conversation_workspace, publish_conversation_pr};
+use super::workspace::{
+    commit_working_tree, load_conversation_workspace, publish_conversation_pr, sync_conversation,
+};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -620,6 +622,7 @@ impl Composer {
 enum CommandAction {
     From,
     Help,
+    Sync,
     Title,
     UpdateTree,
 }
@@ -633,7 +636,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 4] = [
+const COMMANDS: [Command; 5] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -647,6 +650,13 @@ const COMMANDS: [Command; 4] = [
         description: "show keyboard shortcuts and slash commands",
         action: CommandAction::Help,
         takes_argument: false,
+    },
+    Command {
+        name: "/sync",
+        usage: "/sync <target-branch>",
+        description: "merge a branch into the selected conversation",
+        action: CommandAction::Sync,
+        takes_argument: true,
     },
     Command {
         name: "/title",
@@ -1108,8 +1118,8 @@ impl App {
             return;
         };
         // Resolve the prompt into the turn's message and, for `/update-tree`,
-        // the tree the human commit should carry. `/from`, `/help`, and
-        // `/title` are not turns and return here; everything else falls
+        // the tree the human commit should carry. `/from`, `/help`, `/sync`,
+        // and `/title` are not turns and return here; everything else falls
         // through to run one.
         let mut human_tree = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
@@ -1128,6 +1138,10 @@ impl App {
                 }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
+                    return;
+                }
+                CommandAction::Sync => {
+                    self.sync_selected(arguments);
                     return;
                 }
                 CommandAction::Title => {
@@ -1830,6 +1844,43 @@ impl App {
         }
     }
 
+    fn sync_selected(&mut self, target: &str) {
+        if self.selected().is_busy() {
+            self.selected_mut().status =
+                "finish this conversation's operation before syncing it".to_string();
+            return;
+        }
+        if self.selected().current_hash().is_none() {
+            match self
+                .transport()
+                .and_then(|transport| transport.resolve_revspec(target))
+                .and_then(|commit| {
+                    commit.ok_or_else(|| format!("cannot resolve target branch {target:?}"))
+                }) {
+                Ok(commit) => {
+                    self.selected_mut().turn_options.base = Some(commit.to_string());
+                    self.selected_mut().status =
+                        format!("new conversation will start from {target}");
+                }
+                Err(error) => self.selected_mut().status = error,
+            }
+            return;
+        }
+
+        let conversation = self.selected().id.clone();
+        let title = self.selected().title.clone();
+        let result = sync_conversation(&conversation, target, &self.repo_dir).and_then(|_| {
+            let transport = self.transport()?;
+            publish_user_conversation(&transport, &self.user, &conversation, &title)?;
+            self.selected_mut().reload(&transport);
+            Ok(())
+        });
+        self.selected_mut().status = match result {
+            Ok(()) => format!("synced {target} into this conversation"),
+            Err(error) => error,
+        };
+    }
+
     fn publish_selected(&mut self) {
         if self.selected().is_busy() {
             self.selected_mut().status =
@@ -2166,10 +2217,10 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/help", "/title", "/update-tree"]
+            ["/from", "/help", "/sync", "/title", "/update-tree"]
         );
 
-        assert!(composer.select_command(2));
+        assert!(composer.select_command(3));
         assert!(composer.complete_command());
         assert_eq!(composer.text, "/title ");
         assert!(composer.command_matches().is_empty());
@@ -2208,6 +2259,10 @@ mod tests {
         assert_eq!(command.action, CommandAction::Help);
         assert_eq!(arguments, "");
 
+        let (command, arguments) = parse_command("/sync main").unwrap();
+        assert_eq!(command.action, CommandAction::Sync);
+        assert_eq!(arguments, "main");
+
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
     }
@@ -2217,6 +2272,7 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.selected_mut().composer.insert_str("/");
 
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
