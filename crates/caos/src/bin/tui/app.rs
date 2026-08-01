@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
@@ -821,7 +821,6 @@ enum UiMessage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfirmAction {
-    Load,
     Publish,
 }
 
@@ -1343,7 +1342,7 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
         let is_publish =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
-        if !is_load && !is_publish {
+        if !is_publish {
             self.confirm_action = None;
         }
         if is_load {
@@ -1786,31 +1785,14 @@ impl App {
     fn load_selected(&mut self) {
         if self.selected().is_busy() {
             self.selected_mut().status =
-                "finish this conversation's operation before loading it".to_string();
-        } else if self
-            .selected()
-            .diff
-            .as_ref()
-            .is_none_or(|diff| diff.patch.is_empty())
-        {
-            self.selected_mut().status = "there are no conversation changes to load".to_string();
-        } else if self.confirm_action != Some(ConfirmAction::Load) {
-            self.confirm_action = Some(ConfirmAction::Load);
-            self.selected_mut().status =
-                "press Ctrl+L again to check out this conversation's head in a clean working tree"
-                    .to_string();
-        } else {
-            self.confirm_action = None;
-            let diff = self
-                .selected()
-                .diff
-                .as_ref()
-                .expect("a non-empty diff was checked")
-                .clone();
-            self.selected_mut().status = match load_conversation_workspace(&diff, Path::new(".")) {
-                Ok(()) => "checked out the conversation head in the working tree".to_string(),
+                "finish this conversation's operation before checking it out".to_string();
+        } else if let Some(diff) = self.selected().diff.clone() {
+            self.selected_mut().status = match load_conversation_workspace(&diff, &self.repo_dir) {
+                Ok(()) => format!("checked out {} in detached HEAD", short_hash(&diff.head)),
                 Err(error) => error,
             };
+        } else {
+            self.selected_mut().status = "this conversation has no commit to check out".to_string();
         }
     }
 
@@ -2802,14 +2784,55 @@ mod tests {
             stat: "1 file changed".to_string(),
             patch: "diff --git a/a b/a".to_string(),
         });
-        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        assert_eq!(app.confirm_action, Some(ConfirmAction::Load));
-        assert!(app.selected().status.contains("press Ctrl+L again"));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));
         assert!(app.selected().status.contains("press Ctrl+P again"));
         assert!(!app.selected().publishing);
+    }
+
+    #[test]
+    fn ctrl_l_checks_out_the_conversation_on_the_first_press() {
+        let dir = throwaway_repo("ctrl-l");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["config", "user.name", "Test User"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("file.txt"), "conversation\n").unwrap();
+        git(&["commit", "-qam", "conversation"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--detach", "-q", &base]);
+
+        let mut selected = state("talk-1");
+        selected.diff = Some(WorkspaceDiff {
+            base,
+            head: head.clone(),
+            stat: "1 file changed".to_string(),
+            patch: "changed".to_string(),
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        app.repo_dir = dir.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+
+        assert_eq!(git(&["rev-parse", "HEAD"]), head);
+        assert!(app.selected().status.contains("checked out"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
