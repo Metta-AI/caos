@@ -52,6 +52,14 @@ pub(crate) enum View {
     Tools,
 }
 
+/// Which pane currently receives navigation keys: the left conversation list
+/// or the main conversation pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Focus {
+    List,
+    Conversation,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryRole {
     Human,
@@ -820,6 +828,7 @@ pub(crate) struct App {
     copied_chars: Option<usize>,
     animation_frame: usize,
     view: View,
+    focus: Focus,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
 }
@@ -923,6 +932,7 @@ impl App {
             copied_chars: None,
             animation_frame: 0,
             view: View::Chat,
+            focus: Focus::Conversation,
             tx,
             rx,
         })
@@ -966,6 +976,10 @@ impl App {
 
     pub(crate) fn view(&self) -> View {
         self.view
+    }
+
+    pub(crate) fn focus(&self) -> Focus {
+        self.focus
     }
 
     pub(crate) fn showing_transcript(&self) -> bool {
@@ -1345,9 +1359,7 @@ impl App {
             }
             return;
         }
-        if ctrl_t
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a'))
-        {
+        if ctrl_t {
             self.view = if self.view == View::Activity {
                 View::Chat
             } else {
@@ -1360,7 +1372,10 @@ impl App {
             self.start_new_conversation(None);
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+        if self.focus == Focus::List
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('e')
+        {
             self.close_selected();
             return;
         }
@@ -1384,6 +1399,15 @@ impl App {
             } else {
                 self.selected_mut().status =
                     "finish this conversation's operation before reloading".to_string();
+            }
+            return;
+        }
+        if self.focus == Focus::List {
+            match key.code {
+                KeyCode::Enter => self.focus = Focus::Conversation,
+                KeyCode::Up => self.select_relative(-1),
+                KeyCode::Down => self.select_relative(1),
+                _ => {}
             }
             return;
         }
@@ -1466,10 +1490,21 @@ impl App {
                 self.selected_mut().composer.complete_command();
             }
             KeyCode::Esc => {
-                self.selected_mut().composer.dismiss_command_menu();
+                if !self.selected_mut().composer.dismiss_command_menu() {
+                    self.focus = Focus::List;
+                }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.move_home()
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.move_end()
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.delete_word_left()
             }
             KeyCode::Char(ch)
                 if !key
@@ -1916,6 +1951,7 @@ mod tests {
                 copied_chars: None,
                 animation_frame: 0,
                 view: View::Chat,
+                focus: Focus::Conversation,
                 tx: tx.clone(),
                 rx,
             },
@@ -2307,6 +2343,34 @@ mod tests {
     }
 
     #[test]
+    fn list_focus_navigates_conversations_and_enter_opens_the_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        assert_eq!(app.focus(), Focus::Conversation);
+
+        // Esc with an empty command menu moves focus to the conversation list.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.focus(), Focus::List);
+
+        // Up/Down move through conversations while the list is focused.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().id, "talk-2");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().id, "talk-3");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().id, "talk-2");
+
+        // Typing does not reach the composer while the list is focused.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.selected().composer.text.is_empty());
+
+        // Enter moves focus into the conversation pane, where typing lands.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus(), Focus::Conversation);
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "x");
+    }
+
+    #[test]
     fn conversation_selection_is_sticky_or_fresh() {
         let conversations = vec![summary("recent"), summary("talk-1")];
         assert_eq!(
@@ -2413,7 +2477,7 @@ mod tests {
         conversation.activities = vec![activity(1), activity(2), activity(3)];
         let (mut app, _) = app_with(vec![conversation]);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Activity);
         assert_eq!(app.selected().activity_selection, Some(2));
 
@@ -2854,15 +2918,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_w_removes_virtual_conversations_and_replaces_the_last_one() {
+    fn ctrl_e_removes_virtual_conversations_and_replaces_the_last_one() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        // Archiving lives in the conversation list, so focus it first.
+        app.focus = Focus::List;
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        let dir = throwaway_repo("ctrl-w");
+        let dir = throwaway_repo("ctrl-e");
         app.repo_dir = dir.clone();
         app.selected = 1;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(
             app.conversations
                 .iter()
@@ -2872,10 +2938,10 @@ mod tests {
         );
         assert_eq!(app.selected().id, "talk-3");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(app.selected().id, "talk-1");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
@@ -2884,16 +2950,61 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_w_keeps_a_busy_conversation_open() {
+    fn ctrl_e_keeps_a_busy_conversation_open() {
         let mut running = state("talk-1");
         running.running = true;
         let (mut app, _) = app_with(vec![running, state("talk-2")]);
+        app.focus = Focus::List;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
 
         assert_eq!(app.conversations.len(), 2);
         assert_eq!(app.selected().id, "talk-1");
         assert!(app.selected().status.contains("before archiving"));
+    }
+
+    #[test]
+    fn ctrl_e_moves_to_line_ends_in_the_conversation_and_never_archives() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2")]);
+        app.selected_mut().composer.insert_str("first\nsecond");
+
+        // In the conversation pane, Ctrl+A/Ctrl+E move to the line's ends
+        // and leave every conversation in place.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.cursor_row_col(), (1, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.cursor_row_col(), (1, 6));
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().composer.text, "first\nsecond");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_previous_word_in_the_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("one two three");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "one two ");
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "one ");
+    }
+
+    #[test]
+    fn new_conversation_is_available_from_either_focus() {
+        // `start_new_conversation` reaches the (absent) remote and reports an
+        // error, but the key must be dispatched from both focuses rather than
+        // swallowed by the list's navigation handling. A dispatched attempt
+        // moves the status off "ready".
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.focus = Focus::List;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_ne!(app.selected().status, "ready");
+
+        app.selected_mut().status = "ready".to_string();
+        app.focus = Focus::Conversation;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_ne!(app.selected().status, "ready");
     }
 
     #[test]

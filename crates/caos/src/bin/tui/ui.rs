@@ -12,7 +12,8 @@ use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use super::{
-    short_hash, ActivityState, App, Command, ConversationState, EntryRole, TranscriptPoint, View,
+    short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, TranscriptPoint,
+    View,
 };
 use caos::chat::TurnPhase;
 
@@ -25,7 +26,13 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_header(app, state, frame, areas.header);
     render_conversations(app, frame, areas.sidebar);
     match app.view {
-        View::Chat => render_chat(state, app.animation_frame, frame, areas.content),
+        View::Chat => render_chat(
+            state,
+            app.animation_frame,
+            app.focus() == Focus::Conversation,
+            frame,
+            areas.content,
+        ),
         View::Activity => render_activity_browser(state, frame, areas.content),
         View::Diff => render_diff(state, frame, areas.content),
         View::Tools => render_tools(state, frame, areas.content),
@@ -33,7 +40,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_composer(
         state,
         app.view,
-        !app.selection_locked,
+        !app.selection_locked && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
     );
@@ -221,11 +228,18 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut selected = ListState::default()
         .with_offset(offset)
         .with_selected(Some(app.selected));
+    let focused = app.focus() == Focus::List;
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
     frame.render_stateful_widget(
         List::new(items)
             .block(
                 Block::default()
                     .title(" Conversations ")
+                    .border_style(border_style)
                     .borders(Borders::ALL),
             )
             .highlight_symbol("> ")
@@ -242,11 +256,12 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
 fn render_chat(
     state: &ConversationState,
     animation_frame: usize,
+    focused: bool,
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
     let (transcript, activity) = chat_areas(state, area);
-    render_transcript(state, frame, transcript);
+    render_transcript(state, focused, frame, transcript);
     if let Some(activity) = activity {
         render_live_activity(state, animation_frame, frame, activity);
     }
@@ -287,14 +302,20 @@ fn render_live_activity(
     );
 }
 
-fn render_transcript(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame<'_>, area: Rect) {
     let paragraph = transcript_paragraph(state);
     let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
     frame.render_widget(
         paragraph
             .block(
                 Block::default()
                     .title(" Conversation ")
+                    .border_style(border_style)
                     .borders(Borders::ALL),
             )
             .scroll((scroll, 0)),
@@ -876,13 +897,17 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             " Selection lock: redraws paused, ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
+    } else if app.focus() == Focus::List {
+        Line::raw(
+            " Conversations: Up/Dn select  Enter opens  ^N new  ^E archive  ^Up/Dn switch  ^C quit",
+        )
     } else if app.view == View::Activity {
         Line::raw(
             " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
         )
     } else {
         Line::raw(
-            " Enter sends  Shift+Enter/^J newline  Wheel scrolls  Drag selects+copies  ^T activity  ^Q diff  ^C quit",
+            " Enter sends  Shift+Enter/^J newline  ^A/^E line ends  ^W del word  Esc focuses list  ^T activity  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);

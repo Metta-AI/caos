@@ -40,20 +40,30 @@ time that user opens the TUI.
 
 ## Controls
 
+Focus is either in the left pane (the conversation list) or the main pane (the
+conversation). While the conversation list is focused, `Up` / `Down` move
+through conversations and `Enter` moves focus into the conversation pane;
+`Escape` in the conversation pane (with no slash-command matches showing) moves
+focus back to the list. The focused pane's border is highlighted.
+
 | Input | Action |
 |---|---|
+| `Up` / `Down` (list focused) | Select the previous or next conversation |
+| `Enter` (list focused) | Focus the conversation pane |
+| `Ctrl+E` (list focused) | Archive the selected conversation for this user |
+| `Escape` (conversation focused) | Dismiss slash-command matches, else focus the list |
+| `Ctrl+A` / `Ctrl+E` (conversation focused) | Move to the start / end of the current line |
 | `Enter` | Send the prompt |
 | `Alt+Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
-| `Escape` | Dismiss slash-command matches |
 | `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
 | `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
+| `Ctrl+W` (conversation focused) | Delete the previous word |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
-| `Ctrl+N` | Start a new virtual conversation |
-| `Ctrl+W` | Archive the selected conversation for this user |
+| `Ctrl+N` | Start a new virtual conversation (from either focus) |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
-| `Ctrl+T` or `Ctrl+A` | Enter or leave the Activity browser |
+| `Ctrl+T` | Enter or leave the Activity browser |
 | `Ctrl+Shift+T` | Show the tools available to the selected conversation |
 | `Up` / `Down` in Activity | Select the previous or next activity entry |
 | `PageUp` / `PageDown` in Activity | Scroll the selected activity's full details |
