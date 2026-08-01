@@ -1,7 +1,7 @@
 # Work -- request and response
 
 A WorkRequest is:
-- an ArgSet: a git tree containing named args:
+- an ArgTree: a git tree containing named args:
     - image: See below
     - other args, by agreement between the caller and the worker, all as git files/trees/commits
     - std (optional, but very common)
@@ -11,8 +11,8 @@ A WorkRequest is:
 
 A WorkResult is a git object, containing whatever the worker chose to return
 
-WorkRequest contains ArgsSet, stack, trace id, etc #todo
-- The ArgsSet is the cache key
+WorkRequest contains ArgTree, stack, trace id, etc #todo
+- The ArgTree is the cache key
 
 Also note in calling that rebinding existing args is an error #todo
 
@@ -38,7 +38,7 @@ Also a git tree, but containing a flake.nix and flake.lock, which are used to bu
 
 ## Currying
 
-Importantly, we don't pass around images. Instead, we pass around ArgSets. These might contain only an image, or they might contain other args. Thus, we can easily support a curry operation that takes an ArgSet, and returns a new ArgSet, now with more args
+Importantly, we don't pass around images. Instead, we pass around ArgTrees. These might contain only an image, or they might contain other args. Thus, we can easily support a curry operation that takes an ArgTree, and returns a new ArgTree, now with more args
 
 Curry shall fail if passed an arg that is already defined in the WorkRequest
 
@@ -59,7 +59,7 @@ Caos is reliable because:
 # Principles of performance
 
 Caos is fast because:
-- It caches work based on the ArgSet. The same work is never run a second time
+- It caches work based on the ArgTree. The same work is never run a second time
 - It takes pains to narrow trees before using them as keys, to avoid cache misses
     - For example, caos-tools/build.sh narrows the tree to just what the flake needs to build the stackbuilder image. Then it passes just the source files when running the stack-builder to build a stack
     - Compare with calculating custom keys based on a subset of the data: this causes stale values when it goes wrong
