@@ -972,8 +972,9 @@
         };
 
         # No `checks` output at all. test, clippy, doc and fmt all run in
-        # tests/unit, through the cargo worker, and `caos-cli run-tool test`
-        # is the only runner anyone invokes — there is no CI here, and
+        # tests/unit-{test,clippy,doc,fmt}, through the cargo worker, and
+        # `caos-cli run-tool test` is the only runner anyone invokes —
+        # there is no CI here, and
         # CLAUDE.md's pre-commit step is nix build + caosd up + run-tool test.
         #
         # Every one of them had a reason to move, and the tests had the

@@ -135,12 +135,87 @@ fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
     Ok(Some(dir))
 }
 
-/// Discover the tree-defined tools: `caos-tools/*.sh`, each (name,
-/// description) with the description from its `#@doc ` lines. Resolved fresh
-/// from the CURRENT workspace every round, so an agent that adds, edits, or
-/// removes a tool sees the change on its next request. Reserved names are
-/// skipped loudly; subdirectories are helpers, not tools.
-pub fn tree_tools(ws: &str) -> Result<Vec<(String, String)>, String> {
+/// Arg names a tree tool may not declare: the interpreter binds these itself
+/// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
+const RESERVED_ARGS: &[&str] = &["in", "worker1", "image", "std", "salt"];
+
+/// One tree tool as the registry sees it: its name, its `#@doc` description,
+/// and the `#@arg` parameters it accepts.
+pub struct TreeTool {
+    pub name: String,
+    pub doc: String,
+    pub args: Vec<TreeArg>,
+}
+
+/// One `#@arg` line: `#@arg <name> <description>` is required, `#@arg
+/// [<name>] <description>` optional. The name becomes the script's `--<name>`
+/// arg, readable at `/cas/args/<name>`.
+pub struct TreeArg {
+    pub name: String,
+    pub doc: String,
+    pub required: bool,
+}
+
+/// Parse one `#@arg` line's payload (everything after the marker) into a
+/// parameter. `None` — reported by the caller — for a malformed name, so a
+/// typo costs a visible skip rather than an arg the model can't use.
+fn parse_arg(payload: &str) -> Option<TreeArg> {
+    let (token, doc) = match payload.split_once(char::is_whitespace) {
+        Some((t, d)) => (t, d.trim()),
+        None => (payload, ""),
+    };
+    let (name, required) = match token.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        Some(inner) => (inner, false),
+        None => (token, true),
+    };
+    let ok = !name.is_empty()
+        && !RESERVED_ARGS.contains(&name)
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then(|| TreeArg {
+        name: name.to_string(),
+        doc: doc.to_string(),
+        required,
+    })
+}
+
+/// Read one tool script into its registry shape: the `#@doc` lines joined as
+/// the description, the `#@arg` lines as parameters.
+fn read_tool(name: &str, path: &str) -> Result<TreeTool, String> {
+    caos(["get", path])?;
+    let text = fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let mut doc: Vec<&str> = Vec::new();
+    let mut args = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("#@doc") {
+            doc.push(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("#@arg") {
+            match parse_arg(rest.trim()) {
+                Some(a) => args.push(a),
+                None => eprintln!("caos-tools/{name}.sh: unusable #@arg line: {line}"),
+            }
+        }
+    }
+    let doc = if doc.is_empty() {
+        format!("Project tool caos-tools/{name}.sh (no #@doc description).")
+    } else {
+        doc.join(" ")
+    };
+    Ok(TreeTool {
+        name: name.to_string(),
+        doc,
+        args,
+    })
+}
+
+/// Discover the tree-defined tools: `caos-tools/*.sh`, each with the
+/// description from its `#@doc ` lines and the parameters from its `#@arg`
+/// lines. Resolved fresh from the CURRENT workspace every round, so an agent
+/// that adds, edits, or removes a tool sees the change on its next request.
+/// Reserved names are skipped loudly; subdirectories are helpers, not tools.
+pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
     let Some(dir) = tree_tools_dir(ws)? else {
         return Ok(Vec::new());
     };
@@ -164,37 +239,42 @@ pub fn tree_tools(ws: &str) -> Result<Vec<(String, String)>, String> {
             eprintln!("caos-tools/{fname} shadows the built-in {name:?} tool — ignored");
             continue;
         }
-        caos(["get", &p])?;
-        let text = fs::read_to_string(&p).map_err(|e| format!("reading {p}: {e}"))?;
-        let doc: Vec<&str> = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("#@doc").map(str::trim))
-            .collect();
-        let doc = if doc.is_empty() {
-            format!("Project tool caos-tools/{fname} (no #@doc description).")
-        } else {
-            doc.join(" ")
-        };
-        out.push((name.to_string(), doc));
+        out.push(read_tool(name, &p)?);
     }
     Ok(out)
 }
 
-/// One discovered tool's registry entry. Tree tools take no arguments (yet —
-/// a `#@arg` schema convention can come later): the workspace tree IS the
-/// input, so the description carries everything the model needs.
-pub fn tree_tool_declaration(name: &str, doc: &str) -> Value {
+/// One discovered tool's registry entry. A tool with no `#@arg` lines takes
+/// no parameters — the workspace tree IS its input — and one with them takes
+/// them as strings, since every arg reaches the script as a `/cas/args/<name>`
+/// blob whatever JSON type it left the model as.
+pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
+    let mut props = serde_json::Map::new();
+    let mut required = Vec::new();
+    for a in &tool.args {
+        props.insert(
+            a.name.clone(),
+            json!({"type": "string", "description": a.doc}),
+        );
+        if a.required {
+            required.push(Value::String(a.name.clone()));
+        }
+    }
+    let mut schema = json!({"type": "object", "properties": Value::Object(props)});
+    if !required.is_empty() {
+        schema["required"] = Value::Array(required);
+    }
     json!({
-        "name": name,
-        "description": doc,
-        "input_schema": {"type": "object", "properties": {}}
+        "name": tool.name,
+        "description": tool.doc,
+        "input_schema": schema
     })
 }
 
 /// Resolve tool `name` in the CURRENT workspace — invocation-time lookup, so
 /// a call made right after an edit runs the edited script. `None` when the
 /// tree doesn't define it (or the name is reserved / not a clean filename).
-pub fn tree_tool_script(ws: &str, name: &str) -> Result<Option<String>, String> {
+pub fn tree_tool_script(ws: &str, name: &str) -> Result<Option<(String, TreeTool)>, String> {
     if RESERVED_TOOLS.contains(&name) || name.contains('/') || name.contains("..") {
         return Ok(None);
     }
@@ -202,7 +282,55 @@ pub fn tree_tool_script(ws: &str, name: &str) -> Result<Option<String>, String> 
         return Ok(None);
     };
     let p = format!("{dir}/{name}.sh");
-    Ok(Path::new(&p).is_file().then_some(p))
+    if !Path::new(&p).is_file() {
+        return Ok(None);
+    }
+    let tool = read_tool(name, &p)?;
+    Ok(Some((p, tool)))
+}
+
+/// Bind a tree-tool call's inputs to the parameters the script declared,
+/// returning the `--<name>=<value>` pairs for the curry. A missing required
+/// arg, an undeclared one, or a non-scalar value is the model's mistake, so it
+/// comes back as a ready-made `is_error` tool_result rather than a worker
+/// error — the same contract `grep_precheck` uses.
+pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, String)>, Value> {
+    let id = call["id"].as_str().unwrap_or("");
+    let fail = |msg: String| Err(block(id, &msg, true));
+    let empty = serde_json::Map::new();
+    let input = call["input"].as_object().unwrap_or(&empty);
+    for key in input.keys() {
+        if !tool.args.iter().any(|a| &a.name == key) {
+            let known: Vec<&str> = tool.args.iter().map(|a| a.name.as_str()).collect();
+            return fail(format!(
+                "{} takes no {key:?} argument (declared: {})",
+                tool.name,
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for a in &tool.args {
+        let value = match input.get(&a.name) {
+            None | Some(Value::Null) => {
+                if a.required {
+                    return fail(format!("{} needs a {:?} argument", tool.name, a.name));
+                }
+                continue;
+            }
+            Some(Value::String(s)) => s.clone(),
+            Some(v @ (Value::Number(_) | Value::Bool(_))) => v.to_string(),
+            Some(_) => {
+                return fail(format!("{}'s {:?} must be a string", tool.name, a.name));
+            }
+        };
+        out.push((a.name.clone(), value));
+    }
+    Ok(out)
 }
 
 /// The tool_result block for a tree tool's result — a VALUE whose shape the
@@ -661,4 +789,117 @@ fn fresh(prefix: &str) -> String {
 fn counter() -> u32 {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arg_lines_parse() {
+        let required = parse_arg("hash The record hash.").unwrap();
+        assert_eq!(required.name, "hash");
+        assert_eq!(required.doc, "The record hash.");
+        assert!(required.required);
+
+        let optional = parse_arg("[log] Which log.").unwrap();
+        assert_eq!(optional.name, "log");
+        assert!(!optional.required);
+
+        // A name with no description is still a usable parameter.
+        assert_eq!(parse_arg("bare").unwrap().name, "bare");
+
+        // Rejected: an arg the interpreter already binds (curry errors on a
+        // rebind), and anything that isn't a plain lower-case flag name.
+        assert!(parse_arg("in The workspace.").is_none());
+        assert!(parse_arg("worker1 The script.").is_none());
+        assert!(parse_arg("Hash The record hash.").is_none());
+        assert!(parse_arg("--hash The record hash.").is_none());
+        assert!(parse_arg("").is_none());
+    }
+
+    #[test]
+    fn declaration_matches_the_declared_args() {
+        let tool = TreeTool {
+            name: "test-result".to_string(),
+            doc: "Print a record.".to_string(),
+            args: vec![
+                TreeArg {
+                    name: "hash".to_string(),
+                    doc: "The record hash.".to_string(),
+                    required: true,
+                },
+                TreeArg {
+                    name: "log".to_string(),
+                    doc: "Which log.".to_string(),
+                    required: false,
+                },
+            ],
+        };
+        let d = tree_tool_declaration(&tool);
+        assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
+        assert_eq!(
+            d["input_schema"]["properties"]["log"]["description"],
+            "Which log."
+        );
+        // Only the required ones are listed, so an optional arg can be omitted.
+        assert_eq!(d["input_schema"]["required"], json!(["hash"]));
+
+        // No #@arg lines: an empty properties object and NO `required` key —
+        // an empty required array is not valid JSON Schema for the API.
+        let bare = TreeTool {
+            name: "build".to_string(),
+            doc: "Build.".to_string(),
+            args: Vec::new(),
+        };
+        let d = tree_tool_declaration(&bare);
+        assert_eq!(
+            d["input_schema"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn bad_calls_become_is_error_results() {
+        let tool = TreeTool {
+            name: "echo-arg".to_string(),
+            doc: String::new(),
+            args: vec![
+                TreeArg {
+                    name: "word".to_string(),
+                    doc: String::new(),
+                    required: true,
+                },
+                TreeArg {
+                    name: "suffix".to_string(),
+                    doc: String::new(),
+                    required: false,
+                },
+            ],
+        };
+        let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
+
+        let bound = tree_tool_args(&call(json!({"word": "banana"})), &tool).unwrap();
+        assert_eq!(bound, vec![("word".to_string(), "banana".to_string())]);
+
+        // Scalars are stringified, since every arg reaches the script as a blob.
+        let bound = tree_tool_args(&call(json!({"word": 7, "suffix": true})), &tool).unwrap();
+        assert_eq!(
+            bound,
+            vec![
+                ("word".to_string(), "7".to_string()),
+                ("suffix".to_string(), "true".to_string())
+            ]
+        );
+
+        for bad in [
+            json!({}),                             // required arg missing
+            json!({"word": "x", "colour": "red"}), // undeclared arg
+            json!({"word": ["banana"]}),           // non-scalar value
+        ] {
+            let block = tree_tool_args(&call(bad), &tool).unwrap_err();
+            assert_eq!(block["is_error"], true);
+            assert_eq!(block["tool_use_id"], "toolu_01");
+        }
+    }
 }

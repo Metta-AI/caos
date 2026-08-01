@@ -232,17 +232,30 @@ fn drive(
         // A tree tool? Resolved in the CURRENT workspace at invocation time,
         // so a call made right after an edit runs the edited script.
         if !tools::is_inline(name) && cfg.tools_image.is_some() {
-            if let Some(script) = tools::tree_tool_script(&ws, name)? {
-                return launch_tree_tool(
-                    cfg,
-                    &call,
-                    name,
-                    &script,
-                    &ws,
-                    step_path,
-                    &queue[1..],
-                    &results,
-                );
+            if let Some((script, tool)) = tools::tree_tool_script(&ws, name)? {
+                // Bind the declared `#@arg`s before launching: a bad call is
+                // an is_error result and the queue continues, exactly as a
+                // bad grep is — only a valid one exits into the sub-run.
+                match tools::tree_tool_args(&call, &tool) {
+                    Err(block) => {
+                        results.push(block);
+                        queue.remove(0);
+                        continue;
+                    }
+                    Ok(bound) => {
+                        return launch_tree_tool(
+                            cfg,
+                            &call,
+                            name,
+                            &script,
+                            &bound,
+                            &ws,
+                            step_path,
+                            &queue[1..],
+                            &results,
+                        )
+                    }
+                }
             }
         }
         if !tools::is_inline(name) {
@@ -503,15 +516,16 @@ fn launch_grep(
 /// Launch a tree tool (`caos-tools/<name>.sh`, already resolved in the current
 /// workspace) as a run-then sub-run: the input is the workspace tree and the
 /// SCRIPT BLOB rides curried on the script-worker image, so the run caches
-/// on exactly (workspace tree, script content) — and an edited tool is a new
-/// key automatically. The result is a value, not a workspace — the current
-/// `ws` rides the continuation, unchanged by the run.
+/// on exactly (workspace tree, script content, the bound `#@arg`s) — and an
+/// edited tool is a new key automatically. The result is a value, not a
+/// workspace — the current `ws` rides the continuation, unchanged by the run.
 #[allow(clippy::too_many_arguments)]
 fn launch_tree_tool(
     cfg: &Config,
     call: &Value,
     name: &str,
     script: &str,
+    bound: &[(String, String)],
     ws: &str,
     step_path: &str,
     pending: &[Value],
@@ -524,7 +538,13 @@ fn launch_tree_tool(
         .tools_image
         .as_ref()
         .ok_or("launch_tree_tool without a tools_image (drive guards this)")?;
-    let curried = caos_curry(image, &[("worker1", Arg::Path(script))])?;
+    // The model's arg values bind as LITERALS, so they land at
+    // /cas/args/<name> for the script to read and — being part of the args
+    // tree — key the run: the same tool called with a different hash is a
+    // different job, not a cache hit.
+    let mut kvs: Vec<(&str, Arg)> = vec![("worker1", Arg::Path(script))];
+    kvs.extend(bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))));
+    let curried = caos_curry(image, &kvs)?;
     let me = self_curry(
         step_path,
         pending,
@@ -716,8 +736,8 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     // Tree tools: whatever caos-tools/*.sh the CURRENT workspace carries —
     // re-discovered every round, so the set tracks the agent's own edits.
     if cfg.tools_image.is_some() {
-        for (name, doc) in tools::tree_tools(ws)? {
-            tools.push(tools::tree_tool_declaration(&name, &doc));
+        for tool in tools::tree_tools(ws)? {
+            tools.push(tools::tree_tool_declaration(&tool));
         }
     }
     Ok(tools)

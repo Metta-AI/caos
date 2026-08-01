@@ -53,9 +53,12 @@ pub use chat::{cli_chat, cli_talk};
 /// worker edit. When you do want the tree — a failing test's inner stack logs,
 /// say — `caos-cli get <hash> <path>` checks it out.
 ///
-/// Conventions on the result: a `report` file is printed (a FAILED banner
-/// fails the command), and failing `results/<name>/` records show their full
-/// `output`. Everything else just gets the printed result hash.
+/// Conventions on the result: a BLOB result is printed verbatim (a tool whose
+/// answer is text, like `test-result`), and a `report` file is printed (a
+/// FAILED banner fails the command). Everything else just gets the printed
+/// result hash. Exactly what an agent is shown for the same call — the report
+/// is the tool's whole answer to both, so neither reader sees more than the
+/// other.
 pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     let (tool, kvs) = match args {
         [tool, kvs @ ..] => (tool, kvs),
@@ -92,11 +95,21 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
 }
 
 /// Print a tool result's report conventions, reading ONLY the objects they
-/// name: the top tree, a `report` blob, and — for each `results/<rec>` whose
-/// `verdict` is not a PASS — that record's `output`. A tool with no `report`
-/// (`build` returns an image) costs exactly one object.
+/// name: the top tree and a `report` blob, or the result itself when it is one.
+/// A tool with no `report` (`build` returns an image) costs exactly one object.
 fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(), String> {
     let Some(entries) = fetch_tree_entries(t, result)? else {
+        // Not a tree: the tool's whole answer IS the blob. Print it — the same
+        // rendering the agent harness gives a blob result, so `run-tool
+        // test-result <hash>` by hand shows what the agent would have seen.
+        // Without this a text-valued tool prints its hash and nothing else.
+        let (_, bytes) = t.get_object(result)?;
+        let text = String::from_utf8_lossy(&bytes);
+        eprintln!();
+        eprint!("{text}");
+        if !text.ends_with('\n') {
+            eprintln!();
+        }
         return Ok(());
     };
     let find = |entries: &[gix::objs::tree::Entry], want: &str| {
@@ -115,31 +128,14 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
     eprintln!();
     eprint!("{text}");
 
-    if let Some(results) = find(&entries, "results") {
-        for rec in fetch_tree_entries(t, &results)?.unwrap_or_default() {
-            let rec_name = String::from_utf8_lossy(entry_name(&rec)).into_owned();
-            let Some(fields) = fetch_tree_entries(t, &rec.oid.to_string())? else {
-                continue;
-            };
-            // No verdict is not a failure — the record shape is the tool's.
-            let passed = match find(&fields, "verdict") {
-                Some(v) => fetch_blob_string(t, &v)?.contains("PASS"),
-                None => true,
-            };
-            if passed {
-                continue;
-            }
-            eprintln!("\n---- {rec_name} (full output; also at results/{rec_name}) ----");
-            if let Some(output) = find(&fields, "output") {
-                let (_, bytes) = t.get_object(&output)?;
-                let output = String::from_utf8_lossy(&bytes);
-                eprint!("{output}");
-                if !output.ends_with('\n') {
-                    eprintln!();
-                }
-            }
-        }
-    }
+    // THE REPORT IS THE WHOLE OUTPUT. There used to be a second pass here that
+    // walked `results/<rec>` and dumped the full `output` of every record whose
+    // verdict wasn't a PASS. Once the report itself carried each failure's tail
+    // and its record hash, that printed the same failure twice — and, worse,
+    // showed a human something the agent never saw, when the point of the two
+    // callers is that a tool cannot behave differently depending on who ran it.
+    // The full output is one `run-tool test-result <hash>` away, which the
+    // report says.
     if text.contains("FAILED") {
         return Err(format!("{name} reported FAILED"));
     }

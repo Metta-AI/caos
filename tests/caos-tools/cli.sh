@@ -5,12 +5,15 @@
 #
 # Tree-defined agent tools (caos-tools/*.sh, design/cargo-workers.md):
 # llm-step discovers them per round from the CURRENT workspace (#@doc lines
-# as the descriptions), resolves them at INVOCATION time, and runs each as
-# curry(tools_image, script) over the tree. Asserts, against the scripted
-# stub LLM: registration (name + doc in the request; a reserved name is NOT
-# shadowed), invocation (the script's output returns as the tool_result),
-# and same-turn dynamism — a bash edit to the tool changes what the very
-# next call runs.
+# as the descriptions, #@arg lines as the parameters), resolves them at
+# INVOCATION time, and runs each as curry(tools_image, script, args) over the
+# tree. Asserts, against the scripted stub LLM: registration (name + doc in
+# the request; a reserved name is NOT shadowed), invocation (the script's
+# output returns as the tool_result), same-turn dynamism — a bash edit to the
+# tool changes what the very next call runs — and the #@arg contract: a
+# declared arg reaches the script at /cas/args/<name>, while a missing
+# required arg or an undeclared one comes back as an is_error tool_result
+# WITHOUT a sub-run.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -39,18 +42,40 @@ cat > ws/caos-tools/bash.sh <<'EOF'
 #!/usr/bin/env bash
 #@doc An impostor bash.
 EOF
+# A tool with parameters: one required, one optional. Reads them where every
+# curried arg lands — /cas/args/<name> — so the assertion below is on the
+# whole path from the model's JSON to the script's stdin.
+cat > ws/caos-tools/echo-arg.sh <<'EOF'
+#!/usr/bin/env bash
+#@doc Echo the word it is given.
+#@arg word The word to echo.
+#@arg [suffix] An optional suffix.
+set -euo pipefail
+caos get /cas/args/word
+out="word=$(cat /cas/args/word)"
+if [ -e /cas/args/suffix ]; then
+  caos get /cas/args/suffix
+  out="$out$(cat /cas/args/suffix)"
+fi
+printf '%s' "$out" > /tmp/o
+caos put /tmp/o /cas/out
+EOF
 echo "You are a coding agent." > system.txt
 commit "workspace + tools"
 base=$(mkcommit "HEAD:ws" "base")
 human1=$(mkcommit "HEAD:ws" "run the hello tool" "$base")
 
-echo "== script the stub LLM (call; edit-then-call; end) ==" >&2
+echo "== script the stub LLM (call; edit-then-call; arg calls; end) ==" >&2
 R1='[{"id":"toolu_01","input":{},"name":"hello","type":"tool_use"}]'
 R2='[{"id":"toolu_02","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello.sh","paths":["caos-tools/hello.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_03","input":{},"name":"hello","type":"tool_use"}]'
+# Two bad calls then a good one, in ONE response: the bad ones must be
+# answered in place and the queue continue, so the good one still runs.
+R3='[{"id":"toolu_04","input":{},"name":"echo-arg","type":"tool_use"},{"id":"toolu_05","input":{"word":"x","colour":"red"},"name":"echo-arg","type":"tool_use"},{"id":"toolu_06","input":{"word":"banana","suffix":"-split"},"name":"echo-arg","type":"tool_use"}]'
 mkdir stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > stub/response-2.json
-printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-3.json
+printf '{"content":%s,"stop_reason":"tool_use"}' "$R3" > stub/response-3.json
+printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-4.json
 
 stub_pid=""
 for _ in 1 2 3 4 5; do
@@ -94,5 +119,35 @@ echo "== dynamism: the bash-edited tool ran on the very next call ==" >&2
 grep -qF 'hello-from-tree-v2' stub/request-3.json \
   || fail "edited tool did not take effect: $(grep -oF 'hello-from-tree-v[0-9]' stub/request-3.json | tr '\n' ' ')"
 echo "  ok: same-turn edit changed the tool's behavior" >&2
+
+# serde_json's Map is a BTreeMap, so a request's object keys come out sorted —
+# that is what these literal fragments are matching, not the order the json!
+# macro writes them in.
+echo "== #@arg: declared as a schema, required marked, doc carried ==" >&2
+grep -qF '"word":{"description":"The word to echo.","type":"string"}' stub/request-1.json \
+  || fail "#@arg word not declared as a string property"
+grep -qF '"suffix":{"description":"An optional suffix.","type":"string"}' stub/request-1.json \
+  || fail "#@arg [suffix] not declared"
+grep -qF '"required":["word"]' stub/request-1.json \
+  || fail "required args wrong: [name] must be optional, a bare name required"
+# A tool with no #@arg lines still advertises an empty object schema — and no
+# `required` key, which the API rejects as an empty array.
+grep -qF '"description":"Say hello from the tree.","input_schema":{"properties":{},"type":"object"},"name":"hello"' \
+  stub/request-1.json || fail "an argument-less tool's schema changed shape"
+echo "  ok: word required, suffix optional, hello unchanged" >&2
+
+echo "== #@arg: the values reach the script at /cas/args/<name> ==" >&2
+grep -qF 'word=banana-split' stub/request-4.json \
+  || fail "the bound args did not reach the tool script"
+echo "  ok: word=banana-split came back as the tool_result" >&2
+
+echo "== #@arg: bad calls are is_error results, not worker errors ==" >&2
+grep -qF 'echo-arg needs a' stub/request-4.json \
+  || fail "a missing required arg was not reported back to the model"
+grep -qF 'takes no' stub/request-4.json \
+  || fail "an undeclared arg was not reported back to the model"
+[ "$(grep -oF '"is_error":true' stub/request-4.json | wc -l)" = 2 ] \
+  || fail "expected exactly two is_error tool_results in round 4"
+echo "  ok: both bad calls answered in place; the good call still ran" >&2
 
 echo "caos-tools: ALL PASS" >&2

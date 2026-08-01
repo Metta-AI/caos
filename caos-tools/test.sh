@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #@doc Build the test stack image from the tree and run the whole test suite —
 #@doc the unit tests and every tests/<name> integration suite — as cached
-#@doc jobs: an unchanged test never re-runs. Returns the report; each test's
-#@doc complete record (full output, inner-stack logs) rides in the result
-#@doc tree. Nothing is handed in from the host: the stack under test is
-#@doc compiled from these sources, inside workers.
+#@doc jobs: an unchanged test never re-runs. Returns the report: a line per
+#@doc test with its time and the hash of its record, the last few lines of
+#@doc every failing test, and a pass/fail banner. Pass a record's hash to
+#@doc `test-result` for that test's full output or its inner-stack logs.
+#@doc Nothing is handed in from the host: the stack under test is compiled
+#@doc from these sources, inside workers.
 #
 # THE test suite, as a caos worker (design/test-stack-image.md). Its interface
 # is a TOOL's interface: the workspace tree as --in, and optionally an API key
@@ -31,6 +33,12 @@
 set -euo pipefail
 
 fail() { echo "TEST FAIL: $*" >&2; exit 1; }
+
+# How much of a failing test's output the report inlines. Enough to carry the
+# stage heading, the assertion and its diagnostic — not enough to bury the
+# other tests when several fail at once. The whole thing is one `test-result`
+# call away, which is the point: the report is an INDEX, not an archive.
+EXCERPT_LINES=20
 
 # Args are lazy placeholders — fetch before reading. The initial invocation
 # carries no --stage, so the fetch fails and we default to the first stage.
@@ -203,10 +211,12 @@ stage3)
     fi
 
     case "$t" in
-      cargo-self | unit)
+      cargo-self | unit-*)
         # Dogfood the tree under test — the PRUNED build tree (what cargo
         # reads, the compile's own input), so only Rust-relevant edits re-key
-        # these, exactly like the compile itself.
+        # these, exactly like the compile itself. A glob, so the four unit-*
+        # tests (test, clippy, doc, fmt) all get the same tree and re-key
+        # together — a new one needs no edit here.
         ln -s /cas/args/build-ws "/tmp/sel/$t/workspace"
         ;;
       std-lint)
@@ -269,7 +279,7 @@ summarize)
   {
     # Collected first, printed after: the column width is only known once every
     # child has been read.
-    names=() marks=() times=()
+    names=() marks=() times=() hashes=() excerpts=()
     width=0
     for c in /cas/args/children/*; do
       t=$(basename "$c")
@@ -281,12 +291,26 @@ summarize)
       # logs by hand.
       caos get "/cas/args/children/$t/seconds"
       s=$(cat "$c/seconds")
+      excerpt=""
       if grep -q "^RUN-TEST: PASS" "$c/verdict"; then
         mark="✓"; passn=$((passn + 1))
       else
         mark="✗"; failn=$((failn + 1))
+        # THE LAST LINES, NOT THE FIRST. Every tests/<name>/cli.sh narrates its
+        # way down — `echo "== step ==" >&2` per stage — and ends at `fail`, so
+        # the head of a failing output is the fixture setup that worked and the
+        # tail is the assertion that didn't, with the stage heading right above
+        # it. Checked against a deliberately failed test: the head was "== build
+        # the fixture worker ==", the tail was the FAIL line.
+        caos get "/cas/args/children/$t/output"
+        excerpt=$(tail -n "$EXCERPT_LINES" "$c/output")
       fi
-      names+=("$t"); marks+=("$mark"); times+=("$s")
+      names+=("$t"); marks+=("$mark"); times+=("$s"); excerpts+=("$excerpt")
+      # The record's own hash, so `test-result <hash>` can read the WHOLE thing
+      # — full output, inner-stack logs — without the reader first having to
+      # learn how to address a subtree of the suite result. It is printed for
+      # passes too: a green test whose logs you want is the same lookup.
+      hashes+=("$(caos hash "/cas/args/children/$t")")
       # `if`, not `[ … ] && …`: this is the last command in the loop body, where
       # a false test would end the loop AND the script under `set -e`.
       if [ ${#t} -gt "$width" ]; then width=${#t}; fi
@@ -303,7 +327,8 @@ summarize)
     # terminal, and ANSI escapes would be baked into the artifact and into every
     # log that ever prints it.
     for i in "${!names[@]}"; do
-      printf '  %s %-*s %4s\n' "${marks[$i]}" "$width" "${names[$i]}" "${times[$i]}s"
+      printf '  %s %-*s %4s  %s\n' \
+        "${marks[$i]}" "$width" "${names[$i]}" "${times[$i]}s" "${hashes[$i]}"
     done
     echo
     if [ "$failn" -eq 0 ]; then
@@ -320,7 +345,29 @@ summarize)
     # unpacking a new image across twenty concurrent stacks.
     echo "(times are each test's LAST ACTUAL RUN; an unchanged test is a cache"
     echo " hit and replays the time it recorded then."
-    echo " Pass \`--test-salt=\$(date --iso=s)\` to rerun all tests)"
+    echo " Pass \`--test-salt=\$(date --iso=s)\` to rerun all tests."
+    echo " The hash is the test's record: \`test-result <hash>\` prints its full"
+    echo " output, \`test-result <hash> --log=server\` an inner-stack log.)"
+
+    # The excerpts go LAST, after the banner and the notes, because both
+    # readers of this report truncate by keeping the TAIL (run-tool's caller
+    # and the agent harness's tree_tool_result_block both cut the head at
+    # 100 KB). A twenty-test suite where half of them fail must not spend its
+    # budget on the passing table and lose every diagnostic.
+    for i in "${!names[@]}"; do
+      if [ -z "${excerpts[$i]}" ]; then continue; fi
+      echo
+      echo "---- ${names[$i]}: last $EXCERPT_LINES lines (test-result ${hashes[$i]}) ----"
+      # Indented, so a test's output can never be mistaken for the report's own
+      # structure — an inner "SUITE OK" would otherwise read as this suite's.
+      #
+      # A bash loop, not `sed`: std/bash's contents are bash, coreutils,
+      # diffutils, gnugrep, findutils and jq — there is NO gnused. This ran
+      # green for two suites before anything noticed, because the loop only
+      # executes when a test FAILS, which is precisely when the report must
+      # not be the thing that breaks.
+      while IFS= read -r line; do printf '  %s\n' "$line"; done <<< "${excerpts[$i]}"
+    done
   } > /tmp/rep/report
   ln -s /cas/args/children /tmp/rep/results
   caos put /tmp/rep /cas/out

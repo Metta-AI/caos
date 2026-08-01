@@ -542,7 +542,7 @@ caosd reset   # stop and wipe those volumes + the server repo for a clean slate
 ```bash
 caos-cli run-tool build      # the worker images, from the deployed binaries
 caos-cli run-tool test       # images + the whole test suite
-caos-cli run-tool test --only="unit rgrep" # just these tests (cache shared
+caos-cli run-tool test --only="unit-test rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
 CAOS_SALT=$(date +%s) caos-cli run-tool test   # force a re-run (retry a flake)
 ```
@@ -562,9 +562,18 @@ computations through `caos-cli` against a nested caos stack built from
 your edited tree. New tests are picked up automatically. Results — every
 test's verdict, full output, and the inner stack's logs — land as a git
 tree pinned on the server. `run-tool` materializes none of it: it prints the
-result hash, then reads just the report (and any failing test's output) one
-object at a time. To get the whole tree on disk — a failing test's full output
-and inner stack logs — `caos-cli get <hash> <path>`.
+result hash, then reads just the report — two objects.
+
+The report is an index, not an archive: a line per test with its time and the
+hash of its record, then the last 20 lines of each failing test. Read a record
+in full with the second tool, by hash — no checkout, one object at a time:
+
+```bash
+caos-cli run-tool test-result --hash=<hash>            # the test's full output
+caos-cli run-tool test-result --hash=<hash> --log=server  # an inner-stack log
+```
+
+To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
 
 ## Notes
 

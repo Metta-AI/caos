@@ -134,3 +134,83 @@ Run `time result/bin/caos-cli run-tool test`
 # From agents
 
 Agents, add more notes here
+
+# Tools
+
+A tool is a worker script at `caos-tools/<name>.sh`, run as an ordinary caos
+job over the workspace tree. It has TWO callers and one contract: an agent's
+tool call (`worker-llm-step`), and `caos-cli run-tool <name> [--k=v ...]` by
+hand. Both build the same ArgTree, so a tool cannot behave differently
+depending on who invoked it.
+
+## Invocation
+
+- The job is `curry(<tools image>, worker1=<the script>, <declared args>)` run
+  with the workspace tree as `--in`
+- Tools are discovered fresh from the CURRENT workspace on every LLM round and
+  resolved again at INVOCATION time, so an agent that edits a tool sees the
+  change on its next call, within the same turn
+- `bash`, `grep`, `read`, `ls`, `write` and `edit` are reserved. A
+  `caos-tools/bash.sh` is ignored, not registered — the model's primitives,
+  including the repair path for a broken tool edit, stay stable whatever the
+  tree carries
+- Subdirectories of `caos-tools/` are helpers, not tools
+
+## Declaring a tool
+
+Marker lines in the script's header comment:
+
+- `#@doc <text>` — one or more lines, joined, become the tool's description.
+  A tool with none gets a placeholder
+- `#@arg <name> <description>` — a REQUIRED parameter
+- `#@arg [<name>] <description>` — an OPTIONAL parameter
+
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `image`, `std` and `salt`
+are refused: the interpreter binds those itself and currying SHALL fail on a
+rebind. A malformed `#@arg` line is skipped with a message, never silently
+turned into an arg the model cannot use.
+
+Every parameter is declared to the model as a string, because every arg
+reaches the script as a blob whatever JSON type it left the model as. A tool
+with no `#@arg` lines takes no parameters: the workspace tree IS its input.
+
+## Receiving args
+
+- A bound arg lands at `/cas/args/<name>`, a lazy placeholder like any other
+  arg — `caos get` it before reading
+- An omitted optional arg simply does not exist; test with `[ -e ]`
+- Values are never shell-interpolated. They are argv elements to `caos curry`,
+  then bytes in a file
+- Args are part of the ArgTree, and the ArgTree is the cache key. The same
+  tool called with different args is a different job; a repeat of either is a
+  cache hit. Tools need no keying logic of their own
+
+## Returning a result
+
+The result is a git object whose shape the tool chooses. Three conventions,
+applied identically by `run-tool` and by the agent harness:
+
+- a BLOB — printed verbatim. The shape for a tool whose answer is text
+- a tree with a `report` file — the report is printed, and a `FAILED` banner
+  in it marks the call a failure. Do NOT use this shape for a tool that
+  returns arbitrary logs, which say `FAILED` all the time
+- any other tree — its top-level listing is shown
+
+Long results are truncated by keeping the TAIL, so a tool SHALL put its
+summary and its diagnostics last.
+
+A tool's printed answer SHALL be the same for both callers. A convention that
+shows the human more than the agent — as an extra pass over the result tree
+once did — makes the tool untestable through the surface an agent uses. If a
+result needs more detail than its report carries, expose the detail as ANOTHER
+TOOL taking a hash (`test` and `test-result`), not as richer printing.
+
+## Failure
+
+- A caller's mistake — a missing required arg, an undeclared one, a
+  non-scalar value — is answered as an error tool_result the model can read
+  and correct. The sub-run never launches
+- A tool's own EXPECTED failures SHALL be values too, not job errors: a tool
+  is often called precisely because something already went wrong, and a job
+  error there takes the agent's turn down with it
+- Unexpected failures die, per the reliability principles above

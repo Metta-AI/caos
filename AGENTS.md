@@ -15,6 +15,14 @@ Every script here runs with it, and two constructs quietly break under it.
   "absent" answer is a 404 dies instead of returning empty. Distinguish absent
   from broken explicitly — a swallowed error here silently hides an unreachable
   service.
+- **A worker script only has what its image's flake lists.** `std/bash` is
+  bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
+  `sed`**, and no awk. `sed 's/^/  /'` in `caos-tools/test.sh` passed two
+  green suites before it fired, because it only ran on the failing-test path:
+  the report that exists to explain a failure was the thing that broke. Prefer
+  a bash loop (`while IFS= read -r line`), and when reaching for a binary,
+  check `std/<image>/flake.nix` first — an absent one is exit 127 at runtime,
+  not a build error.
 
 # Nix
 
