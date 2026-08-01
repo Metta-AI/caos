@@ -1558,6 +1558,53 @@ enum Body {
     Dir(Vec<u8>, Vec<Hashed>),
 }
 
+/// The git tree entry for a real symlink at `path`: a blob holding the link
+/// target, mode 120000. Used both for a genuine symlink outside the CAS and to
+/// preserve a CAS node that is itself a symlink (rather than reusing its
+/// dereferenced target's hash).
+fn link_entry(path: &Path) -> Result<Hashed, String> {
+    let link = std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let target = link.as_os_str().as_bytes().to_vec();
+    let oid = hash_bytes("blob", &target)?;
+    Ok(Hashed {
+        mode: gix::objs::tree::EntryKind::Link.into(),
+        oid,
+        body: Body::Link(target),
+    })
+}
+
+/// Resolve a staging symlink to the CAS node it names, WITHOUT dereferencing
+/// that node itself. Returns the node's real path when it lands inside
+/// `cas_real`, else `None` — a genuine symlink pointing elsewhere, which the
+/// caller records as an ordinary git symlink.
+///
+/// Workers stage a result by symlinking already-fetched `/cas/...` entries into
+/// a scratch tree (outside the CAS) and `caos put`ting it — that is how an
+/// agent's write/edit keeps every untouched sibling. The node such a link names
+/// may itself be a git symlink (materialized as a real symlink, e.g. a
+/// `CLAUDE.md -> AGENTS.md`); a plain `canonicalize()` of the staging link would
+/// resolve THROUGH it to its target and reuse that file's blob hash, flattening
+/// the symlink into a regular copy. So resolve the link one hop and canonicalize
+/// only the DIRECTORY of the node it points at, then re-attach the node's name,
+/// leaving the node's own symlink-ness for the caller to preserve.
+fn cas_node(link: &Path, cas_real: &Path) -> Option<PathBuf> {
+    let hop = std::fs::read_link(link).ok()?;
+    let hop = if hop.is_absolute() {
+        hop
+    } else {
+        link.parent()?.join(hop)
+    };
+    let dir = hop.parent()?;
+    let name = hop.file_name()?;
+    if let Ok(dir) = dir.canonicalize() {
+        let node = dir.join(name);
+        if node != cas_real && node.starts_with(cas_real) {
+            return Some(node);
+        }
+    }
+    None
+}
+
 /// Hash `path` into git objects without storing anything. Same shape rules as
 /// [`store`]: symlinks into the CAS reuse their recorded hash, other symlinks
 /// are blobs holding the link target, directories are trees.
@@ -1569,25 +1616,26 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
 
     if ft.is_symlink() {
         if let Some(cas_real) = cas_real {
-            if let Ok(canon) = path.canonicalize() {
-                if canon != cas_real && canon.starts_with(cas_real) {
-                    let (mode, oid) = cas_entry(&canon)?;
-                    return Ok(Hashed {
-                        mode,
-                        oid,
-                        body: Body::Stored,
-                    });
+            if let Some(node) = cas_node(path, cas_real) {
+                let node = node.as_path();
+                // A CAS node that is itself a git symlink must be recorded AS a
+                // symlink carrying its own target, not dereferenced onto its
+                // target's content — which is what fully canonicalizing the
+                // staging link would do, silently rewriting a symlink into a
+                // regular copy (e.g. a `CLAUDE.md -> AGENTS.md` staged untouched
+                // by an agent turn).
+                if node.is_symlink() {
+                    return link_entry(node);
                 }
+                let (mode, oid) = cas_entry(node)?;
+                return Ok(Hashed {
+                    mode,
+                    oid,
+                    body: Body::Stored,
+                });
             }
         }
-        let link = std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let target = link.as_os_str().as_bytes().to_vec();
-        let oid = hash_bytes("blob", &target)?;
-        return Ok(Hashed {
-            mode: EntryKind::Link.into(),
-            oid,
-            body: Body::Link(target),
-        });
+        return link_entry(path);
     }
 
     if ft.is_dir() {
