@@ -16,7 +16,7 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{load_conversation_workspace, publish_conversation_pr};
+use super::workspace::{commit_working_tree, load_conversation_workspace, publish_conversation_pr};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -595,6 +595,7 @@ impl Composer {
 enum CommandAction {
     From,
     Title,
+    UpdateTree,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -603,20 +604,30 @@ struct Command {
     usage: &'static str,
     description: &'static str,
     action: CommandAction,
+    takes_argument: bool,
 }
 
-const COMMANDS: [Command; 2] = [
+const COMMANDS: [Command; 3] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
         description: "start a conversation from a completed turn",
         action: CommandAction::From,
+        takes_argument: true,
     },
     Command {
         name: "/title",
         usage: "/title <new title>",
         description: "rename the selected conversation",
         action: CommandAction::Title,
+        takes_argument: true,
+    },
+    Command {
+        name: "/update-tree",
+        usage: "/update-tree <message>",
+        description: "fold working-tree edits into the commit",
+        action: CommandAction::UpdateTree,
+        takes_argument: true,
     },
 ];
 
@@ -1055,20 +1066,41 @@ impl App {
                 "this conversation already has an operation running".to_string();
             return;
         }
-        let Some(message) = self.selected_mut().composer.take_message() else {
+        let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
-        if let Some((command, arguments)) = parse_command(&message) {
-            if arguments.is_empty() {
+        // Resolve the prompt into the turn's message and, for `/update-tree`,
+        // the tree the human commit should carry. `/from` and `/title` are not
+        // turns and return here; everything else falls through to run one.
+        let mut human_tree = None;
+        let message = if let Some((command, arguments)) = parse_command(&raw) {
+            if command.takes_argument && arguments.is_empty() {
                 self.selected_mut().status = format!("usage: {}", command.usage);
-            } else {
-                match command.action {
-                    CommandAction::From => self.start_from_hash(arguments),
-                    CommandAction::Title => self.rename_selected(arguments),
+                return;
+            }
+            match command.action {
+                CommandAction::From => {
+                    self.start_from_hash(arguments);
+                    return;
+                }
+                CommandAction::Title => {
+                    self.rename_selected(arguments);
+                    return;
+                }
+                CommandAction::UpdateTree => {
+                    match commit_working_tree(arguments, &self.repo_dir) {
+                        Ok(tree) => human_tree = Some(tree),
+                        Err(error) => {
+                            self.selected_mut().status = error;
+                            return;
+                        }
+                    }
+                    arguments.to_string()
                 }
             }
-            return;
-        }
+        } else {
+            raw
+        };
         {
             let state = self.selected_mut();
             state.apply_automatic_title(&message);
@@ -1093,12 +1125,19 @@ impl App {
         let repo_dir = self.repo_dir.clone();
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                run_chat_turn(&transport, &options, &conversation, &message, |event| {
-                    let _ = tx.send(UiMessage::Turn {
-                        conversation: conversation.clone(),
-                        event,
-                    });
-                })
+                run_chat_turn(
+                    &transport,
+                    &options,
+                    &conversation,
+                    &message,
+                    human_tree.as_deref(),
+                    |event| {
+                        let _ = tx.send(UiMessage::Turn {
+                            conversation: conversation.clone(),
+                            event,
+                        });
+                    },
+                )
                 .map(|_| ())
             });
             if let Err(error) = result {
@@ -2055,7 +2094,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/title"]
+            ["/from", "/title", "/update-tree"]
         );
 
         assert!(composer.select_command(1));
@@ -2087,6 +2126,11 @@ mod tests {
         let (command, arguments) = parse_command("/from\nabc123").unwrap();
         assert_eq!(command.action, CommandAction::From);
         assert_eq!(arguments, "abc123");
+
+        let (command, arguments) = parse_command("/update-tree include this text").unwrap();
+        assert_eq!(command.action, CommandAction::UpdateTree);
+        assert_eq!(arguments, "include this text");
+        assert!(command.takes_argument);
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
@@ -2132,6 +2176,9 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("> /from <commit> — start a conversation from a completed turn"));
         assert!(rendered.contains("/title <new title> — rename the selected conversation"));
+        assert!(
+            rendered.contains("/update-tree <message> — fold working-tree edits into the commit")
+        );
     }
 
     #[test]

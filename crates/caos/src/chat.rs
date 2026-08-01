@@ -475,7 +475,7 @@ fn run_cli_turn(
     name: &str,
     message: &str,
 ) -> Result<(), String> {
-    run_chat_turn(t, options, name, message, |event| match event {
+    run_chat_turn(t, options, name, message, None, |event| match event {
         TurnEvent::PhaseComplete {
             label,
             elapsed_secs,
@@ -937,6 +937,7 @@ pub fn run_chat_turn(
     options: &TurnOptions,
     name: &str,
     message: &str,
+    human_tree: Option<&str>,
     mut emit: impl FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     let refname = validated_refname(t, name)?;
@@ -944,17 +945,30 @@ pub fn run_chat_turn(
         return Err("empty message".to_string());
     }
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
-    turn(t, options, name, &refname, message.trim(), &mut emit)
+    turn(
+        t,
+        options,
+        name,
+        &refname,
+        message.trim(),
+        human_tree,
+        &mut emit,
+    )
 }
 
 /// One turn: mint the human commit, run llm-step over it, emit progress, and
 /// advance the conversation ref.
+///
+/// `human_tree`, when set, is the tree the human commit carries instead of
+/// inheriting the parent's — this is how a client folds local working-tree
+/// edits into a user-authored turn (the TUI's `/update-tree`).
 fn turn(
     t: &GitTransport,
     options: &TurnOptions,
     name: &str,
     refname: &str,
     message: &str,
+    human_tree: Option<&str>,
     emit: &mut dyn FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     // Everything that can fail cheaply fails *before* the human commit is
@@ -1009,13 +1023,27 @@ fn turn(
         ));
     }
 
-    // Mint the human turn: parent = head/base, tree = parent's tree (human
-    // turns are text-only for now), message = the user's text, author = the
-    // user's git identity.
-    let tree = t
-        .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
-        .trim()
-        .to_string();
+    // Mint the human turn: parent = head/base, message = the user's text,
+    // author = the user's git identity. The tree is the parent's (human turns
+    // are text-only) unless the client supplied one — a working-tree snapshot
+    // folded in by `/update-tree`, which must not carry the harness's reserved
+    // top-level `.caos` entry.
+    let tree = match human_tree {
+        Some(tree) => {
+            if rev_parse_opt(t, &format!("{tree}:.caos"))?.is_some() {
+                return Err(
+                    "the working tree contains a top-level `.caos` entry, which is reserved \
+                     for the agent harness; remove it before folding the tree into a turn"
+                        .to_string(),
+                );
+            }
+            tree.to_string()
+        }
+        None => t
+            .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
+            .trim()
+            .to_string(),
+    };
     let human = t
         .git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
         .trim()

@@ -71,9 +71,12 @@ time that user opens the TUI.
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
 TUI. Enter `/title <new title>` to change the shared title without changing the
-conversation ID or HEAD. Activity entries show the durable hashes of internal
-harness steps for inspection; those step trees contain harness metadata and are
-not branch points.
+conversation ID or HEAD. Enter `/update-tree <message>` to send an ordinary
+user turn whose commit also folds in your current working-tree changes — the
+intended companion to `Ctrl+L` (check out the head, edit files, then
+`/update-tree <message>` with the text you want in that turn). Activity entries
+show the durable hashes of internal harness steps for inspection; those step
+trees contain harness metadata and are not branch points.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -142,6 +145,24 @@ advance `caos/<conversation>` with clean snapshot commits, push that branch to
 `origin`, and use the authenticated `gh` CLI to find or open its pull request.
 The clean branch deliberately excludes the conversation's internal step DAG and
 `.caos` metadata.
+
+`/update-tree <message>` is the one command that reads the working tree back
+into a conversation. It sends an ordinary user turn — authored by your git
+identity, carrying your `<message>` — but the turn's commit takes its tree from
+your local checkout instead of inheriting the head's. It first commits your
+working tree: `git add -A` then a commit with `<message>` when the tree is
+dirty (nothing is committed if you already committed the changes yourself). So
+the snapshot covers tracked edits, new files, and deletions, honoring
+`.gitignore`, and — because your changes are now committed — the checkout is
+left clean. That matters: after a later agent turn you can press `Ctrl+L` again
+to check out the new head without the clean-tree guard tripping on leftover
+local changes. The agent then runs over the changes you folded in. A working
+tree carrying the harness's reserved top-level `.caos` entry is refused.
+
+The intended loop is `Ctrl+L` (check out the head) → edit files → `/update-tree
+<message>` → let the agent respond → `Ctrl+L` again. You can also commit the
+changes yourself first and then run `/update-tree <message>`; the already-clean
+tree is committed no further and its `HEAD` tree is what the turn receives.
 
 API responses currently arrive one completed model round at a time. The
 backend also does not yet provide reliable cancellation for a running turn;
