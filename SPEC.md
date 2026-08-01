@@ -85,7 +85,7 @@ Caos is fast because:
 Two things need to be fast:
 - Primary: Rebuild and retest everything: `time CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool test`
     - This doesn't rebuild the stack-builder image from the flake, because that's just a function of the flake and is cached in docker
-- Secondary: Build and restart on the host: `time nix build && time result/bin/caosd up`
+- Secondary: Build and restart on the host: `time nix build && time result/bin/caosd up`. Not part of the normal dev loop
 
 We have various kinds of salt to control what work gets redone:
 - `CAOS_SALT=$(date --iso=s)` to rerun all caos workers (but not rebuild flakes, which do not include this in their key)

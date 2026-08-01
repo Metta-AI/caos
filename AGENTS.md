@@ -43,8 +43,8 @@ Every script here runs with it, and two constructs quietly break under it.
 
 # Before committing
 
-- **Never read a gate's exit status through a pipe.** `caosd up 2>&1 | tail`
-  reports `tail`'s status, so a failed deploy looks like a pass — that happened,
+- **Never read a gate's exit status through a pipe.** `cmd 2>&1 | tail`
+  reports `tail`'s status, so a failed command looks like a pass — that happened,
   and the next step ran against a stack that was not up. Use
   `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
 - If this doesn't catch everything, we need to add it to the above step

@@ -528,9 +528,9 @@ the cache key, never hidden inside a memoized computation.
 
 ## Local testing
 
-Build the stack with `nix build`
-
-Run the dev stack with `results/bin/caosd up`
+- Build the stack with `nix build`
+- Run the dev stack with `results/bin/caosd up`
+- Test with `caos-cli run-tool test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
 
 ```bash
 caosd up      # bring the stack up + publish all of std, then return. Updates it if already running
