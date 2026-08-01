@@ -1703,7 +1703,8 @@ impl App {
         } else if self.confirm_action != Some(ConfirmAction::Load) {
             self.confirm_action = Some(ConfirmAction::Load);
             self.selected_mut().status =
-                "press Ctrl+L again to load this diff into a clean working tree".to_string();
+                "press Ctrl+L again to check out this conversation's head in a clean working tree"
+                    .to_string();
         } else {
             self.confirm_action = None;
             let diff = self
@@ -1713,7 +1714,7 @@ impl App {
                 .expect("a non-empty diff was checked")
                 .clone();
             self.selected_mut().status = match load_conversation_workspace(&diff, Path::new(".")) {
-                Ok(()) => "conversation loaded into the working tree".to_string(),
+                Ok(()) => "checked out the conversation head in the working tree".to_string(),
                 Err(error) => error,
             };
         }

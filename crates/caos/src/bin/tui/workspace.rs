@@ -1,14 +1,15 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use caos::chat::WorkspaceDiff;
 
-/// Apply a conversation's accumulated workspace change to a clean checkout.
+/// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
 /// the TUI chooses when to mutate the checkout and requires confirmation before
-/// calling it.
+/// calling it. Rather than applying the base-to-head diff as unstaged changes,
+/// this moves the local HEAD onto the conversation head commit so the checkout
+/// exactly matches it.
 pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
@@ -17,28 +18,12 @@ pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> R
     )?;
     if !dirty.is_empty() {
         return Err(
-            "the working tree is not clean; commit or stash local changes before applying the conversation workspace"
+            "the working tree is not clean; commit or stash local changes before checking out the conversation head"
                 .to_string(),
         );
     }
-    let patch = capture_required_raw(
-        "git",
-        &[
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-ext-diff",
-            "--no-color",
-            &diff.base,
-            &diff.head,
-        ],
-        cwd,
-    )?;
-    if patch.is_empty() {
-        return Ok(());
-    }
-    git_apply(&patch, true, cwd)?;
-    git_apply(&patch, false, cwd)
+    capture_required("git", &["checkout", "--detach", &diff.head], cwd)?;
+    Ok(())
 }
 
 /// Publish the virtual workspace as a clean branch without checking it out.
@@ -146,11 +131,6 @@ pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Resu
     require_success(program, output).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
-fn capture_required_raw(program: &str, args: &[&str], cwd: &Path) -> Result<Vec<u8>, String> {
-    let output = command_output(program, args, cwd)?;
-    require_success(program, output)
-}
-
 fn capture_optional(program: &str, args: &[&str], cwd: &Path) -> Result<Option<String>, String> {
     let output = command_output(program, args, cwd)?;
     if output.status.success() {
@@ -180,39 +160,6 @@ fn require_success(program: &str, output: Output) -> Result<Vec<u8>, String> {
     } else {
         detail
     })
-}
-
-fn git_apply(patch: &[u8], check: bool, cwd: &Path) -> Result<(), String> {
-    let mut command = Command::new("git");
-    command.arg("apply");
-    if check {
-        command.arg("--check");
-    }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .current_dir(cwd);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("running git apply: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("git apply stdin was not piped")?
-        .write_all(patch)
-        .map_err(|error| format!("writing patch to git apply: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("waiting for git apply: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let action = if check { "checking" } else { "applying" };
-    Err(format!(
-        "{action} the conversation workspace failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    ))
 }
 
 fn short_hash(hash: &str) -> &str {
@@ -247,14 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn load_requires_a_clean_checkout_and_applies_the_conversation_diff() {
+    fn load_requires_a_clean_checkout_and_checks_out_the_conversation_head() {
         let dir = temp_repo("load-test");
         let base = commit_file(&dir, "base\n", "base");
         let head = commit_file(&dir, "conversation result\n", "turn");
         capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
         let diff = WorkspaceDiff {
             base,
-            head,
+            head: head.clone(),
             stat: String::new(),
             patch: "changed".to_string(),
         };
@@ -264,6 +211,12 @@ mod tests {
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
             "conversation result\n"
         );
+        assert_eq!(
+            capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap(),
+            head
+        );
+
+        std::fs::write(dir.join("file.txt"), "local edit\n").unwrap();
         assert!(load_conversation_workspace(&diff, &dir)
             .unwrap_err()
             .contains("working tree is not clean"));
