@@ -1,6 +1,6 @@
 //! Terminal rendering.
 
-use ratatui_core::buffer::Buffer;
+use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::terminal::Frame;
@@ -69,7 +69,8 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(26), Constraint::Min(40)])
         .split(outer[1]);
-    let input_height = state.composer.text.split('\n').count().clamp(1, 8) as u16;
+    let composer_width = body[1].width.saturating_sub(2);
+    let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
         state.composer.command_matches().len() as u16
     } else {
@@ -792,7 +793,6 @@ fn render_composer(
     } else {
         Vec::new()
     };
-    let (row, column) = state.composer.cursor_row_col();
     let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -810,10 +810,11 @@ fn render_composer(
         inner.width.saturating_sub(2),
         command_height,
     );
+    let (row, column) = composer_cursor(&state.composer, composer_area.width);
     let inner_height = composer_height as usize;
     let vertical_scroll = row.saturating_sub(inner_height.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(composer_lines(&state.composer))
+        Paragraph::new(composer_lines(&state.composer, composer_area.width))
             .scroll((vertical_scroll.min(u16::MAX as usize) as u16, 0)),
         composer_area,
     );
@@ -842,17 +843,64 @@ fn render_composer(
     }
 }
 
-fn composer_lines(composer: &super::Composer) -> Vec<Line<'_>> {
+fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut ranges = Vec::new();
+    let mut logical_start = 0;
+    loop {
+        let logical_end = text[logical_start..]
+            .find('\n')
+            .map(|offset| logical_start + offset)
+            .unwrap_or(text.len());
+        let mut visual_start = logical_start;
+        let mut cells: u16 = 0;
+        for (offset, ch) in text[logical_start..logical_end].char_indices() {
+            let index = logical_start + offset;
+            let char_width = ch.to_string().cell_width();
+            if cells > 0 && cells.saturating_add(char_width) > width {
+                ranges.push((visual_start, index));
+                visual_start = index;
+                cells = 0;
+            }
+            cells = cells.saturating_add(char_width);
+        }
+        ranges.push((visual_start, logical_end));
+        if logical_end == text.len() {
+            break;
+        }
+        logical_start = logical_end + 1;
+    }
+    ranges
+}
+
+fn composer_visual_height(composer: &super::Composer, width: u16) -> usize {
+    let ranges = composer_visual_ranges(&composer.text, width);
+    let (row, _) = composer_cursor(composer, width);
+    ranges.len().max(row + 1)
+}
+
+fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
+    let width = width.max(1);
+    let ranges = composer_visual_ranges(&composer.text, width);
+    let row = ranges
+        .iter()
+        .rposition(|(start, end)| composer.cursor >= *start && composer.cursor <= *end)
+        .expect("the composer cursor is within its text");
+    let column = composer.text[ranges[row].0..composer.cursor].cell_width() as usize;
+    if column >= width as usize {
+        (row + 1, 0)
+    } else {
+        (row, column)
+    }
+}
+
+fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
     let selection = composer.selection_range();
     let selection_style = Style::default().fg(Color::Black).bg(Color::Cyan);
-    let mut offset = 0;
-    composer
-        .text
-        .split('\n')
-        .map(|line| {
-            let line_start = offset;
-            let line_end = line_start + line.len();
-            offset = line_end + 1;
+    composer_visual_ranges(&composer.text, width)
+        .into_iter()
+        .map(|(line_start, line_end)| {
+            let line = &composer.text[line_start..line_end];
             let Some((selection_start, selection_end)) = selection else {
                 return Line::raw(line);
             };
@@ -984,10 +1032,38 @@ mod tests {
         composer.insert_str("one two");
         composer.select_word_left();
 
-        let lines = composer_lines(&composer);
+        let lines = composer_lines(&composer, 80);
 
         assert_eq!(lines[0].spans[1].content, "two");
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::Black));
         assert_eq!(lines[0].spans[1].style.bg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn composer_soft_wraps_and_places_the_cursor_on_visual_rows() {
+        let mut composer = super::super::Composer::default();
+        composer.insert_str("abcdefghij");
+
+        let lines = composer_lines(&composer, 4);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content, "abcd");
+        assert_eq!(lines[1].spans[0].content, "efgh");
+        assert_eq!(lines[2].spans[0].content, "ij");
+        assert_eq!(composer_cursor(&composer, 4), (2, 2));
+        assert_eq!(composer_visual_height(&composer, 4), 3);
+    }
+
+    #[test]
+    fn composer_wrap_counts_terminal_cell_width() {
+        let mut composer = super::super::Composer::default();
+        composer.insert_str("ab界c");
+
+        let lines = composer_lines(&composer, 4);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content, "ab界");
+        assert_eq!(lines[1].spans[0].content, "c");
+        assert_eq!(composer_cursor(&composer, 4), (1, 1));
     }
 }
