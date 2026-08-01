@@ -2562,14 +2562,14 @@ fn std_tree() -> Result<String, String> {
     Ok(hash)
 }
 
-/// `curry <image> -- [--name=value ...]` — bind arguments to `<image>`, printing
-/// a ref (a git hash) to the resulting curried image. The ref can be `run` —
-/// which supplies the rest of the args — or `curry`'d again, exactly like any
-/// image; the binding is partial application, not a rebuilt container image.
-/// This is the *worker* form: path args resolve against `/cas`. (The CLI's is
-/// [`cli_curry`].)
+/// `curry <arg tree> -- [--name=value ...]` — bind arguments to `<image>`, printing
+/// a ref (a git hash) to the new arg tree that includes the new args.
+/// The ref can be `run` — which supplies the rest of the args —
+/// or `curry`'d again, exactly like any other arg tree; the binding is partial
+/// application, not a rebuilt container image. This is the *worker* form: path
+/// args resolve against `/cas`. (The CLI's is [`cli_curry`].)
 ///
-/// The curried image is a small CAS tree: a `base` blob (the underlying image
+/// The curried arg tree is a small CAS tree: a `base` blob (the underlying image
 /// ref), an `args` subtree (the bound args, in `build_arg_entries` shape), and a
 /// [`CURRY_MARKER`] blob. Currying flattens: if `<image>` is itself curried, its
 /// bindings are folded in and `base` stays a plain (docker/git) image, so the

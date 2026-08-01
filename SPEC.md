@@ -14,37 +14,42 @@ A WorkResult is a git object, containing whatever the worker chose to return
 WorkRequest contains ArgTree, stack, trace id, etc #todo
 - The ArgTree is the cache key
 
+We generally talk about ArgTrees, not images. An image is just one arg (see
+below), so one simple ArgTree is one that only contains an image; richer
+ArgTrees carry other args alongside it. Passing around ArgTrees rather than
+images is what makes currying (below) a uniform operation.
+
 Also note in calling that rebinding existing args is an error #todo
 
-# Image
+# Forming an ArgTree
 
-Work is run in a container, described by an image. There are several forms of this:
+The simplest ArgTree is one that only specifies an image
 
 ## Docker digest
 
-"docker://<docker url>" (a string), using a hash/digest, not a tag
+image = "docker://<docker url>" (a string), using a hash/digest, not a tag
+
+## A flake
+
+image = git tree, containing a flake.nix and flake.lock, which are used to build the image
 
 ## Git-tree image
 
-A git tree with the following structure:
+image = git tree with the following structure:
 - base: an image ref
 - overlay (optional): a git tree that will sit on top of the base
     - non-standard ownership or perms can be represented with a sidecar foo.caosmeta file for a given file foo
 - env: #todo
 
-## A flake
-
-Also a git tree, but containing a flake.nix and flake.lock, which are used to build the image
-
 ## Currying
 
-Importantly, we don't pass around images. Instead, we pass around ArgTrees. These might contain only an image, or they might contain other args. Thus, we can easily support a curry operation that takes an ArgTree, and returns a new ArgTree, now with more args
+Currying takes an ArgTree and args and returns a new ArgTree, binding the existing args and the new args
 
 Curry shall fail if passed an arg that is already defined in the WorkRequest
 
 ## Caos overlay
 
-When caos is asked to run any docker image, it adds in its own overlay, containing /bin/caos, /etc/passwd and /etc/group. #todo more here
+When caos is asked to run any docker image, it adds in its own overlay, containing /bin/caos, /etc/passwd and /etc/group. #todo more here0
 
 # Principles of reliability
 
