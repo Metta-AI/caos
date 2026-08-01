@@ -47,9 +47,16 @@ Currying takes an ArgTree and args and returns a new ArgTree, binding the existi
 
 Curry shall fail if passed an arg that is already defined in the WorkRequest
 
-## Caos overlay
+# Workers
 
-When caos is asked to run any docker image, it adds in its own overlay, containing /bin/caos, /etc/passwd and /etc/group. #todo more here0
+When caos gets a WorkRequest, it builds the image specified by the ArgTree. When doing this, it adds a few pieces to the image:
+- /bin/caos: the binary used by the worker to communicate with caos
+- a worker user, distinct from root, so that caos can prevent the worker from tampering with content-addressable files
+
+Add more about the contract with the worker #todo
+- get/put, unreadable files, +x preservation
+- /cas/out
+- run-then, map-then
 
 # Principles of reliability
 
