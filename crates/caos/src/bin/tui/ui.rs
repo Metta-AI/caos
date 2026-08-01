@@ -794,7 +794,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
-        Line::raw("  Ctrl+L twice    check out the conversation commit locally"),
+        Line::raw("  Ctrl+L          check out the conversation commit locally"),
         Line::raw("  Ctrl+P twice    publish a clean branch and open a PR"),
         Line::raw("  Ctrl+N          start a new conversation"),
         Line::raw("  Esc             focus the conversation list"),
@@ -1015,7 +1015,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             "^S"
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^L checkout  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
