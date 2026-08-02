@@ -139,16 +139,43 @@ fn main() {
         "uploadpack.allowAnySHA1InWant",
         "true",
     ]);
-    // Never let git auto-gc this repo. `git-receive-pack` (which http-backend
-    // spawns on every push) forks a background `git gc --auto` once loose
-    // objects cross gc.auto; that repack rewrites the object store while a
-    // concurrent `git-upload-pack` is streaming a fetch from it, which can
-    // truncate the pack and surface on the client as the intermittent
-    // `fetch-pack: invalid index-pack output`. The likelihood grows with
-    // accumulated objects, so a long-lived stack degrades. Client repos already
-    // set `gc.auto 0`; do the same here, unconditionally so an already-seeded
-    // repo is healed on the next restart (not just fresh ones).
+    // Never let git rewrite this repo's object store behind our back.
+    // `git-receive-pack` (which http-backend spawns on every push) forks a
+    // background repack; that rewrites the object store while a concurrent
+    // `git-upload-pack` is streaming a fetch from it, which can truncate the
+    // pack and surface on the client as the intermittent `fetch-pack: invalid
+    // index-pack output`. Worse, we hold the same repo open as a
+    // `gix::ThreadSafeRepository`: when its object database re-consolidates
+    // against packs that moved under it, gix asserts ("if the generation
+    // changed, the slot index must have changed for sure") and the panic
+    // unwinds that request's thread. tiny_http then answers a bare 500 from
+    // `Drop`, so the caller sees a body-less `500 Internal Server Error` and
+    // nothing at all appears in this log.
+    //
+    // THREE settings, because one is no longer enough. `gc.auto 0` gates only
+    // the `gc` task; git 2.54 added a `geometric-repack` maintenance task that
+    // ignores every gc knob (`gc.auto`, `gc.autoPackLimit`,
+    // `maintenance.gc.enabled` — all measured, all repack anyway). So also
+    // refuse the auto-maintenance hook outright, and disable the task by name
+    // for any path that reaches it another way.
+    //
+    // `--cruft` is why this is data loss and not just a crash: nearly every
+    // object here is unreachable from a ref (results and trees are addressed
+    // by hash), so a cruft repack sorts the CAS into a cruft pack and drops
+    // whatever has not been touched in two weeks — while redis keeps handing
+    // out result hashes that point at it.
+    //
+    // Unconditional, so an already-seeded repo is healed on the next restart
+    // and not just a fresh one.
     git(&["-C", &git_dir, "config", "gc.auto", "0"]);
+    git(&["-C", &git_dir, "config", "receive.autogc", "false"]);
+    git(&[
+        "-C",
+        &git_dir,
+        "config",
+        "maintenance.geometric-repack.enabled",
+        "false",
+    ]);
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
