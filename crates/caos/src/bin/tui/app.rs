@@ -1370,6 +1370,7 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
             self.start_new_conversation(None);
+            self.focus = Focus::Conversation;
             return;
         }
         if self.focus == Focus::List
@@ -3005,6 +3006,19 @@ mod tests {
         app.focus = Focus::Conversation;
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_ne!(app.selected().status, "ready");
+    }
+
+    #[test]
+    fn ctrl_n_focuses_the_new_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        // Pressing Ctrl+N from the list moves focus into the conversation so
+        // the composer is ready for the first prompt, regardless of whether
+        // minting the conversation reaches a remote.
+        app.focus = Focus::List;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.focus, Focus::Conversation);
     }
 
     #[test]
