@@ -60,6 +60,7 @@ focus back to the list. The focused pane's border is highlighted.
 | `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
 | `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
 | `Ctrl+W` (conversation focused) | Delete the previous word |
+| `Ctrl+K` (conversation focused) | Kill from the cursor to the end of the line |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation (from either focus) and focus it |
 | `Ctrl+Q` | Switch between conversation and workspace changes |

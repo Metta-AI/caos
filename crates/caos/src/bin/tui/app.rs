@@ -310,6 +310,22 @@ impl Composer {
         self.delete_range(self.cursor, end);
     }
 
+    fn kill_line(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let (_, end) = self.line_bounds();
+        if self.cursor == end {
+            // Already at the end of the line: swallow the newline, joining the
+            // next line onto this one (matching readline's Ctrl+K).
+            if end < self.text.len() {
+                self.delete_range(self.cursor, self.cursor + 1);
+            }
+            return;
+        }
+        self.delete_range(self.cursor, end);
+    }
+
     fn word_left(&self) -> usize {
         let mut chars = self.text[..self.cursor].char_indices().rev().peekable();
         while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
@@ -1506,6 +1522,9 @@ impl App {
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.delete_word_left()
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.kill_line()
             }
             KeyCode::Char(ch)
                 if !key
@@ -2988,6 +3007,27 @@ mod tests {
         assert_eq!(app.selected().composer.text, "one two ");
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(app.selected().composer.text, "one ");
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_the_end_of_the_line_in_the_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("first\nsecond");
+        app.selected_mut().composer.move_home();
+
+        // Kill from the cursor to the end of the current line, leaving the
+        // preceding line and its newline intact.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "first\n");
+
+        // With the cursor already at a line's end, a second Ctrl+K swallows the
+        // newline, joining the next line onto this one.
+        app.selected_mut().composer.clear();
+        app.selected_mut().composer.insert_str("first\nsecond");
+        app.selected_mut().composer.move_vertical(true);
+        app.selected_mut().composer.move_end();
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "firstsecond");
     }
 
     #[test]
