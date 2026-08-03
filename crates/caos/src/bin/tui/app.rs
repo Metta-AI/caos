@@ -411,6 +411,7 @@ impl Composer {
         self.snap_cursor_after_placeholder();
     }
 
+    #[cfg(test)]
     fn cursor_row_col(&self) -> (usize, usize) {
         let before = &self.text[..self.cursor];
         let row = before.bytes().filter(|byte| *byte == b'\n').count();
