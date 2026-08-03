@@ -127,6 +127,19 @@ let
       ${muslCCEnvName} = "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
     }
   );
+
+  # The image builder may run on a different platform from the Linux worker
+  # contents. Use tools for the platform executing fakeRootCommands while
+  # continuing to inflate the Linux-built dependency archive.
+  inflateWith = buildPkgs: ''
+    wsroot=$(cat ws-root)
+    targetdir=$(cat target-dir)
+    mkdir -p ".$targetdir"
+    ${buildPkgs.gnutar}/bin/tar --use-compress-program=${buildPkgs.zstd}/bin/zstd \
+      -xf ${deps}/target.tar.zst -C ".$targetdir"
+    chown -R 1000:1000 ".$wsroot"
+    chmod -R u+w ".$wsroot"
+  '';
 in
 {
   inherit
@@ -138,6 +151,7 @@ in
     muslCCEnv
     deps
     craneLib
+    inflateWith
     ;
 
   # The image root shared by both consumers: only the two recorded paths. The
@@ -172,13 +186,5 @@ in
   # (uid 1000 — it materializes sources at the workspace root and cargo
   # rewrites target/). Crane archives the CONTENTS of CARGO_TARGET_DIR, so
   # extract at $targetdir, not $wsroot.
-  inflate = ''
-    wsroot=$(cat ws-root)
-    targetdir=$(cat target-dir)
-    mkdir -p ".$targetdir"
-    ${pkgs.gnutar}/bin/tar --use-compress-program=${pkgs.zstd}/bin/zstd \
-      -xf ${deps}/target.tar.zst -C ".$targetdir"
-    chown -R 1000:1000 ".$wsroot"
-    chmod -R u+w ".$wsroot"
-  '';
+  inflate = inflateWith pkgs;
 }
