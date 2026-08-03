@@ -74,10 +74,14 @@ focus back to the list. The focused pane's border is highlighted.
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over visible transcript text | Select and copy rendered text |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
-| `Ctrl+L` twice | Check out the selected conversation's head commit in the working tree |
+| `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
+
+Command failures are appended as red `Error` entries at the bottom of the
+conversation transcript. The header remains available for the current or last
+successful operation status.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
@@ -147,15 +151,16 @@ Press `Ctrl+Y` or `Escape` to resume.
 
 Agent workspaces remain virtual commit trees under independent conversation
 refs. Opening, switching, and running conversations never overwrite the working
-checkout. Loading changes requires two `Ctrl+L` presses and a clean working
+checkout. Loading changes requires one `Ctrl+L` press and a clean working
 tree, then detaches HEAD onto the conversation's head commit so the checkout
 matches it exactly.
 
 Publishing also leaves the checkout untouched. Two `Ctrl+P` presses create or
-advance `caos/<conversation>` with clean snapshot commits, push that branch to
-`origin`, and use the authenticated `gh` CLI to find or open its pull request.
-The clean branch deliberately excludes the conversation's internal step DAG and
-`.caos` metadata.
+replace `caos/<conversation>` with one clean snapshot commit, push that branch
+to `origin`, and use the authenticated `gh` CLI to find or open its pull
+request. Republish replaces that commit instead of retaining earlier snapshots,
+and the clean branch excludes the conversation's internal step DAG and `.caos`
+metadata.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git

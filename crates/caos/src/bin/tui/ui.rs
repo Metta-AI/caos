@@ -315,7 +315,7 @@ fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame
         paragraph
             .block(
                 Block::default()
-                    .title(" Conversation ")
+                    .title(format!(" Conversation — {} ", state.status))
                     .border_style(border_style)
                     .borders(Borders::ALL),
             )
@@ -955,7 +955,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         )
     } else {
         Line::raw(
-            " ^Enter sends  Enter/^J newline  ^A/^E line ends  ^W del word  Esc focuses list  ^T activity  ^C quit",
+            " ^Enter sends  Enter/^J newline  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  Esc list  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);
