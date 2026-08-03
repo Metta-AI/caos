@@ -355,6 +355,16 @@ fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
         lines.extend(entry.text.lines().map(inline_markdown_line));
         lines.push(Line::raw(""));
     }
+    if !state.is_busy() && !state.status.is_empty() {
+        lines.push(Line::styled(
+            "Status",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.extend(state.status.lines().map(inline_markdown_line));
+        lines.push(Line::raw(""));
+    }
     Paragraph::new(lines).wrap(Wrap { trim: false })
 }
 
@@ -795,7 +805,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
         Line::raw("  Ctrl+L          check out the conversation commit locally"),
-        Line::raw("  Ctrl+P twice    publish a clean branch and open a PR"),
+        Line::raw("  Ctrl+P twice    publish a replaceable snapshot and open a PR"),
         Line::raw("  Ctrl+N          start a new conversation"),
         Line::raw("  Esc             focus the conversation list"),
         Line::raw("  Ctrl+E          archive from the conversation list"),
@@ -1015,7 +1025,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             "^S"
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^L checkout  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);

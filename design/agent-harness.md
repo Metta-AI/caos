@@ -276,13 +276,17 @@ Two verbs and a full-screen client over one turn engine (implemented —
   and freezes redraws for native terminal text selection. `Ctrl+L` checks out
   the selected conversation commit as a detached HEAD after requiring a clean
   host checkout. `Ctrl+H` opens the keyboard and slash-command reference.
-  Double `Ctrl+P` publishes the
-  selected workspace without checking it out: it advances a clean
-  `caos/<conversation>` snapshot branch, pushes to `origin`, and opens or finds
-  its PR through `gh`. Merely opening, running, switching, or publishing
-  conversations never mutates the checkout. Progress remains one completed API
-  round at a time, and a running turn is not cancellable until the server/runner
-  protocol grows cancellation.
+  Double `Ctrl+P` publishes the selected workspace without checking it out: it
+  replaces the clean `caos/<conversation>` snapshot commit directly above the
+  fetched tip of `origin`'s advertised default branch. Its tree is a checkout-
+  free three-way merge of that tip with the conversation head; conflicts stop
+  publication and are reported in the chat. CAOS pushes the snapshot with an
+  exact remote lease and opens or finds its open PR through `gh` against the
+  same branch. This preserves non-conflicting upstream and chained-conversation
+  filesystem changes while excluding all prior conversation history. Merely
+  opening, running, switching, or publishing conversations never mutates the
+  checkout. Progress remains one completed API round at a time, and a running
+  turn is not cancellable until the server/runner protocol grows cancellation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>` (in

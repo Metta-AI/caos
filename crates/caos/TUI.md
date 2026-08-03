@@ -80,6 +80,10 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
+Command failures are appended as red `Error` entries at the bottom of the
+conversation transcript. Other operation updates appear in a `Status` block at
+the bottom; the conversation title never carries status or error text.
+
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
 TUI. Enter `/title <new title>` to change the shared title without changing the
@@ -153,10 +157,16 @@ tree, then detaches HEAD onto the conversation's head commit so the checkout
 matches it exactly.
 
 Publishing also leaves the checkout untouched. Two `Ctrl+P` presses create or
-advance `caos/<conversation>` with clean snapshot commits, push that branch to
-`origin`, and use the authenticated `gh` CLI to find or open its pull request.
-The clean branch deliberately excludes the conversation's internal step DAG and
-`.caos` metadata.
+replace `caos/<conversation>` with one clean snapshot commit directly above the
+fetched tip of `origin`'s advertised default branch. Before creating it, CAOS
+three-way merges that tip with the conversation head without touching the
+checkout or index. Non-conflicting upstream changes survive; a conflict stops
+publication and lists its paths in the chat. CAOS pushes the clean snapshot and
+uses the authenticated `gh` CLI to find or open its pull request against the
+same default branch. Republish replaces the commit instead of retaining earlier
+snapshots, and the branch excludes the conversation's internal step DAG and
+`.caos` metadata even when one conversation starts from another conversation's
+head.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git
