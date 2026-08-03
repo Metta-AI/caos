@@ -59,7 +59,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
-| `build-builtins.sh`, `test-*.sh` | Local dev + integration tests |
+| `build-builtins.sh`, `caos-tools/*.sh` | Local dev + integration tests |
 
 ## Development
 
@@ -529,7 +529,7 @@ the cache key, never hidden inside a memoized computation.
 ## Local testing
 
 - Build the stack with `nix build`
-- Run the dev stack with `results/bin/caosd up`
+- Run the dev stack with `result/bin/caosd up`
 - Test with `caos-cli run-tool test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
 
 ```bash
