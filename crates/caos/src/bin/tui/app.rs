@@ -1495,12 +1495,14 @@ impl App {
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.selected_mut().composer.move_word_right()
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.selected_mut().composer.insert_char('\n')
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.selected_mut().composer.complete_command() {
+                    self.start_turn();
+                }
             }
             KeyCode::Enter => {
                 if !self.selected_mut().composer.complete_command() {
-                    self.start_turn();
+                    self.selected_mut().composer.insert_char('\n');
                 }
             }
             KeyCode::Tab => {
@@ -2007,11 +2009,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_and_ctrl_j_insert_newlines() {
+    fn enter_and_ctrl_j_insert_newlines() {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.selected_mut().composer.insert_str("first");
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.selected_mut().composer.insert_str("second");
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
 
@@ -2777,7 +2779,7 @@ mod tests {
         assert!(rendered.contains("$ cargo test"));
         assert!(rendered.contains("Ctrl+T expands"));
         assert!(rendered.contains("follow-up"));
-        assert!(rendered.contains("Shift+Enter/^J newline"));
+        assert!(rendered.contains("Enter/^J newline"));
         assert!(!rendered.contains("Alt+Enter"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -3074,7 +3076,7 @@ mod tests {
             .composer
             .insert_str("/title Mutable title");
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
         assert_eq!(app.selected().id, "stable-id");
         assert_eq!(app.selected().title, "Mutable title");

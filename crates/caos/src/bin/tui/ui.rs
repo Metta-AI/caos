@@ -907,7 +907,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         )
     } else {
         Line::raw(
-            " Enter sends  Shift+Enter/^J newline  ^A/^E line ends  ^W del word  Esc focuses list  ^T activity  ^C quit",
+            " ^Enter sends  Enter/^J newline  ^A/^E line ends  ^W del word  Esc focuses list  ^T activity  ^C quit",
         )
     };
     frame.render_widget(Paragraph::new(footer), area);
