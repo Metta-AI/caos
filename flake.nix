@@ -350,7 +350,7 @@
           # then pushes it again.
           contents = cargoDef.contents;
           config = cargoDef.config;
-          fakeRootCommands = cargoDef.fakeRootCommands;
+          fakeRootCommands = cargoBake.inflateWith pkgs;
         };
 
         # ---- The stack root ----
@@ -495,7 +495,7 @@
               "CAOS_GRANT_ENGINE_SOCKET=1"
             ];
           };
-          fakeRootCommands = cargoBake.inflate + ''
+          fakeRootCommands = cargoBake.inflateWith pkgs + ''
             ln -sf bash bin/sh
             # Workers scratch under /tmp; a bare nix root has none.
             mkdir -p tmp
