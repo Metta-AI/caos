@@ -39,6 +39,7 @@ if [ "$ok" = 0 ] || [ ! -e r2/exit ] || [ "$(cat r2/exit)" != "0" ]; then
   # unit-test, which puts stdout last for the same reason.
   echo "---- stdout ----" >&2; cat r2/stdout >&2 || true
   echo "---- stderr ----" >&2; cat r2/stderr >&2 || true
+  if [ "$ok" = 0 ] || [ ! -e r2/exit ]; then infra "cargo worker did not run"; fi
   fail "clippy failed"
 fi
 echo "unit-clippy: ALL PASS" >&2

@@ -31,6 +31,7 @@ if [ "$ok" = 0 ] || [ ! -e r3/exit ] || [ "$(cat r3/exit)" != "0" ]; then
   # inlines a failing test's LAST lines.
   echo "---- stdout ----" >&2; cat r3/stdout >&2 || true
   echo "---- stderr ----" >&2; cat r3/stderr >&2 || true
+  if [ "$ok" = 0 ] || [ ! -e r3/exit ]; then infra "cargo worker did not run"; fi
   fail "doc failed"
 fi
 echo "unit-doc: ALL PASS" >&2

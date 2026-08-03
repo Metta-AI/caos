@@ -27,6 +27,7 @@ if [ "$ok" = 0 ] || [ ! -e r4/exit ] || [ "$(cat r4/exit)" != "0" ]; then
   # inlines a failing test's LAST lines.
   echo "---- stderr ----" >&2; cat r4/stderr >&2 || true
   echo "---- stdout ----" >&2; cat r4/stdout >&2 || true
+  if [ "$ok" = 0 ] || [ ! -e r4/exit ]; then infra "cargo worker did not run"; fi
   fail "fmt failed"
 fi
 echo "unit-fmt: ALL PASS" >&2

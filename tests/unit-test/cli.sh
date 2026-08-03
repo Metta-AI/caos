@@ -45,6 +45,10 @@ if [ "$ok" = 0 ] || [ ! -e r1/exit ] || [ "$(cat r1/exit)" != "0" ]; then
   # unit-clippy and unit-doc want the opposite order, and say so.
   echo "---- stderr ----" >&2; cat r1/stderr >&2 || true
   echo "---- stdout ----" >&2; cat r1/stdout >&2 || true
+  # Split the outcome: no result at all (the caos run failed, or no exit file)
+  # is INFRA — the cargo worker never ran, so this is uncached and retried, not
+  # a cached red. A result whose exit is non-zero is the test's own verdict.
+  if [ "$ok" = 0 ] || [ ! -e r1/exit ]; then infra "cargo worker did not run"; fi
   fail "unit tests failed"
 fi
 echo "unit-test: ALL PASS" >&2
