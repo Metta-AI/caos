@@ -53,8 +53,8 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+E` (list focused) | Archive the selected conversation for this user |
 | `Escape` (conversation focused) | Dismiss slash-command matches, else focus the list |
 | `Ctrl+A` / `Ctrl+E` (conversation focused) | Move to the start / end of the current line |
-| `Enter` | Send the prompt |
-| `Alt+Enter` or `Ctrl+J` | Insert a newline |
+| `Ctrl+S` | Send the prompt (`Ctrl+Enter` also works in terminals with enhanced keyboard input) |
+| `Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
 | `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
@@ -63,6 +63,7 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+K` (conversation focused) | Kill from the cursor to the end of the line |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation (from either focus) and focus it |
+| `Ctrl+H` | Enter or leave keyboard help |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Enter or leave the Activity browser |
 | `Ctrl+Shift+T` | Show the tools available to the selected conversation |

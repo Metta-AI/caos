@@ -17,7 +17,8 @@ use ratatui_crossterm::crossterm::event::{
 };
 use ratatui_crossterm::crossterm::execute;
 use ratatui_crossterm::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui_crossterm::CrosstermBackend;
 
@@ -243,6 +244,7 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     let mut app = App::new(args)?;
 
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;
+    app.set_enhanced_keyboard(supports_keyboard_enhancement().unwrap_or(false));
     let mut stdout = io::stdout();
     if let Err(error) = enter_screen(&mut stdout) {
         let _ = disable_raw_mode();

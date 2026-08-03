@@ -50,6 +50,7 @@ pub(crate) enum View {
     Activity,
     Diff,
     Tools,
+    Help,
 }
 
 /// Which pane currently receives navigation keys: the left conversation list
@@ -619,6 +620,7 @@ impl Composer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandAction {
     From,
+    Help,
     Title,
     UpdateTree,
 }
@@ -632,13 +634,20 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 3] = [
+const COMMANDS: [Command; 4] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
         description: "start a conversation from a completed turn",
         action: CommandAction::From,
         takes_argument: true,
+    },
+    Command {
+        name: "/help",
+        usage: "/help",
+        description: "show keyboard shortcuts and slash commands",
+        action: CommandAction::Help,
+        takes_argument: false,
     },
     Command {
         name: "/title",
@@ -844,6 +853,7 @@ pub(crate) struct App {
     selecting_transcript: bool,
     copied_chars: Option<usize>,
     animation_frame: usize,
+    enhanced_keyboard: bool,
     view: View,
     focus: Focus,
     tx: Sender<UiMessage>,
@@ -948,6 +958,7 @@ impl App {
             selecting_transcript: false,
             copied_chars: None,
             animation_frame: 0,
+            enhanced_keyboard: false,
             view: View::Chat,
             focus: Focus::Conversation,
             tx,
@@ -973,6 +984,14 @@ impl App {
 
     pub(crate) fn selection_locked(&self) -> bool {
         self.selection_locked
+    }
+
+    pub(crate) fn enhanced_keyboard(&self) -> bool {
+        self.enhanced_keyboard
+    }
+
+    pub(crate) fn set_enhanced_keyboard(&mut self, supported: bool) {
+        self.enhanced_keyboard = supported;
     }
 
     pub(crate) fn clear_copy_notice(&mut self) {
@@ -1101,8 +1120,9 @@ impl App {
             return;
         };
         // Resolve the prompt into the turn's message and, for `/update-tree`,
-        // the tree the human commit should carry. `/from` and `/title` are not
-        // turns and return here; everything else falls through to run one.
+        // the tree the human commit should carry. `/from`, `/help`, and
+        // `/title` are not turns and return here; everything else falls
+        // through to run one.
         let mut human_tree = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
             if command.takes_argument && arguments.is_empty() {
@@ -1110,6 +1130,14 @@ impl App {
                 return;
             }
             match command.action {
+                CommandAction::Help => {
+                    if arguments.is_empty() {
+                        self.view = View::Help;
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
+                    return;
+                }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
                     return;
@@ -1344,6 +1372,11 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
         let is_publish =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
+        // Ctrl+H is a distinct control byte in legacy terminal input. Keep
+        // Ctrl+? as an alias for terminals whose enhanced keyboard protocol
+        // reports the modifiers unambiguously.
+        let is_help = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h' | '?' | '/'));
         if !is_load && !is_publish {
             self.confirm_action = None;
         }
@@ -1355,9 +1388,18 @@ impl App {
             self.publish_selected();
             return;
         }
+        if is_help {
+            self.view = if self.view == View::Help {
+                View::Chat
+            } else {
+                View::Help
+            };
+            self.selected_mut().scroll_from_bottom = 0;
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             self.view = match self.view {
-                View::Chat | View::Activity | View::Tools => View::Diff,
+                View::Chat | View::Activity | View::Tools | View::Help => View::Diff,
                 View::Diff => View::Chat,
             };
             self.selected_mut().scroll_from_bottom = 0;
@@ -1368,7 +1410,7 @@ impl App {
         if ctrl_t && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.view = match self.view {
                 View::Tools => View::Chat,
-                View::Chat | View::Activity | View::Diff => View::Tools,
+                View::Chat | View::Activity | View::Diff | View::Help => View::Tools,
             };
             self.selected_mut().scroll_from_bottom = 0;
             if self.view == View::Tools {
@@ -1440,6 +1482,10 @@ impl App {
             }
             return;
         }
+        if self.view == View::Help && key.code == KeyCode::Esc {
+            self.view = View::Chat;
+            return;
+        }
         match key.code {
             KeyCode::PageUp => self.scroll_up(8),
             KeyCode::PageDown => self.scroll_down(8),
@@ -1496,8 +1542,11 @@ impl App {
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.selected_mut().composer.move_word_right()
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.selected_mut().composer.complete_command() {
+            KeyCode::Enter | KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let command_is_complete = parse_command(&self.selected().composer.text).is_some();
+                if command_is_complete || !self.selected_mut().composer.complete_command() {
                     self.start_turn();
                 }
             }
@@ -1973,6 +2022,7 @@ mod tests {
                 selecting_transcript: false,
                 copied_chars: None,
                 animation_frame: 0,
+                enhanced_keyboard: false,
                 view: View::Chat,
                 focus: Focus::Conversation,
                 tx: tx.clone(),
@@ -2153,10 +2203,10 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/title", "/update-tree"]
+            ["/from", "/help", "/title", "/update-tree"]
         );
 
-        assert!(composer.select_command(1));
+        assert!(composer.select_command(2));
         assert!(composer.complete_command());
         assert_eq!(composer.text, "/title ");
         assert!(composer.command_matches().is_empty());
@@ -2191,6 +2241,10 @@ mod tests {
         assert_eq!(arguments, "include this text");
         assert!(command.takes_argument);
 
+        let (command, arguments) = parse_command("/help").unwrap();
+        assert_eq!(command.action, CommandAction::Help);
+        assert_eq!(arguments, "");
+
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
     }
@@ -2200,6 +2254,7 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.selected_mut().composer.insert_str("/");
 
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.selected().composer.text, "/title ");
@@ -2214,6 +2269,26 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.selected().composer.text, "/from ");
+    }
+
+    #[test]
+    fn ctrl_h_ctrl_question_mark_and_help_command_toggle_help() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, View::Chat);
+
+        app.selected_mut().composer.insert_str("/help");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Help);
+        assert!(!app.selected().running);
     }
 
     #[test]
@@ -2781,7 +2856,43 @@ mod tests {
         assert!(rendered.contains("Ctrl+T expands"));
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("Enter/^J newline"));
+        assert!(rendered.contains("^S send"));
         assert!(!rendered.contains("Alt+Enter"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let legacy_help: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(legacy_help.contains("Ctrl+S          send the prompt"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+
+        app.set_enhanced_keyboard(true);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let enhanced_footer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(enhanced_footer.contains("^Enter send"));
+        assert!(!enhanced_footer.contains("^S send"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let enhanced_help: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(enhanced_help.contains("Ctrl+Enter      send the prompt"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Activity);
@@ -3077,7 +3188,7 @@ mod tests {
             .composer
             .insert_str("/title Mutable title");
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
         assert_eq!(app.selected().id, "stable-id");
         assert_eq!(app.selected().title, "Mutable title");
