@@ -12,8 +12,8 @@ use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
 use super::{
-    short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, TranscriptPoint,
-    View, COMMANDS,
+    short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, ScrollState,
+    TranscriptPoint, View, COMMANDS,
 };
 use caos::chat::TurnPhase;
 
@@ -307,7 +307,7 @@ fn render_live_activity(
 
 fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame<'_>, area: Rect) {
     let paragraph = transcript_paragraph(state);
-    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -479,7 +479,7 @@ fn transcript_inner(area: Rect) -> Rect {
 }
 
 fn transcript_scroll(state: &ConversationState, area: Rect) -> u16 {
-    paragraph_scroll(&transcript_paragraph(state), area, state.scroll_from_bottom)
+    paragraph_scroll(&transcript_paragraph(state), area, &state.scroll)
 }
 
 pub(super) fn transcript_point(
@@ -697,7 +697,7 @@ fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         })
         .collect();
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
     frame.render_widget(
         paragraph
             .block(
@@ -772,7 +772,7 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         }
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, state.scroll_from_bottom);
+    let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
     frame.render_widget(
         paragraph
             .block(
@@ -1045,17 +1045,14 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-pub(crate) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, from_bottom: usize) -> u16 {
+pub(super) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, scroll: &ScrollState) -> u16 {
     let line_count = paragraph.line_count(area.width.saturating_sub(2));
-    scroll_offset(line_count, area.height, from_bottom)
+    scroll_offset(line_count, area.height, scroll)
 }
 
-pub(crate) fn scroll_offset(line_count: usize, height: u16, from_bottom: usize) -> u16 {
+pub(super) fn scroll_offset(line_count: usize, height: u16, scroll: &ScrollState) -> u16 {
     let visible = height.saturating_sub(2) as usize;
-    line_count
-        .saturating_sub(visible)
-        .saturating_sub(from_bottom)
-        .min(u16::MAX as usize) as u16
+    scroll.resolve(line_count.saturating_sub(visible))
 }
 
 #[cfg(test)]
