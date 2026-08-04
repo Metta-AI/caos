@@ -333,6 +333,12 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             } else {
                 (" ", Color::DarkGray)
             };
+            let (author, author_color, preview) = match state.latest_message_preview() {
+                Some((EntryRole::Human, preview)) => ("You ", Color::Cyan, preview),
+                Some((EntryRole::Agent, preview)) => ("AI  ", Color::Green, preview),
+                Some(_) => unreachable!("conversation previews exclude local notices"),
+                None => ("", Color::DarkGray, "Start a conversation".to_string()),
+            };
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
@@ -340,8 +346,9 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
+                    Span::styled(author, Style::default().fg(author_color)),
                     Span::styled(
-                        state.latest_message_preview(),
+                        preview,
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::DIM),
