@@ -8,6 +8,7 @@ use ratatui_core::text::{Line, Span};
 use ratatui_core::widgets::Widget;
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
+use ratatui_widgets::clear::Clear;
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -45,12 +46,78 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_composer(
         state,
         app.view,
-        !app.selection_locked && app.focus() == Focus::Conversation,
+        !app.selection_locked && app.palette.is_none() && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
     );
     render_footer(app, frame, areas.footer);
+    render_command_palette(app, frame);
     render_screen_selection(app, frame);
+}
+
+fn render_command_palette(app: &App, frame: &mut Frame<'_>) {
+    let Some(palette) = app.palette.as_ref() else {
+        return;
+    };
+    let matches = palette.matches();
+    let terminal = frame.area();
+    let width = terminal.width.saturating_sub(4).clamp(20, 72);
+    let height = (matches.len() as u16 + 4)
+        .min(terminal.height.saturating_sub(2))
+        .max(5);
+    let area = terminal.centered(Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Command palette ")
+        .border_style(Style::default().fg(Color::Cyan))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(palette.query.clone()),
+        ])),
+        rows[0],
+    );
+
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching commands").style(Style::default().fg(Color::DarkGray)),
+            rows[1],
+        );
+    } else {
+        let label_width = rows[1].width.saturating_sub(24) as usize;
+        let items = matches
+            .iter()
+            .map(|command| {
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{:<label_width$}", command.label)),
+                    Span::styled(command.shortcut, Style::default().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut selected = ListState::default().with_selected(Some(palette.selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_symbol("> ").highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rows[1],
+            &mut selected,
+        );
+    }
+    let cursor_x = rows[0]
+        .x
+        .saturating_add(2)
+        .saturating_add(palette.query.cell_width())
+        .min(rows[0].right().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, rows[0].y));
 }
 
 fn render_screen_selection(app: &App, frame: &mut Frame<'_>) {
@@ -1261,6 +1328,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw("  Ctrl+H          toggle this help"),
+        Line::raw("  Ctrl+Shift+P    open the command palette"),
         Line::raw(format!("  {send_shortcut:<16}send the prompt")),
         Line::raw("  Enter/Ctrl+J    insert a newline"),
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
@@ -1465,7 +1533,9 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
 }
 
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let footer = if matches!(app.confirm_action, Some(ConfirmAction::Publish { .. })) {
+    let footer = if app.palette.is_some() {
+        Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
+    } else if matches!(app.confirm_action, Some(ConfirmAction::Publish { .. })) {
         Line::raw(
             " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
         )
@@ -1491,7 +1561,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             "^S"
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
