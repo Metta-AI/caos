@@ -437,7 +437,7 @@ pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Chat, args)?;
     migrate_legacy_conversation_refs(t)?;
     let name = a.name.clone().expect("chat parse requires a name");
-    let refname = validated_refname(t, &name)?;
+    let refname = validated_refname(&name)?;
     if a.log {
         return print_log(t, &name, &refname);
     }
@@ -450,7 +450,7 @@ pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Talk, args)?;
     migrate_legacy_conversation_refs(t)?;
     let (name, fresh) = pick_conversation(t, &a)?;
-    let refname = validated_refname(t, &name)?;
+    let refname = validated_refname(&name)?;
     if a.log {
         return print_log(t, &name, &refname);
     }
@@ -573,7 +573,7 @@ fn migrate_server_conversation_head(t: &GitTransport, id: &str, head: &str) -> R
 /// up front. The id's final segment may not be a reserved channel name (else
 /// `<id>/from-user` would collide with another conversation's channel), and git
 /// must accept the full refname.
-fn validated_refname(t: &GitTransport, name: &str) -> Result<String, String> {
+fn validated_refname(name: &str) -> Result<String, String> {
     let last_segment = name.rsplit('/').next().unwrap_or(name);
     if RESERVED_CHANNELS.contains(&last_segment) {
         return Err(format!(
@@ -581,7 +581,9 @@ fn validated_refname(t: &GitTransport, name: &str) -> Result<String, String> {
         ));
     }
     let refname = conversation_head_ref(name);
-    t.git_capture(&["check-ref-format", &refname], None)
+    let _: &gix::refs::FullNameRef = refname
+        .as_str()
+        .try_into()
         .map_err(|_| format!("invalid conversation name {name:?}"))?;
     Ok(refname)
 }
@@ -706,16 +708,16 @@ fn user_conversation_ref(user: &str, status: UserConversationStatus, id: &str) -
     )
 }
 
-fn validate_conversation_user(t: &GitTransport, user: &str) -> Result<(), String> {
+fn validate_conversation_user(user: &str) -> Result<(), String> {
     let refname = user_conversation_ref(user, UserConversationStatus::Active, "conversation");
-    t.git_capture(&["check-ref-format", &refname], None)
+    <&gix::refs::FullNameRef>::try_from(refname.as_str())
         .map(|_| ())
         .map_err(|_| format!("invalid conversation user {user:?}"))
 }
 
-fn validate_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
-    validated_refname(t, id)?;
-    validate_conversation_user(t, user)
+fn validate_user_conversation(user: &str, id: &str) -> Result<(), String> {
+    validated_refname(id)?;
+    validate_conversation_user(user)
 }
 
 fn validate_conversation_title(title: &str) -> Result<&str, String> {
@@ -765,9 +767,9 @@ pub fn publish_user_conversation(
     id: &str,
     title: &str,
 ) -> Result<(), String> {
-    validate_user_conversation(t, user, id)?;
+    validate_user_conversation(user, id)?;
     let title = validate_conversation_title(title)?;
-    let local_ref = validated_refname(t, id)?;
+    let local_ref = validated_refname(id)?;
     let head = rev_parse_opt(t, &local_ref)?
         .ok_or_else(|| format!("cannot publish conversation {id:?} before its first turn"))?;
     let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
@@ -797,7 +799,7 @@ pub fn publish_user_conversation(
 
 /// Change a conversation's shared title without changing its identity or HEAD.
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
-    validated_refname(t, id)?;
+    validated_refname(id)?;
     let title = validate_conversation_title(title)?;
     let hash = t.put_object("blob", title.as_bytes())?.to_string();
     t.ensure_pushed(&hash)?;
@@ -815,7 +817,7 @@ fn move_user_conversation(
     from: UserConversationStatus,
     to: UserConversationStatus,
 ) -> Result<(), String> {
-    validate_user_conversation(t, user, id)?;
+    validate_user_conversation(user, id)?;
     let from_ref = user_conversation_ref(user, from, id);
     let to_ref = user_conversation_ref(user, to, id);
     let refs = remote_refs(t, [from_ref.clone(), to_ref.clone()])?;
@@ -875,7 +877,7 @@ pub fn unarchive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Re
 /// Existing active or archived entries win, so opening the TUI never
 /// accidentally unarchives a conversation.
 pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(), String> {
-    validate_conversation_user(t, user)?;
+    validate_conversation_user(user)?;
     migrate_legacy_conversation_refs(t)?;
     let active = format!(
         "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/{}",
@@ -889,7 +891,7 @@ pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(
     );
     let indexed = remote_refs(t, [active, archived])?;
     for conversation in list_conversations(t)? {
-        validate_user_conversation(t, user, &conversation.name)?;
+        validate_user_conversation(user, &conversation.name)?;
         let active_ref =
             user_conversation_ref(user, UserConversationStatus::Active, &conversation.name);
         let archived_ref =
@@ -908,7 +910,7 @@ pub fn list_user_conversations(
     user: &str,
     status: UserConversationStatus,
 ) -> Result<Vec<UserConversationSummary>, String> {
-    validate_conversation_user(t, user)?;
+    validate_conversation_user(user)?;
     let prefix = format!(
         "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/",
         status.ref_component()
@@ -919,7 +921,7 @@ pub fn list_user_conversations(
         .filter_map(|refname| refname.strip_prefix(&prefix).map(str::to_string))
         .collect();
     for id in &ids {
-        validate_user_conversation(t, user, id)?;
+        validate_user_conversation(user, id)?;
     }
 
     let mut metadata = HashMap::new();
@@ -949,7 +951,7 @@ pub fn list_user_conversations(
             }
         };
         t.fetch_object(&head)?;
-        let local_ref = validated_refname(t, &id)?;
+        let local_ref = validated_refname(&id)?;
         t.git_capture(&["update-ref", &local_ref, &head], None)?;
 
         let title_ref = conversation_title_ref(&id);
@@ -986,7 +988,7 @@ pub fn list_user_conversations(
 
 /// Read a named conversation's clean human/agent spine, oldest first.
 pub fn conversation_history(t: &GitTransport, name: &str) -> Result<Vec<ConversationTurn>, String> {
-    let refname = validated_refname(t, name)?;
+    let refname = validated_refname(name)?;
     let head = rev_parse_opt(t, &refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
     history_from_head(t, &head).map(|(turns, _base)| turns)
@@ -996,7 +998,7 @@ pub fn conversation_history(t: &GitTransport, name: &str) -> Result<Vec<Conversa
 /// from. This operation is side-effect free; clients own any policy for
 /// applying or publishing the returned change.
 pub fn conversation_workspace_diff(t: &GitTransport, name: &str) -> Result<WorkspaceDiff, String> {
-    let refname = validated_refname(t, name)?;
+    let refname = validated_refname(name)?;
     let head = rev_parse_opt(t, &refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
     let (_turns, base_commit) = history_from_head(t, &head)?;
@@ -1024,7 +1026,7 @@ pub fn run_chat_turn(
     human_tree: Option<&str>,
     mut emit: impl FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
-    let refname = validated_refname(t, name)?;
+    let refname = validated_refname(name)?;
     if message.trim().is_empty() {
         return Err("empty message".to_string());
     }
@@ -1714,6 +1716,17 @@ mod tests {
             &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
         );
         (root, repo)
+    }
+
+    #[test]
+    fn conversation_ref_validation_does_not_spawn_git() {
+        assert_eq!(
+            validated_refname("talk-1").unwrap(),
+            "refs/caos/conversations/talk-1/from-user"
+        );
+        assert!(validated_refname("bad name").is_err());
+        assert!(validate_conversation_user("nishadsingh").is_ok());
+        assert!(validate_conversation_user("bad user").is_err());
     }
 
     #[test]
