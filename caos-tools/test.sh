@@ -6,10 +6,8 @@
 #@doc every failing test, and a pass/fail banner. Pass a record's hash to
 #@doc `test-result` for that test's full output or its inner-stack logs.
 #@doc Nothing is handed in from the host: the stack under test is compiled
-#@doc from these sources, inside workers. Pass an optional `--test-salt=<value>`
-#@doc (e.g. `--test-salt=$(date --iso=s)`) to re-run every test while leaving
-#@doc the build a cache hit — it rides only in each per-test wrapper, so it
-#@doc re-keys the tests and nothing else.
+#@doc from these sources, inside workers
+#@arg [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys the tests and nothing else.
 #
 # THE test suite, as a caos worker (design/test-stack-image.md). Its interface
 # is a TOOL's interface: the workspace tree as --in, and optionally an API key
