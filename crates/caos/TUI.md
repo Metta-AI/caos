@@ -73,7 +73,7 @@ focus back to the list. The focused pane's border is highlighted.
 | `PageUp` / `PageDown` in conversation | Scroll by rendered rows |
 | Mouse wheel over the transcript | Scroll the conversation by rendered rows |
 | Mouse wheel over Activity | Scroll the selected activity's full details |
-| Mouse drag over visible transcript text | Select and copy rendered text |
+| Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
 | `Ctrl+P` twice | Choose a base, push a clean branch, and open a PR |
@@ -146,10 +146,11 @@ viewport and highlights the count when a new message arrived off-screen.
 Scrolling back to the bottom resumes tail-follow and marks the message read.
 
 Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
-selection for the current transcript viewport. Drag across rendered transcript
-text to highlight it and copy automatically on mouse release. macOS uses
-`pbcopy`; other environments receive the same text through the standard OSC 52
-terminal clipboard sequence.
+selection over the entire rendered interface. Drag across the header, sidebar,
+conversation, activity, diff, help, prompt, or footer to highlight text and copy
+automatically on mouse release. A click without a drag still selects a
+conversation in the sidebar. macOS uses `pbcopy`; other environments receive
+the same text through the standard OSC 52 terminal clipboard sequence.
 
 For native terminal selection, press `Ctrl+Y`. CAOS releases mouse capture and
 freezes redraws, so dragging and the terminal's normal copy shortcut (`Cmd+C`

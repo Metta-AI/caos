@@ -50,6 +50,32 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         areas.composer,
     );
     render_footer(app, frame, areas.footer);
+    render_screen_selection(app, frame);
+}
+
+fn render_screen_selection(app: &App, frame: &mut Frame<'_>) {
+    let Some(selection) = app.screen_selection else {
+        return;
+    };
+    let area = frame.area();
+    let (start, end) = selection.ordered();
+    for row in start.row..=end.row.min(area.bottom().saturating_sub(1)) {
+        let start_column = if row == start.row {
+            start.column
+        } else {
+            area.x
+        };
+        let end_column = if row == end.row {
+            end.column
+        } else {
+            area.right().saturating_sub(1)
+        };
+        for column in start_column..=end_column.min(area.right().saturating_sub(1)) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
+                cell.set_fg(Color::Black).set_bg(Color::Cyan);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

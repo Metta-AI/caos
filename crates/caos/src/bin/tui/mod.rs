@@ -39,6 +39,7 @@ fn run_app(
     terminal
         .draw(|frame| render(app, frame))
         .map_err(|error| format!("drawing terminal: {error}"))?;
+    app.capture_screen(terminal.current_buffer_mut());
     let mut next_animation = Instant::now() + ANIMATION_TICK;
     while !app.should_quit() {
         // Selection lock deliberately freezes the frame: background turn messages
@@ -120,6 +121,7 @@ fn run_app(
             terminal
                 .draw(|frame| render(app, frame))
                 .map_err(|error| format!("drawing terminal: {error}"))?;
+            app.capture_screen(terminal.current_buffer_mut());
         }
     }
     Ok(())
