@@ -339,6 +339,7 @@ fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
         let (label, color) = match entry.role {
             EntryRole::Human => ("You", Color::Cyan),
             EntryRole::Agent => ("Agent", Color::Green),
+            EntryRole::Info => ("CAOS", Color::Cyan),
             EntryRole::Notice => ("Error", Color::Red),
         };
         let mut heading = vec![Span::styled(
@@ -353,16 +354,6 @@ fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
         }
         lines.push(Line::from(heading));
         lines.extend(entry.text.lines().map(inline_markdown_line));
-        lines.push(Line::raw(""));
-    }
-    if !state.is_busy() && !state.status.is_empty() {
-        lines.push(Line::styled(
-            "Status",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        lines.extend(state.status.lines().map(inline_markdown_line));
         lines.push(Line::raw(""));
     }
     Paragraph::new(lines).wrap(Wrap { trim: false })

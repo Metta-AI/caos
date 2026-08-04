@@ -66,6 +66,7 @@ pub(crate) enum Focus {
 enum EntryRole {
     Human,
     Agent,
+    Info,
     Notice,
 }
 
@@ -811,6 +812,16 @@ impl ConversationState {
         self.transcript_selection = None;
     }
 
+    fn push_info(&mut self, message: impl Into<String>) {
+        self.status.clear();
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::Info,
+            commit: None,
+            text: message.into(),
+        });
+        self.transcript_selection = None;
+    }
+
     fn apply_automatic_title(&mut self, prompt: &str) {
         if self.automatic_title {
             self.title = automatic_title(prompt);
@@ -1278,7 +1289,7 @@ impl App {
                         let state = &mut self.conversations[index];
                         state.publishing = false;
                         match result {
-                            Ok(url) => state.status = format!("PR ready: {url}"),
+                            Ok(url) => state.push_info(format!("PR ready: {url}")),
                             Err(error) => state.push_error(format!("PR failed: {error}")),
                         }
                     }
@@ -2790,6 +2801,12 @@ mod tests {
             &first_visible_line
         );
         assert!(!after.join("\n").contains("completed e1769972f6"));
+
+        app.scroll_down(usize::MAX);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let at_tail = rendered_main_pane(&terminal).join("\n");
+        assert!(!at_tail.contains("Status"));
+        assert!(!at_tail.contains("completed e1769972f6"));
     }
 
     #[test]
@@ -3234,30 +3251,46 @@ mod tests {
     }
 
     #[test]
-    fn successful_statuses_render_below_the_conversation_title() {
+    fn routine_idle_status_is_not_rendered() {
         let mut conversation = state("talk-1");
-        conversation.status = "PR ready: https://github.com/Metta-AI/caos/pull/54".to_string();
+        conversation.status = "ready".to_string();
         let (app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(&app, frame)).unwrap();
 
-        let rows: Vec<String> = terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(100)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect();
-        let title = rows
-            .iter()
-            .find(|row| row.contains("Conversation"))
-            .unwrap();
-        assert!(!title.contains("PR ready"));
-        let rendered = rows.join("\n");
-        assert!(rendered.contains("Status"));
+        let rendered = rendered_main_pane(&terminal).join("\n");
+        assert!(!rendered.contains("Status"));
+        assert!(!rendered.contains("ready"));
+    }
+
+    #[test]
+    fn successful_publish_adds_a_caos_transcript_entry() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "publishing".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+
+        tx.send(UiMessage::Published {
+            conversation: "talk-1".to_string(),
+            result: Ok("https://github.com/Metta-AI/caos/pull/54".to_string()),
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+
+        let state = app.selected();
+        assert!(!state.publishing);
+        assert!(state.status.is_empty());
+        assert_eq!(state.transcript.last().unwrap().role, EntryRole::Info);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = rendered_main_pane(&terminal).join("\n");
+        assert!(rendered.contains("CAOS"));
         assert!(rendered.contains("PR ready: https://github.com/Metta-AI/caos/pull/54"));
+        assert!(!rendered.contains("Status"));
     }
 
     #[test]

@@ -81,8 +81,9 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
 Command failures are appended as red `Error` entries at the bottom of the
-conversation transcript. Other operation updates appear in a `Status` block at
-the bottom; the conversation title never carries status or error text.
+conversation transcript. A successfully opened PR is appended as a cyan `CAOS`
+entry so its URL remains available. Routine operation status is shown only
+while the operation is running and is not added to the transcript or title.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
