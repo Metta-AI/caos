@@ -65,6 +65,7 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation (from either focus) and focus it |
 | `Ctrl+H` | Enter or leave keyboard help |
+| `Ctrl+Shift+P` | Open or close the searchable command palette |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Enter or leave the Activity browser |
 | `Ctrl+Shift+T` | Show the tools available to the selected conversation |
@@ -113,6 +114,12 @@ usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
 or Enter to complete it with a trailing space. Typing arguments closes the
 menu. Escape dismisses it without changing the prompt. An unrecognized
 slash-prefixed prompt is sent normally.
+
+`Ctrl+Shift+P` or `/commands` opens a searchable command palette without
+changing the current draft. Type any words from an action, use Up and Down to
+choose a match, then press Enter to run it. The palette covers conversation,
+workspace, publishing, activity, tool, help, reload, archive, and selection
+actions. Escape closes it.
 
 Bracketed paste mode keeps pasted newlines inside the prompt instead of
 submitting partial lines. Pastes over 1,000 characters are kept out of the

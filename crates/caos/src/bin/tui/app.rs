@@ -695,6 +695,7 @@ impl Composer {
 enum CommandAction {
     From,
     Help,
+    Palette,
     Title,
     UpdateTree,
 }
@@ -708,7 +709,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 4] = [
+const COMMANDS: [Command; 5] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -736,6 +737,13 @@ const COMMANDS: [Command; 4] = [
         description: "fold working-tree edits into the commit",
         action: CommandAction::UpdateTree,
         takes_argument: true,
+    },
+    Command {
+        name: "/commands",
+        usage: "/commands",
+        description: "open the searchable command palette",
+        action: CommandAction::Palette,
+        takes_argument: false,
     },
 ];
 
@@ -957,6 +965,129 @@ enum ConfirmAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteAction {
+    NewConversation,
+    Checkout,
+    Publish,
+    Activity,
+    Changes,
+    Tools,
+    Reload,
+    Help,
+    Archive,
+    SelectionLock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaletteCommand {
+    label: &'static str,
+    shortcut: &'static str,
+    keywords: &'static str,
+    action: PaletteAction,
+}
+
+const PALETTE_COMMANDS: [PaletteCommand; 10] = [
+    PaletteCommand {
+        label: "New conversation",
+        shortcut: "Ctrl+N",
+        keywords: "create start chat",
+        action: PaletteAction::NewConversation,
+    },
+    PaletteCommand {
+        label: "Check out conversation",
+        shortcut: "Ctrl+L",
+        keywords: "load workspace git",
+        action: PaletteAction::Checkout,
+    },
+    PaletteCommand {
+        label: "Publish pull request",
+        shortcut: "Ctrl+P twice",
+        keywords: "push pr github branch",
+        action: PaletteAction::Publish,
+    },
+    PaletteCommand {
+        label: "Show activity",
+        shortcut: "Ctrl+T",
+        keywords: "tools progress browser",
+        action: PaletteAction::Activity,
+    },
+    PaletteCommand {
+        label: "Show workspace changes",
+        shortcut: "Ctrl+Q",
+        keywords: "diff files",
+        action: PaletteAction::Changes,
+    },
+    PaletteCommand {
+        label: "Show available tools",
+        shortcut: "Ctrl+Shift+T",
+        keywords: "commands agent",
+        action: PaletteAction::Tools,
+    },
+    PaletteCommand {
+        label: "Reload conversation",
+        shortcut: "Ctrl+R",
+        keywords: "refresh history",
+        action: PaletteAction::Reload,
+    },
+    PaletteCommand {
+        label: "Show keyboard help",
+        shortcut: "Ctrl+H",
+        keywords: "shortcuts documentation",
+        action: PaletteAction::Help,
+    },
+    PaletteCommand {
+        label: "Archive conversation",
+        shortcut: "Ctrl+E in list",
+        keywords: "close remove",
+        action: PaletteAction::Archive,
+    },
+    PaletteCommand {
+        label: "Toggle native selection lock",
+        shortcut: "Ctrl+Y",
+        keywords: "copy mouse terminal freeze",
+        action: PaletteAction::SelectionLock,
+    },
+];
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
+impl CommandPalette {
+    fn matches(&self) -> Vec<&'static PaletteCommand> {
+        let terms = self.query.split_whitespace().map(str::to_lowercase);
+        let terms = terms.collect::<Vec<_>>();
+        PALETTE_COMMANDS
+            .iter()
+            .filter(|command| {
+                let searchable = format!("{} {}", command.label, command.keywords).to_lowercase();
+                terms.iter().all(|term| searchable.contains(term))
+            })
+            .collect()
+    }
+
+    fn edit(&mut self, edit: impl FnOnce(&mut String)) {
+        edit(&mut self.query);
+        self.selected = 0;
+    }
+
+    fn select(&mut self, amount: isize) {
+        let count = self.matches().len();
+        if count > 0 {
+            self.selected = (self.selected as isize + amount).rem_euclid(count as isize) as usize;
+        }
+    }
+
+    fn selected_action(&self) -> Option<PaletteAction> {
+        self.matches()
+            .get(self.selected)
+            .map(|command| command.action)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MouseAction {
     Ignored,
@@ -972,6 +1103,7 @@ pub(crate) struct App {
     should_quit: bool,
     selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
+    palette: Option<CommandPalette>,
     selecting_transcript: bool,
     screen_selection: Option<ScreenSelection>,
     selecting_screen: bool,
@@ -1081,6 +1213,7 @@ impl App {
             should_quit: false,
             selection_locked: false,
             confirm_action: None,
+            palette: None,
             selecting_transcript: false,
             screen_selection: None,
             selecting_screen: false,
@@ -1337,6 +1470,14 @@ impl App {
                     }
                     return;
                 }
+                CommandAction::Palette => {
+                    if arguments.is_empty() {
+                        self.palette = Some(CommandPalette::default());
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
+                    return;
+                }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
                     return;
@@ -1561,6 +1702,20 @@ impl App {
             }
             return;
         }
+        let is_palette = key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('p' | 'P'));
+        if is_palette {
+            self.confirm_action = None;
+            self.selected_mut().publish_prompt = false;
+            self.palette = self.palette.take().is_none().then(CommandPalette::default);
+            return;
+        }
+        if self.palette.is_some() {
+            self.handle_palette_key(key);
+            return;
+        }
         let is_load =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
         let is_publish =
@@ -1689,18 +1844,7 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            if !self.selected().is_busy() {
-                match self.transport() {
-                    Ok(transport) => {
-                        self.selected_mut().reload(&transport);
-                        self.selected_mut().status = "reloaded".to_string();
-                    }
-                    Err(error) => self.selected_mut().show_command_error(error),
-                }
-            } else {
-                self.selected_mut()
-                    .show_command_error("finish this conversation's operation before reloading");
-            }
+            self.reload_selected();
             return;
         }
         if self.focus == Focus::List {
@@ -1860,6 +2004,90 @@ impl App {
 
     pub(crate) fn selected_composer_text(&self) -> Option<&str> {
         self.selected().composer.selected_text()
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Enter => {
+                let action = self
+                    .palette
+                    .as_ref()
+                    .and_then(CommandPalette::selected_action);
+                self.palette = None;
+                if let Some(action) = action {
+                    self.execute_palette_action(action);
+                }
+            }
+            KeyCode::Up => self.palette.as_mut().expect("palette is open").select(-1),
+            KeyCode::Down => self.palette.as_mut().expect("palette is open").select(1),
+            KeyCode::Backspace => self
+                .palette
+                .as_mut()
+                .expect("palette is open")
+                .edit(|query| {
+                    query.pop();
+                }),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self
+                .palette
+                .as_mut()
+                .expect("palette is open")
+                .edit(String::clear),
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.palette
+                    .as_mut()
+                    .expect("palette is open")
+                    .edit(|query| query.push(ch));
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::NewConversation => self.start_new_conversation(None),
+            PaletteAction::Checkout => self.load_selected(),
+            PaletteAction::Publish => self.publish_selected(),
+            PaletteAction::Activity => {
+                self.selected_mut().ensure_activity_selection();
+                self.view = View::Activity;
+            }
+            PaletteAction::Changes => {
+                self.view = View::Diff;
+                self.selected_mut().follow_tail();
+            }
+            PaletteAction::Tools => {
+                self.view = View::Tools;
+                self.selected_mut().follow_tail();
+                self.load_selected_tool_set();
+            }
+            PaletteAction::Reload => self.reload_selected(),
+            PaletteAction::Help => {
+                self.view = View::Help;
+                self.selected_mut().follow_tail();
+            }
+            PaletteAction::Archive => self.close_selected(),
+            PaletteAction::SelectionLock => self.selection_locked = true,
+        }
+    }
+
+    fn reload_selected(&mut self) {
+        if !self.selected().is_busy() {
+            match self.transport() {
+                Ok(transport) => {
+                    self.selected_mut().reload(&transport);
+                    self.selected_mut().status = "reloaded".to_string();
+                }
+                Err(error) => self.selected_mut().show_command_error(error),
+            }
+        } else {
+            self.selected_mut()
+                .show_command_error("finish this conversation's operation before reloading");
+        }
     }
 
     pub(crate) fn scroll_up(&mut self, rows: usize) {
@@ -2372,6 +2600,7 @@ mod tests {
                 focus: Focus::Conversation,
                 tx: tx.clone(),
                 rx,
+                palette: None,
             },
             tx,
         )
@@ -2563,7 +2792,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/help", "/title", "/update-tree"]
+            ["/from", "/help", "/title", "/update-tree", "/commands"]
         );
 
         assert!(composer.select_command(2));
@@ -2603,6 +2832,10 @@ mod tests {
 
         let (command, arguments) = parse_command("/help").unwrap();
         assert_eq!(command.action, CommandAction::Help);
+        assert_eq!(arguments, "");
+
+        let (command, arguments) = parse_command("/commands").unwrap();
+        assert_eq!(command.action, CommandAction::Palette);
         assert_eq!(arguments, "");
 
         assert!(parse_command("/future server convention").is_none());
@@ -2704,6 +2937,61 @@ mod tests {
         assert!(rendered.contains("/title <new title> — rename the selected conversation"));
         assert!(
             rendered.contains("/update-tree <message> — fold working-tree edits into the commit")
+        );
+    }
+
+    #[test]
+    fn command_palette_filters_and_runs_actions_without_changing_the_draft() {
+        let mut conversation = state("talk-1");
+        conversation.composer.insert_str("keep this draft");
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.palette.is_some());
+        for ch in "workspace changes".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let matches = app.palette.as_ref().unwrap().matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].action, PaletteAction::Changes);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Command palette"));
+        assert!(rendered.contains("Show workspace changes"));
+        assert!(!rendered.contains("New conversation"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.palette.is_none());
+        assert_eq!(app.view, View::Diff);
+        assert_eq!(app.selected().composer.text, "keep this draft");
+    }
+
+    #[test]
+    fn command_palette_searches_keywords_and_wraps_selection() {
+        let mut palette = CommandPalette {
+            query: "github branch".to_string(),
+            ..CommandPalette::default()
+        };
+        assert_eq!(palette.matches()[0].action, PaletteAction::Publish);
+
+        palette.query.clear();
+        palette.select(-1);
+        assert_eq!(palette.selected, PALETTE_COMMANDS.len() - 1);
+        assert_eq!(
+            palette.selected_action(),
+            Some(PaletteAction::SelectionLock)
         );
     }
 
