@@ -10,6 +10,7 @@ use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, ScrollState,
@@ -306,7 +307,7 @@ fn render_live_activity(
 }
 
 fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame<'_>, area: Rect) {
-    let paragraph = transcript_paragraph(state);
+    let paragraph = transcript_paragraph(state, transcript_inner(area).width);
     let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -327,7 +328,7 @@ fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame
     render_transcript_selection(state, frame, area);
 }
 
-fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
+fn transcript_paragraph(state: &ConversationState, width: u16) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if state.transcript.is_empty() {
         lines.push(Line::styled(
@@ -353,14 +354,335 @@ fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
             ));
         }
         lines.push(Line::from(heading));
-        lines.extend(entry.text.lines().map(inline_markdown_line));
+        lines.extend(markdown_block_lines(&entry.text, width));
         lines.push(Line::raw(""));
     }
     Paragraph::new(lines).wrap(Wrap { trim: false })
 }
 
+/// Expand one entry's body into transcript lines: GitHub-style markdown tables
+/// are laid out to fit `width`, everything else is rendered as inline markdown.
+/// Over-long table cells wrap *within* their column (rather than truncating) so
+/// that a select-and-copy — which screen-scrapes the rendered cells — still
+/// yields every value in full.
+fn markdown_block_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let raw: Vec<&str> = text.lines().collect();
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < raw.len() {
+        if let Some(consumed) = render_table(&raw[index..], width, &mut lines) {
+            index += consumed;
+        } else {
+            lines.push(inline_markdown_line(raw[index]));
+            index += 1;
+        }
+    }
+    lines
+}
+
 fn inline_markdown_line(text: &str) -> Line<'static> {
     Line::from(inline_markdown_spans(text, Style::default()))
+}
+
+/// Column alignment parsed from a table's delimiter row (`:--`, `--:`, `:-:`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ColumnAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// If `block` starts with a GitHub-style table (a header row, a `---` delimiter
+/// row, then zero or more body rows), render it into `out` and return how many
+/// input lines it consumed. Otherwise return `None`.
+fn render_table(block: &[&str], width: u16, out: &mut Vec<Line<'static>>) -> Option<usize> {
+    let header = *block.first()?;
+    if !header.contains('|') {
+        return None;
+    }
+    let aligns = table_alignments(block.get(1)?)?;
+
+    let mut rows = vec![split_table_cells(header)];
+    let mut consumed = 2;
+    while let Some(&line) = block.get(consumed) {
+        if line.trim().is_empty() || !line.contains('|') {
+            break;
+        }
+        rows.push(split_table_cells(line));
+        consumed += 1;
+    }
+
+    let columns = rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .max(aligns.len());
+    if columns == 0 {
+        return None;
+    }
+    for row in &mut rows {
+        row.resize(columns, String::new());
+    }
+    let mut aligns = aligns;
+    aligns.resize(columns, ColumnAlign::Left);
+
+    // A cell that renders to N columns needs N; every column is at least 1 wide.
+    let natural: Vec<usize> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .map(|row| rendered_width(&row[column]))
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
+
+    // Each column is drawn as `| cell `, and the row closes with a final `|`:
+    // that is 3 cells of chrome per column plus the closing bar.
+    let overhead = 3 * columns + 1;
+    let budget = width as usize;
+    if budget <= overhead + columns {
+        // Too narrow to seat even one cell per column — fall back to inline text.
+        return None;
+    }
+    let widths = fit_widths(&natural, budget - overhead);
+
+    let border = Style::default().fg(Color::DarkGray);
+    push_table_row(out, &rows[0], &widths, &aligns, border, true);
+    out.push(table_divider(&widths, border));
+    for row in &rows[1..] {
+        push_table_row(out, row, &widths, &aligns, border, false);
+    }
+    Some(consumed)
+}
+
+/// Split one table row on unescaped `|`, dropping the optional outer borders and
+/// trimming each cell.
+fn split_table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                current.push('|');
+                chars.next();
+            }
+            '|' => cells.push(std::mem::take(&mut current).trim().to_string()),
+            _ => current.push(ch),
+        }
+    }
+    cells.push(current.trim().to_string());
+    cells
+}
+
+/// Parse a delimiter row (`| :--- | ---: |`) into per-column alignments, or
+/// `None` if the line is not a delimiter row.
+fn table_alignments(line: &str) -> Option<Vec<ColumnAlign>> {
+    if !line.contains('|') {
+        return None;
+    }
+    let cells = split_table_cells(line);
+    if cells.is_empty() {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            let dashes = &cell[usize::from(left)..cell.len() - usize::from(right)];
+            if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => ColumnAlign::Center,
+                (false, true) => ColumnAlign::Right,
+                _ => ColumnAlign::Left,
+            })
+        })
+        .collect()
+}
+
+/// Water-fill `natural` column widths into `budget`: columns keep their natural
+/// width until a shared cap forces the widest ones to give room back, so only
+/// genuinely over-long columns get narrowed (and thus wrapped).
+fn fit_widths(natural: &[usize], budget: usize) -> Vec<usize> {
+    if natural.iter().sum::<usize>() <= budget {
+        return natural.to_vec();
+    }
+    let max = natural.iter().copied().max().unwrap_or(0);
+    let cap = (1..=max)
+        .take_while(|cap| natural.iter().map(|&w| w.min(*cap)).sum::<usize>() <= budget)
+        .last()
+        .unwrap_or(1);
+    let mut widths: Vec<usize> = natural.iter().map(|&w| w.min(cap)).collect();
+    // Hand any leftover budget back to still-capped columns, one column at a time.
+    let mut remaining = budget - widths.iter().sum::<usize>();
+    while remaining > 0 {
+        let mut progressed = false;
+        for (width, &nat) in widths.iter_mut().zip(natural) {
+            if remaining == 0 {
+                break;
+            }
+            if *width < nat {
+                *width += 1;
+                remaining -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    widths
+}
+
+/// Append one table row to `out`, wrapping each cell to its column width; a row
+/// occupies as many transcript lines as its tallest wrapped cell.
+fn push_table_row(
+    out: &mut Vec<Line<'static>>,
+    row: &[String],
+    widths: &[usize],
+    aligns: &[ColumnAlign],
+    border: Style,
+    header: bool,
+) {
+    let base = if header {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let cells: Vec<Vec<Vec<Span<'static>>>> = row
+        .iter()
+        .enumerate()
+        .map(|(column, text)| wrap_cell(text, widths[column], aligns[column], base))
+        .collect();
+    let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    for visual in 0..height {
+        let mut spans = vec![Span::styled("|", border)];
+        for (column, cell) in cells.iter().enumerate() {
+            spans.push(Span::raw(" "));
+            match cell.get(visual) {
+                Some(line) => spans.extend(line.iter().cloned()),
+                None => spans.push(Span::raw(" ".repeat(widths[column]))),
+            }
+            spans.push(Span::styled(" |", border));
+        }
+        out.push(Line::from(spans));
+    }
+}
+
+/// The `|-----|-----|` rule under a table's header.
+fn table_divider(widths: &[usize], border: Style) -> Line<'static> {
+    let mut spans = vec![Span::styled("|", border)];
+    for &width in widths {
+        spans.push(Span::styled("-".repeat(width + 2), border));
+        spans.push(Span::styled("|", border));
+    }
+    Line::from(spans)
+}
+
+/// Render a cell's inline markdown, then wrap it to `width` display columns
+/// (breaking at spaces where possible, hard-breaking an over-long word), padding
+/// each visual line to `width` per `align`.
+fn wrap_cell(text: &str, width: usize, align: ColumnAlign, base: Style) -> Vec<Vec<Span<'static>>> {
+    let styled: Vec<(char, Style)> = inline_markdown_spans(text, base)
+        .into_iter()
+        .flat_map(|span| {
+            let style = span.style;
+            span.content
+                .chars()
+                .map(|ch| (ch, style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut line: Vec<(char, Style)> = Vec::new();
+    let mut line_width = 0usize;
+    for (ch, style) in styled {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if line_width + ch_width > width && !line.is_empty() {
+            if let Some(space) = line.iter().rposition(|&(c, _)| c == ' ') {
+                let mut rest = line.split_off(space);
+                while rest.first().is_some_and(|&(c, _)| c == ' ') {
+                    rest.remove(0);
+                }
+                while line.last().is_some_and(|&(c, _)| c == ' ') {
+                    line.pop();
+                }
+                lines.push(std::mem::replace(&mut line, rest));
+            } else {
+                lines.push(std::mem::take(&mut line));
+            }
+            line_width = line
+                .iter()
+                .map(|&(c, _)| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+        }
+        line.push((ch, style));
+        line_width += ch_width;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+
+    lines
+        .into_iter()
+        .map(|line| pad_cell_line(line, width, align))
+        .collect()
+}
+
+/// Coalesce a wrapped cell line's chars back into styled spans and pad it to
+/// `width` per `align`.
+fn pad_cell_line(line: Vec<(char, Style)>, width: usize, align: ColumnAlign) -> Vec<Span<'static>> {
+    let text_width: usize = line
+        .iter()
+        .map(|&(c, _)| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    let pad = width.saturating_sub(text_width);
+    let (left, right) = match align {
+        ColumnAlign::Left => (0, pad),
+        ColumnAlign::Right => (pad, 0),
+        ColumnAlign::Center => (pad / 2, pad - pad / 2),
+    };
+
+    let mut spans = Vec::new();
+    if left > 0 {
+        spans.push(Span::raw(" ".repeat(left)));
+    }
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for (ch, style) in line {
+        if run_style != Some(style) {
+            if let Some(previous) = run_style.take() {
+                spans.push(Span::styled(std::mem::take(&mut run), previous));
+            }
+            run_style = Some(style);
+        }
+        run.push(ch);
+    }
+    if let Some(style) = run_style {
+        spans.push(Span::styled(run, style));
+    }
+    if right > 0 {
+        spans.push(Span::raw(" ".repeat(right)));
+    }
+    spans
+}
+
+/// Display width of a cell's text *after* inline markdown markers are stripped,
+/// so column widths match what actually renders.
+fn rendered_width(text: &str) -> usize {
+    inline_markdown_spans(text, Style::default())
+        .iter()
+        .map(|span| UnicodeWidthStr::width(&*span.content))
+        .sum()
 }
 
 fn inline_markdown_spans(text: &str, style: Style) -> Vec<Span<'static>> {
@@ -470,7 +792,11 @@ fn transcript_inner(area: Rect) -> Rect {
 }
 
 fn transcript_scroll(state: &ConversationState, area: Rect) -> u16 {
-    paragraph_scroll(&transcript_paragraph(state), area, &state.scroll)
+    paragraph_scroll(
+        &transcript_paragraph(state, transcript_inner(area).width),
+        area,
+        &state.scroll,
+    )
 }
 
 pub(super) fn transcript_point(
@@ -490,7 +816,7 @@ pub(super) fn transcript_point(
         column: column - inner.x,
     };
     let absolute_row = transcript_scroll(state, area).saturating_add(point.row);
-    let line_count = transcript_paragraph(state).line_count(inner.width);
+    let line_count = transcript_paragraph(state, inner.width).line_count(inner.width);
     ((absolute_row as usize) < line_count).then_some(point)
 }
 
@@ -504,7 +830,7 @@ pub(super) fn transcript_selection_text(
     if inner.is_empty() {
         return None;
     }
-    let paragraph = transcript_paragraph(state);
+    let paragraph = transcript_paragraph(state, inner.width);
     let line_count = paragraph.line_count(inner.width).min(u16::MAX as usize) as u16;
     let mut buffer = Buffer::empty(Rect::new(0, 0, inner.width, line_count));
     paragraph.render(buffer.area, &mut buffer);
@@ -1082,6 +1408,68 @@ mod tests {
                 Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
             ])
         );
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn markdown_table_aligns_columns_and_draws_a_divider() {
+        let table = "| Name | Role |\n| :--- | ---: |\n| Ann | dev |\n| Bo | lead |";
+        let lines = markdown_block_lines(table, 40);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "| Name | Role |".to_string(),
+                "|------|------|".to_string(),
+                "| Ann  |  dev |".to_string(),
+                "| Bo   | lead |".to_string(),
+            ]
+        );
+        // Every row is padded to the same display width.
+        let widths: Vec<usize> = rendered.iter().map(|row| row.chars().count()).collect();
+        assert!(widths.iter().all(|&w| w == widths[0]));
+    }
+
+    #[test]
+    fn markdown_table_wraps_over_long_cells_instead_of_truncating() {
+        let table = "| Item | Note |\n| --- | --- |\n| a | one two three four five |";
+        let lines = markdown_block_lines(table, 24);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        // The long cell spills onto extra visual rows; no content is dropped.
+        let note: String = rendered
+            .iter()
+            .flat_map(|row| row.split('|').nth(2).map(str::trim).map(str::to_string))
+            .filter(|cell| !cell.is_empty() && !cell.starts_with('-') && *cell != "Note")
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(note, "one two three four five");
+        // Nothing exceeds the pane width.
+        assert!(rendered.iter().all(|row| row.chars().count() <= 24));
+    }
+
+    #[test]
+    fn markdown_table_falls_back_to_inline_when_too_narrow() {
+        let table = "| Name | Role |\n| --- | --- |\n| Ann | dev |";
+        let lines = markdown_block_lines(table, 6);
+        // Too narrow to seat the columns: rows stay as raw inline text.
+        assert_eq!(line_text(&lines[0]), "| Name | Role |");
+    }
+
+    #[test]
+    fn markdown_block_leaves_non_tables_as_inline_markdown() {
+        let text = "just a **bold** line\nand another";
+        let lines = markdown_block_lines(text, 80);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "just a bold line");
+        assert_eq!(line_text(&lines[1]), "and another");
     }
 
     #[test]

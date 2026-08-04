@@ -110,6 +110,7 @@ dependencies = [
  "ratatui-widgets",
  "serde_json",
  "tar",
+ "unicode-width",
  "xattr",
 ]
 
