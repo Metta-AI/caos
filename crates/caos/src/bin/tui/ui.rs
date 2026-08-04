@@ -353,10 +353,181 @@ fn transcript_paragraph(state: &ConversationState) -> Paragraph<'static> {
             ));
         }
         lines.push(Line::from(heading));
-        lines.extend(entry.text.lines().map(inline_markdown_line));
+        lines.extend(markdown_lines(&entry.text));
         lines.push(Line::raw(""));
     }
     Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let source: Vec<&str> = text.lines().collect();
+    let mut rendered = Vec::new();
+    let mut index = 0;
+    while index < source.len() {
+        if let Some((table, consumed)) = markdown_table(&source[index..]) {
+            rendered.extend(table);
+            index += consumed;
+        } else {
+            rendered.push(inline_markdown_line(source[index]));
+            index += 1;
+        }
+    }
+    rendered
+}
+
+fn markdown_table(source: &[&str]) -> Option<(Vec<Line<'static>>, usize)> {
+    let header = parse_table_row(source.first()?)?;
+    let delimiter = parse_table_delimiter(source.get(1)?)?;
+    if header.len() != delimiter.len() {
+        return None;
+    }
+
+    let columns = header.len();
+    let mut rows = vec![header];
+    let mut consumed = 2;
+    while let Some(line) = source.get(consumed) {
+        let Some(mut row) = parse_table_row(line) else {
+            break;
+        };
+        if row.len() > columns {
+            break;
+        }
+        row.resize(columns, String::new());
+        rows.push(row);
+        consumed += 1;
+    }
+
+    let widths = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .map(|row| markdown_cell_width(&row[column]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let mut lines = vec![table_border('┌', '┬', '┐', &widths)];
+    lines.push(table_row(&rows[0], &widths, &delimiter, true));
+    lines.push(table_border('├', '┼', '┤', &widths));
+    lines.extend(
+        rows.iter()
+            .skip(1)
+            .map(|row| table_row(row, &widths, &delimiter, false)),
+    );
+    lines.push(table_border('└', '┴', '┘', &widths));
+    Some((lines, consumed))
+}
+
+fn parse_table_row(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    if !line.contains('|') {
+        return None;
+    }
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    let mut code = false;
+    for ch in line.chars() {
+        if escaped {
+            cell.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '`' {
+            code = !code;
+            cell.push(ch);
+        } else if ch == '|' && !code {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+        } else {
+            cell.push(ch);
+        }
+    }
+    if escaped {
+        cell.push('\\');
+    }
+    cells.push(cell.trim().to_string());
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn parse_table_delimiter(line: &str) -> Option<Vec<TableAlignment>> {
+    let cells = parse_table_row(line)?;
+    cells
+        .into_iter()
+        .map(|cell| {
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            let dashes = cell.trim_matches(':');
+            if dashes.len() < 3 || !dashes.bytes().all(|byte| byte == b'-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => TableAlignment::Center,
+                (false, true) => TableAlignment::Right,
+                _ => TableAlignment::Left,
+            })
+        })
+        .collect()
+}
+
+fn markdown_cell_width(text: &str) -> usize {
+    inline_markdown_spans(text, Style::default())
+        .iter()
+        .map(|span| span.content.cell_width() as usize)
+        .sum()
+}
+
+fn table_border(left: char, separator: char, right: char, widths: &[usize]) -> Line<'static> {
+    let mut text = String::new();
+    text.push(left);
+    for (index, width) in widths.iter().enumerate() {
+        text.push_str(&"─".repeat(width + 2));
+        text.push(if index + 1 == widths.len() {
+            right
+        } else {
+            separator
+        });
+    }
+    Line::styled(text, Style::default().fg(Color::DarkGray))
+}
+
+fn table_row(
+    cells: &[String],
+    widths: &[usize],
+    alignments: &[TableAlignment],
+    header: bool,
+) -> Line<'static> {
+    let border = Style::default().fg(Color::DarkGray);
+    let cell_style = if header {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![Span::styled("│", border)];
+    for (index, cell) in cells.iter().enumerate() {
+        let width = markdown_cell_width(cell);
+        let empty = widths[index].saturating_sub(width);
+        let (left, right) = match alignments[index] {
+            TableAlignment::Left => (0, empty),
+            TableAlignment::Center => (empty / 2, empty - empty / 2),
+            TableAlignment::Right => (empty, 0),
+        };
+        spans.push(Span::raw(format!(" {}", " ".repeat(left))));
+        spans.extend(inline_markdown_spans(cell, cell_style));
+        spans.push(Span::raw(format!("{} ", " ".repeat(right))));
+        spans.push(Span::styled("│", border));
+    }
+    Line::from(spans)
 }
 
 fn inline_markdown_line(text: &str) -> Line<'static> {
@@ -1081,6 +1252,43 @@ mod tests {
                 Span::raw("`**not bold** _not italic_` and "),
                 Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
             ])
+        );
+    }
+
+    #[test]
+    fn markdown_tables_render_with_borders_alignment_and_inline_styles() {
+        let lines =
+            markdown_lines("| Name | Count |\n| :--- | ---: |\n| **alpha** | 2 |\n| beta | 100 |");
+
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text[0], "┌───────┬───────┐");
+        assert_eq!(text[1], "│ Name  │ Count │");
+        assert_eq!(text[3], "│ alpha │     2 │");
+        assert_eq!(text[4], "│ beta  │   100 │");
+        assert_eq!(text[5], "└───────┴───────┘");
+        assert!(lines[1]
+            .spans
+            .iter()
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(lines[3].spans.iter().any(
+            |span| span.content == "alpha" && span.style.add_modifier.contains(Modifier::BOLD)
+        ));
+    }
+
+    #[test]
+    fn malformed_table_delimiters_remain_plain_markdown() {
+        let lines = markdown_lines("a | b\n-- | --\n1 | 2");
+        assert_eq!(
+            lines,
+            vec![Line::raw("a | b"), Line::raw("-- | --"), Line::raw("1 | 2")]
         );
     }
 
