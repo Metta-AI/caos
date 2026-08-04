@@ -48,7 +48,10 @@ echo "  ok: workspace checks clean (${took}ms)" >&2
 # served from the PREVIOUS suite's cache and both numbers below are fixed
 # overhead. That is why this test has been flaky: it was often comparing two
 # cache hits. One fresh salt, shared by both runs, so the first genuinely
-# computes and the second genuinely reuses it.
+# computes and the second genuinely reuses it. That the salt TOOK is checked
+# comparatively (cold_hits << edit_hits) once both runs are in, not by
+# demanding the cold run have exactly zero hits (intra-run diamond dedup makes
+# that count jitter — see below).
 CAOS_SALT="cargo-self-$(date +%s%N)"
 export CAOS_SALT
 
@@ -61,7 +64,14 @@ t3=$(ms)
 cold=$((t3 - t2))
 cold_hits=$(grep -c '"cache_hit":true' cold.trace || true)
 echo "  ok: per-crate check clean (${cold}ms cold, ${cold_hits} cache hits)" >&2
-[ "$cold_hits" -eq 0 ] || fail "the cold run had ${cold_hits} cache hits — the salt did not take, so nothing below is measuring what it claims"
+# NB: cold_hits is NOT asserted to be 0. The workspace DAG has diamonds
+# (worker-common is a dependency of many members), so its single `job` is
+# computed once and re-requested by every dependent. Whether a re-request lands
+# as a single-flight WAITER (records no cache_hit) or, if the first finished and
+# cached first, a redis cache_hit:true is pure timing — so a genuinely cold run
+# legitimately shows a small, jittery number of intra-run dedup hits. Asserting
+# ==0 was the flake. The real question — "did the salt take?" — is answered
+# comparatively against the edit run below, where it has meaning and no race.
 
 # Edit one leaf crate: its jobs (and the whole-tree-keyed orchestration)
 # re-run; every other member's compile is a CACHE HIT, and that is what this
@@ -89,6 +99,15 @@ t5=$(ms)
 [ "$(cat r3/exit)" = "0" ] || fail "edited mode=all check failed: $(tail -c 2000 r3/stderr)"
 edit_hits=$(grep -c '"cache_hit":true' edit.trace || true)
 echo "  ok: one-crate edit had ${edit_hits} cache hits (cold had ${cold_hits})" >&2
+# The salt-took check, done comparatively and race-free. If the salt had NOT
+# taken, the "cold" run would have been served wholesale from the previous
+# suite's cache, so cold_hits would be the full cached-job count — at least as
+# large as the edit run's reuse count. When the salt DID take, cold_hits is only
+# the handful of intra-run diamond-dedup hits, well below edit_hits. So a cold
+# run with FEWER hits than the reuse run is the honest signal, and it cannot be
+# broken by the single-flight-vs-cache timing that broke the old ==0 assertion.
+[ "$cold_hits" -lt "$edit_hits" ] \
+  || fail "the cold run had ${cold_hits} cache hits vs ${edit_hits} in the edit run — the salt did not take, so nothing here is measuring what it claims"
 [ "$edit_hits" -ge 8 ] \
   || fail "one-crate edit reused only ${edit_hits} cached jobs — per-crate caching regressed.
   Editing the leaf crate worker-rgrep should leave every other member's compile
