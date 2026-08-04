@@ -1910,7 +1910,7 @@ impl App {
             self.selected_mut()
                 .push_error("finish this conversation's operation before checking it out");
         } else if let Some(diff) = self.selected().diff.clone() {
-            match load_conversation_workspace(&diff, &self.repo_dir) {
+            match load_conversation_workspace(&diff.head, &self.repo_dir) {
                 Ok(()) => {
                     self.selected_mut().status =
                         format!("checked out {} in detached HEAD", short_hash(&diff.head));
@@ -3134,9 +3134,8 @@ mod tests {
 
         app.selected_mut().running = false;
         app.selected_mut().diff = Some(WorkspaceDiff {
-            base: "a".repeat(40),
+            base_commit: "a".repeat(40),
             head: "b".repeat(40),
-            stat: "1 file changed".to_string(),
             patch: "diff --git a/a b/a".to_string(),
         });
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
@@ -3175,9 +3174,8 @@ mod tests {
 
         let mut selected = state("talk-1");
         selected.diff = Some(WorkspaceDiff {
-            base,
+            base_commit: base,
             head: head.clone(),
-            stat: "1 file changed".to_string(),
             patch: "changed".to_string(),
         });
         let (mut app, _) = app_with(vec![selected]);
