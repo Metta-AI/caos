@@ -17,8 +17,9 @@
 //!   plus each non-empty child result tree, linked into one tree.
 //! * `--in` a file (a file-scoped grep) — the match blob itself.
 //!
-//! The pattern is a curried arg, so the recursion image — this request's own
-//! image — carries it, and a child's cache key is exactly (subtree, pattern).
+//! The pattern is a curried arg, so the recursion ArgTree — this request's own
+//! image curried with the pattern — carries it, and a child's cache key is
+//! exactly (subtree, pattern).
 //! Binary files (NUL in the first 8KB) and symlinks are skipped, like grep -I.
 
 use std::fs;
@@ -85,7 +86,7 @@ fn run() -> Result<(), String> {
         return caos(["put", path(&own), "/cas/out"]);
     }
 
-    // Fan out: map ourselves (this request's image — the pattern rides in it)
+    // Fan out: map ourselves (this request's ArgTree — the pattern rides in it)
     // over just the subdirectories; the local matches ride into `then`.
     let own_cas = "/cas/rgrep-own";
     caos(["put", path(&own), own_cas])?;

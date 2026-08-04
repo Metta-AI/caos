@@ -86,10 +86,13 @@ fn run(args: &[String]) -> Result<(), String> {
             [input, sep, kvs @ ..] if sep == "--" => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
-        // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an image, printing
-        // a ref to the resulting curried image (run/curry it like any image).
+        // `curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]` —
+        // bind args to an ArgTree (a bare image, a curry node, or a flat args
+        // tree like `own_args_tree`), printing a ref to the resulting curried
+        // ArgTree (run/curry it like any other). `--unbind` releases a bound arg
+        // so it can be rebound.
         Some("curry") => match &args[2..] {
-            [image, sep, kvs @ ..] if sep == "--" => caos::caos_curry(&http()?, image, kvs),
+            [arg_tree, rest @ ..] => caos::caos_curry(&http()?, arg_tree, rest),
             _ => Err(usage(args)),
         },
         // `runner --job=<json>` — run the handed-in job, then poll for more; see
@@ -394,7 +397,7 @@ fn usage(args: &[String]) -> String {
          {prog} hash <cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>]\n  \
-         {prog} curry <image> -- [--name=value | --name:@=path ...]\n  \
+         {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
          {prog} runner --job=<json>"
     )
 }

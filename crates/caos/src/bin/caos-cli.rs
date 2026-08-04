@@ -101,11 +101,13 @@ fn run(args: &[String]) -> Result<(), String> {
                 None => run(None),
             }
         }
-        // `curry <image> -- [--name=value | --name:@=path ...]` — bind args to an
-        // image, printing a ref to the curried image (run it like any image).
-        // Path args are host paths to ingest, or `/cas/std/<name>` builtin refs.
+        // `curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]` —
+        // bind args to an ArgTree (a bare image, a curry node, or a flat args
+        // tree), printing a ref to the curried ArgTree (run it like any other).
+        // Path args are host paths to ingest, or `/cas/std/<name>` builtin refs;
+        // `--unbind` releases a bound arg so it can be rebound.
         Some("curry") => match &args[2..] {
-            [image, sep, kvs @ ..] if sep == "--" => caos::cli_curry(&transport()?, image, kvs),
+            [arg_tree, rest @ ..] => caos::cli_curry(&transport()?, arg_tree, rest),
             _ => Err(usage(args)),
         },
         // `import-image [--base docker://<ref>] <docker-archive>` — store a
@@ -167,7 +169,7 @@ fn usage(args: &[String]) -> String {
     format!(
         "usage:\n  \
          {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
-         {prog} curry <image | /cas/std/<name>> -- [--name=value | --name:@=path ...]\n  \
+         {prog} curry <arg tree | /cas/std/<name>> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
          {prog} tui [--new | --from <commit>] [options]\n  \

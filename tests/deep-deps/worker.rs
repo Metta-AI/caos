@@ -145,8 +145,8 @@ fn deepen_image() -> Result<String, String> {
     caos_curry(&me(), &kvs)
 }
 
-/// This image, for currying `deepen`/`finish` — its own image from the
-/// request's reserved `image` args entry, so recursion needs no std lookup.
+/// The ArgTree to recurse with: our own image (the request's reserved `image`
+/// args entry) curried with `deepen`/`finish`, so recursion needs no std lookup.
 fn me() -> String {
     own_image()
 }

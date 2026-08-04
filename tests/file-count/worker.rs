@@ -1,10 +1,10 @@
 //! caos-worker-file-count: counts the leaf files under `--in`, recursing with
-//! itself through map-then. One image, three positions, told apart by the
+//! itself through map-then. One ArgTree, three positions, told apart by the
 //! arguments the server (or a caller) passes:
 //!
 //!   * `--in` a tree, no `--children` — the recursive case: record the
 //!     continuation `{in, map: file-count, then: file-count}` and exit. The
-//!     server counts each child (in parallel) and calls this image back with
+//!     server counts each child (in parallel) and calls this ArgTree back with
 //!     the results;
 //!   * `--in` plus `--children` (the `then` position) — combine: the count is
 //!     the sum of the child counts (each entry a number);
@@ -42,7 +42,7 @@ fn run() -> Result<(), String> {
         // A tree with no counted children yet: recurse. Tail call — the
         // continuation is this worker's result.
         eprintln!("file-count: recursing over the tree's children");
-        let me = recur_image()?;
+        let me = recur_arg_tree()?;
         return map_then(&arg("in"), Some(&me), Some(&me));
     };
 
@@ -51,10 +51,10 @@ fn run() -> Result<(), String> {
     caos(["put", path(&out), "/cas/out"])
 }
 
-/// The image to recurse with: our own (unwrapped) image, rebinding the
+/// The ArgTree to recurse with: our own (unwrapped) image, rebinding the
 /// runner-pool `bin` when we ship as a curry so children re-exec this binary.
 /// A no-op when there's no `bin` (a baked image already carries `/worker`).
-fn recur_image() -> Result<String, String> {
+fn recur_arg_tree() -> Result<String, String> {
     let me = own_image();
     let bin = arg("worker1");
     if Path::new(&bin).exists() {

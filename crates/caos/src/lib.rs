@@ -2650,66 +2650,117 @@ fn std_tree() -> Result<String, String> {
     Ok(hash)
 }
 
-/// `curry <arg tree> -- [--name=value ...]` — bind arguments to `<image>`, printing
-/// a ref (a git hash) to the new arg tree that includes the new args.
-/// The ref can be `run` — which supplies the rest of the args —
+/// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — bind arguments
+/// to `<arg tree>`, printing a ref (a git hash) to the new arg tree that includes
+/// the new args. The ref can be `run` — which supplies the rest of the args —
 /// or `curry`'d again, exactly like any other arg tree; the binding is partial
 /// application, not a rebuilt container image. This is the *worker* form: path
 /// args resolve against `/cas`. (The CLI's is [`cli_curry`].)
 ///
-/// The curried arg tree is a small CAS tree: a `base` blob (the underlying image
-/// ref), an `args` subtree (the bound args, in `build_arg_entries` shape), and a
-/// [`CURRY_MARKER`] blob. Currying flattens: if `<image>` is itself curried, its
-/// bindings are folded in and `base` stays a plain (docker/git) image, so the
-/// result is canonical (`curry (curry img a) b` == `curry img a b`) — and
-/// STRICT: rebinding an already-bound name is refused, not overridden (see
-/// `curry_object`).
-pub fn caos_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+/// Currying is an ArgTree → ArgTree operation. `arg_tree` may be given in any of
+/// its equivalent forms — a curry node, a flat args tree (e.g. `own_args_tree`),
+/// or a bare image (the *simplest* ArgTree, image and nothing else) — because
+/// `unwrap_curry` normalizes whichever it is into the `(base image, bound
+/// args)` pair an ArgTree decomposes to. So no caller has to wrap a bare image
+/// first; that wrapping is exactly the empty-bound-args case here.
+///
+/// The result is a small CAS tree: a `base` blob (the image), an `args` subtree
+/// (the bound args, in `build_arg_entries` shape), and a [`CURRY_MARKER`] blob.
+/// Currying flattens: if `arg_tree` is itself curried, its bindings are folded in
+/// and `base` stays a plain (docker/git) image, so the result is canonical
+/// (`curry (curry img a) b` == `curry img a b`) — and STRICT: rebinding an
+/// already-bound name is refused, not overridden, unless it is first `--unbind`ed
+/// (see `curry_object`).
+pub fn caos_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<(), String> {
     let cas = cas_dir();
-    let image = resolve_run_image(t, &cas, image)?;
-    println!("{}", curry_object(t, &image, Some(&cas), kvs)?);
+    let (unbind, kvs) = split_curry_args(rest)?;
+    let arg_tree = resolve_run_image(t, &cas, arg_tree)?;
+    println!("{}", curry_object(t, &arg_tree, Some(&cas), &unbind, kvs)?);
     Ok(())
 }
 
-/// `curry <image> -- [--name=value ...]` — the *CLI* form of [`caos_curry`]:
-/// `<image>` may be a `/cas/std/<name>` builtin, path args are host paths to
-/// ingest (or `/cas/std/<name>` builtin refs), and the curried image is pushed
-/// so a later `run` can use the printed ref directly.
-pub fn cli_curry(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
-    let image = resolve_cli_image(t, image)?;
-    let curried = curry_object(t, &image, None, kvs)?;
+/// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — the *CLI* form
+/// of [`caos_curry`]: `<arg tree>` may be a `/cas/std/<name>` builtin, path args
+/// are host paths to ingest (or `/cas/std/<name>` builtin refs), and the curried
+/// arg tree is pushed so a later `run` can use the printed ref directly.
+pub fn cli_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<(), String> {
+    let (unbind, kvs) = split_curry_args(rest)?;
+    let arg_tree = resolve_cli_image(t, arg_tree)?;
+    let curried = curry_object(t, &arg_tree, None, &unbind, kvs)?;
     t.ensure_pushed(&curried.to_string())?;
-    if is_hex_hash(&image) {
-        t.ensure_pushed(&image)?;
+    if is_hex_hash(&arg_tree) {
+        t.ensure_pushed(&arg_tree)?;
     }
     println!("{curried}");
     Ok(())
 }
 
-/// Build (and store) a curry node over the resolved `image`: the shared body of
-/// [`caos_curry`] / [`cli_curry`]. `cas` decides how path args resolve, exactly
-/// as in [`run_request`].
+/// Split a `curry`'s tail — `[--unbind=<name> …] -- [--name=value …]` — into the
+/// unbind names (before `--`) and the bind kvs (after it). The `--` is required,
+/// so the two regions never blur; only `--unbind=<name>` is accepted before it,
+/// which cannot collide with a bound arg (a different region entirely).
+fn split_curry_args(rest: &[String]) -> Result<(Vec<&str>, &[String]), String> {
+    let sep = rest
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("curry needs `--` before its args (e.g. `curry <arg tree> -- --k=v`)")?;
+    let (flags, kvs) = (&rest[..sep], &rest[sep + 1..]);
+    let unbind = flags
+        .iter()
+        .map(|f| {
+            f.strip_prefix("--unbind=").ok_or_else(|| {
+                format!(
+                    "curry: unexpected {f:?} before `--`; only --unbind=<name> is allowed there"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((unbind, kvs))
+}
+
+/// Build (and store) a curry node from the ArgTree `arg_tree` plus `unbind`/`kvs`:
+/// the shared body of [`caos_curry`] / [`cli_curry`]. [`unwrap_curry`] decomposes
+/// `arg_tree` (whatever form it's in) into its `base` image and already-`bound`
+/// args; we then drop the `unbind` names, refuse any rebind, and add `kvs`. `cas`
+/// decides how path args resolve, exactly as in [`run_request`].
 fn curry_object(
     t: &dyn Transport,
-    image: &str,
+    arg_tree: &str,
     cas: Option<&Path>,
+    unbind: &[&str],
     kvs: &[String],
 ) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
 
-    let (image, bound) = unwrap_curry(t, image)?;
+    let (base, mut bound) = unwrap_curry(t, arg_tree)?;
+
+    // UNBIND first: drop the named args so they can be rebound. Currying is
+    // otherwise strict (below), so carrying a whole ArgTree forward and changing
+    // a few of its args — the self-recurry case — needs an explicit release. An
+    // unbind of a name that isn't bound is a mistake (a typo, or a wrong
+    // assumption about the ArgTree's shape), so it's an error, not a no-op.
+    for name in unbind {
+        let before = bound.len();
+        bound.retain(|e| entry_name(e) != name.as_bytes());
+        if bound.len() == before {
+            return Err(format!(
+                "curry: --unbind={name} but {name:?} is not bound in {arg_tree}"
+            ));
+        }
+    }
 
     // REFUSE to rebind a name that's already bound: a colliding curry is
     // almost always the reserved-name class of bug (a caller arg landing on
     // `worker1`), and silent override turns it into a distant, cryptic
     // failure. Call-time args still override curry bindings at run — only
-    // curry-over-curry is strict.
+    // curry-over-curry is strict. Unbind (above) is the deliberate release.
     let new = build_arg_entries(t, cas, kvs)?;
     for e in &new {
         if bound.iter().any(|b| b.filename == e.filename) {
             return Err(format!(
-                "curry: arg {:?} is already bound in {image}; rename one of them \
-                 (curry refuses to rebind — run-time args may still override)",
+                "curry: arg {:?} is already bound in {arg_tree}; rename one of them, \
+                 or --unbind it first (curry refuses to rebind — run-time args \
+                 may still override)",
                 String::from_utf8_lossy(&e.filename)
             ));
         }
@@ -2721,7 +2772,7 @@ fn curry_object(
         Entry {
             mode: EntryKind::Blob.into(),
             filename: b"base".to_vec().into(),
-            oid: post_object(t, "blob", image.as_bytes())?,
+            oid: post_object(t, "blob", base.as_bytes())?,
         },
         Entry {
             mode: EntryKind::Tree.into(),
@@ -2749,16 +2800,63 @@ fn unwrap_curry(
     let mut image = image.to_string();
     let mut bound = Vec::new();
     while is_hex_hash(&image) {
-        match curry_node(t, &image)? {
-            None => break, // a plain git image, not a curry node
-            Some((inner_image, inner_args)) => {
-                // `bound` holds outer layers, which win over this deeper one.
-                bound = merge_entries(inner_args, bound);
-                image = inner_image;
-            }
+        if let Some((inner_image, inner_args)) = curry_node(t, &image)? {
+            // `bound` holds outer layers, which win over this deeper one.
+            bound = merge_entries(inner_args, bound);
+            image = inner_image;
+            continue;
         }
+        // The OTHER form of an ArgTree: a flat args tree `{image, …args}` (no
+        // curry marker), which is what the server materializes at `/cas/args`
+        // and `own_args_tree` names. Its `image` entry is the base; its other
+        // entries are bound args. Recognizing it lets `curry` carry a whole
+        // ArgTree forward — bind/unbind onto it — not just re-bind onto a bare
+        // base image.
+        if let Some((inner_image, inner_args)) = args_tree_node(t, &image)? {
+            bound = merge_entries(inner_args, bound);
+            image = inner_image;
+            continue;
+        }
+        break; // a plain image (git-docker/flake), not an ArgTree
     }
     Ok((image, bound))
+}
+
+/// If `hash` names a flat **args tree** — a tree carrying the reserved `image`
+/// entry but no [`CURRY_MARKER`] — return its base image ref (from the `image`
+/// entry: a git image's tree oid, or a `docker://` blob's contents) and its
+/// remaining entries as bound args. This is the shape the server materializes at
+/// `/cas/args` (hence what `own_args_tree` names); `None` for a curry node, a
+/// plain image, or any tree without an `image` entry.
+fn args_tree_node(
+    t: &dyn Transport,
+    hash: &str,
+) -> Result<Option<(String, Vec<gix::objs::tree::Entry>)>, String> {
+    let entries = match fetch_tree_entries(t, hash)? {
+        Some(entries) => entries,
+        None => return Ok(None),
+    };
+    if entries
+        .iter()
+        .any(|e| entry_name(e) == CURRY_MARKER.as_bytes())
+    {
+        return Ok(None); // a curry node — handled by `curry_node`
+    }
+    let Some(image) = entries.iter().find(|e| entry_name(e) == b"image") else {
+        return Ok(None); // no reserved `image` entry — not an args tree
+    };
+    // A git image rides embedded (the entry IS its tree, so the ref is the oid);
+    // a `docker://` ref rides as a blob naming the registry ref.
+    let base_ref = if image.mode.is_tree() {
+        image.oid.to_string()
+    } else {
+        fetch_blob_string(t, &image.oid.to_string())?
+    };
+    let bound = entries
+        .into_iter()
+        .filter(|e| entry_name(e) != b"image")
+        .collect();
+    Ok(Some((base_ref, bound)))
 }
 
 /// If `hash` names a curry node, return its base image ref and bound-args

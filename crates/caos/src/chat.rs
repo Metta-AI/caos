@@ -1063,7 +1063,8 @@ fn turn(
     let bash_image = match &bash_bin {
         Some(bin) => {
             let runner = runner.as_deref().expect("resolved when a bin is given");
-            let img = curry_object(t, runner, None, &[format!("--worker1:@={bin}")])?.to_string();
+            let img =
+                curry_object(t, runner, None, &[], &[format!("--worker1:@={bin}")])?.to_string();
             t.ensure_pushed(&img)?;
             t.ensure_pushed(runner)?;
             img
@@ -1074,7 +1075,8 @@ fn turn(
     let grep_image = match &rgrep_bin {
         Some(bin) => {
             let runner = runner.as_deref().expect("resolved when a bin is given");
-            let img = curry_object(t, runner, None, &[format!("--worker1:@={bin}")])?.to_string();
+            let img =
+                curry_object(t, runner, None, &[], &[format!("--worker1:@={bin}")])?.to_string();
             t.ensure_pushed(&img)?;
             t.ensure_pushed(runner)?;
             img
@@ -1139,7 +1141,7 @@ fn turn(
         }
         None => resolve_cli_image(t, LLM_STEP_IMAGE)?,
     };
-    let llm = curry_object(t, &llm_base, None, &kvs)?.to_string();
+    let llm = curry_object(t, &llm_base, None, &[], &kvs)?.to_string();
     emit(TurnEvent::PhaseComplete {
         label: "resolving the workers".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),

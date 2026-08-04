@@ -11,6 +11,22 @@
 //! scratch tree and `caos put`ting it; `caos put` resolves those symlinks to the
 //! content's recorded hash, so nothing is re-read or re-uploaded. That's why a
 //! worker needs no `cp`/coreutils — and so no shell in its image.
+//!
+//! What a worker curries and calls is an *ArgTree*, not an image (SPEC, "Work"):
+//! currying takes an ArgTree and args and returns a new ArgTree, and its in-code
+//! form is a curry node (`{base, args, .caos-curry}`). An image is just one arg
+//! (the reserved `image`), so the *simplest* ArgTree is a bare image — which is
+//! exactly what `own_image`/`std_image` hand you: image refs, the value under
+//! that one arg. `caos curry` binds args onto such a ref to build a richer
+//! ArgTree; the `map`/`then`/`run` operands are ArgTree refs (a bare image, or a
+//! curry node carrying an image plus other args).
+//!
+//! To recurse, a worker calls a new ArgTree built from itself. Two ways: curry
+//! onto [`own_image`] (the bare base) and re-supply the args to carry — simple,
+//! but every carried arg must be re-listed; or carry the whole ArgTree forward
+//! with [`own_args_tree`] + [`caos_recurry`], unbinding only the args that
+//! change. The latter is what a worker with mutable loop state wants — config
+//! rides along untouched, and only the state is unbound and rebound.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -25,23 +41,38 @@ pub fn arg(name: &str) -> String {
     format!("{ARGS}/{name}")
 }
 
-/// A built-in's image, referenced as a path into the standard-library tree the
-/// server materialized at `/cas/std`. Pass the result to `caos map-then`/`caos curry`
-/// like any image ref — `caos` resolves the recorded hash. The binding rides in
-/// `std` (and thus the cache key), not in env.
+/// A built-in's image ref: a path into the standard-library tree the server
+/// materialized at `/cas/std`. Pass the result to `caos map-then`/`caos curry`
+/// as the ArgTree to call or curry onto — a bare image is the simplest ArgTree,
+/// and `caos` resolves the recorded hash. The binding rides in `std` (and thus
+/// the cache key), not in env.
 pub fn std_image(name: &str) -> String {
     format!("/cas/std/{name}")
 }
 
-/// This worker's *own* image — the request's reserved `image` args entry, which
-/// a git image materializes as a tree at `/cas/args/image`. Pass it to `caos
-/// map-then`/`caos curry` to recurse with yourself: it's the exact image
-/// running, so recursion needs no std lookup and works for any git image (a
-/// rustc-built worker as much as a builtin). Not for `docker://` workers —
-/// there the entry is a blob naming the registry ref, and a path resolves to
-/// the recorded hash, not the ref.
+/// This worker's *own* image ref — the request's reserved `image` args entry,
+/// which a git image materializes as a tree at `/cas/args/image`. It's the
+/// UNWRAPPED base image (never a curry node), so curry your args back onto it to
+/// recurse by calling yourself — an ArgTree built from the exact image running,
+/// needing no std lookup, for any git image (a rustc-built worker as much as a
+/// builtin). Not for `docker://` workers — there the entry is a blob naming the
+/// registry ref, and a path resolves to the recorded hash, not the ref.
+///
+/// Reaching for this to rebuild your whole ArgTree by hand? Prefer
+/// [`own_args_tree`] + [`caos_recurry`], which carry every other arg forward.
 pub fn own_image() -> String {
     arg("image")
+}
+
+/// This worker's *own* ArgTree — the git hash of the args tree the server
+/// materialized at `/cas/args` (the `image` base plus every bound and call arg).
+/// Unlike [`own_image`], which is just the base, this is the WHOLE ArgTree, so a
+/// worker can recurse by currying it *forward* — [`caos_recurry`] — instead of
+/// re-listing its config arg by arg (miss one and it silently vanishes next
+/// round). Its per-call args (`in`, `result`, `children`, …) ride along too, so
+/// `unbind` any that shouldn't persist into the next call.
+pub fn own_args_tree() -> Result<String, String> {
+    cas_hash(ARGS)
 }
 
 /// A worker's `main`: run `run`, map its `Result` to an exit code, and prefix any
@@ -66,16 +97,37 @@ pub fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
 /// operators — `--name=value` for a literal, `--name:@=value` for a path — so
 /// the distinction is explicit, never sniffed from the value.
 pub enum Arg<'a> {
-    /// A literal string (e.g. a mode, or an image ref to bind).
+    /// A literal string (e.g. a mode, or an arg-tree ref to bind).
     Lit(&'a str),
     /// A `/cas` path to reference (or, off-worker, a host path to ingest).
     Path(&'a str),
 }
 
-/// `caos curry <image> -- …` — bind the given named arguments to `image`,
-/// returning a ref to the resulting curried image.
-pub fn caos_curry(image: &str, args: &[(&str, Arg)]) -> Result<String, String> {
-    let argv = verb_argv("curry", image, args);
+/// `caos curry <arg tree> -- …` — bind the given named arguments to `arg_tree`,
+/// returning a ref to the resulting curried ArgTree. Currying is strict: it
+/// refuses to rebind an already-bound name — use [`caos_recurry`] to release
+/// one first.
+pub fn caos_curry(arg_tree: &str, args: &[(&str, Arg)]) -> Result<String, String> {
+    caos_recurry(arg_tree, &[], args)
+}
+
+/// `caos curry <arg tree> --unbind=… -- …` — carry `arg_tree` forward, dropping
+/// each name in `unbind` so it can be rebound, then binding `args`; returns a ref
+/// to the new ArgTree. This is the self-recurry primitive: pair it with
+/// [`own_args_tree`] to change a few args and keep every other one untouched, e.g.
+/// `caos_recurry(&own_args_tree()?, &["step"], &[("step", Arg::Path(&next))])`.
+pub fn caos_recurry(
+    arg_tree: &str,
+    unbind: &[&str],
+    args: &[(&str, Arg)],
+) -> Result<String, String> {
+    let mut argv = vec!["curry".to_string(), arg_tree.to_string()];
+    argv.extend(unbind.iter().map(|name| format!("--unbind={name}")));
+    argv.push("--".to_string());
+    argv.extend(args.iter().map(|(k, v)| match v {
+        Arg::Lit(s) => format!("--{k}={s}"),
+        Arg::Path(s) => format!("--{k}:@={s}"),
+    }));
     caos_capture(&str_refs(&argv))
 }
 
@@ -88,14 +140,14 @@ pub fn caos_curry(image: &str, args: &[(&str, Arg)]) -> Result<String, String> {
 /// `design/map-then.md`). A blob `input` has no children (a leaf), so `then`
 /// gets an empty `children` tree. With no `then`, the children tree itself is
 /// the result; with no `map`, `then(--in=<input>)` is a plain tail call.
-/// `map`/`then` are image refs (a `/cas` path, a git/curry hash, or
+/// `map`/`then` are arg-tree refs (a `/cas` path, a git/curry hash, or
 /// `docker://…`), usually curried with whatever else they need.
 ///
 /// This is a worker's *final act*: it produces `/cas/out`, so call it once, in
 /// tail position.
 pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<(), String> {
     if map.is_none() && then.is_none() {
-        return Err("map_then needs a map or a then image".to_string());
+        return Err("map_then needs a map or a then arg tree".to_string());
     }
     let mut argv: Vec<String> = vec!["map-then".into(), input.into(), "--".into()];
     if let Some(map) = map {
@@ -113,7 +165,7 @@ pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<()
 /// worker exits: one sub-run `run(--in=<input>)` yields R, then
 /// `then(--in=<input>, --result=<R>)` produces the final result — or R itself
 /// with no `then`, a plain tail call to `run`. R may itself be a promise; the
-/// server collapses it fully before `then` sees it. `run`/`then` are image refs
+/// server collapses it fully before `then` sees it. `run`/`then` are arg-tree refs
 /// exactly as in [`map_then`], usually curried with whatever else they need
 /// (e.g. a worker currying its own state into `then` to be called back with the
 /// sub-run's result).
@@ -131,17 +183,6 @@ pub fn run_then(input: &str, run: &str, then: Option<&str>) -> Result<(), String
         argv.push(format!("--then={then}"));
     }
     caos_argv(&str_refs(&argv))
-}
-
-/// Build a `caos <verb> <image> -- …` argument vector, serializing each arg per
-/// its kind (literal `--k=v`, path `--k:@=v`).
-fn verb_argv(verb: &str, image: &str, args: &[(&str, Arg)]) -> Vec<String> {
-    let mut argv = vec![verb.to_string(), image.to_string(), "--".to_string()];
-    argv.extend(args.iter().map(|(k, v)| match v {
-        Arg::Lit(s) => format!("--{k}={s}"),
-        Arg::Path(s) => format!("--{k}:@={s}"),
-    }));
-    argv
 }
 
 fn str_refs(args: &[String]) -> Vec<&str> {

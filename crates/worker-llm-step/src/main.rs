@@ -42,8 +42,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use worker_common::{
-    arg, caos, caos_curry, cas_hash, entries, file_name, link, path, read_arg, read_arg_opt,
-    read_commit, run_then, run_worker, scratch, write_commit_as, Arg, Commit,
+    arg, caos, caos_curry, caos_recurry, cas_hash, entries, file_name, link, own_args_tree, path,
+    read_arg, read_arg_opt, read_commit, run_then, run_worker, scratch, write_commit_as, Arg,
+    Commit,
 };
 
 /// Author name on step and turn commits — and how the conversation walk tells
@@ -708,11 +709,18 @@ fn launch_tree_tool(
     run_then(ws, &curried, Some(&me))
 }
 
-/// Rebuild ourselves as `curry(image, bin, <config>, <loop state>)` — a
-/// source-built worker is curry(runner, bin) and gets unwrapped into args, so
-/// "ourselves" is that same curry rebuilt from our own args (content-addressed,
-/// hence identical), plus the state to remember. Commit-valued paths (`head`,
-/// `step`, `wc`) re-bind as gitlinks (their kind xattr rides the curry).
+/// Rebuild ourselves as the `then` for the next round — the same ArgTree we're
+/// running as, with the loop state advanced. We carry our WHOLE current ArgTree
+/// forward with [`own_args_tree`] (so the static config — `api-key`, `system`,
+/// `bash-image`, `head`, `worker1`, and the optional
+/// `model`/`base-url`/`conversation`/`grep-image`/`tools-image`/`merge-image`/`merge-refs`
+/// — rides along and a NEW config arg needs no edit here) and manage only the
+/// args this loop OWNS: unbind whichever are bound right now, then rebind the
+/// ones that continue. Commit-valued paths (`head`, `step`, `wc`) ride as
+/// gitlinks. Contrast the old approach — rebuild from the bare base and re-list
+/// every arg — whose keep-list dropped a config arg the moment you forgot to add
+/// it; here a forgotten carry is impossible and a forgotten unbind is a loud
+/// rebind error, not a stale value.
 fn self_curry(
     wc: &str,
     step_path: &str,
@@ -724,17 +732,32 @@ fn self_curry(
     let pending_json = Value::Array(pending.to_vec()).to_string();
     let results_json = Value::Array(results.to_vec()).to_string();
 
-    let bin = arg("worker1");
-    let head = arg("head");
-    let api_key = arg("api-key");
-    let system = arg("system");
-    let bash_image = arg("bash-image");
+    // The loop/per-call args this function owns. Unbind whichever are bound in
+    // the current invocation (so they neither double-bind nor persist), then
+    // rebind the state below and the per-tool `extras`; `in`/`result` (run-then's
+    // call args) are dropped — the server supplies fresh ones next call.
+    //   loop state (rebound below): step, wc, pending, results, current-id
+    //   per-tool (rebound via `extras`): current-tool, ws, scope
+    //   run-then's call args (dropped): in, result
+    const MANAGED: &[&str] = &[
+        "step",
+        "wc",
+        "pending",
+        "results",
+        "current-id",
+        "current-tool",
+        "ws",
+        "scope",
+        "in",
+        "result",
+    ];
+    let unbind: Vec<&str> = MANAGED
+        .iter()
+        .copied()
+        .filter(|name| Path::new(&arg(name)).exists())
+        .collect();
+
     let mut kvs: Vec<(&str, Arg)> = vec![
-        ("worker1", Arg::Path(&bin)),
-        ("head", Arg::Path(&head)),
-        ("api-key", Arg::Path(&api_key)),
-        ("system", Arg::Path(&system)),
-        ("bash-image", Arg::Path(&bash_image)),
         ("step", Arg::Path(step_path)),
         // The workspace commit the callback continues from (a gitlink).
         ("wc", Arg::Path(wc)),
@@ -742,22 +765,6 @@ fn self_curry(
         ("results", Arg::Lit(&results_json)),
         ("current-id", Arg::Lit(current_id)),
     ];
-    let optional: Vec<(&str, String)> = [
-        "model",
-        "base-url",
-        "conversation",
-        "grep-image",
-        "tools-image",
-        "merge-image",
-        "merge-refs",
-    ]
-    .iter()
-    .map(|name| (*name, arg(name)))
-    .filter(|(_, p)| Path::new(p).exists())
-    .collect();
-    for (name, p) in &optional {
-        kvs.push((name, Arg::Path(p)));
-    }
     for (name, value) in extras {
         kvs.push((
             name,
@@ -767,7 +774,7 @@ fn self_curry(
             },
         ));
     }
-    caos_curry(&arg("image"), &kvs)
+    caos_recurry(&own_args_tree()?, &unbind, &kvs)
 }
 
 // ---------------------------------------------------------------------------
