@@ -286,9 +286,8 @@ impl UserConversationStatus {
 /// The accumulated workspace change carried by a conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceDiff {
-    pub base: String,
+    pub base_commit: String,
     pub head: String,
-    pub stat: String,
     pub patch: String,
 }
 
@@ -915,23 +914,14 @@ pub fn conversation_workspace_diff(t: &GitTransport, name: &str) -> Result<Works
     let refname = validated_refname(t, name)?;
     let head = rev_parse_opt(t, &refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
-    let (_turns, base) = history_from_head(t, &head)?;
-    let stat = t.git_capture(
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-color",
-            "--stat",
-            &base,
-            &head,
-        ],
+    let (_turns, base_commit) = history_from_head(t, &head)?;
+    let patch = t.git_capture(
+        &["diff", "--no-ext-diff", "--no-color", &base_commit, &head],
         None,
     )?;
-    let patch = t.git_capture(&["diff", "--no-ext-diff", "--no-color", &base, &head], None)?;
     Ok(WorkspaceDiff {
-        base,
+        base_commit,
         head,
-        stat,
         patch,
     })
 }

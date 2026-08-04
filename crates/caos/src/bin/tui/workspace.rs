@@ -10,7 +10,7 @@ use caos::chat::WorkspaceDiff;
 /// calling it. Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
-pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> Result<(), String> {
+pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -22,7 +22,7 @@ pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> R
                 .to_string(),
         );
     }
-    capture_required("git", &["checkout", "--detach", &diff.head], cwd)?;
+    capture_required("git", &["checkout", "--detach", head], cwd)?;
     Ok(())
 }
 
@@ -55,26 +55,41 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
 /// Publish the virtual workspace as a clean branch without checking it out.
 ///
 /// Conversation commits retain their internal step DAG as second parents. A
-/// PR should not expose that implementation history, so the publish branch is
-/// a clean sequence of snapshot commits whose trees match conversation heads.
+/// PR should not expose that implementation history or retain superseded
+/// snapshots, so the publish branch is one clean commit above the freshly
+/// fetched remote default-branch tip. Its tree is a three-way merge of the
+/// conversation's changes onto that tip, preserving non-conflicting upstream
+/// changes without exposing the conversation commits.
 pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Result<String, String> {
     let cwd = Path::new(".");
-    let branch = prepare_publish_branch(name, diff, cwd)?;
-    let branch_ref = format!("refs/heads/{branch}");
-    let push_ref = format!("{branch_ref}:refs/heads/{branch}");
-    capture_required("git", &["push", "--set-upstream", "origin", &push_ref], cwd)?;
+    let branch = format!("caos/{name}");
+    let (pr_base, pr_base_commit) = remote_default_branch_tip(cwd)?;
+    prepare_publish_branch(name, diff, &pr_base_commit, cwd)?;
+    push_publish_branch(&branch, cwd)?;
 
-    if let Some(url) = capture_optional(
+    let existing_url = capture_required(
         "gh",
-        &["pr", "view", &branch, "--json", "url", "--jq", ".url"],
+        &[
+            "pr",
+            "list",
+            "--head",
+            &branch,
+            "--base",
+            &pr_base,
+            "--state",
+            "open",
+            "--json",
+            "url",
+            "--jq",
+            ".[0].url // empty",
+        ],
         cwd,
-    )?
-    .filter(|url| !url.is_empty())
-    {
-        return Ok(url);
+    )?;
+    if !existing_url.is_empty() {
+        return Ok(existing_url);
     }
     let body = format!(
-        "Published from virtual CAOS conversation `{name}` at `{}`.\n\nThe working tree was not modified.",
+        "Published from virtual CAOS conversation `{name}` at `{}`.",
         short_hash(&diff.head)
     );
     capture_required(
@@ -84,6 +99,8 @@ pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Resul
             "create",
             "--head",
             &branch,
+            "--base",
+            &pr_base,
             "--title",
             &format!("CAOS conversation {name}"),
             "--body",
@@ -93,45 +110,126 @@ pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Resul
     )
 }
 
+pub(crate) fn remote_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+    let branch = remote_default_branch(cwd)?;
+    let commit = fetch_remote_branch_tip(&branch, cwd)?;
+    Ok((branch, commit))
+}
+
+fn remote_default_branch(cwd: &Path) -> Result<String, String> {
+    let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
+    let stdout = require_success("git", output)?;
+    parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
+}
+
+fn parse_remote_default_branch(output: &str) -> Result<String, String> {
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(marker), Some(reference), Some(target)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if marker == "ref:" && target == "HEAD" {
+            let branch = reference
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| format!("origin HEAD points outside refs/heads: {reference}"))?;
+            if branch.is_empty() {
+                return Err("origin HEAD advertises an empty default branch".to_string());
+            }
+            return Ok(branch.to_string());
+        }
+    }
+    Err("origin HEAD did not advertise a default branch".to_string())
+}
+
+fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String, String> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let tracking_ref = format!("refs/remotes/origin/{branch}");
+    let refspec = format!("+{remote_ref}:{tracking_ref}");
+    capture_required(
+        "git",
+        &["fetch", "--quiet", "--no-tags", "origin", &refspec],
+        cwd,
+    )?;
+    capture_required("git", &["rev-parse", "--verify", &tracking_ref], cwd)
+}
+
+fn push_publish_branch(branch: &str, cwd: &Path) -> Result<(), String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let remote_tip = remote_branch_tip(&branch_ref, cwd)?;
+    let expected = remote_tip.as_deref().unwrap_or("");
+    let lease = format!("--force-with-lease={branch_ref}:{expected}");
+    let push_ref = format!("{branch_ref}:{branch_ref}");
+    capture_required(
+        "git",
+        &["push", "--set-upstream", &lease, "origin", &push_ref],
+        cwd,
+    )?;
+    Ok(())
+}
+
+fn remote_branch_tip(branch_ref: &str, cwd: &Path) -> Result<Option<String>, String> {
+    let output = command_output(
+        "git",
+        &["ls-remote", "--exit-code", "--heads", "origin", branch_ref],
+        cwd,
+    )?;
+    if output.status.code() == Some(2) {
+        return Ok(None);
+    }
+    let stdout = require_success("git", output)?;
+    let result = String::from_utf8_lossy(&stdout);
+    let mut fields = result.split_whitespace();
+    let oid = fields
+        .next()
+        .ok_or_else(|| format!("git ls-remote returned no object for {branch_ref}"))?;
+    let found_ref = fields
+        .next()
+        .ok_or_else(|| format!("git ls-remote returned no ref for {branch_ref}"))?;
+    if found_ref != branch_ref {
+        return Err(format!(
+            "git ls-remote returned {found_ref} while querying {branch_ref}"
+        ));
+    }
+    Ok(Some(oid.to_string()))
+}
+
 pub(crate) fn prepare_publish_branch(
     name: &str,
     diff: &WorkspaceDiff,
+    publish_base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
     let branch = format!("caos/{name}");
     let branch_ref = format!("refs/heads/{branch}");
-    let head_tree_spec = format!("{}^{{tree}}", diff.head);
-    let head_tree = capture_required("git", &["rev-parse", &head_tree_spec], cwd)?;
+    let publish_tree = merge_publish_tree(&diff.head, publish_base, cwd)?;
     let previous = capture_optional("git", &["rev-parse", "--verify", &branch_ref], cwd)?;
-    let publish_commit = if let Some(previous) = previous.as_deref() {
+    let reusable = if let Some(previous) = previous.as_deref() {
         let previous_tree_spec = format!("{previous}^{{tree}}");
         let previous_tree = capture_required("git", &["rev-parse", &previous_tree_spec], cwd)?;
-        if previous_tree == head_tree {
-            previous.to_string()
-        } else {
-            capture_required(
-                "git",
-                &[
-                    "commit-tree",
-                    &head_tree,
-                    "-p",
-                    previous,
-                    "-m",
-                    &format!("Update CAOS conversation {name}"),
-                ],
-                cwd,
-            )?
-        }
+        let previous_parent =
+            capture_optional("git", &["rev-parse", &format!("{previous}^")], cwd)?;
+        previous_tree == publish_tree && previous_parent.as_deref() == Some(publish_base)
+    } else {
+        false
+    };
+    let publish_commit = if reusable {
+        previous.clone().expect("a reusable publish commit exists")
     } else {
         capture_required(
             "git",
             &[
                 "commit-tree",
-                &head_tree,
+                &publish_tree,
                 "-p",
-                &diff.base,
+                publish_base,
                 "-m",
-                &format!("CAOS conversation {name}"),
+                &format!(
+                    "CAOS conversation {} at {}",
+                    short_hash(name),
+                    short_hash(&diff.head)
+                ),
             ],
             cwd,
         )?
@@ -150,6 +248,53 @@ pub(crate) fn prepare_publish_branch(
         _ => {}
     }
     Ok(branch)
+}
+
+/// Merge the conversation's complete final state with the current PR base
+/// without touching the real index or working tree. Git chooses their natural
+/// merge base so a conversation chained from an earlier conversation retains
+/// that earlier filesystem work. An actual merge commit would make all of the
+/// conversation commits reachable, so only the resulting tree is retained and
+/// the caller creates a single-parent snapshot commit from it.
+fn merge_publish_tree(head: &str, publish_base: &str, cwd: &Path) -> Result<String, String> {
+    let output = command_output(
+        "git",
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            publish_base,
+            head,
+        ],
+        cwd,
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() {
+        return stdout
+            .lines()
+            .next()
+            .filter(|tree| !tree.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "git merge-tree returned no merged tree".to_string());
+    }
+    if output.status.code() == Some(1) {
+        let conflicts = stdout
+            .lines()
+            .skip(1)
+            .filter(|path| !path.is_empty())
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>();
+        let paths = if conflicts.is_empty() {
+            "  (git did not report the conflicting paths)".to_string()
+        } else {
+            conflicts.join("\n")
+        };
+        return Err(format!(
+            "conversation changes conflict with the current default branch:\n{paths}\nresolve these files against the latest default branch before publishing"
+        ));
+    }
+    require_success("git merge-tree", output).map(|_| unreachable!())
 }
 
 pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
@@ -225,14 +370,7 @@ mod tests {
         let base = commit_file(&dir, "base\n", "base");
         let head = commit_file(&dir, "conversation result\n", "turn");
         capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
-        let diff = WorkspaceDiff {
-            base,
-            head: head.clone(),
-            stat: String::new(),
-            patch: "changed".to_string(),
-        };
-
-        load_conversation_workspace(&diff, &dir).unwrap();
+        load_conversation_workspace(&head, &dir).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
             "conversation result\n"
@@ -243,7 +381,7 @@ mod tests {
         );
 
         std::fs::write(dir.join("file.txt"), "local edit\n").unwrap();
-        assert!(load_conversation_workspace(&diff, &dir)
+        assert!(load_conversation_workspace(&head, &dir)
             .unwrap_err()
             .contains("working tree is not clean"));
 
@@ -306,39 +444,221 @@ mod tests {
     }
 
     #[test]
-    fn publish_branch_is_a_clean_snapshot_without_checkout_changes() {
+    fn publish_branch_is_one_replaceable_snapshot_without_checkout_changes() {
         let dir = temp_repo("publish-test");
+        let remote = dir.with_extension("remote.git");
+        let remote_path = remote.to_string_lossy().to_string();
+        capture_required("git", &["init", "--bare", "-q", &remote_path], &dir).unwrap();
+        capture_required("git", &["remote", "add", "origin", &remote_path], &dir).unwrap();
         let base = commit_file(&dir, "base\n", "base");
-        let head = commit_file(&dir, "conversation result\n", "internal turn");
+        std::fs::write(dir.join("main.txt"), "new on main\n").unwrap();
+        capture_required("git", &["add", "main.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "main advances"], &dir).unwrap();
+        let main_tip = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+        let git_dir = format!("--git-dir={remote_path}");
+        capture_required(
+            "git",
+            &[&git_dir, "symbolic-ref", "HEAD", "refs/heads/main"],
+            &dir,
+        )
+        .unwrap();
+        let default_push = format!("{main_tip}:refs/heads/main");
+        capture_required("git", &["push", "--quiet", "origin", &default_push], &dir).unwrap();
+        assert_eq!(remote_default_branch(&dir).unwrap(), "main");
+        assert_eq!(fetch_remote_branch_tip("main", &dir).unwrap(), main_tip);
+
+        capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
+        std::fs::write(dir.join("key.txt"), "temporary secret\n").unwrap();
+        std::fs::write(dir.join("inherited.txt"), "from conversation A\n").unwrap();
+        capture_required("git", &["add", "key.txt", "inherited.txt"], &dir).unwrap();
+        let first_head = commit_file(&dir, "first result\n", "internal turn with key");
         let before = std::fs::read_to_string(dir.join("file.txt")).unwrap();
-        let diff = WorkspaceDiff {
-            base: base.clone(),
-            head: head.clone(),
-            stat: String::new(),
+        let first_diff = WorkspaceDiff {
+            base_commit: base.clone(),
+            head: first_head.clone(),
             patch: "changed".to_string(),
         };
 
-        let branch = prepare_publish_branch("publish-test", &diff, &dir).unwrap();
+        let branch = prepare_publish_branch("publish-test", &first_diff, &main_tip, &dir).unwrap();
         assert_eq!(branch, "caos/publish-test");
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
             before
         );
+        let first_publish =
+            capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
+        push_publish_branch(&branch, &dir).unwrap();
+        let branch_ref = "refs/heads/caos/publish-test";
         assert_eq!(
-            capture_required("git", &["rev-parse", "caos/publish-test^{tree}"], &dir).unwrap(),
-            capture_required("git", &["rev-parse", &format!("{head}^{{tree}}")], &dir).unwrap()
+            remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
+            Some(first_publish.as_str())
+        );
+
+        capture_required("git", &["rm", "-q", "key.txt"], &dir).unwrap();
+        let final_head = commit_file(&dir, "final result\n", "internal turn without key");
+        let final_diff = WorkspaceDiff {
+            // This conversation was started from the previous conversation's
+            // head. Publishing must not make that internal history reachable.
+            base_commit: first_head.clone(),
+            head: final_head.clone(),
+            patch: "changed again".to_string(),
+        };
+        prepare_publish_branch("publish-test", &final_diff, &main_tip, &dir).unwrap();
+        let final_publish =
+            capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
+        assert_ne!(final_publish, first_publish);
+        assert_eq!(
+            capture_required(
+                "git",
+                &["show", "-s", "--format=%s", "caos/publish-test"],
+                &dir
+            )
+            .unwrap(),
+            format!(
+                "CAOS conversation {} at {}",
+                short_hash("publish-test"),
+                short_hash(&final_head)
+            )
+        );
+        assert_eq!(
+            capture_required("git", &["show", "caos/publish-test:file.txt"], &dir).unwrap(),
+            "final result"
+        );
+        assert_eq!(
+            capture_required("git", &["show", "caos/publish-test:main.txt"], &dir).unwrap(),
+            "new on main"
+        );
+        assert_eq!(
+            capture_required("git", &["show", "caos/publish-test:inherited.txt"], &dir).unwrap(),
+            "from conversation A"
         );
         assert_eq!(
             capture_required("git", &["rev-parse", "caos/publish-test^"], &dir).unwrap(),
-            base
+            main_tip
         );
-        let first = capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
-        prepare_publish_branch("publish-test", &diff, &dir).unwrap();
+        assert_eq!(
+            capture_required(
+                "git",
+                &[
+                    "rev-list",
+                    "--count",
+                    &format!("{main_tip}..caos/publish-test")
+                ],
+                &dir
+            )
+            .unwrap(),
+            "1"
+        );
+        assert!(
+            capture_optional("git", &["show", "caos/publish-test:key.txt"], &dir)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!command_output(
+            "git",
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &first_publish,
+                &final_publish
+            ],
+            &dir
+        )
+        .unwrap()
+        .status
+        .success());
+        assert!(!command_output(
+            "git",
+            &["merge-base", "--is-ancestor", &first_head, &final_publish],
+            &dir
+        )
+        .unwrap()
+        .status
+        .success());
+
+        // A failed earlier publish can leave the local snapshot ahead of a
+        // different remote tip. Lease against the freshly queried remote tip,
+        // not the stale local branch that this call is about to push.
+        assert_eq!(
+            remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
+            Some(first_publish.as_str())
+        );
+        push_publish_branch(&branch, &dir).unwrap();
+        assert_eq!(
+            remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
+            Some(final_publish.as_str())
+        );
+
+        // An auto-deleted merged branch is recreated only if it is still
+        // absent when the force-with-lease push reaches the remote.
+        capture_required("git", &[&git_dir, "update-ref", "-d", branch_ref], &dir).unwrap();
+        assert_eq!(remote_branch_tip(branch_ref, &dir).unwrap(), None);
+        push_publish_branch(&branch, &dir).unwrap();
+        assert_eq!(
+            remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
+            Some(final_publish.as_str())
+        );
+
+        prepare_publish_branch("publish-test", &final_diff, &main_tip, &dir).unwrap();
         assert_eq!(
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
-            first
+            final_publish
         );
 
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_refuses_conflicts_without_changing_the_checkout_or_branch() {
+        let dir = temp_repo("publish-conflict-test");
+        let base = commit_file(&dir, "base\n", "base");
+        let conversation_head = commit_file(&dir, "conversation\n", "conversation turn");
+        capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
+        let main_tip = commit_file(&dir, "main\n", "main advances");
+
+        let diff = WorkspaceDiff {
+            base_commit: base,
+            head: conversation_head,
+            patch: "changed".to_string(),
+        };
+        let error = prepare_publish_branch("conflict-test", &diff, &main_tip, &dir).unwrap_err();
+
+        assert!(error.contains("conflict with the current default branch"));
+        assert!(error.contains("file.txt"));
+        assert_eq!(
+            capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap(),
+            main_tip
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("file.txt")).unwrap(),
+            "main\n"
+        );
+        assert!(capture_optional(
+            "git",
+            &["rev-parse", "--verify", "refs/heads/caos/conflict-test"],
+            &dir
+        )
+        .unwrap()
+        .is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remote_default_branch_comes_from_the_origin_head_symref() {
+        assert_eq!(
+            parse_remote_default_branch(
+                "ref: refs/heads/release/next\tHEAD\n0123456789abcdef\tHEAD\n"
+            )
+            .unwrap(),
+            "release/next"
+        );
+        assert!(parse_remote_default_branch("0123456789abcdef\tHEAD\n")
+            .unwrap_err()
+            .contains("did not advertise"));
+        assert!(parse_remote_default_branch("ref: refs/tags/v1\tHEAD\n")
+            .unwrap_err()
+            .contains("outside refs/heads"));
     }
 }

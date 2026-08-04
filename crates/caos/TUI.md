@@ -53,8 +53,8 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+E` (list focused) | Archive the selected conversation for this user |
 | `Escape` (conversation focused) | Dismiss slash-command matches, else focus the list |
 | `Ctrl+A` / `Ctrl+E` (conversation focused) | Move to the start / end of the current line |
-| `Enter` | Send the prompt |
-| `Alt+Enter` or `Ctrl+J` | Insert a newline |
+| `Ctrl+S` | Send the prompt (`Ctrl+Enter` also works in terminals with enhanced keyboard input) |
+| `Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
 | `Alt+Left` / `Alt+Right` or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
@@ -63,6 +63,7 @@ focus back to the list. The focused pane's border is highlighted.
 | `Ctrl+K` (conversation focused) | Kill from the cursor to the end of the line |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
 | `Ctrl+N` | Start a new virtual conversation (from either focus) and focus it |
+| `Ctrl+H` | Enter or leave keyboard help |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
 | `Ctrl+T` | Enter or leave the Activity browser |
 | `Ctrl+Shift+T` | Show the tools available to the selected conversation |
@@ -74,10 +75,15 @@ focus back to the list. The focused pane's border is highlighted.
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over visible transcript text | Select and copy rendered text |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
-| `Ctrl+L` twice | Check out the selected conversation's head commit in the working tree |
+| `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
 | `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
+
+Command failures are appended as red `Error` entries at the bottom of the
+conversation transcript. A successfully opened PR is appended as a cyan `CAOS`
+entry so its URL remains available. Routine operation status is shown only
+while the operation is running and is not added to the transcript or title.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
@@ -96,6 +102,9 @@ A fresh conversation starts with a temporary `talk-N` title. Its first prompt
 automatically becomes a whitespace-collapsed title of at most 60 characters.
 Using `/title` before the first prompt keeps that explicit title instead.
 Existing conversations are never automatically retitled.
+
+Fresh conversations start from the fetched tip of `origin`'s advertised
+default branch. `--base` and `/from <turn-hash>` override that default.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
@@ -130,7 +139,8 @@ conversations.
 
 The transcript fills the conversation pane above the fixed composer. Use
 `PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
-Scrolling up pauses tail-follow until the viewport returns to the bottom.
+Scrolling up pauses tail-follow and holds the viewport in place as new activity
+arrives. Scrolling back to the bottom resumes tail-follow.
 
 Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
 selection for the current transcript viewport. Drag across rendered transcript
@@ -147,15 +157,21 @@ Press `Ctrl+Y` or `Escape` to resume.
 
 Agent workspaces remain virtual commit trees under independent conversation
 refs. Opening, switching, and running conversations never overwrite the working
-checkout. Loading changes requires two `Ctrl+L` presses and a clean working
+checkout. Loading changes requires one `Ctrl+L` press and a clean working
 tree, then detaches HEAD onto the conversation's head commit so the checkout
 matches it exactly.
 
 Publishing also leaves the checkout untouched. Two `Ctrl+P` presses create or
-advance `caos/<conversation>` with clean snapshot commits, push that branch to
-`origin`, and use the authenticated `gh` CLI to find or open its pull request.
-The clean branch deliberately excludes the conversation's internal step DAG and
-`.caos` metadata.
+replace `caos/<conversation>` with one clean snapshot commit directly above the
+fetched tip of `origin`'s advertised default branch. Before creating it, CAOS
+three-way merges that tip with the conversation head without touching the
+checkout or index. Non-conflicting upstream changes survive; a conflict stops
+publication and lists its paths in the chat. CAOS pushes the clean snapshot and
+uses the authenticated `gh` CLI to find or open its pull request against the
+same default branch. Republish replaces the commit instead of retaining earlier
+snapshots, and the branch excludes the conversation's internal step DAG and
+`.caos` metadata even when one conversation starts from another conversation's
+head.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git

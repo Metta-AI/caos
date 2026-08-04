@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -16,7 +17,10 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{commit_working_tree, load_conversation_workspace, publish_conversation_pr};
+use super::workspace::{
+    commit_working_tree, load_conversation_workspace, publish_conversation_pr,
+    remote_default_branch_tip,
+};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -50,6 +54,7 @@ pub(crate) enum View {
     Activity,
     Diff,
     Tools,
+    Help,
 }
 
 /// Which pane currently receives navigation keys: the left conversation list
@@ -64,6 +69,7 @@ pub(crate) enum Focus {
 enum EntryRole {
     Human,
     Agent,
+    Info,
     Notice,
 }
 
@@ -72,6 +78,34 @@ struct TranscriptEntry {
     role: EntryRole,
     commit: Option<String>,
     text: String,
+}
+
+#[derive(Debug, Default)]
+struct ScrollState {
+    offset: Option<usize>,
+    rendered_max: Cell<usize>,
+}
+
+impl ScrollState {
+    fn follow_tail(&mut self) {
+        self.offset = None;
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        let offset = self.offset.unwrap_or_else(|| self.rendered_max.get());
+        self.offset = Some(offset.saturating_sub(rows));
+    }
+
+    fn scroll_down(&mut self, rows: usize) {
+        let max = self.rendered_max.get();
+        let offset = self.offset.unwrap_or(max).saturating_add(rows).min(max);
+        self.offset = (offset < max).then_some(offset);
+    }
+
+    fn resolve(&self, max: usize) -> u16 {
+        self.rendered_max.set(max);
+        self.offset.unwrap_or(max).min(max).min(u16::MAX as usize) as u16
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,6 +653,7 @@ impl Composer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandAction {
     From,
+    Help,
     Title,
     UpdateTree,
 }
@@ -632,13 +667,20 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 3] = [
+const COMMANDS: [Command; 4] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
         description: "start a conversation from a completed turn",
         action: CommandAction::From,
         takes_argument: true,
+    },
+    Command {
+        name: "/help",
+        usage: "/help",
+        description: "show keyboard shortcuts and slash commands",
+        action: CommandAction::Help,
+        takes_argument: false,
     },
     Command {
         name: "/title",
@@ -686,7 +728,7 @@ struct ConversationState {
     running: bool,
     turn_phase: TurnPhase,
     publishing: bool,
-    scroll_from_bottom: usize,
+    scroll: ScrollState,
     transcript_selection: Option<TranscriptSelection>,
     activity_selection: Option<usize>,
     activity_detail_scroll: usize,
@@ -708,7 +750,7 @@ impl ConversationState {
             running: false,
             turn_phase: TurnPhase::System,
             publishing: false,
-            scroll_from_bottom: 0,
+            scroll: ScrollState::default(),
             transcript_selection: None,
             activity_selection: None,
             activity_detail_scroll: 0,
@@ -739,17 +781,16 @@ impl ConversationState {
                     Ok(diff) => self.diff = Some(diff),
                     Err(error) => {
                         self.diff = None;
-                        self.status = format!("loading workspace changes failed: {error}");
+                        self.push_error(format!("loading workspace changes failed: {error}"));
                     }
                 }
             }
             Err(error) => {
                 self.transcript.clear();
                 self.diff = None;
-                self.status = format!("loading conversation failed: {error}");
+                self.push_error(format!("loading conversation failed: {error}"));
             }
         }
-        self.scroll_from_bottom = 0;
         self.transcript_selection = None;
     }
 
@@ -762,6 +803,26 @@ impl ConversationState {
 
     fn is_busy(&self) -> bool {
         self.running || self.publishing
+    }
+
+    fn push_error(&mut self, error: impl Into<String>) {
+        self.status.clear();
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::Notice,
+            commit: None,
+            text: error.into(),
+        });
+        self.transcript_selection = None;
+    }
+
+    fn push_info(&mut self, message: impl Into<String>) {
+        self.status.clear();
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::Info,
+            commit: None,
+            text: message.into(),
+        });
+        self.transcript_selection = None;
     }
 
     fn apply_automatic_title(&mut self, prompt: &str) {
@@ -822,7 +883,6 @@ enum UiMessage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfirmAction {
-    Load,
     Publish,
 }
 
@@ -844,6 +904,7 @@ pub(crate) struct App {
     selecting_transcript: bool,
     copied_chars: Option<usize>,
     animation_frame: usize,
+    enhanced_keyboard: bool,
     view: View,
     focus: Focus,
     tx: Sender<UiMessage>,
@@ -927,7 +988,7 @@ impl App {
                 ConversationState::new_virtual(
                     id.clone(),
                     selected_name.clone(),
-                    args.turn,
+                    new_conversation_options(args.turn.clone(), args.turn.base, &repo_dir)?.0,
                     initial_status,
                 ),
             );
@@ -948,6 +1009,7 @@ impl App {
             selecting_transcript: false,
             copied_chars: None,
             animation_frame: 0,
+            enhanced_keyboard: false,
             view: View::Chat,
             focus: Focus::Conversation,
             tx,
@@ -973,6 +1035,14 @@ impl App {
 
     pub(crate) fn selection_locked(&self) -> bool {
         self.selection_locked
+    }
+
+    pub(crate) fn enhanced_keyboard(&self) -> bool {
+        self.enhanced_keyboard
+    }
+
+    pub(crate) fn set_enhanced_keyboard(&mut self, supported: bool) {
+        self.enhanced_keyboard = supported;
     }
 
     pub(crate) fn clear_copy_notice(&mut self) {
@@ -1093,23 +1163,33 @@ impl App {
 
     fn start_turn(&mut self) {
         if self.selected().is_busy() {
-            self.selected_mut().status =
-                "this conversation already has an operation running".to_string();
+            self.selected_mut()
+                .push_error("this conversation already has an operation running");
             return;
         }
         let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
         // Resolve the prompt into the turn's message and, for `/update-tree`,
-        // the tree the human commit should carry. `/from` and `/title` are not
-        // turns and return here; everything else falls through to run one.
+        // the tree the human commit should carry. `/from`, `/help`, and
+        // `/title` are not turns and return here; everything else falls
+        // through to run one.
         let mut human_tree = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
             if command.takes_argument && arguments.is_empty() {
-                self.selected_mut().status = format!("usage: {}", command.usage);
+                self.selected_mut()
+                    .push_error(format!("usage: {}", command.usage));
                 return;
             }
             match command.action {
+                CommandAction::Help => {
+                    if arguments.is_empty() {
+                        self.view = View::Help;
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
+                    return;
+                }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
                     return;
@@ -1122,7 +1202,7 @@ impl App {
                     match commit_working_tree(arguments, &self.repo_dir) {
                         Ok(tree) => human_tree = Some(tree),
                         Err(error) => {
-                            self.selected_mut().status = error;
+                            self.selected_mut().push_error(error);
                             return;
                         }
                     }
@@ -1146,7 +1226,7 @@ impl App {
             state.running = true;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
-            state.scroll_from_bottom = 0;
+            state.scroll.follow_tail();
             state.transcript_selection = None;
         }
 
@@ -1201,11 +1281,7 @@ impl App {
                         let state = &mut self.conversations[index];
                         state.running = false;
                         state.status = "turn failed".to_string();
-                        state.transcript.push(TranscriptEntry {
-                            role: EntryRole::Notice,
-                            commit: None,
-                            text: error,
-                        });
+                        state.push_error(error);
                     }
                 }
                 UiMessage::Published {
@@ -1215,10 +1291,10 @@ impl App {
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.publishing = false;
-                        state.status = match result {
-                            Ok(url) => format!("PR ready: {url}"),
-                            Err(error) => format!("PR failed: {error}"),
-                        };
+                        match result {
+                            Ok(url) => state.push_info(format!("PR ready: {url}")),
+                            Err(error) => state.push_error(format!("PR failed: {error}")),
+                        }
                     }
                 }
             }
@@ -1242,12 +1318,15 @@ impl App {
                     match publish_user_conversation(&transport, &user, &state.id, &state.title) {
                         Ok(()) => state.reload(&transport),
                         Err(error) => {
-                            state.status =
-                                format!("publishing completed conversation failed: {error}")
+                            state.push_error(format!(
+                                "publishing completed conversation failed: {error}"
+                            ));
                         }
                     }
                 }
-                Err(error) => state.status = format!("reloading completed turn failed: {error}"),
+                Err(error) => {
+                    state.push_error(format!("reloading completed turn failed: {error}"));
+                }
             }
             return;
         }
@@ -1266,7 +1345,6 @@ impl App {
                     commit: None,
                     text,
                 });
-                state.scroll_from_bottom = 0;
                 state.transcript_selection = None;
             }
             TurnEvent::ToolCall {
@@ -1344,7 +1422,12 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
         let is_publish =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
-        if !is_load && !is_publish {
+        // Ctrl+H is a distinct control byte in legacy terminal input. Keep
+        // Ctrl+? as an alias for terminals whose enhanced keyboard protocol
+        // reports the modifiers unambiguously.
+        let is_help = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h' | '?' | '/'));
+        if !is_publish {
             self.confirm_action = None;
         }
         if is_load {
@@ -1355,12 +1438,21 @@ impl App {
             self.publish_selected();
             return;
         }
+        if is_help {
+            self.view = if self.view == View::Help {
+                View::Chat
+            } else {
+                View::Help
+            };
+            self.selected_mut().scroll.follow_tail();
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             self.view = match self.view {
-                View::Chat | View::Activity | View::Tools => View::Diff,
+                View::Chat | View::Activity | View::Tools | View::Help => View::Diff,
                 View::Diff => View::Chat,
             };
-            self.selected_mut().scroll_from_bottom = 0;
+            self.selected_mut().scroll.follow_tail();
             return;
         }
         let ctrl_t = key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1368,9 +1460,9 @@ impl App {
         if ctrl_t && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.view = match self.view {
                 View::Tools => View::Chat,
-                View::Chat | View::Activity | View::Diff => View::Tools,
+                View::Chat | View::Activity | View::Diff | View::Help => View::Tools,
             };
-            self.selected_mut().scroll_from_bottom = 0;
+            self.selected_mut().scroll.follow_tail();
             if self.view == View::Tools {
                 self.load_selected_tool_set();
             }
@@ -1412,11 +1504,11 @@ impl App {
                         self.selected_mut().reload(&transport);
                         self.selected_mut().status = "reloaded".to_string();
                     }
-                    Err(error) => self.selected_mut().status = error,
+                    Err(error) => self.selected_mut().push_error(error),
                 }
             } else {
-                self.selected_mut().status =
-                    "finish this conversation's operation before reloading".to_string();
+                self.selected_mut()
+                    .push_error("finish this conversation's operation before reloading");
             }
             return;
         }
@@ -1438,6 +1530,10 @@ impl App {
                 KeyCode::PageDown => self.scroll_activity_details_down(8),
                 _ => {}
             }
+            return;
+        }
+        if self.view == View::Help && key.code == KeyCode::Esc {
+            self.view = View::Chat;
             return;
         }
         match key.code {
@@ -1496,8 +1592,11 @@ impl App {
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.selected_mut().composer.move_word_right()
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.selected_mut().composer.complete_command() {
+            KeyCode::Enter | KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let command_is_complete = parse_command(&self.selected().composer.text).is_some();
+                if command_is_complete || !self.selected_mut().composer.complete_command() {
                     self.start_turn();
                 }
             }
@@ -1575,13 +1674,13 @@ impl App {
     pub(crate) fn scroll_up(&mut self, rows: usize) {
         let state = self.selected_mut();
         state.transcript_selection = None;
-        state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(rows);
+        state.scroll.scroll_up(rows);
     }
 
     pub(crate) fn scroll_down(&mut self, rows: usize) {
         let state = self.selected_mut();
         state.transcript_selection = None;
-        state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(rows);
+        state.scroll.scroll_down(rows);
     }
 
     fn select_activity(&mut self, amount: isize) {
@@ -1620,7 +1719,7 @@ impl App {
         let commit = match resolved {
             Ok(commit) => commit.to_string(),
             Err(error) => {
-                self.selected_mut().status = error;
+                self.selected_mut().push_error(error);
                 return;
             }
         };
@@ -1631,7 +1730,7 @@ impl App {
         let transport = match self.transport() {
             Ok(transport) => transport,
             Err(error) => {
-                self.selected_mut().status = error;
+                self.selected_mut().push_error(error);
                 return;
             }
         };
@@ -1639,7 +1738,7 @@ impl App {
             match list_user_conversations(&transport, &self.user, UserConversationStatus::Active) {
                 Ok(conversations) => conversations,
                 Err(error) => {
-                    self.selected_mut().status = error;
+                    self.selected_mut().push_error(error);
                     return;
                 }
             };
@@ -1648,7 +1747,7 @@ impl App {
             {
                 Ok(conversations) => conversations,
                 Err(error) => {
-                    self.selected_mut().status = error;
+                    self.selected_mut().push_error(error);
                     return;
                 }
             };
@@ -1662,16 +1761,22 @@ impl App {
         let id = match fresh_conversation_id(&transport, &self.user) {
             Ok(id) => id,
             Err(error) => {
-                self.selected_mut().status = error;
+                self.selected_mut().push_error(error);
                 return;
             }
         };
-        let mut options = self.selected().turn_options.clone();
-        options.base = base.clone();
-        let status = base
-            .as_deref()
-            .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
-            .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
+        let (options, base) = match new_conversation_options(
+            self.selected().turn_options.clone(),
+            base,
+            &self.repo_dir,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.selected_mut().push_error(error);
+                return;
+            }
+        };
+        let status = format!("ready from {}; enter a prompt", short_hash(&base));
         self.conversations.insert(
             0,
             ConversationState::new_virtual(id, title, options, status),
@@ -1696,8 +1801,8 @@ impl App {
 
     fn close_selected(&mut self) {
         if self.selected().is_busy() {
-            self.selected_mut().status =
-                "finish this conversation's operation before archiving it".to_string();
+            self.selected_mut()
+                .push_error("finish this conversation's operation before archiving it");
             return;
         }
         let replacement = if self.conversations.len() == 1 {
@@ -1712,15 +1817,26 @@ impl App {
             {
                 Ok(id) => id,
                 Err(error) => {
-                    self.selected_mut().status = error;
+                    self.selected_mut().push_error(error);
+                    return;
+                }
+            };
+            let (options, base) = match new_conversation_options(
+                self.selected().turn_options.clone(),
+                None,
+                &self.repo_dir,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.selected_mut().push_error(error);
                     return;
                 }
             };
             Some(ConversationState::new_virtual(
                 id,
                 title,
-                self.selected().turn_options.clone(),
-                "new virtual conversation; enter a prompt".to_string(),
+                options,
+                format!("ready from {}; enter a prompt", short_hash(&base)),
             ))
         } else {
             None
@@ -1730,7 +1846,8 @@ impl App {
                 archive_user_conversation(&transport, &self.user, &self.selected().id)
             });
             if let Err(error) = result {
-                self.selected_mut().status = format!("archiving conversation failed: {error}");
+                self.selected_mut()
+                    .push_error(format!("archiving conversation failed: {error}"));
                 return;
             }
         }
@@ -1751,11 +1868,13 @@ impl App {
     fn rename_selected(&mut self, title: &str) {
         let title = title.trim();
         if title.is_empty() {
-            self.selected_mut().status = "conversation title cannot be empty".to_string();
+            self.selected_mut()
+                .push_error("conversation title cannot be empty");
             return;
         }
         if title.contains(['\n', '\r', '\t']) {
-            self.selected_mut().status = "conversation title must be one line".to_string();
+            self.selected_mut()
+                .push_error("conversation title must be one line");
             return;
         }
         if self.selected().current_hash().is_some() {
@@ -1764,7 +1883,7 @@ impl App {
                 .transport()
                 .and_then(|transport| set_conversation_title(&transport, &id, title))
             {
-                self.selected_mut().status = error;
+                self.selected_mut().push_error(error);
                 return;
             }
         }
@@ -1788,46 +1907,34 @@ impl App {
 
     fn load_selected(&mut self) {
         if self.selected().is_busy() {
-            self.selected_mut().status =
-                "finish this conversation's operation before loading it".to_string();
-        } else if self
-            .selected()
-            .diff
-            .as_ref()
-            .is_none_or(|diff| diff.patch.is_empty())
-        {
-            self.selected_mut().status = "there are no conversation changes to load".to_string();
-        } else if self.confirm_action != Some(ConfirmAction::Load) {
-            self.confirm_action = Some(ConfirmAction::Load);
-            self.selected_mut().status =
-                "press Ctrl+L again to check out this conversation's head in a clean working tree"
-                    .to_string();
+            self.selected_mut()
+                .push_error("finish this conversation's operation before checking it out");
+        } else if let Some(diff) = self.selected().diff.clone() {
+            match load_conversation_workspace(&diff.head, &self.repo_dir) {
+                Ok(()) => {
+                    self.selected_mut().status =
+                        format!("checked out {} in detached HEAD", short_hash(&diff.head));
+                }
+                Err(error) => self.selected_mut().push_error(error),
+            }
         } else {
-            self.confirm_action = None;
-            let diff = self
-                .selected()
-                .diff
-                .as_ref()
-                .expect("a non-empty diff was checked")
-                .clone();
-            self.selected_mut().status = match load_conversation_workspace(&diff, Path::new(".")) {
-                Ok(()) => "checked out the conversation head in the working tree".to_string(),
-                Err(error) => error,
-            };
+            self.selected_mut()
+                .push_error("this conversation has no commit to check out");
         }
     }
 
     fn publish_selected(&mut self) {
         if self.selected().is_busy() {
-            self.selected_mut().status =
-                "finish this conversation's operation before publishing it".to_string();
+            self.selected_mut()
+                .push_error("finish this conversation's operation before publishing it");
         } else if self
             .selected()
             .diff
             .as_ref()
             .is_none_or(|diff| diff.patch.is_empty())
         {
-            self.selected_mut().status = "there are no conversation changes to publish".to_string();
+            self.selected_mut()
+                .push_error("there are no conversation changes to publish");
         } else if self.confirm_action != Some(ConfirmAction::Publish) {
             self.confirm_action = Some(ConfirmAction::Publish);
             self.selected_mut().status =
@@ -1865,6 +1972,19 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
     );
     t.put_object("blob", descriptor.as_bytes())
         .map(|id| id.to_string())
+}
+
+fn new_conversation_options(
+    mut options: TurnOptions,
+    requested_base: Option<String>,
+    repo_dir: &Path,
+) -> Result<(TurnOptions, String), String> {
+    let base = match requested_base {
+        Some(base) => base,
+        None => remote_default_branch_tip(repo_dir)?.1,
+    };
+    options.base = Some(base.clone());
+    Ok((options, base))
 }
 
 fn choose_conversation(
@@ -1948,6 +2068,47 @@ mod tests {
         dir
     }
 
+    fn git_ok(cwd: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn repo_with_default_branch(name: &str, branch: &str) -> (PathBuf, PathBuf, String) {
+        let dir = throwaway_repo(name);
+        git_ok(&dir, &["config", "user.name", "CAOS test"]);
+        git_ok(&dir, &["config", "user.email", "caos-test@example.invalid"]);
+        std::fs::write(dir.join("base.txt"), "default branch\n").unwrap();
+        git_ok(&dir, &["add", "base.txt"]);
+        git_ok(&dir, &["commit", "-q", "-m", "default branch"]);
+        let tip = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let remote = dir.with_extension("remote.git");
+        let remote_path = remote.to_string_lossy().to_string();
+        git_ok(&dir, &["init", "--bare", "-q", &remote_path]);
+        let git_dir = format!("--git-dir={remote_path}");
+        let default_ref = format!("refs/heads/{branch}");
+        git_ok(&dir, &[&git_dir, "symbolic-ref", "HEAD", &default_ref]);
+        git_ok(&dir, &["remote", "add", "origin", &remote_path]);
+        let push_ref = format!("HEAD:{default_ref}");
+        git_ok(&dir, &["push", "-q", "origin", &push_ref]);
+
+        (dir, remote, tip)
+    }
+
     fn activity(number: usize) -> Activity {
         Activity {
             id: format!("tool-{number}"),
@@ -1973,6 +2134,7 @@ mod tests {
                 selecting_transcript: false,
                 copied_chars: None,
                 animation_frame: 0,
+                enhanced_keyboard: false,
                 view: View::Chat,
                 focus: Focus::Conversation,
                 tx: tx.clone(),
@@ -1980,6 +2142,15 @@ mod tests {
             },
             tx,
         )
+    }
+
+    fn rendered_main_pane(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().skip(26).map(|cell| cell.symbol()).collect())
+            .collect()
     }
 
     #[test]
@@ -2153,10 +2324,10 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/title", "/update-tree"]
+            ["/from", "/help", "/title", "/update-tree"]
         );
 
-        assert!(composer.select_command(1));
+        assert!(composer.select_command(2));
         assert!(composer.complete_command());
         assert_eq!(composer.text, "/title ");
         assert!(composer.command_matches().is_empty());
@@ -2191,8 +2362,44 @@ mod tests {
         assert_eq!(arguments, "include this text");
         assert!(command.takes_argument);
 
+        let (command, arguments) = parse_command("/help").unwrap();
+        assert_eq!(command.action, CommandAction::Help);
+        assert_eq!(arguments, "");
+
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn new_conversations_default_to_the_remote_default_branch_tip() {
+        let (dir, remote, tip) = repo_with_default_branch("default-base", "release/next");
+        let previous = TurnOptions {
+            base: Some("old conversation base".to_string()),
+            ..TurnOptions::default()
+        };
+
+        let (options, base) = new_conversation_options(previous, None, &dir).unwrap();
+
+        assert_eq!(base, tip);
+        assert_eq!(options.base.as_deref(), Some(tip.as_str()));
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn explicit_conversation_bases_override_the_remote_default() {
+        let options = TurnOptions::default();
+        let requested = "5ec3751".to_string();
+
+        let (options, base) = new_conversation_options(
+            options,
+            Some(requested.clone()),
+            Path::new("does-not-need-a-repository"),
+        )
+        .unwrap();
+
+        assert_eq!(base, requested);
+        assert_eq!(options.base.as_deref(), Some(requested.as_str()));
     }
 
     #[test]
@@ -2200,6 +2407,7 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.selected_mut().composer.insert_str("/");
 
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.selected().composer.text, "/title ");
@@ -2214,6 +2422,26 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.selected().composer.text, "/from ");
+    }
+
+    #[test]
+    fn ctrl_h_ctrl_question_mark_and_help_command_toggle_help() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, View::Chat);
+
+        app.selected_mut().composer.insert_str("/help");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Help);
+        assert!(!app.selected().running);
     }
 
     #[test]
@@ -2488,10 +2716,31 @@ mod tests {
     }
 
     #[test]
-    fn scroll_follows_tail_and_moves_up() {
-        assert_eq!(scroll_offset(20, 10, 0), 12);
-        assert_eq!(scroll_offset(20, 10, 5), 7);
-        assert_eq!(scroll_offset(3, 10, 0), 0);
+    fn scroll_holds_an_anchor_until_it_returns_to_the_tail() {
+        let mut scroll = ScrollState::default();
+        assert_eq!(scroll_offset(20, 10, &scroll), 12);
+
+        scroll.scroll_up(5);
+        assert_eq!(scroll_offset(20, 10, &scroll), 7);
+        assert_eq!(scroll_offset(40, 10, &scroll), 7);
+
+        scroll.scroll_down(25);
+        assert_eq!(scroll_offset(40, 10, &scroll), 32);
+
+        let short = ScrollState::default();
+        assert_eq!(scroll_offset(3, 10, &short), 0);
+    }
+
+    #[test]
+    fn incoming_assistant_text_keeps_a_paused_scroll_anchor() {
+        let mut conversation = state("talk-1");
+        assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
+        conversation.scroll.scroll_up(5);
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+
+        assert_eq!(scroll_offset(40, 10, &app.selected().scroll), 7);
     }
 
     #[test]
@@ -2589,9 +2838,11 @@ mod tests {
         )
         .wrap(Wrap { trim: false });
         let area = Rect::new(0, 0, 18, 5);
-        let tail = paragraph_scroll(&paragraph, area, 0);
+        let mut scroll = ScrollState::default();
+        let tail = paragraph_scroll(&paragraph, area, &scroll);
         assert!(tail > 0);
-        assert!(paragraph_scroll(&paragraph, area, 2) < tail);
+        scroll.scroll_up(2);
+        assert!(paragraph_scroll(&paragraph, area, &scroll) < tail);
     }
 
     #[test]
@@ -2617,6 +2868,51 @@ mod tests {
         conversation.running = true;
         assert!(!transcript_contains(&conversation, terminal, 27, 23));
         assert!(transcript_contains(&conversation, terminal, 27, 22));
+    }
+
+    #[test]
+    fn completion_status_does_not_move_a_paused_transcript() {
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.status = "calling model".to_string();
+        conversation.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent,
+            commit: None,
+            text: (0..60)
+                .map(|line| format!("line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        app.scroll_up(8);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let before = rendered_main_pane(&terminal);
+        let first_visible_line = before
+            .iter()
+            .find(|row| row.contains("line "))
+            .unwrap()
+            .clone();
+
+        app.selected_mut().running = false;
+        app.selected_mut().status = "completed e1769972f6".to_string();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let after = rendered_main_pane(&terminal);
+
+        assert_eq!(
+            after.iter().find(|row| row.contains("line ")).unwrap(),
+            &first_visible_line
+        );
+        assert!(!after.join("\n").contains("completed e1769972f6"));
+
+        app.scroll_down(usize::MAX);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let at_tail = rendered_main_pane(&terminal).join("\n");
+        assert!(!at_tail.contains("Status"));
+        assert!(!at_tail.contains("completed e1769972f6"));
     }
 
     #[test]
@@ -2781,7 +3077,45 @@ mod tests {
         assert!(rendered.contains("Ctrl+T expands"));
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("Enter/^J newline"));
+        assert!(rendered.contains("^S send"));
+        assert!(rendered.contains("^L checkout"));
+        assert!(rendered.contains("^P×2 publish"));
         assert!(!rendered.contains("Alt+Enter"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let legacy_help: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(legacy_help.contains("Ctrl+S          send the prompt"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+
+        app.set_enhanced_keyboard(true);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let enhanced_footer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(enhanced_footer.contains("^Enter send"));
+        assert!(!enhanced_footer.contains("^S send"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let enhanced_help: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(enhanced_help.contains("Ctrl+Enter      send the prompt"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Activity);
@@ -2800,19 +3134,58 @@ mod tests {
 
         app.selected_mut().running = false;
         app.selected_mut().diff = Some(WorkspaceDiff {
-            base: "a".repeat(40),
+            base_commit: "a".repeat(40),
             head: "b".repeat(40),
-            stat: "1 file changed".to_string(),
             patch: "diff --git a/a b/a".to_string(),
         });
-        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        assert_eq!(app.confirm_action, Some(ConfirmAction::Load));
-        assert!(app.selected().status.contains("press Ctrl+L again"));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));
         assert!(app.selected().status.contains("press Ctrl+P again"));
         assert!(!app.selected().publishing);
+    }
+
+    #[test]
+    fn ctrl_l_checks_out_the_conversation_on_the_first_press() {
+        let dir = throwaway_repo("ctrl-l");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["config", "user.name", "Test User"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("file.txt"), "conversation\n").unwrap();
+        git(&["commit", "-qam", "conversation"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--detach", "-q", &base]);
+
+        let mut selected = state("talk-1");
+        selected.diff = Some(WorkspaceDiff {
+            base_commit: base,
+            head: head.clone(),
+            patch: "changed".to_string(),
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        app.repo_dir = dir.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+
+        assert_eq!(git(&["rev-parse", "HEAD"]), head);
+        assert!(app.selected().status.contains("checked out"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2941,13 +3314,97 @@ mod tests {
     }
 
     #[test]
+    fn publish_errors_join_the_transcript_without_stealing_scroll() {
+        let mut conversation = state("talk-1");
+        conversation.status = "completed abc1234".to_string();
+        conversation.publishing = true;
+        conversation.scroll.offset = Some(12);
+        let (mut app, tx) = app_with(vec![conversation]);
+
+        tx.send(UiMessage::Published {
+            conversation: "talk-1".to_string(),
+            result: Err("gh could not open the PR".to_string()),
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+
+        let state = app.selected();
+        assert!(!state.publishing);
+        assert!(state.status.is_empty());
+        assert_eq!(state.scroll.offset, Some(12));
+        assert_eq!(state.transcript.last().unwrap().role, EntryRole::Notice);
+        assert_eq!(
+            state.transcript.last().unwrap().text,
+            "PR failed: gh could not open the PR"
+        );
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(!rows[0].contains("PR failed"));
+        let rendered = rows.join("\n");
+        assert!(rendered.contains("PR failed: gh could not open the PR"));
+        assert!(!rendered.contains("Status"));
+    }
+
+    #[test]
+    fn routine_idle_status_is_not_rendered() {
+        let mut conversation = state("talk-1");
+        conversation.status = "ready".to_string();
+        let (app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered = rendered_main_pane(&terminal).join("\n");
+        assert!(!rendered.contains("Status"));
+        assert!(!rendered.contains("ready"));
+    }
+
+    #[test]
+    fn successful_publish_adds_a_caos_transcript_entry() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "publishing".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+
+        tx.send(UiMessage::Published {
+            conversation: "talk-1".to_string(),
+            result: Ok("https://github.com/Metta-AI/caos/pull/54".to_string()),
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+
+        let state = app.selected();
+        assert!(!state.publishing);
+        assert!(state.status.is_empty());
+        assert_eq!(state.transcript.last().unwrap().role, EntryRole::Info);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = rendered_main_pane(&terminal).join("\n");
+        assert!(rendered.contains("CAOS"));
+        assert!(rendered.contains("PR ready: https://github.com/Metta-AI/caos/pull/54"));
+        assert!(!rendered.contains("Status"));
+    }
+
+    #[test]
     fn ctrl_e_removes_virtual_conversations_and_replaces_the_last_one() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
         // Archiving lives in the conversation list, so focus it first.
         app.focus = Focus::List;
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        let dir = throwaway_repo("ctrl-e");
+        let (dir, remote, tip) = repo_with_default_branch("ctrl-e", "main");
         app.repo_dir = dir.clone();
         app.selected = 1;
 
@@ -2968,8 +3425,12 @@ mod tests {
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
-        assert!(app.selected().status.contains("new virtual conversation"));
+        assert_eq!(
+            app.selected().turn_options.base.as_deref(),
+            Some(tip.as_str())
+        );
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
@@ -2983,7 +3444,14 @@ mod tests {
 
         assert_eq!(app.conversations.len(), 2);
         assert_eq!(app.selected().id, "talk-1");
-        assert!(app.selected().status.contains("before archiving"));
+        assert!(app.selected().status.is_empty());
+        assert!(app
+            .selected()
+            .transcript
+            .last()
+            .unwrap()
+            .text
+            .contains("before archiving"));
     }
 
     #[test]
@@ -3035,20 +3503,36 @@ mod tests {
 
     #[test]
     fn new_conversation_is_available_from_either_focus() {
-        // `start_new_conversation` reaches the (absent) remote and reports an
-        // error, but the key must be dispatched from both focuses rather than
-        // swallowed by the list's navigation handling. A dispatched attempt
-        // moves the status off "ready".
+        // Force transport discovery to fail so a dispatched attempt has an
+        // observable transcript error without depending on the test runner's
+        // current repository or remote.
         let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.repo_dir = std::env::temp_dir().join(format!(
+            "caos-cli-tui-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
 
         app.focus = Focus::List;
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_ne!(app.selected().status, "ready");
+        assert_eq!(app.focus, Focus::Conversation);
+        assert!(app.selected().status.is_empty());
+        assert_eq!(
+            app.selected().transcript.last().unwrap().role,
+            EntryRole::Notice
+        );
 
-        app.selected_mut().status = "ready".to_string();
+        app.selected_mut().transcript.clear();
         app.focus = Focus::Conversation;
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_ne!(app.selected().status, "ready");
+        assert!(app.selected().status.is_empty());
+        assert_eq!(
+            app.selected().transcript.last().unwrap().role,
+            EntryRole::Notice
+        );
     }
 
     #[test]
@@ -3077,7 +3561,7 @@ mod tests {
             .composer
             .insert_str("/title Mutable title");
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
         assert_eq!(app.selected().id, "stable-id");
         assert_eq!(app.selected().title, "Mutable title");
@@ -3093,12 +3577,17 @@ mod tests {
         let dir = throwaway_repo("reload");
 
         let mut conversation = state("missing-conversation-for-reload-test");
+        assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
+        conversation.scroll.scroll_up(5);
         let transport = GitTransport::discover(&dir).unwrap();
         conversation.reload(&transport);
-        assert!(conversation.transcript.is_empty());
         assert!(conversation.diff.is_none());
-        assert!(conversation.status.contains("loading conversation failed"));
-        assert!(conversation.status.contains("no conversation"));
+        assert!(conversation.status.is_empty());
+        let error = conversation.transcript.last().unwrap();
+        assert_eq!(error.role, EntryRole::Notice);
+        assert!(error.text.contains("loading conversation failed"));
+        assert!(error.text.contains("no conversation"));
+        assert_eq!(conversation.scroll.offset, Some(7));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
