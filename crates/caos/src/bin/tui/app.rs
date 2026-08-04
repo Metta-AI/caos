@@ -3462,6 +3462,36 @@ mod tests {
     }
 
     #[test]
+    fn idle_chat_header_keeps_only_the_title_and_head_metadata() {
+        let mut conversation = state("A concise title");
+        conversation.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent,
+            commit: Some("b".repeat(40)),
+            text: "done".to_string(),
+        });
+        let (app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let header = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .take(100)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(header.contains("caos"));
+        assert!(header.contains("A concise title"));
+        assert!(header.contains("head bbbbbbb"));
+        assert!(!header.contains("idle"));
+        assert!(!header.contains("[chat]"));
+        assert!(!header.contains("0 running"));
+    }
+
+    #[test]
     fn ctrl_l_checks_out_the_conversation_on_the_first_press() {
         let dir = throwaway_repo("ctrl-l");
         let git = |args: &[&str]| {
