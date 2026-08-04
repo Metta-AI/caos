@@ -10,7 +10,7 @@
 #                                        the server stacks and pushes on first
 #                                        use — the same shape std/flake-builder
 #                                        emits
-#   flake     (bash)                     literal checked-in std/<name> dirs —
+#   flake     (bash, merge)               literal checked-in std/<name> dirs —
 #                                        complete worker images, /worker
 #                                        included; the flake-builder images
 #                                        each tree on first use
@@ -29,14 +29,14 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder)
+[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge)
 
 # std entries that are FLAKE TREES (design/flake-images.md, part 2): the
 # checked-in std/<name> directory IS the published tree, copied whole —
 # nothing generated (std/refresh.sh maintains the checked-in redundancies,
 # tests/std-lint verifies them). The server's flake-builder images each
 # tree on first use.
-is_flake_entry() { case "$1" in bash) return 0 ;; *) return 1 ;; esac; }
+is_flake_entry() { case "$1" in bash | merge) return 0 ;; *) return 1 ;; esac; }
 # Everything else is a DELTA entry: the flake-builder (the bootstrap image),
 # the runner (the pooled interpreter) — both self-contained nix closures — and
 # cargo, whose image the root flake builds from the same `src` and toolchain as

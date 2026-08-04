@@ -70,6 +70,13 @@ struct Config {
     /// caos-tools/*.sh, discovered per round and resolved at invocation time
     /// (design/cargo-workers.md). Registered only when present.
     tools_image: Option<String>,
+    /// The git-bearing merge worker (std/merge). The `merge` tool is registered
+    /// only when present.
+    merge_image: Option<String>,
+    /// The turn-start ref snapshot: `name <hash>` lines the `merge` tool
+    /// resolves `--theirs` against (SPEC "Resolving `--theirs`"). Absent = the
+    /// tool takes only a bare hash.
+    merge_refs: Option<String>,
     model: String,
     base_url: String,
     conversation: Option<String>,
@@ -83,6 +90,8 @@ impl Config {
             bash_image: read_arg("bash-image")?,
             grep_image: read_arg_opt("grep-image")?,
             tools_image: read_arg_opt("tools-image")?,
+            merge_image: read_arg_opt("merge-image")?,
+            merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
             base_url: read_arg_opt("base-url")?
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
@@ -129,12 +138,23 @@ fn start(cfg: &Config) -> Result<(), String> {
 
     let mut messages = prior;
     messages.push(user_text(&head.message));
-    llm_round(cfg, messages, &ws, &head_hash, &head_hash, &[])
+    // The workspace commit threaded through the turn (SPEC "Tools thread a
+    // commit"): starts as the head commit itself, advances as tools mutate.
+    llm_round(
+        cfg,
+        messages,
+        &ws,
+        &arg("head"),
+        &head_hash,
+        &head_hash,
+        &[],
+    )
 }
 
-/// Callback from run-then: `result` is the bash tool's result tree, `in` the
+/// Callback from run-then: `result` is the sub-run tool's result, `in` the
 /// call it answered (unused — `current_id` carries the id), and the rest of
-/// the loop state rode our own curry.
+/// the loop state rode our own curry. Establishes the workspace (`ws`) and the
+/// workspace commit (`wc`) the queue continues over.
 fn callback(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
     progress::status(
@@ -147,11 +167,9 @@ fn callback(cfg: &Config) -> Result<(), String> {
     let current_id = read_arg("current-id")?;
 
     // Fold the tool's outcome into a tool_result block the model will see,
-    // and establish the workspace the queue continues over: bash results
-    // carry the post-command workspace as `tree`; a grep result is a sparse
-    // match tree, NOT a workspace — the pre-grep workspace rode our curry.
+    // and establish (ws, wc) the queue continues over.
     let current_tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
-    let ws = match current_tool.as_str() {
+    let (ws, wc) = match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
             results.push(tools::grep_result_block(
@@ -161,16 +179,29 @@ fn callback(cfg: &Config) -> Result<(), String> {
             )?);
             let ws = arg("ws");
             caos(["get", &ws])?;
-            ws
+            // A grep is read-only: workspace and its commit are unchanged.
+            (ws, arg("wc"))
+        }
+        // `merge` returns a COMMIT (its two-parent M): M becomes the workspace
+        // commit, its tree the workspace, and the model hears about any
+        // conflicts. Unlike every other tool, the ancestry advanced — that is
+        // the whole point (SPEC "Merging and conflict resolution").
+        "merge" => {
+            let m = arg("result");
+            let commit = read_commit(&m)?;
+            let ws = fresh("ws");
+            caos(["get-hash", &commit.tree, &ws])?;
+            results.push(merge_result_block(&current_id, &ws)?);
+            (ws, m)
         }
         // A tree tool's result (caos-tools/<name>.sh) is a VALUE — a report,
         // a bin tree, diagnostics — never a workspace: the pre-run workspace
-        // rode our curry, exactly like grep.
+        // and its commit rode our curry, exactly like grep.
         name if name != "bash" => {
             results.push(tools::tree_tool_result_block(&current_id, &arg("result"))?);
             let ws = arg("ws");
             caos(["get", &ws])?;
-            ws
+            (ws, arg("wc"))
         }
         _ => {
             results.push(tool_result_block(&current_id)?);
@@ -179,21 +210,25 @@ fn callback(cfg: &Config) -> Result<(), String> {
                 return Err("bash result carries no `tree` entry".to_string());
             }
             caos(["get", &ws])?;
-            ws
+            // bash may have mutated the tree — advance the workspace commit.
+            let wc = advance_wc(&ws, &arg("wc"), "bash")?;
+            (ws, wc)
         }
     };
 
-    drive(cfg, ws, &head_hash, &arg("step"), &pending, results)
+    drive(cfg, ws, wc, &head_hash, &arg("step"), &pending, results)
 }
 
-/// Work through the call queue: inline tools (read/ls/write/edit) execute
-/// right here — the workspace advances in-process, no sub-run — while a bash
-/// call exits into its run-then sub-run (the tail call; `callback` re-enters
-/// this loop). A drained queue sends every result back in ONE user message
-/// (the API requires it) and fires the next LLM round.
+/// Work through the call queue, threading the workspace `ws` AND its commit
+/// `wc` (SPEC "Tools thread a commit"): inline reads leave both unchanged;
+/// inline mutations advance `ws` and mint a child `wc`; a bash/grep/tree/merge
+/// call exits into its run-then sub-run (the tail call; `callback` re-enters).
+/// A drained queue sends every result back in ONE user message and fires the
+/// next LLM round.
 fn drive(
     cfg: &Config,
     mut ws: String,
+    mut wc: String,
     head_hash: &str,
     step_path: &str,
     queue: &[Value],
@@ -203,7 +238,28 @@ fn drive(
     while let Some(call) = queue.first().cloned() {
         let name = call["name"].as_str().unwrap_or("");
         if name == "bash" {
-            return launch(cfg, &call, &ws, step_path, &queue[1..], &results);
+            return launch(cfg, &call, &ws, &wc, step_path, &queue[1..], &results);
+        }
+        if name == "merge" && cfg.merge_image.is_some() {
+            match resolve_theirs(cfg, &call) {
+                Err(block) => {
+                    results.push(block);
+                    queue.remove(0);
+                    continue;
+                }
+                Ok(theirs) => {
+                    return launch_merge(
+                        cfg,
+                        &call,
+                        &theirs,
+                        &ws,
+                        &wc,
+                        step_path,
+                        &queue[1..],
+                        &results,
+                    )
+                }
+            }
         }
         if name == "grep" && cfg.grep_image.is_some() {
             // Validate before launching: a bad pattern or scope is an
@@ -222,6 +278,7 @@ fn drive(
                         &scope,
                         &prefix,
                         &ws,
+                        &wc,
                         step_path,
                         &queue[1..],
                         &results,
@@ -250,6 +307,7 @@ fn drive(
                             &script,
                             &bound,
                             &ws,
+                            &wc,
                             step_path,
                             &queue[1..],
                             &results,
@@ -260,13 +318,16 @@ fn drive(
         }
         if !tools::is_inline(name) {
             return Err(format!(
-                "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, \
-                 write, edit; plus this workspace's caos-tools/*.sh)"
+                "model called unknown tool {name:?} (built-ins: bash, grep, read, read-oid, \
+                 ls, write, edit, merge; plus this workspace's caos-tools/*.sh)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
         results.push(block);
         if let Some(w) = new_ws {
+            // An inline MUTATION: advance the workspace and mint its child
+            // commit (a read returns None and leaves both untouched).
+            wc = advance_wc(&w, &wc, name)?;
             ws = w;
         }
         queue.remove(0);
@@ -282,17 +343,32 @@ fn drive(
         messages.extend(step_messages(&step));
     }
     messages.push(message("user", Value::Array(results.clone())));
-    llm_round(cfg, messages, &ws, head_hash, &step_hash, &results)
+    llm_round(cfg, messages, &ws, &wc, head_hash, &step_hash, &results)
+}
+
+/// Mint the child workspace commit after a mutation: `commit(new tree, parent
+/// = current wc)`, recorded at a fresh commit path. The workspace-commit chain
+/// this builds roots at the head commit, so a `merge`'s `M` (and thus its
+/// `theirs`) is reachable once a step hangs the latest `wc` off itself.
+fn advance_wc(ws: &str, wc: &str, what: &str) -> Result<String, String> {
+    let tree = cas_hash(ws)?;
+    let parent = cas_hash(wc)?;
+    let out = fresh("wc");
+    write_commit_as(&tree, &[&parent], what, agent_now(), &out)?;
+    Ok(out)
 }
 
 /// One LLM API round over `messages`, with `ws` the workspace CAS path the
-/// round is over, `prev` the commit the next step chains onto (the previous
-/// step, or the human turn), and `sent_results` the tool_result blocks this
-/// round's request carried (recorded in the step commit's step.json).
+/// round is over, `wc` its commit, `prev` the commit the next step chains onto
+/// (the previous step, or the human turn), and `sent_results` the tool_result
+/// blocks this round's request carried (recorded in the step commit's
+/// step.json).
+#[allow(clippy::too_many_arguments)]
 fn llm_round(
     cfg: &Config,
     messages: Vec<Value>,
     ws: &str,
+    wc: &str,
     head_hash: &str,
     prev: &str,
     sent_results: &[Value],
@@ -344,7 +420,7 @@ fn llm_round(
                 // The turn used tools: mint a final step (so this round's
                 // blocks and the last tool results stay tree-reachable), then
                 // the pure turn merge.
-                let (step_hash, _) = mint_step(cfg, ws, prev, sent_results, &blocks)?;
+                let (step_hash, _) = mint_step(cfg, ws, prev, wc, sent_results, &blocks)?;
                 let tree = cas_hash(ws)?;
                 write_commit_as(
                     &tree,
@@ -360,10 +436,11 @@ fn llm_round(
             if tool_uses.is_empty() {
                 return Err("stop_reason tool_use but no tool_use blocks".to_string());
             }
-            let (_, step_path) = mint_step(cfg, ws, prev, sent_results, &blocks)?;
+            let (_, step_path) = mint_step(cfg, ws, prev, wc, sent_results, &blocks)?;
             drive(
                 cfg,
                 ws.to_string(),
+                wc.to_string(),
                 head_hash,
                 &step_path,
                 &tool_uses,
@@ -379,27 +456,47 @@ fn llm_round(
 
 /// Mint a step commit: tree = the workspace plus `.caos/step.json` (this
 /// round's verbatim response blocks and the tool_results its request carried),
-/// parent = the previous step (or the human turn), author `caos-agent` at
-/// wall-clock time. Pushes the progress ref (best-effort). Returns the
-/// commit's `(hash, cas-path)`.
+/// FIRST parent = the previous step (or the human turn), SECOND parent = the
+/// workspace commit `wc` (unless it already equals the first parent — the
+/// turn's first round, before any tool ran). That second parent hangs the
+/// workspace-commit chain — and so any `merge`'s `M` and its `theirs` — off the
+/// transcript, reachable, without disturbing the first-parent spine or the
+/// transcript walk. Author `caos-agent` at wall-clock time. Pushes the progress
+/// ref (best-effort). Returns the commit's `(hash, cas-path)`.
 fn mint_step(
     cfg: &Config,
     ws: &str,
     parent: &str,
+    wc: &str,
     sent_results: &[Value],
     blocks: &[Value],
 ) -> Result<(String, String), String> {
     let dir = scratch("steptree")?;
+    // Link every workspace entry EXCEPT `.caos` (rebuilt below): a mid-merge
+    // workspace carries `.caos/conflicts`, which must survive alongside the
+    // step.json we add — the two share the `.caos/` name, never a file.
+    let mut ws_caos: Option<String> = None;
     for child in entries(ws)? {
+        if file_name(&child) == STEP_DIR {
+            ws_caos = Some(path(&child).to_string());
+            continue;
+        }
         link(&child, dir.join(file_name(&child)))?;
     }
-    fs::create_dir(dir.join(STEP_DIR)).map_err(|e| format!("creating {STEP_DIR}: {e}"))?;
+    let caos_dir = dir.join(STEP_DIR);
+    fs::create_dir(&caos_dir).map_err(|e| format!("creating {STEP_DIR}: {e}"))?;
+    if let Some(ws_caos) = ws_caos {
+        caos(["get", &ws_caos])?;
+        for child in entries(&ws_caos)? {
+            link(&child, caos_dir.join(file_name(&child)))?;
+        }
+    }
     let step_json = json!({
         "content": blocks,
         "results": sent_results,
         "v": 1,
     });
-    fs::write(dir.join(STEP_DIR).join(STEP_FILE), step_json.to_string())
+    fs::write(caos_dir.join(STEP_FILE), step_json.to_string())
         .map_err(|e| format!("writing {STEP_FILE}: {e}"))?;
     let tree_path = fresh("steptree");
     caos(["put", path(&dir), &tree_path])?;
@@ -414,22 +511,29 @@ fn mint_step(
     } else {
         text
     };
+    // The workspace commit as a second parent — omitted when it IS the first
+    // parent (the turn's opening round, wc still the head commit): git allows a
+    // duplicate parent but it is noise.
+    let wc_hash = cas_hash(wc)?;
+    let mut parents: Vec<&str> = vec![parent];
+    if wc_hash != parent {
+        parents.push(&wc_hash);
+    }
     let commit_path = fresh("step");
-    let hash = write_commit_as(&tree_hash, &[parent], &message, agent_now(), &commit_path)?;
+    let hash = write_commit_as(&tree_hash, &parents, &message, agent_now(), &commit_path)?;
     if let Some(conversation) = &cfg.conversation {
         progress::push(conversation, &hash);
     }
     Ok((hash, commit_path))
 }
 
-/// Launch one tool call as a run-then sub-run: `in` = `{tree, cmd, paths}`
-/// (the workspace with `.caos` never present — `ws` is always a pure
-/// workspace), `run` = the bash image, `then` = ourselves re-curried with the
-/// loop state.
+/// Launch one bash call as a run-then sub-run: `in` = `{tree, cmd, paths}`,
+/// `run` = the bash image, `then` = ourselves re-curried with the loop state.
 fn launch(
     cfg: &Config,
     call: &Value,
     ws: &str,
+    wc: &str,
     step_path: &str,
     pending: &[Value],
     results: &[Value],
@@ -463,6 +567,7 @@ fn launch(
     caos(["put", path(&dir), &in_path])?;
 
     let me = self_curry(
+        wc,
         step_path,
         pending,
         results,
@@ -470,6 +575,50 @@ fn launch(
         &[("current-tool", Arg::Lit("bash"))],
     )?;
     run_then(&in_path, &cfg.bash_image, Some(&me))
+}
+
+/// Launch a `merge` call as a run-then sub-run of the git-bearing merge worker
+/// (std/merge): `ours` is the threaded workspace commit `wc`, `theirs` the
+/// resolved commit, both curried onto the image as gitlink args; the worker
+/// fetches their closures from the server, three-way-merges, and returns the
+/// two-parent commit `M`. `--in` is immaterial (everything rides curried) but
+/// run-then needs one. The result is a COMMIT, not a workspace tree — the
+/// callback makes it the new workspace commit.
+#[allow(clippy::too_many_arguments)]
+fn launch_merge(
+    cfg: &Config,
+    call: &Value,
+    theirs: &str,
+    ws: &str,
+    wc: &str,
+    step_path: &str,
+    pending: &[Value],
+    results: &[Value],
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let image = cfg
+        .merge_image
+        .as_ref()
+        .ok_or("launch_merge without a merge_image (drive guards this)")?;
+    // `theirs` is a bare hash (from the ref snapshot); materialize it as a
+    // commit-kinded /cas path so it curries as a gitlink (`:commit=`), like wc.
+    let theirs_path = fresh("theirs");
+    caos(["get-hash", theirs, &theirs_path])?;
+    let curried = caos_curry(
+        image,
+        &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
+    )?;
+    let me = self_curry(
+        wc,
+        step_path,
+        pending,
+        results,
+        id,
+        &[("current-tool", Arg::Lit("merge"))],
+    )?;
+    run_then(ws, &curried, Some(&me))
 }
 
 /// Launch a grep as a run-then sub-run of the rgrep fold worker: the input is
@@ -484,6 +633,7 @@ fn launch_grep(
     scope: &str,
     scope_prefix: &str,
     ws: &str,
+    wc: &str,
     step_path: &str,
     pending: &[Value],
     results: &[Value],
@@ -500,6 +650,7 @@ fn launch_grep(
         .ok_or("launch_grep without a grep_image (drive guards this)")?;
     let curried = caos_curry(image, &[("pattern", Arg::Lit(pattern))])?;
     let me = self_curry(
+        wc,
         step_path,
         pending,
         results,
@@ -527,6 +678,7 @@ fn launch_tree_tool(
     script: &str,
     bound: &[(String, String)],
     ws: &str,
+    wc: &str,
     step_path: &str,
     pending: &[Value],
     results: &[Value],
@@ -546,6 +698,7 @@ fn launch_tree_tool(
     kvs.extend(bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))));
     let curried = caos_curry(image, &kvs)?;
     let me = self_curry(
+        wc,
         step_path,
         pending,
         results,
@@ -559,8 +712,9 @@ fn launch_tree_tool(
 /// source-built worker is curry(runner, bin) and gets unwrapped into args, so
 /// "ourselves" is that same curry rebuilt from our own args (content-addressed,
 /// hence identical), plus the state to remember. Commit-valued paths (`head`,
-/// `step`) re-bind as gitlinks (their kind xattr rides the curry).
+/// `step`, `wc`) re-bind as gitlinks (their kind xattr rides the curry).
 fn self_curry(
+    wc: &str,
     step_path: &str,
     pending: &[Value],
     results: &[Value],
@@ -582,6 +736,8 @@ fn self_curry(
         ("system", Arg::Path(&system)),
         ("bash-image", Arg::Path(&bash_image)),
         ("step", Arg::Path(step_path)),
+        // The workspace commit the callback continues from (a gitlink).
+        ("wc", Arg::Path(wc)),
         ("pending", Arg::Lit(&pending_json)),
         ("results", Arg::Lit(&results_json)),
         ("current-id", Arg::Lit(current_id)),
@@ -592,6 +748,8 @@ fn self_curry(
         "conversation",
         "grep-image",
         "tools-image",
+        "merge-image",
+        "merge-refs",
     ]
     .iter()
     .map(|name| (*name, arg(name)))
@@ -733,6 +891,9 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         tools.push(tools::grep_declaration());
     }
+    if cfg.merge_image.is_some() {
+        tools.push(merge_tool());
+    }
     // Tree tools: whatever caos-tools/*.sh the CURRENT workspace carries —
     // re-discovered every round, so the set tracks the agent's own edits.
     if cfg.tools_image.is_some() {
@@ -741,6 +902,114 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
         }
     }
     Ok(tools)
+}
+
+/// The `merge` tool's registry entry.
+fn merge_tool() -> Value {
+    json!({
+        "name": "merge",
+        "description": "Three-way merge another commit into the current workspace. `theirs` is \
+    a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current \
+    side is the workspace as it is now. A clean merge advances the workspace to the merged \
+    result. A conflict advances it too, with git's inline conflict markers in the files and a \
+    reserved `.caos/conflicts` file listing every unresolved path — including structural \
+    conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file \
+    (use `read-oid` to inspect a stage's content by its hash), then delete that path's rows \
+    from `.caos/conflicts`. Then build and test.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "theirs": {"type": "string", "description": "The commit to merge in: a ref name from the snapshot, or a commit hash."}
+            },
+            "required": ["theirs"]
+        }
+    })
+}
+
+/// Resolve a `merge` call's `--theirs` against the turn-start ref snapshot
+/// (SPEC "Resolving `--theirs`"): a known ref name → its hash, a bare hash →
+/// itself, else an is_error tool_result listing the available names.
+fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
+    let id = call["id"].as_str().unwrap_or("");
+    let theirs = call["input"]["theirs"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    lookup_theirs(cfg.merge_refs.as_deref(), theirs).map_err(|msg| {
+        json!({
+            "type": "tool_result",
+            "tool_use_id": id,
+            "content": [{"type": "text", "text": msg}],
+            "is_error": true,
+        })
+    })
+}
+
+/// The pure core of [`resolve_theirs`]: given the snapshot blob (`name <hash>`
+/// lines) and the requested `theirs`, return the hash or a user-facing error.
+fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, String> {
+    let theirs = theirs
+        .ok_or_else(|| "merge needs a string `theirs` (a ref name or a commit hash)".to_string())?;
+    let mut names = Vec::new();
+    for line in refs.unwrap_or("").lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, hash)) = line.split_once(char::is_whitespace) {
+            let (name, hash) = (name.trim(), hash.trim());
+            if name == theirs {
+                return Ok(hash.to_string());
+            }
+            names.push(name.to_string());
+        }
+    }
+    // A bare hash is always allowed (sha1/sha256), so the model can merge a
+    // commit it learned by hash even if it isn't a named ref.
+    if (theirs.len() == 40 || theirs.len() == 64) && theirs.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(theirs.to_string());
+    }
+    Err(format!(
+        "unknown merge target {theirs:?}; available refs: {}",
+        if names.is_empty() {
+            "(none)".to_string()
+        } else {
+            names.join(", ")
+        }
+    ))
+}
+
+/// The tool_result for a finished merge: clean, or the conflicted paths the
+/// model must resolve (from `M`'s `.caos/conflicts`). `ws` is `M`'s tree,
+/// already materialized one level.
+fn merge_result_block(id: &str, ws: &str) -> Result<Value, String> {
+    let caos_dir = format!("{ws}/{STEP_DIR}");
+    let mut conflicts = None;
+    if Path::new(&caos_dir).exists() {
+        caos(["get", &caos_dir])?;
+        let file = format!("{caos_dir}/conflicts");
+        if Path::new(&file).exists() {
+            caos(["get", &file])?;
+            conflicts =
+                Some(fs::read_to_string(&file).map_err(|e| format!("reading conflicts: {e}"))?);
+        }
+    }
+    let text = match conflicts {
+        Some(body) => format!(
+            "merge produced conflicts. The workspace now carries git's inline conflict markers \
+             in the affected files, plus .caos/conflicts (git's unmerged notation, richer than \
+             markers). Resolve each path — edit the file, using read-oid to inspect a stage's \
+             content by its hash — then delete that path's rows from .caos/conflicts. Build and \
+             test when done.\n\n.caos/conflicts:\n{}",
+            body.trim_end()
+        ),
+        None => "merge completed cleanly; the workspace is the merged result.".to_string(),
+    };
+    Ok(json!({
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": [{"type": "text", "text": text}],
+    }))
 }
 
 /// The bash tool's registry entry, steering the model into the declared-paths
@@ -858,4 +1127,32 @@ fn fresh(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("/cas/{prefix}-{n}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theirs_lookup() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let refs = format!("main {a}\norigin/main {b}\n");
+        // A known ref name resolves to its snapshotted hash.
+        assert_eq!(lookup_theirs(Some(&refs), Some("main")).unwrap(), a);
+        assert_eq!(lookup_theirs(Some(&refs), Some("origin/main")).unwrap(), b);
+        // A bare hash passes through even when it is not a named ref.
+        let c = "c".repeat(40);
+        assert_eq!(lookup_theirs(Some(&refs), Some(&c)).unwrap(), c);
+        // An unknown name errors, listing the available names.
+        let e = lookup_theirs(Some(&refs), Some("nope")).unwrap_err();
+        assert!(e.contains("main") && e.contains("origin/main"), "{e}");
+        // A missing/blank target errors.
+        assert!(lookup_theirs(Some(&refs), None).is_err());
+        // No snapshot at all: a bare hash still works, a name reports "(none)".
+        assert_eq!(lookup_theirs(None, Some(&a)).unwrap(), a);
+        assert!(lookup_theirs(None, Some("main"))
+            .unwrap_err()
+            .contains("(none)"));
+    }
 }

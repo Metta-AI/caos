@@ -214,3 +214,182 @@ TOOL taking a hash (`test` and `test-result`), not as richer printing.
   is often called precisely because something already went wrong, and a job
   error there takes the agent's turn down with it
 - Unexpected failures die, per the reliability principles above
+
+# Merging and conflict resolution
+
+An agent resolves a git merge from inside a conversation. The obstacle is
+that git's "resolve in the working tree, then `git add` to the index, then
+`git commit`" ceremony has no place to live: there is no index, and a
+conversation advances by whole commits, not staged files. Caos collapses the
+ceremony — resolving a conflict is just producing the next commit — and
+provides two tools:
+
+- `merge --theirs=<ref|hash>` — three-way merge the given commit into the
+  conversation head. A git-bearing SUB-RUN, not in-process (below).
+- `read-oid <oid>` — read a blob by hash. In-process at the hash level, like
+  `read`/`ls`/`write`/`edit` (below).
+
+## Tools thread a commit, not a tree
+
+To let `merge` record `theirs` as an ancestor, a tool's unit of work is a
+COMMIT, not a bare tree: the step loop threads a workspace commit through the
+call queue, and every tool is `commit -> (commit, result)`.
+
+- **Read-only tools** (`read`, `ls`, `grep`, `read-oid`) return the input
+  commit UNCHANGED — no new object, no no-op commit.
+- **Mutations** (`write`, `edit`, `bash`, tree tools) return a single-parent
+  commit `commit(new tree, parent = input commit)`.
+- **`merge`** returns a two-parent commit `commit(merged tree, parents =
+  [input commit, theirs])` — the only tool that fills a second parent, but
+  otherwise an ordinary tool with the ordinary signature.
+
+Reachability does the rest. A merge commit `M` carries both its parents, so
+anyone who has `M` has `ours` and `theirs`; the sole requirement is that `M`
+be reachable from the conversation head. That is automatic: the step commit a
+round mints hangs the round's FINAL workspace commit off itself (as a second
+parent — the first-parent spine and the transcript walk are untouched), and
+that workspace commit chains back through the round's per-mutation commits —
+`M` among them — to the head. So `theirs` is wired in with no note, no
+sidecar, no turn-ending special case; `merge` is not privileged, it just
+returns the commit it built.
+
+This makes commits per MUTATION (reads stay free). Fine under the squash
+workflow below; caching is unaffected — sub-runs key on their input TREE, not
+on commits.
+
+## `merge --theirs=<commit>`
+
+- Takes exactly one commit arg (`theirs`). The other side (`ours`) is the
+  workspace commit threaded into the call — the head plus whatever this turn
+  already did, so no earlier edit is cut out.
+- The merge is index-free and worktree-free: `git merge-tree --write-tree
+  <ours> <theirs>` is a pure `(commit, commit) -> (tree, conflict report)`,
+  which memoizes like any other job and needs no materialized working copy
+  (the harness forbids one). The merge base is `merge-base(ours, theirs)`,
+  which `merge-tree` derives from the commit graph.
+- It runs the real `git` binary in its own worker. `.caos/conflicts`
+  and the inline markers are straight from git's own output (below), so we want
+  `merge-tree`'s exact notation, not a reimplementation. gix is a dependency
+  but carries no merge (`gix-merge` is not pulled in), and its output would not
+  match git's notation anyway. So `merge` is a decomposed compute tool like
+  `bash`/`build`/`test`, and only `read-oid` is in-process.
+- Its image is a small git worker — a `std/merge` flake
+  (`nixpkgs.gitMinimal`) run as `curry(std/runner, worker1=<merge script>)`,
+  the same flake-image pattern as `std/bash`. Not `std/cargo` (which has git
+  but is a heavy image and the wrong home) and not folded into the bash-tool
+  image (whose surface stays minimal). The script reconstructs a git odb from
+  the `ours`/`theirs` commit closures in `/cas` (a merge is inherently a
+  both-whole-trees op — the one place laziness can't help), runs `merge-tree`,
+  writes `.caos/conflicts`, and `put-commit`s the two-parent commit as its
+  result.
+- Clean merge → `M`'s tree is the merged workspace and the merge is done.
+- Conflicts → `M`'s tree carries inline conflict markers in the text files
+  (what the agent edits), plus a reserved `.caos/conflicts` file (below). The
+  agent resolves over subsequent turns; each resolution is an ordinary
+  mutation commit on top of `M`.
+
+## Resolving `--theirs` (the ref snapshot)
+
+The model says "merge in `main`", but a ref name only exists in the user's git
+repo — the merge worker, mid-turn on the compute network, has no refs, and the
+model doesn't know hashes. So `--theirs` is resolved on the CLIENT, at turn
+START — the only place the refs live and the only moment the client is in the
+loop (a tool call three rounds deep cannot reach back into the repo):
+
+- The client resolves a small, curated set of refs to hashes — `HEAD`'s
+  upstream, `main`/`master`, the `origin` default — `ensure_pushed`es their
+  closures (onto the CONTENT-ADDRESSED `refs/caos/req/<hash>`, exactly as
+  `--head:commit` is pushed; NO semantic ref like `main` is ever written to the
+  shared server, so users never contend for a name), and curries a
+  name→hash MAP into the llm-step worker as an ordinary blob arg.
+- The `merge` tool resolves `--theirs` against that map: a known ref name → its
+  snapshotted hash; a bare hash → used directly; anything else → an is_error
+  tool_result listing the available names. `ours` is never named — it is the
+  threaded workspace commit.
+
+**Snapshot semantics**, deliberately: "merge in `main`" merges `main` as it was
+when the turn started, so the merge is deterministic and immune to `main`
+moving mid-turn. `ensure_pushed` negotiates against the server, so an unmoved
+`main` re-pushes nothing — the steady-state cost is the delta since last time.
+
+## `.caos/conflicts`
+
+The authoritative set of unresolved conflicts, produced by the merge itself —
+not re-derived by grepping for markers. Grepping is rejected as the store: it
+false-negatives on the conflicts that have no textual marker at all
+(modify/delete, binary, type/mode change), which it would silently report as
+resolved.
+
+It holds git's own unmerged notation verbatim — `git ls-files -u` rows,
+`<mode> <oid> <stage> <path>` (stage 1 = base, 2 = ours, 3 = theirs) — plus
+git's informational-messages block as human hints. That notation is strictly
+richer than text markers:
+
+- content conflict → the stage rows' oids differ (and markers are also
+  written into the file, for editing);
+- perm/type conflict → the stage rows' MODES differ (regular ↔ symlink ↔
+  gitlink); nothing lives in the bytes, so there is no marker — resolving
+  means choosing the entry's mode;
+- modify/delete → a stage is simply ABSENT.
+
+The agent resolves a path by editing the file (removing markers) or fixing
+the entry, then DELETING that path's rows from `.caos/conflicts`. That
+deletion IS the per-path `git add` — an explicit "this one's done"
+assertion, trusted exactly as git trusts `add` (no re-scan). An empty
+`.caos/conflicts` means done; the agent need not remove the file (inline tools
+have no delete — `bash rm` does, for a clean mid-conversation checkout).
+
+`.caos/conflicts` is workspace state: it lives in the workspace tree `ws` the
+tools thread, so it rides into `M` and every mutation commit on top of it for
+free — it is part of `ws` like any file. This does NOT collide with
+`.caos/step.json`, which shares the `.caos/` name but never the same place:
+step.json exists ONLY in a step-commit tree (`mint_step` injects it), never in
+`ws`; conflicts exists ONLY in `ws`. They meet in one `.caos/` directory only
+inside a step tree, and the harness tells them apart by FILENAME. So four small
+local rules, no "persistence exemption":
+
+- **Inline tools** refuse `.caos/step.json` specifically, not all of `.caos/`,
+  so `.caos/conflicts` is editable like any file (deleting a path's rows is an
+  `edit`).
+- **`mint_step`** PRESERVES an existing `.caos/` when it injects `step.json`
+  (symlinking `.caos/conflicts` in alongside), rather than assuming `.caos/` is
+  absent.
+- **Compute tools** (`bash`/build/test) see `ws` as-is, `.caos/conflicts`
+  included — it is workspace state. (A build run mid-merge keys on a tree that
+  still carries the file, so it won't cache-hit the post-resolution build;
+  negligible, and only during resolution.)
+- **Publish** (the tui's PR flow) strips `.caos/` from the snapshot AFTER the
+  guard below, so scaffolding never reaches the PR — a leftover or empty
+  `.caos/conflicts` cannot leak.
+
+Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
+so a mid-merge head is fully reviewable.
+
+## `read-oid`
+
+Bounded blob read by hash — same contract as `read` (100KB / offset+limit).
+It is load-bearing, not a convenience: the stage oids in `.caos/conflicts`
+name content that is NOT reachable through any workspace path — the base
+(stage 1), and either side of a modify/delete, binary, or type conflict, none
+of which appear at the path. Without `read-oid` the agent cannot see what it
+is choosing between. (Tree-oid listing is a cheap optional companion.)
+
+## Guards and workflow
+
+- NO empty-`.caos/conflicts` guard on turn completion. Asking the user how to
+  resolve a conflict IS ending a turn mid-merge; a turn-completion guard would
+  make that impossible.
+- Correctness of a resolution is checked by BUILD/TEST at the end of the
+  resolution turn (a leftover marker does not compile) — not by a marker
+  re-scan, which cannot tell a real marker from a bad resolution.
+- The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
+  remaining marker is PUBLISH (the tui's PR flow) — the moment work actually
+  leaves the conversation.
+
+## Caveat
+
+Per-mutation commits mean real, sometimes marker-bearing, non-building commits
+land in history. These conversations produce throwaway histories that are only
+usable once SQUASHED, so this is fine — but an intermediate commit (a
+mid-resolution merge commit especially) is NOT safe to cherry-pick or check out
+in isolation.

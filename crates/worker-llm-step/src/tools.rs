@@ -30,7 +30,7 @@ const MAX_ENTRIES: usize = 1_000;
 
 /// True if `name` is one of the inline tools this module executes.
 pub fn is_inline(name: &str) -> bool {
-    matches!(name, "read" | "ls" | "write" | "edit")
+    matches!(name, "read" | "ls" | "write" | "edit" | "read-oid")
 }
 
 /// The inline tools' registry entries, alongside `bash`'s.
@@ -92,6 +92,23 @@ pub fn declarations() -> Vec<Value> {
                 "required": ["file_path", "old_string", "new_string"]
             }
         }),
+        json!({
+            "name": "read-oid",
+            "description": "Read a blob by its git object hash. Bounded exactly like `read` \
+        (large blobs truncate; use `offset`/`limit`). Use this to inspect content named by an \
+        oid that no workspace path holds — in particular a stage oid from `.caos/conflicts` \
+        (the merge base, or either side of a modify/delete, binary, or type conflict), so you \
+        can see what you are choosing between.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "oid": {"type": "string", "description": "A git object hash (a blob)."},
+                    "offset": {"type": "integer", "description": "1-based first line to return."},
+                    "limit": {"type": "integer", "description": "Number of lines to return."}
+                },
+                "required": ["oid"]
+            }
+        }),
     ]
 }
 
@@ -121,7 +138,7 @@ pub fn grep_declaration() -> Value {
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
 /// the file tools) must stay stable whatever the tree carries.
-const RESERVED_TOOLS: &[&str] = &["bash", "grep", "read", "ls", "write", "edit"];
+const RESERVED_TOOLS: &[&str] = &["bash", "grep", "read", "ls", "write", "edit", "read-oid"];
 
 /// The tree's tool directory (`caos-tools/` in the workspace), expanded one
 /// level; `None` when the tree defines no tools.
@@ -501,6 +518,7 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
     let name = call["name"].as_str().unwrap_or("");
     let outcome = match name {
         "read" => read(call, ws).map(|text| (text, None)),
+        "read-oid" => read_oid(call).map(|text| (text, None)),
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "edit" => edit(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
@@ -536,9 +554,48 @@ fn read(call: &Value, ws: &str) -> Result<String, Fail> {
         return Err(User(format!("{} is a directory; use ls", comps.join("/"))));
     }
     let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    let total = bytes.len();
-    let text = String::from_utf8_lossy(&bytes);
+    bounded(&bytes, call)
+}
 
+/// A git object hash: hex, 40 (sha1) or 64 (sha256) chars.
+fn valid_oid(oid: &str) -> bool {
+    (oid.len() == 40 || oid.len() == 64) && oid.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Read a blob by hash. The load-bearing companion to `.caos/conflicts`: a
+/// stage oid there (the merge base, or a side of a modify/delete, binary, or
+/// type conflict) names content reachable through no workspace path, so the
+/// agent has no other way to see what it is choosing between. Bounded exactly
+/// like `read`. An unknown/malformed oid is the model's mistake — an is_error
+/// result to react to, not a worker failure.
+fn read_oid(call: &Value) -> Result<String, Fail> {
+    let oid = call["input"]["oid"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| User("read-oid needs a string `oid`".to_string()))?;
+    if !valid_oid(oid) {
+        return Err(User(format!("{oid:?} is not a git object hash")));
+    }
+    let dst = fresh("oid");
+    caos(["get-hash", oid, &dst]).map_err(|e| User(format!("cannot read {oid}: {e}")))?;
+    let p = Path::new(&dst);
+    if p.is_dir() {
+        return Err(User(format!(
+            "{oid} names a tree, not a blob; read-oid reads blobs"
+        )));
+    }
+    let _ = caos(["get", &dst]);
+    let bytes = fs::read(p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
+    bounded(&bytes, call)
+}
+
+/// Apply `read`'s bounds to raw bytes: a line window when `offset`/`limit` is
+/// set, else a head-truncation at [`MAX_READ_BYTES`]. Shared by `read` and
+/// `read-oid` so the two present content identically.
+fn bounded(bytes: &[u8], call: &Value) -> Result<String, Fail> {
+    let total = bytes.len();
+    let text = String::from_utf8_lossy(bytes);
     let offset = call["input"]["offset"].as_u64().map(|n| n.max(1) as usize);
     let limit = call["input"]["limit"].as_u64().map(|n| n as usize);
     if offset.is_some() || limit.is_some() {
@@ -695,9 +752,10 @@ fn components(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
     if comps.iter().any(|c| c == "..") {
         return Err(User("`..` is not allowed in workspace paths".to_string()));
     }
-    if comps[0] == STEP_DIR {
+    if comps[0] == STEP_DIR && !(comps.len() == 2 && comps[1] == "conflicts") {
         return Err(User(format!(
-            "{STEP_DIR} is reserved for the harness and not part of the workspace"
+            "{STEP_DIR}/ is reserved for the harness; only {STEP_DIR}/conflicts (the merge \
+             conflict set) is editable"
         )));
     }
     Ok(comps)
@@ -794,6 +852,27 @@ fn counter() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oid_shape() {
+        assert!(valid_oid(&"a".repeat(40))); // sha1
+        assert!(valid_oid(&"0".repeat(64))); // sha256
+        assert!(valid_oid("0123456789abcdef0123456789abcdef01234567"));
+        assert!(!valid_oid("")); // empty
+        assert!(!valid_oid(&"a".repeat(39))); // too short
+        assert!(!valid_oid(&"a".repeat(41))); // between the two lengths
+        assert!(!valid_oid(&"g".repeat(40))); // not hex
+        assert!(!valid_oid("src/main.rs")); // a path, not an oid
+    }
+
+    #[test]
+    fn read_oid_is_inline_and_reserved() {
+        // Routed in-process (no sub-run) and shadow-proof against a tree tool.
+        assert!(is_inline("read-oid"));
+        assert!(RESERVED_TOOLS.contains(&"read-oid"));
+        // It is offered to the model in every turn (no image gate).
+        assert!(declarations().iter().any(|d| d["name"] == "read-oid"));
+    }
 
     #[test]
     fn arg_lines_parse() {

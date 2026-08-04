@@ -75,6 +75,15 @@ const RGREP_IMAGE: &str = "/cas/std/rgrep";
 /// Optional: a stack whose std predates it just doesn't register tree tools.
 const TOOLS_IMAGE: &str = "/cas/std/bash";
 
+/// The git-bearing merge worker (SPEC "Merging and conflict resolution").
+/// Optional: a stack whose std predates it just doesn't offer the merge tool.
+const MERGE_IMAGE: &str = "/cas/std/merge";
+
+/// Refs snapshotted to hashes at turn start so the `merge` tool can resolve
+/// `--theirs=<name>` (SPEC "Resolving `--theirs`"). Curated to the names a
+/// model actually types; a spec that doesn't resolve is simply skipped.
+const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin/master"];
+
 /// Auto-named conversations (`talk` with no `-c`): `talk-1`, `talk-2`, …
 const AUTO_NAME_PREFIX: &str = "talk-";
 
@@ -1088,6 +1097,26 @@ fn turn(
     // that way too).
     let tools_image = resolve_cli_image(t, TOOLS_IMAGE).ok();
 
+    // The merge worker and the turn-start ref snapshot (SPEC "Resolving
+    // `--theirs`"): resolve a curated set of refs to hashes, push each closure
+    // (onto its content-addressed `refs/caos/req/<hash>`, so no semantic ref is
+    // written to the shared server), and carry a name→hash map into the turn.
+    // ensure_pushed negotiates, so an unmoved ref re-pushes nothing.
+    let merge_image = resolve_cli_image(t, MERGE_IMAGE).ok();
+    let merge_refs = match &merge_image {
+        None => None,
+        Some(_) => {
+            let mut lines = String::new();
+            for spec in MERGE_REF_CANDIDATES {
+                if let Some(hash) = rev_parse_opt(t, spec)? {
+                    t.ensure_pushed(&hash)?;
+                    lines.push_str(&format!("{spec} {hash}\n"));
+                }
+            }
+            Some(lines)
+        }
+    };
+
     let mut kvs = vec![
         format!("--api-key={api_key}"),
         format!("--system={system}"),
@@ -1097,6 +1126,12 @@ fn turn(
     ];
     if let Some(tools) = &tools_image {
         kvs.push(format!("--tools-image={tools}"));
+    }
+    if let Some(merge) = &merge_image {
+        kvs.push(format!("--merge-image={merge}"));
+    }
+    if let Some(refs) = &merge_refs {
+        kvs.push(format!("--merge-refs={refs}"));
     }
     if let Some(model) = &options.model {
         kvs.push(format!("--model={model}"));

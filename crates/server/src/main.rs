@@ -139,6 +139,12 @@ fn main() {
         "uploadpack.allowAnySHA1InWant",
         "true",
     ]);
+    // Serve partial-clone (`--filter`) fetches: the std/merge worker fetches
+    // the commit GRAPH only (`--filter=tree:0`) and lazily faults in just the
+    // three trees `git merge-tree` needs, rather than the whole history's
+    // trees and blobs. Same class of flag as the two above — a protocol
+    // capability the server owns.
+    git(&["-C", &git_dir, "config", "uploadpack.allowFilter", "true"]);
     // Never let git rewrite this repo's object store behind our back.
     // `git-receive-pack` (which http-backend spawns on every push) forks a
     // background repack; that rewrites the object store while a concurrent

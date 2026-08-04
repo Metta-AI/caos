@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# std/merge/worker is this script's only copy; the suite's image jobs
+# (caos-tools/build.sh) read it here.
+# (env shebang: the flake image this defines has bash at /bin/bash, but the
+# nix-builder images have only /usr/bin/env, which the flake-builder's caos
+# delta guarantees — the portable meeting point, as std/bash notes.)
+#
+# The merge worker (SPEC "Merging and conflict resolution"). The caos runner
+# execs us as /worker with the args materialized under /cas/args:
+#   ours   (:commit=)  the workspace commit to merge into (the current side)
+#   theirs (:commit=)  the commit to merge in
+# We three-way merge them and write a single result: a two-parent commit M =
+# (merged tree, parents [ours, theirs]). On conflict the merged tree carries
+# git's inline markers PLUS a reserved .caos/conflicts file — git's own
+# unmerged notation, which text markers cannot express for structural
+# conflicts (see SPEC). M becomes the run's result at /cas/out.
+set -euo pipefail
+
+# The commit args materialize as raw commit-object files; `caos hash` reads the
+# recorded id without fetching content — and the id is all we need, since the
+# objects themselves come from the server over git below.
+ours=$(caos hash /cas/args/ours)
+theirs=$(caos hash /cas/args/theirs)
+
+# A throwaway git repo, and the two commit closures fetched from the server's
+# own git transport. `--filter=tree:0` fetches the commit GRAPH ONLY — every
+# ancestor commit (small: merge-base needs the graph) but NONE of the history's
+# trees or blobs. `merge-tree` below then lazily faults in exactly the three
+# trees it 3-way-merges and the blobs that differ, via the promisor remote — so
+# we transfer the graph plus two end states, not the whole repo. This is why
+# the merge is a git-bearing worker: no odb reconstruction, git does it.
+# `caos put`/`git push` workers already speak to $CAOS_SERVER_URL this way; a
+# bare-hash filtered fetch works because the server sets
+# uploadpack.allowAnySHA1InWant and uploadpack.allowFilter.
+repo=/tmp/merge-repo
+rm -rf "$repo"; mkdir -p "$repo"
+git -C "$repo" init -q
+git -C "$repo" remote add origin "$CAOS_SERVER_URL"
+# Mark origin a promisor remote so later commands lazily fetch missing objects
+# from it rather than failing — set explicitly (a manual fetch --filter does
+# not always configure this the way `clone --filter` does).
+git -C "$repo" config extensions.partialClone origin
+git -C "$repo" config remote.origin.promisor true
+git -C "$repo" config remote.origin.partialclonefilter tree:0
+git -C "$repo" fetch -q --filter=tree:0 origin "$ours" "$theirs"
+
+# `merge-tree --write-tree`: writes the merged tree to the odb and prints its
+# oid on line 1; on conflict, exits 1 and prints the unmerged-file notation and
+# informational messages after it. Any other exit is a real failure.
+set +e
+merge_out=$(git -C "$repo" merge-tree --write-tree "$ours" "$theirs")
+code=$?
+set -e
+if [ "$code" != 0 ] && [ "$code" != 1 ]; then
+  echo "merge: git merge-tree failed (exit $code):" >&2
+  printf '%s\n' "$merge_out" >&2
+  exit 1
+fi
+# Line 1 is the tree oid; the rest (conflict case) is the notation for
+# .caos/conflicts. Parameter expansion, not `head`/`tail` pipes — a
+# `printf | head -1` can SIGPIPE and trip `pipefail` (AGENTS.md).
+merged_tree=${merge_out%%$'\n'*}
+
+# Lift the merged tree out of the odb onto disk so caos can re-ingest it.
+# Re-hashing reproduces the same tree (git hashing is deterministic); on a
+# clean merge the caos tree IS merged_tree, on a conflict it is that plus
+# .caos/conflicts.
+work=/tmp/merge-work
+rm -rf "$work"; mkdir -p "$work"
+git -C "$repo" archive "$merged_tree" | tar -x -C "$work"
+
+if [ "$code" = 1 ]; then
+  # The authoritative conflict set: everything after the tree oid, verbatim —
+  # git's ls-files -u rows plus its informational-messages block. The agent
+  # resolves a path by editing it and deleting its rows here (SPEC).
+  mkdir -p "$work/.caos"
+  printf '%s\n' "${merge_out#*$'\n'}" > "$work/.caos/conflicts"
+fi
+
+caos put "$work" /cas/merged
+mtree=$(caos hash /cas/merged)
+
+# Mint M = (merged tree, parents [ours, theirs]). Fixed identity / zero time:
+# a merge of the same two commits is a pure value. put-commit at /cas/out makes
+# `commit <hash>` the run's result.
+commit=/tmp/merge-commit
+{
+  printf 'tree %s\n' "$mtree"
+  printf 'parent %s\n' "$ours"
+  printf 'parent %s\n' "$theirs"
+  printf 'author caos <caos@caos> 0 +0000\n'
+  printf 'committer caos <caos@caos> 0 +0000\n'
+  printf '\nmerge %s into %s\n' "$theirs" "$ours"
+} > "$commit"
+caos put-commit "$commit" /cas/out
