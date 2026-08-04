@@ -103,6 +103,9 @@ automatically becomes a whitespace-collapsed title of at most 60 characters.
 Using `/title` before the first prompt keeps that explicit title instead.
 Existing conversations are never automatically retitled.
 
+Fresh conversations start from the fetched tip of `origin`'s advertised
+default branch. `--base` and `/from <turn-hash>` override that default.
+
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
 or Enter to complete it with a trailing space. Typing arguments closes the

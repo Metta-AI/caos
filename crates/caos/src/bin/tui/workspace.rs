@@ -63,8 +63,7 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
 pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Result<String, String> {
     let cwd = Path::new(".");
     let branch = format!("caos/{name}");
-    let pr_base = remote_default_branch(cwd)?;
-    let pr_base_commit = fetch_remote_branch_tip(&pr_base, cwd)?;
+    let (pr_base, pr_base_commit) = remote_default_branch_tip(cwd)?;
     prepare_publish_branch(name, diff, &pr_base_commit, cwd)?;
     push_publish_branch(&branch, cwd)?;
 
@@ -109,6 +108,12 @@ pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Resul
         ],
         cwd,
     )
+}
+
+pub(crate) fn remote_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+    let branch = remote_default_branch(cwd)?;
+    let commit = fetch_remote_branch_tip(&branch, cwd)?;
+    Ok((branch, commit))
 }
 
 fn remote_default_branch(cwd: &Path) -> Result<String, String> {
