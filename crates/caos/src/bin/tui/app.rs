@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -73,6 +74,34 @@ struct TranscriptEntry {
     role: EntryRole,
     commit: Option<String>,
     text: String,
+}
+
+#[derive(Debug, Default)]
+struct ScrollState {
+    offset: Option<usize>,
+    rendered_max: Cell<usize>,
+}
+
+impl ScrollState {
+    fn follow_tail(&mut self) {
+        self.offset = None;
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        let offset = self.offset.unwrap_or_else(|| self.rendered_max.get());
+        self.offset = Some(offset.saturating_sub(rows));
+    }
+
+    fn scroll_down(&mut self, rows: usize) {
+        let max = self.rendered_max.get();
+        let offset = self.offset.unwrap_or(max).saturating_add(rows).min(max);
+        self.offset = (offset < max).then_some(offset);
+    }
+
+    fn resolve(&self, max: usize) -> u16 {
+        self.rendered_max.set(max);
+        self.offset.unwrap_or(max).min(max).min(u16::MAX as usize) as u16
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -695,7 +724,7 @@ struct ConversationState {
     running: bool,
     turn_phase: TurnPhase,
     publishing: bool,
-    scroll_from_bottom: usize,
+    scroll: ScrollState,
     transcript_selection: Option<TranscriptSelection>,
     activity_selection: Option<usize>,
     activity_detail_scroll: usize,
@@ -717,7 +746,7 @@ impl ConversationState {
             running: false,
             turn_phase: TurnPhase::System,
             publishing: false,
-            scroll_from_bottom: 0,
+            scroll: ScrollState::default(),
             transcript_selection: None,
             activity_selection: None,
             activity_detail_scroll: 0,
@@ -758,7 +787,6 @@ impl ConversationState {
                 self.push_error(format!("loading conversation failed: {error}"));
             }
         }
-        self.scroll_from_bottom = 0;
         self.transcript_selection = None;
     }
 
@@ -780,7 +808,6 @@ impl ConversationState {
             commit: None,
             text: error.into(),
         });
-        self.scroll_from_bottom = 0;
         self.transcript_selection = None;
     }
 
@@ -1185,7 +1212,7 @@ impl App {
             state.running = true;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
-            state.scroll_from_bottom = 0;
+            state.scroll.follow_tail();
             state.transcript_selection = None;
         }
 
@@ -1304,7 +1331,6 @@ impl App {
                     commit: None,
                     text,
                 });
-                state.scroll_from_bottom = 0;
                 state.transcript_selection = None;
             }
             TurnEvent::ToolCall {
@@ -1404,7 +1430,7 @@ impl App {
             } else {
                 View::Help
             };
-            self.selected_mut().scroll_from_bottom = 0;
+            self.selected_mut().scroll.follow_tail();
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
@@ -1412,7 +1438,7 @@ impl App {
                 View::Chat | View::Activity | View::Tools | View::Help => View::Diff,
                 View::Diff => View::Chat,
             };
-            self.selected_mut().scroll_from_bottom = 0;
+            self.selected_mut().scroll.follow_tail();
             return;
         }
         let ctrl_t = key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1422,7 +1448,7 @@ impl App {
                 View::Tools => View::Chat,
                 View::Chat | View::Activity | View::Diff | View::Help => View::Tools,
             };
-            self.selected_mut().scroll_from_bottom = 0;
+            self.selected_mut().scroll.follow_tail();
             if self.view == View::Tools {
                 self.load_selected_tool_set();
             }
@@ -1634,13 +1660,13 @@ impl App {
     pub(crate) fn scroll_up(&mut self, rows: usize) {
         let state = self.selected_mut();
         state.transcript_selection = None;
-        state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(rows);
+        state.scroll.scroll_up(rows);
     }
 
     pub(crate) fn scroll_down(&mut self, rows: usize) {
         let state = self.selected_mut();
         state.transcript_selection = None;
-        state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(rows);
+        state.scroll.scroll_down(rows);
     }
 
     fn select_activity(&mut self, amount: isize) {
@@ -2031,6 +2057,15 @@ mod tests {
             },
             tx,
         )
+    }
+
+    fn rendered_main_pane(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().skip(26).map(|cell| cell.symbol()).collect())
+            .collect()
     }
 
     #[test]
@@ -2564,10 +2599,31 @@ mod tests {
     }
 
     #[test]
-    fn scroll_follows_tail_and_moves_up() {
-        assert_eq!(scroll_offset(20, 10, 0), 12);
-        assert_eq!(scroll_offset(20, 10, 5), 7);
-        assert_eq!(scroll_offset(3, 10, 0), 0);
+    fn scroll_holds_an_anchor_until_it_returns_to_the_tail() {
+        let mut scroll = ScrollState::default();
+        assert_eq!(scroll_offset(20, 10, &scroll), 12);
+
+        scroll.scroll_up(5);
+        assert_eq!(scroll_offset(20, 10, &scroll), 7);
+        assert_eq!(scroll_offset(40, 10, &scroll), 7);
+
+        scroll.scroll_down(25);
+        assert_eq!(scroll_offset(40, 10, &scroll), 32);
+
+        let short = ScrollState::default();
+        assert_eq!(scroll_offset(3, 10, &short), 0);
+    }
+
+    #[test]
+    fn incoming_assistant_text_keeps_a_paused_scroll_anchor() {
+        let mut conversation = state("talk-1");
+        assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
+        conversation.scroll.scroll_up(5);
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+
+        assert_eq!(scroll_offset(40, 10, &app.selected().scroll), 7);
     }
 
     #[test]
@@ -2665,9 +2721,11 @@ mod tests {
         )
         .wrap(Wrap { trim: false });
         let area = Rect::new(0, 0, 18, 5);
-        let tail = paragraph_scroll(&paragraph, area, 0);
+        let mut scroll = ScrollState::default();
+        let tail = paragraph_scroll(&paragraph, area, &scroll);
         assert!(tail > 0);
-        assert!(paragraph_scroll(&paragraph, area, 2) < tail);
+        scroll.scroll_up(2);
+        assert!(paragraph_scroll(&paragraph, area, &scroll) < tail);
     }
 
     #[test]
@@ -2693,6 +2751,45 @@ mod tests {
         conversation.running = true;
         assert!(!transcript_contains(&conversation, terminal, 27, 23));
         assert!(transcript_contains(&conversation, terminal, 27, 22));
+    }
+
+    #[test]
+    fn completion_status_does_not_move_a_paused_transcript() {
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.status = "calling model".to_string();
+        conversation.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent,
+            commit: None,
+            text: (0..60)
+                .map(|line| format!("line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        app.scroll_up(8);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let before = rendered_main_pane(&terminal);
+        let first_visible_line = before
+            .iter()
+            .find(|row| row.contains("line "))
+            .unwrap()
+            .clone();
+
+        app.selected_mut().running = false;
+        app.selected_mut().status = "completed e1769972f6".to_string();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let after = rendered_main_pane(&terminal);
+
+        assert_eq!(
+            after.iter().find(|row| row.contains("line ")).unwrap(),
+            &first_visible_line
+        );
+        assert!(!after.join("\n").contains("completed e1769972f6"));
     }
 
     #[test]
@@ -3096,11 +3193,11 @@ mod tests {
     }
 
     #[test]
-    fn publish_errors_appear_at_the_bottom_without_a_status_title() {
+    fn publish_errors_join_the_transcript_without_stealing_scroll() {
         let mut conversation = state("talk-1");
         conversation.status = "completed abc1234".to_string();
         conversation.publishing = true;
-        conversation.scroll_from_bottom = 12;
+        conversation.scroll.offset = Some(12);
         let (mut app, tx) = app_with(vec![conversation]);
 
         tx.send(UiMessage::Published {
@@ -3113,7 +3210,7 @@ mod tests {
         let state = app.selected();
         assert!(!state.publishing);
         assert!(state.status.is_empty());
-        assert_eq!(state.scroll_from_bottom, 0);
+        assert_eq!(state.scroll.offset, Some(12));
         assert_eq!(state.transcript.last().unwrap().role, EntryRole::Notice);
         assert_eq!(
             state.transcript.last().unwrap().text,
@@ -3339,6 +3436,8 @@ mod tests {
         let dir = throwaway_repo("reload");
 
         let mut conversation = state("missing-conversation-for-reload-test");
+        assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
+        conversation.scroll.scroll_up(5);
         let transport = GitTransport::discover(&dir).unwrap();
         conversation.reload(&transport);
         assert!(conversation.diff.is_none());
@@ -3347,6 +3446,7 @@ mod tests {
         assert_eq!(error.role, EntryRole::Notice);
         assert!(error.text.contains("loading conversation failed"));
         assert!(error.text.contains("no conversation"));
+        assert_eq!(conversation.scroll.offset, Some(7));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

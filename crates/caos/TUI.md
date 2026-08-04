@@ -135,7 +135,8 @@ conversations.
 
 The transcript fills the conversation pane above the fixed composer. Use
 `PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
-Scrolling up pauses tail-follow until the viewport returns to the bottom.
+Scrolling up pauses tail-follow and holds the viewport in place as new activity
+arrives. Scrolling back to the bottom resumes tail-follow.
 
 Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
 selection for the current transcript viewport. Drag across rendered transcript
