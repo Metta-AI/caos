@@ -39,6 +39,9 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         View::Tools => render_tools(state, frame, areas.content),
         View::Help => render_help(app, frame, areas.content),
     }
+    if let Some(notice) = areas.notice {
+        render_command_error(state, frame, notice);
+    }
     render_composer(
         state,
         app.view,
@@ -54,6 +57,7 @@ struct Areas {
     header: Rect,
     sidebar: Rect,
     content: Rect,
+    notice: Option<Rect>,
     composer: Rect,
     footer: Rect,
 }
@@ -78,10 +82,12 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     } else {
         0
     };
+    let notice_height = if state.command_error.is_some() { 3 } else { 0 };
     let conversation = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
+            Constraint::Length(notice_height),
             Constraint::Length(input_height + command_height + 2),
         ])
         .split(body[1]);
@@ -89,9 +95,28 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
         header: outer[0],
         sidebar: body[0],
         content: conversation[0],
-        composer: conversation[1],
+        notice: (notice_height > 0).then_some(conversation[1]),
+        composer: conversation[2],
         footer: outer[2],
     }
+}
+
+fn render_command_error(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    let Some(error) = state.command_error.as_deref() else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(error)
+            .style(Style::default().fg(Color::Red))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Command error ")
+                    .border_style(Style::default().fg(Color::Red))
+                    .borders(Borders::ALL),
+            ),
+        area,
+    );
 }
 
 pub(super) fn content_contains(
