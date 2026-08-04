@@ -95,7 +95,7 @@ stage3)
   # published std into the host registry before the fan-out, because nineteen
   # stacks starting on a cold registry all missed the same memo and all baked
   # the toolchain, filling the outer pool with 20-minute jobs until whatever was
-  # still queued died on the pending timeout (`no runner for req (waited 900s)`,
+  # still queued died on the pending timeout (`no runner for arg_tree (waited 900s)`,
   # measured). That whole stage is gone: std is published ONCE, when the image
   # is built (design/one-stack-image.md, "The seed"), so there is no cold-start
   # herd left to serialize.

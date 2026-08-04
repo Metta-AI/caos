@@ -123,7 +123,7 @@ Run `time result/bin/caos-cli run-tool test`
     - GC is disabled
 - shall listen on port 80 and respond to requests:
     - Git push/pull requests are routed to git to handle against the repo
-    - WorkRequests as described below. The input is the hash of the WorkRequest as a git tree. The result is the hash of the WorkResult
+    - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack and trace id travel alongside it, not inside the hashed tree). The result is the hash of the WorkResult
 
 # Misc
 

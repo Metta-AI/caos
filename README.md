@@ -151,7 +151,7 @@ runner-side: the set of hanging `/runner/poll`s *is* the pool.
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
-| `GET /run?req=<reqHash>&trace=<traceId>` | Run the request object `<reqHash>` and return `"<type> <hash>"` (the fully-resolved result), optionally emitting trace events. See [compute](#compute). |
+| `GET /run?req=<argTreeHash>&trace=<traceId>` | Run the ArgTree `<argTreeHash>` (`req` is the query param's historical name; its value is the ArgTree hash) and return `"<type> <hash>"` (the fully-resolved result), optionally emitting trace events. See [compute](#compute). |
 | `GET /trace/<traceId>/stream` | Stream one live trace as Chrome `B`/`E` events in JSONL. |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
@@ -172,26 +172,31 @@ Worker-running knobs (network, docker binary, slots) live on `caos-runnerd`.
 
 ### Compute
 
-A run **request** is itself a content-addressed git object: a tree
-`{args, std, salt}` whose hash, `reqHash`, *is* the cache key and the
-rendezvous id. The worker image rides *inside* `args`, under a reserved `image`
-entry — so a computation is identified entirely by its args (an executor can
+A run **request** is a **WorkRequest**: an **ArgTree** to run, plus runtime
+context (an ancestor stack for cycle detection and an optional trace id) that is
+NOT part of the cache key. The ArgTree is itself a content-addressed git object,
+whose hash, `argTreeHash`, *is* the cache key and the rendezvous id — with
+nothing keyed alongside it. The worker image rides *inside* the ArgTree, under a
+reserved `image` entry — as do the standard library `std` (a reserved `std`
+entry naming the std tree) and the cache-busting `salt` (a reserved `salt`
+entry) — so a computation is identified entirely by its args (an executor can
 match on the worker alongside the rest, and a worker, seeing its args at
-`/cas/args`, can read its own image to call itself). `GET /run?req=<reqHash>`:
+`/cas/args`, can read its own image to call itself). `GET /run?req=<argTreeHash>`
+(`req` is the query param's historical name; its value is the ArgTree hash):
 
-1. **read** the request tree (`args` tree — whose `image` entry is the worker
-   ref — plus the `std` tree and `salt`);
-2. **cache** lookup in Redis keyed on `reqHash` — a hit returns the cached
+1. **read** the ArgTree, whose `image` entry is the worker ref, `std` entry
+   names the standard library, and `salt` entry is the cache-buster;
+2. **cache** lookup in Redis keyed on `argTreeHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
-3. **cycle check** — the server threads the chain of in-progress `reqHash`es
+3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es
    through its promise sub-runs (below); re-entering one on the stack has no
    fixpoint, so the run fails listing the cycle;
 4. **resolve the image** — a `docker://<ref>` is used directly; one of our git
    images is converted to a real image, pushed to the registry, and run by
    digest (see [git images](#git-images));
 5. **dispatch to a runner** — the job is matched against the hanging
-   `/runner/poll`s (a runner's required args are name → oid pairs the args
-   tree's top level must equal; most specific match wins, so a warm runner
+   `/runner/poll`s (a runner's required args are name → oid pairs the
+   ArgTree's top level must equal; most specific match wins, so a warm runner
    already running this image beats the generic `caos-runnerd`, which starts a
    fresh container `/bin/caos runner --job=<json>`);
 6. the runner posts back either the result, `"<type> <hash>"`, or a
@@ -202,7 +207,7 @@ match on the worker alongside the rest, and a worker, seeing its args at
    the children in parallel, then `then` — through this same pipeline, so
    sub-runs are cached, cycle-checked, and may themselves promise;
 7. **cache** the resolved result, and for an **external** run (one that arrived
-   over HTTP) pin `refs/caos/res/<reqHash>` at it, for durability and as a
+   over HTTP) pin `refs/caos/res/<argTreeHash>` at it, for durability and as a
    fetch/watch point. Sub-runs set no ref.
 
 Results stay on the server. The caller gets back the hash and a type; it does
@@ -237,7 +242,7 @@ work, only server threads ever wait; a bounded runner pool always drains. See
 ### Caching
 
 Results, converted images, and built layers are cached in Redis
-(`caos:result:<reqHash>`, `caos:image:<git-hash>`, `caos:layer:<tree-hash>`).
+(`caos:result:<argTreeHash>`, `caos:image:<git-hash>`, `caos:layer:<tree-hash>`).
 A hit on the result key skips the container entirely (logged `cache hit …` vs
 `cache miss …`). Redis is best-effort: if it's unreachable the server logs and
 runs uncached. There are no locks yet, so two identical cold-cache requests may
@@ -324,15 +329,18 @@ setuid `caos`.
 `caos-cli run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
-1. assembles the args into a git **tree** — including the `<image>` under a
-   reserved `image` entry (see [arguments](#arguments-literals-and-paths));
-2. bundles `{args, std, salt}` into a content-addressed **request object**
-   (`reqHash`), where `std` is the standard library in effect (resolved from
-   `refs/caos/std`, see [built-ins](#built-ins-casstd));
-3. gets the request onto the server — one negotiated `git push` to
-   `refs/caos/req/<reqHash>`, whose reachable graph includes any embedded
+1. assembles the args into a git **tree** — the **ArgTree** — including the
+   `<image>` under a reserved `image` entry, the standard library `std` under a
+   reserved `std` entry (a blob naming the std tree, resolved from
+   `refs/caos/std`, see [built-ins](#built-ins-casstd)), and (when set) the
+   cache-busting salt under a reserved `salt` entry (see
+   [arguments](#arguments-literals-and-paths));
+2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —
+   nothing wraps it, so the ArgTree is the whole cache key;
+3. gets the ArgTree onto the server — one negotiated `git push` to
+   `refs/caos/req/<argTreeHash>`, whose reachable graph includes any embedded
    git-image tree, so the image needs no separate push;
-4. calls `/run?req=<reqHash>`; the server resolves any promises before
+4. calls `/run?req=<argTreeHash>`; the server resolves any promises before
    answering, so the reply is always a final value;
 5. records the result at `<output>`: it **checks the result out in full** —
    fetching the object and (for a tree) every descendant as ordinary rw files
@@ -439,8 +447,9 @@ filesystem (only `/cas`), so a non-`/cas` path there is an error.
 `caos runner --job=<json>` runs jobs inside the container until an idle TTL
 passes (see `design/runner-protocol.md`). Per job:
 
-1. **unpack** — fetch the request tree named by the job's `req` and read its
-   `args`/`std`/`salt`;
+1. **unpack** — fetch the request tree named by the job's `req` (it IS the
+   ArgTree) and read its reserved `std`/`salt` entries (image, std and salt all
+   ride inside it);
 2. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
    materialize the args at `/cas/args` and the standard library at `/cas/std`;
 3. **run `/worker`** — dropped to the unprivileged `worker` user so it can't

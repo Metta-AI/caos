@@ -215,9 +215,10 @@ fn slot_loop(config: &Config, slot: u32) {
 }
 
 /// A claimed job: the fields runnerd itself needs, plus the payload verbatim to
-/// hand the container.
+/// hand the container. (`req` is the wire field name; its value is the ArgTree
+/// hash.)
 struct Job {
-    req: String,
+    arg_tree: String,
     nonce: String,
     image_ref: String,
     payload: String,
@@ -254,12 +255,12 @@ fn poll(config: &Config) -> Result<Option<Job>, String> {
     };
     let field = |k: &str| job[k].as_str().unwrap_or_default().to_string();
     let parsed = Job {
-        req: field("req"),
+        arg_tree: field("req"),
         nonce: field("nonce"),
         image_ref: field("image_ref"),
         payload: job.to_string(),
     };
-    if parsed.req.is_empty() || parsed.nonce.is_empty() || parsed.image_ref.is_empty() {
+    if parsed.arg_tree.is_empty() || parsed.nonce.is_empty() || parsed.image_ref.is_empty() {
         return Err(format!(
             "job missing req/nonce/image_ref: {}",
             parsed.payload
@@ -273,8 +274,8 @@ fn poll(config: &Config) -> Result<Option<Job>, String> {
 /// reported, so post a failure with the captured log (410 if it did report).
 fn run_container(config: &Config, slot: u32, job: &Job) {
     eprintln!(
-        "runnerd slot {slot}: req {} -> container ({})",
-        job.req, job.image_ref
+        "runnerd slot {slot}: arg_tree {} -> container ({})",
+        job.arg_tree, job.image_ref
     );
     let mut command = Command::new(&config.docker_bin);
     command
@@ -317,7 +318,7 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         Err(e) => Some((format!("running {}: {e}", config.docker_bin), String::new())),
     };
     if let Some((error, log)) = failure {
-        eprintln!("runnerd slot {slot}: req {}: {error}", job.req);
+        eprintln!("runnerd slot {slot}: arg_tree {}: {error}", job.arg_tree);
         if let Err(e) = post_failure(config, job, &error, &log) {
             eprintln!("runnerd slot {slot}: reporting failure: {e}");
         }
@@ -339,7 +340,7 @@ fn post_failure(config: &Config, job: &Job, error: &str, log: &str) -> Result<()
         .collect::<Vec<_>>()
         .join("\n");
     let body = serde_json::json!({
-        "req": job.req, "nonce": job.nonce, "ok": false, "error": error, "log": tail,
+        "req": job.arg_tree, "nonce": job.nonce, "ok": false, "error": error, "log": tail,
     });
     let url = format!("{}/runner/result", config.server_url.trim_end_matches('/'));
     let mut req = minreq::post(&url)

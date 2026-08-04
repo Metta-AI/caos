@@ -78,6 +78,7 @@ The job payload is the rendezvous ids plus only what the runner can't derive:
 ```
 
 No `args`/`std`/`salt`: those are exactly the entries of the `req` tree, which
+IS the ArgTree (`image`, `std` and `salt` are all reserved entries of it), which
 the runner unpacks itself (one tree fetch, plus the `std` ref blob) — `req`
 has to travel anyway for the result post, and sending only it means the
 payload can't disagree with the request. `image_ref` is genuinely

@@ -1,7 +1,7 @@
 //! The runner protocol: pull-based dispatch (see `design/runner-protocol.md`).
 //!
 //! Anything that can run work long-polls `POST /runner/poll` with its
-//! *required args* — name → oid pairs a job's args-tree top level must match
+//! *required args* — name → oid pairs a job's ArgTree top level must match
 //! exactly. The server never starts, stops, or counts workers: the set of
 //! parked polls *is* the available capacity, and dispatch is matching pending
 //! jobs against hanging polls. A poll is answered with a job, `idle` (its TTL
@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::HttpError;
 
-/// A runner's required args / a job's args-tree top level: name → git oid.
+/// A runner's required args / a job's ArgTree top level: name → git oid.
 type ArgTree = BTreeMap<String, String>;
 
 /// How long a job may sit unclaimed before the dispatch fails 503. New capacity
@@ -112,10 +112,10 @@ enum Phase {
 
 /// One dispatched job, from enqueue to result.
 struct Job {
-    req: String,
+    arg_tree: String,
     /// Docker-pullable image reference (always sent; warm runners ignore it).
     image_ref: String,
-    /// The args tree's top-level name → oid map, what `required` matches against.
+    /// The ArgTree's top-level name → oid map, what `required` matches against.
     arg_entries: ArgTree,
     /// Current rendezvous nonce; refreshed on requeue (first post per nonce wins).
     nonce: String,
@@ -182,7 +182,8 @@ fn matches(required: &ArgTree, arg_entries: &ArgTree) -> bool {
 /// The job payload a matched poll is answered with.
 fn payload(job: &Job) -> String {
     let mut body = serde_json::json!({
-        "req": job.req,
+        // `req` is the wire field name; its value is the ArgTree hash.
+        "req": job.arg_tree,
         "nonce": job.nonce,
         "image_ref": job.image_ref,
         // No execution deadline (see Phase::Inflight); 0 kept for payload
@@ -195,10 +196,11 @@ fn payload(job: &Job) -> String {
     body.to_string()
 }
 
-/// Run `req` (args-tree top level `arg_entries`, resolved image `image_ref`)
-/// through the runner rendezvous, blocking until a runner posts its result.
+/// Run ArgTree `arg_tree` (its top level `arg_entries`, resolved image
+/// `image_ref`) through the runner rendezvous, blocking until a runner posts its
+/// result.
 pub(crate) fn dispatch(
-    req: &str,
+    arg_tree: &str,
     arg_entries: ArgTree,
     image_ref: &str,
 ) -> Result<String, HttpError> {
@@ -212,7 +214,7 @@ pub(crate) fn dispatch(
         st.jobs.insert(
             id,
             Job {
-                req: req.to_string(),
+                arg_tree: arg_tree.to_string(),
                 image_ref: image_ref.to_string(),
                 arg_entries,
                 nonce,
@@ -266,8 +268,8 @@ pub(crate) fn dispatch(
                         return Err(HttpError::new(
                             503,
                             format!(
-                                "no runner for req {} (waited {:?})",
-                                job.req,
+                                "no runner for arg_tree {} (waited {:?})",
+                                job.arg_tree,
                                 pending_timeout()
                             ),
                         ));
@@ -471,9 +473,10 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
     check_auth(authorization)?;
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| HttpError::new(400, format!("invalid result json: {e}")))?;
-    let req = v["req"].as_str().unwrap_or_default();
+    // `req` is the wire field name; its value is the ArgTree hash.
+    let arg_tree = v["req"].as_str().unwrap_or_default();
     let nonce = v["nonce"].as_str().unwrap_or_default();
-    if req.is_empty() || nonce.is_empty() {
+    if arg_tree.is_empty() || nonce.is_empty() {
         return Err(HttpError::new(400, "result missing req/nonce"));
     }
 
@@ -481,7 +484,7 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
     let Some(&id) = st.by_nonce.get(nonce) else {
         return Err(HttpError::new(410, "unknown or consumed nonce"));
     };
-    if st.jobs[&id].req != req {
+    if st.jobs[&id].arg_tree != arg_tree {
         return Err(HttpError::new(410, "nonce does not belong to this req"));
     }
 

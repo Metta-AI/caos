@@ -119,11 +119,12 @@ fn http() -> Result<HttpTransport, String> {
 const RUNNER_TTL_ENV: &str = "CAOS_RUNNER_TTL_MS";
 const DEFAULT_RUNNER_TTL_MS: u32 = 2000;
 
-/// A job handed to this runner: the rendezvous ids (the request is fetched and
-/// unpacked from `req` itself), plus the bearer token children present back to
-/// the server. Everything else about the job is derived from `req`.
+/// A job handed to this runner: the rendezvous ids (the ArgTree is fetched and
+/// unpacked from `arg_tree` itself), plus the bearer token children present back
+/// to the server. Everything else about the job is derived from the ArgTree.
+/// (`req` is the wire field name; its value is the ArgTree hash.)
 struct RunnerJob {
-    req: String,
+    arg_tree: String,
     nonce: String,
     token: Option<String>,
 }
@@ -137,13 +138,13 @@ impl RunnerJob {
 
     fn from_value(v: &serde_json::Value) -> Result<RunnerJob, String> {
         let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
-        let req = field("req").unwrap_or_default().to_string();
+        let arg_tree = field("req").unwrap_or_default().to_string();
         let nonce = field("nonce").unwrap_or_default().to_string();
-        if req.is_empty() || nonce.is_empty() {
+        if arg_tree.is_empty() || nonce.is_empty() {
             return Err("job missing req/nonce".to_string());
         }
         Ok(RunnerJob {
-            req,
+            arg_tree,
             nonce,
             token: field("token").map(str::to_string),
         })
@@ -177,18 +178,18 @@ fn runner(job_json: &str) -> Result<(), String> {
     }
 }
 
-/// One job through the staged lifecycle: unpack the request, set up `/cas`,
+/// One job through the staged lifecycle: unpack the ArgTree, set up `/cas`,
 /// run `/worker`, read back `/cas/out`, tear down. The process is reused across
-/// jobs, so std/salt come from the request rather than our env: `/cas/std` is
-/// materialized from the request's value, and the worker child gets both as
+/// jobs, so std/salt come from the ArgTree rather than our env: `/cas/std` is
+/// materialized from the ArgTree's value, and the worker child gets both as
 /// env vars — `caos map-then`/`curry` running under it read them from there.
 fn run_runner_job(
     t: &HttpTransport,
     job: &RunnerJob,
     image_oid: &mut Option<String>,
 ) -> Result<String, String> {
-    let (args, std, salt) = read_req_tree(t, &job.req)?;
-    let cas = cas_setup(Some(&args), std.as_deref())?;
+    let (arg_tree, std, salt) = read_arg_tree(t, &job.arg_tree)?;
+    let cas = cas_setup(Some(&arg_tree), std.as_deref())?;
     // Our image's CAS-level name, for the follow-up poll's required args — read
     // off the placeholder cas_setup just materialized (every entry is tagged
     // with its hash).
@@ -205,35 +206,38 @@ fn run_runner_job(
     Ok(result)
 }
 
-/// Unpack a request tree `{args, std, salt}`: the args-tree hash, the std tree
-/// hash (its entry is a blob *naming* the tree; `None` if empty or absent), and
-/// the salt (empty if absent).
-fn read_req_tree(t: &dyn Transport, req: &str) -> Result<(String, Option<String>, String), String> {
-    let (kind, content) = t.get_object(req)?;
+/// Unpack an ArgTree: its hash (returned back for `/cas/args`), the std tree hash
+/// (its reserved `std` entry is a blob *naming* the tree; `None` if empty or
+/// absent), and the salt (its reserved `salt` entry, empty if absent).
+/// `image`/`std`/`salt` are all entries of this one tree, per SPEC's ArgTree.
+fn read_arg_tree(
+    t: &dyn Transport,
+    arg_tree: &str,
+) -> Result<(String, Option<String>, String), String> {
+    let (kind, content) = t.get_object(arg_tree)?;
     if kind != "tree" {
-        return Err(format!("request {req} is a {kind}, not a tree"));
+        return Err(format!("arg tree {arg_tree} is a {kind}, not a tree"));
     }
     let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
-        .map_err(|e| format!("malformed request tree {req}: {e}"))?;
+        .map_err(|e| format!("malformed arg tree {arg_tree}: {e}"))?;
     let blob = |oid: gix::ObjectId| -> Result<String, String> {
         let (_, content) = t.get_object(&oid.to_string())?;
         Ok(String::from_utf8_lossy(&content).trim().to_string())
     };
-    let (mut args, mut std, mut salt) = (None, None, String::new());
+    let (mut std, mut salt) = (None, String::new());
     for entry in tree.entries {
         match entry.filename.to_vec().as_slice() {
-            b"args" => args = Some(entry.oid.to_string()),
             b"std" => std = Some(blob(entry.oid.into())?).filter(|s| !s.is_empty()),
             b"salt" => salt = blob(entry.oid.into())?,
             _ => {}
         }
     }
-    let args = args.ok_or_else(|| format!("request {req} missing 'args'"))?;
-    Ok((args, std, salt))
+    Ok((arg_tree.to_string(), std, salt))
 }
 
 /// POST the job's outcome to `/runner/result`. A 410 means the nonce was
 /// already consumed (someone else reported) — fine, the job is settled.
+/// (`req` is the wire field name; its value is the ArgTree hash.)
 fn post_result(
     t: &HttpTransport,
     job: &RunnerJob,
@@ -241,10 +245,10 @@ fn post_result(
 ) -> Result<(), String> {
     let body = match ran {
         Ok(result) => serde_json::json!({
-            "req": job.req, "nonce": job.nonce, "ok": true, "result": result,
+            "req": job.arg_tree, "nonce": job.nonce, "ok": true, "result": result,
         }),
         Err(error) => serde_json::json!({
-            "req": job.req, "nonce": job.nonce, "ok": false, "error": error,
+            "req": job.arg_tree, "nonce": job.nonce, "ok": false, "error": error,
         }),
     };
     let url = runner_url(t, "result")?;

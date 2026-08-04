@@ -1152,7 +1152,7 @@ fn turn(
     // thread: request_compute needs only two strings, so the transport (and
     // the repo handle) stay on this thread for progress polling.
     let phase = std::time::Instant::now();
-    let req = prepare_request(t, &llm, None, &[format!("--head:commit={human}")])?;
+    let arg_tree = prepare_request(t, &llm, None, &[format!("--head:commit={human}")])?;
     emit(TurnEvent::PhaseComplete {
         label: "pushing the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
@@ -1160,8 +1160,8 @@ fn turn(
     emit(TurnEvent::PhaseStarted(TurnPhase::Model));
     let server = t.server_url()?;
     let run = {
-        let (server, req) = (server.clone(), req);
-        std::thread::spawn(move || request_compute(&server, &req))
+        let (server, arg_tree) = (server.clone(), arg_tree);
+        std::thread::spawn(move || request_compute(&server, &arg_tree))
     };
 
     // While the run blocks, follow the worker's per-step progress ref and

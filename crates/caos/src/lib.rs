@@ -183,11 +183,11 @@ pub const STD_ENV: &str = "CAOS_STD";
 pub const STD_REF_ENV: &str = "CAOS_STD_REF";
 pub const DEFAULT_STD_REF: &str = "refs/caos/std";
 
-/// An opaque cache-busting value mixed into every run's request — and so into its
-/// `reqHash` and cache key. Empty by default, so runs are cached purely by their
-/// inputs. Like `std` it's threaded: the server injects it into each worker and
-/// into every promise sub-run, so a whole run tree shares one salt. Tests set it
-/// to a per-run random value, making their cache entries collision-free across
+/// An opaque cache-busting value mixed into every run's ArgTree — and so into its
+/// arg-tree hash and cache key. Empty by default, so runs are cached purely by
+/// their inputs. Like `std` it's threaded: the server injects it into each worker
+/// and into every promise sub-run, so a whole run tree shares one salt. Tests set
+/// it to a per-run random value, making their cache entries collision-free across
 /// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
 
@@ -2178,21 +2178,23 @@ fn run_request(
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
 ) -> Result<(String, String), String> {
-    let req = prepare_request(t, image, cas, kvs)?;
+    let arg_tree = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
-    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<req> at it).
+    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
+    // at it).
     let server = t.server_url()?;
     match trace {
-        Some((id, output)) => request_compute_streamed(&server, &req, id, output),
-        None => request_compute(&server, &req),
+        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output),
+        None => request_compute(&server, &arg_tree),
     }
 }
 
-/// Everything in [`run_request`] up to (and including) getting the request onto
-/// the server, returning the request id. Split out so a caller can trigger the
-/// blocking compute itself — `chat` runs [`request_compute`] on its own thread
-/// (it needs only the request id and the server URL, both plain strings) while
-/// it watches the turn's progress ref from the main one.
+/// Everything in [`run_request`] up to (and including) getting the ArgTree onto
+/// the server, returning its hash (the arg-tree hash — the request id). Split out
+/// so a caller can trigger the blocking compute itself — `chat` runs
+/// [`request_compute`] on its own thread (it needs only the arg-tree hash and the
+/// server URL, both plain strings) while it watches the turn's progress ref from
+/// the main one.
 fn prepare_request(
     t: &dyn Transport,
     image: &str,
@@ -2220,27 +2222,42 @@ fn prepare_request(
     // that path straight to `caos run`. A `docker://` ref has no git object to
     // embed, so it rides as a blob naming the registry ref.
     let image_entry = image_arg_entry(t, &image)?;
-    let args_tree = post_tree(
-        t,
-        merge_entries(merge_entries(bound, call), vec![image_entry]),
-    )?;
+    let mut arg_entries = merge_entries(merge_entries(bound, call), vec![image_entry]);
+
+    // The cache-busting salt (empty by default) rides *in* the args tree under the
+    // reserved `salt` entry, exactly like `image` — per SPEC an ArgTree is a git
+    // tree of named args including `salt`, so the salt belongs there rather than
+    // as a sibling of `args` in the request. Since the args tree is the cache key,
+    // a salted run is simply a different args tree; it needs no keying of its own.
+    // Absent (the common case) it adds nothing, so an unsalted run's args tree —
+    // and request — is unchanged. Threaded into sub-runs via CAOS_SALT like std.
+    let salt = run_salt();
+    if !salt.is_empty() {
+        arg_entries = merge_entries(arg_entries, vec![salt_arg_entry(t, &salt)?]);
+    }
 
     // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
-    // resolved from the `refs/caos/std` ref at the top. Part of the request so the
-    // server keys on it and threads it down (materialized at /cas/std).
+    // resolved from the `refs/caos/std` ref at the top. It too rides *in* the args
+    // tree, under the reserved `std` entry — a blob NAMING the std tree (not the
+    // tree embedded), so the args-tree closure stays small while its hash still
+    // turns over when std changes. The server threads it down and materializes it
+    // at `/cas/std`; the reserved entry is only written when std is non-empty.
     let std = run_std()?;
-    // The cache-busting salt (empty by default), threaded like std.
-    let salt = run_salt();
+    if !std.is_empty() {
+        arg_entries = merge_entries(arg_entries, vec![std_arg_entry(t, &std)?]);
+    }
 
-    // Bundle the request as a content-addressed object {args, std, salt} (the
-    // worker image is inside `args`); its hash is the request id (and the server's
-    // cache key). Get it onto the server — a no-op POST-as-you-go for the HTTP
-    // transport, a push for the git one. The push carries the whole graph
-    // reachable from the request, which now includes any embedded git-image tree,
-    // so the image lands on the server without a separate push.
-    let req = build_request(t, &args_tree, &std, &salt)?;
-    t.ensure_pushed(&req.to_string())?;
-    Ok(req.to_string())
+    // The request object IS the args tree — the ArgTree — so its hash *is* the
+    // request id and the server's cache key, with nothing keyed alongside it
+    // (image, salt and std are all entries within). Get it onto the server — a
+    // no-op POST-as-you-go for the HTTP transport, a push for the git one. The
+    // push carries the whole graph reachable from the tree, which includes any
+    // embedded git-image tree, so the image lands on the server without a
+    // separate push. (`std` rides as a bare hash, so the std tree is not in this
+    // closure — it is already on the server, published at `refs/caos/std`.)
+    let arg_tree = post_tree(t, arg_entries)?;
+    t.ensure_pushed(&arg_tree.to_string())?;
+    Ok(arg_tree.to_string())
 }
 
 /// `map-then <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a
@@ -2442,35 +2459,29 @@ fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::En
     })
 }
 
-/// Bundle a run request as a content-addressed object: a tree `{args, std,
-/// salt}` — `std`/`salt` as blobs, `args` as the args subtree (which carries the
-/// worker image under its reserved `image` entry — see [`image_arg_entry`]). Its
-/// hash is the request id: the server's cache key and the result-ref rendezvous.
-fn build_request(
-    t: &dyn Transport,
-    args_tree: &gix::ObjectId,
-    std: &str,
-    salt: &str,
-) -> Result<gix::ObjectId, String> {
+/// Build the args tree's reserved `salt` entry: the cache-busting salt as a plain
+/// blob. The counterpart of [`image_arg_entry`] / [`std_arg_entry`] for the other
+/// reserved ArgTree member; merged in only when the salt is non-empty.
+fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entry, String> {
     use gix::objs::tree::{Entry, EntryKind};
-    let entries = vec![
-        Entry {
-            mode: EntryKind::Tree.into(),
-            filename: b"args".to_vec().into(),
-            oid: *args_tree,
-        },
-        Entry {
-            mode: EntryKind::Blob.into(),
-            filename: b"std".to_vec().into(),
-            oid: post_object(t, "blob", std.as_bytes())?,
-        },
-        Entry {
-            mode: EntryKind::Blob.into(),
-            filename: b"salt".to_vec().into(),
-            oid: post_object(t, "blob", salt.as_bytes())?,
-        },
-    ];
-    post_tree(t, entries)
+    Ok(Entry {
+        mode: EntryKind::Blob.into(),
+        filename: b"salt".to_vec().into(),
+        oid: post_object(t, "blob", salt.as_bytes())?,
+    })
+}
+
+/// Build the args tree's reserved `std` entry: a blob NAMING the std tree (its
+/// hash), not the tree embedded — so the args-tree closure stays small while its
+/// hash still turns over when std changes. Merged in only when std is non-empty;
+/// the server materializes the named tree at `/cas/std`.
+fn std_arg_entry(t: &dyn Transport, std: &str) -> Result<gix::objs::tree::Entry, String> {
+    use gix::objs::tree::{Entry, EntryKind};
+    Ok(Entry {
+        mode: EntryKind::Blob.into(),
+        filename: b"std".to_vec().into(),
+        oid: post_object(t, "blob", std.as_bytes())?,
+    })
 }
 
 /// The built-in tree hash (`std`) for a run. Inside a worker the server sets
@@ -2550,7 +2561,7 @@ fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
             return Err(format!("{image} resolves outside {}", cas.display()));
         }
         // A `docker://` image has no git object, so it rides as a *blob naming
-        // the ref* (see `read_args_image`); a file holding such a ref resolves
+        // the ref* (see `read_request`); a file holding such a ref resolves
         // to the ref itself — its recorded blob hash names an object no engine
         // could run. Fetch the blob rather than reading the file: a CAS entry
         // is a content-less placeholder until someone `get`s it.
@@ -2912,21 +2923,22 @@ fn merge_entries(
     by_name.into_values().collect()
 }
 
-/// Trigger compute for request `req` and return the result's `(type, hash)`. The
-/// server runs the container (resolving any promise it leaves behind) and
-/// replies with the final `"<type> <hash>"`.
-fn request_compute(base: &str, req: &str) -> Result<(String, String), String> {
-    let url = format!("{}/run?req={}", base.trim_end_matches('/'), req);
+/// Trigger compute for ArgTree `arg_tree` (its hash) and return the result's
+/// `(type, hash)`. The server runs the container (resolving any promise it leaves
+/// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
+/// param's historical name; its value is the arg-tree hash.)
+fn request_compute(base: &str, arg_tree: &str) -> Result<(String, String), String> {
+    let url = format!("{}/run?req={}", base.trim_end_matches('/'), arg_tree);
     request_compute_url(&url)
 }
 
 fn request_compute_traced(
     base: &str,
-    req: &str,
+    arg_tree: &str,
     trace_id: &str,
 ) -> Result<(String, String), String> {
     let url = format!(
-        "{}/run?req={req}&trace={trace_id}",
+        "{}/run?req={arg_tree}&trace={trace_id}",
         base.trim_end_matches('/')
     );
     request_compute_url(&url)
@@ -2948,7 +2960,7 @@ fn request_compute_url(url: &str) -> Result<(String, String), String> {
 
 fn request_compute_streamed(
     base: &str,
-    req: &str,
+    arg_tree: &str,
     trace_id: &str,
     output: &mut (dyn Write + Send),
 ) -> Result<(String, String), String> {
@@ -2985,7 +2997,7 @@ fn request_compute_streamed(
             }
             Ok(())
         });
-        let result = request_compute_traced(base, req, trace_id);
+        let result = request_compute_traced(base, arg_tree, trace_id);
         let trace_result = trace
             .join()
             .map_err(|_| "the trace stream thread panicked".to_string())?;

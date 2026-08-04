@@ -8,7 +8,8 @@
 //!
 //! Compute:
 //!
-//! * `GET /run?req=<hash>&trace=<id>` — run the request tree `<hash>` and return
+//! * `GET /run?req=<hash>&trace=<id>` — run the ArgTree `<hash>` (`req` is the
+//!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result, optionally emitting this invocation to an open
 //!   trace stream.
 //! * `GET /trace/<id>/stream` — follow one live invocation as chunked NDJSON.
@@ -22,8 +23,8 @@
 //! `caos-runnerd`, an ordinary poller with no required args.
 //!
 //! Compute results are cached in Redis (`CAOS_REDIS_ADDR`, default
-//! `caos-redis:6379`): the key is the request hash (the args tree — which carries
-//! the worker image — plus std and salt), the value the
+//! `caos-redis:6379`): the key is the arg-tree hash — the ArgTree itself, which
+//! carries the worker image, std and salt — the value the
 //! result hash. A hit skips the worker entirely. Redis is best-effort — if
 //! it's unreachable we log and run uncached.
 //!

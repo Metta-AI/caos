@@ -39,7 +39,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         // `run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [...]`.
         // The trace id is invocation metadata; everything after `--` is a
-        // computation argument and therefore part of the request hash.
+        // computation argument and therefore part of the ArgTree (the cache key).
         Some("run") => {
             let mut trace_id = None;
             let mut trace_path = None;
