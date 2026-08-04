@@ -11,6 +11,7 @@ use caos::chat::{
     WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
+use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::Rect;
 use ratatui_crossterm::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -168,6 +169,22 @@ struct TranscriptPoint {
 struct TranscriptSelection {
     anchor: TranscriptPoint,
     head: TranscriptPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScreenSelection {
+    anchor: TranscriptPoint,
+    head: TranscriptPoint,
+}
+
+impl ScreenSelection {
+    fn ordered(self) -> (TranscriptPoint, TranscriptPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
 }
 
 impl TranscriptSelection {
@@ -930,6 +947,10 @@ pub(crate) struct App {
     selection_locked: bool,
     confirm_action: Option<ConfirmAction>,
     selecting_transcript: bool,
+    screen_selection: Option<ScreenSelection>,
+    selecting_screen: bool,
+    pending_conversation_click: Option<usize>,
+    rendered_screen: Option<Buffer>,
     copied_chars: Option<usize>,
     animation_frame: usize,
     enhanced_keyboard: bool,
@@ -1035,6 +1056,10 @@ impl App {
             selection_locked: false,
             confirm_action: None,
             selecting_transcript: false,
+            screen_selection: None,
+            selecting_screen: false,
+            pending_conversation_click: None,
+            rendered_screen: None,
             copied_chars: None,
             animation_frame: 0,
             enhanced_keyboard: false,
@@ -1081,6 +1106,10 @@ impl App {
         self.copied_chars = Some(text.chars().count());
     }
 
+    pub(crate) fn capture_screen(&mut self, buffer: &Buffer) {
+        self.rendered_screen = Some(buffer.clone());
+    }
+
     pub(crate) fn has_visible_animation(&self) -> bool {
         self.selected().is_busy()
     }
@@ -1106,12 +1135,6 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            if let Some(index) = ui::conversation_at(self, area, mouse.column, mouse.row) {
-                self.select(index);
-                return MouseAction::Redraw;
-            }
-        }
         match mouse.kind {
             MouseEventKind::ScrollUp
                 if self.view == View::Activity
@@ -1144,17 +1167,18 @@ impl App {
                 MouseAction::Redraw
             }
             MouseEventKind::Down(MouseButton::Left) if self.showing_transcript() => {
-                let Some(point) =
+                if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
-                else {
-                    return MouseAction::Ignored;
-                };
-                self.selected_mut().transcript_selection = Some(TranscriptSelection {
-                    anchor: point,
-                    head: point,
-                });
-                self.selecting_transcript = true;
-                MouseAction::Redraw
+                {
+                    self.screen_selection = None;
+                    self.selected_mut().transcript_selection = Some(TranscriptSelection {
+                        anchor: point,
+                        head: point,
+                    });
+                    self.selecting_transcript = true;
+                    return MouseAction::Redraw;
+                }
+                self.start_screen_selection(mouse.column, mouse.row, area)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.selecting_transcript => {
                 if let Some(point) =
@@ -1185,8 +1209,77 @@ impl App {
                     .map(MouseAction::Copy)
                     .unwrap_or(MouseAction::Redraw)
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.start_screen_selection(mouse.column, mouse.row, area)
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting_screen => {
+                let point = screen_point(mouse.column, mouse.row, area);
+                if let Some(selection) = self.screen_selection.as_mut() {
+                    selection.head = point;
+                    if selection.anchor != point {
+                        self.pending_conversation_click = None;
+                    }
+                }
+                MouseAction::Redraw
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selecting_screen => {
+                let point = screen_point(mouse.column, mouse.row, area);
+                if let Some(selection) = self.screen_selection.as_mut() {
+                    selection.head = point;
+                }
+                self.selecting_screen = false;
+                if let Some(index) = self.pending_conversation_click.take() {
+                    if self
+                        .screen_selection
+                        .is_some_and(|selection| selection.anchor == selection.head)
+                    {
+                        self.screen_selection = None;
+                        self.select(index);
+                        return MouseAction::Redraw;
+                    }
+                }
+                self.screen_selection_text()
+                    .map(MouseAction::Copy)
+                    .unwrap_or(MouseAction::Redraw)
+            }
             _ => MouseAction::Ignored,
         }
+    }
+
+    fn start_screen_selection(&mut self, column: u16, row: u16, area: Rect) -> MouseAction {
+        let point = screen_point(column, row, area);
+        self.selected_mut().transcript_selection = None;
+        self.screen_selection = Some(ScreenSelection {
+            anchor: point,
+            head: point,
+        });
+        self.selecting_screen = true;
+        self.pending_conversation_click = ui::conversation_at(self, area, column, row);
+        MouseAction::Redraw
+    }
+
+    fn screen_selection_text(&self) -> Option<String> {
+        let selection = self.screen_selection?;
+        let buffer = self.rendered_screen.as_ref()?;
+        let (start, end) = selection.ordered();
+        let mut rows = Vec::new();
+        for row in start.row..=end.row.min(buffer.area.bottom().saturating_sub(1)) {
+            let start_column = if row == start.row { start.column } else { 0 };
+            let end_column = if row == end.row {
+                end.column
+            } else {
+                buffer.area.right().saturating_sub(1)
+            };
+            let mut text = String::new();
+            for column in start_column..=end_column.min(buffer.area.right().saturating_sub(1)) {
+                if let Some(cell) = buffer.cell((column, row)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            rows.push(text.trim_end().to_string());
+        }
+        let text = rows.join("\n");
+        (!text.is_empty()).then_some(text)
     }
 
     fn start_turn(&mut self) {
@@ -1744,12 +1837,14 @@ impl App {
     }
 
     pub(crate) fn scroll_up(&mut self, rows: usize) {
+        self.screen_selection = None;
         let state = self.selected_mut();
         state.transcript_selection = None;
         state.scroll.scroll_up(rows);
     }
 
     pub(crate) fn scroll_down(&mut self, rows: usize) {
+        self.screen_selection = None;
         let state = self.selected_mut();
         state.transcript_selection = None;
         state.scroll.scroll_down(rows);
@@ -2062,6 +2157,13 @@ impl App {
     }
 }
 
+fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
+    TranscriptPoint {
+        row: row.clamp(area.y, area.bottom().saturating_sub(1)),
+        column: column.clamp(area.x, area.right().saturating_sub(1)),
+    }
+}
+
 fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String> {
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2233,6 +2335,10 @@ mod tests {
                 selection_locked: false,
                 confirm_action: None,
                 selecting_transcript: false,
+                screen_selection: None,
+                selecting_screen: false,
+                pending_conversation_click: None,
+                rendered_screen: None,
                 copied_chars: None,
                 animation_frame: 0,
                 enhanced_keyboard: false,
@@ -2756,22 +2862,65 @@ mod tests {
             .collect();
         let (mut app, _) = app_with(conversations);
         let area = Rect::new(0, 0, 100, 30);
-        let click = |row| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
+        let mouse = |kind, row| MouseEvent {
+            kind,
             column: 5,
             row,
             modifiers: KeyModifiers::NONE,
         };
 
-        assert_eq!(app.handle_mouse(click(5), area), MouseAction::Redraw);
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5), area),
+            MouseAction::Redraw
+        );
+        assert_eq!(app.selected, 0);
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5), area),
+            MouseAction::Redraw
+        );
         assert_eq!(app.selected, 1);
 
         app.selected = 19;
-        assert_eq!(app.handle_mouse(click(2), area), MouseAction::Redraw);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2), area);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2), area);
         assert_eq!(app.selected, 7);
 
-        assert_eq!(app.handle_mouse(click(1), area), MouseAction::Ignored);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1), area);
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1), area),
+            MouseAction::Redraw
+        );
         assert_eq!(app.selected, 7);
+    }
+
+    #[test]
+    fn mouse_drag_copies_text_outside_the_conversation_box() {
+        let (mut app, _) = app_with(vec![state("copy-anywhere")]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        app.capture_screen(terminal.backend().buffer());
+        let area = Rect::new(0, 0, 100, 30);
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1), area),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20), area),
+            MouseAction::Redraw
+        );
+        let copied = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 20), area);
+
+        assert!(
+            matches!(copied, MouseAction::Copy(ref text) if text.contains("caos") && text.contains("copy-anywhere"))
+        );
     }
 
     #[test]
