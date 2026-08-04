@@ -730,6 +730,7 @@ struct ConversationState {
     turn_phase: TurnPhase,
     publishing: bool,
     scroll: ScrollState,
+    unread_below: bool,
     transcript_selection: Option<TranscriptSelection>,
     activity_selection: Option<usize>,
     activity_detail_scroll: usize,
@@ -753,6 +754,7 @@ impl ConversationState {
             turn_phase: TurnPhase::System,
             publishing: false,
             scroll: ScrollState::default(),
+            unread_below: false,
             transcript_selection: None,
             activity_selection: None,
             activity_detail_scroll: 0,
@@ -808,6 +810,7 @@ impl ConversationState {
     }
 
     fn push_error(&mut self, error: impl Into<String>) {
+        self.note_transcript_append();
         self.status.clear();
         self.transcript.push(TranscriptEntry {
             role: EntryRole::Notice,
@@ -818,6 +821,7 @@ impl ConversationState {
     }
 
     fn push_info(&mut self, message: impl Into<String>) {
+        self.note_transcript_append();
         self.status.clear();
         self.transcript.push(TranscriptEntry {
             role: EntryRole::Info,
@@ -831,6 +835,17 @@ impl ConversationState {
         self.command_error = Some(error.into());
         self.status.clear();
         self.transcript_selection = None;
+    }
+
+    fn note_transcript_append(&mut self) {
+        if self.scroll.offset.is_some() {
+            self.unread_below = true;
+        }
+    }
+
+    fn follow_tail(&mut self) {
+        self.scroll.follow_tail();
+        self.unread_below = false;
     }
 
     fn apply_automatic_title(&mut self, prompt: &str) {
@@ -1234,7 +1249,7 @@ impl App {
             state.running = true;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
-            state.scroll.follow_tail();
+            state.follow_tail();
             state.transcript_selection = None;
         }
 
@@ -1348,6 +1363,7 @@ impl App {
             } => state.status = format!("{label}: {elapsed_secs:.1}s"),
             TurnEvent::Status(status) => state.status = status,
             TurnEvent::AssistantText(text) => {
+                state.note_transcript_append();
                 state.transcript.push(TranscriptEntry {
                     role: EntryRole::Agent,
                     commit: None,
@@ -1453,7 +1469,7 @@ impl App {
             } else {
                 View::Help
             };
-            self.selected_mut().scroll.follow_tail();
+            self.selected_mut().follow_tail();
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
@@ -1461,7 +1477,7 @@ impl App {
                 View::Chat | View::Activity | View::Tools | View::Help => View::Diff,
                 View::Diff => View::Chat,
             };
-            self.selected_mut().scroll.follow_tail();
+            self.selected_mut().follow_tail();
             return;
         }
         let ctrl_t = key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1471,7 +1487,7 @@ impl App {
                 View::Tools => View::Chat,
                 View::Chat | View::Activity | View::Diff | View::Help => View::Tools,
             };
-            self.selected_mut().scroll.follow_tail();
+            self.selected_mut().follow_tail();
             if self.view == View::Tools {
                 self.load_selected_tool_set();
             }
@@ -1690,6 +1706,9 @@ impl App {
         let state = self.selected_mut();
         state.transcript_selection = None;
         state.scroll.scroll_down(rows);
+        if state.scroll.offset.is_none() {
+            state.unread_below = false;
+        }
     }
 
     fn select_activity(&mut self, amount: isize) {
@@ -2750,6 +2769,40 @@ mod tests {
         app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
 
         assert_eq!(scroll_offset(40, 10, &app.selected().scroll), 7);
+        assert!(app.selected().unread_below);
+        app.scroll_down(usize::MAX);
+        assert!(!app.selected().unread_below);
+    }
+
+    #[test]
+    fn paused_transcript_shows_unread_and_rendered_lines_below() {
+        let mut conversation = state("talk-1");
+        conversation.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent,
+            commit: None,
+            text: (0..60)
+                .map(|line| format!("existing line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let (mut app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        app.scroll_up(8);
+
+        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let rendered = rendered_main_pane(&terminal).join("\n");
+        assert!(rendered.contains("New message ·"));
+        assert!(rendered.contains("lines below ↓"));
+
+        app.scroll_down(usize::MAX);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(!rendered_main_pane(&terminal)
+            .join("\n")
+            .contains("lines below ↓"));
     }
 
     #[test]
