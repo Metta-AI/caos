@@ -7,7 +7,7 @@
 # real API calls: the scripted llm-stub plays the LLM exactly as in
 # tests/llm-step. Covers, in order: the missing-API-key fail-fast, the
 # reserved-`.caos`-base refusal, a two-turn conversation through the real verb
-# (turn 1 creates refs/caos/conversations/<name>, turn 2 — message on stdin —
+# (turn 1 creates refs/caos/conversations/<name>/from-user, turn 2 — message on stdin —
 # advances it and replays turn 1's transcript to the stub), the progress
 # output (a `$ <cmd>` tool-call line lands on stdout), and `chat --log`.
 set -euo pipefail
@@ -76,7 +76,7 @@ if env -u ANTHROPIC_API_KEY \
 fi
 grep -q "ANTHROPIC_API_KEY" key-err \
   || fail "no clear message about the missing key: $(cat key-err)"
-git rev-parse -q --verify "refs/caos/conversations/$conv" >/dev/null \
+git rev-parse -q --verify "refs/caos/conversations/$conv/from-user" >/dev/null \
   && fail "conversation ref exists after the key failure"
 [ ! -f stub/request-1.json ] || fail "a request reached the stub despite the missing key"
 echo "  ok: clean error, no ref, no request" >&2
@@ -99,7 +99,7 @@ echo "== turn 1 creates the conversation ref ==" >&2
 "$CAOS_CLI" chat "$conv" -m "create out.txt containing hi" --base "$base" "${opts[@]}" \
   > turn1.out
 sed 's/^/  turn1| /' turn1.out >&2
-turn1=$(git rev-parse -q --verify "refs/caos/conversations/$conv") \
+turn1=$(git rev-parse -q --verify "refs/caos/conversations/$conv/from-user") \
   || fail "conversation ref not created"
 human1=$(git rev-parse "$turn1^")
 [ "$(git show -s --format=%s "$human1")" = "create out.txt containing hi" ] \
@@ -120,11 +120,11 @@ grep -qF "[$conv " turn1.out || fail "conversation/short-hash line not printed"
 echo "  ok: tool line, step text, response, hash line" >&2
 
 echo "== turn 1 pushed the in-round status ref ==" >&2
-# The worker brackets each API attempt with refs/caos/conversations/<conv>-status — a blob
+# The worker brackets each API attempt with refs/caos/conversations/<conv>/status — a blob
 # "<human hash>\n<text>". The stub answers in ms so the client's 2s poll
 # won't have printed it; assert the server-side ref and blob shape instead.
-status_tip=$(git ls-remote caos "refs/caos/conversations/$conv-status" | cut -f1)
-[ -n "$status_tip" ] || fail "no refs/caos/conversations/$conv-status on the server"
+status_tip=$(git ls-remote caos "refs/caos/conversations/$conv/status" | cut -f1)
+[ -n "$status_tip" ] || fail "no refs/caos/conversations/$conv/status on the server"
 git fetch -q caos "$status_tip"
 [ "$(git cat-file blob "$status_tip" | head -1)" = "$human1" ] \
   || fail "status blob not scoped to turn 1's human commit"
@@ -135,7 +135,7 @@ echo "  ok: status ref present, scoped to the turn, latency recorded" >&2
 echo "== turn 2 (message on stdin) advances the ref and replays turn 1 ==" >&2
 echo "and now?" | "$CAOS_CLI" chat "$conv" "${opts[@]}" > turn2.out
 sed 's/^/  turn2| /' turn2.out >&2
-turn2=$(git rev-parse "refs/caos/conversations/$conv")
+turn2=$(git rev-parse "refs/caos/conversations/$conv/from-user")
 [ "$turn2" != "$turn1" ] || fail "conversation ref did not advance"
 human2=$(git rev-parse "$turn2^")
 [ "$(git rev-parse "$human2^")" = "$turn1" ] || fail "turn 2 does not chain onto turn 1"
@@ -172,7 +172,7 @@ env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
 sed 's/^/  talk1| /' talk1.out >&2
 grep -qF "[conversation $conv]" talk1.err \
   || fail "talk did not announce the sticky conversation: $(cat talk1.err)"
-turn3=$(git rev-parse "refs/caos/conversations/$conv")
+turn3=$(git rev-parse "refs/caos/conversations/$conv/from-user")
 [ "$turn3" != "$turn2" ] || fail "talk did not advance the sticky conversation"
 [ "$(git rev-parse "$turn3^^")" = "$turn2" ] || fail "talk turn does not chain onto turn 2"
 grep -qF "$T3_TEXT" talk1.out || fail "talk's response text not printed"
@@ -190,8 +190,8 @@ env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
 sed 's/^/  talk2| /' talk2.out >&2
 grep -qF "[conversation talk-1 — new]" talk2.err \
   || fail "talk --new did not announce a new talk-1: $(cat talk2.err)"
-git rev-parse -q --verify refs/caos/conversations/talk-1 >/dev/null \
-  || fail "talk --new did not create refs/caos/conversations/talk-1"
+git rev-parse -q --verify refs/caos/conversations/talk-1/from-user >/dev/null \
+  || fail "talk --new did not create refs/caos/conversations/talk-1/from-user"
 grep -qF "$T4_TEXT" talk2.out || fail "talk --new's response text not printed"
 grep -qF '{"content":"and now?","role":"user"}' stub/request-5.json \
   && fail "old conversation replayed into the new one"
@@ -223,7 +223,7 @@ printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$INLINE_CALLS" 
 printf '{"content":[{"text":"file tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-7.json
 "$CAOS_CLI" chat "$conv" -m "exercise the file tools" "${opts[@]}" > inline.out
 sed 's/^/  inline| /' inline.out >&2
-turn_inline=$(git rev-parse "refs/caos/conversations/$conv")
+turn_inline=$(git rev-parse "refs/caos/conversations/$conv/from-user")
 [ "$(git show "$turn_inline:notes/new.txt")" = "goodbye world" ] \
   || fail "write+edit did not land in the turn tree"
 [ "$(git show "$turn_inline:notes/todo.txt")" = "hello notes" ] || fail "sibling file lost"
@@ -250,7 +250,7 @@ printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$MIXED_CALLS" |
 printf '{"content":[{"text":"mixed done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-9.json
 "$CAOS_CLI" chat "$conv" -m "mix inline and bash" "${opts[@]}" > mixed.out
 sed 's/^/  mixed| /' mixed.out >&2
-turn_mixed=$(git rev-parse "refs/caos/conversations/$conv")
+turn_mixed=$(git rev-parse "refs/caos/conversations/$conv/from-user")
 [ "$(git show "$turn_mixed:mix.txt")" = "world" ] || fail "post-bash edit did not land"
 [ "$(git show "$turn_mixed:mix3.txt")" = "HELLO" ] || fail "bash did not see the inline write"
 # The request also replays earlier turns' tool_results, so assert this
@@ -274,7 +274,7 @@ printf '{"content":%s,"stop_reason":"tool_use"}' "$(printf '%s' "$GREP_CALLS" | 
 printf '{"content":[{"text":"grep done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-11.json
 "$CAOS_CLI" chat "$conv" -m "search the workspace" "${opts[@]}" > grep.out
 sed 's/^/  grep| /' grep.out >&2
-turn_grep=$(git rev-parse "refs/caos/conversations/$conv")
+turn_grep=$(git rev-parse "refs/caos/conversations/$conv/from-user")
 git diff --quiet "$turn_mixed" "$turn_grep" -- || fail "grep changed the workspace tree"
 grep -qF "grep hello" grep.out || fail "root grep progress line missing"
 grep -qF "grep goodbye notes" grep.out || fail "scoped grep progress line missing"

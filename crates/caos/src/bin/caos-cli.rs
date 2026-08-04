@@ -129,8 +129,9 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation: mint the human commit, run llm-step over it, print
-        // progress, advance `refs/caos/conversations/<name>` on success. Flag
-        // parsing (and the chat-specific usage) lives in `caos::cli_chat`.
+        // progress, advance `refs/caos/conversations/<name>/from-user` on
+        // success. Flag parsing (and the chat-specific usage) lives in
+        // `caos::cli_chat`.
         Some("chat") => caos::cli_chat(&transport()?, &args[2..]),
         // `run-tool <script | name> [--name=value ...]` — run a caos-tool (a
         // worker script, `caos-tools/<name>.sh` for a bare name) as a caos

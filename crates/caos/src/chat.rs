@@ -5,10 +5,10 @@
 //! the base for a new conversation; tree = the parent's tree — human turns
 //! are text-only for now), hand it to an `llm-step` run, watch the turn's
 //! progress ref while the run blocks, and on success advance
-//! `refs/caos/conversations/<name>` to the returned turn commit. Conversation
-//! identity is that ref — the only mutable thing, owned by this client. On a
-//! failed run the ref is untouched; the minted human commit is harmlessly
-//! orphaned.
+//! `refs/caos/conversations/<name>/from-user` to the returned turn commit.
+//! Conversation identity is that ref — the only mutable thing, owned by this
+//! client. On a failed run the ref is untouched; the minted human commit is
+//! harmlessly orphaned.
 //!
 //! `talk` is the everyday surface: the positional argument is the prompt, the
 //! conversation defaults to the repo's most recently used one (`--new` starts
@@ -37,20 +37,31 @@ use super::{
 /// turn must carry any other author.
 const AGENT_AUTHOR: &str = "caos-agent";
 
-/// The conversation namespace. The turn engine keeps its working HEAD at
-/// `<id>` in the local repo; the TUI publishes the canonical server HEAD and
-/// mutable title at `<id>/{head,title}`.
+/// The conversation namespace. Every ref of a conversation lives together
+/// under `<prefix><id>/<channel>` (see design/talk-while-thinking.md, "Refs"):
+///
+/// * `from-user` — the user branch tip: the engine's local HEAD *and* the
+///   server's canonical HEAD (now identically named), advancing to the turn
+///   merge on completion. Client is its sole writer.
+/// * `from-agent` — the agent's step-chain tip, pushed by the worker.
+/// * `title` — the display-name blob (client).
+/// * `status` — the worker's in-round status blob `"<human hash>\n<text>"`
+///   (calling / retrying / answered-in; the hash scopes it to a turn, so a
+///   stale one is ignorable).
+///
+/// The channel names are reserved in [`validated_refname`], so a conversation
+/// id can't shadow another's channel.
 const CONV_REF_PREFIX: &str = "refs/caos/conversations/";
-
-/// A conversation's channels all live together under [`CONV_REF_PREFIX`]:
-/// `<id>` (the engine's local cache), `<id>/{head,title}` on the server, plus
-/// two server-side refs the worker pushes — `<id>-progress` (the growing step
-/// chain) and `<id>-status` (a blob `"<human hash>\n<text>"` force-updated around each
-/// API attempt: calling / retrying / answered-in; the hash scopes it to a
-/// turn, so a stale one is ignorable). The suffixes are reserved in
-/// [`validated_refname`] so a conversation can't shadow another's channels.
-const PROGRESS_SUFFIX: &str = "-progress";
-const STATUS_SUFFIX: &str = "-status";
+const FROM_USER_CHANNEL: &str = "from-user";
+const FROM_AGENT_CHANNEL: &str = "from-agent";
+const TITLE_CHANNEL: &str = "title";
+const STATUS_CHANNEL: &str = "status";
+const RESERVED_CHANNELS: [&str; 4] = [
+    FROM_USER_CHANNEL,
+    FROM_AGENT_CHANNEL,
+    TITLE_CHANNEL,
+    STATUS_CHANNEL,
+];
 
 /// The LLM API key rides in from the environment, never a flag (it would land
 /// in shell history and process listings).
@@ -140,7 +151,7 @@ pub fn describe_tool_set(
 ) -> Result<ToolSetDescription, String> {
     use gix::objs::tree::EntryKind;
 
-    let conversation_ref = format!("{CONV_REF_PREFIX}{conversation}");
+    let conversation_ref = conversation_head_ref(conversation);
     let root = if rev_parse_opt(t, &conversation_ref)?.is_some() {
         conversation_ref
     } else {
@@ -424,6 +435,7 @@ impl ChatArgs {
 /// `chat <name> …` — the explicit, scriptable one-turn form.
 pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Chat, args)?;
+    migrate_legacy_conversation_refs(t)?;
     let name = a.name.clone().expect("chat parse requires a name");
     let refname = validated_refname(t, &name)?;
     if a.log {
@@ -436,6 +448,7 @@ pub fn cli_chat(t: &GitTransport, args: &[String]) -> Result<(), String> {
 /// `talk [<prompt>] …` — the everyday surface; see the module documentation.
 pub fn cli_talk(t: &GitTransport, args: &[String]) -> Result<(), String> {
     let a = ChatArgs::parse(Verb::Talk, args)?;
+    migrate_legacy_conversation_refs(t)?;
     let (name, fresh) = pick_conversation(t, &a)?;
     let refname = validated_refname(t, &name)?;
     if a.log {
@@ -501,19 +514,73 @@ fn run_cli_turn(
     Ok(())
 }
 
-/// The conversation ref for `name`, validated up front (the name also becomes
-/// the `-progress`/`-status` channel refs, so let git check it — and reserve
-/// those suffixes, or conversation `foo-progress` would shadow `foo`'s
-/// channel).
-fn validated_refname(t: &GitTransport, name: &str) -> Result<String, String> {
-    for suffix in [PROGRESS_SUFFIX, STATUS_SUFFIX] {
-        if name.ends_with(suffix) {
-            return Err(format!(
-                "conversation names ending in {suffix:?} are reserved (channel refs)"
-            ));
+/// Migrate legacy conversation refs into the `<id>/from-user` scheme, in
+/// place and idempotently. A conversation head used to live at the bare
+/// `refs/caos/conversations/<id>`; it now lives at `<id>/from-user`. Any ref
+/// whose final segment is not a reserved channel is such a legacy bare head:
+/// move it (a bare ref is a FILE where `<id>/from-user` needs `<id>` to be a
+/// DIRECTORY, so the two cannot coexist — delete the bare ref, then create the
+/// channel). A no-op once migrated (already-`from-user` refs are skipped), so
+/// it is safe to run at every entry point.
+fn migrate_legacy_conversation_refs(t: &GitTransport) -> Result<(), String> {
+    let out = t.git_capture(
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            CONV_REF_PREFIX.trim_end_matches('/'),
+        ],
+        None,
+    )?;
+    let mut legacy = Vec::new();
+    for line in out.lines() {
+        let Some((refname, oid)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(rest) = refname.strip_prefix(CONV_REF_PREFIX) else {
+            continue;
+        };
+        let last_segment = rest.rsplit('/').next().unwrap_or(rest);
+        if RESERVED_CHANNELS.contains(&last_segment) {
+            continue; // already a channel ref (`from-user` and friends)
         }
+        legacy.push((refname.to_string(), rest.to_string(), oid.to_string()));
     }
-    let refname = format!("{CONV_REF_PREFIX}{name}");
+    for (old_ref, id, oid) in legacy {
+        let new_ref = conv_ref(&id, FROM_USER_CHANNEL);
+        // Delete only if still at the value we read, then create the channel.
+        t.git_capture(&["update-ref", "-d", &old_ref, &oid], None)?;
+        t.git_capture(&["update-ref", &new_ref, &oid], None)?;
+    }
+    Ok(())
+}
+
+/// Rename a legacy server conversation head (`<id>/head`) to `<id>/from-user`
+/// with one atomic push: create the channel at `head`, delete the legacy ref.
+/// Idempotent in effect — once done, `<id>/head` is gone and later lists take
+/// the `from-user` path.
+fn migrate_server_conversation_head(t: &GitTransport, id: &str, head: &str) -> Result<(), String> {
+    let create = format!("{head}:{}", conversation_head_ref(id));
+    let delete = format!(":{}", conversation_legacy_head_ref(id));
+    t.git_capture(
+        &["push", "--quiet", "--atomic", CAOS_REMOTE, &create, &delete],
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("migrating conversation {id:?} server head: {error}"))
+}
+
+/// The conversation's `from-user` ref for `name` — the engine head — validated
+/// up front. The id's final segment may not be a reserved channel name (else
+/// `<id>/from-user` would collide with another conversation's channel), and git
+/// must accept the full refname.
+fn validated_refname(t: &GitTransport, name: &str) -> Result<String, String> {
+    let last_segment = name.rsplit('/').next().unwrap_or(name);
+    if RESERVED_CHANNELS.contains(&last_segment) {
+        return Err(format!(
+            "conversation names ending in a channel segment {last_segment:?} are reserved"
+        ));
+    }
+    let refname = conversation_head_ref(name);
     t.git_capture(&["check-ref-format", &refname], None)
         .map_err(|_| format!("invalid conversation name {name:?}"))?;
     Ok(refname)
@@ -525,12 +592,12 @@ fn validated_refname(t: &GitTransport, name: &str) -> Result<String, String> {
 /// fresh one when there is none yet.
 fn pick_conversation(t: &GitTransport, a: &ChatArgs) -> Result<(String, bool), String> {
     if let Some(name) = &a.name {
-        if a.new_conv && rev_parse_opt(t, &format!("{CONV_REF_PREFIX}{name}"))?.is_some() {
+        if a.new_conv && rev_parse_opt(t, &conversation_head_ref(name))?.is_some() {
             return Err(format!(
                 "--new: conversation {name:?} already exists (drop --new to continue it)"
             ));
         }
-        let fresh = rev_parse_opt(t, &format!("{CONV_REF_PREFIX}{name}"))?.is_none();
+        let fresh = rev_parse_opt(t, &conversation_head_ref(name))?.is_none();
         return Ok((name.clone(), fresh));
     }
     if !a.new_conv {
@@ -566,15 +633,14 @@ pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a
 }
 
 /// The most recently advanced conversation in this repo, by the head commit's
-/// committer date (turn commits carry wall-clock timestamps). Channel refs
-/// (`-progress`/`-status`) are server-side, but skip them defensively in case
-/// a broad fetch ever mirrored them here.
+/// committer date (turn commits carry wall-clock timestamps).
 fn latest_conversation(t: &GitTransport) -> Result<Option<String>, String> {
     Ok(list_conversations(t)?.into_iter().next().map(|c| c.name))
 }
 
-/// List the local conversation refs, newest first. Progress/status channel refs
-/// are server-owned implementation details and never appear in this list.
+/// List the local conversations, newest first, by finding each `from-user`
+/// (head) ref. The other channels (`from-agent`/`title`/`status`) are not
+/// conversation heads and are skipped.
 pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, String> {
     let out = t.git_capture(
         &[
@@ -585,22 +651,19 @@ pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, 
         ],
         None,
     )?;
+    let head_suffix = format!("/{FROM_USER_CHANNEL}");
     let mut conversations = Vec::new();
     for line in out.lines() {
         let mut fields = line.split('\t');
         let Some(refname) = fields.next() else {
             continue;
         };
-        let Some(name) = refname.strip_prefix(CONV_REF_PREFIX) else {
+        let Some(rest) = refname.strip_prefix(CONV_REF_PREFIX) else {
             continue;
         };
-        if name.ends_with(PROGRESS_SUFFIX)
-            || name.ends_with(STATUS_SUFFIX)
-            || name.ends_with("/head")
-            || name.ends_with("/title")
-        {
+        let Some(name) = rest.strip_suffix(&head_suffix) else {
             continue;
-        }
+        };
         let head = fields.next().unwrap_or_default().to_string();
         let updated_unix = fields
             .next()
@@ -617,12 +680,23 @@ pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, 
 
 const USER_CONVERSATION_PREFIX: &str = "refs/caos/users/";
 
+/// The ref for one channel of a conversation.
+fn conv_ref(id: &str, channel: &str) -> String {
+    format!("{CONV_REF_PREFIX}{id}/{channel}")
+}
+
 fn conversation_head_ref(id: &str) -> String {
-    format!("{CONV_REF_PREFIX}{id}/head")
+    conv_ref(id, FROM_USER_CHANNEL)
+}
+
+/// The pre-`from-user` server head channel. A conversation an older TUI
+/// published lives only here until [`list_user_conversations`] renames it.
+fn conversation_legacy_head_ref(id: &str) -> String {
+    conv_ref(id, "head")
 }
 
 fn conversation_title_ref(id: &str) -> String {
-    format!("{CONV_REF_PREFIX}{id}/title")
+    conv_ref(id, TITLE_CHANNEL)
 }
 
 fn user_conversation_ref(user: &str, status: UserConversationStatus, id: &str) -> String {
@@ -802,6 +876,7 @@ pub fn unarchive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Re
 /// accidentally unarchives a conversation.
 pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(), String> {
     validate_conversation_user(t, user)?;
+    migrate_legacy_conversation_refs(t)?;
     let active = format!(
         "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/{}",
         UserConversationStatus::Active.ref_component(),
@@ -849,20 +924,30 @@ pub fn list_user_conversations(
 
     let mut metadata = HashMap::new();
     for chunk in ids.chunks(128) {
-        metadata.extend(remote_refs(
-            t,
-            chunk
-                .iter()
-                .flat_map(|id| [conversation_head_ref(id), conversation_title_ref(id)]),
-        )?);
+        let mut patterns = Vec::new();
+        for id in chunk {
+            patterns.push(conversation_head_ref(id));
+            patterns.push(conversation_title_ref(id));
+            patterns.push(conversation_legacy_head_ref(id));
+        }
+        metadata.extend(remote_refs(t, patterns)?);
     }
     let mut conversations = Vec::new();
     for id in ids {
-        let head_ref = conversation_head_ref(&id);
-        let head = metadata
-            .get(&head_ref)
-            .ok_or_else(|| format!("conversation {id:?} has no server HEAD"))?
-            .clone();
+        // Prefer the `from-user` head; a conversation an older TUI published
+        // lives only at the legacy `<id>/head` — rename it on the server the
+        // first time it is listed, then use it.
+        let head = match metadata.get(&conversation_head_ref(&id)) {
+            Some(head) => head.clone(),
+            None => {
+                let legacy = metadata
+                    .get(&conversation_legacy_head_ref(&id))
+                    .ok_or_else(|| format!("conversation {id:?} has no server HEAD"))?
+                    .clone();
+                migrate_server_conversation_head(t, &id, &legacy)?;
+                legacy
+            }
+        };
         t.fetch_object(&head)?;
         let local_ref = validated_refname(t, &id)?;
         t.git_capture(&["update-ref", &local_ref, &head], None)?;
@@ -1169,8 +1254,8 @@ fn turn(
     // it, the in-round status ref — what the API call is doing right now —
     // goes to stderr (transient meta, not conversation content).
     let http = HttpTransport { base: server };
-    let progress_ref = format!("{CONV_REF_PREFIX}{name}{PROGRESS_SUFFIX}");
-    let status_ref = format!("{CONV_REF_PREFIX}{name}{STATUS_SUFFIX}");
+    let progress_ref = conv_ref(name, FROM_AGENT_CHANNEL);
+    let status_ref = conv_ref(name, STATUS_CHANNEL);
     let mut printed: HashSet<String> = HashSet::new();
     let mut last_status: Option<String> = None;
     while !run.is_finished() {
@@ -1290,7 +1375,7 @@ fn rev_parse_opt(t: &GitTransport, spec: &str) -> Result<Option<String>, String>
 }
 
 // ---------------------------------------------------------------------------
-// Progress: follow the conversation's -progress ref while the run blocks.
+// Progress: follow the conversation's `from-agent` ref while the run blocks.
 // ---------------------------------------------------------------------------
 
 /// One poll: read the progress ref off the server and print any new steps.
@@ -1620,14 +1705,10 @@ mod tests {
         std::fs::write(repo.join("file"), "two\n").unwrap();
         git(&repo, &["commit", "--quiet", "-am", "two"]);
         let second = git(&repo, &["rev-parse", "HEAD"]);
-        git(
-            &repo,
-            &["update-ref", "refs/caos/conversations/first", &first],
-        );
-        git(
-            &repo,
-            &["update-ref", "refs/caos/conversations/second", &second],
-        );
+        let first_ref = "refs/caos/conversations/first/from-user";
+        let second_ref = "refs/caos/conversations/second/from-user";
+        git(&repo, &["update-ref", first_ref, &first]);
+        git(&repo, &["update-ref", second_ref, &second]);
         git(
             &repo,
             &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
@@ -1716,33 +1797,23 @@ mod tests {
     fn remote_user_state_lists_renames_archives_and_restores_conversations() {
         let (root, repo) = conversation_repo();
         let transport = GitTransport::discover(&repo).unwrap();
+        let first_ref = "refs/caos/conversations/first/from-user";
+        let second_ref = "refs/caos/conversations/second/from-user";
 
         publish_user_conversation(&transport, "alice", "first", "First title").unwrap();
         publish_user_conversation(&transport, "alice", "second", "Second title").unwrap();
         publish_user_conversation(&transport, "bob", "first", "First title").unwrap();
-        let first_head = git(&repo, &["rev-parse", "refs/caos/conversations/first"]);
+        let first_head = git(&repo, &["rev-parse", first_ref]);
         let tree = git(&repo, &["rev-parse", &format!("{first_head}^{{tree}}")]);
         let divergent = git(&repo, &["commit-tree", &tree, "-m", "divergent"]);
-        git(
-            &repo,
-            &["update-ref", "refs/caos/conversations/first", &divergent],
-        );
+        git(&repo, &["update-ref", first_ref, &divergent]);
         assert!(
             publish_user_conversation(&transport, "alice", "first", "Conflict").is_err(),
             "a non-fast-forward conversation HEAD was accepted"
         );
-        git(
-            &repo,
-            &["update-ref", "refs/caos/conversations/first", &first_head],
-        );
-        git(
-            &repo,
-            &["update-ref", "-d", "refs/caos/conversations/first"],
-        );
-        git(
-            &repo,
-            &["update-ref", "-d", "refs/caos/conversations/second"],
-        );
+        git(&repo, &["update-ref", first_ref, &first_head]);
+        git(&repo, &["update-ref", "-d", first_ref]);
+        git(&repo, &["update-ref", "-d", second_ref]);
         let active =
             list_user_conversations(&transport, "alice", UserConversationStatus::Active).unwrap();
         assert_eq!(
@@ -1753,7 +1824,7 @@ mod tests {
             [("second", "Second title"), ("first", "First title")]
         );
         assert_eq!(
-            git(&repo, &["rev-parse", "refs/caos/conversations/first"]),
+            git(&repo, &["rev-parse", first_ref]),
             active
                 .iter()
                 .find(|conversation| conversation.id == "first")
@@ -1793,6 +1864,124 @@ mod tests {
                 .map(|conversation| conversation.id.as_str())
                 .collect::<Vec<_>>(),
             ["second", "first"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_bare_conversation_refs_migrate_to_from_user() {
+        let root = std::env::temp_dir().join(format!(
+            "caos-legacy-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        git(&repo, &["config", "user.name", "tester"]);
+        git(&repo, &["config", "user.email", "tester@example.com"]);
+        std::fs::write(repo.join("file"), "one\n").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "--quiet", "-m", "one"]);
+        let c = git(&repo, &["rev-parse", "HEAD"]);
+
+        // Two legacy bare heads (one slashed) and one already-migrated head.
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/old-one", &c],
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/proj/feature", &c],
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/kept/from-user", &c],
+        );
+
+        let t = GitTransport::discover(&repo).unwrap();
+        migrate_legacy_conversation_refs(&t).unwrap();
+        let resolve = |name: &str| rev_parse_opt(&t, name).unwrap();
+
+        // Bare heads gone; their `from-user` channels now hold the commit.
+        assert!(resolve("refs/caos/conversations/old-one").is_none());
+        assert_eq!(
+            resolve("refs/caos/conversations/old-one/from-user").as_deref(),
+            Some(c.as_str())
+        );
+        assert!(resolve("refs/caos/conversations/proj/feature").is_none());
+        assert_eq!(
+            resolve("refs/caos/conversations/proj/feature/from-user").as_deref(),
+            Some(c.as_str())
+        );
+        // The already-migrated head is untouched.
+        assert_eq!(
+            resolve("refs/caos/conversations/kept/from-user").as_deref(),
+            Some(c.as_str())
+        );
+
+        // Idempotent, and list_conversations now sees all three.
+        migrate_legacy_conversation_refs(&t).unwrap();
+        let mut names: Vec<String> = list_conversations(&t)
+            .unwrap()
+            .into_iter()
+            .map(|conversation| conversation.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["kept", "old-one", "proj/feature"]);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_server_conversation_head_migrates_on_list() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        let first_ref = "refs/caos/conversations/first/from-user";
+        let from_user = "refs/caos/conversations/legacy/from-user";
+        let legacy_head = "refs/caos/conversations/legacy/head";
+
+        // A conversation an older TUI published lives only at <id>/head on the
+        // server, indexed active for the user — no <id>/from-user yet.
+        let head = git(&repo, &["rev-parse", first_ref]);
+        let title = transport
+            .put_object("blob", b"Legacy title")
+            .unwrap()
+            .to_string();
+        transport.ensure_pushed(&title).unwrap();
+        git(
+            &repo,
+            &[
+                "push",
+                CAOS_REMOTE,
+                &format!("{head}:{legacy_head}"),
+                &format!("{title}:refs/caos/conversations/legacy/title"),
+                &format!("{head}:refs/caos/users/tester/conversations/active/legacy"),
+            ],
+        );
+
+        let listed =
+            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "legacy");
+        assert_eq!(listed[0].title, "Legacy title");
+        assert_eq!(listed[0].head, head);
+
+        // The server head was renamed to from-user and the local ref set.
+        let patterns = [from_user.to_string(), legacy_head.to_string()];
+        let server = remote_refs(&transport, patterns).unwrap();
+        assert_eq!(
+            server.get(from_user).map(String::as_str),
+            Some(head.as_str())
+        );
+        assert!(!server.contains_key(legacy_head));
+        assert_eq!(
+            rev_parse_opt(&transport, from_user).unwrap().as_deref(),
+            Some(head.as_str())
         );
 
         std::fs::remove_dir_all(root).unwrap();

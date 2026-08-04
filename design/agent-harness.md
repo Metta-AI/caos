@@ -210,7 +210,7 @@ and rides in job payloads; the runner-token auth is the fence.
 ## Progress
 
 The step chain grows in real time. The step worker pushes
-`refs/caos/conversations/<name>-progress` (next to the conversation head, so a conversation's refs sit together) to the server's existing smart-HTTP
+`refs/caos/conversations/<name>/from-agent` (next to the conversation head, so a conversation's refs sit together) to the server's existing smart-HTTP
 transport after each step (when a `conversation` arg names one); the client
 watches a turn by polling `git fetch` on that ref. No new progress API, no
 enabling change: the server sets `http.receivepack=true` on its repo at
@@ -232,7 +232,7 @@ valid conversation state a future resume could start from.
 **In-round status** (finer than the step): the API call is the one slow,
 silent part of a turn — a toolless turn mints no step until it's over, and a
 rate-limited round sleeps invisibly. So the worker also force-updates
-`refs/caos/conversations/<name>-status` around each API attempt with a blob
+`refs/caos/conversations/<name>/status` around each API attempt with a blob
 `"<human hash>\n<text>"` — `calling <model>…`, `<why> — retrying in Ns
 (attempt M/4)`, `<model> answered in X.Xs` — over the same hand-rolled push
 (the blob goes up via `/object` first). The first line scopes the status to
@@ -260,7 +260,7 @@ Two verbs and a full-screen client over one turn engine (implemented —
   own crate. It consumes structured `TurnEvent`s from the same engine,
   reconstructs durable history from server-indexed conversation refs, and
   presents independent virtual conversations in a left sidebar. A stable
-  conversation ID addresses `refs/caos/conversations/<id>/head`; its mutable
+  conversation ID addresses `refs/caos/conversations/<id>/from-user`; its mutable
   title lives at the sibling `title` ref. Per-user active and archived membership
   lives under `refs/caos/users/<user>/conversations/{active,archived}/`, with
   `--user` defaulting to `$USER`. `Ctrl+W` atomically archives for that user
@@ -289,7 +289,7 @@ Two verbs and a full-screen client over one turn engine (implemented —
   turn is not cancellable until the server/runner protocol grows cancellation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
-from the ref → on completion advances `refs/caos/conversations/<name>` (in
+from the ref → on completion advances `refs/caos/conversations/<name>/from-user` (in
 the *local* repo) and prints the response text and short hash. Conversation
 identity is that ref — the only mutable thing, owned by the client. Shared
 flags: `--base <revspec>` (a new conversation's base commit, default `HEAD` —
@@ -364,3 +364,7 @@ deadlines are comfortable; the top-level pending timeout
    events, durable history/diff readers, multiline composer, task switching,
    live activity, workspace review, and confirmed clean-checkout apply. **Done**
    (`crates/caos/src/bin/tui`; unit tests plus the existing chat integration suite).
+8. **Talk while thinking** — interjections as a second commit branch that the
+   turn merge reconciles: steer a running turn at round boundaries via a
+   client→worker `-inject` ref, mirror of the progress ref. **Design**
+   (`talk-while-thinking.md`).
