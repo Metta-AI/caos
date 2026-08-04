@@ -13,8 +13,8 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, ScrollState,
-    TranscriptPoint, View, COMMANDS,
+    short_hash, ActivityState, App, Command, ConfirmAction, ConversationState, EntryRole, Focus,
+    ScrollState, TranscriptPoint, View, COMMANDS,
 };
 use caos::chat::TurnPhase;
 
@@ -40,7 +40,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         View::Help => render_help(app, frame, areas.content),
     }
     if let Some(notice) = areas.notice {
-        render_command_error(state, frame, notice);
+        render_notice(app, state, frame, notice);
     }
     render_composer(
         state,
@@ -82,7 +82,11 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() { 3 } else { 0 };
+    let notice_height = if state.command_error.is_some() || state.publish_prompt {
+        3
+    } else {
+        0
+    };
     let conversation = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -101,20 +105,52 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     }
 }
 
-fn render_command_error(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
-    let Some(error) = state.command_error.as_deref() else {
+fn render_notice(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+    if let Some(error) = state.command_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(error)
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(" Command error ")
+                        .border_style(Style::default().fg(Color::Red))
+                        .borders(Borders::ALL),
+                ),
+            area,
+        );
+        return;
+    }
+    let Some(ConfirmAction::Publish {
+        default_base,
+        base_input,
+    }) = app.confirm_action.as_ref()
+    else {
         return;
     };
+    let branch = if base_input.is_empty() {
+        Span::styled(
+            format!("{default_base} (default)"),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::styled(base_input.clone(), Style::default().fg(Color::Cyan))
+    };
     frame.render_widget(
-        Paragraph::new(error)
-            .style(Style::default().fg(Color::Red))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Command error ")
-                    .border_style(Style::default().fg(Color::Red))
-                    .borders(Borders::ALL),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Base branch: ",
+                Style::default().add_modifier(Modifier::BOLD),
             ),
+            branch,
+            Span::styled("│", Style::default().fg(Color::Cyan)),
+        ]))
+        .block(
+            Block::default()
+                .title(" Publish PR — type a base, Ctrl+P confirms, Esc cancels ")
+                .border_style(Style::default().fg(Color::Cyan))
+                .borders(Borders::ALL),
+        ),
         area,
     );
 }
@@ -1360,7 +1396,11 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
 }
 
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let footer = if app.selection_locked {
+    let footer = if matches!(app.confirm_action, Some(ConfirmAction::Publish { .. })) {
+        Line::raw(
+            " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
+        )
+    } else if app.selection_locked {
         Line::styled(
             " Selection lock: redraws paused, ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),

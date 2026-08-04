@@ -76,7 +76,7 @@ focus back to the list. The focused pane's border is highlighted.
 | Mouse drag over visible transcript text | Select and copy rendered text |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
-| `Ctrl+P` twice | Push the selected conversation as a clean branch and open a PR |
+| `Ctrl+P` twice | Choose a base, push a clean branch, and open a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -164,17 +164,22 @@ checkout. Loading changes requires one `Ctrl+L` press and a clean working
 tree, then detaches HEAD onto the conversation's head commit so the checkout
 matches it exactly.
 
-Publishing also leaves the checkout untouched. Two `Ctrl+P` presses create or
-replace `caos/<conversation>` with one clean snapshot commit directly above the
-fetched tip of `origin`'s advertised default branch. Before creating it, CAOS
-three-way merges that tip with the conversation head without touching the
+Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
+branch prompt with `origin`'s advertised default selected; type another branch
+to override it, then press `Ctrl+P` again. CAOS creates or replaces
+`caos/<conversation>` with one clean snapshot commit directly above the fetched
+tip of that base. For the default branch, the snapshot contains the
+conversation's complete workspace. For another branch, CAOS applies only the
+changes made since this conversation started, so a child conversation can be
+stacked on its parent's clean published snapshot without re-merging the parent
+conversation's internal history. Both paths merge without touching the
 checkout or index. Non-conflicting upstream changes survive; a conflict stops
-publication and lists its paths in the chat. CAOS pushes the clean snapshot and
-uses the authenticated `gh` CLI to find or open its pull request against the
-same default branch. Republish replaces the commit instead of retaining earlier
-snapshots, and the branch excludes the conversation's internal step DAG and
-`.caos` metadata even when one conversation starts from another conversation's
-head.
+publication and lists its paths in the command-error panel. CAOS pushes the
+clean snapshot and uses the authenticated `gh` CLI to find or open its pull
+request against the chosen base. Republish replaces the commit instead of
+retaining earlier snapshots, and the branch excludes the conversation's
+internal step DAG and `.caos` metadata even when one conversation starts from
+another conversation's head.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git

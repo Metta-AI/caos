@@ -57,14 +57,20 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
 /// Conversation commits retain their internal step DAG as second parents. A
 /// PR should not expose that implementation history or retain superseded
 /// snapshots, so the publish branch is one clean commit above the freshly
-/// fetched remote default-branch tip. Its tree is a three-way merge of the
-/// conversation's changes onto that tip, preserving non-conflicting upstream
-/// changes without exposing the conversation commits.
-pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Result<String, String> {
+/// fetched PR-base tip. Publishing to the default branch merges the complete
+/// workspace; publishing elsewhere replays this conversation's delta so a
+/// child can target its parent's clean snapshot without duplicating that work.
+pub(crate) fn publish_conversation_pr(
+    name: &str,
+    diff: &WorkspaceDiff,
+    pr_base: &str,
+    default_base: &str,
+) -> Result<String, String> {
     let cwd = Path::new(".");
     let branch = format!("caos/{name}");
-    let (pr_base, pr_base_commit) = remote_default_branch_tip(cwd)?;
-    prepare_publish_branch(name, diff, &pr_base_commit, cwd)?;
+    let pr_base_commit = fetch_remote_branch_tip(pr_base, cwd)?;
+    let change_base = (pr_base != default_base).then_some(diff.base_commit.as_str());
+    prepare_publish_branch(name, diff, &pr_base_commit, change_base, cwd)?;
     push_publish_branch(&branch, cwd)?;
 
     let existing_url = capture_required(
@@ -75,7 +81,7 @@ pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Resul
             "--head",
             &branch,
             "--base",
-            &pr_base,
+            pr_base,
             "--state",
             "open",
             "--json",
@@ -100,7 +106,7 @@ pub(crate) fn publish_conversation_pr(name: &str, diff: &WorkspaceDiff) -> Resul
             "--head",
             &branch,
             "--base",
-            &pr_base,
+            pr_base,
             "--title",
             &format!("CAOS conversation {name}"),
             "--body",
@@ -116,7 +122,7 @@ pub(crate) fn remote_default_branch_tip(cwd: &Path) -> Result<(String, String), 
     Ok((branch, commit))
 }
 
-fn remote_default_branch(cwd: &Path) -> Result<String, String> {
+pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
     let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
     let stdout = require_success("git", output)?;
     parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
@@ -199,11 +205,12 @@ pub(crate) fn prepare_publish_branch(
     name: &str,
     diff: &WorkspaceDiff,
     publish_base: &str,
+    change_base: Option<&str>,
     cwd: &Path,
 ) -> Result<String, String> {
     let branch = format!("caos/{name}");
     let branch_ref = format!("refs/heads/{branch}");
-    let publish_tree = merge_publish_tree(&diff.head, publish_base, cwd)?;
+    let publish_tree = merge_publish_tree(&diff.head, publish_base, change_base, cwd)?;
     let previous = capture_optional("git", &["rev-parse", "--verify", &branch_ref], cwd)?;
     let reusable = if let Some(previous) = previous.as_deref() {
         let previous_tree_spec = format!("{previous}^{{tree}}");
@@ -250,13 +257,43 @@ pub(crate) fn prepare_publish_branch(
     Ok(branch)
 }
 
-/// Merge the conversation's complete final state with the current PR base
-/// without touching the real index or working tree. Git chooses their natural
-/// merge base so a conversation chained from an earlier conversation retains
-/// that earlier filesystem work. An actual merge commit would make all of the
-/// conversation commits reachable, so only the resulting tree is retained and
-/// the caller creates a single-parent snapshot commit from it.
-fn merge_publish_tree(head: &str, publish_base: &str, cwd: &Path) -> Result<String, String> {
+/// Merge the conversation's final state with the current PR base without
+/// touching the real index or working tree. With no `change_base`, Git chooses
+/// the natural merge base so a default-branch publish includes inherited
+/// filesystem work. With one, only changes after that commit are replayed onto
+/// a non-default PR base. Only the resulting tree is retained either way.
+fn merge_publish_tree(
+    head: &str,
+    publish_base: &str,
+    change_base: Option<&str>,
+    cwd: &Path,
+) -> Result<String, String> {
+    // A child conversation starts from its parent's internal commit, while a
+    // stacked PR targets the parent's clean snapshot commit. Those commits
+    // intentionally have different histories. Give the selected snapshot a
+    // temporary parent at the conversation's starting point so merge-tree
+    // applies only this conversation's delta instead of re-merging its parent.
+    let merge_tip = if let Some(change_base) = change_base {
+        let publish_tree = capture_required(
+            "git",
+            &["rev-parse", &format!("{publish_base}^{{tree}}")],
+            cwd,
+        )?;
+        capture_required(
+            "git",
+            &[
+                "commit-tree",
+                &publish_tree,
+                "-p",
+                change_base,
+                "-m",
+                "temporary CAOS publish merge base",
+            ],
+            cwd,
+        )?
+    } else {
+        publish_base.to_string()
+    };
     let output = command_output(
         "git",
         &[
@@ -264,7 +301,7 @@ fn merge_publish_tree(head: &str, publish_base: &str, cwd: &Path) -> Result<Stri
             "--write-tree",
             "--name-only",
             "--no-messages",
-            publish_base,
+            &merge_tip,
             head,
         ],
         cwd,
@@ -291,7 +328,7 @@ fn merge_publish_tree(head: &str, publish_base: &str, cwd: &Path) -> Result<Stri
             conflicts.join("\n")
         };
         return Err(format!(
-            "conversation changes conflict with the current default branch:\n{paths}\nresolve these files against the latest default branch before publishing"
+            "conversation changes conflict with the selected PR base branch:\n{paths}\nresolve these files against the latest selected base before publishing"
         ));
     }
     require_success("git merge-tree", output).map(|_| unreachable!())
@@ -479,7 +516,8 @@ mod tests {
             patch: "changed".to_string(),
         };
 
-        let branch = prepare_publish_branch("publish-test", &first_diff, &main_tip, &dir).unwrap();
+        let branch =
+            prepare_publish_branch("publish-test", &first_diff, &main_tip, None, &dir).unwrap();
         assert_eq!(branch, "caos/publish-test");
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
@@ -503,7 +541,7 @@ mod tests {
             head: final_head.clone(),
             patch: "changed again".to_string(),
         };
-        prepare_publish_branch("publish-test", &final_diff, &main_tip, &dir).unwrap();
+        prepare_publish_branch("publish-test", &final_diff, &main_tip, None, &dir).unwrap();
         let final_publish =
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
         assert_ne!(final_publish, first_publish);
@@ -599,7 +637,7 @@ mod tests {
             Some(final_publish.as_str())
         );
 
-        prepare_publish_branch("publish-test", &final_diff, &main_tip, &dir).unwrap();
+        prepare_publish_branch("publish-test", &final_diff, &main_tip, None, &dir).unwrap();
         assert_eq!(
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
             final_publish
@@ -622,9 +660,10 @@ mod tests {
             head: conversation_head,
             patch: "changed".to_string(),
         };
-        let error = prepare_publish_branch("conflict-test", &diff, &main_tip, &dir).unwrap_err();
+        let error =
+            prepare_publish_branch("conflict-test", &diff, &main_tip, None, &dir).unwrap_err();
 
-        assert!(error.contains("conflict with the current default branch"));
+        assert!(error.contains("conflict with the selected PR base branch"));
         assert!(error.contains("file.txt"));
         assert_eq!(
             capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap(),
@@ -641,6 +680,57 @@ mod tests {
         )
         .unwrap()
         .is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_default_publish_replays_only_the_child_conversation_delta() {
+        let dir = temp_repo("publish-stacked-test");
+        let base = commit_file(&dir, "base\n", "base");
+        let parent_head = commit_file(&dir, "parent conversation\n", "parent turn");
+        let child_head = commit_file(&dir, "child conversation\n", "child turn");
+
+        capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
+        std::fs::write(dir.join("upstream.txt"), "upstream\n").unwrap();
+        capture_required("git", &["add", "upstream.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "base advances"], &dir).unwrap();
+        let selected_base = commit_file(
+            &dir,
+            "parent conversation\n",
+            "clean parent conversation snapshot",
+        );
+
+        // Merging both complete histories repeats the parent's edit and
+        // conflicts with the child's edit to the same line.
+        assert!(merge_publish_tree(&child_head, &selected_base, None, &dir).is_err());
+
+        let diff = WorkspaceDiff {
+            base_commit: parent_head.clone(),
+            head: child_head,
+            patch: "changed".to_string(),
+        };
+        prepare_publish_branch(
+            "stacked-test",
+            &diff,
+            &selected_base,
+            Some(&parent_head),
+            &dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            capture_required("git", &["show", "caos/stacked-test:file.txt"], &dir).unwrap(),
+            "child conversation"
+        );
+        assert_eq!(
+            capture_required("git", &["show", "caos/stacked-test:upstream.txt"], &dir).unwrap(),
+            "upstream"
+        );
+        assert_eq!(
+            capture_required("git", &["rev-parse", "caos/stacked-test^"], &dir).unwrap(),
+            selected_base
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

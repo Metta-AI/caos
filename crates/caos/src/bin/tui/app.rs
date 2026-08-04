@@ -19,7 +19,7 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::workspace::{
     commit_working_tree, load_conversation_workspace, publish_conversation_pr,
-    remote_default_branch_tip,
+    remote_default_branch, remote_default_branch_tip,
 };
 
 #[path = "ui.rs"]
@@ -726,6 +726,7 @@ struct ConversationState {
     composer: Composer,
     status: String,
     command_error: Option<String>,
+    publish_prompt: bool,
     running: bool,
     turn_phase: TurnPhase,
     publishing: bool,
@@ -750,6 +751,7 @@ impl ConversationState {
             composer: Composer::default(),
             status,
             command_error: None,
+            publish_prompt: false,
             running: false,
             turn_phase: TurnPhase::System,
             publishing: false,
@@ -904,9 +906,12 @@ enum UiMessage {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ConfirmAction {
-    Publish,
+    Publish {
+        default_base: String,
+        base_input: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1427,12 +1432,6 @@ impl App {
             return;
         }
         self.selected_mut().command_error = None;
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if !self.selected_mut().composer.clear() {
-                self.should_quit = true;
-            }
-            return;
-        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
             self.selection_locked = !self.selection_locked;
             return;
@@ -1447,14 +1446,62 @@ impl App {
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
         let is_publish =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
+        if matches!(self.confirm_action, Some(ConfirmAction::Publish { .. })) {
+            if is_publish {
+                self.publish_selected();
+            } else {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.confirm_action = None;
+                        self.selected_mut().status.clear();
+                        self.selected_mut().publish_prompt = false;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.confirm_action = None;
+                        self.selected_mut().status.clear();
+                        self.selected_mut().publish_prompt = false;
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(ConfirmAction::Publish { base_input, .. }) =
+                            self.confirm_action.as_mut()
+                        {
+                            base_input.pop();
+                        }
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(ConfirmAction::Publish { base_input, .. }) =
+                            self.confirm_action.as_mut()
+                        {
+                            base_input.clear();
+                        }
+                    }
+                    KeyCode::Char(ch)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                    {
+                        if let Some(ConfirmAction::Publish { base_input, .. }) =
+                            self.confirm_action.as_mut()
+                        {
+                            base_input.push(ch);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if !self.selected_mut().composer.clear() {
+                self.should_quit = true;
+            }
+            return;
+        }
         // Ctrl+H is a distinct control byte in legacy terminal input. Keep
         // Ctrl+? as an alias for terminals whose enhanced keyboard protocol
         // reports the modifiers unambiguously.
         let is_help = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('h' | '?' | '/'));
-        if !is_publish {
-            self.confirm_action = None;
-        }
         if is_load {
             self.load_selected();
             return;
@@ -1820,6 +1867,7 @@ impl App {
     }
 
     fn select(&mut self, index: usize) {
+        self.selected_mut().publish_prompt = false;
         self.selected = index;
         self.confirm_action = None;
         if self.view == View::Tools {
@@ -1963,12 +2011,37 @@ impl App {
         {
             self.selected_mut()
                 .show_command_error("there are no conversation changes to publish");
-        } else if self.confirm_action != Some(ConfirmAction::Publish) {
-            self.confirm_action = Some(ConfirmAction::Publish);
+        } else if self.confirm_action.is_none() {
+            let default_base = match remote_default_branch(&self.repo_dir) {
+                Ok(branch) => branch,
+                Err(error) => {
+                    self.selected_mut().show_command_error(error);
+                    return;
+                }
+            };
+            self.confirm_action = Some(ConfirmAction::Publish {
+                default_base,
+                base_input: String::new(),
+            });
+            self.selected_mut().publish_prompt = true;
             self.selected_mut().status =
-                "press Ctrl+P again to push a clean branch and open a PR".to_string();
+                "enter a PR base branch or press Ctrl+P again for the default".to_string();
         } else {
-            self.confirm_action = None;
+            let (default_base, pr_base) = match self.confirm_action.take() {
+                Some(ConfirmAction::Publish {
+                    default_base,
+                    base_input,
+                }) => {
+                    let base_input = base_input.trim();
+                    if base_input.is_empty() {
+                        (default_base.clone(), default_base)
+                    } else {
+                        (default_base, base_input.to_string())
+                    }
+                }
+                None => unreachable!("publication was confirmed"),
+            };
+            self.selected_mut().publish_prompt = false;
             let name = self.selected().id.clone();
             let diff = self
                 .selected()
@@ -1979,7 +2052,7 @@ impl App {
             self.selected_mut().status = "publishing a clean conversation branch".to_string();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let result = publish_conversation_pr(&name, &diff);
+                let result = publish_conversation_pr(&name, &diff, &pr_base, &default_base);
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
                     result,
@@ -3200,10 +3273,43 @@ mod tests {
             head: "b".repeat(40),
             patch: "diff --git a/a b/a".to_string(),
         });
+        let (publish_repo, publish_remote, _) = repo_with_default_branch("publish-prompt", "trunk");
+        app.repo_dir = publish_repo.clone();
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(app.confirm_action, Some(ConfirmAction::Publish));
-        assert!(app.selected().status.contains("press Ctrl+P again"));
+        assert_eq!(
+            app.confirm_action,
+            Some(ConfirmAction::Publish {
+                default_base: "trunk".to_string(),
+                base_input: String::new(),
+            })
+        );
+        assert!(app.selected().status.contains("enter a PR base branch"));
         assert!(!app.selected().publishing);
+
+        for ch in "release/next".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.confirm_action,
+            Some(ConfirmAction::Publish {
+                default_base: "trunk".to_string(),
+                base_input: "release/next".to_string(),
+            })
+        );
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let publish_prompt = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(publish_prompt.contains("Base branch: release/next"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm_action.is_none());
+        assert!(!app.selected().publish_prompt);
+        std::fs::remove_dir_all(publish_repo).unwrap();
+        std::fs::remove_dir_all(publish_remote).unwrap();
     }
 
     #[test]
