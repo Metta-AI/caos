@@ -234,55 +234,91 @@ pub(super) fn transcript_contains(
 }
 
 fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
-    let operation = if state.running {
-        "running"
-    } else if state.publishing {
-        "publishing"
-    } else {
-        "idle"
-    };
-    let view = if app.selection_locked {
-        "selection lock"
-    } else {
-        match app.view {
-            View::Chat => "chat",
-            View::Activity => "activity",
-            View::Diff => "diff",
-            View::Tools => "tools",
-            View::Help => "help",
-        }
-    };
-    let running = app
+    let active = app
         .conversations
         .iter()
-        .filter(|conversation| conversation.running)
+        .filter(|conversation| conversation.is_busy())
         .count();
-    let header = Line::from(vec![
+    let left = Line::from(vec![
         Span::styled(" caos ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(format!("  {}  ", state.title)),
-        Span::styled(operation, Style::default().fg(Color::Yellow)),
-        Span::raw(format!("  [{view}]")),
-        Span::raw("  "),
         Span::styled(
-            state
-                .current_hash()
-                .map(|hash| format!("head {}", short_hash(hash)))
-                .or_else(|| {
-                    state
-                        .turn_options
-                        .base
-                        .as_deref()
-                        .map(|hash| format!("from {}", short_hash(hash)))
-                })
-                .unwrap_or_else(|| "new conversation".to_string()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("  {running} running"),
-            Style::default().fg(Color::DarkGray),
+            format!("  {}", state.title),
+            Style::default().add_modifier(Modifier::BOLD),
         ),
     ]);
-    frame.render_widget(Paragraph::new(header), area);
+    let mut metadata = Vec::new();
+    let mut push_metadata = |text: String, style: Style| {
+        if !metadata.is_empty() {
+            metadata.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        metadata.push(Span::styled(text, style));
+    };
+    if app.selection_locked {
+        push_metadata(
+            "selection lock".to_string(),
+            Style::default().fg(Color::Cyan),
+        );
+    } else if app.view != View::Chat {
+        push_metadata(
+            match app.view {
+                View::Activity => "activity",
+                View::Diff => "changes",
+                View::Tools => "tools",
+                View::Help => "help",
+                View::Chat => unreachable!("chat is omitted from the header"),
+            }
+            .to_string(),
+            Style::default().fg(Color::Cyan),
+        );
+    }
+    if state.running || state.publishing {
+        push_metadata(
+            if state.publishing {
+                "publishing"
+            } else {
+                "running"
+            }
+            .to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    push_metadata(
+        state
+            .current_hash()
+            .map(|hash| format!("head {}", short_hash(hash)))
+            .or_else(|| {
+                state
+                    .turn_options
+                    .base
+                    .as_deref()
+                    .map(|hash| format!("from {}", short_hash(hash)))
+            })
+            .unwrap_or_else(|| "new conversation".to_string()),
+        Style::default().fg(Color::DarkGray),
+    );
+    if active > 0 {
+        push_metadata(
+            format!("{active} active"),
+            Style::default().fg(Color::DarkGray),
+        );
+    }
+    let metadata_width = metadata
+        .iter()
+        .map(|span| span.content.cell_width())
+        .sum::<u16>()
+        .saturating_add(1)
+        .min(area.width.saturating_sub(12));
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(12), Constraint::Length(metadata_width)])
+        .split(area);
+    frame.render_widget(Paragraph::new(left), columns[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(metadata).right_aligned()),
+        columns[1],
+    );
 }
 
 fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
