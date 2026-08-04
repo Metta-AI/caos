@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
@@ -17,7 +17,10 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{commit_working_tree, load_conversation_workspace, publish_conversation_pr};
+use super::workspace::{
+    commit_working_tree, load_conversation_workspace, publish_conversation_pr,
+    remote_default_branch_tip,
+};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -985,7 +988,7 @@ impl App {
                 ConversationState::new_virtual(
                     id.clone(),
                     selected_name.clone(),
-                    args.turn,
+                    new_conversation_options(args.turn.clone(), args.turn.base, &repo_dir)?.0,
                     initial_status,
                 ),
             );
@@ -1762,12 +1765,18 @@ impl App {
                 return;
             }
         };
-        let mut options = self.selected().turn_options.clone();
-        options.base = base.clone();
-        let status = base
-            .as_deref()
-            .map(|hash| format!("ready from {}; enter a prompt", short_hash(hash)))
-            .unwrap_or_else(|| "new virtual conversation; enter a prompt".to_string());
+        let (options, base) = match new_conversation_options(
+            self.selected().turn_options.clone(),
+            base,
+            &self.repo_dir,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.selected_mut().push_error(error);
+                return;
+            }
+        };
+        let status = format!("ready from {}; enter a prompt", short_hash(&base));
         self.conversations.insert(
             0,
             ConversationState::new_virtual(id, title, options, status),
@@ -1812,11 +1821,22 @@ impl App {
                     return;
                 }
             };
+            let (options, base) = match new_conversation_options(
+                self.selected().turn_options.clone(),
+                None,
+                &self.repo_dir,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.selected_mut().push_error(error);
+                    return;
+                }
+            };
             Some(ConversationState::new_virtual(
                 id,
                 title,
-                self.selected().turn_options.clone(),
-                "new virtual conversation; enter a prompt".to_string(),
+                options,
+                format!("ready from {}; enter a prompt", short_hash(&base)),
             ))
         } else {
             None
@@ -1954,6 +1974,19 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map(|id| id.to_string())
 }
 
+fn new_conversation_options(
+    mut options: TurnOptions,
+    requested_base: Option<String>,
+    repo_dir: &Path,
+) -> Result<(TurnOptions, String), String> {
+    let base = match requested_base {
+        Some(base) => base,
+        None => remote_default_branch_tip(repo_dir)?.1,
+    };
+    options.base = Some(base.clone());
+    Ok((options, base))
+}
+
 fn choose_conversation(
     requested: Option<&str>,
     new: bool,
@@ -2033,6 +2066,47 @@ mod tests {
             .unwrap()
             .success());
         dir
+    }
+
+    fn git_ok(cwd: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn repo_with_default_branch(name: &str, branch: &str) -> (PathBuf, PathBuf, String) {
+        let dir = throwaway_repo(name);
+        git_ok(&dir, &["config", "user.name", "CAOS test"]);
+        git_ok(&dir, &["config", "user.email", "caos-test@example.invalid"]);
+        std::fs::write(dir.join("base.txt"), "default branch\n").unwrap();
+        git_ok(&dir, &["add", "base.txt"]);
+        git_ok(&dir, &["commit", "-q", "-m", "default branch"]);
+        let tip = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let remote = dir.with_extension("remote.git");
+        let remote_path = remote.to_string_lossy().to_string();
+        git_ok(&dir, &["init", "--bare", "-q", &remote_path]);
+        let git_dir = format!("--git-dir={remote_path}");
+        let default_ref = format!("refs/heads/{branch}");
+        git_ok(&dir, &[&git_dir, "symbolic-ref", "HEAD", &default_ref]);
+        git_ok(&dir, &["remote", "add", "origin", &remote_path]);
+        let push_ref = format!("HEAD:{default_ref}");
+        git_ok(&dir, &["push", "-q", "origin", &push_ref]);
+
+        (dir, remote, tip)
     }
 
     fn activity(number: usize) -> Activity {
@@ -2294,6 +2368,38 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn new_conversations_default_to_the_remote_default_branch_tip() {
+        let (dir, remote, tip) = repo_with_default_branch("default-base", "release/next");
+        let previous = TurnOptions {
+            base: Some("old conversation base".to_string()),
+            ..TurnOptions::default()
+        };
+
+        let (options, base) = new_conversation_options(previous, None, &dir).unwrap();
+
+        assert_eq!(base, tip);
+        assert_eq!(options.base.as_deref(), Some(tip.as_str()));
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn explicit_conversation_bases_override_the_remote_default() {
+        let options = TurnOptions::default();
+        let requested = "5ec3751".to_string();
+
+        let (options, base) = new_conversation_options(
+            options,
+            Some(requested.clone()),
+            Path::new("does-not-need-a-repository"),
+        )
+        .unwrap();
+
+        assert_eq!(base, requested);
+        assert_eq!(options.base.as_deref(), Some(requested.as_str()));
     }
 
     #[test]
@@ -3300,7 +3406,7 @@ mod tests {
         app.focus = Focus::List;
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        let dir = throwaway_repo("ctrl-e");
+        let (dir, remote, tip) = repo_with_default_branch("ctrl-e", "main");
         app.repo_dir = dir.clone();
         app.selected = 1;
 
@@ -3321,8 +3427,12 @@ mod tests {
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
-        assert!(app.selected().status.contains("new virtual conversation"));
+        assert_eq!(
+            app.selected().turn_options.base.as_deref(),
+            Some(tip.as_str())
+        );
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
