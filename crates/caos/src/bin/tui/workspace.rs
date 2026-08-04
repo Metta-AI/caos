@@ -10,7 +10,7 @@ use caos::chat::WorkspaceDiff;
 /// calling it. Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
-pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> Result<(), String> {
+pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -22,7 +22,7 @@ pub(crate) fn load_conversation_workspace(diff: &WorkspaceDiff, cwd: &Path) -> R
                 .to_string(),
         );
     }
-    capture_required("git", &["checkout", "--detach", &diff.head], cwd)?;
+    capture_required("git", &["checkout", "--detach", head], cwd)?;
     Ok(())
 }
 
@@ -370,14 +370,7 @@ mod tests {
         let base = commit_file(&dir, "base\n", "base");
         let head = commit_file(&dir, "conversation result\n", "turn");
         capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
-        let diff = WorkspaceDiff {
-            base,
-            head: head.clone(),
-            stat: String::new(),
-            patch: "changed".to_string(),
-        };
-
-        load_conversation_workspace(&diff, &dir).unwrap();
+        load_conversation_workspace(&head, &dir).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
             "conversation result\n"
@@ -388,7 +381,7 @@ mod tests {
         );
 
         std::fs::write(dir.join("file.txt"), "local edit\n").unwrap();
-        assert!(load_conversation_workspace(&diff, &dir)
+        assert!(load_conversation_workspace(&head, &dir)
             .unwrap_err()
             .contains("working tree is not clean"));
 
@@ -481,9 +474,8 @@ mod tests {
         let first_head = commit_file(&dir, "first result\n", "internal turn with key");
         let before = std::fs::read_to_string(dir.join("file.txt")).unwrap();
         let first_diff = WorkspaceDiff {
-            base: base.clone(),
+            base_commit: base.clone(),
             head: first_head.clone(),
-            stat: String::new(),
             patch: "changed".to_string(),
         };
 
@@ -507,9 +499,8 @@ mod tests {
         let final_diff = WorkspaceDiff {
             // This conversation was started from the previous conversation's
             // head. Publishing must not make that internal history reachable.
-            base: first_head.clone(),
+            base_commit: first_head.clone(),
             head: final_head.clone(),
-            stat: String::new(),
             patch: "changed again".to_string(),
         };
         prepare_publish_branch("publish-test", &final_diff, &main_tip, &dir).unwrap();
@@ -627,9 +618,8 @@ mod tests {
         let main_tip = commit_file(&dir, "main\n", "main advances");
 
         let diff = WorkspaceDiff {
-            base,
+            base_commit: base,
             head: conversation_head,
-            stat: String::new(),
             patch: "changed".to_string(),
         };
         let error = prepare_publish_branch("conflict-test", &diff, &main_tip, &dir).unwrap_err();
