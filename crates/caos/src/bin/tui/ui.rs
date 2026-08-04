@@ -334,22 +334,37 @@ fn render_live_activity(
 fn render_transcript(state: &ConversationState, focused: bool, frame: &mut Frame<'_>, area: Rect) {
     let paragraph = transcript_paragraph(state, transcript_inner(area).width);
     let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
+    let rows_below = state
+        .scroll
+        .rendered_max
+        .get()
+        .saturating_sub(scroll as usize);
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default()
     };
-    frame.render_widget(
-        paragraph
-            .block(
-                Block::default()
-                    .title(" Conversation ")
-                    .border_style(border_style)
-                    .borders(Borders::ALL),
-            )
-            .scroll((scroll, 0)),
-        area,
-    );
+    let mut block = Block::default()
+        .title(" Conversation ")
+        .border_style(border_style)
+        .borders(Borders::ALL);
+    if rows_below > 0 {
+        let noun = if rows_below == 1 { "line" } else { "lines" };
+        let label = if state.unread_below {
+            format!(" New message · {rows_below} {noun} below ↓ ")
+        } else {
+            format!(" {rows_below} {noun} below ↓ ")
+        };
+        let style = if state.unread_below {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        block = block.title_bottom(Line::styled(label, style).right_aligned());
+    }
+    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
     render_transcript_selection(state, frame, area);
 }
 
