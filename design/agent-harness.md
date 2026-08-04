@@ -1,8 +1,8 @@
 # Agent harness: conversations as commit chains — design note
 
 **Status:** steps 1–5 implemented — run-then + first-class commits, the
-bounded bash tool (`crates/worker-bash-tool`), the llm-step driver
-(`crates/worker-llm-step`), and the chat client (`caos-cli chat`,
+bounded bash tool (`crates/worker-bash-tool`), the stateless llm-call worker
+(`crates/worker-llm-call`), the llm-step driver (`crates/worker-llm-step`), and the chat client (`caos-cli chat`,
 `crates/caos/src/chat.rs`). Builds on map-then (`map-then.md`). Where this
 note and the code diverged during implementation, the note has been updated
 to match the code; the deltas are called out inline.
@@ -319,14 +319,21 @@ refused if its tree carries a top-level `.caos`), `--system <text>` /
 walk — and run nothing). The API key comes only from `$ANTHROPIC_API_KEY`
 (checked before anything is minted).
 
-The workers come ready-made from the published library: `/cas/std/bash-tool`
-and `/cas/std/llm-step` are `curry(runner, bin=<static binary>)` nodes
+The workers come ready-made from the published library: `/cas/std/bash-tool`,
+`/cas/std/llm-call`, and `/cas/std/llm-step` are
+`curry(runner, bin=<static binary>)` nodes
 (published by build-builtins.sh next to the images), so a turn needs nothing
 built or committed locally — the bash curry rides as a literal image ref and
 the per-turn state (key, system, model…) is curried onto the llm-step curry
 (layers flatten). `--llm-step-bin`/`--bash-tool-bin` (or
 `$CAOS_LLM_STEP_BIN`/`$CAOS_BASH_TOOL_BIN`) override with a git-tracked local
 binary curried onto `/cas/std/runner` — the stub tests' path.
+
+`llm-call` is the smaller sibling of `llm-step`: it accepts a system prompt
+and messages array and returns response text as a blob, with no tools, commits,
+or refs. Both share the HTTP/retry library, but llm-step does not invoke
+llm-call as a nested job; doing so would add a dispatch and container boundary
+to every model round.
 
 Implementation notes (what the workers assume): the human commit is an
 ordinary git commit (any author *except* `caos-agent` — enforced) whose

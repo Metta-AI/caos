@@ -227,10 +227,11 @@
         # image of their own: each runs as curry(runner, bin=<static binary>)
         # in the shared runner pool, so only the binaries are exposed.
         worker-bash-tool = workspaceBins;
+        worker-llm-call = workspaceBins;
         worker-llm-step = workspaceBins;
         worker-rgrep = workspaceBins;
         worker-deep-deps = workspaceBins;
-        # The llm-step tests' scripted LLM API stand-in — a host binary, not a
+        # The LLM worker tests' scripted API stand-in — a host binary, not a
         # worker (the musl build runs on any Linux host).
         llm-stub = workspaceBins;
 
@@ -613,6 +614,7 @@
         # binary under /bin, so these may share one consolidated output.
         builtinWorkerBins = [
           worker-bash-tool
+          worker-llm-call
           worker-llm-step
           worker-rgrep
           worker-deep-deps
@@ -936,8 +938,8 @@
           default = caos-tools;
           inherit caos server runnerd caos-cli caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
-          # llm-step tests' stub LLM server.
-          inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
+          # LLM worker tests' stub server.
+          inherit worker-bash-tool worker-llm-call worker-llm-step worker-rgrep llm-stub;
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc
           # orchestrator (curry(runner, worker1)) — build-builtins.sh needs
