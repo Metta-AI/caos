@@ -11,7 +11,7 @@ use caos::chat::{
     WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
-use ratatui_core::buffer::Buffer;
+use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
 use ratatui_crossterm::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -47,6 +47,30 @@ fn automatic_title(prompt: &str) -> String {
         .take(MAX_CHARS - 1)
         .chain(std::iter::once('…'))
         .collect()
+}
+
+fn message_preview(text: &str, max_cells: u16) -> String {
+    let text = collapse_whitespace(text);
+    let text = text
+        .trim_start_matches(['#', '>', '-', '*'])
+        .trim_start()
+        .trim_matches('`');
+    if text.cell_width() <= max_cells {
+        return text.to_string();
+    }
+    let content_cells = max_cells.saturating_sub(1);
+    let mut preview = String::new();
+    let mut width: u16 = 0;
+    for ch in text.chars() {
+        let ch_width = ch.to_string().cell_width();
+        if width.saturating_add(ch_width) > content_cells {
+            break;
+        }
+        preview.push(ch);
+        width = width.saturating_add(ch_width);
+    }
+    preview.push('…');
+    preview
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -874,13 +898,15 @@ impl ConversationState {
         }
     }
 
-    fn latest_message_preview(&self) -> String {
+    fn latest_message_preview(&self) -> Option<(EntryRole, String)> {
         self.transcript
             .iter()
             .rev()
-            .find(|entry| matches!(entry.role, EntryRole::Human | EntryRole::Agent))
-            .map(|entry| collapse_whitespace(&entry.text))
-            .unwrap_or_else(|| "New conversation".to_string())
+            .find(|entry| {
+                matches!(entry.role, EntryRole::Human | EntryRole::Agent)
+                    && !entry.text.trim().is_empty()
+            })
+            .map(|entry| (entry.role, message_preview(&entry.text, 16)))
     }
 
     fn running_activity(&self) -> Option<&Activity> {
@@ -2505,6 +2531,12 @@ mod tests {
     }
 
     #[test]
+    fn message_previews_strip_block_markers_and_ellipsize_by_terminal_cells() {
+        assert_eq!(message_preview("##  Useful\nsummary", 20), "Useful summary");
+        assert_eq!(message_preview(&"界".repeat(10), 6), "界界…");
+    }
+
+    #[test]
     fn only_new_virtual_conversations_take_their_first_prompt_as_title() {
         let mut virtual_conversation = ConversationState::new_virtual(
             "internal-id".to_string(),
@@ -3602,7 +3634,10 @@ mod tests {
                 text: "internal failure".to_string(),
             },
         ];
-        assert_eq!(selected.latest_message_preview(), "Latest human message");
+        assert_eq!(
+            selected.latest_message_preview(),
+            Some((EntryRole::Human, "Latest human me…".to_string()))
+        );
         let (app, _) = app_with(vec![selected, state("Empty title")]);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3625,7 +3660,7 @@ mod tests {
             .position(|row| row.starts_with('│') && row.contains("Readable title"))
             .unwrap();
         assert!(
-            sidebar_rows[title_row + 1].contains("Latest human"),
+            sidebar_rows[title_row + 1].contains("You Latest human me…"),
             "{:?}",
             &sidebar_rows[title_row..title_row + 3]
         );
@@ -3633,7 +3668,7 @@ mod tests {
             .iter()
             .position(|row| row.starts_with('│') && row.contains("Empty title"))
             .unwrap();
-        assert!(sidebar_rows[empty_title_row + 1].contains("New conversation"));
+        assert!(sidebar_rows[empty_title_row + 1].contains("Start a conversation"));
         let sidebar = sidebar_rows.join("\n");
         assert!(!sidebar.contains(internal_id));
         assert!(!sidebar.contains("internal failure"));

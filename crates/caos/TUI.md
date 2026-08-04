@@ -5,8 +5,9 @@ the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
 The interface keeps independent virtual conversations in a left sidebar. Each
-two-row entry shows its title and latest user or agent message without exposing
-the internal conversation ID. Each conversation has its own durable history,
+two-row entry shows its title plus an author-labeled, single-line preview of the
+latest user or agent message, with a visible ellipsis instead of hard terminal
+clipping. Internal conversation IDs stay hidden. Each conversation has its own durable history,
 multiline prompt, live activity, completed-turn hashes, and workspace diff.
 Turns continue running when another conversation is selected, so several agent
 workspaces can advance concurrently without touching the working checkout.
