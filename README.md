@@ -35,11 +35,14 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | Crate | Binaries / image | What it is |
 |---|---|---|
 | `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
+| `caos-world` | — | The build's world tag, shared by the three crates that speak the server protocol (`caos`, `server`, `runnerd`) so they cannot disagree about their world. |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
+| `runnerd` | `caos-runnerd` | The generic host agent: long-polls the server for jobs and runs worker containers. The server itself runs nothing. See `design/runner-protocol.md`. |
 | `worker-common` | — | Shared library for the Rust workers. |
+| `worker-runner` | — (`std/runner`'s `/worker`) | The in-image runner trampoline: receives a compiled worker binary as its `worker1` arg and execs it, so every compiled worker rides one shared image as `curry(std/runner, worker1=<binary>)`. |
 | `worker-rustc` | — (run as `curry(runner, worker1)`) | Builds a worker from Rust source. See [workers](#workers). |
-| `worker-bash-tool`, `worker-llm-step` | — (run as `curry(runner, worker1)`) | The agent harness: the bounded bash tool and the LLM step driver. See `design/agent-harness.md`. |
-| `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (one flake tree: pinned toolchain + pre-compiled deps + this binary as `/worker`, imaged on first use — see `std/cargo/` and `design/flake-images.md`) — the agent's `build`/`test` tools. See `design/cargo-workers.md`. |
+| `worker-bash-tool`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: the bounded bash tool, the LLM step driver, and recursive grep. See `design/agent-harness.md`. |
+| `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (pinned toolchain + pre-compiled deps + this binary as `/worker`; its image is host-built and streamed like the runner, `caos-worker-cargo-docker` — see `std/cargo/` and `design/cargo-workers.md`) — the agent's `build`/`test` tools. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the llm-step tests. |
 
 ## Prerequisites
@@ -59,7 +62,8 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
-| `build-builtins.sh`, `test-*.sh` | Local dev + integration tests |
+| `build-builtins.sh` | Builds + publishes the `std` library to `refs/caos/std` |
+| `caos-tools/`, `tests/` | The `build`/`test`/`test-result` tools and the integration suites |
 
 ## Development
 
@@ -106,9 +110,12 @@ container, started by `caosd serve`. `caosd up` runs that image; the test suite
 runs the same image in the `test` world, so the suite exercises the stack the
 host actually runs rather than an approximation of it.
 
-Only ONE worker image remains nix-built here: the `flake-builder`. Every std
-worker is a flake-built worker image (`std/runner`, `std/cargo`, `std/bash` —
-complete flakes in `std/`, imaged on demand by the flake-builder) or a
+Only a few images are nix-built here: the `flake-builder`
+(`caos-worker-flake-builder-docker`), the shared `runner`
+(`caos-worker-runner-docker`) and the `cargo` worker
+(`caos-worker-cargo-docker`) — each host-built and streamed. Every other std
+worker is a flake-built worker image (`std/bash`, `std/merge` — complete flakes
+in `std/`, imaged on demand by the flake-builder) or a
 `curry(std/runner, worker1=<binary>)` over the runner —
 see `design/flake-images.md`.
 
@@ -538,7 +545,7 @@ the cache key, never hidden inside a memoized computation.
 ## Local testing
 
 - Build the stack with `nix build`
-- Run the dev stack with `results/bin/caosd up`
+- Run the dev stack with `result/bin/caosd up`
 - Test with `caos-cli run-tool test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
 
 ```bash
