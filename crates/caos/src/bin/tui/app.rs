@@ -19,8 +19,8 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, load_conversation_workspace, publish_conversation_pr,
-    remote_default_branch, remote_default_branch_tip,
+    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
+    publish_conversation_pr, remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -2158,29 +2158,15 @@ impl App {
                 return;
             }
         };
-        let active =
-            match list_user_conversations(&transport, &self.user, UserConversationStatus::Active) {
-                Ok(conversations) => conversations,
-                Err(error) => {
-                    self.selected_mut().show_command_error(error);
-                    return;
-                }
-            };
-        let archived =
-            match list_user_conversations(&transport, &self.user, UserConversationStatus::Archived)
-            {
-                Ok(conversations) => conversations,
-                Err(error) => {
-                    self.selected_mut().show_command_error(error);
-                    return;
-                }
-            };
+        // Name the conversation from the ones already loaded in memory rather
+        // than re-listing the user's whole active+archived set from the server.
+        // `list_user_conversations` fetches every conversation's head object and
+        // title blob over the network, so doing it on each Ctrl+N made starting
+        // a conversation slower the more conversations you had accumulated. The
+        // default title only has to be unique among the conversations you can
+        // see, and the minted id is content-unique regardless of the title.
         let title = first_available_conversation_name(
-            active
-                .iter()
-                .chain(&archived)
-                .map(|item| item.title.as_str())
-                .chain(self.conversations.iter().map(|item| item.title.as_str())),
+            self.conversations.iter().map(|item| item.title.as_str()),
         );
         let id = match fresh_conversation_id(&transport, &self.user) {
             Ok(id) => id,
@@ -2438,7 +2424,7 @@ fn new_conversation_options(
 ) -> Result<(TurnOptions, String), String> {
     let base = match requested_base {
         Some(base) => base,
-        None => remote_default_branch_tip(repo_dir)?.1,
+        None => local_default_branch_tip(repo_dir)?.1,
     };
     options.base = Some(base.clone());
     Ok((options, base))
@@ -2541,6 +2527,9 @@ mod tests {
         std::fs::write(dir.join("base.txt"), "default branch\n").unwrap();
         git_ok(&dir, &["add", "base.txt"]);
         git_ok(&dir, &["commit", "-q", "-m", "default branch"]);
+        // Name the local branch after the default branch, as a real checkout
+        // would be: local_default_branch_tip reads refs/heads/<branch>.
+        git_ok(&dir, &["branch", "-M", branch]);
         let tip = String::from_utf8(
             std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -2562,6 +2551,12 @@ mod tests {
         git_ok(&dir, &["remote", "add", "origin", &remote_path]);
         let push_ref = format!("HEAD:{default_ref}");
         git_ok(&dir, &["push", "-q", "origin", &push_ref]);
+        // Set the origin/HEAD symref (via a one-time fetch + set-head) so
+        // local_default_branch_tip can discover the default branch NAME without
+        // touching the network — as it would in a real clone. It then reads the
+        // tip from the local refs/heads/<branch>.
+        git_ok(&dir, &["fetch", "-q", "origin"]);
+        git_ok(&dir, &["remote", "set-head", "origin", "-a"]);
 
         (dir, remote, tip)
     }
@@ -2843,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn new_conversations_default_to_the_remote_default_branch_tip() {
+    fn new_conversations_default_to_the_local_default_branch_tip() {
         let (dir, remote, tip) = repo_with_default_branch("default-base", "release/next");
         let previous = TurnOptions {
             base: Some("old conversation base".to_string()),

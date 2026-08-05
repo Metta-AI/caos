@@ -116,9 +116,34 @@ pub(crate) fn publish_conversation_pr(
     )
 }
 
-pub(crate) fn remote_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
-    let branch = remote_default_branch(cwd)?;
-    let commit = fetch_remote_branch_tip(&branch, cwd)?;
+/// Resolve the default branch and its tip from the LOCAL branch, without
+/// touching the network.
+///
+/// Starting a new conversation only needs a base commit to build on, and the
+/// tip of your local default branch (e.g. `main`) is a fine one. This discovers
+/// the default branch *name* from the `origin/HEAD` symref, then reads the local
+/// `refs/heads/<name>` — not the `origin/<name>` tracking ref — so it reflects
+/// your checked-out branch as it is right now. It runs no `git ls-remote`/`git
+/// fetch`, so it stays instant (e.g. on every Ctrl+N) instead of blocking on
+/// round-trips to `origin`. Publishing a PR still fetches, where a fresh remote
+/// tip matters.
+pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+    // `refs/remotes/origin/HEAD` is the local symref recording origin's default
+    // branch; it is set at clone time and refreshed by `git remote set-head`.
+    let head_ref = capture_required("git", &["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
+        .map_err(|error| {
+            format!(
+                "could not resolve origin's default branch locally \
+             (run `git remote set-head origin -a`): {error}"
+            )
+        })?;
+    let branch = head_ref
+        .strip_prefix("refs/remotes/origin/")
+        .ok_or_else(|| format!("origin/HEAD points outside refs/remotes/origin: {head_ref}"))?
+        .to_string();
+    let local_ref = format!("refs/heads/{branch}");
+    let commit = capture_required("git", &["rev-parse", "--verify", &local_ref], cwd)
+        .map_err(|error| format!("local default branch {branch:?} not found: {error}"))?;
     Ok((branch, commit))
 }
 
