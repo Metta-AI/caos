@@ -191,8 +191,26 @@ all failure modes redirect loudly to the right tool.
 **Tool failures are values, not errors.** A failing command (`exit 1`,
 compile error) is a normal result — the same `{exit, stdout, stderr, tree}`
 shape — returned to the model as a tool result (marked `is_error`) so it can
-react. Only infrastructure failures (object fetch failed, container died)
-error the sub-run and fail the turn.
+react.
+
+This now holds for the sub-run *itself* failing, too — object fetch failed,
+container died, the tool worker exited non-zero. Every tool launch uses
+`run-then --catch` (`map-then.md`, "Catch"), so the failure comes back as
+`--error` and the callback turns it into an `is_error` tool_result over the
+UNCHANGED workspace: the call is dead, the turn is not. `ws` rides the
+continuation for bash and merge purely for this path — their success paths
+rebuild the workspace from the result.
+
+It did not hold before, and the gap was expensive rather than theoretical. One
+aborting `tests/<name>/cli.sh` inside the `test` tool errored that tool's
+sub-run, which killed the turn, discarded every other test's result, and
+orphaned the model's in-turn work — twice in two days, both times on a bug the
+model had just written and could have fixed had it been allowed to read the
+failure. The other half of that fix is in `tests/lib/run-test.sh`, which no
+longer classifies an unguarded `set -e` abort as infrastructure.
+
+Infrastructure failures are still uncached, and a request whose resolution
+caught one is not memoized either, so a retry really retries.
 
 ## LLM API
 

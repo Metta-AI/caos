@@ -79,9 +79,11 @@ fn run(args: &[String]) -> Result<(), String> {
             [input, sep, kvs @ ..] if sep == "--" => caos::caos_map_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
-        // `run-then <in> -- --run=<image> [--then=<image>]` — the single-valued
-        // map-then: the server runs `run(--in=<in>)` once, then (optionally)
-        // `then(--in=<in>, --result=<R>)`. The same tail-call contract.
+        // `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
+        // single-valued map-then: the server runs `run(--in=<in>)` once, then
+        // (optionally) `then(--in=<in>, --result=<R>)`. The same tail-call
+        // contract. With `--catch`, a failing `run` reaches `then` as
+        // `--error=<blob>` instead of failing the whole request.
         Some("run-then") => match &args[2..] {
             [input, sep, kvs @ ..] if sep == "--" => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
@@ -400,7 +402,7 @@ fn usage(args: &[String]) -> String {
          {prog} put-commit <src-file> <cas-path>\n  \
          {prog} hash <cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
-         {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>]\n  \
+         {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>] [--catch]\n  \
          {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
          {prog} runner --job=<json>"
     )

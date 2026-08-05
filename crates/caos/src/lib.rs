@@ -2272,7 +2272,7 @@ fn prepare_request(
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
-    record_continuation(t, "map-then", input, kvs, &["map", "then"], |given| {
+    record_continuation(t, "map-then", input, kvs, &["map", "then"], &[], |given| {
         if given.is_empty() {
             return Err("`map-then` needs --map and/or --then".to_string());
         }
@@ -2280,36 +2280,61 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     })
 }
 
-/// `run-then <in> -- --run=<image> [--then=<image>]` — the single-valued
-/// [`caos_map_then`]: record a continuation `{in, run, then?}` as this worker's
-/// result at `/cas/out` and exit. The server runs `run(--in=<in>)` once,
-/// yielding R; with `--then` the request's result is `then(--in=<in>,
-/// --result=<R>)` (symmetric with map-then's `--in`/`--children`), else R
-/// itself — so `run` with no `then` is a plain tail call to `run`. `--run` is
-/// required (a bare tail call to one image); `--map` doesn't belong here —
-/// `map` and `run` are mutually exclusive, which this surface enforces
-/// client-side. Image refs resolve exactly as in `map-then`.
+/// `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
+/// single-valued [`caos_map_then`]: record a continuation `{in, run, then?,
+/// catch?}` as this worker's result at `/cas/out` and exit. The server runs
+/// `run(--in=<in>)` once, yielding R; with `--then` the request's result is
+/// `then(--in=<in>, --result=<R>)` (symmetric with map-then's
+/// `--in`/`--children`), else R itself — so `run` with no `then` is a plain tail
+/// call to `run`. `--run` is required (a bare tail call to one image); `--map`
+/// doesn't belong here — `map` and `run` are mutually exclusive, which this
+/// surface enforces client-side. Image refs resolve exactly as in `map-then`.
+///
+/// `--catch` (a bare flag) makes a FAILING `run` a value instead of an error:
+/// the `then` is called with `--error=<blob of the failure text>` in place of
+/// `--result`, and the request succeeds. It needs `--then` — there is nowhere
+/// else for the error to go — and the enclosing request is then left uncached,
+/// so a retry really retries. Reach for it when the caller's job is to react to
+/// the failure rather than propagate it: the agent loop wants a failed tool to
+/// come back as an `is_error` tool_result, not to kill the turn.
 pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
-    record_continuation(t, "run-then", input, kvs, &["run", "then"], |given| {
-        if !given.contains(&"run") {
-            return Err("`run-then` needs --run (with an optional --then)".to_string());
-        }
-        Ok(())
-    })
+    record_continuation(
+        t,
+        "run-then",
+        input,
+        kvs,
+        &["run", "then"],
+        &["catch"],
+        |given| {
+            if !given.contains(&"run") {
+                return Err("`run-then` needs --run (with an optional --then)".to_string());
+            }
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`run-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Shared body of [`caos_map_then`] / [`caos_run_then`]: record a continuation
 /// `{in, <images>}` over `input` as this worker's result at `/cas/out` (a
 /// `promise` placeholder the server resolves once the job is posted). `allowed`
 /// names the image-valued entries this verb accepts — the surface split is the
-/// client-side mutual exclusion of `map` and `run` — and `check` validates the
-/// set actually given, before anything is sealed.
+/// client-side mutual exclusion of `map` and `run` — `markers` names its bare
+/// flags (recorded as one-byte blobs; the interpreter reads only their
+/// presence), and `check` validates the set actually given, before anything is
+/// sealed.
 fn record_continuation(
     t: &dyn Transport,
     verb: &str,
     input: &str,
     kvs: &[String],
     allowed: &[&'static str],
+    markers: &[&'static str],
     check: impl FnOnce(&[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
@@ -2338,13 +2363,37 @@ fn record_continuation(
 
     let mut given: Vec<&str> = Vec::new();
     for kv in kvs {
+        // Markers are bare flags, matched BEFORE parse_kv — which requires a
+        // `=value` and would reject them. Presence is the whole signal, so the
+        // recorded blob's content is arbitrary; the interpreter never reads it.
+        if let Some(&name) = markers.iter().find(|&&m| kv.strip_prefix("--") == Some(m)) {
+            if given.contains(&name) {
+                return Err(format!("--{name} given twice"));
+            }
+            entries.push(Entry {
+                mode: EntryKind::Blob.into(),
+                filename: name.as_bytes().to_vec().into(),
+                oid: post_object(t, "blob", b"1")?,
+            });
+            given.push(name);
+            continue;
+        }
         let (name, value) = parse_kv(kv)?;
         let Some(&name) = allowed.iter().find(|&&a| a == name) else {
-            let flags = allowed
+            let mut flags = allowed
                 .iter()
                 .map(|a| format!("--{a}"))
                 .collect::<Vec<_>>()
                 .join(" and ");
+            if !markers.is_empty() {
+                let m = markers
+                    .iter()
+                    .map(|a| format!("--{a}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                flags = format!("{flags} (each an image ref) and the flag {m}");
+                return Err(format!("`{verb}` takes only {flags}, got --{name}"));
+            }
             return Err(format!(
                 "`{verb}` takes only {flags} (each an image ref), got --{name}"
             ));

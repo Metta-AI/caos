@@ -9,4 +9,9 @@ if [ -e /cas/args/then-img ]; then
   caos get /cas/args/then-img
   args+=(--then="$(cat /cas/args/then-img)")
 fi
+# --catch is a bare flag: any binding of it turns it on, so the value is never
+# read (the test curries --catch=1 purely because a curried arg needs one).
+if [ -e /cas/args/catch ]; then
+  args+=(--catch)
+fi
 caos run-then /cas/args/in -- "${args[@]}"
