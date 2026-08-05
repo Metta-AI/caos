@@ -142,6 +142,13 @@ to the conversation. If the selection is already on the newest step, new
 activity remains selected. Moving to an older step pauses that tail-follow
 behavior.
 
+Before a TUI turn calls `/run`, its exact ArgTree is stored in the
+conversation's server-side `pending` ref. A restarted TUI restores the human
+prompt and calls `/run` with that same hash, which rejoins an in-flight run or
+reads its cached result. Transient connection failures do the same without
+leaving the TUI. Completion atomically publishes the conversation head and
+deletes the pending ref with an exact lease.
+
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other
 users. A running or publishing conversation must finish first. Closing an

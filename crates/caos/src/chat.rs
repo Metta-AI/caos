@@ -6,9 +6,8 @@
 //! are text-only for now), hand it to an `llm-step` run, watch the turn's
 //! progress ref while the run blocks, and on success advance
 //! `refs/caos/conversations/<name>/from-user` to the returned turn commit.
-//! Conversation identity is that ref — the only mutable thing, owned by this
-//! client. On a failed run the ref is untouched; the minted human commit is
-//! harmlessly orphaned.
+//! The TUI records the exact ArgTree under the conversation's `pending` ref
+//! before calling `/run`, so a replacement client can rejoin the same work.
 //!
 //! `talk` is the everyday surface: the positional argument is the prompt, the
 //! conversation defaults to the repo's most recently used one (`--new` starts
@@ -48,6 +47,8 @@ const AGENT_AUTHOR: &str = "caos-agent";
 /// * `status` — the worker's in-round status blob `"<human hash>\n<text>"`
 ///   (calling / retrying / answered-in; the hash scopes it to a turn, so a
 ///   stale one is ignorable).
+/// * `pending` — the TUI's exact in-flight ArgTree, deleted when the completed
+///   turn is published.
 ///
 /// The channel names are reserved in [`validated_refname`], so a conversation
 /// id can't shadow another's channel.
@@ -56,12 +57,19 @@ const FROM_USER_CHANNEL: &str = "from-user";
 const FROM_AGENT_CHANNEL: &str = "from-agent";
 const TITLE_CHANNEL: &str = "title";
 const STATUS_CHANNEL: &str = "status";
-const RESERVED_CHANNELS: [&str; 4] = [
+const PENDING_CHANNEL: &str = "pending";
+const RESERVED_CHANNELS: [&str; 5] = [
     FROM_USER_CHANNEL,
     FROM_AGENT_CHANNEL,
     TITLE_CHANNEL,
     STATUS_CHANNEL,
+    PENDING_CHANNEL,
 ];
+
+/// Delay before reconnecting an interrupted blocking `/run` request. Because
+/// the ArgTree is the request identity, reconnecting joins the same run or
+/// reads its cached result.
+const RECONNECT_MS: u64 = 1_000;
 
 /// The LLM API key rides in from the environment, never a flag (it would land
 /// in shell history and process listings).
@@ -205,6 +213,7 @@ pub fn describe_tool_set(
 /// or a full-screen UI.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnEvent {
+    ConversationSaved,
     PhaseStarted(TurnPhase),
     PhaseComplete {
         label: String,
@@ -239,6 +248,15 @@ pub struct TurnOutcome {
     pub conversation: String,
     pub commit: String,
     pub short_commit: String,
+}
+
+/// A submitted TUI turn which has not yet been published as the conversation
+/// head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTurn {
+    pub arg_tree: String,
+    pub human: String,
+    pub message: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +294,15 @@ pub struct UserConversationSummary {
     pub title: String,
     pub head: String,
     pub updated_unix: i64,
+    pub pending: Option<PendingTurn>,
+}
+
+/// Stable identity plus mutable presentation metadata for one user's
+/// conversation.
+pub struct UserConversationRef<'a> {
+    pub user: &'a str,
+    pub id: &'a str,
+    pub title: &'a str,
 }
 
 /// A user's independent view of a conversation.
@@ -507,7 +534,8 @@ fn run_cli_turn(
         TurnEvent::Completed(outcome) => {
             println!("[{} {}]", outcome.conversation, outcome.short_commit)
         }
-        TurnEvent::PhaseStarted(_)
+        TurnEvent::ConversationSaved
+        | TurnEvent::PhaseStarted(_)
         | TurnEvent::PhaseComplete { .. }
         | TurnEvent::ToolResult { .. } => {}
     })?;
@@ -701,6 +729,10 @@ fn conversation_title_ref(id: &str) -> String {
     conv_ref(id, TITLE_CHANNEL)
 }
 
+fn conversation_pending_ref(id: &str) -> String {
+    conv_ref(id, PENDING_CHANNEL)
+}
+
 fn user_conversation_ref(user: &str, status: UserConversationStatus, id: &str) -> String {
     format!(
         "{USER_CONVERSATION_PREFIX}{user}/conversations/{}/{id}",
@@ -767,6 +799,27 @@ pub fn publish_user_conversation(
     id: &str,
     title: &str,
 ) -> Result<(), String> {
+    publish_user_conversation_refs(t, user, id, title, None)
+}
+
+/// Publish a completed turn and delete only the pending request it completed.
+fn publish_completed_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+    arg_tree: &str,
+) -> Result<(), String> {
+    publish_user_conversation_refs(t, user, id, title, Some(arg_tree))
+}
+
+fn publish_user_conversation_refs(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+    pending: Option<&str>,
+) -> Result<(), String> {
     validate_user_conversation(user, id)?;
     let title = validate_conversation_title(title)?;
     let local_ref = validated_refname(id)?;
@@ -781,20 +834,104 @@ pub fn publish_user_conversation(
     let head_update = format!("{head}:{head_ref}");
     let title_update = format!("+{title_hash}:{title_ref}");
     let active_update = format!("+{head}:{active_ref}");
-    t.git_capture(
-        &[
-            "push",
-            "--quiet",
-            "--atomic",
-            CAOS_REMOTE,
-            &head_update,
-            &title_update,
-            &active_update,
-        ],
-        None,
-    )
-    .map(|_| ())
-    .map_err(|error| format!("publishing conversation {id:?}: {error}"))
+    let pending_ref = pending.map(|_| conversation_pending_ref(id));
+    let mut args = vec![
+        "push".to_string(),
+        "--quiet".to_string(),
+        "--atomic".to_string(),
+    ];
+    if let (Some(arg_tree), Some(pending_ref)) = (pending, pending_ref.as_deref()) {
+        args.push(format!("--force-with-lease={pending_ref}:{arg_tree}"));
+    }
+    args.extend([
+        CAOS_REMOTE.to_string(),
+        head_update,
+        title_update,
+        active_update,
+    ]);
+    if let Some(pending_ref) = pending_ref.as_deref() {
+        args.push(format!(":{pending_ref}"));
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    t.git_capture(&refs, None)
+        .map(|_| ())
+        .map_err(|error| format!("publishing conversation {id:?}: {error}"))
+}
+
+/// Give a new TUI conversation a durable base before its first request. This
+/// is idempotent for an existing conversation.
+fn initialize_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+    base: Option<&str>,
+) -> Result<(), String> {
+    validate_user_conversation(user, id)?;
+    let local_ref = validated_refname(id)?;
+    if rev_parse_opt(t, &local_ref)?.is_none() {
+        let rev = base.unwrap_or("HEAD");
+        let base = t
+            .resolve_revspec(rev)?
+            .ok_or_else(|| format!("cannot resolve --base {rev:?}"))?
+            .to_string();
+        refuse_reserved_step_tree(t, &base, "the base commit's tree")?;
+        t.git_capture(&["update-ref", &local_ref, &base], None)?;
+    }
+    publish_user_conversation(t, user, id, title)
+}
+
+/// Read the exact ArgTree for an unfinished turn, if one exists.
+fn pending_chat_turn(t: &GitTransport, id: &str) -> Result<Option<PendingTurn>, String> {
+    validated_refname(id)?;
+    let pending_ref = conversation_pending_ref(id);
+    let Some(arg_tree) = remote_refs(t, [pending_ref.clone()])?.remove(&pending_ref) else {
+        return Ok(None);
+    };
+    decode_pending_chat_turn(t, &arg_tree).map(Some)
+}
+
+fn decode_pending_chat_turn(t: &GitTransport, arg_tree: &str) -> Result<PendingTurn, String> {
+    t.fetch_object(arg_tree)?;
+    let entries = fetch_tree_entries(t, arg_tree)?
+        .ok_or_else(|| format!("pending ArgTree {arg_tree} is not a tree"))?;
+    let human = tree_entry_hash(&entries, "head")
+        .ok_or_else(|| format!("pending ArgTree {arg_tree} has no head argument"))?;
+    t.fetch_object(&human)?;
+    let message = t
+        .git_capture(&["show", "-s", "--format=%B", &human], None)?
+        .trim_end()
+        .to_string();
+    Ok(PendingTurn {
+        arg_tree: arg_tree.to_string(),
+        human,
+        message,
+    })
+}
+
+fn tree_entry_hash(entries: &[gix::objs::tree::Entry], name: &str) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| entry_name(entry) == name.as_bytes())
+        .map(|entry| entry.oid.to_string())
+}
+
+fn publish_pending_chat_turn(t: &GitTransport, id: &str, arg_tree: &str) -> Result<(), String> {
+    let pending_ref = conversation_pending_ref(id);
+    let lease = format!("--force-with-lease={pending_ref}:");
+    let update = format!("{arg_tree}:{pending_ref}");
+    t.git_capture(&["push", "--quiet", &lease, CAOS_REMOTE, &update], None)
+        .map(|_| ())
+        .map_err(|error| format!("recording pending turn for {id:?}: {error}"))
+}
+
+fn clear_pending_chat_turn(t: &GitTransport, id: &str, arg_tree: &str) -> Result<(), String> {
+    let pending_ref = conversation_pending_ref(id);
+    let lease = format!("--force-with-lease={pending_ref}:{arg_tree}");
+    let delete = format!(":{pending_ref}");
+    t.git_capture(&["push", "--quiet", &lease, CAOS_REMOTE, &delete], None)
+        .map(|_| ())
+        .map_err(|error| format!("clearing pending turn for {id:?}: {error}"))
 }
 
 /// Change a conversation's shared title without changing its identity or HEAD.
@@ -931,6 +1068,7 @@ pub fn list_user_conversations(
             patterns.push(conversation_head_ref(id));
             patterns.push(conversation_title_ref(id));
             patterns.push(conversation_legacy_head_ref(id));
+            patterns.push(conversation_pending_ref(id));
         }
         metadata.extend(remote_refs(t, patterns)?);
     }
@@ -966,6 +1104,10 @@ pub fn list_user_conversations(
         }
         let title = String::from_utf8(title)
             .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?;
+        let pending = metadata
+            .get(&conversation_pending_ref(&id))
+            .map(|arg_tree| decode_pending_chat_turn(t, arg_tree))
+            .transpose()?;
         let updated_unix = t
             .git_capture(&["show", "-s", "--format=%ct", &head], None)?
             .trim()
@@ -976,6 +1118,7 @@ pub fn list_user_conversations(
             title,
             head,
             updated_unix,
+            pending,
         });
     }
     conversations.sort_by(|a, b| {
@@ -1027,11 +1170,7 @@ pub fn run_chat_turn(
     mut emit: impl FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     let refname = validated_refname(name)?;
-    if message.trim().is_empty() {
-        return Err("empty message".to_string());
-    }
-    emit(TurnEvent::PhaseStarted(TurnPhase::System));
-    turn(
+    let turn = prepare_turn(
         t,
         options,
         name,
@@ -1039,16 +1178,89 @@ pub fn run_chat_turn(
         message.trim(),
         human_tree,
         &mut emit,
-    )
+    )?;
+    let outcome = finish_turn(t, name, &refname, &turn, false, &mut emit)?;
+    emit(TurnEvent::Completed(outcome.clone()));
+    Ok(outcome)
 }
 
-/// One turn: mint the human commit, run llm-step over it, emit progress, and
-/// advance the conversation ref.
+/// Run a TUI turn with a durable recovery marker and publish it on success.
+pub fn run_user_chat_turn(
+    t: &GitTransport,
+    options: &TurnOptions,
+    conversation: &UserConversationRef<'_>,
+    message: &str,
+    human_tree: Option<&str>,
+    mut emit: impl FnMut(TurnEvent),
+) -> Result<TurnOutcome, String> {
+    initialize_user_conversation(
+        t,
+        conversation.user,
+        conversation.id,
+        conversation.title,
+        options.base.as_deref(),
+    )?;
+    emit(TurnEvent::ConversationSaved);
+    let refname = validated_refname(conversation.id)?;
+    let turn = prepare_turn(
+        t,
+        options,
+        conversation.id,
+        &refname,
+        message.trim(),
+        human_tree,
+        &mut emit,
+    )?;
+    publish_pending_chat_turn(t, conversation.id, &turn.arg_tree)?;
+    let outcome = finish_turn(t, conversation.id, &refname, &turn, true, &mut emit)?;
+    publish_completed_user_conversation(
+        t,
+        conversation.user,
+        conversation.id,
+        conversation.title,
+        &turn.arg_tree,
+    )?;
+    emit(TurnEvent::Completed(outcome.clone()));
+    Ok(outcome)
+}
+
+/// Rejoin the exact ArgTree recorded for an unfinished TUI turn.
+pub fn resume_user_chat_turn(
+    t: &GitTransport,
+    conversation: &UserConversationRef<'_>,
+    mut emit: impl FnMut(TurnEvent),
+) -> Result<TurnOutcome, String> {
+    let refname = validated_refname(conversation.id)?;
+    let pending = pending_chat_turn(t, conversation.id)?
+        .ok_or_else(|| format!("conversation {:?} has no pending turn", conversation.id))?;
+    emit(TurnEvent::PhaseStarted(TurnPhase::Model));
+    let turn = PreparedTurn {
+        human: pending.human,
+        arg_tree: pending.arg_tree,
+    };
+    let outcome = finish_turn(t, conversation.id, &refname, &turn, true, &mut emit)?;
+    publish_completed_user_conversation(
+        t,
+        conversation.user,
+        conversation.id,
+        conversation.title,
+        &turn.arg_tree,
+    )?;
+    emit(TurnEvent::Completed(outcome.clone()));
+    Ok(outcome)
+}
+
+struct PreparedTurn {
+    human: String,
+    arg_tree: String,
+}
+
+/// Mint the human commit and build its exact ArgTree without starting compute.
 ///
 /// `human_tree`, when set, is the tree the human commit carries instead of
 /// inheriting the parent's — this is how a client folds local working-tree
 /// edits into a user-authored turn (the TUI's `/update-tree`).
-fn turn(
+fn prepare_turn(
     t: &GitTransport,
     options: &TurnOptions,
     name: &str,
@@ -1056,7 +1268,11 @@ fn turn(
     message: &str,
     human_tree: Option<&str>,
     emit: &mut dyn FnMut(TurnEvent),
-) -> Result<TurnOutcome, String> {
+) -> Result<PreparedTurn, String> {
+    if message.is_empty() {
+        return Err("empty message".to_string());
+    }
+    emit(TurnEvent::PhaseStarted(TurnPhase::System));
     // Everything that can fail cheaply fails *before* the human commit is
     // minted or anything is pushed.
     let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
@@ -1083,16 +1299,7 @@ fn turn(
                 .resolve_revspec(rev)?
                 .ok_or_else(|| format!("cannot resolve --base {rev:?}"))?
                 .to_string();
-            // `.caos` is the harness's reserved top-level workspace entry
-            // (step transcripts live there): refuse to start a conversation
-            // over a tree that already carries one.
-            if rev_parse_opt(t, &format!("{base}:.caos"))?.is_some() {
-                return Err(
-                    "the base commit's tree contains a top-level `.caos` entry, which \
-                     is reserved for the agent harness; start from a tree without one"
-                        .to_string(),
-                );
-            }
+            refuse_reserved_step_tree(t, &base, "the base commit's tree")?;
             base
         }
     };
@@ -1116,13 +1323,7 @@ fn turn(
     // top-level `.caos` entry.
     let tree = match human_tree {
         Some(tree) => {
-            if rev_parse_opt(t, &format!("{tree}:.caos"))?.is_some() {
-                return Err(
-                    "the working tree contains a top-level `.caos` entry, which is reserved \
-                     for the agent harness; remove it before folding the tree into a turn"
-                        .to_string(),
-                );
-            }
+            refuse_reserved_step_tree(t, tree, "the working tree")?;
             tree.to_string()
         }
         None => t
@@ -1234,66 +1435,101 @@ fn turn(
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
 
-    // Build + push the request (this also pushes the human commit's closure —
-    // the `:commit=` machinery), then trigger the blocking compute on its own
-    // thread: request_compute needs only two strings, so the transport (and
-    // the repo handle) stay on this thread for progress polling.
+    // Build and push the ArgTree, including the human commit's closure. Durable
+    // callers record this hash before they trigger compute.
     let phase = std::time::Instant::now();
     let arg_tree = prepare_request(t, &llm, None, &[format!("--head:commit={human}")])?;
     emit(TurnEvent::PhaseComplete {
         label: "pushing the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
+    Ok(PreparedTurn { human, arg_tree })
+}
+
+fn finish_turn(
+    t: &GitTransport,
+    name: &str,
+    refname: &str,
+    turn: &PreparedTurn,
+    durable: bool,
+    emit: &mut dyn FnMut(TurnEvent),
+) -> Result<TurnOutcome, String> {
+    let human = &turn.human;
+    let arg_tree = &turn.arg_tree;
     emit(TurnEvent::PhaseStarted(TurnPhase::Model));
     let server = t.server_url()?;
-    let run = {
-        let (server, arg_tree) = (server.clone(), arg_tree);
-        std::thread::spawn(move || request_compute(&server, &arg_tree))
-    };
 
     // While the run blocks, follow the worker's per-step progress ref and
     // print each new step (assistant text + one-line tool calls); alongside
     // it, the in-round status ref — what the API call is doing right now —
     // goes to stderr (transient meta, not conversation content).
-    let http = HttpTransport { base: server };
+    let http = HttpTransport {
+        base: server.clone(),
+    };
     let progress_ref = conv_ref(name, FROM_AGENT_CHANNEL);
     let status_ref = conv_ref(name, STATUS_CHANNEL);
     let mut printed: HashSet<String> = HashSet::new();
     let mut last_status: Option<String> = None;
-    while !run.is_finished() {
-        for _ in 0..(POLL_MS / 100) {
+    let (kind, turn_hash) = loop {
+        let run = {
+            let server = server.clone();
+            let arg_tree = arg_tree.clone();
+            std::thread::spawn(move || request_compute(&server, &arg_tree))
+        };
+        while !run.is_finished() {
+            for _ in 0..(POLL_MS / 100) {
+                if run.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             if run.is_finished() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Err(e) = poll_progress(t, &http, &progress_ref, human, &mut printed, emit) {
+                emit(TurnEvent::Status(format!(
+                    "progress poll failed (non-fatal): {e}"
+                )));
+            }
+            // Best-effort by design, like the ref it reads.
+            let _ = poll_status(t, &http, &status_ref, human, &mut last_status, emit);
         }
-        if run.is_finished() {
-            break;
-        }
-        if let Err(e) = poll_progress(t, &http, &progress_ref, &human, &mut printed, emit) {
-            emit(TurnEvent::Status(format!(
-                "progress poll failed (non-fatal): {e}"
-            )));
-        }
-        // Best-effort by design, like the ref it reads.
-        let _ = poll_status(t, &http, &status_ref, &human, &mut last_status, emit);
-    }
 
-    let outcome = run
-        .join()
-        .map_err(|_| "the run thread panicked".to_string())?;
-    let (kind, turn_hash) = match outcome {
-        Ok(result) => result,
-        Err(e) => {
-            // Show whatever steps did land before the failure, then fail; the
-            // conversation ref is untouched (the human commit is harmlessly
-            // orphaned — see design/agent-harness.md).
-            let _ = poll_progress(t, &http, &progress_ref, &human, &mut printed, emit);
-            return Err(format!("turn failed; {refname} was not advanced.\n{e}"));
+        let outcome = run
+            .join()
+            .map_err(|_| "the run thread panicked".to_string())?;
+        match outcome {
+            Ok(result) => break result,
+            Err(error) if durable && compute_connection_error(&error) => {
+                emit(TurnEvent::Status(
+                    "connection lost; reconnecting to the running turn".to_string(),
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(RECONNECT_MS));
+            }
+            Err(error) => {
+                let _ = poll_progress(t, &http, &progress_ref, human, &mut printed, emit);
+                let cleanup = durable
+                    .then(|| clear_pending_chat_turn(t, name, arg_tree))
+                    .transpose()
+                    .err()
+                    .map(|cleanup| format!("\nAdditionally, {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "turn failed; {refname} was not advanced.\n{error}{cleanup}"
+                ));
+            }
         }
     };
     if kind != "commit" {
-        return Err(format!("the run returned a {kind}, expected a commit"));
+        let cleanup = durable
+            .then(|| clear_pending_chat_turn(t, name, arg_tree))
+            .transpose()
+            .err()
+            .map(|cleanup| format!("; {cleanup}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "the run returned a {kind}, expected a commit{cleanup}"
+        ));
     }
 
     // Fetch the turn (and so the whole step chain — it's tree-reachable), then
@@ -1306,7 +1542,7 @@ fn turn(
     // closure (including the base's whole history) every turn.
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
     let phase = std::time::Instant::now();
-    t.fetch_object_negotiated(&turn_hash, &human)?;
+    t.fetch_object_negotiated(&turn_hash, human)?;
     emit(TurnEvent::PhaseComplete {
         label: "fetching the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
@@ -1316,7 +1552,7 @@ fn turn(
         if printed.contains(&tail) {
             show_message = false;
         } else {
-            let _ = drain_steps(&http, &tail, &human, &mut printed, Some(&tail), emit);
+            let _ = drain_steps(&http, &tail, human, &mut printed, Some(&tail), emit);
         }
     }
 
@@ -1329,13 +1565,28 @@ fn turn(
     if show_message {
         emit(TurnEvent::AssistantText(text.trim_end().to_string()));
     }
-    let outcome = TurnOutcome {
+    Ok(TurnOutcome {
         conversation: name.to_string(),
         commit: turn_hash,
         short_commit: short,
-    };
-    emit(TurnEvent::Completed(outcome.clone()));
-    Ok(outcome)
+    })
+}
+
+fn compute_connection_error(error: &str) -> bool {
+    error.starts_with("GET ") && !error.contains(": server returned ")
+}
+
+fn refuse_reserved_step_tree(
+    t: &GitTransport,
+    object: &str,
+    description: &str,
+) -> Result<(), String> {
+    if rev_parse_opt(t, &format!("{object}:.caos"))?.is_some() {
+        return Err(format!(
+            "{description} contains a top-level `.caos` entry, which is reserved for the agent harness"
+        ));
+    }
+    Ok(())
 }
 
 /// An explicit worker-binary override: the flag, else its env var, else `None`
@@ -1718,6 +1969,34 @@ mod tests {
         (root, repo)
     }
 
+    fn pending_arg_tree_for(
+        repo: &std::path::Path,
+        transport: &GitTransport,
+        conversation: &str,
+    ) -> (String, String) {
+        use gix::objs::tree::{Entry, EntryKind};
+
+        let human = git(
+            repo,
+            &[
+                "rev-parse",
+                &format!("refs/caos/conversations/{conversation}/from-user"),
+            ],
+        );
+        let arg_tree = crate::post_tree(
+            transport,
+            vec![Entry {
+                mode: EntryKind::Commit.into(),
+                filename: b"head".to_vec().into(),
+                oid: crate::parse_oid(&human).unwrap(),
+            }],
+        )
+        .unwrap()
+        .to_string();
+        transport.ensure_pushed(&human).unwrap();
+        (human, arg_tree)
+    }
+
     #[test]
     fn conversation_ref_validation_does_not_spawn_git() {
         assert_eq!(
@@ -1725,6 +2004,7 @@ mod tests {
             "refs/caos/conversations/talk-1/from-user"
         );
         assert!(validated_refname("bad name").is_err());
+        assert!(validated_refname("project/pending").is_err());
         assert!(validate_conversation_user("nishadsingh").is_ok());
         assert!(validate_conversation_user("bad user").is_err());
     }
@@ -1804,6 +2084,108 @@ mod tests {
             first_available_conversation_name(["talk-1", "named", "talk-2"]),
             "talk-3"
         );
+    }
+
+    #[test]
+    fn pending_turn_round_trips_flat_arg_tree() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        let (human, arg_tree) = pending_arg_tree_for(&repo, &transport, "first");
+
+        publish_pending_chat_turn(&transport, "first", &arg_tree).unwrap();
+        assert_eq!(
+            pending_chat_turn(&transport, "first").unwrap(),
+            Some(PendingTurn {
+                arg_tree: arg_tree.clone(),
+                human,
+                message: "one".to_string(),
+            })
+        );
+        publish_pending_chat_turn(&transport, "first", &arg_tree).unwrap();
+        let (_other_human, other_arg_tree) = pending_arg_tree_for(&repo, &transport, "second");
+        assert!(publish_pending_chat_turn(&transport, "first", &other_arg_tree).is_err());
+
+        clear_pending_chat_turn(&transport, "first", &arg_tree).unwrap();
+        assert_eq!(pending_chat_turn(&transport, "first").unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_user_turn_publishes_and_clears_pending_atomically() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        let first_ref = "refs/caos/conversations/first/from-user";
+        let second_ref = "refs/caos/conversations/second/from-user";
+        publish_user_conversation(&transport, "alice", "first", "First title").unwrap();
+        let first = git(&repo, &["rev-parse", first_ref]);
+        let (_human, arg_tree) = pending_arg_tree_for(&repo, &transport, "first");
+        publish_pending_chat_turn(&transport, "first", &arg_tree).unwrap();
+        let completed = git(&repo, &["rev-parse", second_ref]);
+        git(&repo, &["update-ref", first_ref, &completed]);
+
+        assert!(publish_completed_user_conversation(
+            &transport,
+            "alice",
+            "first",
+            "Completed title",
+            &first,
+        )
+        .is_err());
+        let active =
+            list_user_conversations(&transport, "alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(active[0].head, first);
+        assert_eq!(active[0].pending.as_ref().unwrap().arg_tree, arg_tree);
+        git(&repo, &["update-ref", first_ref, &completed]);
+
+        publish_completed_user_conversation(
+            &transport,
+            "alice",
+            "first",
+            "Completed title",
+            &arg_tree,
+        )
+        .unwrap();
+        let active =
+            list_user_conversations(&transport, "alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(active[0].head, completed);
+        assert_eq!(active[0].title, "Completed title");
+        assert!(active[0].pending.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_user_conversation_is_visible_before_its_first_turn() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+
+        initialize_user_conversation(&transport, "alice", "fresh", "Fresh title", Some(&base))
+            .unwrap();
+
+        let active =
+            list_user_conversations(&transport, "alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "fresh");
+        assert_eq!(active[0].title, "Fresh title");
+        assert_eq!(active[0].head, base);
+        assert!(active[0].pending.is_none());
+        assert!(conversation_history(&transport, "fresh")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_errors_distinguish_disconnects_from_server_failures() {
+        assert!(compute_connection_error(
+            "GET http://caos/run?req=abc: connection reset"
+        ));
+        assert!(!compute_connection_error(
+            "GET http://caos/run?req=abc: server returned 500 Internal Server Error"
+        ));
+        assert!(!compute_connection_error(
+            "server returned a malformed result"
+        ));
     }
 
     #[test]
@@ -1915,6 +2297,10 @@ mod tests {
             &repo,
             &["update-ref", "refs/caos/conversations/kept/from-user", &c],
         );
+        git(
+            &repo,
+            &["update-ref", "refs/caos/conversations/kept/pending", &c],
+        );
 
         let t = GitTransport::discover(&repo).unwrap();
         migrate_legacy_conversation_refs(&t).unwrap();
@@ -1934,6 +2320,10 @@ mod tests {
         // The already-migrated head is untouched.
         assert_eq!(
             resolve("refs/caos/conversations/kept/from-user").as_deref(),
+            Some(c.as_str())
+        );
+        assert_eq!(
+            resolve("refs/caos/conversations/kept/pending").as_deref(),
             Some(c.as_str())
         );
 
