@@ -441,6 +441,28 @@ impl GitTransport {
         &self.work_dir
     }
 
+    /// Verify that the configured CAOS server accepts connections.
+    ///
+    /// The server deliberately returns 404 at its root, so any HTTP response
+    /// proves reachability. This is a user-facing preflight for interactive
+    /// clients: it fails before they take over the terminal and turns a later,
+    /// low-level Git transport error into one concise diagnosis.
+    pub fn ensure_server_reachable(&self) -> Result<(), String> {
+        const TIMEOUT_SECS: u64 = 5;
+
+        let url = self.server_url()?;
+        minreq::get(url.trim_end_matches('/'))
+            .with_timeout(TIMEOUT_SECS)
+            .send()
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "cannot reach the CAOS server at {url}: {error}\n\
+                     check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
+                )
+            })
+    }
+
     pub(crate) fn git_capture(
         &self,
         args: &[&str],
@@ -3138,6 +3160,43 @@ mod git_transport_tests {
                 .to_string(),
             expected_head
         );
+    }
+
+    #[test]
+    fn unreachable_server_error_names_the_url_and_remote() {
+        let root = TestDir::new("unreachable-server");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        git(&repo, &["remote", "add", CAOS_REMOTE, &url]);
+
+        let error = GitTransport::discover(&repo)
+            .unwrap()
+            .ensure_server_reachable()
+            .unwrap_err();
+
+        assert!(error.contains(&format!("cannot reach the CAOS server at {url}")));
+        assert!(error.contains("check that it is running"));
+        assert!(error.contains("`caos` git remote"));
+    }
+
+    #[test]
+    fn missing_caos_remote_error_explains_how_to_add_it() {
+        let root = TestDir::new("missing-caos-remote");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let error = GitTransport::discover(&repo)
+            .unwrap()
+            .ensure_server_reachable()
+            .unwrap_err();
+
+        assert!(error.contains("no `caos` git remote"));
+        assert!(error.contains("`git remote add caos <server-url>`"));
     }
 
     #[test]
