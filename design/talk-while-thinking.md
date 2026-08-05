@@ -5,7 +5,7 @@ Steer and cancel a running turn. Extends `agent-harness.md`; terms from there
 
 ## Status
 
-- **Done — refs + migration** (Stage 0 below): the four-ref scheme,
+- **Done — refs + migration** (Stage 0 below): the conversation channel scheme,
   `validated_refname` reservation, `list_conversations`, both migrations, and
   their unit tests, in `crates/caos/src/chat.rs` and
   `crates/worker-llm-step/src/progress.rs`. Behaviour-preserving: the turn
@@ -46,7 +46,7 @@ H ← S1 ← S2(⊕Hi1) ← S3(⊕Hi2) ← … ← M    (agent branch; M seals t
 | | user side — client writes | agent side — worker writes |
 |---|---|---|
 | **branch tip** (DAG) | `from-user` | `from-agent` |
-| **sidecar blob** | `title` | `status` |
+| **sidecar** | `title`, `pending` | `status` |
 
 - `from-user` — user branch tip; the client is its sole writer. One ref, three
   phases: **head** (idle, tip = last `M`), **live** (mid-turn, tip = `H`),
@@ -54,10 +54,11 @@ H ← S1 ← S2(⊕Hi1) ← S3(⊕Hi2) ← … ← M    (agent branch; M seals t
 - `from-agent` — agent branch tip (step chain). Today's `-progress`.
 - `status` — in-round telemetry blob `"<H>\n<text>"`; not a DAG commit (updated
   without a commit), so it cannot fold into `from-agent`.
-- Conversation-name validation (`validated_refname`, chat.rs — runs
-  `git check-ref-format` and rejects reserved names) SHALL reject an id whose
-  final segment is a channel name (`from-user`/`from-agent`/`title`/`status`),
-  replacing today's `-progress`/`-status` suffix check.
+- `pending` — the exact in-flight ArgTree. It lets a replacement client rejoin
+  `/run` without rebuilding configuration or minting another `H`.
+- Conversation-name validation (`validated_refname`, chat.rs) SHALL reject an
+  id whose final segment is a channel name (`from-user`/`from-agent`/`title`/
+  `status`/`pending`).
 - Migration: retire bare `<id>`, `<id>/head`, `<id>-progress`, `<id>-status`;
   `list_conversations` = "every `<id>/from-user`, strip suffix". Touches
   `progress.rs`, `chat.rs`, `agent-harness.md`, tests. Existing conversations
@@ -73,8 +74,9 @@ H ← S1 ← S2(⊕Hi1) ← S3(⊕Hi2) ← … ← M    (agent branch; M seals t
 
 ## Delivery
 
-- Content flows as git objects/refs. The only compute trigger is one
-  `GET /run?req=<hash>` per turn (start or restart).
+- Content flows as git objects/refs. The compute trigger is
+  `GET /run?req=<hash>` using the ArgTree recorded at `pending`; reconnects and
+  replacement clients repeat that same request.
 - Interjection = client pushes `from-user`. **No notification.**
 - Cancellation = client resets `from-user`. **No notification.**
 - Rounds are server-driven (`run-then` promise resolution re-invokes the
@@ -87,11 +89,11 @@ H ← S1 ← S2(⊕Hi1) ← S3(⊕Hi2) ← … ← M    (agent branch; M seals t
 
 - Owns `from-user`; never writes `from-agent`/`status`.
 - Turn start: mint `H` (author ≠ `caos-agent`; parent/tree per **User commit**),
-  push, set `from-user=H`, `GET /run`.
+  push, record the ArgTree at `pending`, set `from-user=H`, `GET /run`.
 - Interjection: mint the user commit, push, advance `from-user`.
 - Cancel: reset `from-user` — to the previous `M` (abandon) or a new `H'`
   (restart; new `GET /run`). A failed turn is an abandon.
-- Success: advance `from-user` to `M`.
+- Success: atomically advance `from-user` to `M` and lease-delete `pending`.
 - Poll loop: watch `from-agent` + `status`; read stdin (interactive) / composer
   event (TUI) to interject.
 
@@ -163,9 +165,10 @@ Round boundaries: `start`, `drive`-drain (queue empty → next LLM round),
 
 ## Stages
 
-0. **Refs + migration — DONE.** Four-ref scheme (`from-user`/`from-agent`/
-   `title`/`status`); `validated_refname` rejects ids whose final segment is a
-   channel; `list_conversations` selects `<id>/from-user`; local
+0. **Refs + migration — DONE.** Conversation channels (`from-user`/
+   `from-agent`/`title`/`status`/`pending`); `validated_refname` rejects ids
+   whose final segment is a channel; `list_conversations` selects
+   `<id>/from-user`; local
    (`migrate_legacy_conversation_refs`, at `cli_chat`/`cli_talk`/
    `publish_unindexed_conversations`) and server
    (`migrate_server_conversation_head`, in `list_user_conversations`) migration.

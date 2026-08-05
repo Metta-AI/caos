@@ -305,13 +305,16 @@ Two verbs and a full-screen client over one turn engine (implemented —
   through `gh` against the same branch. This preserves non-conflicting upstream
   work while excluding all prior conversation history. Merely
   opening, running, switching, or publishing conversations never mutates the
-  checkout. Progress remains one completed API round at a time, and a running
-  turn is not cancellable until the server/runner protocol grows cancellation.
+  checkout. The exact ArgTree of a running TUI turn is stored at the
+  conversation's `pending` ref before `/run`; startup and transient connection
+  recovery reissue that hash instead of minting another human turn. Progress
+  remains one completed API round at a time, and a running turn is not
+  cancellable until the server/runner protocol grows cancellation.
 
-A turn creates the human commit → requests the run → hangs, printing progress
-from the ref → on completion advances `refs/caos/conversations/<name>/from-user` (in
-the *local* repo) and prints the response text and short hash. Conversation
-identity is that ref — the only mutable thing, owned by the client. Shared
+A TUI turn creates the human commit → stores its ArgTree at `pending` → requests
+the run → hangs, printing progress from the ref → on completion advances
+`refs/caos/conversations/<name>/from-user` and lease-deletes `pending` in the
+same remote transaction. A restarted client resumes the stored ArgTree. Shared
 flags: `--base <revspec>` (a new conversation's base commit, default `HEAD` —
 refused if its tree carries a top-level `.caos`), `--system <text>` /
 `--system-file <path>` (default: a short coding-agent prompt), `--model`,
@@ -344,17 +347,18 @@ negotiated with the human commit as the sole tip, so the pack is this turn's
 new objects — a no-negotiation fetch re-downloads the base's entire history
 every turn, ~10s of index-pack CPU on a large repo, while a full multi-ref
 negotiation can go multi-round, which the smart-HTTP delegate has been seen
-to break on) and the ref advances; on failure the error prints and the ref
-is untouched —
-the human commit is harmlessly orphaned. `tests/chat-online` runs one tiny real-API
+to break on) and the ref advances. A definite run failure clears `pending`;
+an ambiguous connection or publication failure leaves it recoverable.
+`tests/chat-online` runs one tiny real-API
 turn as part of the regular suite (self-skipped unless `ANTHROPIC_API_KEY` is
 set — the only check the scripted stub can't make).
 
 ## Caching / retry semantics
 
 LLM steps are nondeterministic and effectively never cache-hit (unique
-prompt+tree, plus commit timestamps). This is accepted: retry = new commit
-with a new timestamp, no salt machinery needed. Determinism-based requeue
+prompt+tree, plus commit timestamps). A new user retry creates a new commit;
+a transport reconnect deliberately reuses the pending ArgTree and therefore
+the same computation. Determinism-based requeue
 (deadline_ms) can double-call the API; first-post-wins keeps it correct and
 the cost is accepted for the prototype. A step is one API round, so per-job
 deadlines are comfortable; the top-level pending timeout

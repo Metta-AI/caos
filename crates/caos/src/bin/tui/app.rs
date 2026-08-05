@@ -5,10 +5,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use caos::chat::{
     archive_user_conversation, conversation_history, conversation_workspace_diff,
     describe_tool_set, first_available_conversation_name, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
+    publish_unindexed_conversations, resume_user_chat_turn, run_user_chat_turn,
     set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, TurnPhase, UserConversationStatus, UserConversationSummary,
-    WorkspaceDiff,
+    TurnEvent, TurnOptions, TurnPhase, UserConversationRef, UserConversationStatus,
+    UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -767,6 +767,7 @@ struct ConversationState {
     id: String,
     title: String,
     automatic_title: bool,
+    persisted: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
@@ -792,6 +793,7 @@ impl ConversationState {
             id,
             title,
             automatic_title: false,
+            persisted: true,
             turn_options,
             transcript: Vec::new(),
             activities: Vec::new(),
@@ -815,6 +817,7 @@ impl ConversationState {
     fn new_virtual(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         let mut state = Self::new(id, title, turn_options, status);
         state.automatic_title = true;
+        state.persisted = false;
         state
     }
 
@@ -1182,6 +1185,26 @@ impl App {
         for state in &mut states {
             state.reload(&transport);
         }
+        let mut pending = Vec::new();
+        for (state, summary) in states.iter_mut().zip(&conversations) {
+            if let Some(turn) = &summary.pending {
+                if !state
+                    .transcript
+                    .iter()
+                    .any(|entry| entry.commit.as_deref() == Some(turn.human.as_str()))
+                {
+                    state.transcript.push(TranscriptEntry {
+                        role: EntryRole::Human,
+                        commit: Some(turn.human.clone()),
+                        text: turn.message.clone(),
+                    });
+                }
+                state.running = true;
+                state.turn_phase = TurnPhase::Model;
+                state.status = "reconnecting to running turn".to_string();
+                pending.push((state.id.clone(), state.title.clone()));
+            }
+        }
         let selected_id = if states.iter().any(|state| state.id == selected_name) {
             selected_name.clone()
         } else {
@@ -1205,7 +1228,7 @@ impl App {
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
-        Ok(Self {
+        let app = Self {
             repo_dir,
             user: args.user,
             conversations: states,
@@ -1226,7 +1249,39 @@ impl App {
             focus: Focus::Conversation,
             tx,
             rx,
-        })
+        };
+        app.resume_pending_turns(pending);
+        Ok(app)
+    }
+
+    fn resume_pending_turns(&self, pending: Vec<(String, String)>) {
+        for (conversation, title) in pending {
+            let tx = self.tx.clone();
+            let repo_dir = self.repo_dir.clone();
+            let user = self.user.clone();
+            std::thread::spawn(move || {
+                let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                    let conversation_ref = UserConversationRef {
+                        user: &user,
+                        id: &conversation,
+                        title: &title,
+                    };
+                    resume_user_chat_turn(&transport, &conversation_ref, |event| {
+                        let _ = tx.send(UiMessage::Turn {
+                            conversation: conversation.clone(),
+                            event,
+                        });
+                    })
+                    .map(|_| ())
+                });
+                if let Err(error) = result {
+                    let _ = tx.send(UiMessage::Failed {
+                        conversation,
+                        error,
+                    });
+                }
+            });
+        }
     }
 
     fn selected(&self) -> &ConversationState {
@@ -1521,13 +1576,20 @@ impl App {
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
         let conversation = self.selected().id.clone();
+        let title = self.selected().title.clone();
+        let user = self.user.clone();
         let repo_dir = self.repo_dir.clone();
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                run_chat_turn(
+                let conversation_ref = UserConversationRef {
+                    user: &user,
+                    id: &conversation,
+                    title: &title,
+                };
+                run_user_chat_turn(
                     &transport,
                     &options,
-                    &conversation,
+                    &conversation_ref,
                     &message,
                     human_tree.as_deref(),
                     |event| {
@@ -1597,21 +1659,11 @@ impl App {
     fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
         if let TurnEvent::Completed(outcome) = event {
             let transport = self.transport();
-            let user = self.user.clone();
             let state = &mut self.conversations[index];
             state.running = false;
             state.status = format!("completed {}", outcome.short_commit);
             match transport {
-                Ok(transport) => {
-                    match publish_user_conversation(&transport, &user, &state.id, &state.title) {
-                        Ok(()) => state.reload(&transport),
-                        Err(error) => {
-                            state.push_error(format!(
-                                "publishing completed conversation failed: {error}"
-                            ));
-                        }
-                    }
-                }
+                Ok(transport) => state.reload(&transport),
                 Err(error) => {
                     state.push_error(format!("reloading completed turn failed: {error}"));
                 }
@@ -1621,6 +1673,7 @@ impl App {
 
         let state = &mut self.conversations[index];
         match event {
+            TurnEvent::ConversationSaved => state.persisted = true,
             TurnEvent::PhaseStarted(phase) => state.turn_phase = phase,
             TurnEvent::PhaseComplete {
                 label,
@@ -2252,7 +2305,7 @@ impl App {
         } else {
             None
         };
-        if self.selected().current_hash().is_some() {
+        if self.selected().persisted {
             let result = self.transport().and_then(|transport| {
                 archive_user_conversation(&transport, &self.user, &self.selected().id)
             });
@@ -2288,7 +2341,7 @@ impl App {
                 .show_command_error("conversation title must be one line");
             return;
         }
-        if self.selected().current_hash().is_some() {
+        if self.selected().persisted {
             let id = self.selected().id.clone();
             if let Err(error) = self
                 .transport()
@@ -2478,16 +2531,19 @@ mod tests {
             title: id.to_string(),
             head: "a".repeat(40),
             updated_unix: 1,
+            pending: None,
         }
     }
 
     fn state(name: &str) -> ConversationState {
-        ConversationState::new(
+        let mut state = ConversationState::new(
             name.to_string(),
             name.to_string(),
             TurnOptions::default(),
             "ready".to_string(),
-        )
+        );
+        state.persisted = false;
+        state
     }
 
     /// A throwaway git repo for transport-touching paths, so no test depends
