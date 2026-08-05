@@ -297,13 +297,17 @@ Two verbs and a full-screen client over one turn engine (implemented —
   `Ctrl+P` opens a PR-base prompt and a second press publishes the selected
   workspace without checking it out. It replaces the clean
   `caos/<conversation>` snapshot commit directly above the fetched tip of that
-  base. The default base receives the complete conversation workspace; another
-  base receives only this conversation's delta, allowing a child conversation
-  to stack on its parent's clean snapshot without re-merging the parent layer.
-  Conflicts stop publication and are reported in the command-error panel. CAOS
-  pushes the snapshot with an exact remote lease and opens or finds its open PR
-  through `gh` against the same branch. This preserves non-conflicting upstream
-  work while excluding all prior conversation history. Merely
+  base. First, an ordinary visible agent turn calls the standard `merge` worker
+  with the exact fetched tip, resolves its conflicts in the virtual workspace,
+  and builds/tests the result. The default base receives the complete
+  conversation workspace; another base uses a synthetic merge target rooted at
+  the conversation's starting commit, so a child conversation contributes only
+  its own delta when stacked on its parent's clean snapshot. Publishing guards
+  that the target is reachable and no conflict rows or text markers remain,
+  then strips `.caos`, pushes the one-commit snapshot with an exact remote
+  lease, and opens or finds its open PR through `gh` against the same branch.
+  This preserves non-conflicting upstream work while excluding all prior
+  conversation history. Merely
   opening, running, switching, or publishing conversations never mutates the
   checkout. Progress remains one completed API round at a time, and a running
   turn is not cancellable until the server/runner protocol grows cancellation.

@@ -385,6 +385,11 @@ is choosing between. (Tree-oid listing is a cheap optional companion.)
 - The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
   remaining marker is PUBLISH (the tui's PR flow) — the moment work actually
   leaves the conversation.
+- The tui's PR flow fetches the selected base tip, pushes that exact snapshot
+  to caos, and runs an ordinary visible agent turn instructing the agent to use
+  `merge` and resolve/test the result. Only that resolved workspace is
+  snapshotted for the PR; publish verifies the target is reachable, applies the
+  conflict guard above, and strips `.caos` from the outgoing tree.
 
 ## Caveat
 

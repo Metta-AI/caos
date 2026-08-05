@@ -20,7 +20,7 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::workspace::{
     commit_working_tree, load_conversation_workspace, local_default_branch_tip,
-    publish_conversation_pr, remote_default_branch,
+    prepare_publish_target, publish_conversation_pr, remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -933,6 +933,26 @@ impl ConversationState {
         )
     }
 
+    fn begin_turn(&mut self, message: &str, apply_automatic_title: bool) {
+        if apply_automatic_title {
+            self.apply_automatic_title(message);
+        }
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text: message.to_string(),
+        });
+        self.activities.clear();
+        self.activity_selection = None;
+        self.activity_detail_scroll = 0;
+        self.running = true;
+        self.sidebar_attention = None;
+        self.turn_phase = TurnPhase::System;
+        self.status = "starting turn".to_string();
+        self.follow_tail();
+        self.transcript_selection = None;
+    }
+
     fn running_activity(&self) -> Option<&Activity> {
         self.activities
             .iter()
@@ -959,6 +979,10 @@ impl ConversationState {
 }
 
 enum UiMessage {
+    PublishTurnStarted {
+        conversation: String,
+        message: String,
+    },
     Turn {
         conversation: String,
         event: TurnEvent,
@@ -1606,6 +1630,14 @@ impl App {
         while let Ok(message) = self.rx.try_recv() {
             changed = true;
             match message {
+                UiMessage::PublishTurnStarted {
+                    conversation,
+                    message,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.conversations[index].begin_turn(&message, false);
+                    }
+                }
                 UiMessage::Turn {
                     conversation,
                     event,
@@ -1649,6 +1681,7 @@ impl App {
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.publishing = false;
+                        state.running = false;
                         match result {
                             Ok(url) => state.push_info(format!("PR ready: {url}")),
                             Err(error) => {
@@ -2488,10 +2521,31 @@ impl App {
                 .clone()
                 .expect("a non-empty diff was checked");
             self.selected_mut().publishing = true;
-            self.selected_mut().status = "publishing a clean conversation branch".to_string();
+            self.selected_mut().status = "fetching the selected PR base".to_string();
             let tx = self.tx.clone();
+            let options = self.selected().turn_options.clone();
+            let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
-                let result = publish_conversation_pr(&name, &diff, &pr_base, &default_base);
+                let result = (|| {
+                    let target = prepare_publish_target(&diff, &pr_base, &default_base, &repo_dir)?;
+                    let transport = GitTransport::discover(&repo_dir)?;
+                    transport.ensure_pushed(&target.merge_commit)?;
+
+                    let message = publish_merge_prompt(&pr_base, &target.merge_commit);
+                    let _ = tx.send(UiMessage::PublishTurnStarted {
+                        conversation: name.clone(),
+                        message: message.clone(),
+                    });
+                    run_chat_turn(&transport, &options, &name, &message, None, |event| {
+                        let _ = tx.send(UiMessage::Turn {
+                            conversation: name.clone(),
+                            event,
+                        });
+                    })?;
+
+                    let merged = conversation_workspace_diff(&transport, &name)?;
+                    publish_conversation_pr(&name, &merged, &pr_base, &target, &repo_dir)
+                })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
                     result,
@@ -2499,6 +2553,15 @@ impl App {
             });
         }
     }
+}
+
+fn publish_merge_prompt(pr_base: &str, merge_commit: &str) -> String {
+    format!(
+        "Prepare this conversation for a pull request against `{pr_base}`. Use the `merge` tool \
+         with `theirs` set exactly to `{merge_commit}`. Resolve every conflict it reports, \
+         deleting each resolved path's rows from `.caos/conflicts`, then run the repository's \
+         build and tests. Do not finish until the workspace is ready to publish."
+    )
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -4112,6 +4175,39 @@ mod tests {
         assert!(app.drain_messages());
         assert_eq!(app.conversations[0].status, "running a tool");
         assert_eq!(app.selected().id, "talk-2");
+    }
+
+    #[test]
+    fn publish_preparation_is_a_visible_agent_turn() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        let (mut app, tx) = app_with(vec![conversation]);
+        let message = publish_merge_prompt("main", &"a".repeat(40));
+
+        tx.send(UiMessage::PublishTurnStarted {
+            conversation: "talk-1".to_string(),
+            message: message.clone(),
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+
+        let state = app.selected();
+        assert!(state.publishing);
+        assert!(state.running);
+        assert_eq!(state.transcript.last().unwrap().role, EntryRole::Human);
+        assert_eq!(state.transcript.last().unwrap().text, message);
+        assert!(state
+            .transcript
+            .last()
+            .unwrap()
+            .text
+            .contains("`merge` tool"));
+        assert!(state
+            .transcript
+            .last()
+            .unwrap()
+            .text
+            .contains(&"a".repeat(40)));
     }
 
     #[test]
