@@ -7,25 +7,23 @@ starts).
 ## Problem
 
 Some tools need secrets: the github-push tool needs an auth token, and there
-will be many like it. But caos is built on **content-addressed, cached arg
-trees**, and a secret is exactly the thing that must not enter a
-content-addressed store or a cache key. So the value must stay out of the
-tree; only the secret's *identity* may appear.
+will be many like it. But:
+- we don't want secrets in content-addressed stores, where they might leak
+- we don't want secrets in keys, because we don't want to invalidate (most) keys if a secret is rotated
+- we don't want secrets in one worker/arg tree to be able to be read from it by another worker
 
-## No secret arg kind
+## Solution
 
-We considered `--foo:secret=bar`. Rejected. If no arg kind ever carries a
-secret value, then **no secret value can ride in an arg tree**, so there is no
-delegation-by-passing: a worker cannot hand a token to a sub-run, because the
-only channel would be an arg, and args are hashed and cached. Entitlement is
-therefore **always per-identity, never transitive** — a child that needs
-github must itself be entitled; it can't be lent the value by its parent. Same
-discipline as removing `std`: capability doesn't leak downhill through
-composition.
+- Secrets live in a git-ignored .caos-secrets directory
+- Each secret file contains the secret's value and a list of partial arg trees
+- A partial arg tree is described as a path to tree in git, which is evaluated with `caos eval-path`
+- A secret is visible to a worker if the worker's arg tree is a superset of one of the arg trees of the secret 
+- If a secret is visible to a worker, it is injected into a worker in `/secret/<name>`
+- We attempt to scrub secret values from the logs of workers
+- We attempt to check files that are added to git with `caos put` for secret values. Any new file (hash not in git) that contains the value of a secret that is visible to this worker is rejected
+- The names of all secrets visible to a worker are included in the worker's cache key, but not the values. This means that a worker's result must not depend on the secret's value. For example, a worker can fail with an invalid secret, but it should not return a list of things, filtered to what is visible to this secret's account
 
-Consequence to accept: a generic authenticated-conduit worker (a shared
-`http-post` many tools route through) cannot work — the code that touches the
-plaintext must be the code that is entitled.
+## Bot version follows
 
 ## Declaration: secrets as deps
 
