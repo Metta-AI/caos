@@ -24,6 +24,9 @@ nix build
 ```
 
 During development, launch it with `cargo run -p caos --bin caos-cli -- tui`.
+The TUI checks the configured server before entering the alternate screen. If
+it cannot connect within five seconds, it exits with the server URL and asks
+you to check the running service and the `caos` git remote.
 
 ```text
 caos tui                  continue the most recent conversation

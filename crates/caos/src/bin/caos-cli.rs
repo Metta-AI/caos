@@ -138,6 +138,20 @@ fn run(args: &[String]) -> Result<(), String> {
         // job over this repo's tree: what an agent's tool invocation does,
         // callable by hand. See `caos::cli_run_tool` for the result conventions.
         Some("run-tool") => caos::cli_run_tool(&transport()?, &args[2..]),
+        // `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files
+        // from the tree root down to <path> and print the result's
+        // "<kind> <hash>". With no --tree, the tracked workspace tree is the
+        // start. See design/caos-expr.md.
+        Some("eval-path") => {
+            let (tree, path) = match &args[2..] {
+                [path] => (None, path.as_str()),
+                [flag, path] if flag.starts_with("--tree=") => {
+                    (Some(&flag["--tree=".len()..]), path.as_str())
+                }
+                _ => return Err(usage(args)),
+            };
+            caos::cli_eval_path(&transport()?, tree, path)
+        }
         // `get <hash> <path>` — check a result out on the host, the escape
         // hatch from laziness. `run-tool` prints a hash and materializes
         // nothing, which is right for the common case and useless when you
@@ -176,6 +190,7 @@ fn usage(args: &[String]) -> String {
          {prog} tui [--new | --from <commit>] [options]\n  \
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
+         {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>"
     )
 }

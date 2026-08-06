@@ -172,7 +172,27 @@ pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<()
 ///
 /// Like `map_then`, this is a worker's *final act*: it produces `/cas/out`, so
 /// call it once, in tail position.
+///
+/// [`run_then_catching`] is the same call with a failing `run` turned into a
+/// value for `then` instead of an error that propagates.
 pub fn run_then(input: &str, run: &str, then: Option<&str>) -> Result<(), String> {
+    run_then_inner(input, run, then, false)
+}
+
+/// [`run_then`] with `--catch`: if the sub-run FAILS, the server calls
+/// `then(--in=<input>, --error=<blob>)` — the blob holding the failure text,
+/// in place of `--result` — and the request succeeds. `then` is required (an
+/// error needs a recipient), and the enclosing request is left uncached so a
+/// retry genuinely retries.
+///
+/// For drivers that must outlive their callees. The agent loop is the case this
+/// exists for: a tool that dies has to come back to the model as an `is_error`
+/// tool_result it can read and react to, not take the whole turn down with it.
+pub fn run_then_catching(input: &str, run: &str, then: &str) -> Result<(), String> {
+    run_then_inner(input, run, Some(then), true)
+}
+
+fn run_then_inner(input: &str, run: &str, then: Option<&str>, catch: bool) -> Result<(), String> {
     let mut argv: Vec<String> = vec![
         "run-then".into(),
         input.into(),
@@ -181,6 +201,9 @@ pub fn run_then(input: &str, run: &str, then: Option<&str>) -> Result<(), String
     ];
     if let Some(then) = then {
         argv.push(format!("--then={then}"));
+    }
+    if catch {
+        argv.push("--catch".into());
     }
     caos_argv(&str_refs(&argv))
 }

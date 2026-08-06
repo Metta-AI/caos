@@ -43,8 +43,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, entries, file_name, link, own_args_tree, path,
-    read_arg, read_arg_opt, read_commit, run_then, run_worker, scratch, write_commit_as, Arg,
-    Commit,
+    read_arg, read_arg_opt, read_commit, run_then_catching, run_worker, scratch, write_commit_as,
+    Arg, Commit,
 };
 
 /// Author name on step and turn commits — and how the conversation walk tells
@@ -102,11 +102,12 @@ impl Config {
 }
 
 /// Two positions, told apart by the args present: `--result` (run-then calling
-/// us back with a tool's result) is the callback; otherwise this is the start
-/// of a turn.
+/// us back with a tool's result) or `--error` (calling us back with a tool's
+/// FAILURE, via `run-then --catch`) is the callback; otherwise this is the
+/// start of a turn.
 fn run() -> Result<(), String> {
     let cfg = Config::read()?;
-    if Path::new(&arg("result")).exists() {
+    if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
         callback(&cfg)
     } else {
         start(&cfg)
@@ -170,6 +171,39 @@ fn callback(cfg: &Config) -> Result<(), String> {
     // Fold the tool's outcome into a tool_result block the model will see,
     // and establish (ws, wc) the queue continues over.
     let current_tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
+
+    // The sub-run FAILED and `run-then --catch` handed us the failure instead of
+    // killing the turn. There is no result to fold and no workspace to advance:
+    // the pre-call `ws`/`wc` rode our own curry, so the queue continues from
+    // exactly where it stood, and the model gets an is_error tool_result it can
+    // read and react to — the whole point of catching (design/agent-harness.md,
+    // "Tool failures are values, not errors"). Infrastructure failures used to
+    // land here as a dead turn; now only the tool call is dead.
+    if Path::new(&arg("error")).exists() {
+        let text = read_arg("error")?;
+        results.push(json!({
+            "type": "tool_result",
+            "tool_use_id": current_id,
+            "is_error": true,
+            "content": [{"type": "text", "text": format!(
+                "the `{current_tool}` tool failed to run: {}\n\nThe workspace is unchanged. \
+                 This is the tool itself failing, not a non-zero exit from your command.",
+                text.trim_end()
+            )}],
+        }));
+        let ws = arg("ws");
+        caos(["get", &ws])?;
+        return drive(
+            cfg,
+            ws,
+            arg("wc"),
+            &head_hash,
+            &arg("step"),
+            &pending,
+            results,
+        );
+    }
+
     let (ws, wc) = match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -573,9 +607,12 @@ fn launch(
         pending,
         results,
         id,
-        &[("current-tool", Arg::Lit("bash"))],
+        // `ws` rides even though a SUCCESSFUL bash callback takes the workspace
+        // from `result/tree`: a CAUGHT failure has no result tree, and the queue
+        // has to continue from the workspace as it stood before the call.
+        &[("current-tool", Arg::Lit("bash")), ("ws", Arg::Path(ws))],
     )?;
-    run_then(&in_path, &cfg.bash_image, Some(&me))
+    run_then_catching(&in_path, &cfg.bash_image, &me)
 }
 
 /// Launch a `merge` call as a run-then sub-run of the git-bearing merge worker
@@ -617,9 +654,11 @@ fn launch_merge(
         pending,
         results,
         id,
-        &[("current-tool", Arg::Lit("merge"))],
+        // As in `launch`: the success path rebuilds the workspace from the
+        // merge commit, but a caught failure continues from this `ws`.
+        &[("current-tool", Arg::Lit("merge")), ("ws", Arg::Path(ws))],
     )?;
-    run_then(ws, &curried, Some(&me))
+    run_then_catching(ws, &curried, &me)
 }
 
 /// Launch a grep as a run-then sub-run of the rgrep fold worker: the input is
@@ -662,7 +701,7 @@ fn launch_grep(
             ("scope", Arg::Lit(scope_prefix)),
         ],
     )?;
-    run_then(scope, &curried, Some(&me))
+    run_then_catching(scope, &curried, &me)
 }
 
 /// Launch a tree tool (`caos-tools/<name>.sh`, already resolved in the current
@@ -706,7 +745,7 @@ fn launch_tree_tool(
         id,
         &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
     )?;
-    run_then(ws, &curried, Some(&me))
+    run_then_catching(ws, &curried, &me)
 }
 
 /// Rebuild ourselves as the `then` for the next round — the same ArgTree we're
@@ -750,6 +789,10 @@ fn self_curry(
         "scope",
         "in",
         "result",
+        // run-then's other call arg: bound instead of `result` when `--catch`
+        // delivered a failure. Unbound here like `result`, or the next call
+        // would inherit a stale error and re-report it.
+        "error",
     ];
     let unbind: Vec<&str> = MANAGED
         .iter()

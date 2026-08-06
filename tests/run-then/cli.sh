@@ -4,9 +4,11 @@
 # (tests/lib/run-test.sh).
 #
 # Exercises run-then — the single-valued map-then (the continuation
-# `{in, run?, then?}`): a plain tail call (--run only), the sub-run's result
-# threading into `then` as --result, a nested promise from the run position,
-# the client-side --map/--run mutual exclusion, and run-cycle detection. The
+# `{in, run?, then?, catch?}`): a plain tail call (--run only), the sub-run's
+# result threading into `then` as --result, a nested promise from the run
+# position, the client-side flag validation, run-cycle detection, and `--catch`
+# — a failing run delivered to `then` as --error instead of failing the request,
+# with the uncaught case asserted alongside it so the default cannot drift. The
 # workers are curried bash scripts (see the *.sh fixtures), so no new images
 # are needed.
 set -euo pipefail
@@ -59,6 +61,30 @@ echo "== --map/--run exclusivity and missing --run are rejected client-side ==" 
 ok=$("$CAOS_CLI" run /cas/std/bash -- --worker1:@=test/checks.sh --in:@=in.txt)
 [ "$ok" = "ok" ] || fail "checks.sh did not pass: $ok"
 echo "  ok: bad flag combinations refused before anything is recorded" >&2
+
+echo "== without --catch, a failing run fails the whole request ==" >&2
+# The default, asserted so `--catch` below can't quietly become the behaviour
+# everywhere: a pipeline that loses a step has no business reporting success.
+boom=$("$CAOS_CLI" curry /cas/std/bash -- --worker1:@=test/boom.sh)
+catcher=$("$CAOS_CLI" curry /cas/std/bash -- --worker1:@=test/catcher.sh)
+uncaught_driver=$("$CAOS_CLI" curry /cas/std/bash -- \
+  --worker1:@=test/driver.sh --run-img="$boom" --then-img="$catcher")
+if "$CAOS_CLI" run "$uncaught_driver" -- --in:@=in.txt 2>boom.err; then
+  fail "expected the failing run to fail the request, but it succeeded"
+fi
+grep -q "exit status: 1" boom.err \
+  || fail "no worker failure reported; got: $(cat boom.err)"
+echo "  ok: the run's failure propagated" >&2
+
+echo "== with --catch, the failure reaches then as --error ==" >&2
+# Same failing run, same then — only the flag differs, so what changes is the
+# interpreter's handling and nothing else.
+caught_driver=$("$CAOS_CLI" curry /cas/std/bash -- \
+  --worker1:@=test/driver.sh --run-img="$boom" --then-img="$catcher" --catch=1)
+c=$("$CAOS_CLI" run "$caught_driver" -- --in:@=in.txt) \
+  || fail "expected --catch to make the request succeed"
+[ "$c" = "in=21 caught=yes" ] || fail "expected 'in=21 caught=yes', got: $c"
+echo "  ok: then ran with --in and --error, and the request succeeded" >&2
 
 echo "== a run-then cycle is detected (by the server) ==" >&2
 # cycle.sh re-curries itself (content-addressed, so the sub-request is

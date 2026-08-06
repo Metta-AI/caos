@@ -1,0 +1,19 @@
+[package]
+name = "worker-deep-deps"
+version = "0.1.0"
+edition = "2021"
+
+# deep-deps: restructure a tree so every directory that declares dependencies
+# carries them, deepened, inside itself (design/caos-expr.md). A directory's
+# `DEPS` file lists one dependency per line as `<path> <name>`, the path
+# relative to the DEPS file's own directory (so `../..` reaches parents) and the
+# name the mount under `DEEP-DEPS/`. The whole tree is walked; the recursion runs
+# as server-resolved map-then promises and caches per (subtree, subgraph).
+# Builds to a static binary that runs as curry(runner, worker1) in the shared
+# runner pool.
+[dependencies]
+worker-common = { path = "../worker-common" }
+
+[[bin]]
+name = "worker-deep-deps"
+path = "src/main.rs"

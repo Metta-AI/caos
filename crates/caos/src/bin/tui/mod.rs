@@ -227,6 +227,7 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     let args = Args::parse(raw)?;
     if args.list_archived || args.unarchive.is_some() {
         let transport = GitTransport::from_cwd()?;
+        transport.ensure_server_reachable()?;
         publish_unindexed_conversations(&transport, &args.user)?;
         if args.list_archived {
             for conversation in
@@ -243,6 +244,7 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("requires an interactive terminal; use `caos talk` for pipes".to_string());
     }
+    GitTransport::from_cwd()?.ensure_server_reachable()?;
     let mut app = App::new(args)?;
 
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;
