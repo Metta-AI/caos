@@ -66,9 +66,7 @@ EOF
 commit "secrets fixtures"
 
 echo "== a granted secret is injected; a non-matching one is not ==" >&2
-out=$("$CAOS_CLI" run /cas/std/bash -- --worker1:@=check.sh) || fail "run failed: $out"
-hash=${out##* }
-"$CAOS_CLI" get "$hash" got || fail "get $hash"
+out=$("$CAOS_CLI" run /cas/std/bash got -- --worker1:@=check.sh) || fail "run failed: $out"
 verdict=$(cat got/verdict)
 [ "$verdict" = "token-ok locked-absent" ] \
   || fail "verdict: $verdict (expected 'token-ok locked-absent')"
