@@ -129,6 +129,9 @@ struct RunnerJob {
     arg_tree: String,
     nonce: String,
     token: Option<String>,
+    /// Secrets the server granted this job (design/secrets.md): name → value.
+    /// Dropped at `/secret/<name>` for the worker, out of band from its args.
+    secrets: Vec<(String, String)>,
 }
 
 impl RunnerJob {
@@ -145,10 +148,23 @@ impl RunnerJob {
         if arg_tree.is_empty() || nonce.is_empty() {
             return Err("job missing req/nonce".to_string());
         }
+        let secrets = match v.get("secrets") {
+            Some(serde_json::Value::Object(map)) => map
+                .iter()
+                .map(|(name, value)| {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| format!("secret {name:?} value is not a string"))?;
+                    Ok((name.clone(), value.to_string()))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            _ => Vec::new(),
+        };
         Ok(RunnerJob {
             arg_tree,
             nonce,
             token: field("token").map(str::to_string),
+            secrets,
         })
     }
 }
