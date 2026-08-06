@@ -95,16 +95,19 @@ scoped to the Git repository it is launched from. Its transcript scrolls
 independently while the composer stays pinned to the bottom of the window.
 
 ```bash
-cargo run --manifest-path desktop/src-tauri/Cargo.toml
+nix run .#caos-desktop
 ```
 
-See [`desktop/README.md`](desktop/README.md) for environment overrides and the
-current CLI-parity scope.
+Build it without launching with `nix build .#caos-desktop`. The desktop remains
+a separate Cargo workspace, and bare `nix build` continues to build only the
+CLI and daemon host tools. See [`desktop/README.md`](desktop/README.md) for the
+direct Cargo command, environment overrides, and current CLI-parity scope.
 
 ## Building
 
 ```bash
 nix build .#caos              # ./result/bin/{caos,caos-cli}
+nix build .#caos-desktop      # ./result/bin/caos-desktop
 nix build .#server            # ./result/bin/server
 ```
 
