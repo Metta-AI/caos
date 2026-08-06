@@ -218,10 +218,53 @@ fn run_runner_job(
         (caos::STD_ENV, std.as_deref().unwrap_or("")),
         (caos::SALT_ENV, salt.as_str()),
     ];
-    run_worker(&envs)?;
+    // Drop the granted secrets at `/secret/<name>` just before the worker runs
+    // (design/secrets.md). `write_secrets` wipes any prior job's `/secret`
+    // first, so a warm runner never leaks a secret into a later job that wasn't
+    // granted it.
+    write_secrets(&job.secrets)?;
+    let ran = run_worker(&envs);
+    // Remove the secrets whether the worker passed or failed; the next job's
+    // `write_secrets` also wipes, but don't leave plaintext around meanwhile.
+    remove_secrets();
+    ran?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
     Ok(result)
+}
+
+/// In-container directory the runner drops granted secrets into, one file per
+/// secret, for the worker to read (design/secrets.md, `/secret/<name>`).
+const SECRET_DIR: &str = "/secret";
+
+/// Write `secrets` (name → value) into `/secret/<name>`, wiping any prior
+/// contents first. Written root-owned but world-readable so the unprivileged
+/// worker can read them; a name with a path separator is rejected (it must be a
+/// single file component).
+fn write_secrets(secrets: &[(String, String)]) -> Result<(), String> {
+    remove_secrets();
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(SECRET_DIR)
+        .map_err(|e| format!("creating {SECRET_DIR}: {e}"))?;
+    std::fs::set_permissions(SECRET_DIR, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {SECRET_DIR}: {e}"))?;
+    for (name, value) in secrets {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(format!("secret name {name:?} is not a single path component"));
+        }
+        let path = format!("{SECRET_DIR}/{name}");
+        std::fs::write(&path, value).map_err(|e| format!("writing secret {name}: {e}"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .map_err(|e| format!("chmod secret {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Remove `/secret` and everything in it. Succeeds if it's already gone.
+fn remove_secrets() {
+    let _ = std::fs::remove_dir_all(SECRET_DIR);
 }
 
 /// Unpack an ArgTree: its hash (returned back for `/cas/args`), the std tree hash
