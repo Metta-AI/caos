@@ -14,13 +14,19 @@ will be many like it. But:
 
 ## Solution
 
+`.caos-secrets`:
 - Secrets live in a git-ignored .caos-secrets directory
 - Each secret file contains the secret's value and a list of partial arg trees
 - A partial arg tree is described as a path to tree in git, which is evaluated with `caos eval-path`
 - A secret is visible to a worker if the worker's arg tree is a superset of one of the arg trees of the secret 
+
+Worker experience:
 - If a secret is visible to a worker, it is injected into a worker in `/secret/<name>`
 - We attempt to scrub secret values from the logs of workers
 - We attempt to check files that are added to git with `caos put` for secret values. Any new file (hash not in git) that contains the value of a secret that is visible to this worker is rejected
+
+Server behavior:
+- When dispatching a work request, at the same time that the server selects a runner based on the closest match of the arg tree, the server also finds all secrets that list arg trees that are subsets of the worker's arg tree, and provides them to the runner
 - The names of all secrets visible to a worker are included in the worker's cache key, but not the values. This means that a worker's result must not depend on the secret's value. For example, a worker can fail with an invalid secret, but it should not return a list of things, filtered to what is visible to this secret's account
 
 ## Bot version follows
