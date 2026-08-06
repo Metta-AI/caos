@@ -319,7 +319,12 @@ fn run_dispatch(
             Some(entries) => entries,
             None => args_entries(config, arg_tree).map_err(fail)?,
         };
-        crate::runner::dispatch(arg_tree, arg_entries, &image_ref).map_err(fail)?
+        // Find the secrets this job's identity is entitled to (design/secrets.md):
+        // readers whose partial arg tree is a subset of ours. They ride out of
+        // band in the job payload — never in the ArgTree, so never in the cache
+        // key — and the container runner drops them at `/secret/<name>`.
+        let secrets = crate::secrets::for_job(config, std, &arg_entries);
+        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, secrets).map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
