@@ -258,6 +258,25 @@ pub struct ConversationTurn {
     pub message: String,
 }
 
+/// Durable step events associated with one completed agent turn.
+///
+/// The clean conversation spine deliberately omits intermediate model text
+/// and tool activity. Those records remain reachable through the turn
+/// commit's second-parent step chain and can be replayed by richer clients.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationTurnEvents {
+    pub turn_commit: String,
+    pub events: Vec<TurnEvent>,
+}
+
+/// A conversation's clean turns plus the durable events behind each agent
+/// turn, all ordered oldest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationReplay {
+    pub turns: Vec<ConversationTurn>,
+    pub turn_events: Vec<ConversationTurnEvents>,
+}
+
 /// A locally-known conversation ref, ordered newest-first by
 /// [`list_conversations`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -995,6 +1014,27 @@ pub fn conversation_history(t: &GitTransport, name: &str) -> Result<Vec<Conversa
     history_from_head(t, &head).map(|(turns, _base)| turns)
 }
 
+/// Read the clean conversation and replay every completed turn's durable step
+/// events. Transient phase and status updates are not stored and therefore do
+/// not appear here.
+pub fn conversation_replay(t: &GitTransport, name: &str) -> Result<ConversationReplay, String> {
+    let refname = validated_refname(name)?;
+    let head = rev_parse_opt(t, &refname)?
+        .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
+    let (turns, _base) = history_from_head(t, &head)?;
+    let turn_events = turns
+        .iter()
+        .filter(|turn| turn.role == ConversationRole::Agent)
+        .map(|turn| {
+            replay_turn_events(t, &turn.commit).map(|events| ConversationTurnEvents {
+                turn_commit: turn.commit.clone(),
+                events,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConversationReplay { turns, turn_events })
+}
+
 /// Diff the conversation's current workspace against the commit it started
 /// from. This operation is side-effect free; clients own any policy for
 /// applying or publishing the returned change.
@@ -1611,6 +1651,44 @@ fn step_json(http: &HttpTransport, tree: &str) -> Result<Value, String> {
     serde_json::from_slice(&content).map_err(|e| format!("parsing step.json: {e}"))
 }
 
+/// Replay one completed turn's local step chain. Completed conversation heads
+/// fetch this chain through the turn commit's second parent, so unlike live
+/// progress polling all objects are available through ordinary git reads.
+fn replay_turn_events(t: &GitTransport, turn_commit: &str) -> Result<Vec<TurnEvent>, String> {
+    let human = rev_parse_opt(t, &format!("{turn_commit}^1"))?
+        .ok_or_else(|| format!("agent turn {turn_commit} has no human parent"))?;
+    let Some(tail) = rev_parse_opt(t, &format!("{turn_commit}^2"))? else {
+        return Ok(Vec::new());
+    };
+    let mut chain = Vec::new();
+    let mut cur = tail.clone();
+    while cur != human {
+        let author = t
+            .git_capture(&["show", "-s", "--format=%an", &cur], None)?
+            .trim()
+            .to_string();
+        if author != AGENT_AUTHOR {
+            return Err(format!(
+                "step chain for turn {turn_commit} reached non-agent commit {cur}"
+            ));
+        }
+        let spec = format!("{cur}:.caos/step.json");
+        let step = t.git_capture(&["show", &spec], None)?;
+        let step =
+            serde_json::from_str(&step).map_err(|error| format!("parsing {spec}: {error}"))?;
+        chain.push((cur.clone(), step));
+        cur = rev_parse_opt(t, &format!("{cur}^"))?.ok_or_else(|| {
+            format!("step chain for turn {turn_commit} ended before its human parent")
+        })?;
+    }
+
+    let mut events = Vec::new();
+    for (hash, step) in chain.into_iter().rev() {
+        emit_step(&step, &hash, hash == tail, &mut |event| events.push(event));
+    }
+    Ok(events)
+}
+
 /// Decode one durable step into frontend events. Thinking blocks stay private.
 fn emit_step(
     step: &Value,
@@ -1907,6 +1985,111 @@ mod tests {
                 content: "failed".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn conversation_replay_restores_durable_step_events() {
+        let (root, repo) = conversation_repo();
+        git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "Inspect it"],
+        );
+        let human = git(&repo, &["rev-parse", "HEAD"]);
+
+        std::fs::create_dir(repo.join(".caos")).unwrap();
+        std::fs::write(
+            repo.join(".caos/step.json"),
+            serde_json::to_vec(&json!({
+                "v": 1,
+                "results": [],
+                "content": [
+                    {"type": "text", "text": "Looking now."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read",
+                        "input": {"file_path": "README.md"}
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        git(&repo, &["add", ".caos/step.json"]);
+        git(&repo, &["config", "user.name", AGENT_AUTHOR]);
+        git(&repo, &["config", "user.email", "caos@caos"]);
+        git(&repo, &["commit", "--quiet", "-m", "step one"]);
+        let first_step = git(&repo, &["rev-parse", "HEAD"]);
+
+        std::fs::write(
+            repo.join(".caos/step.json"),
+            serde_json::to_vec(&json!({
+                "v": 1,
+                "results": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "is_error": false,
+                    "content": "README contents"
+                }],
+                "content": [{"type": "text", "text": "Done."}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        git(&repo, &["commit", "--quiet", "-am", "step two"]);
+        let final_step = git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{final_step}^")]),
+            first_step
+        );
+
+        let pure_tree = git(&repo, &["rev-parse", &format!("{human}^{{tree}}")]);
+        let turn = git(
+            &repo,
+            &[
+                "commit-tree",
+                &pure_tree,
+                "-p",
+                &human,
+                "-p",
+                &final_step,
+                "-m",
+                "Done.",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "update-ref",
+                "refs/caos/conversations/replay/from-user",
+                &turn,
+            ],
+        );
+
+        let replay =
+            conversation_replay(&GitTransport::discover(&repo).unwrap(), "replay").unwrap();
+        assert_eq!(replay.turns.len(), 2);
+        assert_eq!(replay.turn_events.len(), 1);
+        assert_eq!(replay.turn_events[0].turn_commit, turn);
+        assert_eq!(
+            replay.turn_events[0].events,
+            vec![
+                TurnEvent::AssistantText("Looking now.".to_string()),
+                TurnEvent::ToolCall {
+                    step_commit: first_step,
+                    tool_use_id: "tool-1".to_string(),
+                    name: "read".to_string(),
+                    summary: "read README.md".to_string(),
+                },
+                TurnEvent::ToolResult {
+                    step_commit: final_step,
+                    tool_use_id: "tool-1".to_string(),
+                    is_error: false,
+                    content: "README contents".to_string(),
+                },
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

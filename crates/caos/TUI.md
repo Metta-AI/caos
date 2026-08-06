@@ -145,9 +145,10 @@ verb such as `Thinking…`, `Reading…`, or `Running…` and the current operat
 `Ctrl+A` remains an alias. Up and Down select durable harness steps, and the
 pane beside the list shows the selected step's complete result. Scroll long
 results with PageUp, PageDown, or the mouse wheel. Escape or `Ctrl+T` returns
-to the conversation. If the selection is already on the newest step, new
-activity remains selected. Moving to an older step pauses that tail-follow
-behavior.
+to the conversation. Completed activity is reconstructed from the durable
+step chain when the TUI restarts. If the selection is already on the newest
+step, new activity remains selected. Moving to an older step pauses that
+tail-follow behavior.
 
 Archiving atomically moves only the selected user's membership ref from
 `active` to `archived`; it does not move the conversation HEAD or affect other
