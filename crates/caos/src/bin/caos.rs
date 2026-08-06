@@ -496,9 +496,15 @@ fn cas_setup(
 /// Run `/worker` with `envs` added to its environment. We stay root (to tear
 /// down `/cas` after), but drop the worker to an unprivileged user so it can't
 /// tamper with the root-owned `/cas` — only the setuid-root `caos` it invokes
-/// can. Its output is captured, relayed to our stderr (the container log), and
-/// included in the error on failure so the failure post carries the log.
-fn run_worker(envs: &[(&str, &str)]) -> Result<(), String> {
+/// can. Its output is captured, MASKED (any injected `secrets` value replaced —
+/// design/secrets.md log masking), then relayed to our stderr (the container
+/// log) and included in the error on failure. Masking here is the one
+/// chokepoint that covers the whole chain: every downstream log (this
+/// container's stderr, runnerd's relay, the server's failure message) derives
+/// from this string. Best-effort and transform-blind — a value the worker
+/// base64'd or split slips through; this catches an accidental echo, not a
+/// determined exfiltrator.
+fn run_worker(envs: &[(&str, &str)], secrets: &[(String, String)]) -> Result<(), String> {
     let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
     let gid = caos::env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
     let mut command = std::process::Command::new(DEFAULT_WORKER);
