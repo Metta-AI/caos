@@ -1,0 +1,15 @@
+[package]
+name = "llm-client"
+version = "0.1.0"
+edition = "2021"
+
+# Shared Anthropic Messages API transport for workers that make model calls.
+# Keeping it separate lets the agent turn driver and stateless call worker
+# share retry/TLS behavior without nesting one CAOS job inside another.
+[dependencies]
+serde_json = "1"
+minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+
+[lib]
+name = "llm_client"
+path = "src/lib.rs"

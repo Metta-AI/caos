@@ -5,10 +5,15 @@ the same conversation engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
 The interface keeps independent virtual conversations in a left sidebar. Each
-two-row entry shows its title plus an author-labeled, single-line preview of the
-latest user or agent message, with a visible ellipsis instead of hard terminal
-clipping. Internal conversation IDs stay hidden. Each conversation has its own durable history,
-multiline prompt, live activity, completed-turn hashes, and workspace diff.
+entry has a stable task title and a second row reserved for live operation or
+attention status. Idle conversations do not show a stripped message preview.
+Submitting the first message of a fresh conversation runs one separate,
+stateless `llm-call` title job concurrently with the agent turn. The result uses
+the existing durable title metadata, so reopening the TUI does not regenerate
+it or require any additional refs. Text ends with a visible ellipsis instead of
+hard terminal clipping, and internal conversation IDs stay hidden. Each
+conversation has its own durable history, multiline prompt, live activity,
+completed-turn hashes, and workspace diff.
 Turns continue running when another conversation is selected, so several agent
 workspaces can advance concurrently without touching the working checkout.
 
@@ -105,9 +110,11 @@ Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
 A fresh conversation starts with a temporary `talk-N` title. Its first prompt
-automatically becomes a whitespace-collapsed title of at most 60 characters.
-Using `/title` before the first prompt keeps that explicit title instead.
-Existing conversations are never automatically retitled.
+provides an immediate fallback title and starts a stateless `llm-call` job using
+that message alone. Title generation runs concurrently with the agent turn, so
+it does not depend on the turn succeeding. Failure leaves the fallback in
+place, and later messages make no title calls. Using `/title` before the first
+prompt keeps that explicit title instead.
 
 Fresh conversations start from the fetched tip of `origin`'s advertised
 default branch. `--base` and `/from <turn-hash>` override that default.

@@ -4,11 +4,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
     archive_user_conversation, conversation_history, conversation_workspace_diff,
-    describe_tool_set, first_available_conversation_name, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
-    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, TurnPhase, UserConversationStatus, UserConversationSummary,
-    WorkspaceDiff,
+    describe_tool_set, first_available_conversation_name, generate_conversation_title,
+    list_user_conversations, publish_unindexed_conversations, publish_user_conversation,
+    run_chat_turn, set_conversation_title, unarchive_user_conversation, ConversationRole,
+    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -51,10 +51,9 @@ fn automatic_title(prompt: &str) -> String {
 
 fn message_preview(text: &str, max_cells: u16) -> String {
     let text = collapse_whitespace(text);
-    let text = text
-        .trim_start_matches(['#', '>', '-', '*'])
-        .trim_start()
-        .trim_matches('`');
+    if max_cells == 0 {
+        return String::new();
+    }
     if text.cell_width() <= max_cells {
         return text.to_string();
     }
@@ -766,7 +765,10 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    sidebar_attention: Option<String>,
     automatic_title: bool,
+    automatic_title_fallback_applied: bool,
+    generating_title: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     activities: Vec<Activity>,
@@ -791,7 +793,10 @@ impl ConversationState {
         Self {
             id,
             title,
+            sidebar_attention: None,
             automatic_title: false,
+            automatic_title_fallback_applied: false,
+            generating_title: false,
             turn_options,
             transcript: Vec::new(),
             activities: Vec::new(),
@@ -900,21 +905,32 @@ impl ConversationState {
     }
 
     fn apply_automatic_title(&mut self, prompt: &str) {
-        if self.automatic_title {
+        if self.automatic_title && !self.automatic_title_fallback_applied {
             self.title = automatic_title(prompt);
-            self.automatic_title = false;
+            self.automatic_title_fallback_applied = true;
         }
     }
 
-    fn latest_message_preview(&self) -> Option<(EntryRole, String)> {
-        self.transcript
-            .iter()
-            .rev()
-            .find(|entry| {
-                matches!(entry.role, EntryRole::Human | EntryRole::Agent)
-                    && !entry.text.trim().is_empty()
-            })
-            .map(|entry| (entry.role, message_preview(&entry.text, 16)))
+    fn sidebar_text(&self, max_cells: u16) -> (String, String) {
+        let detail = if self.running {
+            self.running_activity()
+                .map(|activity| {
+                    format!("{} {}", activity.running_verb(), activity.running_summary())
+                })
+                .unwrap_or_else(|| self.status.clone())
+        } else if self.generating_title {
+            "Generating title…".to_string()
+        } else if self.publishing {
+            self.status.clone()
+        } else if let Some(attention) = &self.sidebar_attention {
+            attention.clone()
+        } else {
+            String::new()
+        };
+        (
+            message_preview(&self.title, max_cells),
+            message_preview(&detail, max_cells),
+        )
     }
 
     fn running_activity(&self) -> Option<&Activity> {
@@ -950,6 +966,14 @@ enum UiMessage {
     Failed {
         conversation: String,
         error: String,
+    },
+    Completed {
+        conversation: String,
+        outcome: TurnOutcome,
+    },
+    TitleGenerated {
+        conversation: String,
+        result: Result<String, String>,
     },
     Published {
         conversation: String,
@@ -1500,9 +1524,14 @@ impl App {
         } else {
             raw
         };
+        let should_generate_title =
+            self.selected().automatic_title && !self.selected().generating_title;
         {
             let state = self.selected_mut();
             state.apply_automatic_title(&message);
+            if should_generate_title {
+                state.generating_title = true;
+            }
             state.transcript.push(TranscriptEntry {
                 role: EntryRole::Human,
                 commit: None,
@@ -1512,6 +1541,7 @@ impl App {
             state.activity_selection = None;
             state.activity_detail_scroll = 0;
             state.running = true;
+            state.sidebar_attention = None;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
             state.follow_tail();
@@ -1522,22 +1552,45 @@ impl App {
         let options = self.selected().turn_options.clone();
         let conversation = self.selected().id.clone();
         let repo_dir = self.repo_dir.clone();
+        if should_generate_title {
+            let title_tx = tx.clone();
+            let title_options = options.clone();
+            let title_conversation = conversation.clone();
+            let title_repo_dir = repo_dir.clone();
+            let first_message = message.clone();
+            std::thread::spawn(move || {
+                let result = GitTransport::discover(title_repo_dir).and_then(|transport| {
+                    generate_conversation_title(&transport, &title_options, &first_message)
+                });
+                let _ = title_tx.send(UiMessage::TitleGenerated {
+                    conversation: title_conversation,
+                    result,
+                });
+            });
+        }
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                run_chat_turn(
+                let outcome = run_chat_turn(
                     &transport,
                     &options,
                     &conversation,
                     &message,
                     human_tree.as_deref(),
                     |event| {
+                        if matches!(event, TurnEvent::Completed(_)) {
+                            return;
+                        }
                         let _ = tx.send(UiMessage::Turn {
                             conversation: conversation.clone(),
                             event,
                         });
                     },
-                )
-                .map(|_| ())
+                )?;
+                let _ = tx.send(UiMessage::Completed {
+                    conversation: conversation.clone(),
+                    outcome,
+                });
+                Ok(())
             });
             if let Err(error) = result {
                 let _ = tx.send(UiMessage::Failed {
@@ -1569,7 +1622,24 @@ impl App {
                         let state = &mut self.conversations[index];
                         state.running = false;
                         state.status = "turn failed".to_string();
+                        state.sidebar_attention = Some("Failed — open for details".to_string());
                         state.push_error(error);
+                    }
+                }
+                UiMessage::Completed {
+                    conversation,
+                    outcome,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.finish_turn(index, outcome);
+                    }
+                }
+                UiMessage::TitleGenerated {
+                    conversation,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.finish_title_generation(index, result);
                     }
                 }
                 UiMessage::Published {
@@ -1581,7 +1651,11 @@ impl App {
                         state.publishing = false;
                         match result {
                             Ok(url) => state.push_info(format!("PR ready: {url}")),
-                            Err(error) => state.show_command_error(format!("PR failed: {error}")),
+                            Err(error) => {
+                                state.sidebar_attention =
+                                    Some("PR failed — open for details".to_string());
+                                state.show_command_error(format!("PR failed: {error}"));
+                            }
                         }
                     }
                 }
@@ -1596,26 +1670,7 @@ impl App {
 
     fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
         if let TurnEvent::Completed(outcome) = event {
-            let transport = self.transport();
-            let user = self.user.clone();
-            let state = &mut self.conversations[index];
-            state.running = false;
-            state.status = format!("completed {}", outcome.short_commit);
-            match transport {
-                Ok(transport) => {
-                    match publish_user_conversation(&transport, &user, &state.id, &state.title) {
-                        Ok(()) => state.reload(&transport),
-                        Err(error) => {
-                            state.push_error(format!(
-                                "publishing completed conversation failed: {error}"
-                            ));
-                        }
-                    }
-                }
-                Err(error) => {
-                    state.push_error(format!("reloading completed turn failed: {error}"));
-                }
-            }
+            self.finish_turn(index, outcome);
             return;
         }
 
@@ -1685,6 +1740,55 @@ impl App {
             }
             TurnEvent::Completed(_) => unreachable!("completed events return above"),
         }
+    }
+
+    fn finish_turn(&mut self, index: usize, outcome: TurnOutcome) {
+        let transport = self.transport();
+        let user = self.user.clone();
+        let state = &mut self.conversations[index];
+        state.running = false;
+        state.sidebar_attention = None;
+        state.status = format!("completed {}", outcome.short_commit);
+        match transport {
+            Ok(transport) => {
+                match publish_user_conversation(&transport, &user, &state.id, &state.title) {
+                    Ok(()) => state.reload(&transport),
+                    Err(error) => {
+                        state.sidebar_attention = Some("Failed to save conversation".to_string());
+                        state.push_error(format!(
+                            "publishing completed conversation failed: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                state.sidebar_attention = Some("Failed to reload conversation".to_string());
+                state.push_error(format!("reloading completed turn failed: {error}"));
+            }
+        }
+    }
+
+    fn finish_title_generation(&mut self, index: usize, result: Result<String, String>) {
+        let transport = self.transport();
+        let state = &mut self.conversations[index];
+        state.generating_title = false;
+        if !state.automatic_title {
+            return;
+        }
+        state.automatic_title = false;
+        let title = match result {
+            Ok(title) => title,
+            Err(_) => return,
+        };
+        if state.current_hash().is_some() {
+            let Ok(transport) = transport else {
+                return;
+            };
+            if set_conversation_title(&transport, &state.id, &title).is_err() {
+                return;
+            }
+        }
+        state.title = title;
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
@@ -2755,13 +2859,16 @@ mod tests {
     }
 
     #[test]
-    fn message_previews_strip_block_markers_and_ellipsize_by_terminal_cells() {
-        assert_eq!(message_preview("##  Useful\nsummary", 20), "Useful summary");
+    fn sidebar_text_only_collapses_whitespace_and_ellipsizes_by_terminal_cells() {
+        assert_eq!(
+            message_preview("##  Useful\nsummary", 20),
+            "## Useful summary"
+        );
         assert_eq!(message_preview(&"界".repeat(10), 6), "界界…");
     }
 
     #[test]
-    fn only_new_virtual_conversations_take_their_first_prompt_as_title() {
+    fn only_new_virtual_conversations_take_their_first_prompt_as_fallback_title() {
         let mut virtual_conversation = ConversationState::new_virtual(
             "internal-id".to_string(),
             "talk-1".to_string(),
@@ -2775,6 +2882,28 @@ mod tests {
         let mut existing = state("Existing title");
         existing.apply_automatic_title("A later prompt");
         assert_eq!(existing.title, "Existing title");
+    }
+
+    #[test]
+    fn first_message_title_result_replaces_the_fallback_only_once() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("First message fallback");
+        conversation.generating_title = true;
+        assert!(!conversation.is_busy());
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.finish_title_generation(0, Ok("Generated task title".to_string()));
+        assert_eq!(app.selected().title, "Generated task title");
+        assert!(!app.selected().automatic_title);
+        assert!(!app.selected().generating_title);
+
+        app.finish_title_generation(0, Ok("Late replacement".to_string()));
+        assert_eq!(app.selected().title, "Generated task title");
     }
 
     #[test]
@@ -3897,7 +4026,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_list_renders_titles_and_latest_message_previews_without_ids() {
+    fn conversation_list_renders_titles_and_live_status_without_ids() {
         let internal_id = "0123456789abcdef0123456789abcdef01234567";
         let mut selected = ConversationState::new(
             internal_id.to_string(),
@@ -3905,23 +4034,22 @@ mod tests {
             TurnOptions::default(),
             "ready".to_string(),
         );
-        selected.transcript = vec![
-            TranscriptEntry {
-                role: EntryRole::Human,
-                commit: None,
-                text: "Latest\n  human\tmessage".to_string(),
-            },
-            TranscriptEntry {
-                role: EntryRole::Notice,
-                commit: None,
-                text: "internal failure".to_string(),
-            },
-        ];
         assert_eq!(
-            selected.latest_message_preview(),
-            Some((EntryRole::Human, "Latest human me…".to_string()))
+            selected.sidebar_text(16),
+            ("Readable title".to_string(), String::new())
         );
-        let (app, _) = app_with(vec![selected, state("Empty title")]);
+        selected.running = true;
+        selected.status = "calling model…".to_string();
+        assert_eq!(selected.sidebar_text(16).1, "calling model…".to_string());
+        selected.running = false;
+        let mut generating_title = ConversationState::new(
+            internal_id.to_string(),
+            "Existing title".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        generating_title.generating_title = true;
+        let (app, _) = app_with(vec![selected, generating_title, state("Empty title")]);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -3942,19 +4070,27 @@ mod tests {
             .iter()
             .position(|row| row.starts_with('│') && row.contains("Readable title"))
             .unwrap();
+        assert!(sidebar_rows[title_row + 1]
+            .trim_matches('│')
+            .trim()
+            .is_empty());
         assert!(
-            sidebar_rows[title_row + 1].contains("You Latest human me…"),
-            "{:?}",
-            &sidebar_rows[title_row..title_row + 3]
+            sidebar_rows
+                .iter()
+                .any(|row| row.contains("Generating title")),
+            "{sidebar_rows:#?}"
         );
         let empty_title_row = sidebar_rows
             .iter()
             .position(|row| row.starts_with('│') && row.contains("Empty title"))
             .unwrap();
-        assert!(sidebar_rows[empty_title_row + 1].contains("Start a conversation"));
+        assert!(sidebar_rows[empty_title_row + 1]
+            .trim_matches('│')
+            .trim()
+            .is_empty());
         let sidebar = sidebar_rows.join("\n");
         assert!(!sidebar.contains(internal_id));
-        assert!(!sidebar.contains("internal failure"));
+        assert!(!sidebar.contains("Latest human message"));
     }
 
     #[test]
