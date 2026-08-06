@@ -15,7 +15,17 @@
     return files;
   }
 
-  const api = { filePatchesFromPatch };
+  function lineCountsFromPatch(patch) {
+    let additions = 0;
+    let deletions = 0;
+    for (const line of String(patch || '').split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) additions += 1;
+      if (line.startsWith('-') && !line.startsWith('---')) deletions += 1;
+    }
+    return { additions, deletions };
+  }
+
+  const api = { filePatchesFromPatch, lineCountsFromPatch };
   globalScope.CaosChanges = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 }(typeof window === 'undefined' ? globalThis : window));
