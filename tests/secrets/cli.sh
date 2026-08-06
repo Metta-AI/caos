@@ -87,7 +87,7 @@ if "$CAOS_CLI" run /cas/std/bash leaked -- --worker1:@=leak.sh >/dev/null 2>leak
   fail "run leaking the secret should have failed"
 fi
 grep -qi "secret" leak.err || fail "leak error should mention a secret: $(cat leak.err)"
-grep -q "SEKRET-abc-123" leak.err && fail "the error must NOT echo the secret value"
+if grep -q "SEKRET-abc-123" leak.err; then fail "the error must NOT echo the secret value"; fi
 echo "  ok: leaking the secret value into output fails the run, without echoing it" >&2
 
 echo "secrets: ALL PASS" >&2
