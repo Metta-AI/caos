@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const {
   activityGroupComplete,
+  activityGroupExpandable,
   activityGroupSummary,
   mergeReplayedHistory,
   replayedTurnEntries,
@@ -19,6 +20,9 @@ assert.equal(toolDescription({ name: 'edit', summary: 'edit desktop/ui/app.css' 
 assert.equal(activityGroupComplete({ calls: [] }), false);
 assert.equal(activityGroupComplete({ calls: [{ result: { isError: false } }] }), true);
 assert.equal(activityGroupComplete({ calls: [{ result: { isError: false } }, {}] }), false);
+assert.equal(activityGroupExpandable({ calls: [{ name: 'bash' }] }), true);
+assert.equal(activityGroupExpandable({ calls: [{ name: 'read' }] }), false);
+assert.equal(activityGroupExpandable({ calls: [{ name: 'read' }, { name: 'edit' }] }), true);
 assert.equal(scrollPositionIsNearBottom({ scrollHeight: 800, clientHeight: 300, scrollTop: 500 }), true);
 assert.equal(scrollPositionIsNearBottom({ scrollHeight: 800, clientHeight: 300, scrollTop: 450 }), false);
 

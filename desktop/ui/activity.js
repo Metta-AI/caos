@@ -44,6 +44,11 @@
     return Boolean(entry?.calls?.length) && entry.calls.every((call) => call.result);
   }
 
+  function activityGroupExpandable(entry) {
+    return Boolean(entry?.calls?.length > 1)
+      || Boolean(entry?.calls?.some((call) => call.name === 'bash'));
+  }
+
   function scrollPositionIsNearBottom(position, threshold = 24) {
     const remaining = position.scrollHeight - position.clientHeight - position.scrollTop;
     return remaining <= threshold;
@@ -122,6 +127,7 @@
 
   const api = {
     activityGroupComplete,
+    activityGroupExpandable,
     activityGroupSummary,
     mergeReplayedHistory,
     replayedTurnEntries,
