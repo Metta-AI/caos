@@ -7,8 +7,8 @@ edition = "2021"
 #   * `caos`     — the worker-side client: talks HTTP `/object`, runs the
 #                  container `entrypoint`, is installed setuid-root in worker
 #                  images so an unprivileged worker reaches the root-owned /cas.
-#   * `caos-cli` — the user-facing client: uses the server as a `caos` git remote
-#                  (negotiated push/fetch over the local working repo).
+#   * `caos-cli` — the user-facing client: reads and writes the local repository
+#                  with gix and exchanges objects with the `caos` server API.
 # The shared logic — object model, currying, args trees, CAS materialization,
 # and the presentation-independent chat engine — lives in the library.
 
@@ -25,10 +25,17 @@ name = "caos-cli"
 path = "src/bin/caos-cli.rs"
 
 [dependencies]
-# Read/write git objects (blobs/trees) in the local repo and parse those the
-# object server returns. Same pure-Rust, static-musl-friendly config as the
-# server crate, so the workspace shares a single gix build.
-gix = { version = "0.84", default-features = false, features = ["sha1"] }
+# Read/write the local repository, including status, checkout, diff/merge, and
+# fetching ordinary origin branches. The CLI never invokes the git executable.
+gix = { version = "0.84", default-features = false, features = [
+  "blob-diff",
+  "blocking-http-transport-reqwest-rust-tls",
+  "merge",
+  "revision",
+  "sha1",
+  "status",
+  "worktree-mutation",
+] }
 # Minimal blocking HTTP client. default-features = false keeps it to plain HTTP
 # (no TLS) and, unlike heavier clients, it pulls no `url`/`idna` tree — so the
 # build stays small, pure-Rust, and static.

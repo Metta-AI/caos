@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use super::{
     curry_object, entry_name, fetch_blob_string, fetch_tree_entries, prepare_request,
-    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -523,19 +523,8 @@ fn run_cli_turn(
 /// channel). A no-op once migrated (already-`from-user` refs are skipped), so
 /// it is safe to run at every entry point.
 fn migrate_legacy_conversation_refs(t: &GitTransport) -> Result<(), String> {
-    let out = t.git_capture(
-        &[
-            "for-each-ref",
-            "--format=%(refname)%09%(objectname)",
-            CONV_REF_PREFIX.trim_end_matches('/'),
-        ],
-        None,
-    )?;
     let mut legacy = Vec::new();
-    for line in out.lines() {
-        let Some((refname, oid)) = line.split_once('\t') else {
-            continue;
-        };
+    for (refname, oid) in t.local_refs(CONV_REF_PREFIX.trim_end_matches('/'))? {
         let Some(rest) = refname.strip_prefix(CONV_REF_PREFIX) else {
             continue;
         };
@@ -543,13 +532,14 @@ fn migrate_legacy_conversation_refs(t: &GitTransport) -> Result<(), String> {
         if RESERVED_CHANNELS.contains(&last_segment) {
             continue; // already a channel ref (`from-user` and friends)
         }
-        legacy.push((refname.to_string(), rest.to_string(), oid.to_string()));
+        let id = rest.to_string();
+        legacy.push((refname, id, oid));
     }
     for (old_ref, id, oid) in legacy {
         let new_ref = conv_ref(&id, FROM_USER_CHANNEL);
         // Delete only if still at the value we read, then create the channel.
-        t.git_capture(&["update-ref", "-d", &old_ref, &oid], None)?;
-        t.git_capture(&["update-ref", &new_ref, &oid], None)?;
+        t.delete_local_ref(&old_ref, &oid)?;
+        t.update_local_ref(&new_ref, &oid)?;
     }
     Ok(())
 }
@@ -559,13 +549,10 @@ fn migrate_legacy_conversation_refs(t: &GitTransport) -> Result<(), String> {
 /// Idempotent in effect — once done, `<id>/head` is gone and later lists take
 /// the `from-user` path.
 fn migrate_server_conversation_head(t: &GitTransport, id: &str, head: &str) -> Result<(), String> {
-    let create = format!("{head}:{}", conversation_head_ref(id));
-    let delete = format!(":{}", conversation_legacy_head_ref(id));
-    t.git_capture(
-        &["push", "--quiet", "--atomic", CAOS_REMOTE, &create, &delete],
-        None,
-    )
-    .map(|_| ())
+    t.push_server_refs(&[
+        (conversation_head_ref(id), Some(head.to_string())),
+        (conversation_legacy_head_ref(id), None),
+    ])
     .map_err(|error| format!("migrating conversation {id:?} server head: {error}"))
 }
 
@@ -644,39 +631,23 @@ fn latest_conversation(t: &GitTransport) -> Result<Option<String>, String> {
 /// (head) ref. The other channels (`from-agent`/`title`/`status`) are not
 /// conversation heads and are skipped.
 pub fn list_conversations(t: &GitTransport) -> Result<Vec<ConversationSummary>, String> {
-    let out = t.git_capture(
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            "--format=%(refname)%09%(objectname)%09%(committerdate:unix)",
-            CONV_REF_PREFIX.trim_end_matches('/'),
-        ],
-        None,
-    )?;
     let head_suffix = format!("/{FROM_USER_CHANNEL}");
     let mut conversations = Vec::new();
-    for line in out.lines() {
-        let mut fields = line.split('\t');
-        let Some(refname) = fields.next() else {
-            continue;
-        };
+    for (refname, head) in t.local_refs(CONV_REF_PREFIX.trim_end_matches('/'))? {
         let Some(rest) = refname.strip_prefix(CONV_REF_PREFIX) else {
             continue;
         };
         let Some(name) = rest.strip_suffix(&head_suffix) else {
             continue;
         };
-        let head = fields.next().unwrap_or_default().to_string();
-        let updated_unix = fields
-            .next()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default();
+        let updated_unix = t.commit_details(&head)?.timestamp;
         conversations.push(ConversationSummary {
             name: name.to_string(),
             head,
             updated_unix,
         });
     }
+    conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.updated_unix));
     Ok(conversations)
 }
 
@@ -739,19 +710,15 @@ fn remote_refs(
     if patterns.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut args = vec![
-        "ls-remote".to_string(),
-        "--refs".to_string(),
-        CAOS_REMOTE.to_string(),
-    ];
-    args.extend(patterns);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = t.git_capture(&refs, None)?;
-    Ok(out
-        .lines()
-        .filter_map(|line| {
-            let (hash, refname) = line.split_once('\t')?;
-            Some((refname.to_string(), hash.to_string()))
+    let advertised = t.server_refs("")?;
+    Ok(advertised
+        .into_iter()
+        .filter(|(name, _)| {
+            patterns.iter().any(|pattern| {
+                pattern
+                    .strip_suffix('*')
+                    .map_or(name == pattern, |prefix| name.starts_with(prefix))
+            })
         })
         .collect())
 }
@@ -778,22 +745,11 @@ pub fn publish_user_conversation(
     let head_ref = conversation_head_ref(id);
     let title_ref = conversation_title_ref(id);
     let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id);
-    let head_update = format!("{head}:{head_ref}");
-    let title_update = format!("+{title_hash}:{title_ref}");
-    let active_update = format!("+{head}:{active_ref}");
-    t.git_capture(
-        &[
-            "push",
-            "--quiet",
-            "--atomic",
-            CAOS_REMOTE,
-            &head_update,
-            &title_update,
-            &active_update,
-        ],
-        None,
-    )
-    .map(|_| ())
+    t.push_server_refs(&[
+        (head_ref, Some(head.clone())),
+        (title_ref, Some(title_hash)),
+        (active_ref, Some(head)),
+    ])
     .map_err(|error| format!("publishing conversation {id:?}: {error}"))
 }
 
@@ -804,9 +760,7 @@ pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result
     let hash = t.put_object("blob", title.as_bytes())?.to_string();
     t.ensure_pushed(&hash)?;
     let title_ref = conversation_title_ref(id);
-    let update = format!("+{hash}:{title_ref}");
-    t.git_capture(&["push", "--quiet", CAOS_REMOTE, &update], None)
-        .map(|_| ())
+    t.push_server_refs(&[(title_ref, Some(hash))])
         .map_err(|error| format!("renaming conversation {id:?}: {error}"))
 }
 
@@ -830,22 +784,15 @@ fn move_user_conversation(
         (Some(_), Some(_)) => Err(format!(
             "conversation {id:?} is both active and archived for user {user:?}"
         )),
-        (Some(hash), None) => {
-            let create = format!("{hash}:{to_ref}");
-            let delete = format!(":{from_ref}");
-            t.git_capture(
-                &["push", "--quiet", "--atomic", CAOS_REMOTE, &create, &delete],
-                None,
-            )
-            .map(|_| ())
+        (Some(hash), None) => t
+            .push_server_refs(&[(to_ref, Some(hash.clone())), (from_ref, None)])
             .map_err(|error| {
                 format!(
                     "moving conversation {id:?} from {} to {}: {error}",
                     from.ref_component(),
                     to.ref_component()
                 )
-            })
-        }
+            }),
     }
 }
 
@@ -952,7 +899,7 @@ pub fn list_user_conversations(
         };
         t.fetch_object(&head)?;
         let local_ref = validated_refname(&id)?;
-        t.git_capture(&["update-ref", &local_ref, &head], None)?;
+        t.update_local_ref(&local_ref, &head)?;
 
         let title_ref = conversation_title_ref(&id);
         let title_hash = metadata
@@ -966,11 +913,7 @@ pub fn list_user_conversations(
         }
         let title = String::from_utf8(title)
             .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?;
-        let updated_unix = t
-            .git_capture(&["show", "-s", "--format=%ct", &head], None)?
-            .trim()
-            .parse()
-            .map_err(|error| format!("conversation {id:?} has an invalid timestamp: {error}"))?;
+        let updated_unix = t.commit_details(&head)?.timestamp;
         conversations.push(UserConversationSummary {
             id,
             title,
@@ -1002,10 +945,7 @@ pub fn conversation_workspace_diff(t: &GitTransport, name: &str) -> Result<Works
     let head = rev_parse_opt(t, &refname)?
         .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
     let (_turns, base_commit) = history_from_head(t, &head)?;
-    let patch = t.git_capture(
-        &["diff", "--no-ext-diff", "--no-color", &base_commit, &head],
-        None,
-    )?;
+    let patch = t.diff_commits(&base_commit, &head)?;
     Ok(WorkspaceDiff {
         base_commit,
         head,
@@ -1099,10 +1039,8 @@ fn turn(
 
     // The agent author name is the turn-walk marker; a human commit carrying it
     // would corrupt every future transcript walk.
-    let ident = t
-        .git_capture(&["var", "GIT_AUTHOR_IDENT"], None)
-        .map_err(|e| format!("no git author identity (set user.name/user.email): {e}"))?;
-    if ident.split(" <").next().unwrap_or("").trim() == AGENT_AUTHOR {
+    let author = t.author_name()?;
+    if author == AGENT_AUTHOR {
         return Err(format!(
             "your git author name is {AGENT_AUTHOR:?}, which is reserved for agent commits; \
              set a different user.name"
@@ -1125,15 +1063,9 @@ fn turn(
             }
             tree.to_string()
         }
-        None => t
-            .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
-            .trim()
-            .to_string(),
+        None => t.commit_details(&parent)?.tree,
     };
-    let human = t
-        .git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
-        .trim()
-        .to_string();
+    let human = t.create_commit(&tree, &parent, message)?;
 
     // The workers: by default the std-published curries (`curry(runner, bin)`,
     // build-builtins.sh) — already server-side under refs/caos/std, nothing to
@@ -1180,7 +1112,8 @@ fn turn(
     // `--theirs`"): resolve a curated set of refs to hashes, push each closure
     // (onto its content-addressed `refs/caos/req/<hash>`, so no semantic ref is
     // written to the shared server), and carry a name→hash map into the turn.
-    // ensure_pushed negotiates, so an unmoved ref re-pushes nothing.
+    // ensure_pushed prunes closures the server already has, so an unmoved ref
+    // uploads nothing.
     let merge_image = resolve_cli_image(t, MERGE_IMAGE).ok();
     let merge_refs = match &merge_image {
         None => None,
@@ -1301,12 +1234,11 @@ fn turn(
     // turn message, so the response is printed exactly once: either a poll
     // already showed the final step (skip the message), or the drain here
     // suppresses that step's text and the message is printed below.
-    // Negotiating with the human commit as the tip keeps the pack to this
-    // turn's new objects — a noop fetch would re-download the workspace
-    // closure (including the base's whole history) every turn.
+    // Fetching the closure stops at objects already present locally, keeping
+    // the transfer to this turn's new objects.
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
     let phase = std::time::Instant::now();
-    t.fetch_object_negotiated(&turn_hash, &human)?;
+    t.fetch_object_closure(&turn_hash)?;
     emit(TurnEvent::PhaseComplete {
         label: "fetching the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
@@ -1320,12 +1252,10 @@ fn turn(
         }
     }
 
-    t.git_capture(&["update-ref", refname, &turn_hash], None)?;
-    let text = t.git_capture(&["show", "-s", "--format=%B", &turn_hash], None)?;
-    let short = t
-        .git_capture(&["rev-parse", "--short", &turn_hash], None)?
-        .trim()
-        .to_string();
+    t.update_local_ref(refname, &turn_hash)?;
+    let details = t.commit_details(&turn_hash)?;
+    let text = details.message;
+    let short = details.short_id;
     if show_message {
         emit(TurnEvent::AssistantText(text.trim_end().to_string()));
     }
@@ -1368,12 +1298,8 @@ fn read_message(message: Option<&str>) -> Result<String, String> {
     Ok(message)
 }
 
-/// `git rev-parse --verify --quiet <spec>`, `None` when it doesn't resolve.
 fn rev_parse_opt(t: &GitTransport, spec: &str) -> Result<Option<String>, String> {
-    match t.git_capture(&["rev-parse", "--verify", "--quiet", spec], None) {
-        Ok(out) => Ok(Some(out.trim().to_string())),
-        Err(_) => Ok(None),
-    }
+    t.resolve(spec)
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,11 +1316,10 @@ fn poll_progress(
     printed: &mut HashSet<String>,
     emit: &mut dyn FnMut(TurnEvent),
 ) -> Result<(), String> {
-    let out = t.git_capture(&["ls-remote", CAOS_REMOTE, progress_ref], None)?;
-    let Some(tip) = out.split_whitespace().next().filter(|h| !h.is_empty()) else {
+    let Some(tip) = t.server_ref(progress_ref)? else {
         return Ok(()); // no ref yet
     };
-    drain_steps(http, tip, human, printed, None, emit)
+    drain_steps(http, &tip, human, printed, None, emit)
 }
 
 /// One poll of the in-round status ref: print this turn's newest status line
@@ -1409,14 +1334,13 @@ fn poll_status(
     last: &mut Option<String>,
     emit: &mut dyn FnMut(TurnEvent),
 ) -> Result<(), String> {
-    let out = t.git_capture(&["ls-remote", CAOS_REMOTE, status_ref], None)?;
-    let Some(tip) = out.split_whitespace().next().filter(|h| !h.is_empty()) else {
+    let Some(tip) = t.server_ref(status_ref)? else {
         return Ok(()); // no ref yet
     };
-    if last.as_deref() == Some(tip) {
+    if last.as_deref() == Some(tip.as_str()) {
         return Ok(());
     }
-    let (kind, content) = http.get_object(tip)?;
+    let (kind, content) = http.get_object(&tip)?;
     if kind != "blob" {
         return Ok(());
     }
@@ -1427,7 +1351,7 @@ fn poll_status(
     if turn_root == human {
         emit(TurnEvent::Status(line.trim_end().to_string()));
     }
-    *last = Some(tip.to_string());
+    *last = Some(tip);
     Ok(())
 }
 
@@ -1596,7 +1520,7 @@ fn block_text(content: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// --log: the conversation so far, from the local ref with plain git.
+// --log: the conversation so far, from the local ref.
 // ---------------------------------------------------------------------------
 
 /// Print the conversation's turns oldest-first: a first-parent walk down from
@@ -1624,23 +1548,15 @@ fn history_from_head(
     let mut cur = head.to_string();
     let mut prev_was_agent = false;
     loop {
-        let author = t
-            .git_capture(&["show", "-s", "--format=%an", &cur], None)?
-            .trim()
-            .to_string();
+        let details = t.commit_details(&cur)?;
+        let author = details.author;
         let is_agent = author == AGENT_AUTHOR;
         if !is_agent && !prev_was_agent {
             turns.reverse();
             return Ok((turns, cur)); // the base commit — conversation starts above it
         }
-        let short = t
-            .git_capture(&["rev-parse", "--short", &cur], None)?
-            .trim()
-            .to_string();
-        let message = t
-            .git_capture(&["show", "-s", "--format=%B", &cur], None)?
-            .trim_end()
-            .to_string();
+        let short = details.short_id;
+        let message = details.message.trim_end().to_string();
         turns.push(ConversationTurn {
             commit: cur.clone(),
             short_commit: short,
@@ -1652,7 +1568,7 @@ fn history_from_head(
             },
             message,
         });
-        let Some(parent) = rev_parse_opt(t, &format!("{cur}^"))? else {
+        let Some(parent) = details.parent else {
             return Err(format!(
                 "conversation rooted at {cur} has no distinct base commit"
             ));
@@ -1665,6 +1581,7 @@ fn history_from_head(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CAOS_REMOTE;
     use serde_json::json;
     use std::path::Path;
 
