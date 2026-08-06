@@ -224,7 +224,7 @@ fn run_runner_job(
     // first, so a warm runner never leaks a secret into a later job that wasn't
     // granted it.
     write_secrets(&job.secrets)?;
-    let ran = run_worker(&envs);
+    let ran = run_worker(&envs, &job.secrets);
     // Remove the secrets whether the worker passed or failed; the next job's
     // `write_secrets` also wipes, but don't leave plaintext around meanwhile.
     remove_secrets();
