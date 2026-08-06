@@ -2,10 +2,10 @@ const assert = require('node:assert/strict');
 const {
   activityGroupComplete,
   activityGroupSummary,
-  mergeTransientTurnEntries,
+  mergeReplayedHistory,
+  replayedTurnEntries,
   scrollPositionIsNearBottom,
-  toolDescription,
-  transientTurnEntries
+  toolDescription
 } = require('../ui/activity.js');
 
 const calls = [
@@ -22,23 +22,35 @@ assert.equal(activityGroupComplete({ calls: [{ result: { isError: false } }, {}]
 assert.equal(scrollPositionIsNearBottom({ scrollHeight: 800, clientHeight: 300, scrollTop: 500 }), true);
 assert.equal(scrollPositionIsNearBottom({ scrollHeight: 800, clientHeight: 300, scrollTop: 450 }), false);
 
-const activity = { role: 'activity', calls: [{ name: 'read' }] };
-const optimistic = [
-  { role: 'agent', message: 'Earlier answer' },
-  { role: 'human', message: 'New request' },
-  { role: 'agent', message: 'I will inspect it.' },
-  activity,
-  { role: 'agent', message: 'Done.' }
-];
-const transient = transientTurnEntries(optimistic, 1);
-assert.deepEqual(transient, [optimistic[2], activity]);
+const replayed = replayedTurnEntries([
+  { kind: 'assistantText', text: 'I will inspect it.' },
+  { kind: 'toolCall', toolUseId: 'tool-1', stepCommit: 'aaaaaaa', name: 'read', summary: 'read README.md' },
+  { kind: 'toolResult', toolUseId: 'tool-1', stepCommit: 'bbbbbbb', isError: false, content: 'README contents' }
+], 123);
+assert.equal(replayed.length, 2);
+assert.deepEqual(replayed[0], {
+  role: 'agent',
+  message: 'I will inspect it.',
+  shortCommit: '',
+  timestampUnix: 123
+});
+assert.equal(replayed[1].role, 'activity');
+assert.equal(replayed[1].running, false);
+assert.equal(replayed[1].calls[0].result.content, 'README contents');
 
-const durable = [
-  { role: 'agent', message: 'Earlier answer', shortCommit: '1111111' },
-  { role: 'human', message: 'New request', shortCommit: '2222222' },
-  { role: 'agent', message: 'Done.', shortCommit: '3333333' }
+const turns = [
+  { role: 'human', message: 'New request', commit: '1111111', timestampUnix: 100 },
+  { role: 'agent', message: 'Done.', commit: '2222222', timestampUnix: 123 }
 ];
-const merged = mergeTransientTurnEntries(durable, transient);
-assert.deepEqual(merged, [durable[0], durable[1], optimistic[2], activity, durable[2]]);
+const history = mergeReplayedHistory(turns, [{ turnCommit: '2222222', events: [
+  { kind: 'assistantText', text: 'I will inspect it.' },
+  { kind: 'toolCall', toolUseId: 'tool-1', stepCommit: 'aaaaaaa', name: 'read', summary: 'read README.md' },
+  { kind: 'toolResult', toolUseId: 'tool-1', stepCommit: 'bbbbbbb', isError: false, content: 'README contents' }
+] }]);
+assert.equal(history.length, 4);
+assert.equal(history[0], turns[0]);
+assert.equal(history[1].message, 'I will inspect it.');
+assert.equal(history[2].role, 'activity');
+assert.equal(history[3], turns[1]);
 
 console.log('activity timeline tests passed');

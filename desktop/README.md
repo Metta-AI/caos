@@ -24,11 +24,9 @@ therefore do not enter the core CAOS workspace, its lockfile, or worker images.
 - one reusable “New conversation” draft created with local-only Git work until
   its first prompt is sent
 - live chat turns using the existing harness
-- current-turn activity and tool results
-- inline, collapsible tool activity in the conversation transcript
-- accumulated workspace diff
-- independently toggled Changes and Activity inspectors that share a resizable
-  right column and can be split vertically when both are open
+- inline, collapsible tool activity and intermediate responses reconstructed
+  from durable conversation history after reloads and restarts
+- accumulated workspace diff in a conditional, resizable Changes inspector
 - bottom-pinned composer with a separately scrolling transcript
 - safe GitHub-style Markdown rendering for headings, lists, links, images,
   blockquotes, inline and fenced code, tables, and text emphasis

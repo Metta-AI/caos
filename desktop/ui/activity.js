@@ -49,45 +49,84 @@
     return remaining <= threshold;
   }
 
-  function transientTurnEntries(history, turnStart) {
-    const tail = history.slice(turnStart + 1);
-    let finalAgent = -1;
-    for (let index = tail.length - 1; index >= 0; index -= 1) {
-      if (tail[index].role === 'agent') {
-        finalAgent = index;
-        break;
+  function replayedTurnEntries(events, timestampUnix) {
+    const entries = [];
+    let group = null;
+    const finishGroup = () => {
+      if (!group) return;
+      if (group.calls.length > 0) entries.push(group);
+      group = null;
+    };
+
+    for (const event of events || []) {
+      if (event.kind === 'assistantText' && event.text) {
+        finishGroup();
+        entries.push({
+          role: 'agent',
+          message: event.text,
+          shortCommit: '',
+          timestampUnix
+        });
+      } else if (event.kind === 'toolCall') {
+        if (activityGroupComplete(group)) finishGroup();
+        group ||= {
+          role: 'activity',
+          calls: [],
+          expanded: false,
+          running: false,
+          status: ''
+        };
+        group.calls.push({ ...event });
+      } else if (event.kind === 'toolResult') {
+        let call = group?.calls.find((item) => item.toolUseId === event.toolUseId);
+        if (!call) {
+          group ||= {
+            role: 'activity',
+            calls: [],
+            expanded: false,
+            running: false,
+            status: ''
+          };
+          call = {
+            kind: 'toolCall',
+            stepCommit: event.stepCommit,
+            toolUseId: event.toolUseId,
+            name: 'result',
+            summary: `result ${event.toolUseId}`
+          };
+          group.calls.push(call);
+        }
+        call.result = { ...event };
       }
     }
-    return tail.filter((entry, index) => (
-      (entry.role === 'activity' && entry.calls.length > 0)
-      || (entry.role === 'agent' && index !== finalAgent)
-    ));
+    finishGroup();
+    return entries;
   }
 
-  function mergeTransientTurnEntries(history, entries) {
-    if (!entries?.length) return history;
-    let finalAgent = -1;
-    for (let index = history.length - 1; index >= 0; index -= 1) {
-      if (history[index].role === 'agent') {
-        finalAgent = index;
-        break;
+  function mergeReplayedHistory(turns, turnEvents) {
+    const eventsByTurn = new Map(
+      (turnEvents || []).map((turn) => [turn.turnCommit, turn.events])
+    );
+    const history = [];
+    for (const turn of turns || []) {
+      if (turn.role === 'agent') {
+        history.push(...replayedTurnEntries(
+          eventsByTurn.get(turn.commit),
+          turn.timestampUnix
+        ));
       }
+      history.push(turn);
     }
-    if (finalAgent < 0) return history;
-    return [
-      ...history.slice(0, finalAgent),
-      ...entries,
-      ...history.slice(finalAgent)
-    ];
+    return history;
   }
 
   const api = {
     activityGroupComplete,
     activityGroupSummary,
-    mergeTransientTurnEntries,
+    mergeReplayedHistory,
+    replayedTurnEntries,
     scrollPositionIsNearBottom,
-    toolDescription,
-    transientTurnEntries
+    toolDescription
   };
   globalScope.CaosActivity = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
