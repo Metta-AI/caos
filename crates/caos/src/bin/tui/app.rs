@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
-    archive_user_conversation, conversation_history, conversation_workspace_diff,
-    describe_tool_set, first_available_conversation_name, generate_conversation_title,
-    list_user_conversations, publish_unindexed_conversations, publish_user_conversation,
-    run_chat_turn, set_conversation_title, unarchive_user_conversation, ConversationRole,
-    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    archive_user_conversation, conversation_replay, conversation_workspace_diff, describe_tool_set,
+    first_available_conversation_name, generate_conversation_title, list_user_conversations,
+    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
+    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
+    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
     UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
@@ -172,6 +172,60 @@ impl Activity {
             _ => &self.summary,
         }
     }
+}
+
+fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
+    let mut activities: Vec<Activity> = Vec::new();
+    for event in events {
+        match event {
+            TurnEvent::ToolCall {
+                step_commit,
+                tool_use_id,
+                name,
+                summary,
+            } => activities.push(Activity {
+                id: tool_use_id.clone(),
+                step_commit: step_commit.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                detail: String::new(),
+                state: ActivityState::Running,
+            }),
+            TurnEvent::ToolResult {
+                step_commit,
+                tool_use_id,
+                is_error,
+                content,
+            } => {
+                if let Some(activity) = activities
+                    .iter_mut()
+                    .find(|activity| activity.id == *tool_use_id)
+                {
+                    activity.state = if *is_error {
+                        ActivityState::Failed
+                    } else {
+                        ActivityState::Succeeded
+                    };
+                    activity.detail = content.clone();
+                } else {
+                    activities.push(Activity {
+                        id: tool_use_id.clone(),
+                        step_commit: step_commit.clone(),
+                        name: "result".to_string(),
+                        summary: format!("result {tool_use_id}"),
+                        detail: content.clone(),
+                        state: if *is_error {
+                            ActivityState::Failed
+                        } else {
+                            ActivityState::Succeeded
+                        },
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    activities
 }
 
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
@@ -824,9 +878,17 @@ impl ConversationState {
     }
 
     fn reload(&mut self, transport: &GitTransport) {
-        match conversation_history(transport, &self.id) {
-            Ok(turns) => {
-                self.transcript = turns
+        match conversation_replay(transport, &self.id) {
+            Ok(replay) => {
+                self.activities = replay
+                    .turn_events
+                    .last()
+                    .map(|turn| replayed_activities(&turn.events))
+                    .unwrap_or_default();
+                self.activity_selection = self.activities.len().checked_sub(1);
+                self.activity_detail_scroll = 0;
+                self.transcript = replay
+                    .turns
                     .into_iter()
                     .map(|turn| TranscriptEntry {
                         role: match turn.role {
@@ -847,6 +909,9 @@ impl ConversationState {
             }
             Err(error) => {
                 self.transcript.clear();
+                self.activities.clear();
+                self.activity_selection = None;
+                self.activity_detail_scroll = 0;
                 self.diff = None;
                 self.push_error(format!("loading conversation failed: {error}"));
             }
@@ -3526,6 +3591,29 @@ mod tests {
         activity.name = "unknown".to_string();
         activity.summary = "unknown something".to_string();
         assert_eq!(activity.running_verb(), "Running");
+    }
+
+    #[test]
+    fn replayed_activity_restores_tool_results() {
+        let activities = replayed_activities(&[
+            TurnEvent::ToolCall {
+                step_commit: "1".repeat(40),
+                tool_use_id: "tool-1".to_string(),
+                name: "read".to_string(),
+                summary: "read README.md".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "2".repeat(40),
+                tool_use_id: "tool-1".to_string(),
+                is_error: false,
+                content: "README contents".to_string(),
+            },
+        ]);
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].name, "read");
+        assert_eq!(activities[0].state, ActivityState::Succeeded);
+        assert_eq!(activities[0].detail, "README contents");
     }
 
     #[test]
