@@ -14,6 +14,11 @@ use caos::chat::{
     ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
     TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
+use caos::workspace::{
+    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
+    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
+    publish_merge_target, remote_default_branch,
+};
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -22,12 +27,6 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{
-    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
-    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
-    publish_merge_target, remote_default_branch,
-};
-
 #[path = "ui.rs"]
 pub(crate) mod ui;
 

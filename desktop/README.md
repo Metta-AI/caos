@@ -9,6 +9,7 @@ remote and the ordinary CAOS environment (including `ANTHROPIC_API_KEY`).
 
 ```bash
 cargo run --manifest-path desktop/src-tauri/Cargo.toml
+cargo run --manifest-path desktop/src-tauri/Cargo.toml -- --model claude-opus-4-8
 ```
 
 The reproducible Nix build is a separate flake output so it stays out of the
@@ -16,7 +17,9 @@ core workspace and worker images:
 
 ```bash
 nix build .#caos-desktop
+./result/bin/caos-desktop
 nix run .#caos-desktop
+nix run .#caos-desktop -- --model claude-opus-4-8
 ```
 
 The package build runs the desktop Rust and JavaScript tests. It is also exposed
@@ -34,12 +37,20 @@ therefore do not enter the core CAOS workspace, its lockfile, or worker images.
 ## Current scope
 
 - repo-scoped active conversation list
-- one reusable “New conversation” draft created with local-only Git work until
-  its first prompt is sent
+- reusable “New conversation” drafts based on the local default-branch tip,
+  with `/from <commit>` for starting from another completed turn
 - live chat turns using the existing harness
+- a per-conversation model selector in the composer, initialized by the sole
+  advanced launch option, `--model <model>`
+- generated conversation titles with the first-prompt fallback used by the TUI
 - inline, collapsible tool activity and intermediate responses reconstructed
   from durable conversation history after reloads and restarts
 - accumulated workspace diff in a conditional, resizable Changes inspector
+- clean-checkout loading with `Ctrl+L`, and working-tree updates through
+  `/update-tree <message>`
+- clean snapshot branch publishing with the TUI's two-step `Ctrl+P` flow
+- conversation archiving and restoration
+- the project tool-set inspector available with `Ctrl+Shift+T`
 - bottom-pinned composer with a separately scrolling transcript
 - safe GitHub-style Markdown rendering for headings, lists, links, images,
   blockquotes, inline and fenced code, tables, and text emphasis
@@ -51,10 +62,7 @@ therefore do not enter the core CAOS workspace, its lockfile, or worker images.
 - direct navigation to the first nine visible conversations with `Ctrl+1`
   through `Ctrl+9`
 - a clickable command palette that also opens with `Ctrl+Shift+P` or `/commands`
+- slash-command completion in the composer
 - persisted conversation renaming with `/rename <title>` or the TUI-compatible
   `/title <title>` alias
 - persistent whole-interface zoom with `Cmd++`, `Cmd+-`, and `Cmd+0`
-
-Publishing, checkout, archive management, and the TUI's other local commands
-remain available through the existing CLI/TUI and are deliberately not
-duplicated as desktop buttons yet.

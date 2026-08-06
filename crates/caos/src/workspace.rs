@@ -3,19 +3,19 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedPublishWorkspace {
-    pub(crate) head: String,
-    pub(crate) tree: String,
+pub struct PreparedPublishWorkspace {
+    head: String,
+    tree: String,
 }
 
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
-/// the TUI chooses when to mutate the checkout and requires confirmation before
+/// clients choose when to mutate the checkout and require confirmation before
 /// calling it. Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
-pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
+pub fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -43,7 +43,7 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit
 /// mirrors what a normal commit of the working tree would contain.
-pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, String> {
+pub fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, String> {
     capture_required("git", &["add", "-A"], cwd)?;
     // `git diff --cached --quiet` exits non-zero exactly when the index differs
     // from HEAD, i.e. there is something to commit.
@@ -59,7 +59,7 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
 /// Name the exact commit the ordinary publish turn must merge. A stacked
 /// snapshot keeps the selected base's tree but shares the conversation's base,
 /// so `merge` applies only this conversation's delta.
-pub(crate) fn publish_merge_target(
+pub fn publish_merge_target(
     conversation_base: &str,
     publish_base: &str,
     stacked: bool,
@@ -87,7 +87,7 @@ pub(crate) fn publish_merge_target(
     )
 }
 
-pub(crate) fn prepare_publish_workspace(
+pub fn prepare_publish_workspace(
     head: &str,
     target: &str,
     cwd: &Path,
@@ -175,7 +175,7 @@ pub(crate) fn prepare_publish_workspace(
 ///
 /// The chat core has already merged, resolved, tested, and removed harness
 /// state. Keep only that tree as one commit above the exact fetched PR base.
-pub(crate) fn publish_conversation_pr(
+pub fn publish_conversation_pr(
     name: &str,
     workspace: &PreparedPublishWorkspace,
     pr_base: &str,
@@ -240,7 +240,7 @@ pub(crate) fn publish_conversation_pr(
 /// fetch`, so it stays instant (e.g. on every Ctrl+N) instead of blocking on
 /// round-trips to `origin`. Publishing a PR still fetches, where a fresh remote
 /// tip matters.
-pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+pub fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
     // `refs/remotes/origin/HEAD` is the local symref recording origin's default
     // branch; it is set at clone time and refreshed by `git remote set-head`.
     let head_ref = capture_required("git", &["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
@@ -260,7 +260,7 @@ pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), S
     Ok((branch, commit))
 }
 
-pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
+pub fn remote_default_branch(cwd: &Path) -> Result<String, String> {
     let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
     let stdout = require_success("git", output)?;
     parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
@@ -287,7 +287,7 @@ fn parse_remote_default_branch(output: &str) -> Result<String, String> {
     Err("origin HEAD did not advertise a default branch".to_string())
 }
 
-pub(crate) fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String, String> {
+pub fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String, String> {
     let remote_ref = format!("refs/heads/{branch}");
     let tracking_ref = format!("refs/remotes/origin/{branch}");
     let refspec = format!("+{remote_ref}:{tracking_ref}");
