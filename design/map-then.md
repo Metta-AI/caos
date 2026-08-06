@@ -38,13 +38,16 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 - **`caos map-then <in> -- [--map=<img>] [--then=<img>]`** (worker form) writes
   `/cas/out` as a **promise placeholder** naming a continuation object;
   `entrypoint` reports `promise <hash>` instead of `blob/tree <hash>`.
-- The **continuation** is a content-addressed tree `{in, map?, run?, then?}`:
-  `in` is a real tree entry (the data node, mode + oid); `map`/`run`/`then` are
-  blobs naming images (resolved to hashes / `docker://` refs client-side, so
-  the server never sees `/cas` paths). `map` and `run` are **mutually
+- The **continuation** is a content-addressed tree `{in, map?, run?, then?,
+  catch?}`: `in` is a real tree entry (the data node, mode + oid);
+  `map`/`run`/`then` are blobs naming images (resolved to hashes / `docker://`
+  refs client-side, so the server never sees `/cas` paths); `catch` is a marker
+  blob whose presence is the whole signal (see
+  [Catch](#catch-a-failing-run-as-a-value)). `map` and `run` are **mutually
   exclusive** — the worker CLI's two verbs (`map-then` takes only
-  `--map`/`--then`, `run-then` only `--run`/`--then`) enforce that client-side,
-  and the server rejects a continuation carrying both as defense in depth.
+  `--map`/`--then`, `run-then` only `--run`/`--then`/`--catch`) enforce that
+  client-side, and the server rejects a continuation carrying both as defense
+  in depth.
 - The **server**, on a `promise` result, resolves it — one path, a *middle
   step* then `then`:
   1. if `map` is given and `in` is a tree: run `map` with `--in=<child>` for
@@ -87,6 +90,38 @@ first-class commits) as much as a blob or tree.
 
 `caos-cli run` is **unchanged**: it still blocks at the top level (it holds no
 worker slot), and the server resolves all promises before answering.
+
+## Catch: a failing `run` as a value
+
+`caos run-then <in> -- --run=<img> --then=<img> --catch` (helper:
+`worker_common::run_then_catching`) records a `catch` marker alongside the rest.
+When the `run` sub-run **fails**, the server does not fail the request: it
+stores the failure text as a blob and calls `then(--in=<in>, --error=<blob>)` —
+the error landing exactly where `--result` would have. `then` therefore sees
+`--result` xor `--error`, never both.
+
+Without it, a failed sub-run fails the whole request, and that stays the default:
+a pipeline that loses a step has no business reporting success. Catching is for
+a caller whose job is to *react* to the failure rather than propagate it. The
+agent loop is the case that forced it — a tool call that dies has to come back
+to the model as an `is_error` tool_result it can read and fix, not take the
+whole turn down with it (`agent-harness.md`, "Tool failures are values, not
+errors"). Before `catch`, one aborting sub-run discarded the turn, the other
+tool results, and the model's in-turn work.
+
+Two constraints, both enforced client-side and re-checked by the interpreter:
+
+- **`catch` needs `then`.** An error with no recipient is just an error.
+- **`catch` is `run`-only.** A caught `map` would have to say *which* child
+  failed and what the surviving siblings' results mean; nothing needs that yet,
+  and guessing the shape now would be the wrong guess.
+
+A request whose resolution caught a failure is **not memoized**. Sub-run
+failures are deliberately uncached (`cargo-workers.md`); folding one into a
+cached parent result would launder it into a permanent answer, so a retry would
+replay the failure without re-running anything. The `then` request itself caches
+normally — the error blob is in its ArgTree, so the same error in gives the same
+result out.
 
 ## Why this cannot deadlock
 

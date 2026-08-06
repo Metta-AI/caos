@@ -10,10 +10,12 @@
 # tree. Asserts, against the scripted stub LLM: registration (name + doc in
 # the request; a reserved name is NOT shadowed), invocation (the script's
 # output returns as the tool_result), same-turn dynamism — a bash edit to the
-# tool changes what the very next call runs — and the #@arg contract: a
+# tool changes what the very next call runs — the #@arg contract: a
 # declared arg reaches the script at /cas/args/<name>, while a missing
 # required arg or an undeclared one comes back as an is_error tool_result
-# WITHOUT a sub-run.
+# WITHOUT a sub-run — and, at the other end of that spectrum, a tool whose
+# sub-run DIES (no result at all) also coming back as an is_error tool_result,
+# over an unchanged workspace, with the turn carrying on.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -41,6 +43,16 @@ EOF
 cat > ws/caos-tools/bash.sh <<'EOF'
 #!/usr/bin/env bash
 #@doc An impostor bash.
+EOF
+# A tool whose SUB-RUN dies: the script exits non-zero, so the worker exits
+# non-zero and the job errors. Not a non-zero exit reported inside a result —
+# no result exists at all. Before `run-then --catch` this killed the turn.
+cat > ws/caos-tools/boom.sh <<'EOF'
+#!/usr/bin/env bash
+#@doc A tool that dies without producing a result.
+set -euo pipefail
+echo "boom: this tool never writes /cas/out" >&2
+exit 1
 EOF
 # A tool with parameters: one required, one optional. Reads them where every
 # curried arg lands — /cas/args/<name> — so the assertion below is on the
@@ -71,11 +83,14 @@ R2='[{"id":"toolu_02","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello.sh","path
 # Two bad calls then a good one, in ONE response: the bad ones must be
 # answered in place and the queue continue, so the good one still runs.
 R3='[{"id":"toolu_04","input":{},"name":"echo-arg","type":"tool_use"},{"id":"toolu_05","input":{"word":"x","colour":"red"},"name":"echo-arg","type":"tool_use"},{"id":"toolu_06","input":{"word":"banana","suffix":"-split"},"name":"echo-arg","type":"tool_use"}]'
+# Round 4 calls the tool that DIES. The turn must survive it and reach round 5.
+R4='[{"id":"toolu_07","input":{},"name":"boom","type":"tool_use"}]'
 mkdir stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > stub/response-2.json
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R3" > stub/response-3.json
-printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-4.json
+printf '{"content":%s,"stop_reason":"tool_use"}' "$R4" > stub/response-4.json
+printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-5.json
 
 stub_pid=""
 for _ in 1 2 3 4 5; do
@@ -149,5 +164,26 @@ grep -qF 'takes no' stub/request-4.json \
 [ "$(grep -oF '"is_error":true' stub/request-4.json | wc -l)" = 2 ] \
   || fail "expected exactly two is_error tool_results in round 4"
 echo "  ok: both bad calls answered in place; the good call still ran" >&2
+
+echo "== a tool whose SUB-RUN dies is an is_error result, not a dead turn ==" >&2
+# The turn reaching round 5 at all is the assertion: before `run-then --catch`
+# the failed sub-run errored the whole run, the conversation ref never moved,
+# and the model never learned why. (The `tools done` check above already proved
+# the turn completed — this proves it completed THROUGH the failure.)
+[ -e stub/request-5.json ] || fail "the turn died on the failing tool instead of continuing"
+grep -qF 'the `boom` tool failed to run' stub/request-5.json \
+  || fail "the sub-run failure was not reported back to the model"
+grep -qF '"is_error":true' stub/request-5.json \
+  || fail "the failure was not marked is_error"
+# The workspace must be the pre-call one: a tool that never produced a result
+# cannot have advanced it. Asserted on the TURN TREE, not on the request — the
+# request replays the transcript, so an earlier round's text would match there
+# whatever happened to the tree.
+hello_after=$(git show "$turn:caos-tools/hello.sh")
+case "$hello_after" in
+  *hello-from-tree-v2*) ;;
+  *) fail "the round-4 failure lost the workspace edit from round 2" ;;
+esac
+echo "  ok: the dead sub-run came back as a value and the turn finished" >&2
 
 echo "caos-tools: ALL PASS" >&2

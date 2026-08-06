@@ -229,6 +229,7 @@
         worker-bash-tool = workspaceBins;
         worker-llm-step = workspaceBins;
         worker-rgrep = workspaceBins;
+        worker-deep-deps = workspaceBins;
         # The llm-step tests' scripted LLM API stand-in — a host binary, not a
         # worker (the musl build runs on any Linux host).
         llm-stub = workspaceBins;
@@ -614,6 +615,7 @@
           worker-bash-tool
           worker-llm-step
           worker-rgrep
+          worker-deep-deps
           # Not curries: these ride only in refs/caos/bins — the test
           # suite's own image pipeline stages them (std's runner bakes its
           # /worker in workerRunnerImage; std/cargo compiles its own).
@@ -936,6 +938,7 @@
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # llm-step tests' stub LLM server.
           inherit worker-bash-tool worker-llm-step worker-rgrep llm-stub;
+          inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc
           # orchestrator (curry(runner, worker1)) — build-builtins.sh needs
           # the binaries exposed.

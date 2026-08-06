@@ -3,82 +3,103 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
-# deep-deps turns a flat, name-keyed package map (each package a `DEPS` list, one
-# dependency name per line) into a DAG of nodes: the output mirrors the input but
-# each node carries a `DEEP-DEPS` subtree of its recursively-deepened direct deps
-# (and drops its own DEPS). We check correctness + DAG sharing, incremental
-# recompute on edits, and cycle detection. The fixture map (a -> {b,c}, b -> {d},
-# c -> {d}, d -> {}) lives as real files under packages/. The recursion runs as
-# server-resolved map-then promises, deps mapped in parallel.
-# The worker is a TEST FIXTURE, not a std entry: this test carries its source
-# (./worker.rs) and builds it with std/rustc — memoized, so the compile
-# happens once per source edit, not per run.
+# deep-deps (design/caos-expr.md) restructures a tree so that every directory
+# carrying a `DEPS` file gets its dependencies, recursively deepened, mounted
+# inside it under `DEEP-DEPS/`. A `DEPS` line is `<path> <name>`: the path is
+# relative to the DEPS file's OWN directory (so `../..` reaches parents), and
+# the name is the mount. There is no special `packages` root — it is a
+# whole-tree transform, published as the std entry /cas/std/deep-deps
+# (curry(runner, worker1=<binary>), like rgrep). We check the deepened shape,
+# DAG sharing, incremental recompute, cycle detection, and its use THROUGH
+# eval-path (a top-level `.caos-expr` invoking it).
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-# The CLI ingests only git-tracked paths, so commit the map before each deepen.
+# The CLI ingests only git-tracked paths, so commit before each run.
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-echo "== build the fixture worker from its source ==" >&2
-builder=$("$CAOS_CLI" curry /cas/std/rustc -- --runner:@=/cas/std/runner)
-"$CAOS_CLI" run "$builder" img -- --src:@=test/worker.rs
-commit "built deep-deps"
-worker=$(git rev-parse HEAD:img)
-
-# Deepen a package map (a dir) and check the result tree out.
-deepen() { # <pkgs-dir> <out-dir>
-  "$CAOS_CLI" run "$worker" "$2" -- --mode=all --packages:@="$1"
+# The fixture: `app` depends on two libs by relative path; `lib/foo` depends on
+# its sibling `lib/bar`. So `bar` is reached three ways (app's dep, foo's dep,
+# and structurally under lib) — one shared node.
+build_fixture() { # <root-dir>
+  local r=$1
+  mkdir -p "$r/app" "$r/lib/foo" "$r/lib/bar"
+  echo "app main" > "$r/app/main.txt"
+  printf '../lib/foo foo\n../lib/bar bar\n' > "$r/app/DEPS"
+  echo "foo lib" > "$r/lib/foo/foo.txt"
+  printf '../bar shared\n' > "$r/lib/foo/DEPS"
+  echo "bar lib" > "$r/lib/bar/bar.txt"
 }
 
-# A writable copy of the fixture map we edit across phases.
-cp -R test/packages pkgs
-chmod -R u+w pkgs
-commit "phase A map"
+deepen() { # <in-dir> <out-dir>
+  "$CAOS_CLI" run /cas/std/deep-deps "$2" -- --in:@="$1"
+}
 
-echo "== Phase A: correctness + DAG sharing ==" >&2
-deepen pkgs outA
-A=outA
-[ -e "$A/a/DEEP-DEPS/b" ] || fail "a should depend on b"
-[ -e "$A/a/DEEP-DEPS/c" ] || fail "a should depend on c"
-[ -e "$A/b/DEEP-DEPS/d" ] || fail "b should depend on d"
-[ -e "$A/a/DEPS" ]        && fail "DEPS should be dropped from nodes"
-[ -n "$(ls -A "$A/d/DEEP-DEPS")" ] && fail "d should have no deep-deps"
-diff -r "$A/b/DEEP-DEPS/d" "$A/c/DEEP-DEPS/d" >/dev/null \
-  || fail "shared dep d should be one identical node under b and c"
-echo "  ok: shape correct; DEPS dropped; d shared identically under b and c" >&2
+build_fixture tree
+commit "fixture"
 
-echo "== Phase B: editing an UNRELATED package leaves a,b,c,d untouched ==" >&2
-mkdir -p pkgs/e; : > pkgs/e/DEPS
-commit "phase B map"
-deepen pkgs outB
-for n in a b c d; do
-  diff -r "$A/$n" "outB/$n" >/dev/null \
-    || fail "$n changed after editing an unrelated package"
-done
-[ -e outB/e ] || fail "e missing from output"
-echo "  ok: a,b,c,d byte-identical; e added" >&2
+echo "== deepened shape: DEPS replaced by DEEP-DEPS, paths resolved ==" >&2
+deepen tree outA
+[ -e outA/app/DEEP-DEPS/foo/foo.txt ]                 || fail "app should mount foo"
+[ -e outA/app/DEEP-DEPS/bar/bar.txt ]                 || fail "app should mount bar"
+[ -e outA/app/DEEP-DEPS/foo/DEEP-DEPS/shared/bar.txt ] || fail "foo should mount bar as shared"
+[ -e outA/app/main.txt ]                              || fail "app's own files should survive"
+[ -e outA/app/DEPS ]                                  && fail "DEPS should be dropped from nodes"
+[ -e outA/lib/foo/DEEP-DEPS/shared/bar.txt ]          || fail "lib/foo should also be deepened in place"
+echo "  ok: relative <path> resolved, <name> mounted, DEPS dropped" >&2
 
-echo "== Phase C: editing leaf d recomputes everything that reaches d ==" >&2
-mkdir -p pkgs/x; : > pkgs/x/DEPS
-printf 'x\n' > pkgs/d/DEPS
-commit "phase C map"
-deepen pkgs outC
-for n in a b c d; do
-  diff -r "$A/$n" "outC/$n" >/dev/null \
-    && fail "$n should have changed when d changed"
-done
-[ -e outC/d/DEEP-DEPS/x ] || fail "d should now depend on x"
-echo "  ok: a,b,c,d all recomputed; d now reaches x" >&2
+echo "== DAG sharing: bar is one identical node everywhere it appears ==" >&2
+diff -r outA/app/DEEP-DEPS/bar outA/lib/bar >/dev/null \
+  || fail "app's bar and lib/bar should be identical"
+diff -r outA/app/DEEP-DEPS/foo outA/lib/foo >/dev/null \
+  || fail "app's foo and lib/foo should be identical"
+diff -r outA/app/DEEP-DEPS/foo/DEEP-DEPS/shared outA/lib/bar >/dev/null \
+  || fail "foo's shared dep should be the same node as lib/bar"
+echo "  ok: shared subgraphs are byte-identical" >&2
 
-echo "== Phase D: a dependency cycle is detected (by the server) ==" >&2
-# Close a loop: d -> a, so a -> b -> d -> a. The deepen recursion re-enters the
-# same request and the server's run-cycle detection catches it.
-printf 'a\n' > pkgs/d/DEPS
-commit "phase D map"
-if deepen pkgs outD 2>cyc.err; then
+echo "== editing an unrelated package leaves app,lib untouched ==" >&2
+mkdir -p tree/other; echo x > tree/other/x.txt
+commit "add unrelated dir"
+deepen tree outB
+diff -r outA/app outB/app >/dev/null || fail "app changed after an unrelated edit"
+diff -r outA/lib outB/lib >/dev/null || fail "lib changed after an unrelated edit"
+[ -e outB/other/x.txt ] || fail "the new dir is missing from the output"
+echo "  ok: app,lib byte-identical; other added" >&2
+
+echo "== editing shared leaf bar recomputes everything that reaches it ==" >&2
+echo "bar lib v2" > tree/lib/bar/bar.txt
+commit "edit bar"
+deepen tree outC
+diff -r outA/app outC/app >/dev/null && fail "app should change when bar changes"
+[ "$(cat outC/app/DEEP-DEPS/bar/bar.txt)" = "bar lib v2" ] || fail "app's bar not updated"
+[ "$(cat outC/app/DEEP-DEPS/foo/DEEP-DEPS/shared/bar.txt)" = "bar lib v2" ] \
+  || fail "foo's shared bar not updated"
+echo "  ok: every node reaching bar recomputed" >&2
+
+echo "== a dependency cycle is detected (by the server) ==" >&2
+# Close a loop: lib/bar -> app, so app -> bar -> app. The recursion re-enters
+# the same node request and the server's run-cycle detection catches it.
+printf '../../app loop\n' > tree/lib/bar/DEPS
+commit "cycle"
+if deepen tree outD 2>cyc.err; then
   fail "expected the cyclic graph to fail, but the run succeeded"
 fi
 grep -q "run cycle detected" cyc.err || fail "no cycle reported; got: $(cat cyc.err)"
+rm -f tree/lib/bar/DEPS
 echo "  ok: run failed with a run-cycle error" >&2
+
+echo "== through eval-path: a top-level .caos-expr invokes deep-deps ==" >&2
+# A `.caos-expr` at the tree root deepens the whole tree; eval-path then
+# descends into the deepened result.
+build_fixture evtree
+printf 'run /std/deep-deps -- --in:@=.\n' > evtree/.caos-expr
+commit "evtree with .caos-expr"
+out=$("$CAOS_CLI" eval-path evtree/app/DEEP-DEPS/foo) || fail "eval-path failed"
+kind=${out%% *}; hash=${out##* }
+[ "$kind" = tree ] || fail "expected a tree, got: $out"
+"$CAOS_CLI" get "$hash" evfoo || fail "get $hash"
+[ -e evfoo/foo.txt ] || fail "deepened foo missing foo.txt"
+[ -e evfoo/DEEP-DEPS/shared/bar.txt ] || fail "deepened foo missing its shared dep"
+echo "  ok: eval-path deepened the tree and dug into a package's node" >&2
 
 echo "deep-deps: ALL PASS" >&2

@@ -276,7 +276,7 @@ summarize)
   caos get /cas/args/build-time
   caos get /cas/args/start-time
   mkdir -p /tmp/rep
-  passn=0 failn=0
+  passn=0 failn=0 abortn=0
   {
     # Collected first, printed after: the column width is only known once every
     # child has been read.
@@ -296,7 +296,16 @@ summarize)
       if grep -q "^RUN-TEST: PASS" "$c/verdict"; then
         mark="✓"; passn=$((passn + 1))
       else
-        mark="✗"; failn=$((failn + 1))
+        # A test that ABORTED never reached an assertion — an unguarded command
+        # tripped `set -e` (tests/lib/run-test.sh). That is a different report
+        # to "the assertion ran and disagreed", and it points somewhere else:
+        # at the cli.sh itself, or at the code it was driving. `!` not `✗`.
+        if grep -q "(aborted)" "$c/verdict"; then
+          mark="!"; abortn=$((abortn + 1))
+        else
+          mark="✗"
+        fi
+        failn=$((failn + 1))
         # THE LAST LINES, NOT THE FIRST. Every tests/<name>/cli.sh narrates its
         # way down — `echo "== step ==" >&2` per stage — and ends at `fail`, so
         # the head of a failing output is the fixture setup that worked and the
@@ -334,8 +343,18 @@ summarize)
     echo
     if [ "$failn" -eq 0 ]; then
       echo "SUITE OK: $passn/$((passn + failn)) passed"
-    else
+    elif [ "$abortn" -eq 0 ]; then
       echo "SUITE FAILED: $passn/$((passn + failn)) passed"
+    else
+      # Aborts called out on the banner line: they are the ones whose excerpt
+      # is a stack trace of the harness rather than an assertion, and knowing
+      # that before reading the excerpts saves a wrong first guess.
+      echo "SUITE FAILED: $passn/$((passn + failn)) passed ($abortn aborted)"
+    fi
+    # `!` is a new mark; say what it means, but only when one is on the board.
+    if [ "$abortn" -gt 0 ]; then
+      echo "(! = aborted before asserting: an unguarded command failed. Read the"
+      echo " cli.sh, or what it was driving — not an assertion that never ran.)"
     fi
     # A duration is a property of a RUN; a result is a property of its INPUTS.
     # Caching the one inside the other means an unchanged test replays whatever
