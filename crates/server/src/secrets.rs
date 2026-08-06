@@ -48,9 +48,10 @@ struct Secret {
     readers: Vec<String>,
 }
 
-/// The secrets visible to a job whose top-level arg entries are `arg_entries`
-/// and whose std tree is `std`: every secret with at least one reader whose
-/// resolved partial arg tree is a subset of `arg_entries`. Deduped by name.
+/// The secrets visible to a job whose ArgTree's top-level entries are
+/// `arg_entries` (name → oid, as `compute::args_entries` reads them) and whose
+/// std tree is `std`: every secret with at least one reader whose resolved
+/// partial arg tree is a subset of those entries. Deduped by name.
 ///
 /// Best-effort and fail-closed: a directory that can't be read, a secret that
 /// can't be parsed, or a reader that can't be resolved is logged and grants
