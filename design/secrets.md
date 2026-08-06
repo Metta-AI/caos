@@ -41,3 +41,13 @@ Correctness requirements: Neither the secret values nor the names of the secrets
 
 Server behavior:
 - When dispatching a work request, at the same time that the server selects a runner based on the closest match of the arg tree, the server also finds all secrets that list arg trees that are subsets of the worker's arg tree, and provides them to the runner
+
+## Remaining work
+
+- Output-scrub assertion (hard reject of new objects containing a secret) and log
+  masking — the two leak-prevention mechanisms.
+- Tree-relative readers and `:@=` reader args — currently only `std/<name>` readers
+  resolve (others are skipped, never granting). Full eval-path resolution of
+  repo-local tool paths is the main follow-up.
+- `value:@=` is parsed but the value stays UTF-8 (binary/multiline is a later
+  concern).
