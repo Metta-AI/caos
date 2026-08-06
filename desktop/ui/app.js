@@ -1,6 +1,6 @@
 const tauri = window.__TAURI__?.core;
 const { renderMarkdown } = window.CaosMarkdown;
-const { filePatchesFromPatch } = window.CaosChanges;
+const { filePatchesFromPatch, lineCountsFromPatch } = window.CaosChanges;
 const {
   activityGroupComplete,
   activityGroupExpandable,
@@ -40,7 +40,7 @@ const state = {
   pendingActivityGroups: new Map(),
   turnStartIndexes: new Map(),
   running: new Set(),
-  drafts: new Map(),
+  composerDrafts: new Map(),
   changesOpen: false,
   selectedAction: null,
   shortcutHelpOpen: false,
@@ -320,22 +320,22 @@ function scrollTranscriptToBottom() {
 }
 
 function saveSelectedDraft() {
-  if (state.selectedId) state.drafts.set(state.selectedId, elements.prompt.value);
+  if (state.selectedId) state.composerDrafts.set(state.selectedId, elements.prompt.value);
 }
 
 function restoreSelectedDraft() {
-  elements.prompt.value = state.drafts.get(state.selectedId) || '';
+  elements.prompt.value = state.composerDrafts.get(state.selectedId) || '';
   resizePrompt();
 }
 
 function clearComposer() {
-  state.drafts.set(state.selectedId, '');
+  state.composerDrafts.set(state.selectedId, '');
   elements.prompt.value = '';
   resizePrompt();
 }
 
 function prefillCommand(command) {
-  state.drafts.set(state.selectedId, command);
+  state.composerDrafts.set(state.selectedId, command);
   elements.prompt.value = command;
   resizePrompt();
   elements.prompt.focus({ preventScroll: true });
@@ -857,16 +857,6 @@ function selectRelativeConversation(amount) {
   selectConversation(state.conversations[next].id);
 }
 
-function lineCountsFromPatch(patch) {
-  let additions = 0;
-  let deletions = 0;
-  for (const line of patch.split('\n')) {
-    if (line.startsWith('+') && !line.startsWith('+++')) additions += 1;
-    if (line.startsWith('-') && !line.startsWith('---')) deletions += 1;
-  }
-  return { additions, deletions };
-}
-
 function renderPatch(patch) {
   elements.diff.replaceChildren();
   for (const line of patch.split('\n')) {
@@ -899,8 +889,8 @@ function renderChangeCount(stats) {
   elements.changeCount.append(additions, deletions);
 }
 
-function renderDiff(payload) {
-  const patch = payload?.patch || '';
+function renderDiff(value) {
+  const patch = String(value || '');
   const hasChanges = patch.trim().length > 0;
   elements.changesToggle.hidden = !hasChanges;
   if (!hasChanges && state.changesOpen) {
@@ -959,9 +949,9 @@ async function loadDiff(id, force = false) {
     elements.diff.textContent = 'Loading changes…';
   }
   try {
-    const payload = await tauri.invoke('get_diff', { conversation: id });
-    state.diffs.set(id, payload);
-    if (state.selectedId === id) renderDiff(payload);
+    const patch = await tauri.invoke('get_diff', { conversation: id });
+    state.diffs.set(id, patch);
+    if (state.selectedId === id) renderDiff(patch);
   } catch (error) {
     if (state.selectedId === id) {
       elements.changesPane.classList.add('is-empty');
@@ -1036,10 +1026,6 @@ async function refreshConversations(selectedId) {
   const persisted = await tauri.invoke('get_conversations');
   const drafts = state.conversations.filter((item) => item.draft && item.id !== selectedId);
   state.conversations = [...persisted, ...drafts];
-  if (!state.conversations.some((item) => item.id === selectedId)) {
-    const persistedSelected = persisted.find((item) => item.id === selectedId);
-    if (persistedSelected) state.conversations.unshift(persistedSelected);
-  }
 }
 
 async function sendCurrentMessage() {
@@ -1187,7 +1173,7 @@ elements.composer.addEventListener('submit', (event) => {
   sendCurrentMessage();
 });
 elements.prompt.addEventListener('input', () => {
-  state.drafts.set(state.selectedId, elements.prompt.value);
+  state.composerDrafts.set(state.selectedId, elements.prompt.value);
   resizePrompt();
 });
 

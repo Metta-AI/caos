@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { filePatchesFromPatch } = require('../ui/changes.js');
+const { filePatchesFromPatch, lineCountsFromPatch } = require('../ui/changes.js');
 
 const patch = [
   'diff --git a/desktop/ui/app.js b/desktop/ui/app.js',
@@ -25,5 +25,7 @@ assert.match(files[0].patch, /\+new app/u);
 assert.doesNotMatch(files[0].patch, /new css/u);
 assert.match(files[1].patch, /\+new css/u);
 assert.deepEqual(filePatchesFromPatch(''), []);
+assert.deepEqual(lineCountsFromPatch(patch), { additions: 2, deletions: 2 });
+assert.deepEqual(lineCountsFromPatch(''), { additions: 0, deletions: 0 });
 
 console.log('change viewer tests passed');

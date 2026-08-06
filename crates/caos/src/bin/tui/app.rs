@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
-    archive_user_conversation, conversation_replay, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, generate_conversation_title, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
-    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    archive_user_conversation, automatic_conversation_title, conversation_replay,
+    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
+    fresh_conversation_id, generate_conversation_title, list_user_conversations,
+    normalize_conversation_title, publish_unindexed_conversations, publish_user_conversation,
+    run_chat_turn, set_conversation_title, unarchive_user_conversation, ConversationRole,
+    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
     UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
@@ -32,21 +33,6 @@ fn short_hash(hash: &str) -> &str {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn automatic_title(prompt: &str) -> String {
-    const MAX_CHARS: usize = 60;
-
-    let title = collapse_whitespace(prompt);
-    if title.chars().count() <= MAX_CHARS {
-        return title;
-    }
-
-    title
-        .chars()
-        .take(MAX_CHARS - 1)
-        .chain(std::iter::once('…'))
-        .collect()
 }
 
 fn message_preview(text: &str, max_cells: u16) -> String {
@@ -971,7 +957,7 @@ impl ConversationState {
 
     fn apply_automatic_title(&mut self, prompt: &str) {
         if self.automatic_title && !self.automatic_title_fallback_applied {
-            self.title = automatic_title(prompt);
+            self.title = automatic_conversation_title(prompt);
             self.automatic_title_fallback_applied = true;
         }
     }
@@ -2446,17 +2432,13 @@ impl App {
     }
 
     fn rename_selected(&mut self, title: &str) {
-        let title = title.trim();
-        if title.is_empty() {
-            self.selected_mut()
-                .show_command_error("conversation title cannot be empty");
-            return;
-        }
-        if title.contains(['\n', '\r', '\t']) {
-            self.selected_mut()
-                .show_command_error("conversation title must be one line");
-            return;
-        }
+        let title = match normalize_conversation_title(title) {
+            Ok(title) => title,
+            Err(error) => {
+                self.selected_mut().show_command_error(error);
+                return;
+            }
+        };
         if self.selected().current_hash().is_some() {
             let id = self.selected().id.clone();
             if let Err(error) = self
@@ -2571,19 +2553,6 @@ fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
         row: row.clamp(area.y, area.bottom().saturating_sub(1)),
         column: column.clamp(area.x, area.right().saturating_sub(1)),
     }
-}
-
-fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String> {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("reading the clock: {error}"))?
-        .as_nanos();
-    let descriptor = format!(
-        "caos conversation v1\ncreator {user}\ncreated {created}\nprocess {}\n",
-        std::process::id()
-    );
-    t.put_object("blob", descriptor.as_bytes())
-        .map(|id| id.to_string())
 }
 
 fn new_conversation_options(
@@ -2908,19 +2877,6 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit());
-    }
-
-    #[test]
-    fn automatic_titles_collapse_whitespace_and_limit_unicode_scalars() {
-        assert_eq!(
-            automatic_title("  Review\t the\nλ parser  "),
-            "Review the λ parser"
-        );
-        assert_eq!(automatic_title(&"界".repeat(60)), "界".repeat(60));
-        assert_eq!(
-            automatic_title(&"界".repeat(61)),
-            format!("{}…", "界".repeat(59))
-        );
     }
 
     #[test]

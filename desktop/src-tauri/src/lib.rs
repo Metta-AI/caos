@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use caos::chat::{
-    conversation_replay, conversation_workspace_diff, list_user_conversations,
+    automatic_conversation_title, conversation_replay, conversation_workspace_diff,
+    fresh_conversation_id, list_user_conversations, normalize_conversation_title,
     publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
     set_conversation_title, ConversationRole, TurnEvent, TurnOptions, TurnPhase,
     UserConversationStatus, UserConversationSummary,
 };
-use caos::{GitTransport, Transport};
+use caos::GitTransport;
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{State, WebviewWindow};
@@ -26,6 +27,39 @@ struct AppState {
 struct DraftState {
     title: Option<String>,
     started: bool,
+}
+
+struct ActiveTurnGuard {
+    conversation: String,
+    active_turns: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ActiveTurnGuard {
+    fn start(
+        active_turns: Arc<Mutex<HashSet<String>>>,
+        conversation: String,
+    ) -> Result<Self, String> {
+        {
+            let mut active = active_turns
+                .lock()
+                .map_err(|_| "desktop turn state is unavailable".to_string())?;
+            if !active.insert(conversation.clone()) {
+                return Err(format!("conversation {conversation:?} is already running"));
+            }
+        }
+        Ok(Self {
+            conversation,
+            active_turns,
+        })
+    }
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_turns.lock() {
+            active.remove(&self.conversation);
+        }
+    }
 }
 
 impl AppState {
@@ -99,7 +133,6 @@ fn set_ui_zoom(window: WebviewWindow, scale: f64) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct BootstrapPayload {
     repo_name: String,
-    repo_path: String,
     conversations: Vec<ConversationPayload>,
 }
 
@@ -110,9 +143,21 @@ struct ConversationPayload {
     title: String,
     head: String,
     short_head: String,
-    updated_unix: i64,
     draft: bool,
     started: bool,
+}
+
+impl ConversationPayload {
+    fn draft(id: String, title: String) -> Self {
+        Self {
+            id,
+            title,
+            head: String::new(),
+            short_head: String::new(),
+            draft: true,
+            started: false,
+        }
+    }
 }
 
 impl From<UserConversationSummary> for ConversationPayload {
@@ -122,7 +167,6 @@ impl From<UserConversationSummary> for ConversationPayload {
             id: summary.id,
             title: summary.title,
             head: summary.head,
-            updated_unix: summary.updated_unix,
             draft: false,
             started: true,
         }
@@ -135,7 +179,6 @@ struct HistoryEntryPayload {
     commit: String,
     short_commit: String,
     timestamp_unix: i64,
-    author: String,
     role: &'static str,
     message: String,
 }
@@ -152,23 +195,6 @@ struct HistoryTurnEventsPayload {
 struct HistoryPayload {
     turns: Vec<HistoryEntryPayload>,
     turn_events: Vec<HistoryTurnEventsPayload>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiffPayload {
-    base_commit: String,
-    head: String,
-    patch: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnOutcomePayload {
-    conversation: String,
-    commit: String,
-    short_commit: String,
-    title: String,
 }
 
 #[derive(Serialize)]
@@ -265,44 +291,6 @@ fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
 }
 
-fn automatic_title(prompt: &str) -> String {
-    const MAX_CHARS: usize = 60;
-    let title = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if title.chars().count() <= MAX_CHARS {
-        return title;
-    }
-    title
-        .chars()
-        .take(MAX_CHARS - 1)
-        .chain(std::iter::once('…'))
-        .collect()
-}
-
-fn validated_conversation_title(title: &str) -> Result<String, String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Err("conversation title cannot be empty".to_string());
-    }
-    if title.contains(['\n', '\r', '\t']) {
-        return Err("conversation title must be one line".to_string());
-    }
-    Ok(title.to_string())
-}
-
-fn fresh_conversation_id(transport: &GitTransport, user: &str) -> Result<String, String> {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("reading the clock: {error}"))?
-        .as_nanos();
-    let descriptor = format!(
-        "caos conversation v1\ncreator {user}\ncreated {created}\nprocess {}\n",
-        std::process::id()
-    );
-    transport
-        .put_object("blob", descriptor.as_bytes())
-        .map(|id| id.to_string())
-}
-
 fn active_conversations(
     transport: &GitTransport,
     user: &str,
@@ -316,14 +304,12 @@ fn active_conversations(
 async fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let repo_dir = state.repo_dir()?;
     let repo_name = state.repo_name.clone();
-    let repo_path = repo_dir.display().to_string();
     let user = state.user.clone();
     run_blocking(move || {
         let transport = GitTransport::discover(&repo_dir)?;
         let conversations = active_conversations(&transport, &user)?;
         Ok(BootstrapPayload {
             repo_name,
-            repo_path,
             conversations,
         })
     })
@@ -362,15 +348,7 @@ async fn new_conversation(state: State<'_, AppState>) -> Result<ConversationPayl
                 )
             })
         {
-            return Ok(ConversationPayload {
-                id,
-                title,
-                head: String::new(),
-                short_head: String::new(),
-                updated_unix: 0,
-                draft: true,
-                started: false,
-            });
+            return Ok(ConversationPayload::draft(id, title));
         }
         let transport = GitTransport::discover(repo_dir)?;
         let id = fresh_conversation_id(&transport, &user)?;
@@ -378,15 +356,10 @@ async fn new_conversation(state: State<'_, AppState>) -> Result<ConversationPayl
             .lock()
             .map_err(|_| "desktop draft state is unavailable".to_string())?
             .insert(id.clone(), DraftState::default());
-        Ok(ConversationPayload {
+        Ok(ConversationPayload::draft(
             id,
-            title: "New conversation".to_string(),
-            head: String::new(),
-            short_head: String::new(),
-            updated_unix: 0,
-            draft: true,
-            started: false,
-        })
+            "New conversation".to_string(),
+        ))
     })
     .await
 }
@@ -397,7 +370,7 @@ async fn rename_conversation(
     conversation: String,
     title: String,
 ) -> Result<String, String> {
-    let title = validated_conversation_title(&title)?;
+    let title = normalize_conversation_title(&title)?.to_string();
     if state
         .active_turns
         .lock()
@@ -453,7 +426,6 @@ async fn get_history(
                     commit: turn.commit,
                     short_commit: turn.short_commit,
                     timestamp_unix: turn.timestamp_unix,
-                    author: turn.author,
                     role: match turn.role {
                         ConversationRole::Human => "human",
                         ConversationRole::Agent => "agent",
@@ -479,27 +451,19 @@ async fn get_history(
 }
 
 #[tauri::command]
-async fn get_diff(state: State<'_, AppState>, conversation: String) -> Result<DiffPayload, String> {
+async fn get_diff(state: State<'_, AppState>, conversation: String) -> Result<String, String> {
     if state
         .drafts
         .lock()
         .map_err(|_| "desktop draft state is unavailable".to_string())?
         .contains_key(&conversation)
     {
-        return Ok(DiffPayload {
-            base_commit: String::new(),
-            head: String::new(),
-            patch: String::new(),
-        });
+        return Ok(String::new());
     }
     let repo_dir = state.repo_dir()?;
     run_blocking(move || {
         let transport = GitTransport::discover(repo_dir)?;
-        conversation_workspace_diff(&transport, &conversation).map(|diff| DiffPayload {
-            base_commit: diff.base_commit,
-            head: diff.head,
-            patch: diff.patch,
-        })
+        conversation_workspace_diff(&transport, &conversation).map(|diff| diff.patch)
     })
     .await
 }
@@ -511,27 +475,19 @@ async fn send_message(
     message: String,
     title: String,
     on_event: Channel<TurnEventPayload>,
-) -> Result<TurnOutcomePayload, String> {
+) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("empty message".to_string());
     }
-    {
-        let mut active = state
-            .active_turns
-            .lock()
-            .map_err(|_| "desktop turn state is unavailable".to_string())?;
-        if !active.insert(conversation.clone()) {
-            return Err(format!("conversation {conversation:?} is already running"));
-        }
-    }
-
+    let title = normalize_conversation_title(&title)?.to_string();
     let repo_dir = state.repo_dir()?;
     let user = state.user.clone();
     let drafts = Arc::clone(&state.drafts);
-    let active_turns = Arc::clone(&state.active_turns);
-    let conversation_for_error = conversation.clone();
+    let active_turn =
+        ActiveTurnGuard::start(Arc::clone(&state.active_turns), conversation.clone())?;
     tauri::async_runtime::spawn_blocking(move || {
-        let result = (|| {
+        let _active_turn = active_turn;
+        (|| {
             let draft_title = {
                 let mut drafts = drafts
                     .lock()
@@ -541,7 +497,7 @@ async fn send_message(
                     let title = draft
                         .title
                         .clone()
-                        .unwrap_or_else(|| automatic_title(&message));
+                        .unwrap_or_else(|| automatic_conversation_title(&message));
                     draft.title = Some(title.clone());
                     title
                 })
@@ -549,7 +505,7 @@ async fn send_message(
             let is_draft = draft_title.is_some();
             let resolved_title = draft_title.unwrap_or(title);
             let transport = GitTransport::discover(&repo_dir)?;
-            let outcome = run_chat_turn(
+            run_chat_turn(
                 &transport,
                 &TurnOptions::default(),
                 &conversation,
@@ -566,17 +522,8 @@ async fn send_message(
                     .map_err(|_| "desktop draft state is unavailable".to_string())?
                     .remove(&conversation);
             }
-            Ok(TurnOutcomePayload {
-                conversation: outcome.conversation,
-                commit: outcome.commit,
-                short_commit: outcome.short_commit,
-                title: resolved_title,
-            })
-        })();
-        if let Ok(mut active) = active_turns.lock() {
-            active.remove(&conversation_for_error);
-        }
-        result
+            Ok(())
+        })()
     })
     .await
     .map_err(|error| format!("desktop turn worker failed: {error}"))?
@@ -607,20 +554,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{automatic_title, short_hash, validated_conversation_title, TurnEventPayload};
+    use super::{short_hash, ActiveTurnGuard, TurnEventPayload};
     use caos::chat::TurnEvent;
-
-    #[test]
-    fn titles_match_the_tui_limits() {
-        assert_eq!(
-            automatic_title("  Review\t the\nparser  "),
-            "Review the parser"
-        );
-        assert_eq!(
-            automatic_title(&"x".repeat(61)),
-            format!("{}…", "x".repeat(59))
-        );
-    }
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn hashes_are_safe_when_short() {
@@ -629,14 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn conversation_titles_are_trimmed_and_single_line() {
-        assert_eq!(
-            validated_conversation_title("  A useful title  ").unwrap(),
-            "A useful title"
-        );
-        assert!(validated_conversation_title("  ").is_err());
-        assert!(validated_conversation_title("two\nlines").is_err());
-        assert!(validated_conversation_title("tab\tseparated").is_err());
+    fn active_turns_are_exclusive_and_clear_on_drop() {
+        let active = Arc::new(Mutex::new(HashSet::new()));
+        let guard = ActiveTurnGuard::start(Arc::clone(&active), "talk-1".to_string()).unwrap();
+        assert!(active.lock().unwrap().contains("talk-1"));
+        assert!(ActiveTurnGuard::start(Arc::clone(&active), "talk-1".to_string()).is_err());
+        drop(guard);
+        assert!(active.lock().unwrap().is_empty());
     }
 
     #[test]

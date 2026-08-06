@@ -655,6 +655,38 @@ pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a
     unreachable!("some talk-<n> is always free")
 }
 
+/// Create a presentation-independent id for a conversation that has not had
+/// its first turn yet.
+pub fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String> {
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("reading the clock: {error}"))?
+        .as_nanos();
+    let descriptor = format!(
+        "caos conversation v1\ncreator {user}\ncreated {created}\nprocess {}\n",
+        std::process::id()
+    );
+    t.put_object("blob", descriptor.as_bytes())
+        .map(|id| id.to_string())
+}
+
+/// Derive the immediate fallback title shown while best-effort title
+/// generation is still running.
+pub fn automatic_conversation_title(prompt: &str) -> String {
+    const MAX_CHARS: usize = 60;
+
+    let title = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.chars().count() <= MAX_CHARS {
+        return title;
+    }
+
+    title
+        .chars()
+        .take(MAX_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 /// The most recently advanced conversation in this repo, by the head commit's
 /// committer date (turn commits carry wall-clock timestamps).
 fn latest_conversation(t: &GitTransport) -> Result<Option<String>, String> {
@@ -741,7 +773,8 @@ fn validate_user_conversation(user: &str, id: &str) -> Result<(), String> {
     validate_conversation_user(user)
 }
 
-fn validate_conversation_title(title: &str) -> Result<&str, String> {
+/// Trim and validate a title before a client displays or persists it.
+pub fn normalize_conversation_title(title: &str) -> Result<&str, String> {
     let title = title.trim();
     if title.is_empty() {
         return Err("conversation title cannot be empty".to_string());
@@ -789,7 +822,7 @@ pub fn publish_user_conversation(
     title: &str,
 ) -> Result<(), String> {
     validate_user_conversation(user, id)?;
-    let title = validate_conversation_title(title)?;
+    let title = normalize_conversation_title(title)?;
     let local_ref = validated_refname(id)?;
     let head = rev_parse_opt(t, &local_ref)?
         .ok_or_else(|| format!("cannot publish conversation {id:?} before its first turn"))?;
@@ -821,7 +854,7 @@ pub fn publish_user_conversation(
 /// Change a conversation's shared title without changing its identity or HEAD.
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
     validated_refname(id)?;
-    let title = validate_conversation_title(title)?;
+    let title = normalize_conversation_title(title)?;
     let hash = t.put_object("blob", title.as_bytes())?.to_string();
     t.ensure_pushed(&hash)?;
     let title_ref = conversation_title_ref(id);
@@ -1169,7 +1202,7 @@ fn parse_generated_title(text: &str) -> Result<String, String> {
     if title.chars().count() > 60 {
         return Err("conversation title result exceeds 60 characters".to_string());
     }
-    validate_conversation_title(&title).map(str::to_string)
+    normalize_conversation_title(&title).map(str::to_string)
 }
 
 /// One turn: mint the human commit, run llm-step over it, emit progress, and
@@ -1901,6 +1934,29 @@ mod tests {
         assert!(validated_refname("bad name").is_err());
         assert!(validate_conversation_user("nishadsingh").is_ok());
         assert!(validate_conversation_user("bad user").is_err());
+    }
+
+    #[test]
+    fn shared_conversation_titles_are_compact_and_valid() {
+        assert_eq!(
+            automatic_conversation_title("  Review\t the\nλ parser  "),
+            "Review the λ parser"
+        );
+        assert_eq!(
+            automatic_conversation_title(&"界".repeat(60)),
+            "界".repeat(60)
+        );
+        assert_eq!(
+            automatic_conversation_title(&"界".repeat(61)),
+            format!("{}…", "界".repeat(59))
+        );
+        assert_eq!(
+            normalize_conversation_title("  A useful title  ").unwrap(),
+            "A useful title"
+        );
+        assert!(normalize_conversation_title("  ").is_err());
+        assert!(normalize_conversation_title("two\nlines").is_err());
+        assert!(normalize_conversation_title("tab\tseparated").is_err());
     }
 
     #[test]
