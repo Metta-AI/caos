@@ -218,6 +218,7 @@ pub(crate) fn dispatch(
     arg_tree: &str,
     arg_entries: ArgTree,
     image_ref: &str,
+    secrets: Vec<(String, String)>,
 ) -> Result<String, HttpError> {
     let (outcome_tx, outcome_rx) = mpsc::channel();
     let id = {
@@ -232,6 +233,7 @@ pub(crate) fn dispatch(
                 arg_tree: arg_tree.to_string(),
                 image_ref: image_ref.to_string(),
                 arg_entries,
+                secrets,
                 nonce,
                 phase: Phase::Pending {
                     deadline: Instant::now() + pending_timeout(),
