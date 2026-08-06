@@ -38,6 +38,9 @@ use gix::objs::WriteTo;
 pub mod chat;
 pub use chat::{cli_chat, cli_talk};
 
+mod eval;
+pub use eval::cli_eval_path;
+
 /// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool script as a caos job over this repo's tree, exactly what an
 /// agent's tool invocation does. The bash worker gets the tracked worktree
@@ -2201,13 +2204,28 @@ fn prepare_request(
     cas: Option<&Path>,
     kvs: &[String],
 ) -> Result<String, String> {
+    // Build the call's args (paths resolve per `cas`), then hand them to the
+    // shared assembler, which folds in the image, salt and std.
+    let call = build_arg_entries(t, cas, kvs)?;
+    assemble_arg_tree(t, image, call)
+}
+
+/// Assemble a runnable ArgTree from a base `image` ref and the caller's already
+/// resolved `call` args, folding in the reserved `image`/`salt`/`std` entries,
+/// storing it, and getting it onto the server. Returns the ArgTree hash (the
+/// request id and cache key). Shared by [`prepare_request`] (which resolves
+/// `call` from kvs) and the `.caos-expr` evaluator (which resolves `call`
+/// against a git tree).
+fn assemble_arg_tree(
+    t: &dyn Transport,
+    image: &str,
+    call: Vec<gix::objs::tree::Entry>,
+) -> Result<String, String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it. The image is folded into the args tree below, so the server
     // only ever sees a plain args tree.
     let (image, bound) = unwrap_curry(t, image)?;
 
-    // Build the call's args, then merge them over the bound ones (call wins).
-    let call = build_arg_entries(t, cas, kvs)?;
     // The worker (image) rides *in* the args tree under the reserved `image`
     // entry, rather than as a sibling of `args` in the request. So a computation
     // is identified entirely by its args (an executor can match on the worker
@@ -2790,6 +2808,21 @@ fn curry_object(
     unbind: &[&str],
     kvs: &[String],
 ) -> Result<gix::ObjectId, String> {
+    let new = build_arg_entries(t, cas, kvs)?;
+    curry_from_entries(t, arg_tree, unbind, new)
+}
+
+/// The body of [`curry_object`] once the new args are resolved into `new`
+/// entries: decompose `arg_tree` into `(base, bound)`, drop the `unbind` names,
+/// refuse any rebind, add `new`, and store the curry node. Shared with the
+/// `.caos-expr` evaluator, which resolves its `new` entries against a git tree
+/// rather than from kvs.
+fn curry_from_entries(
+    t: &dyn Transport,
+    arg_tree: &str,
+    unbind: &[&str],
+    new: Vec<gix::objs::tree::Entry>,
+) -> Result<gix::ObjectId, String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let (base, mut bound) = unwrap_curry(t, arg_tree)?;
@@ -2814,7 +2847,6 @@ fn curry_object(
     // `worker1`), and silent override turns it into a distant, cryptic
     // failure. Call-time args still override curry bindings at run — only
     // curry-over-curry is strict. Unbind (above) is the deliberate release.
-    let new = build_arg_entries(t, cas, kvs)?;
     for e in &new {
         if bound.iter().any(|b| b.filename == e.filename) {
             return Err(format!(

@@ -10,12 +10,17 @@ Examples:
 
 - `caos eval-path [--tree=oid] <path>` interprets `.caos-expr` files that are embedded in the tree from the root to the provided path and returns the result
 - Each expression is evaluated in the tree returned by the parent expression. Most expressions will evaluate to a tree with a similar shape to the original. But this is not required. A valid path is one where each segment after an expression is valid in the result of that expression. This can't be determined statically
-- A `.caos-expr` contains one line: a run or curry command, potentially with subcommands of the same form. For example:
+- A `.caos-expr` is a sequence of lines. Blank lines and `#` comments are ignored. Any line but the last binds a variable; the last line is the file's value:
   ```
     run   <image> -- [--name=value | --name:@=path | --name:commit=rev]
-    curry <image> -- [--name=value | --name:@=path] 
-    curry <runner-ref> -- --worker1:@=$( run <cargo-ref> -- --src:@=src )
+    curry <image> -- [--name=value | --name:@=path]
+    # bind a variable (uppercase name), then use it with $NAME:
+    FOO=run <cargo-ref> -- --src:@=src
+    curry <runner-ref> -- --worker1=$FOO
   ```
+  Variable names are `[A-Z][A-Z0-9_]*`; the verbs are lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`. A `$NAME` in an image position is the object that variable produced; `--k=$NAME` binds that object by reference (at its own kind); `--k=value` is a literal blob. (This replaces an earlier `$( ... )` command-substitution sketch — the variable form is easier to write, read and parse.)
+- A `run` expression evaluates to the run's result; a `curry` expression to the curried ArgTree. In practice we dig into `run` results, not through `curry`.
+
 - Arguments are parsed as with a normal curry/run-then command, except that paths are relative to the directory containing the `.caos-expr` file. `/std/...` is interpreted as normal for now (until we remove it later)
 - There is no lazy evaluation here
 - `eval-path` converts the expression into an arg tree and then requests that the arg tree is run, providing normal caching

@@ -2242,6 +2242,13 @@ name = "worker-common"
 version = "0.1.0"
 
 [[package]]
+name = "worker-deep-deps"
+version = "0.1.0"
+dependencies = [
+ "worker-common",
+]
+
+[[package]]
 name = "worker-llm-step"
 version = "0.1.0"
 dependencies = [

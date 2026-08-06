@@ -12,6 +12,7 @@ members = [
     "crates/worker-bash-tool",
     "crates/worker-llm-step",
     "crates/worker-rgrep",
+    "crates/worker-deep-deps",
     "crates/llm-stub",
 ]
 
