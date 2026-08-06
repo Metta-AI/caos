@@ -252,8 +252,10 @@ mod tests {
         assert!(!is_subset(&extra, &job));
 
         // A different image never matches.
-        let other_image: BTreeMap<String, String> =
-            [("image", "ff")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let other_image: BTreeMap<String, String> = [("image", "ff")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         assert!(!is_subset(&other_image, &job));
     }
 
