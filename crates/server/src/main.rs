@@ -42,6 +42,7 @@
 mod compute;
 mod git;
 mod runner;
+mod secrets;
 mod storage;
 mod trace;
 
