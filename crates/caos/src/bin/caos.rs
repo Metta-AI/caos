@@ -252,7 +252,9 @@ fn write_secrets(secrets: &[(String, String)]) -> Result<(), String> {
         .map_err(|e| format!("chmod {SECRET_DIR}: {e}"))?;
     for (name, value) in secrets {
         if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-            return Err(format!("secret name {name:?} is not a single path component"));
+            return Err(format!(
+                "secret name {name:?} is not a single path component"
+            ));
         }
         let path = format!("{SECRET_DIR}/{name}");
         std::fs::write(&path, value).map_err(|e| format!("writing secret {name}: {e}"))?;
