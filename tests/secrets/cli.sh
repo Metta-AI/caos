@@ -72,4 +72,22 @@ verdict=$(cat got/verdict)
   || fail "verdict: $verdict (expected 'token-ok locked-absent')"
 echo "  ok: /secret/token granted with the right value, /secret/locked denied" >&2
 
+echo "== a worker that leaks a secret into its output is refused ==" >&2
+cat > leak.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+mkdir -p /tmp/out
+# Copy the raw secret into the output tree — the output-leak assertion must
+# refuse to publish this, failing the run.
+cat /secret/token > /tmp/out/leaked
+caos put /tmp/out /cas/out
+EOF
+commit "leak fixture"
+if "$CAOS_CLI" run /cas/std/bash leaked -- --worker1:@=leak.sh >/dev/null 2>leak.err; then
+  fail "run leaking the secret should have failed"
+fi
+grep -qi "secret" leak.err || fail "leak error should mention a secret: $(cat leak.err)"
+grep -q "SEKRET-abc-123" leak.err && fail "the error must NOT echo the secret value"
+echo "  ok: leaking the secret value into output fails the run, without echoing it" >&2
+
 echo "secrets: ALL PASS" >&2
