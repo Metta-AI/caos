@@ -128,8 +128,7 @@ fn parse_secret(name: &str, path: &Path) -> Result<Secret, String> {
             "value:@" => {
                 let dir = path.parent().unwrap_or_else(|| Path::new("."));
                 let file = dir.join(val);
-                let bytes =
-                    std::fs::read(&file).map_err(|e| format!("value:@={val}: {e}"))?;
+                let bytes = std::fs::read(&file).map_err(|e| format!("value:@={val}: {e}"))?;
                 value = Some(
                     String::from_utf8(bytes)
                         .map_err(|e| format!("value:@={val}: not UTF-8: {e}"))?,
