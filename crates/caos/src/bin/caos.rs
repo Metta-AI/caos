@@ -527,10 +527,13 @@ fn run_worker(envs: &[(&str, &str)], secrets: &[(String, String)]) -> Result<(),
     let out = command
         .output()
         .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let log = mask_secrets(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        secrets,
     );
     eprint!("{log}");
     if !out.status.success() {
@@ -540,6 +543,24 @@ fn run_worker(envs: &[(&str, &str)], secrets: &[(String, String)]) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// Replace every injected secret value in `log` with a fixed marker. Longest
+/// values first, so a secret that contains another is masked whole. Empty
+/// values are skipped (they'd match everywhere). The marker names no secret.
+fn mask_secrets(mut log: String, secrets: &[(String, String)]) -> String {
+    let mut values: Vec<&str> = secrets
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for value in values {
+        if log.contains(value) {
+            log = log.replace(value, "[redacted secret]");
+        }
+    }
+    log
 }
 
 /// Read back the result the worker recorded at `/cas/out`, as `"<type> <hash>"`.
