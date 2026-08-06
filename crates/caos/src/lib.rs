@@ -31,6 +31,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
@@ -1515,6 +1516,11 @@ pub fn put_commit(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String>
     let bytes = std::fs::read(src).map_err(|e| format!("{src}: {e}"))?;
     gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
         .map_err(|e| format!("{src} is not a valid commit: {e}"))?;
+    // A minted commit isn't stored via `send`, so assert here too: its message
+    // (or tree/parent bytes) must not carry an injected secret.
+    if !t.has_object(&hash_bytes("commit", &bytes)?.to_string())? {
+        refuse_if_leaks(&bytes, "a commit")?;
+    }
     let oid = post_object(t, "commit", &bytes)?;
     write_placeholder(&target, "commit", &oid.to_string())?;
     // The minted commit's hash — the caller's handle (e.g. the next parent).
@@ -1712,11 +1718,22 @@ fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
     if matches!(h.body, Body::Stored) || t.has_object(&h.oid.to_string())? {
         return Ok(());
     }
+    // The output-leak assertion (design/secrets.md): scan each NEW blob for any
+    // secret injected into this run BEFORE it is published. We reach here only
+    // for objects the store lacks, so — by git's closure invariant — only for
+    // objects this run is introducing; an output that dedups to something
+    // already stored can't be a new leak. On a hit the whole `put` fails, so
+    // the offending object is never posted. (Off-worker there is no `/secret`,
+    // so this is a no-op for the host CLI.)
     let stored = match &h.body {
         Body::Stored => unreachable!("filtered above"),
-        Body::Link(target) => t.put_object("blob", target)?,
+        Body::Link(target) => {
+            refuse_if_leaks(target, "a symlink target")?;
+            t.put_object("blob", target)?
+        }
         Body::File(path) => {
             let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            refuse_if_leaks(&data, &path.display().to_string())?;
             t.put_object("blob", &data)?
         }
         Body::Dir(encoded, children) => {
@@ -1733,6 +1750,57 @@ fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The in-container directory the runner drops this run's granted secrets into,
+/// one file per secret (design/secrets.md). Shared with the container runner
+/// (`bin/caos.rs`), which writes it.
+pub const SECRET_DIR: &str = "/secret";
+
+/// The raw values of every secret injected into this run, read once from
+/// [`SECRET_DIR`]. Empty off-worker (no such dir) — so the leak scan costs
+/// nothing for the host CLI. Empty values are dropped (nothing to match).
+fn injected_secret_values() -> &'static [Vec<u8>] {
+    static VALUES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    VALUES.get_or_init(|| {
+        let mut values = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(SECRET_DIR) {
+            for entry in entries.flatten() {
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if !bytes.is_empty() {
+                        values.push(bytes);
+                    }
+                }
+            }
+        }
+        values
+    })
+}
+
+/// Fail if `data` contains any injected secret's raw bytes — the hard output
+/// assertion. `what` names the object for the error, and the error deliberately
+/// never quotes the value. Raw-byte only: a secret the worker base64'd or
+/// otherwise transformed slips through (design/secrets.md — this catches bugs,
+/// a token swept into an error file or a stray credential, not a determined
+/// exfiltrator, which is inside the trust boundary anyway).
+fn refuse_if_leaks(data: &[u8], what: &str) -> Result<(), String> {
+    for secret in injected_secret_values() {
+        if contains_subslice(data, secret) {
+            return Err(format!(
+                "refusing to store {what}: it contains an injected secret value \
+                 (design/secrets.md: outputs must not carry secrets)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does `haystack` contain `needle` as a contiguous byte subslice?
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The git object id `kind`/`data` would have, computed locally — no store.

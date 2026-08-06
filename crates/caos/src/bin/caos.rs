@@ -236,7 +236,7 @@ fn run_runner_job(
 
 /// In-container directory the runner drops granted secrets into, one file per
 /// secret, for the worker to read (design/secrets.md, `/secret/<name>`).
-const SECRET_DIR: &str = "/secret";
+const SECRET_DIR: &str = caos::SECRET_DIR;
 
 /// Write `secrets` (name → value) into `/secret/<name>`, wiping any prior
 /// contents first. Written root-owned but world-readable so the unprivileged
