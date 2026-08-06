@@ -6,9 +6,9 @@ use caos::chat::{
     archive_user_conversation, conversation_history, conversation_workspace_diff,
     describe_tool_set, first_available_conversation_name, generate_conversation_title,
     list_user_conversations, publish_unindexed_conversations, publish_user_conversation,
-    run_chat_turn, set_conversation_title, unarchive_user_conversation, ConversationRole,
-    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
-    UserConversationSummary, WorkspaceDiff,
+    run_chat_turn, run_publish_merge_turn, set_conversation_title, unarchive_user_conversation,
+    ConversationRole, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
+    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -19,8 +19,8 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
-    prepare_publish_target, publish_conversation_pr, remote_default_branch,
+    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
+    local_default_branch_tip, publish_conversation_pr, remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -933,9 +933,14 @@ impl ConversationState {
         )
     }
 
-    fn begin_turn(&mut self, message: &str, apply_automatic_title: bool) {
+    fn begin_turn(&mut self, message: &str, apply_automatic_title: bool) -> bool {
+        let should_generate_title =
+            apply_automatic_title && self.automatic_title && !self.generating_title;
         if apply_automatic_title {
             self.apply_automatic_title(message);
+        }
+        if should_generate_title {
+            self.generating_title = true;
         }
         self.transcript.push(TranscriptEntry {
             role: EntryRole::Human,
@@ -951,6 +956,7 @@ impl ConversationState {
         self.status = "starting turn".to_string();
         self.follow_tail();
         self.transcript_selection = None;
+        should_generate_title
     }
 
     fn running_activity(&self) -> Option<&Activity> {
@@ -1548,29 +1554,7 @@ impl App {
         } else {
             raw
         };
-        let should_generate_title =
-            self.selected().automatic_title && !self.selected().generating_title;
-        {
-            let state = self.selected_mut();
-            state.apply_automatic_title(&message);
-            if should_generate_title {
-                state.generating_title = true;
-            }
-            state.transcript.push(TranscriptEntry {
-                role: EntryRole::Human,
-                commit: None,
-                text: message.clone(),
-            });
-            state.activities.clear();
-            state.activity_selection = None;
-            state.activity_detail_scroll = 0;
-            state.running = true;
-            state.sidebar_attention = None;
-            state.turn_phase = TurnPhase::System;
-            state.status = "starting turn".to_string();
-            state.follow_tail();
-            state.transcript_selection = None;
-        }
+        let should_generate_title = self.selected_mut().begin_turn(&message, true);
 
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
@@ -2515,11 +2499,6 @@ impl App {
             };
             self.selected_mut().publish_prompt = false;
             let name = self.selected().id.clone();
-            let diff = self
-                .selected()
-                .diff
-                .clone()
-                .expect("a non-empty diff was checked");
             self.selected_mut().publishing = true;
             self.selected_mut().status = "fetching the selected PR base".to_string();
             let tx = self.tx.clone();
@@ -2527,24 +2506,28 @@ impl App {
             let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
                 let result = (|| {
-                    let target = prepare_publish_target(&diff, &pr_base, &default_base, &repo_dir)?;
+                    let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
                     let transport = GitTransport::discover(&repo_dir)?;
-                    transport.ensure_pushed(&target.merge_commit)?;
-
-                    let message = publish_merge_prompt(&pr_base, &target.merge_commit);
-                    let _ = tx.send(UiMessage::PublishTurnStarted {
-                        conversation: name.clone(),
-                        message: message.clone(),
-                    });
-                    run_chat_turn(&transport, &options, &name, &message, None, |event| {
-                        let _ = tx.send(UiMessage::Turn {
-                            conversation: name.clone(),
-                            event,
-                        });
-                    })?;
-
-                    let merged = conversation_workspace_diff(&transport, &name)?;
-                    publish_conversation_pr(&name, &merged, &pr_base, &target, &repo_dir)
+                    let workspace = run_publish_merge_turn(
+                        &transport,
+                        &options,
+                        &name,
+                        &base_commit,
+                        pr_base != default_base,
+                        |message| {
+                            let _ = tx.send(UiMessage::PublishTurnStarted {
+                                conversation: name.clone(),
+                                message: message.to_string(),
+                            });
+                        },
+                        |event| {
+                            let _ = tx.send(UiMessage::Turn {
+                                conversation: name.clone(),
+                                event,
+                            });
+                        },
+                    )?;
+                    publish_conversation_pr(&name, &workspace, &pr_base, &base_commit, &repo_dir)
                 })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
@@ -2553,15 +2536,6 @@ impl App {
             });
         }
     }
-}
-
-fn publish_merge_prompt(pr_base: &str, merge_commit: &str) -> String {
-    format!(
-        "Prepare this conversation for a pull request against `{pr_base}`. Use the `merge` tool \
-         with `theirs` set exactly to `{merge_commit}`. Resolve every conflict it reports, \
-         deleting each resolved path's rows from `.caos/conflicts`, then run the repository's \
-         build and tests. Do not finish until the workspace is ready to publish."
-    )
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -4182,7 +4156,11 @@ mod tests {
         let mut conversation = state("talk-1");
         conversation.publishing = true;
         let (mut app, tx) = app_with(vec![conversation]);
-        let message = publish_merge_prompt("main", &"a".repeat(40));
+        let message = "The core publish operation has already merged the exact selected base into \
+                       this conversation with the standard merge worker; do not merge it again. \
+                       Resolve every conflict recorded in `.caos/conflicts`, then run the \
+                       repository's build and tests."
+            .to_string();
 
         tx.send(UiMessage::PublishTurnStarted {
             conversation: "talk-1".to_string(),
@@ -4201,13 +4179,7 @@ mod tests {
             .last()
             .unwrap()
             .text
-            .contains("`merge` tool"));
-        assert!(state
-            .transcript
-            .last()
-            .unwrap()
-            .text
-            .contains(&"a".repeat(40)));
+            .contains("standard merge worker"));
     }
 
     #[test]

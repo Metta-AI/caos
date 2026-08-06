@@ -42,7 +42,8 @@ Two kinds of commits, one conversation spine:
 - **Turn commit (agent)** — a **merge**: first parent = the human turn,
   second parent = the last step commit — or, for a turn that used no tools at
   all, a plain single-parent commit (no steps exist). Tree = final workspace
-  with `.caos/` dropped (pure). Message = the response text.
+  without `.caos/step.json`; merge work may retain the workspace-owned
+  `.caos/conflicts` until the publish boundary. Message = the response text.
 
 Step and turn commits are authored **`caos-agent <caos@caos>`** with real
 wall-clock timestamps (so a retried turn is a distinct commit); that author
@@ -76,9 +77,9 @@ workspace state and every API exchange (a blob oid named only in a commit
 message would be unreachable — messages are text, not references).
 
 Diff shapes: step↔step = real edits + one modified `.caos/step.json`;
-turn↔step = real edits + one deletion; turn↔turn = pure. `.caos` is a
-reserved name — the harness errors at conversation start if the base tree
-already contains one.
+turn↔step = real edits + deletion of `step.json`; turn↔turn = workspace edits.
+`.caos` is reserved for harness and merge state — the harness errors at
+conversation start if the base tree already contains one.
 
 ## The step loop
 
@@ -132,8 +133,9 @@ Tool classes:
   non-unique `old_string`) are `is_error` tool_results, not errors. Parameter
   shapes mirror Claude Code's file tools, which models know well.
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
-  includes the workspace tree **with `.caos/` stripped** — tools never see
-  transcripts, and tool cache keys stay identical to real workspace trees.
+  includes the workspace tree as-is. It never contains transcript-only
+  `.caos/step.json`, but a merge-resolution run sees `.caos/conflicts` until
+  the agent clears it; publish strips the directory from the outgoing tree.
   No network in tool images; only the llm-step image has egress. (Not yet
   enforced: both workers currently run as `curry(runner, bin)` in the shared
   runner pool, whose containers all sit on the compute network — a per-image
@@ -297,15 +299,16 @@ Two verbs and a full-screen client over one turn engine (implemented —
   `Ctrl+P` opens a PR-base prompt and a second press publishes the selected
   workspace without checking it out. It replaces the clean
   `caos/<conversation>` snapshot commit directly above the fetched tip of that
-  base. First, an ordinary visible agent turn calls the standard `merge` worker
-  with the exact fetched tip, resolves its conflicts in the virtual workspace,
-  and builds/tests the result. The default base receives the complete
+  base. First, the core chat engine calls the standard `merge` worker directly
+  with the exact fetched tip. An ordinary visible agent turn starts from that
+  result, resolves its conflicts in the virtual workspace, and builds/tests the
+  result. The default base receives the complete
   conversation workspace; another base uses a synthetic merge target rooted at
   the conversation's starting commit, so a child conversation contributes only
-  its own delta when stacked on its parent's clean snapshot. Publishing guards
-  that the target is reachable and no conflict rows or text markers remain,
-  then strips `.caos`, pushes the one-commit snapshot with an exact remote
-  lease, and opens or finds its open PR through `gh` against the same branch.
+  its own delta when stacked on its parent's clean snapshot. The core publish
+  boundary guards that no conflict rows or text markers remain and strips
+  `.caos`; the tui then pushes the one-commit snapshot with an exact remote
+  lease and opens or finds its open PR through `gh` against the same branch.
   This preserves non-conflicting upstream work while excluding all prior
   conversation history. Merely
   opening, running, switching, or publishing conversations never mutates the
