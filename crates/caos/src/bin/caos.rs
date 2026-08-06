@@ -247,8 +247,7 @@ fn write_secrets(secrets: &[(String, String)]) -> Result<(), String> {
     if secrets.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(SECRET_DIR)
-        .map_err(|e| format!("creating {SECRET_DIR}: {e}"))?;
+    std::fs::create_dir_all(SECRET_DIR).map_err(|e| format!("creating {SECRET_DIR}: {e}"))?;
     std::fs::set_permissions(SECRET_DIR, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod {SECRET_DIR}: {e}"))?;
     for (name, value) in secrets {
