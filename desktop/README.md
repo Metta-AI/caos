@@ -11,6 +11,19 @@ remote and the ordinary CAOS environment (including `ANTHROPIC_API_KEY`).
 cargo run --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
+The reproducible Nix build is a separate flake output so it stays out of the
+core workspace and worker images:
+
+```bash
+nix build .#caos-desktop
+nix run .#caos-desktop
+```
+
+The package build runs the desktop Rust and JavaScript tests. It is also exposed
+as `checks.<system>.caos-desktop`, so `nix flake check` validates the same
+derivation without maintaining a second build path. Bare `nix build` continues
+to build the CLI and daemon host tools; GUI dependencies remain opt-in.
+
 Set `CAOS_REPO` to launch against a different worktree without changing the
 shell's current directory. `CAOS_USER` overrides the active-conversation user;
 otherwise the app uses `$USER` (or `$USERNAME` on Windows).
