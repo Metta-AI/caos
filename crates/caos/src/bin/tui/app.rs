@@ -748,6 +748,7 @@ impl Composer {
 enum CommandAction {
     From,
     Help,
+    New,
     Palette,
     Title,
     UpdateTree,
@@ -762,7 +763,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 5] = [
+const COMMANDS: [Command; 6] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -775,6 +776,13 @@ const COMMANDS: [Command; 5] = [
         usage: "/help",
         description: "show keyboard shortcuts and slash commands",
         action: CommandAction::Help,
+        takes_argument: false,
+    },
+    Command {
+        name: "/new",
+        usage: "/new",
+        description: "start a fresh conversation",
+        action: CommandAction::New,
         takes_argument: false,
     },
     Command {
@@ -1569,6 +1577,14 @@ impl App {
                 }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
+                    return;
+                }
+                CommandAction::New => {
+                    if arguments.is_empty() {
+                        self.start_new_conversation(None);
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
                     return;
                 }
                 CommandAction::Title => {
@@ -3022,6 +3038,11 @@ mod tests {
         let (command, arguments) = parse_command("/help").unwrap();
         assert_eq!(command.action, CommandAction::Help);
         assert_eq!(arguments, "");
+
+        let (command, arguments) = parse_command("/new").unwrap();
+        assert_eq!(command.action, CommandAction::New);
+        assert_eq!(arguments, "");
+        assert!(!command.takes_argument);
 
         let (command, arguments) = parse_command("/commands").unwrap();
         assert_eq!(command.action, CommandAction::Palette);

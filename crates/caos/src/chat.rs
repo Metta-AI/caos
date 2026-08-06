@@ -253,6 +253,7 @@ pub enum ConversationRole {
 pub struct ConversationTurn {
     pub commit: String,
     pub short_commit: String,
+    pub timestamp_unix: i64,
     pub author: String,
     pub role: ConversationRole,
     pub message: String,
@@ -1791,10 +1792,15 @@ fn history_from_head(
     let mut cur = head.to_string();
     let mut prev_was_agent = false;
     loop {
-        let author = t
-            .git_capture(&["show", "-s", "--format=%an", &cur], None)?
-            .trim()
-            .to_string();
+        let metadata = t.git_capture(&["show", "-s", "--format=%an%x00%ct", &cur], None)?;
+        let (author, timestamp) = metadata
+            .trim_end()
+            .split_once('\0')
+            .ok_or_else(|| format!("commit {cur} has invalid author metadata"))?;
+        let author = author.to_string();
+        let timestamp_unix = timestamp
+            .parse()
+            .map_err(|error| format!("commit {cur} has an invalid timestamp: {error}"))?;
         let is_agent = author == AGENT_AUTHOR;
         if !is_agent && !prev_was_agent {
             turns.reverse();
@@ -1811,6 +1817,7 @@ fn history_from_head(
         turns.push(ConversationTurn {
             commit: cur.clone(),
             short_commit: short,
+            timestamp_unix,
             author,
             role: if is_agent {
                 ConversationRole::Agent

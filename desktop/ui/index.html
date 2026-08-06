@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CAOS</title>
+    <link rel="stylesheet" href="app.css" />
+    <script src="markdown.js"></script>
+    <script src="activity.js"></script>
+    <script src="changes.js"></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="CAOS tasks">
+        <div class="sidebar-titlebar" data-tauri-drag-region aria-hidden="true"></div>
+        <div class="sidebar-brand">CAOS</div>
+        <button class="new-task" id="new-task" type="button">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>
+          <span>New task</span>
+          <span class="shortcut-hint" aria-hidden="true">Ctrl+N</span>
+        </button>
+        <nav class="task-list" id="task-list" aria-label="Conversations" aria-busy="true">
+          <div class="task-skeleton" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+        </nav>
+      </aside>
+
+      <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-label="Resize sidebar" aria-orientation="vertical" aria-valuemin="180" aria-valuemax="420" tabindex="0"></div>
+
+      <main class="main-pane">
+        <header class="task-header" data-tauri-drag-region>
+          <div class="task-header-title" data-tauri-drag-region>
+            <div class="task-title-cluster" data-tauri-drag-region>
+              <h1 id="task-title" data-tauri-drag-region></h1>
+              <div class="task-meta" id="task-meta" data-tauri-drag-region></div>
+            </div>
+          </div>
+          <div class="task-header-actions">
+            <div class="tabs" aria-label="Conversation inspectors">
+              <button class="tab" id="changes-toggle" type="button" aria-controls="changes-pane" aria-expanded="false" data-pane="changes" hidden>Changes <span class="change-stats" id="change-count"></span><span class="shortcut-hint" aria-hidden="true">Ctrl+Q</span></button>
+            </div>
+            <button class="command-palette-button" id="command-palette-button" type="button" aria-label="Open command palette" aria-haspopup="dialog" aria-expanded="false">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="task-workspace">
+          <section class="view chat-view is-active" id="chat-view">
+            <div class="transcript-scroll" id="transcript-scroll">
+              <div class="transcript" id="transcript">
+                <div class="startup-loading" role="status">
+                  <span class="loading-spinner" aria-hidden="true"></span>
+                  <span>Loading conversations…</span>
+                </div>
+              </div>
+            </div>
+            <div class="composer-dock">
+              <div class="turn-status" id="turn-status" aria-live="polite"></div>
+              <form class="composer" id="composer">
+                <label class="sr-only" for="prompt">Message CAOS</label>
+                <textarea id="prompt" rows="1" placeholder="Ask CAOS…"></textarea>
+                <div class="composer-footer">
+                  <div class="send-control">
+                    <button class="send-button" id="send-button" type="submit" aria-label="Send message" aria-describedby="send-shortcut">
+                      <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 17V7"/><path d="m7.5 11.5 4.5-4.5 4.5 4.5"/></svg>
+                    </button>
+                    <span class="send-shortcut" id="send-shortcut">Ctrl+Enter to send</span>
+                  </div>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <aside class="inspector" id="inspector" aria-label="Conversation inspectors" hidden>
+            <div class="inspector-resizer" id="inspector-resizer" role="separator" aria-label="Resize inspector" aria-orientation="vertical" aria-valuemin="280" aria-valuemax="720" tabindex="0"></div>
+
+            <section class="inspector-pane" id="changes-pane" aria-labelledby="changes-pane-title" hidden>
+              <header class="inspector-pane-header">
+                <h2 id="changes-pane-title">Changes</h2>
+                <button type="button" aria-label="Close changes" data-close-pane="changes"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12"/><path d="m18 6-12 12"/></svg></button>
+              </header>
+              <div class="changes-view">
+                <aside class="file-list" id="file-list" aria-label="Changed files"></aside>
+                <div class="diff" id="diff" aria-label="Workspace diff"></div>
+              </div>
+            </section>
+
+            <section class="inspector-pane action-pane" id="action-pane" aria-labelledby="action-pane-title" hidden>
+              <header class="inspector-pane-header">
+                <h2 id="action-pane-title">Action result</h2>
+                <button type="button" aria-label="Close action result" data-close-pane="action"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12"/><path d="m18 6-12 12"/></svg></button>
+              </header>
+              <div class="action-result" id="action-result" aria-live="polite"></div>
+            </section>
+
+          </aside>
+        </div>
+
+        <section class="fatal-error" id="fatal-error" hidden>
+          <h2>CAOS could not open this repository</h2>
+          <p id="fatal-message"></p>
+          <p>Launch the app from a Git worktree with a configured <code>caos</code> remote.</p>
+        </section>
+      </main>
+    </div>
+
+    <section class="shortcut-help" id="shortcut-help" role="dialog" aria-modal="true" aria-labelledby="shortcut-help-title" hidden>
+      <div class="shortcut-help-backdrop" data-close-shortcuts></div>
+      <div class="shortcut-help-panel">
+        <div class="shortcut-help-header">
+          <h2 id="shortcut-help-title">Keyboard shortcuts</h2>
+          <span>Ctrl+H or Esc to close</span>
+        </div>
+        <div class="shortcut-help-grid">
+          <div class="shortcut-group">
+            <h3>Conversation</h3>
+            <dl>
+              <div><dt>Ctrl+Enter</dt><dd>Send the prompt</dd></div>
+              <div><dt>Enter / Ctrl+J</dt><dd>Insert a newline</dd></div>
+              <div><dt>Ctrl+A / Ctrl+E</dt><dd>Start or end of line</dd></div>
+              <div><dt>Ctrl+W</dt><dd>Delete the previous word</dd></div>
+              <div><dt>Ctrl+K</dt><dd>Delete to the end of line</dd></div>
+              <div><dt>Ctrl+C</dt><dd>Clear a non-empty prompt</dd></div>
+            </dl>
+          </div>
+          <div class="shortcut-group">
+            <h3>Navigation</h3>
+            <dl>
+              <div><dt>Ctrl+N</dt><dd>Start a new conversation</dd></div>
+              <div><dt>Ctrl+1 … Ctrl+9</dt><dd>Open a numbered conversation</dd></div>
+              <div><dt>Ctrl+Up / Ctrl+Down</dt><dd>Switch conversations</dd></div>
+              <div><dt>Ctrl+Q</dt><dd>Toggle workspace changes</dd></div>
+              <div><dt>Ctrl+R</dt><dd>Reload the conversation</dd></div>
+              <div><dt>Ctrl+Shift+P</dt><dd>Toggle the command palette</dd></div>
+              <div><dt>⌘+ / ⌘− / ⌘0</dt><dd>Increase, decrease, or reset interface size</dd></div>
+              <div><dt>PageUp / PageDown</dt><dd>Scroll the transcript</dd></div>
+            </dl>
+          </div>
+          <div class="shortcut-group">
+            <h3>Slash commands</h3>
+            <dl>
+              <div><dt>/rename &lt;title&gt;</dt><dd>Rename the conversation</dd></div>
+              <div><dt>/title &lt;title&gt;</dt><dd>TUI-compatible rename alias</dd></div>
+              <div><dt>/commands</dt><dd>Open the command palette</dd></div>
+              <div><dt>/help</dt><dd>Show this reference</dd></div>
+            </dl>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="command-palette" id="command-palette" role="dialog" aria-modal="true" aria-labelledby="command-palette-title" hidden>
+      <div class="command-palette-backdrop" data-close-command-palette></div>
+      <div class="command-palette-panel">
+        <h2 class="sr-only" id="command-palette-title">Command palette</h2>
+        <div class="command-palette-search">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/></svg>
+          <input id="command-palette-query" type="search" placeholder="Type a command" autocomplete="off" spellcheck="false" aria-controls="command-palette-results" />
+        </div>
+        <div class="command-palette-results" id="command-palette-results" role="listbox" aria-label="Commands"></div>
+        <div class="command-palette-footer"><span>Navigate with ↑ ↓</span><span>Ctrl+Shift+P to close</span></div>
+      </div>
+    </section>
+  </body>
+</html>

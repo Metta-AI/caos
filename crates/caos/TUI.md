@@ -98,7 +98,8 @@ running and is not added to the transcript or title.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
-TUI. Enter `/title <new title>` to change the shared title without changing the
+TUI. Enter `/new` to start a fresh conversation from the default base (the same
+as `Ctrl+N`). Enter `/title <new title>` to change the shared title without changing the
 conversation ID or HEAD. Enter `/update-tree <message>` to send an ordinary
 user turn whose commit also folds in your current working-tree changes — the
 intended companion to `Ctrl+L` (check out the head, edit files, then
