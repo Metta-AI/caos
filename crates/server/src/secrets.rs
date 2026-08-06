@@ -224,8 +224,10 @@ mod tests {
         .collect();
 
         // Just the image: a superset job matches (extra args are wildcards).
-        let only_image: BTreeMap<String, String> =
-            [("image", "aa")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let only_image: BTreeMap<String, String> = [("image", "aa")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         assert!(is_subset(&only_image, &job));
 
         // A pinned arg that agrees still matches.
