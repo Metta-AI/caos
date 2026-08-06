@@ -533,12 +533,12 @@ function activityGroupElement(entry) {
   const expandable = entry.calls.length > 1;
   const toggle = document.createElement(expandable ? 'button' : 'div');
   toggle.className = 'inline-activity-toggle';
+  let chevron = null;
   if (expandable) {
     toggle.type = 'button';
     toggle.setAttribute('aria-expanded', String(entry.expanded));
-    const chevron = iconElement([['path', { d: 'm9 18 6-6-6-6' }]]);
+    chevron = iconElement([['path', { d: 'm9 18 6-6-6-6' }]]);
     chevron.classList.add('inline-activity-chevron');
-    toggle.append(chevron);
   } else {
     toggle.setAttribute('role', 'status');
   }
@@ -547,13 +547,14 @@ function activityGroupElement(entry) {
   label.textContent = hasCalls
     ? activityGroupSummary(entry.calls)
     : entry.status || 'Working';
+  toggle.append(label);
   if (entry.running) {
     const spinner = document.createElement('span');
     spinner.className = 'loading-spinner inline-activity-spinner';
     spinner.setAttribute('aria-hidden', 'true');
     toggle.append(spinner);
   }
-  toggle.append(label);
+  if (chevron) toggle.append(chevron);
 
   const list = document.createElement('div');
   list.className = 'inline-activity-list';
