@@ -15,6 +15,7 @@
 //! `run-then`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 
