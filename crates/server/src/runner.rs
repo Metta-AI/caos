@@ -117,6 +117,11 @@ struct Job {
     image_ref: String,
     /// The ArgTree's top-level name → oid map, what `required` matches against.
     arg_entries: ArgTree,
+    /// Secrets this job is entitled to (design/secrets.md): name → value pairs
+    /// the runner drops at `/secret/<name>`. Ride out of band in the payload,
+    /// never in the ArgTree — so out of the cache key. Recomputed per dispatch,
+    /// so a warm runner's follow-up jobs each carry their own.
+    secrets: Vec<(String, String)>,
     /// Current rendezvous nonce; refreshed on requeue (first post per nonce wins).
     nonce: String,
     phase: Phase,
@@ -193,6 +198,16 @@ fn payload(job: &Job) -> String {
     if let Some(token) = token() {
         body["token"] = serde_json::Value::String(token);
     }
+    if !job.secrets.is_empty() {
+        // Out-of-band injection channel: the values reach only this worker, for
+        // this job, and are never part of the ArgTree/cache key.
+        body["secrets"] = serde_json::Value::Object(
+            job.secrets
+                .iter()
+                .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        );
+    }
     body.to_string()
 }
 
@@ -203,6 +218,7 @@ pub(crate) fn dispatch(
     arg_tree: &str,
     arg_entries: ArgTree,
     image_ref: &str,
+    secrets: Vec<(String, String)>,
 ) -> Result<String, HttpError> {
     let (outcome_tx, outcome_rx) = mpsc::channel();
     let id = {
@@ -217,6 +233,7 @@ pub(crate) fn dispatch(
                 arg_tree: arg_tree.to_string(),
                 image_ref: image_ref.to_string(),
                 arg_entries,
+                secrets,
                 nonce,
                 phase: Phase::Pending {
                     deadline: Instant::now() + pending_timeout(),

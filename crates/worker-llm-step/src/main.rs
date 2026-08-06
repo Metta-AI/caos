@@ -31,7 +31,6 @@
 //! Commit structure and the `.caos/step.json` format are documented in
 //! design/agent-harness.md; the constants below are the load-bearing bits.
 
-mod api;
 mod progress;
 mod tools;
 
@@ -40,6 +39,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use llm_client::{post_messages, DEFAULT_BASE_URL, DEFAULT_MODEL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, entries, file_name, link, own_args_tree, path,
@@ -93,9 +93,8 @@ impl Config {
             tools_image: read_arg_opt("tools-image")?,
             merge_image: read_arg_opt("merge-image")?,
             merge_refs: read_arg_opt("merge-refs")?,
-            model: read_arg_opt("model")?.unwrap_or_else(|| "claude-opus-4-8".to_string()),
-            base_url: read_arg_opt("base-url")?
-                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+            model: read_arg_opt("model")?.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             conversation: read_arg_opt("conversation")?,
         })
     }
@@ -426,7 +425,7 @@ fn llm_round(
     let status = |text: &str| progress::status(cfg.conversation.as_deref(), head_hash, text);
     status(&format!("calling {}…", cfg.model));
     let started = std::time::Instant::now();
-    let resp = api::post_messages(&cfg.base_url, &cfg.api_key, &body, &status)?;
+    let resp = post_messages(&cfg.base_url, &cfg.api_key, &body, &status)?;
     status(&format!(
         "{} answered in {:.1}s",
         cfg.model,

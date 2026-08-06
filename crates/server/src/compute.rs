@@ -319,7 +319,12 @@ fn run_dispatch(
             Some(entries) => entries,
             None => args_entries(config, arg_tree).map_err(fail)?,
         };
-        crate::runner::dispatch(arg_tree, arg_entries, &image_ref).map_err(fail)?
+        // Find the secrets this job's identity is entitled to (design/secrets.md):
+        // readers whose partial arg tree is a subset of ours. They ride out of
+        // band in the job payload — never in the ArgTree, so never in the cache
+        // key — and the container runner drops them at `/secret/<name>`.
+        let secrets = crate::secrets::for_job(config, std, &arg_entries);
+        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, secrets).map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
@@ -1019,7 +1024,7 @@ fn resolve_flake_image(
 
 /// Look up a named image in the `std` library tree (`refs/caos/std`), returning
 /// its object hash.
-fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
+pub(crate) fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
     fetch_tree(config, std)
         .map_err(|e| HttpError::new(500, format!("reading std {std}: {e}")))?
         .iter()

@@ -1,4 +1,4 @@
-//! llm-stub: a scripted stand-in for the LLM API, for the llm-step tests.
+//! llm-stub: a scripted stand-in for the LLM API, for worker tests.
 //!
 //! `llm-stub <addr> <dir>` serves `POST /v1/messages` from `<dir>`: the i-th
 //! request (1-based) is answered with the contents of `<dir>/response-<i>.json`
