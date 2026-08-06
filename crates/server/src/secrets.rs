@@ -42,6 +42,14 @@ const SECRETS_DIR_ENV: &str = "CAOS_SECRETS_DIR";
 
 /// A parsed secret file: the secret's value and its readers (raw reader
 /// expressions, resolved per job against that job's `std`).
+///
+/// Readers are kept UNRESOLVED — as their source strings — on purpose:
+/// resolution is std-relative (a `std/<name>` reader resolves to a different
+/// oid under a different `std`), so a reader's arg entries are a function of
+/// *(reader expr, the job's std)*, not a property of the secret. There is no
+/// single resolved tree to store here; resolution happens at match time in
+/// [`for_job`]. (Re-reading the store each dispatch is also what lets an edit —
+/// a rotated value, an added or revoked grant — take effect on the next job.)
 struct Secret {
     name: String,
     value: String,
