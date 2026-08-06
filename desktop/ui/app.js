@@ -4,10 +4,9 @@ const { filePatchesFromPatch } = window.CaosChanges;
 const {
   activityGroupComplete,
   activityGroupSummary,
-  mergeTransientTurnEntries,
+  mergeReplayedHistory,
   scrollPositionIsNearBottom,
-  toolDescription,
-  transientTurnEntries
+  toolDescription
 } = window.CaosActivity;
 const DEFAULT_SIDEBAR_WIDTH = 226;
 const MIN_SIDEBAR_WIDTH = 180;
@@ -38,7 +37,6 @@ const state = {
   diffs: new Map(),
   selectedDiffFiles: new Map(),
   pendingActivityGroups: new Map(),
-  transientTurnEntries: new Map(),
   turnStartIndexes: new Map(),
   running: new Set(),
   drafts: new Map(),
@@ -738,10 +736,7 @@ async function loadHistory(id, force = false) {
   if (!id || (!force && state.histories.has(id))) return;
   try {
     const history = await tauri.invoke('get_history', { conversation: id });
-    state.histories.set(
-      id,
-      mergeTransientTurnEntries(history, state.transientTurnEntries.get(id))
-    );
+    state.histories.set(id, mergeReplayedHistory(history.turns, history.turnEvents));
   } catch (error) {
     setStatus(String(error));
   }
@@ -999,7 +994,6 @@ async function sendCurrentMessage() {
     renderHeader();
   }
   const history = state.histories.get(id) || [];
-  state.transientTurnEntries.delete(id);
   state.turnStartIndexes.set(id, history.length);
   history.push({
     role: 'human',
@@ -1019,16 +1013,13 @@ async function sendCurrentMessage() {
   const onEvent = new tauri.Channel();
   onEvent.onmessage = (event) => handleTurnEvent(id, event);
   try {
-    const outcome = await tauri.invoke('send_message', {
+    await tauri.invoke('send_message', {
       conversation: id,
       message,
       title: conversation.title,
       onEvent
     });
     finishActivityGroup(id);
-    const optimistic = state.histories.get(id) || [];
-    const turnStart = state.turnStartIndexes.get(id) ?? optimistic.length;
-    state.transientTurnEntries.set(id, transientTurnEntries(optimistic, turnStart));
     state.histories.delete(id);
     state.diffs.delete(id);
     await refreshConversations(id);

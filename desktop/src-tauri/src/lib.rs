@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use caos::chat::{
-    conversation_history, conversation_workspace_diff, list_user_conversations,
+    conversation_replay, conversation_workspace_diff, list_user_conversations,
     publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
     set_conversation_title, ConversationRole, TurnEvent, TurnOptions, TurnPhase,
     UserConversationStatus, UserConversationSummary,
@@ -138,6 +138,20 @@ struct HistoryEntryPayload {
     author: String,
     role: &'static str,
     message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryTurnEventsPayload {
+    turn_commit: String,
+    events: Vec<TurnEventPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryPayload {
+    turns: Vec<HistoryEntryPayload>,
+    turn_events: Vec<HistoryTurnEventsPayload>,
 }
 
 #[derive(Serialize)]
@@ -420,20 +434,24 @@ async fn rename_conversation(
 async fn get_history(
     state: State<'_, AppState>,
     conversation: String,
-) -> Result<Vec<HistoryEntryPayload>, String> {
+) -> Result<HistoryPayload, String> {
     if state
         .drafts
         .lock()
         .map_err(|_| "desktop draft state is unavailable".to_string())?
         .contains_key(&conversation)
     {
-        return Ok(Vec::new());
+        return Ok(HistoryPayload {
+            turns: Vec::new(),
+            turn_events: Vec::new(),
+        });
     }
     let repo_dir = state.repo_dir()?;
     run_blocking(move || {
         let transport = GitTransport::discover(repo_dir)?;
-        conversation_history(&transport, &conversation).map(|turns| {
-            turns
+        conversation_replay(&transport, &conversation).map(|replay| HistoryPayload {
+            turns: replay
+                .turns
                 .into_iter()
                 .map(|turn| HistoryEntryPayload {
                     commit: turn.commit,
@@ -446,7 +464,19 @@ async fn get_history(
                     },
                     message: turn.message,
                 })
-                .collect()
+                .collect(),
+            turn_events: replay
+                .turn_events
+                .into_iter()
+                .map(|turn| HistoryTurnEventsPayload {
+                    turn_commit: turn.turn_commit,
+                    events: turn
+                        .events
+                        .into_iter()
+                        .map(TurnEventPayload::from)
+                        .collect(),
+                })
+                .collect(),
         })
     })
     .await
