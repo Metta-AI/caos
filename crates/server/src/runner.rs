@@ -117,6 +117,11 @@ struct Job {
     image_ref: String,
     /// The ArgTree's top-level name → oid map, what `required` matches against.
     arg_entries: ArgTree,
+    /// Secrets this job is entitled to (design/secrets.md): name → value pairs
+    /// the runner drops at `/secret/<name>`. Ride out of band in the payload,
+    /// never in the ArgTree — so out of the cache key. Recomputed per dispatch,
+    /// so a warm runner's follow-up jobs each carry their own.
+    secrets: Vec<(String, String)>,
     /// Current rendezvous nonce; refreshed on requeue (first post per nonce wins).
     nonce: String,
     phase: Phase,
