@@ -2,6 +2,12 @@ const tauri = window.__TAURI__?.core;
 const { renderMarkdown } = window.CaosMarkdown;
 const { filePatchesFromPatch, lineCountsFromPatch } = window.CaosChanges;
 const {
+  modelChoices,
+  modelLabel,
+  parseComposerCommand,
+  slashCommandMatches
+} = window.CaosCommands;
+const {
   activityGroupComplete,
   activityGroupExpandable,
   activityGroupSummary,
@@ -24,9 +30,14 @@ const UI_ZOOM_STEP = 0.1;
 const PALETTE_COMMANDS = [
   { id: 'new', label: 'New conversation', shortcut: 'Ctrl+N', keywords: 'create start task', run: () => createConversation() },
   { id: 'chat', label: 'Focus conversation', shortcut: '', keywords: 'chat transcript close inspectors', run: () => closeInspectorPanes() },
+  { id: 'checkout', label: 'Check out conversation', shortcut: 'Ctrl+L', keywords: 'load workspace git', run: () => checkoutSelectedConversation() },
+  { id: 'publish', label: 'Publish pull request', shortcut: 'Ctrl+P twice', keywords: 'push pr github branch', run: () => openPublishDialog() },
   { id: 'changes', label: 'Toggle workspace changes', shortcut: 'Ctrl+Q', keywords: 'diff files pane', available: () => !elements.changesToggle.hidden, run: () => toggleChangesPane() },
+  { id: 'tools', label: 'Show available tools', shortcut: 'Ctrl+Shift+T', keywords: 'commands agent project', run: () => toggleToolsPane() },
   { id: 'reload', label: 'Reload conversation', shortcut: 'Ctrl+R', keywords: 'refresh history', run: () => reloadSelectedConversation() },
   { id: 'rename', label: 'Rename conversation', shortcut: '/rename', keywords: 'title name', run: () => prefillCommand('/rename ') },
+  { id: 'archive', label: 'Archive conversation', shortcut: 'Ctrl+E', keywords: 'close remove', run: () => archiveSelectedConversation() },
+  { id: 'restore', label: 'Restore archived conversation', shortcut: '', keywords: 'unarchive reopen', run: () => openArchiveDialog() },
   { id: 'help', label: 'Show keyboard shortcuts', shortcut: 'Ctrl+H', keywords: 'help commands', run: () => setShortcutHelp(true) }
 ];
 
@@ -41,11 +52,19 @@ const state = {
   turnStartIndexes: new Map(),
   running: new Set(),
   composerDrafts: new Map(),
+  conversationModels: new Map(),
   changesOpen: false,
   selectedAction: null,
   shortcutHelpOpen: false,
   commandPaletteOpen: false,
   commandPaletteSelection: 0,
+  modelChoices: modelChoices(null),
+  initialModel: '',
+  modelMenuOpen: false,
+  slashCommandSelection: 0,
+  slashCommandDismissed: false,
+  publishDialogOpen: false,
+  archiveDialogOpen: false,
   uiZoom: 1,
   sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
   inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
@@ -71,6 +90,10 @@ const elements = {
   transcriptScroll: document.getElementById('transcript-scroll'),
   composer: document.getElementById('composer'),
   prompt: document.getElementById('prompt'),
+  slashCommandMenu: document.getElementById('slash-command-menu'),
+  modelButton: document.getElementById('model-button'),
+  modelLabel: document.getElementById('model-label'),
+  modelMenu: document.getElementById('model-menu'),
   sendButton: document.getElementById('send-button'),
   turnStatus: document.getElementById('turn-status'),
   fileList: document.getElementById('file-list'),
@@ -79,6 +102,11 @@ const elements = {
   commandPalette: document.getElementById('command-palette'),
   commandPaletteQuery: document.getElementById('command-palette-query'),
   commandPaletteResults: document.getElementById('command-palette-results'),
+  publishDialog: document.getElementById('publish-dialog'),
+  publishBase: document.getElementById('publish-base'),
+  publishConfirm: document.getElementById('publish-confirm'),
+  archiveDialog: document.getElementById('archive-dialog'),
+  archiveList: document.getElementById('archive-list'),
   fatalError: document.getElementById('fatal-error'),
   fatalMessage: document.getElementById('fatal-message')
 };
@@ -220,6 +248,7 @@ function setStatus(text = '') {
 
 function setShortcutHelp(open) {
   if (open && state.commandPaletteOpen) setCommandPalette(false);
+  if (open) setModelMenu(false);
   state.shortcutHelpOpen = open;
   elements.shortcutHelp.hidden = !open;
   if (!open) elements.prompt.focus();
@@ -287,6 +316,7 @@ function renderCommandPalette() {
 }
 
 function setCommandPalette(open) {
+  if (open) setModelMenu(false);
   if (open && state.shortcutHelpOpen) {
     state.shortcutHelpOpen = false;
     elements.shortcutHelp.hidden = true;
@@ -326,20 +356,101 @@ function saveSelectedDraft() {
 function restoreSelectedDraft() {
   elements.prompt.value = state.composerDrafts.get(state.selectedId) || '';
   resizePrompt();
+  state.slashCommandDismissed = false;
+  renderSlashCommandMenu();
 }
 
 function clearComposer() {
   state.composerDrafts.set(state.selectedId, '');
   elements.prompt.value = '';
   resizePrompt();
+  state.slashCommandDismissed = false;
+  renderSlashCommandMenu();
 }
 
 function prefillCommand(command) {
   state.composerDrafts.set(state.selectedId, command);
   elements.prompt.value = command;
   resizePrompt();
+  state.slashCommandDismissed = false;
+  renderSlashCommandMenu();
   elements.prompt.focus({ preventScroll: true });
   elements.prompt.setSelectionRange(command.length, command.length);
+}
+
+function selectedModel() {
+  if (!state.selectedId) return state.initialModel;
+  return state.conversationModels.has(state.selectedId)
+    ? state.conversationModels.get(state.selectedId)
+    : state.initialModel;
+}
+
+function renderModelControl() {
+  const selected = selectedModel();
+  elements.modelLabel.textContent = modelLabel(selected, state.modelChoices);
+  elements.modelButton.title = selected || 'Use the CAOS default model';
+  elements.modelMenu.replaceChildren();
+  for (const model of state.modelChoices) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'model-option';
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', String(model.value === selected));
+    const label = document.createElement('span');
+    label.textContent = model.label;
+    const detail = document.createElement('small');
+    detail.textContent = model.detail;
+    button.append(label, detail);
+    button.addEventListener('click', () => {
+      if (state.selectedId) state.conversationModels.set(state.selectedId, model.value);
+      setModelMenu(false);
+      renderModelControl();
+    });
+    elements.modelMenu.append(button);
+  }
+}
+
+function setModelMenu(open) {
+  state.modelMenuOpen = open;
+  elements.modelMenu.hidden = !open;
+  elements.modelButton.setAttribute('aria-expanded', String(open));
+  if (open) renderModelControl();
+}
+
+function renderSlashCommandMenu() {
+  const matches = state.slashCommandDismissed ? [] : slashCommandMatches(elements.prompt.value);
+  elements.slashCommandMenu.replaceChildren();
+  elements.slashCommandMenu.hidden = matches.length === 0;
+  if (matches.length === 0) {
+    state.slashCommandSelection = 0;
+    return;
+  }
+  state.slashCommandSelection = Math.min(state.slashCommandSelection, matches.length - 1);
+  matches.forEach((command, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'slash-command-item';
+    button.classList.toggle('is-selected', index === state.slashCommandSelection);
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', String(index === state.slashCommandSelection));
+    const usage = document.createElement('code');
+    usage.textContent = command.usage;
+    const description = document.createElement('span');
+    description.textContent = command.description;
+    button.append(usage, description);
+    button.addEventListener('mousedown', (event) => event.preventDefault());
+    button.addEventListener('click', () => completeSlashCommand(index));
+    elements.slashCommandMenu.append(button);
+  });
+}
+
+function completeSlashCommand(index = state.slashCommandSelection) {
+  const command = slashCommandMatches(elements.prompt.value)[index];
+  if (!command) return false;
+  const takesArgument = command.usage.includes('<');
+  prefillCommand(`${command.name}${takesArgument ? ' ' : ''}`);
+  elements.slashCommandMenu.hidden = true;
+  return true;
 }
 
 function renderSidebar() {
@@ -356,6 +467,7 @@ function renderSidebar() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'task-item';
+    button.dataset.conversationId = conversation.id;
     if (conversation.id === state.selectedId) button.classList.add('is-selected');
     const title = document.createElement('span');
     title.className = 'task-item-title';
@@ -380,7 +492,12 @@ function renderSidebar() {
       status.title = 'Running';
       button.append(status);
     }
-    button.addEventListener('click', () => selectConversation(conversation.id));
+    button.addEventListener('click', async () => {
+      await selectConversation(conversation.id, false);
+      const selectedButton = [...elements.taskList.querySelectorAll('.task-item')]
+        .find((item) => item.dataset.conversationId === conversation.id);
+      selectedButton?.focus({ preventScroll: true });
+    });
     elements.taskList.append(button);
   });
 }
@@ -530,7 +647,7 @@ function activityIcon(name) {
 function actionCallIsSelected(call) {
   if (state.selectedAction?.conversationId !== state.selectedId) return false;
   return state.selectedAction.call === call
-    || Boolean(call.toolUseId && state.selectedAction.call.toolUseId === call.toolUseId);
+    || Boolean(call.toolUseId && state.selectedAction.call?.toolUseId === call.toolUseId);
 }
 
 function activityGroupElement(entry) {
@@ -718,6 +835,79 @@ function updateInspectorLayout() {
 function renderActionResult() {
   const selection = state.selectedAction;
   if (!selection) return;
+  if (selection.kind === 'tools') {
+    elements.actionPaneTitle.textContent = 'Available tools';
+    elements.actionPaneTitle.removeAttribute('title');
+    elements.actionResult.replaceChildren();
+    if (selection.loading) {
+      const loading = document.createElement('div');
+      loading.className = 'panel-empty';
+      loading.textContent = 'Loading project tools…';
+      elements.actionResult.append(loading);
+      return;
+    }
+    if (selection.error) {
+      const error = document.createElement('div');
+      error.className = 'panel-empty is-error';
+      error.textContent = selection.error;
+      elements.actionResult.append(error);
+      return;
+    }
+    const builtinsHeading = document.createElement('h3');
+    builtinsHeading.className = 'tool-set-heading';
+    builtinsHeading.textContent = 'Always available';
+    const builtins = document.createElement('div');
+    builtins.className = 'tool-set-list';
+    for (const [names, docs] of [
+      ['read, ls, write, edit', 'Inline workspace operations'],
+      ['bash', 'Commands in the workspace sandbox'],
+      ['grep', 'Cached regular-expression search']
+    ]) {
+      const item = document.createElement('article');
+      item.className = 'tool-set-item';
+      const name = document.createElement('code');
+      name.textContent = names;
+      const description = document.createElement('p');
+      description.textContent = docs;
+      item.append(name, description);
+      builtins.append(item);
+    }
+    const projectHeading = document.createElement('h3');
+    projectHeading.className = 'tool-set-heading';
+    projectHeading.textContent = 'Project tools';
+    const source = document.createElement('div');
+    source.className = 'tool-set-source';
+    source.textContent = `Source: ${selection.tools.source}`;
+    elements.actionResult.append(builtinsHeading, builtins, projectHeading, source);
+    if (selection.tools.tools.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'panel-empty';
+      empty.textContent = 'This conversation has no project-defined tools.';
+      elements.actionResult.append(empty);
+      return;
+    }
+    const list = document.createElement('div');
+    list.className = 'tool-set-list';
+    for (const tool of selection.tools.tools) {
+      const item = document.createElement('article');
+      item.className = 'tool-set-item';
+      const heading = document.createElement('div');
+      heading.className = 'tool-set-item-heading';
+      const name = document.createElement('code');
+      name.textContent = tool.name;
+      const image = document.createElement('small');
+      image.textContent = /^[0-9a-f]{40,}$/iu.test(tool.image)
+        ? tool.image.slice(0, 7)
+        : tool.image;
+      const docs = document.createElement('p');
+      docs.textContent = tool.docs || 'No description.';
+      heading.append(name, image);
+      item.append(heading, docs);
+      list.append(item);
+    }
+    elements.actionResult.append(list);
+    return;
+  }
   const { call } = selection;
   const title = toolDescription(call);
   elements.actionPaneTitle.textContent = title;
@@ -784,15 +974,17 @@ function closeInspectorPanes() {
   elements.prompt.focus({ preventScroll: true });
 }
 
-async function selectConversation(id) {
+async function selectConversation(id, focusPrompt = true) {
   if (id === state.selectedId) {
-    elements.prompt.focus({ preventScroll: true });
+    if (focusPrompt) elements.prompt.focus({ preventScroll: true });
     return;
   }
   saveSelectedDraft();
   state.selectedId = id;
+  setModelMenu(false);
   renderSidebar();
   renderHeader();
+  renderModelControl();
   restoreSelectedDraft();
   setStatus('');
   resetInspector();
@@ -806,7 +998,7 @@ async function selectConversation(id) {
   renderTranscript({ scrollToBottom: true });
   loadDiff(id);
   elements.sendButton.disabled = state.running.has(id);
-  elements.prompt.focus({ preventScroll: true });
+  if (focusPrompt) elements.prompt.focus({ preventScroll: true });
 }
 
 async function loadHistory(id, force = false) {
@@ -848,6 +1040,199 @@ async function renameSelectedConversation(requestedTitle) {
   } finally {
     elements.prompt.focus({ preventScroll: true });
   }
+}
+
+async function checkoutSelectedConversation() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  if (state.running.has(conversation.id)) {
+    setStatus("Finish this conversation's operation before checking it out");
+    return;
+  }
+  if (conversation.draft) {
+    setStatus('This conversation has no commit to check out');
+    return;
+  }
+  setStatus('Checking out conversation…');
+  try {
+    const head = await tauri.invoke('checkout_conversation', { conversation: conversation.id });
+    setStatus(`Checked out ${head} in detached HEAD`);
+  } catch (error) {
+    setStatus(String(error));
+  } finally {
+    elements.prompt.focus({ preventScroll: true });
+  }
+}
+
+function setPublishDialog(open) {
+  state.publishDialogOpen = open;
+  elements.publishDialog.hidden = !open;
+  if (!open) {
+    elements.publishConfirm.disabled = false;
+    elements.prompt.focus({ preventScroll: true });
+  }
+}
+
+async function openPublishDialog() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  if (state.running.has(conversation.id)) {
+    setStatus("Finish this conversation's operation before publishing it");
+    return;
+  }
+  if (conversation.draft) {
+    setStatus('There are no conversation changes to publish');
+    return;
+  }
+  setCommandPalette(false);
+  setPublishDialog(true);
+  elements.publishBase.value = '';
+  elements.publishBase.placeholder = 'Loading default branch…';
+  elements.publishConfirm.disabled = true;
+  try {
+    const branch = await tauri.invoke('default_publish_branch');
+    if (!state.publishDialogOpen) return;
+    elements.publishBase.value = branch;
+    elements.publishBase.placeholder = branch;
+    elements.publishConfirm.disabled = false;
+    elements.publishBase.focus();
+    elements.publishBase.select();
+  } catch (error) {
+    setPublishDialog(false);
+    setStatus(String(error));
+  }
+}
+
+async function confirmPublish() {
+  const conversation = selectedConversation();
+  if (!conversation || elements.publishConfirm.disabled) return;
+  elements.publishConfirm.disabled = true;
+  const base = elements.publishBase.value.trim();
+  setStatus('Publishing a clean conversation branch…');
+  try {
+    const url = await tauri.invoke('publish_conversation', {
+      conversation: conversation.id,
+      base: base || null
+    });
+    setPublishDialog(false);
+    setStatus(`Published ${url}`);
+  } catch (error) {
+    setStatus(String(error));
+    elements.publishConfirm.disabled = false;
+    elements.publishBase.focus();
+  }
+}
+
+async function archiveSelectedConversation() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  if (state.running.has(conversation.id)) {
+    setStatus("Finish this conversation's operation before archiving it");
+    return;
+  }
+  setCommandPalette(false);
+  setStatus('Archiving conversation…');
+  try {
+    await tauri.invoke('archive_conversation', { conversation: conversation.id });
+    const index = state.conversations.indexOf(conversation);
+    state.conversations.splice(index, 1);
+    state.histories.delete(conversation.id);
+    state.diffs.delete(conversation.id);
+    state.composerDrafts.delete(conversation.id);
+    state.conversationModels.delete(conversation.id);
+    state.selectedId = null;
+    if (state.conversations.length === 0) {
+      await createConversation();
+    } else {
+      await selectConversation(state.conversations[Math.min(index, state.conversations.length - 1)].id);
+    }
+    renderSidebar();
+    setStatus('Conversation archived');
+  } catch (error) {
+    setStatus(String(error));
+  }
+}
+
+function setArchiveDialog(open) {
+  state.archiveDialogOpen = open;
+  elements.archiveDialog.hidden = !open;
+  if (!open) elements.prompt.focus({ preventScroll: true });
+}
+
+async function openArchiveDialog() {
+  setCommandPalette(false);
+  setArchiveDialog(true);
+  elements.archiveList.replaceChildren();
+  const loading = document.createElement('div');
+  loading.className = 'panel-empty';
+  loading.textContent = 'Loading archived conversations…';
+  elements.archiveList.append(loading);
+  try {
+    const conversations = await tauri.invoke('get_archived_conversations');
+    if (!state.archiveDialogOpen) return;
+    elements.archiveList.replaceChildren();
+    if (conversations.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'panel-empty';
+      empty.textContent = 'No archived conversations.';
+      elements.archiveList.append(empty);
+      return;
+    }
+    for (const conversation of conversations) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'archive-item';
+      const title = document.createElement('span');
+      title.textContent = conversation.title;
+      const meta = document.createElement('code');
+      meta.textContent = conversation.shortHead;
+      button.append(title, meta);
+      button.addEventListener('click', () => restoreArchivedConversation(conversation.id, button));
+      elements.archiveList.append(button);
+    }
+    elements.archiveList.querySelector('button')?.focus();
+  } catch (error) {
+    elements.archiveList.textContent = String(error);
+  }
+}
+
+async function restoreArchivedConversation(id, button) {
+  button.disabled = true;
+  try {
+    const conversation = await tauri.invoke('restore_conversation', { conversation: id });
+    state.conversations.unshift(conversation);
+    setArchiveDialog(false);
+    state.selectedId = null;
+    await selectConversation(conversation.id);
+    renderSidebar();
+    setStatus('Conversation restored');
+  } catch (error) {
+    setStatus(String(error));
+    button.disabled = false;
+  }
+}
+
+async function toggleToolsPane() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  if (state.selectedAction?.kind === 'tools'
+    && state.selectedAction.conversationId === conversation.id) {
+    closeInspectorPane('action');
+    return;
+  }
+  state.selectedAction = { kind: 'tools', conversationId: conversation.id, loading: true };
+  updateInspectorLayout();
+  try {
+    const tools = await tauri.invoke('get_tools', { conversation: conversation.id });
+    if (state.selectedAction?.kind !== 'tools'
+      || state.selectedAction.conversationId !== conversation.id) return;
+    state.selectedAction = { kind: 'tools', conversationId: conversation.id, tools };
+  } catch (error) {
+    if (state.selectedAction?.kind !== 'tools'
+      || state.selectedAction.conversationId !== conversation.id) return;
+    state.selectedAction = { kind: 'tools', conversationId: conversation.id, error: String(error) };
+  }
+  renderActionResult();
 }
 
 function selectRelativeConversation(amount) {
@@ -994,7 +1379,7 @@ function handleTurnEvent(id, event) {
       if (call) {
         call.result = event;
         if (state.selectedAction?.conversationId === id
-          && state.selectedAction.call.toolUseId === call.toolUseId) {
+          && state.selectedAction.call?.toolUseId === call.toolUseId) {
           state.selectedAction.call = call;
           renderActionResult();
         }
@@ -1029,27 +1414,48 @@ async function refreshConversations(selectedId) {
 }
 
 async function sendCurrentMessage() {
-  const message = elements.prompt.value.trim();
-  if (message === '/commands') {
-    clearComposer();
-    setCommandPalette(true);
-    return;
-  }
-  if (message === '/help') {
-    clearComposer();
-    setShortcutHelp(true);
-    return;
-  }
-  const rename = message.match(/^\/(?:rename|title)(?:\s+(.*))?$/s);
-  if (rename) {
-    clearComposer();
-    if (!rename[1]?.trim()) {
-      setStatus('Usage: /rename <new title>');
-      elements.prompt.focus({ preventScroll: true });
+  let message = elements.prompt.value.trim();
+  let updateTree = false;
+  const command = parseComposerCommand(message);
+  if (command) {
+    if (command.kind === 'commands') {
+      clearComposer();
+      setCommandPalette(true);
       return;
     }
-    await renameSelectedConversation(rename[1]);
-    return;
+    if (command.kind === 'help') {
+      clearComposer();
+      setShortcutHelp(true);
+      return;
+    }
+    if (command.kind === 'rename') {
+      clearComposer();
+      if (!command.argument) {
+        setStatus('Usage: /rename <new title>');
+        elements.prompt.focus({ preventScroll: true });
+        return;
+      }
+      await renameSelectedConversation(command.argument);
+      return;
+    }
+    if (command.kind === 'from') {
+      clearComposer();
+      if (!command.argument) {
+        setStatus('Usage: /from <commit>');
+        elements.prompt.focus({ preventScroll: true });
+        return;
+      }
+      await createConversation(command.argument);
+      return;
+    }
+    if (command.kind === 'update-tree') {
+      if (!command.argument) {
+        setStatus('Usage: /update-tree <message>');
+        return;
+      }
+      message = command.argument;
+      updateTree = true;
+    }
   }
   const conversation = selectedConversation();
   if (!conversation || !message || state.running.has(conversation.id)) return;
@@ -1081,12 +1487,15 @@ async function sendCurrentMessage() {
   const onEvent = new tauri.Channel();
   onEvent.onmessage = (event) => handleTurnEvent(id, event);
   try {
-    await tauri.invoke('send_message', {
+    const completion = await tauri.invoke('send_message', {
       conversation: id,
       message,
       title: conversation.title,
+      model: selectedModel() || null,
+      updateTree,
       onEvent
     });
+    conversation.title = completion.title;
     finishActivityGroup(id);
     state.histories.delete(id);
     state.diffs.delete(id);
@@ -1123,8 +1532,10 @@ async function sendCurrentMessage() {
   }
 }
 
-async function createConversation() {
-  const existingDraft = state.conversations.find((item) => item.draft && !item.started);
+async function createConversation(base = null) {
+  const existingDraft = !base
+    ? state.conversations.find((item) => item.draft && !item.started)
+    : null;
   if (existingDraft) {
     await selectConversation(existingDraft.id);
     return;
@@ -1132,11 +1543,13 @@ async function createConversation() {
   if (state.creatingConversation) return;
   state.creatingConversation = true;
   elements.newTask.disabled = true;
+  const inheritedModel = selectedModel();
   try {
     saveSelectedDraft();
-    const conversation = await tauri.invoke('new_conversation');
+    const conversation = await tauri.invoke('new_conversation', { base });
     state.conversations.unshift(conversation);
     state.histories.set(conversation.id, []);
+    state.conversationModels.set(conversation.id, inheritedModel);
     await selectConversation(conversation.id);
     elements.prompt.focus();
   } catch (error) {
@@ -1155,6 +1568,8 @@ async function initialize() {
   try {
     const payload = await tauri.invoke('bootstrap');
     state.repo = payload;
+    state.initialModel = payload.initialModel || '';
+    state.modelChoices = modelChoices(state.initialModel);
     state.conversations = payload.conversations;
     clearStartupLoading();
     if (state.conversations.length === 0) {
@@ -1167,14 +1582,17 @@ async function initialize() {
   }
 }
 
-elements.newTask.addEventListener('click', createConversation);
+elements.newTask.addEventListener('click', () => createConversation());
 elements.composer.addEventListener('submit', (event) => {
   event.preventDefault();
   sendCurrentMessage();
 });
 elements.prompt.addEventListener('input', () => {
   state.composerDrafts.set(state.selectedId, elements.prompt.value);
+  state.slashCommandSelection = 0;
+  state.slashCommandDismissed = false;
   resizePrompt();
+  renderSlashCommandMenu();
 });
 
 function commitPromptEdit() {
@@ -1215,6 +1633,28 @@ function deleteToEndOfLine() {
 
 elements.prompt.addEventListener('keydown', (event) => {
   const key = event.key.toLowerCase();
+  if (!elements.slashCommandMenu.hidden && !event.ctrlKey && !event.metaKey) {
+    const matches = slashCommandMatches(elements.prompt.value);
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      const amount = event.key === 'ArrowUp' ? -1 : 1;
+      state.slashCommandSelection =
+        (state.slashCommandSelection + amount + matches.length) % matches.length;
+      renderSlashCommandMenu();
+      return;
+    }
+    if (event.key === 'Tab' || event.key === 'Enter') {
+      event.preventDefault();
+      completeSlashCommand();
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      state.slashCommandDismissed = true;
+      renderSlashCommandMenu();
+      return;
+    }
+  }
   if (event.ctrlKey && !event.shiftKey && event.key === 'Enter' && !event.isComposing) {
     event.preventDefault();
     sendCurrentMessage();
@@ -1268,6 +1708,28 @@ document.addEventListener('keydown', (event) => {
     }
     return;
   }
+  if (state.publishDialogOpen) {
+    if (event.ctrlKey && !event.shiftKey && key === 'p') {
+      event.preventDefault();
+      confirmPublish();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      setPublishDialog(false);
+    }
+    return;
+  }
+  if (state.archiveDialogOpen) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setArchiveDialog(false);
+    }
+    return;
+  }
+  if (state.modelMenuOpen && event.key === 'Escape') {
+    event.preventDefault();
+    setModelMenu(false);
+    return;
+  }
   if (event.ctrlKey && event.shiftKey && key === 'p') {
     event.preventDefault();
     setCommandPalette(!state.commandPaletteOpen);
@@ -1305,6 +1767,19 @@ document.addEventListener('keydown', (event) => {
   } else if (event.ctrlKey && event.key === 'ArrowDown') {
     event.preventDefault();
     selectRelativeConversation(1);
+  } else if (event.ctrlKey && !event.shiftKey && key === 'l') {
+    event.preventDefault();
+    checkoutSelectedConversation();
+  } else if (event.ctrlKey && !event.shiftKey && key === 'p') {
+    event.preventDefault();
+    openPublishDialog();
+  } else if (event.ctrlKey && !event.shiftKey && key === 'e'
+    && event.target !== elements.prompt) {
+    event.preventDefault();
+    archiveSelectedConversation();
+  } else if (event.ctrlKey && event.shiftKey && key === 't') {
+    event.preventDefault();
+    toggleToolsPane();
   } else if (event.ctrlKey && key === 'q') {
     event.preventDefault();
     toggleChangesPane();
@@ -1332,6 +1807,30 @@ window.addEventListener('blur', () => document.body.classList.remove('is-control
 
 elements.shortcutHelp.addEventListener('click', (event) => {
   if (event.target.closest('[data-close-shortcuts]')) setShortcutHelp(false);
+});
+
+elements.modelButton.addEventListener('click', (event) => {
+  event.stopPropagation();
+  setModelMenu(!state.modelMenuOpen);
+});
+
+document.addEventListener('click', (event) => {
+  if (state.modelMenuOpen && !event.target.closest('.model-control')) setModelMenu(false);
+});
+
+elements.publishDialog.addEventListener('click', (event) => {
+  if (event.target.closest('[data-close-publish]')) setPublishDialog(false);
+});
+elements.publishConfirm.addEventListener('click', confirmPublish);
+elements.publishBase.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    confirmPublish();
+  }
+});
+
+elements.archiveDialog.addEventListener('click', (event) => {
+  if (event.target.closest('[data-close-archives]')) setArchiveDialog(false);
 });
 
 elements.commandPaletteButton.addEventListener('click', () => {

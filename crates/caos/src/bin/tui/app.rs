@@ -11,6 +11,10 @@ use caos::chat::{
     ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
     UserConversationSummary, WorkspaceDiff,
 };
+use caos::workspace::{
+    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
+    publish_conversation_pr, remote_default_branch,
+};
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -19,10 +23,6 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{
-    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
-    publish_conversation_pr, remote_default_branch,
-};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -2537,8 +2537,10 @@ impl App {
             self.selected_mut().publishing = true;
             self.selected_mut().status = "publishing a clean conversation branch".to_string();
             let tx = self.tx.clone();
+            let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
-                let result = publish_conversation_pr(&name, &diff, &pr_base, &default_base);
+                let result =
+                    publish_conversation_pr(&name, &diff, &pr_base, &default_base, &repo_dir);
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
                     result,

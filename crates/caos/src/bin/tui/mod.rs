@@ -24,7 +24,6 @@ use ratatui_crossterm::CrosstermBackend;
 
 mod app;
 mod args;
-mod workspace;
 
 use app::{ui::render, App, MouseAction, View};
 use args::{usage, Args};
