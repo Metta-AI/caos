@@ -198,6 +198,16 @@ fn payload(job: &Job) -> String {
     if let Some(token) = token() {
         body["token"] = serde_json::Value::String(token);
     }
+    if !job.secrets.is_empty() {
+        // Out-of-band injection channel: the values reach only this worker, for
+        // this job, and are never part of the ArgTree/cache key.
+        body["secrets"] = serde_json::Value::Object(
+            job.secrets
+                .iter()
+                .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        );
+    }
     body.to_string()
 }
 
