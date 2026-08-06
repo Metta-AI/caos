@@ -1356,7 +1356,6 @@ body.is-resizing-inspector .inspector-resizer::after { background: var(--accent)
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .loading-spinner,
   .task-skeleton span {
     animation: none;
     background-image: none;
