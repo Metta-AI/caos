@@ -41,7 +41,8 @@ const state = {
   turnStartIndexes: new Map(),
   running: new Set(),
   drafts: new Map(),
-  panes: { changes: false },
+  panes: { changes: false, action: false },
+  selectedAction: null,
   shortcutHelpOpen: false,
   commandPaletteOpen: false,
   commandPaletteSelection: 0,
@@ -59,6 +60,9 @@ const elements = {
   inspector: document.getElementById('inspector'),
   inspectorResizer: document.getElementById('inspector-resizer'),
   changesPane: document.getElementById('changes-pane'),
+  actionPane: document.getElementById('action-pane'),
+  actionPaneTitle: document.getElementById('action-pane-title'),
+  actionResult: document.getElementById('action-result'),
   newTask: document.getElementById('new-task'),
   taskTitle: document.getElementById('task-title'),
   taskMeta: document.getElementById('task-meta'),
@@ -106,7 +110,7 @@ function clearStartupLoading() {
 }
 
 function sidebarWidthBounds() {
-  const inspectorWidth = state.panes.changes ? state.inspectorWidth : 0;
+  const inspectorWidth = Object.values(state.panes).some(Boolean) ? state.inspectorWidth : 0;
   return {
     min: MIN_SIDEBAR_WIDTH,
     max: Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, window.innerWidth - inspectorWidth - 380))
@@ -525,6 +529,12 @@ function activityIcon(name) {
   ]);
 }
 
+function actionCallIsSelected(call) {
+  if (state.selectedAction?.conversationId !== state.selectedId) return false;
+  return state.selectedAction.call === call
+    || Boolean(call.toolUseId && state.selectedAction.call.toolUseId === call.toolUseId);
+}
+
 function activityGroupElement(entry) {
   const section = document.createElement('section');
   section.className = 'inline-activity';
@@ -532,7 +542,8 @@ function activityGroupElement(entry) {
 
   const hasCalls = entry.calls.length > 0;
   const expandable = activityGroupExpandable(entry);
-  const toggle = document.createElement(expandable ? 'button' : 'div');
+  const directCall = !expandable && entry.calls.length === 1 ? entry.calls[0] : null;
+  const toggle = document.createElement(expandable || directCall ? 'button' : 'div');
   toggle.className = 'inline-activity-toggle';
   let chevron = null;
   if (expandable) {
@@ -540,6 +551,10 @@ function activityGroupElement(entry) {
     toggle.setAttribute('aria-expanded', String(entry.expanded));
     chevron = iconElement([['path', { d: 'm9 18 6-6-6-6' }]]);
     chevron.classList.add('inline-activity-chevron');
+  } else if (directCall) {
+    toggle.type = 'button';
+    toggle.setAttribute('aria-controls', 'action-pane');
+    if (actionCallIsSelected(directCall)) toggle.classList.add('is-result-selected');
   } else {
     toggle.setAttribute('role', 'status');
   }
@@ -562,9 +577,13 @@ function activityGroupElement(entry) {
   list.setAttribute('role', 'list');
   list.hidden = !expandable || !entry.expanded;
   for (const call of entry.calls) {
-    const row = document.createElement('div');
+    const item = document.createElement('div');
+    item.setAttribute('role', 'listitem');
+    const row = document.createElement('button');
+    row.type = 'button';
     row.className = 'inline-activity-item';
-    row.setAttribute('role', 'listitem');
+    row.setAttribute('aria-controls', 'action-pane');
+    if (actionCallIsSelected(call)) row.classList.add('is-selected');
     if (call.result?.isError) row.classList.add('is-error');
     const icon = activityIcon(call.name);
     icon.classList.add('inline-activity-icon');
@@ -580,7 +599,9 @@ function activityGroupElement(entry) {
       row.append(spinner);
     }
     row.append(description);
-    list.append(row);
+    row.addEventListener('click', () => openActionResult(call, row));
+    item.append(row);
+    list.append(item);
   }
 
   if (expandable) {
@@ -591,6 +612,8 @@ function activityGroupElement(entry) {
       list.hidden = !entry.expanded;
       if (keepBottomAnchored) scrollTranscriptToBottom();
     });
+  } else if (directCall) {
+    toggle.addEventListener('click', () => openActionResult(directCall, toggle));
   }
   section.append(toggle, list);
   return section;
@@ -676,24 +699,75 @@ function renderTranscript({ scrollToBottom = false } = {}) {
 
 function updateInspectorLayout() {
   const changesOpen = state.panes.changes;
-  elements.inspector.hidden = !changesOpen;
+  const actionOpen = state.panes.action && Boolean(state.selectedAction);
+  const inspectorOpen = changesOpen || actionOpen;
+  elements.inspector.hidden = !inspectorOpen;
   elements.changesPane.hidden = !changesOpen;
+  elements.actionPane.hidden = !actionOpen;
+  elements.inspector.classList.toggle('has-stacked-panes', changesOpen && actionOpen);
   for (const button of document.querySelectorAll('[data-pane]')) {
     const open = state.panes[button.dataset.pane];
     button.classList.toggle('is-open', open);
     button.setAttribute('aria-expanded', String(open));
   }
-  if (!changesOpen) {
+  if (!inspectorOpen) {
     setSidebarWidth(state.sidebarWidth);
     return;
   }
   setInspectorWidth(state.inspectorWidth);
   setSidebarWidth(state.sidebarWidth);
-  loadDiff(state.selectedId);
+  if (changesOpen) loadDiff(state.selectedId);
+  if (actionOpen) renderActionResult();
+}
+
+function renderActionResult() {
+  const selection = state.selectedAction;
+  if (!selection) return;
+  const { call } = selection;
+  const title = toolDescription(call);
+  elements.actionPaneTitle.textContent = title;
+  elements.actionPaneTitle.title = title;
+  elements.actionResult.replaceChildren();
+  if (!call.result) {
+    const pending = document.createElement('div');
+    pending.className = 'panel-empty';
+    pending.textContent = 'Waiting for this action to finish…';
+    elements.actionResult.append(pending);
+    return;
+  }
+  const output = document.createElement('pre');
+  output.className = 'action-result-output';
+  if (call.result.isError) output.classList.add('is-error');
+  const code = document.createElement('code');
+  code.textContent = String(call.result.content || '').trimEnd() || 'No output.';
+  output.append(code);
+  elements.actionResult.append(output);
+}
+
+function openActionResult(call, source) {
+  state.selectedAction = { conversationId: state.selectedId, call };
+  state.panes.action = true;
+  for (const selected of elements.transcript.querySelectorAll(
+    '.inline-activity-item.is-selected, .inline-activity-toggle.is-result-selected'
+  )) {
+    selected.classList.remove('is-selected', 'is-result-selected');
+  }
+  source.classList.add(source.classList.contains('inline-activity-item')
+    ? 'is-selected'
+    : 'is-result-selected');
+  updateInspectorLayout();
 }
 
 function setPaneOpen(pane, open) {
   state.panes[pane] = open;
+  if (pane === 'action' && !open) {
+    state.selectedAction = null;
+    for (const selected of elements.transcript.querySelectorAll(
+      '.inline-activity-item.is-selected, .inline-activity-toggle.is-result-selected'
+    )) {
+      selected.classList.remove('is-selected', 'is-result-selected');
+    }
+  }
   updateInspectorLayout();
 }
 
@@ -704,6 +778,13 @@ function togglePane(pane) {
 
 function closeInspectorPanes() {
   state.panes.changes = false;
+  state.panes.action = false;
+  state.selectedAction = null;
+  for (const selected of elements.transcript.querySelectorAll(
+    '.inline-activity-item.is-selected, .inline-activity-toggle.is-result-selected'
+  )) {
+    selected.classList.remove('is-selected', 'is-result-selected');
+  }
   updateInspectorLayout();
   elements.prompt.focus({ preventScroll: true });
 }
@@ -720,6 +801,8 @@ async function selectConversation(id) {
   restoreSelectedDraft();
   setStatus('');
   state.panes.changes = false;
+  state.panes.action = false;
+  state.selectedAction = null;
   updateInspectorLayout();
   elements.changesToggle.hidden = true;
   renderChangeCount(null);
@@ -928,6 +1011,11 @@ function handleTurnEvent(id, event) {
       const call = entry.calls.find((item) => item.toolUseId === event.toolUseId);
       if (call) {
         call.result = event;
+        if (state.selectedAction?.conversationId === id
+          && state.selectedAction.call.toolUseId === call.toolUseId) {
+          state.selectedAction.call = call;
+          renderActionResult();
+        }
         if (entry === state.pendingActivityGroups.get(id) && activityGroupComplete(entry)) {
           entry.running = false;
         }
@@ -1245,7 +1333,7 @@ document.addEventListener('keydown', (event) => {
   } else if (event.ctrlKey && key === 'r') {
     event.preventDefault();
     reloadSelectedConversation();
-  } else if (event.key === 'Escape' && state.panes.changes) {
+  } else if (event.key === 'Escape' && Object.values(state.panes).some(Boolean)) {
     event.preventDefault();
     closeInspectorPanes();
   } else if (event.key === 'PageUp' || event.key === 'PageDown') {

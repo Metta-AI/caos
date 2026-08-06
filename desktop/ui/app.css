@@ -606,11 +606,26 @@ body.is-control-held .shortcut-hint {
 
 .inline-activity-item {
   align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
   display: grid;
+  font: inherit;
   gap: 8px;
   grid-template-columns: 16px minmax(0, 1fr);
   min-height: 30px;
   padding: 2px 5px;
+  text-align: left;
+  width: 100%;
+}
+
+.inline-activity-item:hover,
+.inline-activity-item:focus-visible,
+.inline-activity-item.is-selected,
+.inline-activity-toggle.is-result-selected {
+  color: var(--text);
+  outline: none;
 }
 
 .inline-activity-item.is-running {
@@ -1188,9 +1203,14 @@ body.is-resizing-inspector .inspector-resizer::after { background: var(--accent)
 }
 
 .inspector-pane-header h2 {
+  flex: 1;
   font-size: 12px;
   font-weight: 500;
   margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .inspector-pane-header button {
@@ -1201,6 +1221,7 @@ body.is-resizing-inspector .inspector-resizer::after { background: var(--accent)
   color: var(--muted);
   cursor: pointer;
   display: inline-flex;
+  flex: 0 0 auto;
   height: 26px;
   justify-content: center;
   padding: 0;
@@ -1215,6 +1236,35 @@ body.is-resizing-inspector .inspector-resizer::after { background: var(--accent)
 }
 
 .inspector-pane-header svg { height: 13px; width: 13px; }
+
+.inspector.has-stacked-panes .inspector-pane + .inspector-pane {
+  border-top: 1px solid var(--line);
+}
+
+.action-result {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 14px;
+}
+
+.action-result-output {
+  color: #d8d8d5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.action-result-output.is-error { color: var(--danger); }
+
+.action-result-output code {
+  font: inherit;
+  white-space: inherit;
+}
 
 .changes-view {
   display: grid;
