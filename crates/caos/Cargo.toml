@@ -8,7 +8,7 @@ edition = "2021"
 #                  container `entrypoint`, is installed setuid-root in worker
 #                  images so an unprivileged worker reaches the root-owned /cas.
 #   * `caos-cli` — the user-facing client: reads and writes the local repository
-#                  with gix and exchanges objects with the `caos` server API.
+#                  with gix and uses Git for remote object exchange.
 # The shared logic — object model, currying, args trees, CAS materialization,
 # and the presentation-independent chat engine — lives in the library.
 
@@ -25,11 +25,10 @@ name = "caos-cli"
 path = "src/bin/caos-cli.rs"
 
 [dependencies]
-# Read/write the local repository, including status, checkout, diff/merge, and
-# fetching ordinary origin branches. The CLI never invokes the git executable.
+# Read/write the local repository, including status, checkout, diff, and merge.
+# Network fetch and push continue through the configured Git remote.
 gix = { version = "0.84", default-features = false, features = [
   "blob-diff",
-  "blocking-http-transport-reqwest-rust-tls",
   "merge",
   "revision",
   "sha1",

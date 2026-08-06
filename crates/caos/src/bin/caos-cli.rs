@@ -1,10 +1,10 @@
 //! caos-cli: the user-facing caos client.
 //!
 //! This is what a person runs from inside their working tree. It uses the server
-//! as a `caos` git remote ([`caos::GitTransport`]): gix builds and reads objects
-//! in the local working repo, while the server's object/ref APIs exchange them.
-//! Compute is triggered over HTTP against the same server — its URL is always
-//! the `caos` remote's URL, never an env var.
+//! as a `caos` git remote ([`caos::GitTransport`]): gix handles local repository
+//! operations, while negotiated Git push/fetch exchanges objects with the
+//! server. Compute is triggered over HTTP against the same server — its URL is
+//! always the `caos` remote's URL, never an env var.
 //!
 //! There is no `/cas` here — that's the worker's world. The commands: `run`
 //! (compute, with the result checked out to any host path, or a file result
@@ -151,7 +151,7 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// The CLI uses gix for the local repo and the `caos` remote as its server URL.
+/// The CLI uses gix locally and the `caos` Git remote for network exchange.
 fn transport() -> Result<GitTransport, String> {
     GitTransport::from_cwd()
 }

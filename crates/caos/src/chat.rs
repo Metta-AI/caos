@@ -710,17 +710,7 @@ fn remote_refs(
     if patterns.is_empty() {
         return Ok(HashMap::new());
     }
-    let advertised = t.server_refs("")?;
-    Ok(advertised
-        .into_iter()
-        .filter(|(name, _)| {
-            patterns.iter().any(|pattern| {
-                pattern
-                    .strip_suffix('*')
-                    .map_or(name == pattern, |prefix| name.starts_with(prefix))
-            })
-        })
-        .collect())
+    Ok(t.server_refs(&patterns)?.into_iter().collect())
 }
 
 /// Publish a local conversation into the server-owned conversation namespace
@@ -1234,11 +1224,11 @@ fn turn(
     // turn message, so the response is printed exactly once: either a poll
     // already showed the final step (skip the message), or the drain here
     // suppresses that step's text and the message is printed below.
-    // Fetching the closure stops at objects already present locally, keeping
-    // the transfer to this turn's new objects.
+    // Negotiate from the human commit, which the server already has, so the
+    // transfer contains only this turn's new objects.
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
     let phase = std::time::Instant::now();
-    t.fetch_object_closure(&turn_hash)?;
+    t.fetch_object_negotiated(&turn_hash, &human)?;
     emit(TurnEvent::PhaseComplete {
         label: "fetching the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),

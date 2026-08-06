@@ -182,10 +182,12 @@
           CARGO_PROFILE = "dev";
           CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
 
-          # gix's rustls HTTP transport uses aws-lc-sys. The C compiler is the
-          # musl cross compiler configured above; its build script also needs
-          # cmake explicitly under strictDeps.
-          nativeBuildInputs = [ pkgs.cmake ];
+          # Native build inputs / runtime libs go here as the project grows,
+          # e.g. pkgs.openssl + pkgs.pkg-config for TLS. Note: C deps would
+          # need a musl cross-toolchain to stay static. (the server's gix
+          # uses default-features = false, so it stays pure-Rust / static.)
+          # buildInputs = [ ];
+          # nativeBuildInputs = [ ];
         }
         // crossLinkerEnv
         // muslCCEnv;
@@ -531,8 +533,6 @@
         nativeArgs = {
           inherit src;
           strictDeps = true;
-          # gix's rustls transport builds aws-lc-sys for the native host.
-          nativeBuildInputs = [ pkgs.cmake ];
           pname = "caos-host-tools";
           version = "0.1.0";
           # Dev profile here too (the macOS host build of caos-cli),

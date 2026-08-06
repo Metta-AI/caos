@@ -77,9 +77,6 @@ let
       pname = "caos-workspace";
       version = "0.1.0";
       strictDeps = true;
-      # Must match the root commonArgs: gix's rustls HTTP transport builds
-      # aws-lc-sys, whose build script invokes cmake.
-      nativeBuildInputs = [ pkgs.cmake ];
       cargoVendorDir = vendor;
       CARGO_PROFILE = "dev";
       # Smaller debuginfo (file:line in backtraces, no full DWARF). `env`

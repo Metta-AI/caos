@@ -133,9 +133,8 @@ see `design/flake-images.md`.
   `caos` binary, and may stay warm to take further jobs for its image.
 - A **user** drives it all with `caos-cli` from inside a git working tree that
   has the server configured as a remote named `caos`. The client uses gix for
-  local repository operations and exchanges only missing objects with the
-  server's HTTP object/ref APIs. It does not require the `git` executable at
-  runtime.
+  local repository operations and negotiated git push/fetch for network
+  exchange, so passing a large, mostly-unchanged tree transfers only the delta.
 
 Everything — an input file, a worker image, a result — is a git object named by
 its hash, so identical work is deduplicated and memoized.
@@ -289,9 +288,9 @@ logic — the difference is the **transport** and the privilege model.
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
 - **`caos-cli`** (user-facing; also installed as plain `caos`) uses the server
-  as a **`caos` git remote**: it builds and reads objects in-process with gix,
-  exchanges missing objects through the server API, and has no `/cas` or
-  object-level commands:
+  as a **`caos` git remote**: it builds and reads local objects in-process with
+  gix, exchanges them by negotiated push/fetch, and has no `/cas` or object-level
+  commands:
   - `run` — compute (blocking, as before), with the result checked out to any
     host path;
   - `curry` — bind args to an image, printing the curried ref;
@@ -301,8 +300,7 @@ logic — the difference is the **transport** and the privilege model.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are
-fetched, so there is nothing else to configure. The one-time remote setup can
-be done with any Git client; `caos-cli` itself does not invoke it:
+fetched, so there is nothing else to configure:
 
 ```bash
 git remote add caos http://localhost:9090
