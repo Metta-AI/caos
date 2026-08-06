@@ -1019,7 +1019,7 @@ fn resolve_flake_image(
 
 /// Look up a named image in the `std` library tree (`refs/caos/std`), returning
 /// its object hash.
-fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
+pub(crate) fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
     fetch_tree(config, std)
         .map_err(|e| HttpError::new(500, format!("reading std {std}: {e}")))?
         .iter()
