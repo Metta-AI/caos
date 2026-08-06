@@ -67,15 +67,17 @@ pub(crate) fn for_job(
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for secret in read_secrets(&dir) {
-        let visible = secret.readers.iter().any(|reader| {
-            match resolve_reader(config, std, reader) {
-                Ok(entries) => is_subset(&entries, arg_entries),
-                Err(e) => {
-                    eprintln!("secret {}: ignoring reader {reader:?}: {e}", secret.name);
-                    false
-                }
-            }
-        });
+        let visible =
+            secret
+                .readers
+                .iter()
+                .any(|reader| match resolve_reader(config, std, reader) {
+                    Ok(entries) => is_subset(&entries, arg_entries),
+                    Err(e) => {
+                        eprintln!("secret {}: ignoring reader {reader:?}: {e}", secret.name);
+                        false
+                    }
+                });
         if visible && seen.insert(secret.name.clone()) {
             eprintln!("secret {}: granted to this job", secret.name);
             out.push((secret.name, secret.value));
