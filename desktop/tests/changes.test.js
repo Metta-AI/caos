@@ -1,31 +1,69 @@
 const assert = require('node:assert/strict');
-const { filePatchesFromPatch, lineCountsFromPatch } = require('../ui/changes.js');
+const {
+  filePatchesFromPatch,
+  filePresentation,
+  lineCountsFromPatch,
+  syntaxTokens,
+  unchangedLinesBefore
+} = require('../ui/changes.js');
 
 const patch = [
   'diff --git a/desktop/ui/app.js b/desktop/ui/app.js',
   'index 1111111..2222222 100644',
   '--- a/desktop/ui/app.js',
   '+++ b/desktop/ui/app.js',
-  '@@ -1 +1 @@',
+  '@@ -10,3 +10,4 @@ function run() {',
+  ' const before = true;',
   '-old app',
-  '+new app',
-  'diff --git a/desktop/ui/app.css b/desktop/ui/app.css',
-  'index 3333333..4444444 100644',
-  '--- a/desktop/ui/app.css',
-  '+++ b/desktop/ui/app.css',
-  '@@ -1 +1 @@',
-  '-old css',
-  '+new css',
+  '+const next = "new app";',
+  '+return next;',
+  ' }',
+  '@@ -30 +31 @@ function finish() {',
+  '-old finish',
+  '+new finish',
+  'diff --git a/desktop/ui/new.css b/desktop/ui/new.css',
+  'new file mode 100644',
+  'index 0000000..4444444',
+  '--- /dev/null',
+  '+++ b/desktop/ui/new.css',
+  '@@ -0,0 +1 @@',
+  '+.new { color: green; }',
   ''
 ].join('\n');
 
 const files = filePatchesFromPatch(patch);
-assert.deepEqual(files.map((file) => file.path), ['desktop/ui/app.js', 'desktop/ui/app.css']);
-assert.match(files[0].patch, /\+new app/u);
-assert.doesNotMatch(files[0].patch, /new css/u);
-assert.match(files[1].patch, /\+new css/u);
+assert.deepEqual(files.map((file) => file.path), ['desktop/ui/app.js', 'desktop/ui/new.css']);
+assert.match(files[0].patch, /\+const next/u);
+assert.doesNotMatch(files[0].patch, /color: green/u);
+assert.match(files[1].patch, /color: green/u);
+assert.deepEqual(files[0].stats, { additions: 3, deletions: 2 });
+assert.equal(files[0].status, 'modified');
+assert.equal(files[1].status, 'added');
+
+const [firstHunk, secondHunk] = files[0].hunks;
+assert.deepEqual(firstHunk.lines.slice(0, 4), [
+  { kind: 'context', oldLine: 10, newLine: 10, text: 'const before = true;' },
+  { kind: 'delete', oldLine: 11, newLine: null, text: 'old app' },
+  { kind: 'add', oldLine: null, newLine: 11, text: 'const next = "new app";' },
+  { kind: 'add', oldLine: null, newLine: 12, text: 'return next;' }
+]);
+assert.equal(unchangedLinesBefore(firstHunk), 9);
+assert.equal(unchangedLinesBefore(secondHunk, firstHunk), 17);
+
+assert.deepEqual(filePresentation('desktop/ui/app.js'), {
+  badge: 'JS', directory: 'desktop/ui', extension: 'js', name: 'app.js'
+});
+assert.equal(filePresentation('flake.lock').badge, 'LOCK');
+
+const tokens = syntaxTokens('const title = "Changes"; // label', 'desktop/ui/app.js');
+assert.equal(tokens.map((token) => token.text).join(''), 'const title = "Changes"; // label');
+assert.deepEqual(
+  tokens.filter((token) => token.kind !== 'plain').map((token) => token.kind),
+  ['keyword', 'string', 'comment']
+);
+
 assert.deepEqual(filePatchesFromPatch(''), []);
-assert.deepEqual(lineCountsFromPatch(patch), { additions: 2, deletions: 2 });
+assert.deepEqual(lineCountsFromPatch(patch), { additions: 4, deletions: 2 });
 assert.deepEqual(lineCountsFromPatch(''), { additions: 0, deletions: 0 });
 
 console.log('change viewer tests passed');

@@ -48,7 +48,7 @@
           </div>
         </header>
 
-        <div class="task-workspace">
+        <div class="task-workspace" id="task-workspace">
           <section class="view chat-view is-active" id="chat-view">
             <div class="transcript-scroll" id="transcript-scroll">
               <div class="transcript" id="transcript">
@@ -89,12 +89,24 @@
 
             <section class="inspector-pane" id="changes-pane" aria-labelledby="changes-pane-title" hidden>
               <header class="inspector-pane-header">
-                <h2 id="changes-pane-title">Changes</h2>
+                <div class="inspector-pane-title-group">
+                  <h2 id="changes-pane-title">Conversation changes</h2>
+                  <span class="change-stats" id="changes-summary"></span>
+                </div>
                 <button type="button" aria-label="Close changes" data-close-pane="changes"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12"/><path d="m18 6-12 12"/></svg></button>
               </header>
               <div class="changes-view">
-                <aside class="file-list" id="file-list" aria-label="Changed files"></aside>
-                <div class="diff" id="diff" aria-label="Workspace diff"></div>
+                <section class="diff-column" aria-label="Selected file diff">
+                  <header class="diff-file-header" id="diff-file-header" hidden></header>
+                  <div class="diff" id="diff" aria-label="Workspace diff"></div>
+                </section>
+                <aside class="changed-files" aria-label="Changed files">
+                  <label class="file-filter-control" for="file-filter">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/></svg>
+                    <input id="file-filter" type="search" placeholder="Filter files…" aria-label="Filter changed files" autocomplete="off" spellcheck="false" />
+                  </label>
+                  <div class="file-list" id="file-list"></div>
+                </aside>
               </div>
             </section>
 

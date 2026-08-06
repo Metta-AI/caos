@@ -1,6 +1,11 @@
 const tauri = window.__TAURI__?.core;
 const { renderMarkdown } = window.CaosMarkdown;
-const { filePatchesFromPatch, lineCountsFromPatch } = window.CaosChanges;
+const {
+  filePatchesFromPatch,
+  lineCountsFromPatch,
+  syntaxTokens,
+  unchangedLinesBefore
+} = window.CaosChanges;
 const {
   modelChoices,
   modelLabel,
@@ -48,6 +53,7 @@ const state = {
   histories: new Map(),
   diffs: new Map(),
   selectedDiffFiles: new Map(),
+  diffFileQueries: new Map(),
   pendingActivityGroups: new Map(),
   turnStartIndexes: new Map(),
   running: new Set(),
@@ -73,10 +79,12 @@ const state = {
 
 const elements = {
   taskList: document.getElementById('task-list'),
+  taskWorkspace: document.getElementById('task-workspace'),
   sidebarResizer: document.getElementById('sidebar-resizer'),
   inspector: document.getElementById('inspector'),
   inspectorResizer: document.getElementById('inspector-resizer'),
   changesPane: document.getElementById('changes-pane'),
+  changesSummary: document.getElementById('changes-summary'),
   actionPane: document.getElementById('action-pane'),
   actionPaneTitle: document.getElementById('action-pane-title'),
   actionResult: document.getElementById('action-result'),
@@ -97,6 +105,8 @@ const elements = {
   sendButton: document.getElementById('send-button'),
   turnStatus: document.getElementById('turn-status'),
   fileList: document.getElementById('file-list'),
+  fileFilter: document.getElementById('file-filter'),
+  diffFileHeader: document.getElementById('diff-file-header'),
   diff: document.getElementById('diff'),
   shortcutHelp: document.getElementById('shortcut-help'),
   commandPalette: document.getElementById('command-palette'),
@@ -817,6 +827,7 @@ function updateInspectorLayout() {
   const actionOpen = Boolean(state.selectedAction);
   const inspectorOpen = changesOpen || actionOpen;
   elements.inspector.hidden = !inspectorOpen;
+  elements.taskWorkspace.classList.toggle('is-changes-view', changesOpen);
   elements.changesPane.hidden = !changesOpen;
   elements.actionPane.hidden = !actionOpen;
   elements.inspector.classList.toggle('has-stacked-panes', changesOpen && actionOpen);
@@ -958,7 +969,12 @@ function closeInspectorPane(pane) {
 
 function toggleChangesPane() {
   if (elements.changesToggle.hidden) return;
-  state.changesOpen = !state.changesOpen;
+  const opening = !state.changesOpen;
+  state.changesOpen = opening;
+  if (opening) {
+    state.selectedAction = null;
+    clearActionHighlights();
+  }
   updateInspectorLayout();
 }
 
@@ -1220,6 +1236,7 @@ async function toggleToolsPane() {
     closeInspectorPane('action');
     return;
   }
+  state.changesOpen = false;
   state.selectedAction = { kind: 'tools', conversationId: conversation.id, loading: true };
   updateInspectorLayout();
   try {
@@ -1242,36 +1259,190 @@ function selectRelativeConversation(amount) {
   selectConversation(state.conversations[next].id);
 }
 
-function renderPatch(patch) {
-  elements.diff.replaceChildren();
-  for (const line of patch.split('\n')) {
-    const row = document.createElement('span');
-    row.className = 'diff-line';
-    if (line.startsWith('+') && !line.startsWith('+++')) row.classList.add('is-add');
-    if (line.startsWith('-') && !line.startsWith('---')) row.classList.add('is-delete');
-    if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('@@')) row.classList.add('is-meta');
-    row.textContent = `${line}\n`;
-    elements.diff.append(row);
-  }
-  elements.diff.scrollTop = 0;
-  elements.diff.scrollLeft = 0;
-}
-
-function renderChangeCount(stats) {
-  elements.changeCount.replaceChildren();
-  elements.changeCount.removeAttribute('aria-label');
-  if (!stats) return;
+function changeStatsElement(stats, className = '') {
+  const container = document.createElement('span');
+  container.className = `change-stats ${className}`.trim();
   const additions = document.createElement('span');
   additions.className = 'change-stat is-add';
   additions.textContent = `+${stats.additions}`;
   const deletions = document.createElement('span');
   deletions.className = 'change-stat is-delete';
   deletions.textContent = `-${stats.deletions}`;
-  elements.changeCount.setAttribute(
+  container.setAttribute(
     'aria-label',
     `${stats.additions} lines added, ${stats.deletions} lines deleted`
   );
-  elements.changeCount.append(additions, deletions);
+  container.append(additions, deletions);
+  return container;
+}
+
+function renderChangeCount(stats) {
+  for (const container of [elements.changeCount, elements.changesSummary]) {
+    container.replaceChildren();
+    container.removeAttribute('aria-label');
+    if (!stats) continue;
+    const rendered = changeStatsElement(stats);
+    container.setAttribute('aria-label', rendered.getAttribute('aria-label'));
+    container.append(...rendered.childNodes);
+  }
+}
+
+function fileBadgeElement(file) {
+  const badge = document.createElement('span');
+  badge.className = 'file-badge';
+  badge.dataset.extension = file.presentation.extension || 'file';
+  badge.textContent = file.presentation.badge;
+  return badge;
+}
+
+function renderDiffFileHeader(file) {
+  elements.diffFileHeader.replaceChildren();
+  elements.diffFileHeader.hidden = !file;
+  if (!file) return;
+  const identity = document.createElement('div');
+  identity.className = 'diff-file-identity';
+  const path = document.createElement('span');
+  path.className = 'diff-file-path';
+  path.textContent = file.path;
+  identity.append(fileBadgeElement(file), path);
+  const details = document.createElement('div');
+  details.className = 'diff-file-details';
+  const status = document.createElement('span');
+  status.className = `file-status-label is-${file.status}`;
+  status.textContent = file.status;
+  details.append(status, changeStatsElement(file.stats, 'is-compact'));
+  elements.diffFileHeader.append(identity, details);
+}
+
+function appendHighlightedCode(container, text, path) {
+  for (const token of syntaxTokens(text, path)) {
+    const span = document.createElement('span');
+    span.className = `syntax-${token.kind}`;
+    span.textContent = token.text;
+    container.append(span);
+  }
+}
+
+function diffLineElement(line, path) {
+  const row = document.createElement('div');
+  row.className = `diff-row is-${line.kind}`;
+  const oldNumber = document.createElement('span');
+  oldNumber.className = 'diff-line-number';
+  oldNumber.textContent = line.oldLine ?? '';
+  const newNumber = document.createElement('span');
+  newNumber.className = 'diff-line-number';
+  newNumber.textContent = line.newLine ?? '';
+  const marker = document.createElement('span');
+  marker.className = 'diff-marker';
+  marker.textContent = line.kind === 'add' ? '+' : line.kind === 'delete' ? '−' : '';
+  const code = document.createElement('code');
+  code.className = 'diff-code';
+  if (line.kind === 'notice') {
+    code.textContent = line.text;
+  } else {
+    appendHighlightedCode(code, line.text, path);
+  }
+  row.append(oldNumber, newNumber, marker, code);
+  return row;
+}
+
+function collapsedDiffRegion(lines) {
+  const row = document.createElement('div');
+  row.className = 'diff-collapse';
+  const icon = iconElement([
+    ['path', { d: 'm8 9 4-4 4 4' }],
+    ['path', { d: 'm16 15-4 4-4-4' }]
+  ]);
+  const label = document.createElement('span');
+  label.textContent = `${lines} unmodified ${lines === 1 ? 'line' : 'lines'}`;
+  row.append(icon, label);
+  return row;
+}
+
+function renderPatch(file) {
+  elements.diff.replaceChildren();
+  renderDiffFileHeader(file);
+  if (!file) return;
+  if (file.hunks.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'panel-empty';
+    empty.textContent = file.patch.includes('Binary files') || file.patch.includes('GIT binary patch')
+      ? 'Binary file changed.'
+      : 'File metadata changed.';
+    elements.diff.append(empty);
+    return;
+  }
+  let previousHunk = null;
+  for (const hunk of file.hunks) {
+    const hiddenLines = unchangedLinesBefore(hunk, previousHunk);
+    if (hiddenLines > 0) {
+      elements.diff.append(collapsedDiffRegion(hiddenLines));
+    }
+    for (const line of hunk.lines) elements.diff.append(diffLineElement(line, file.path));
+    previousHunk = hunk;
+  }
+  elements.diff.scrollTop = 0;
+  elements.diff.scrollLeft = 0;
+}
+
+function renderDiffFileList(files, selectedFile, conversationId) {
+  elements.fileList.replaceChildren();
+  const query = (state.diffFileQueries.get(conversationId) || '').trim().toLowerCase();
+  const visibleFiles = files.filter((file) => file.path.toLowerCase().includes(query));
+  if (visibleFiles.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'file-list-empty';
+    empty.textContent = 'No matching files';
+    elements.fileList.append(empty);
+    return;
+  }
+  const groups = new Map();
+  for (const file of visibleFiles) {
+    if (!groups.has(file.presentation.directory)) groups.set(file.presentation.directory, []);
+    groups.get(file.presentation.directory).push(file);
+  }
+  for (const [directory, groupFiles] of groups) {
+    const group = document.createElement('section');
+    group.className = 'file-group';
+    const heading = document.createElement('div');
+    heading.className = 'file-group-heading';
+    const chevron = iconElement([['path', { d: 'm8 10 4 4 4-4' }]]);
+    const directoryLabel = document.createElement('span');
+    directoryLabel.textContent = directory;
+    heading.append(chevron, directoryLabel);
+    group.append(heading);
+    for (const file of groupFiles) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'file-button';
+      const selected = file.path === selectedFile.path;
+      button.classList.toggle('is-active', selected);
+      button.setAttribute('aria-pressed', String(selected));
+      button.title = file.path;
+      const identity = document.createElement('span');
+      identity.className = 'file-button-identity';
+      const name = document.createElement('span');
+      name.className = 'file-button-name';
+      name.textContent = file.presentation.name;
+      identity.append(fileBadgeElement(file), name);
+      const meta = document.createElement('span');
+      meta.className = 'file-button-meta';
+      const stats = changeStatsElement(file.stats, 'is-compact');
+      const status = document.createElement('span');
+      status.className = `file-status is-${file.status}`;
+      status.setAttribute('aria-label', file.status);
+      meta.append(stats, status);
+      button.append(identity, meta);
+      button.addEventListener('click', () => {
+        if (state.selectedId !== conversationId) return;
+        state.selectedDiffFiles.set(conversationId, file.path);
+        renderDiffFileList(files, file, conversationId);
+        renderPatch(file);
+      });
+      group.append(button);
+    }
+    elements.fileList.append(group);
+  }
 }
 
 function renderDiff(value) {
@@ -1285,9 +1456,10 @@ function renderDiff(value) {
   elements.changesPane.classList.toggle('is-empty', !hasChanges);
   elements.fileList.replaceChildren();
   elements.diff.replaceChildren();
+  renderDiffFileHeader(null);
   const files = filePatchesFromPatch(patch);
   renderChangeCount(lineCountsFromPatch(patch));
-  if (!hasChanges) {
+  if (!hasChanges || files.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'panel-empty';
     empty.textContent = 'No workspace changes.';
@@ -1298,28 +1470,9 @@ function renderDiff(value) {
   const requestedPath = state.selectedDiffFiles.get(conversationId);
   const selectedFile = files.find((file) => file.path === requestedPath) || files[0];
   state.selectedDiffFiles.set(conversationId, selectedFile.path);
-  files.forEach((file) => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'file-button';
-    const selected = file.path === selectedFile.path;
-    button.classList.toggle('is-active', selected);
-    button.setAttribute('aria-pressed', String(selected));
-    button.textContent = file.path;
-    button.title = file.path;
-    button.addEventListener('click', () => {
-      if (state.selectedId !== conversationId) return;
-      state.selectedDiffFiles.set(conversationId, file.path);
-      for (const candidate of elements.fileList.querySelectorAll('.file-button')) {
-        const active = candidate === button;
-        candidate.classList.toggle('is-active', active);
-        candidate.setAttribute('aria-pressed', String(active));
-      }
-      renderPatch(file.patch);
-    });
-    elements.fileList.append(button);
-  });
-  renderPatch(selectedFile.patch);
+  elements.fileFilter.value = state.diffFileQueries.get(conversationId) || '';
+  renderDiffFileList(files, selectedFile, conversationId);
+  renderPatch(selectedFile);
 }
 
 async function loadDiff(id, force = false) {
@@ -1331,6 +1484,8 @@ async function loadDiff(id, force = false) {
   if (state.selectedId === id) {
     elements.changesPane.classList.add('is-empty');
     renderChangeCount(null);
+    renderDiffFileHeader(null);
+    elements.fileList.replaceChildren();
     elements.diff.textContent = 'Loading changes…';
   }
   try {
@@ -1865,6 +2020,17 @@ elements.commandPaletteQuery.addEventListener('keydown', (event) => {
 });
 
 elements.changesToggle.addEventListener('click', toggleChangesPane);
+
+elements.fileFilter.addEventListener('input', () => {
+  const conversationId = state.selectedId;
+  if (!conversationId) return;
+  state.diffFileQueries.set(conversationId, elements.fileFilter.value);
+  const files = filePatchesFromPatch(state.diffs.get(conversationId) || '');
+  if (files.length === 0) return;
+  const requestedPath = state.selectedDiffFiles.get(conversationId);
+  const selectedFile = files.find((file) => file.path === requestedPath) || files[0];
+  renderDiffFileList(files, selectedFile, conversationId);
+});
 
 for (const button of document.querySelectorAll('[data-close-pane]')) {
   button.addEventListener('click', () => closeInspectorPane(button.dataset.closePane));
