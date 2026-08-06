@@ -172,89 +172,85 @@ struct TurnOutcomePayload {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnEventPayload {
-    kind: &'static str,
-    phase: Option<&'static str>,
-    label: Option<String>,
-    text: Option<String>,
-    elapsed_secs: Option<f64>,
-    step_commit: Option<String>,
-    tool_use_id: Option<String>,
-    name: Option<String>,
-    summary: Option<String>,
-    is_error: Option<bool>,
-    content: Option<String>,
-    commit: Option<String>,
-    short_commit: Option<String>,
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum TurnEventPayload {
+    PhaseStarted {
+        phase: &'static str,
+    },
+    PhaseComplete {
+        label: String,
+        elapsed_secs: f64,
+    },
+    Status {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ToolCall {
+        step_commit: String,
+        tool_use_id: String,
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        step_commit: String,
+        tool_use_id: String,
+        is_error: bool,
+        content: String,
+    },
+    Completed {
+        commit: String,
+        short_commit: String,
+    },
 }
 
 impl From<TurnEvent> for TurnEventPayload {
     fn from(event: TurnEvent) -> Self {
-        let mut payload = Self {
-            kind: "status",
-            phase: None,
-            label: None,
-            text: None,
-            elapsed_secs: None,
-            step_commit: None,
-            tool_use_id: None,
-            name: None,
-            summary: None,
-            is_error: None,
-            content: None,
-            commit: None,
-            short_commit: None,
-        };
         match event {
-            TurnEvent::PhaseStarted(phase) => {
-                payload.kind = "phaseStarted";
-                payload.phase = Some(phase_name(phase));
-            }
+            TurnEvent::PhaseStarted(phase) => Self::PhaseStarted {
+                phase: phase_name(phase),
+            },
             TurnEvent::PhaseComplete {
                 label,
                 elapsed_secs,
-            } => {
-                payload.kind = "phaseComplete";
-                payload.label = Some(label);
-                payload.elapsed_secs = Some(elapsed_secs);
-            }
-            TurnEvent::Status(text) => payload.text = Some(text),
-            TurnEvent::AssistantText(text) => {
-                payload.kind = "assistantText";
-                payload.text = Some(text);
-            }
+            } => Self::PhaseComplete {
+                label,
+                elapsed_secs,
+            },
+            TurnEvent::Status(text) => Self::Status { text },
+            TurnEvent::AssistantText(text) => Self::AssistantText { text },
             TurnEvent::ToolCall {
                 step_commit,
                 tool_use_id,
                 name,
                 summary,
-            } => {
-                payload.kind = "toolCall";
-                payload.step_commit = Some(step_commit);
-                payload.tool_use_id = Some(tool_use_id);
-                payload.name = Some(name);
-                payload.summary = Some(summary);
-            }
+            } => Self::ToolCall {
+                step_commit,
+                tool_use_id,
+                name,
+                summary,
+            },
             TurnEvent::ToolResult {
                 step_commit,
                 tool_use_id,
                 is_error,
                 content,
-            } => {
-                payload.kind = "toolResult";
-                payload.step_commit = Some(step_commit);
-                payload.tool_use_id = Some(tool_use_id);
-                payload.is_error = Some(is_error);
-                payload.content = Some(content);
-            }
-            TurnEvent::Completed(outcome) => {
-                payload.kind = "completed";
-                payload.commit = Some(outcome.commit);
-                payload.short_commit = Some(outcome.short_commit);
-            }
+            } => Self::ToolResult {
+                step_commit,
+                tool_use_id,
+                is_error,
+                content,
+            },
+            TurnEvent::Completed(outcome) => Self::Completed {
+                commit: outcome.commit,
+                short_commit: outcome.short_commit,
+            },
         }
-        payload
     }
 }
 
@@ -611,7 +607,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{automatic_title, short_hash, validated_conversation_title};
+    use super::{automatic_title, short_hash, validated_conversation_title, TurnEventPayload};
+    use caos::chat::TurnEvent;
 
     #[test]
     fn titles_match_the_tui_limits() {
@@ -640,5 +637,25 @@ mod tests {
         assert!(validated_conversation_title("  ").is_err());
         assert!(validated_conversation_title("two\nlines").is_err());
         assert!(validated_conversation_title("tab\tseparated").is_err());
+    }
+
+    #[test]
+    fn turn_event_payloads_are_tagged_without_null_fields() {
+        let payload = TurnEventPayload::from(TurnEvent::ToolResult {
+            step_commit: "abc1234".to_string(),
+            tool_use_id: "tool-1".to_string(),
+            is_error: false,
+            content: "result".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(payload).unwrap(),
+            serde_json::json!({
+                "kind": "toolResult",
+                "stepCommit": "abc1234",
+                "toolUseId": "tool-1",
+                "isError": false,
+                "content": "result"
+            })
+        );
     }
 }

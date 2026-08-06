@@ -24,7 +24,7 @@ const UI_ZOOM_STEP = 0.1;
 const PALETTE_COMMANDS = [
   { id: 'new', label: 'New conversation', shortcut: 'Ctrl+N', keywords: 'create start task', run: () => createConversation() },
   { id: 'chat', label: 'Focus conversation', shortcut: '', keywords: 'chat transcript close inspectors', run: () => closeInspectorPanes() },
-  { id: 'changes', label: 'Toggle workspace changes', shortcut: 'Ctrl+Q', keywords: 'diff files pane', available: () => !elements.changesToggle.hidden, run: () => togglePane('changes') },
+  { id: 'changes', label: 'Toggle workspace changes', shortcut: 'Ctrl+Q', keywords: 'diff files pane', available: () => !elements.changesToggle.hidden, run: () => toggleChangesPane() },
   { id: 'reload', label: 'Reload conversation', shortcut: 'Ctrl+R', keywords: 'refresh history', run: () => reloadSelectedConversation() },
   { id: 'rename', label: 'Rename conversation', shortcut: '/rename', keywords: 'title name', run: () => prefillCommand('/rename ') },
   { id: 'help', label: 'Show keyboard shortcuts', shortcut: 'Ctrl+H', keywords: 'help commands', run: () => setShortcutHelp(true) }
@@ -41,7 +41,7 @@ const state = {
   turnStartIndexes: new Map(),
   running: new Set(),
   drafts: new Map(),
-  panes: { changes: false, action: false },
+  changesOpen: false,
   selectedAction: null,
   shortcutHelpOpen: false,
   commandPaletteOpen: false,
@@ -49,8 +49,6 @@ const state = {
   uiZoom: 1,
   sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
   inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
-  resizingSidebar: false,
-  resizingInspector: false,
   creatingConversation: false
 };
 
@@ -110,7 +108,7 @@ function clearStartupLoading() {
 }
 
 function sidebarWidthBounds() {
-  const inspectorWidth = Object.values(state.panes).some(Boolean) ? state.inspectorWidth : 0;
+  const inspectorWidth = state.changesOpen || state.selectedAction ? state.inspectorWidth : 0;
   return {
     min: MIN_SIDEBAR_WIDTH,
     max: Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, window.innerWidth - inspectorWidth - 380))
@@ -698,18 +696,15 @@ function renderTranscript({ scrollToBottom = false } = {}) {
 }
 
 function updateInspectorLayout() {
-  const changesOpen = state.panes.changes;
-  const actionOpen = state.panes.action && Boolean(state.selectedAction);
+  const changesOpen = state.changesOpen;
+  const actionOpen = Boolean(state.selectedAction);
   const inspectorOpen = changesOpen || actionOpen;
   elements.inspector.hidden = !inspectorOpen;
   elements.changesPane.hidden = !changesOpen;
   elements.actionPane.hidden = !actionOpen;
   elements.inspector.classList.toggle('has-stacked-panes', changesOpen && actionOpen);
-  for (const button of document.querySelectorAll('[data-pane]')) {
-    const open = state.panes[button.dataset.pane];
-    button.classList.toggle('is-open', open);
-    button.setAttribute('aria-expanded', String(open));
-  }
+  elements.changesToggle.classList.toggle('is-open', changesOpen);
+  elements.changesToggle.setAttribute('aria-expanded', String(changesOpen));
   if (!inspectorOpen) {
     setSidebarWidth(state.sidebarWidth);
     return;
@@ -744,48 +739,48 @@ function renderActionResult() {
   elements.actionResult.append(output);
 }
 
-function openActionResult(call, source) {
-  state.selectedAction = { conversationId: state.selectedId, call };
-  state.panes.action = true;
+function clearActionHighlights() {
   for (const selected of elements.transcript.querySelectorAll(
     '.inline-activity-item.is-selected, .inline-activity-toggle.is-result-selected'
   )) {
     selected.classList.remove('is-selected', 'is-result-selected');
   }
+}
+
+function openActionResult(call, source) {
+  state.selectedAction = { conversationId: state.selectedId, call };
+  clearActionHighlights();
   source.classList.add(source.classList.contains('inline-activity-item')
     ? 'is-selected'
     : 'is-result-selected');
   updateInspectorLayout();
 }
 
-function setPaneOpen(pane, open) {
-  state.panes[pane] = open;
-  if (pane === 'action' && !open) {
+function closeInspectorPane(pane) {
+  if (pane === 'action') {
     state.selectedAction = null;
-    for (const selected of elements.transcript.querySelectorAll(
-      '.inline-activity-item.is-selected, .inline-activity-toggle.is-result-selected'
-    )) {
-      selected.classList.remove('is-selected', 'is-result-selected');
-    }
+    clearActionHighlights();
+  } else if (pane === 'changes') {
+    state.changesOpen = false;
   }
   updateInspectorLayout();
 }
 
-function togglePane(pane) {
-  if (pane === 'changes' && elements.changesToggle.hidden) return;
-  setPaneOpen(pane, !state.panes[pane]);
+function toggleChangesPane() {
+  if (elements.changesToggle.hidden) return;
+  state.changesOpen = !state.changesOpen;
+  updateInspectorLayout();
+}
+
+function resetInspector() {
+  state.changesOpen = false;
+  state.selectedAction = null;
+  clearActionHighlights();
+  updateInspectorLayout();
 }
 
 function closeInspectorPanes() {
-  state.panes.changes = false;
-  state.panes.action = false;
-  state.selectedAction = null;
-  for (const selected of elements.transcript.querySelectorAll(
-    '.inline-activity-item.is-selected, .inline-activity-toggle.is-result-selected'
-  )) {
-    selected.classList.remove('is-selected', 'is-result-selected');
-  }
-  updateInspectorLayout();
+  resetInspector();
   elements.prompt.focus({ preventScroll: true });
 }
 
@@ -800,10 +795,7 @@ async function selectConversation(id) {
   renderHeader();
   restoreSelectedDraft();
   setStatus('');
-  state.panes.changes = false;
-  state.panes.action = false;
-  state.selectedAction = null;
-  updateInspectorLayout();
+  resetInspector();
   elements.changesToggle.hidden = true;
   renderChangeCount(null);
   if (!state.histories.has(id)) {
@@ -911,8 +903,8 @@ function renderDiff(payload) {
   const patch = payload?.patch || '';
   const hasChanges = patch.trim().length > 0;
   elements.changesToggle.hidden = !hasChanges;
-  if (!hasChanges && state.panes.changes) {
-    state.panes.changes = false;
+  if (!hasChanges && state.changesOpen) {
+    state.changesOpen = false;
     updateInspectorLayout();
   }
   elements.changesPane.classList.toggle('is-empty', !hasChanges);
@@ -1329,11 +1321,11 @@ document.addEventListener('keydown', (event) => {
     selectRelativeConversation(1);
   } else if (event.ctrlKey && key === 'q') {
     event.preventDefault();
-    togglePane('changes');
+    toggleChangesPane();
   } else if (event.ctrlKey && key === 'r') {
     event.preventDefault();
     reloadSelectedConversation();
-  } else if (event.key === 'Escape' && Object.values(state.panes).some(Boolean)) {
+  } else if (event.key === 'Escape' && (state.changesOpen || state.selectedAction)) {
     event.preventDefault();
     closeInspectorPanes();
   } else if (event.key === 'PageUp' || event.key === 'PageDown') {
@@ -1387,80 +1379,70 @@ elements.commandPaletteQuery.addEventListener('keydown', (event) => {
   }
 });
 
-for (const button of document.querySelectorAll('[data-pane]')) {
-  button.addEventListener('click', () => togglePane(button.dataset.pane));
-}
+elements.changesToggle.addEventListener('click', toggleChangesPane);
 
 for (const button of document.querySelectorAll('[data-close-pane]')) {
-  button.addEventListener('click', () => setPaneOpen(button.dataset.closePane, false));
+  button.addEventListener('click', () => closeInspectorPane(button.dataset.closePane));
 }
 
-elements.sidebarResizer.addEventListener('pointerdown', (event) => {
-  if (event.button !== 0) return;
-  event.preventDefault();
-  state.resizingSidebar = true;
-  document.body.classList.add('is-resizing-sidebar');
-  elements.sidebarResizer.setPointerCapture(event.pointerId);
-  setSidebarWidth(event.clientX);
-});
-
-window.addEventListener('pointermove', (event) => {
-  if (!state.resizingSidebar) return;
-  setSidebarWidth(event.clientX);
-});
-
-function finishSidebarResize(event) {
-  if (!state.resizingSidebar) return;
-  state.resizingSidebar = false;
-  document.body.classList.remove('is-resizing-sidebar');
-  if (elements.sidebarResizer.hasPointerCapture(event.pointerId)) {
-    elements.sidebarResizer.releasePointerCapture(event.pointerId);
-  }
-  setSidebarWidth(state.sidebarWidth, true);
+function installWidthResizer({
+  handle,
+  bodyClass,
+  defaultWidth,
+  currentWidth,
+  pointerWidth,
+  keyboardDirection,
+  setWidth
+}) {
+  let active = false;
+  handle.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    active = true;
+    document.body.classList.add(bodyClass);
+    handle.setPointerCapture(event.pointerId);
+    setWidth(pointerWidth(event));
+  });
+  window.addEventListener('pointermove', (event) => {
+    if (active) setWidth(pointerWidth(event));
+  });
+  const finish = (event) => {
+    if (!active) return;
+    active = false;
+    document.body.classList.remove(bodyClass);
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    setWidth(currentWidth(), true);
+  };
+  window.addEventListener('pointerup', finish);
+  window.addEventListener('pointercancel', finish);
+  handle.addEventListener('dblclick', () => setWidth(defaultWidth, true));
+  handle.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    event.preventDefault();
+    const direction = event.key === 'ArrowLeft' ? -1 : 1;
+    const step = event.shiftKey ? 32 : 12;
+    setWidth(currentWidth() + direction * keyboardDirection * step, true);
+  });
 }
 
-window.addEventListener('pointerup', finishSidebarResize);
-window.addEventListener('pointercancel', finishSidebarResize);
-elements.sidebarResizer.addEventListener('dblclick', () => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH, true));
-elements.sidebarResizer.addEventListener('keydown', (event) => {
-  if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
-  event.preventDefault();
-  const direction = event.key === 'ArrowLeft' ? -1 : 1;
-  setSidebarWidth(state.sidebarWidth + direction * (event.shiftKey ? 32 : 12), true);
+installWidthResizer({
+  handle: elements.sidebarResizer,
+  bodyClass: 'is-resizing-sidebar',
+  defaultWidth: DEFAULT_SIDEBAR_WIDTH,
+  currentWidth: () => state.sidebarWidth,
+  pointerWidth: (event) => event.clientX,
+  keyboardDirection: 1,
+  setWidth: setSidebarWidth
 });
 
-elements.inspectorResizer.addEventListener('pointerdown', (event) => {
-  if (event.button !== 0) return;
-  event.preventDefault();
-  state.resizingInspector = true;
-  document.body.classList.add('is-resizing-inspector');
-  elements.inspectorResizer.setPointerCapture(event.pointerId);
-  setInspectorWidth(window.innerWidth - event.clientX);
-});
-
-window.addEventListener('pointermove', (event) => {
-  if (!state.resizingInspector) return;
-  setInspectorWidth(window.innerWidth - event.clientX);
-});
-
-function finishInspectorResize(event) {
-  if (!state.resizingInspector) return;
-  state.resizingInspector = false;
-  document.body.classList.remove('is-resizing-inspector');
-  if (elements.inspectorResizer.hasPointerCapture(event.pointerId)) {
-    elements.inspectorResizer.releasePointerCapture(event.pointerId);
-  }
-  setInspectorWidth(state.inspectorWidth, true);
-}
-
-window.addEventListener('pointerup', finishInspectorResize);
-window.addEventListener('pointercancel', finishInspectorResize);
-elements.inspectorResizer.addEventListener('dblclick', () => setInspectorWidth(DEFAULT_INSPECTOR_WIDTH, true));
-elements.inspectorResizer.addEventListener('keydown', (event) => {
-  if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
-  event.preventDefault();
-  const direction = event.key === 'ArrowLeft' ? 1 : -1;
-  setInspectorWidth(state.inspectorWidth + direction * (event.shiftKey ? 32 : 12), true);
+installWidthResizer({
+  handle: elements.inspectorResizer,
+  bodyClass: 'is-resizing-inspector',
+  defaultWidth: DEFAULT_INSPECTOR_WIDTH,
+  currentWidth: () => state.inspectorWidth,
+  pointerWidth: (event) => window.innerWidth - event.clientX,
+  keyboardDirection: -1,
+  setWidth: setInspectorWidth
 });
 
 window.addEventListener('resize', () => {

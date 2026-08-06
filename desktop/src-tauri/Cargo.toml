@@ -24,3 +24,6 @@ caos = { path = "../../crates/caos" }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2.11.5", features = ["macos-private-api"] }
 tauri-plugin-opener = "2.5.4"
+
+[dev-dependencies]
+serde_json = "1"
