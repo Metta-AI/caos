@@ -1516,6 +1516,11 @@ pub fn put_commit(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String>
     let bytes = std::fs::read(src).map_err(|e| format!("{src}: {e}"))?;
     gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
         .map_err(|e| format!("{src} is not a valid commit: {e}"))?;
+    // A minted commit isn't stored via `send`, so assert here too: its message
+    // (or tree/parent bytes) must not carry an injected secret.
+    if !t.has_object(&hash_bytes("commit", &bytes)?.to_string())? {
+        refuse_if_leaks(&bytes, "a commit")?;
+    }
     let oid = post_object(t, "commit", &bytes)?;
     write_placeholder(&target, "commit", &oid.to_string())?;
     // The minted commit's hash — the caller's handle (e.g. the next parent).
