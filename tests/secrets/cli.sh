@@ -90,4 +90,23 @@ grep -qi "secret" leak.err || fail "leak error should mention a secret: $(cat le
 if grep -q "SEKRET-abc-123" leak.err; then fail "the error must NOT echo the secret value"; fi
 echo "  ok: leaking the secret value into output fails the run, without echoing it" >&2
 
+echo "== a secret printed to the log is masked ==" >&2
+cat > shout.sh <<'EOF'
+#!/bin/bash
+# Print the secret to stderr, then fail so the worker log surfaces to the
+# client. The value must be masked out of that log.
+echo "debug: token=SEKRET-abc-123 (oops)" >&2
+exit 1
+EOF
+commit "mask fixture"
+if "$CAOS_CLI" run /cas/std/bash shouted -- --worker1:@=shout.sh >/dev/null 2>shout.err; then
+  fail "the shouting worker should have failed"
+fi
+if grep -q "SEKRET-abc-123" shout.err; then
+  fail "the secret value must be masked out of the surfaced log: $(cat shout.err)"
+fi
+grep -q "redacted secret" shout.err \
+  || fail "expected the redaction marker in the log: $(cat shout.err)"
+echo "  ok: the printed secret is replaced by the redaction marker" >&2
+
 echo "secrets: ALL PASS" >&2
