@@ -105,7 +105,7 @@ done
 # runtime nix), else they're nix-built here. Nothing is staged into flake
 # trees anymore: runner's /worker bakes into its streamed image, cargo's
 # compiles in-flake from the vendored source.
-bin_names=(bash-tool llm-step rgrep deep-deps rustc)
+bin_names=(bash-tool llm-call llm-step rgrep deep-deps rustc)
 if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
   bin_paths=$CAOS_BUILTIN_BINS
 else

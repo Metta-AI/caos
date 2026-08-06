@@ -84,7 +84,7 @@ Publishing (`build-builtins.sh`, run by `caosd up`) has three entry forms:
 | streamed | `flake-builder` | nix-built, composed onto stock `nixos/nix` with `docker build`, pushed; the entry is a curry over the digest ref — no layer bytes in git |
 | literal flake tree | `bash`, `testenv` | the checked-in `std/<name>` directory, copied whole — `{flake.nix, flake.lock, worker}`, nothing generated |
 | staged flake tree | `runner`, `cargo` | the checked-in files + the nix-built `/worker` binary staged on top (`std/<name>/stage-tree.sh`) |
-| curry | `bash-tool`, `llm-step`, `rgrep`, `rustc` | `curry(runner, worker1=<binary>)` |
+| curry | `bash-tool`, `llm-call`, `llm-step`, `rgrep`, `rustc` | `curry(runner, worker1=<binary>)` |
 
 A flake can only read its own tree, and resolution cannot strip a tree
 (only the flake knows which files its build reads) — so each std tree
@@ -232,7 +232,7 @@ flake, a curry, or the result of calling another worker:
 - worker-common-only binaries are exactly `std/rustc`'s input shape (one
   `.rs` + worker-common): compiled in-caos, curried onto runner, memoized
   per source edit.
-- `llm-step` and `rgrep` carry crates.io deps (`serde_json`/`minreq`/
+- `llm-call`, `llm-step`, and `rgrep` carry crates.io deps (`serde_json`/`minreq`/
   `regex`), which rustc refuses — they need the cargo-backed path.
   Collapsing the cargo/rustc pair into one "build worker" is the remaining
   open design here.
@@ -245,7 +245,7 @@ at test start (memoized: one compile per source edit); `hello.rs` rides in
 `examples/consumer/` the same way. A test needing a fixture *image* can
 carry a flake and invoke the flake-builder. std holds only entries with
 real consumers: `flake-builder, runner, cargo, bash, testenv, rustc,
-bash-tool, llm-step, rgrep`.
+bash-tool, llm-call, llm-step, rgrep`.
 
 **caos does not build caos.** The core builds from the host, from a blank
 nix slate — for an immature project, reasoning about which features the
