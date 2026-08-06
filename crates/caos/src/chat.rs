@@ -28,8 +28,9 @@ use std::io::{IsTerminal, Read};
 use serde_json::Value;
 
 use super::{
-    curry_object, entry_name, fetch_blob_string, fetch_tree_entries, prepare_request,
-    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    curry_object, entry_name, fetch_blob_string, fetch_tree_entries, post_tree, prepare_request,
+    request_compute, resolve_cli_image, run_request, GitTransport, HttpTransport, Transport,
+    CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -301,6 +302,21 @@ pub struct WorkspaceDiff {
     pub base_commit: String,
     pub head: String,
     pub patch: String,
+}
+
+/// A conversation workspace prepared for a clean one-commit publication.
+/// `head` is the resolved conversation head; `tree` is its tree with harness
+/// state removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPublishWorkspace {
+    pub head: String,
+    pub tree: String,
+}
+
+#[derive(Clone, Copy)]
+struct HumanWorkspace<'a> {
+    tree: &'a str,
+    parent: Option<&'a str>,
 }
 
 /// Which verb is parsing: they share every flag, but the positional argument
@@ -1032,13 +1048,14 @@ pub fn run_chat_turn(
         return Err("empty message".to_string());
     }
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
+    let human_workspace = human_tree.map(|tree| HumanWorkspace { tree, parent: None });
     turn(
         t,
         options,
         name,
         &refname,
         message.trim(),
-        human_tree,
+        human_workspace,
         &mut emit,
     )
 }
@@ -1131,19 +1148,118 @@ fn parse_generated_title(text: &str) -> Result<String, String> {
     validate_conversation_title(&title).map(str::to_string)
 }
 
+/// Merge an exact commit into a conversation through the standard merge
+/// worker, run a normal agent turn over that result to resolve conflicts and
+/// test it, then return the clean tree clients may publish.
+///
+/// Unlike asking the model to call `merge`, this operation fixes both inputs
+/// before the agent turn starts. The merge result is retained as the human
+/// turn's second parent, while the first-parent conversation transcript stays
+/// unchanged.
+pub fn run_publish_merge_turn(
+    t: &GitTransport,
+    options: &TurnOptions,
+    name: &str,
+    publish_base: &str,
+    stacked: bool,
+    mut started: impl FnMut(&str),
+    mut emit: impl FnMut(TurnEvent),
+) -> Result<PreparedPublishWorkspace, String> {
+    let refname = validated_refname(name)?;
+    let ours = rev_parse_opt(t, &refname)?
+        .ok_or_else(|| format!("no conversation {name:?} ({refname} not found)"))?;
+    let target = publish_merge_target(t, &ours, publish_base, stacked)?;
+    let message = "The core publish operation has already merged the exact selected base into \
+                   this conversation with the standard merge worker; do not merge it again. \
+                   Resolve every conflict recorded in `.caos/conflicts`, then run the \
+                   repository's build and tests. Do not finish until the workspace is ready to \
+                   publish."
+        .to_string();
+    started(&message);
+
+    emit(TurnEvent::Status(format!(
+        "merging the selected publish base {}",
+        target.get(..7).unwrap_or(&target)
+    )));
+    let merge_image = resolve_cli_image(t, MERGE_IMAGE)?;
+    let (kind, merge_commit) = run_request(
+        t,
+        &merge_image,
+        None,
+        None,
+        &[
+            format!("--ours:commit={ours}"),
+            format!("--theirs:commit={target}"),
+        ],
+    )?;
+    if kind != "commit" {
+        return Err(format!(
+            "the merge worker returned a {kind}, expected a commit"
+        ));
+    }
+    t.fetch_object_negotiated(&merge_commit, &ours)?;
+    let merge_tree = t
+        .git_capture(&["rev-parse", &format!("{merge_commit}^{{tree}}")], None)?
+        .trim()
+        .to_string();
+
+    emit(TurnEvent::PhaseStarted(TurnPhase::System));
+    let outcome = turn(
+        t,
+        options,
+        name,
+        &refname,
+        &message,
+        Some(HumanWorkspace {
+            tree: &merge_tree,
+            parent: Some(&merge_commit),
+        }),
+        &mut emit,
+    )?;
+    prepare_publish_workspace(t, &outcome.commit)
+}
+
+/// A stacked PR's selected clean snapshot and its conversation start have
+/// deliberately different histories. Give that snapshot a deterministic
+/// temporary parent so the standard merge worker applies only this
+/// conversation's delta. Default-base publication uses the fetched commit
+/// unchanged.
+fn publish_merge_target(
+    t: &GitTransport,
+    conversation_head: &str,
+    publish_base: &str,
+    stacked: bool,
+) -> Result<String, String> {
+    if !stacked {
+        return Ok(publish_base.to_string());
+    }
+    let (_turns, conversation_base) = history_from_head(t, conversation_head)?;
+    let tree = t
+        .git_capture(&["rev-parse", &format!("{publish_base}^{{tree}}")], None)?
+        .trim()
+        .to_string();
+    let commit = format!(
+        "tree {tree}\nparent {conversation_base}\nauthor caos <caos@caos> 0 +0000\n\
+         committer caos <caos@caos> 0 +0000\n\ntemporary CAOS publish merge base\n"
+    );
+    t.put_object("commit", commit.as_bytes())
+        .map(|oid| oid.to_string())
+}
+
 /// One turn: mint the human commit, run llm-step over it, emit progress, and
 /// advance the conversation ref.
 ///
-/// `human_tree`, when set, is the tree the human commit carries instead of
-/// inheriting the parent's — this is how a client folds local working-tree
-/// edits into a user-authored turn (the TUI's `/update-tree`).
+/// `human_workspace`, when set, supplies the human commit's tree instead of
+/// inheriting its first parent's. Ordinary callers use it for `/update-tree`;
+/// the structured publish operation also retains the merge result as a second
+/// parent.
 fn turn(
     t: &GitTransport,
     options: &TurnOptions,
     name: &str,
     refname: &str,
     message: &str,
-    human_tree: Option<&str>,
+    human_workspace: Option<HumanWorkspace<'_>>,
     emit: &mut dyn FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     // Everything that can fail cheaply fails *before* the human commit is
@@ -1202,10 +1318,18 @@ fn turn(
     // author = the user's git identity. The tree is the parent's (human turns
     // are text-only) unless the client supplied one — a working-tree snapshot
     // folded in by `/update-tree`, which must not carry the harness's reserved
-    // top-level `.caos` entry.
+    // top-level `.caos` entry. The structured publish operation is the one
+    // exception: its tree comes directly from the merge worker, whose
+    // `.caos/conflicts` file is how the agent discovers structural conflicts.
+    let (human_tree, human_workspace_parent) = match human_workspace {
+        Some(workspace) => (Some(workspace.tree), workspace.parent),
+        None => (None, None),
+    };
     let tree = match human_tree {
         Some(tree) => {
-            if rev_parse_opt(t, &format!("{tree}:.caos"))?.is_some() {
+            if human_workspace_parent.is_none()
+                && rev_parse_opt(t, &format!("{tree}:.caos"))?.is_some()
+            {
                 return Err(
                     "the working tree contains a top-level `.caos` entry, which is reserved \
                      for the agent harness; remove it before folding the tree into a turn"
@@ -1219,10 +1343,24 @@ fn turn(
             .trim()
             .to_string(),
     };
-    let human = t
-        .git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
-        .trim()
-        .to_string();
+    let human = match human_workspace_parent {
+        Some(workspace_parent) => t.git_capture(
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-p",
+                workspace_parent,
+                "-m",
+                message,
+            ],
+            None,
+        )?,
+        None => t.git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?,
+    }
+    .trim()
+    .to_string();
 
     // The workers: by default the std-published curries (`curry(runner, bin)`,
     // build-builtins.sh) — already server-side under refs/caos/std, nothing to
@@ -1425,6 +1563,79 @@ fn turn(
     };
     emit(TurnEvent::Completed(outcome.clone()));
     Ok(outcome)
+}
+
+/// Validate the agent's resolved merge and remove harness-only workspace
+/// state at the core publish boundary. Clients receive an ordinary Git tree;
+/// they never need to know how `.caos` represents merge conflicts.
+fn prepare_publish_workspace(
+    t: &GitTransport,
+    head: &str,
+) -> Result<PreparedPublishWorkspace, String> {
+    if let Some(conflicts_blob) = rev_parse_opt(t, &format!("{head}:.caos/conflicts"))? {
+        let conflicts = fetch_blob_string(t, &conflicts_blob)?;
+        if !conflicts.trim().is_empty() {
+            return Err(format!(
+                "the conversation still has unresolved merge entries; resolve them before publishing:\n{}",
+                conflicts.trim_end()
+            ));
+        }
+    }
+
+    let tree = t
+        .git_capture(&["rev-parse", &format!("{head}^{{tree}}")], None)?
+        .trim()
+        .to_string();
+    let mut entries = fetch_tree_entries(t, &tree)?
+        .ok_or_else(|| format!("conversation workspace object {tree} is not a tree"))?;
+    let original_len = entries.len();
+    entries.retain(|entry| entry_name(entry) != b".caos");
+    let tree = if entries.len() == original_len {
+        tree
+    } else {
+        post_tree(t, entries)?.to_string()
+    };
+
+    // `.caos/conflicts` is authoritative for structural conflicts, but catch
+    // accidentally retained textual markers in the publishable tree too.
+    // Scan only after removing `.caos`, since transcripts may legitimately
+    // quote marker syntax and are never part of the published workspace.
+    let output = std::process::Command::new("git")
+        .args([
+            "grep",
+            "-I",
+            "-n",
+            "-e",
+            "^<<<<<<< ",
+            "-e",
+            "^=======$",
+            "-e",
+            "^>>>>>>> ",
+            &tree,
+            "--",
+        ])
+        .current_dir(t.work_dir())
+        .output()
+        .map_err(|error| format!("running git grep: {error}"))?;
+    if output.status.success() {
+        return Err(format!(
+            "the conversation still contains merge conflict markers; resolve them before publishing:\n{}",
+            String::from_utf8_lossy(&output.stdout).trim_end()
+        ));
+    }
+    if output.status.code() != Some(1) {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("git grep exited with {}", output.status)
+        } else {
+            detail
+        });
+    }
+
+    Ok(PreparedPublishWorkspace {
+        head: head.to_string(),
+        tree,
+    })
 }
 
 /// An explicit worker-binary override: the flag, else its env var, else `None`
@@ -1807,6 +2018,12 @@ mod tests {
         (root, repo)
     }
 
+    fn commit_all(repo: &Path, message: &str) -> String {
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "--quiet", "-m", message]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
     #[test]
     fn conversation_ref_validation_does_not_spawn_git() {
         assert_eq!(
@@ -1839,6 +2056,130 @@ mod tests {
             messages[0]["content"],
             "Generate the title for this conversation:\n<conversation_message>\nBuild\n the sidebar title flow\n</conversation_message>"
         );
+    }
+
+    #[test]
+    fn publish_workspace_removes_harness_state_in_core() {
+        let (root, repo) = conversation_repo();
+        std::fs::create_dir(repo.join(".caos")).unwrap();
+        std::fs::write(repo.join(".caos/conflicts"), "").unwrap();
+        std::fs::write(
+            repo.join(".caos/transcript"),
+            "<<<<<<< quoted by the harness\n=======\n>>>>>>> not workspace content\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("publish.txt"), "ready\n").unwrap();
+        let head = commit_all(&repo, "resolved workspace");
+        let transport = GitTransport::discover(&repo).unwrap();
+
+        let prepared = prepare_publish_workspace(&transport, &head).unwrap();
+
+        assert_eq!(prepared.head, head);
+        assert_eq!(
+            git(&repo, &["show", &format!("{}:publish.txt", prepared.tree)]),
+            "ready"
+        );
+        let missing = std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{}:.caos", prepared.tree)])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(!missing.status.success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stacked_publish_target_replays_from_the_conversation_start() {
+        let (root, repo) = conversation_repo();
+        let conversation_base = git(&repo, &["rev-parse", "HEAD"]);
+        let conversation_tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let human = git(
+            &repo,
+            &[
+                "commit-tree",
+                &conversation_tree,
+                "-p",
+                &conversation_base,
+                "-m",
+                "human turn",
+            ],
+        );
+        let agent = git(
+            &repo,
+            &[
+                "-c",
+                "user.name=caos-agent",
+                "-c",
+                "user.email=agent@example.com",
+                "commit-tree",
+                &conversation_tree,
+                "-p",
+                &human,
+                "-m",
+                "agent turn",
+            ],
+        );
+        std::fs::write(repo.join("upstream"), "selected base\n").unwrap();
+        let publish_base = commit_all(&repo, "selected publish base");
+        let publish_tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let transport = GitTransport::discover(&repo).unwrap();
+
+        let target = publish_merge_target(&transport, &agent, &publish_base, true).unwrap();
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{target}^")]),
+            conversation_base
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{target}^{{tree}}")]),
+            publish_tree
+        );
+        assert_eq!(
+            publish_merge_target(&transport, &agent, &publish_base, true).unwrap(),
+            target
+        );
+        assert_eq!(
+            publish_merge_target(&transport, &agent, &publish_base, false).unwrap(),
+            publish_base
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_workspace_refuses_unresolved_structural_conflicts() {
+        let (root, repo) = conversation_repo();
+        std::fs::create_dir(repo.join(".caos")).unwrap();
+        std::fs::write(
+            repo.join(".caos/conflicts"),
+            "100644 aaaaaaa 2\tfile\n100644 bbbbbbb 3\tfile\n",
+        )
+        .unwrap();
+        let head = commit_all(&repo, "unresolved workspace");
+        let transport = GitTransport::discover(&repo).unwrap();
+
+        let error = prepare_publish_workspace(&transport, &head).unwrap_err();
+
+        assert!(error.contains("unresolved merge entries"));
+        assert!(error.contains("file"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_workspace_refuses_text_conflict_markers() {
+        let (root, repo) = conversation_repo();
+        std::fs::write(
+            repo.join("file"),
+            "<<<<<<< ours\nconversation\n=======\nmain\n>>>>>>> theirs\n",
+        )
+        .unwrap();
+        let head = commit_all(&repo, "markers remain");
+        let transport = GitTransport::discover(&repo).unwrap();
+
+        let error = prepare_publish_workspace(&transport, &head).unwrap_err();
+
+        assert!(error.contains("still contains merge conflict markers"));
+        assert!(error.contains("file"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

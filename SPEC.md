@@ -385,6 +385,12 @@ is choosing between. (Tree-oid listing is a cheap optional companion.)
 - The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
   remaining marker is PUBLISH (the tui's PR flow) — the moment work actually
   leaves the conversation.
+- The tui's PR flow fetches the selected base tip and asks the core chat engine
+  to invoke the standard `merge` worker directly with that exact commit. A
+  normal visible agent turn then starts from the worker's result to resolve and
+  test it; the model is not responsible for initiating the merge. The core
+  publish boundary applies the conflict guard above and strips `.caos` before
+  returning the tree the tui snapshots for the PR.
 
 ## Caveat
 
