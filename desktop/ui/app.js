@@ -3,6 +3,7 @@ const { renderMarkdown } = window.CaosMarkdown;
 const { filePatchesFromPatch } = window.CaosChanges;
 const {
   activityGroupComplete,
+  activityGroupExpandable,
   activityGroupSummary,
   mergeReplayedHistory,
   scrollPositionIsNearBottom,
@@ -530,7 +531,7 @@ function activityGroupElement(entry) {
   if (entry.running) section.classList.add('is-running');
 
   const hasCalls = entry.calls.length > 0;
-  const expandable = entry.calls.length > 1;
+  const expandable = activityGroupExpandable(entry);
   const toggle = document.createElement(expandable ? 'button' : 'div');
   toggle.className = 'inline-activity-toggle';
   let chevron = null;
