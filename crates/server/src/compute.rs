@@ -766,6 +766,7 @@ fn run_image(
             arg_tree: &arg_tree,
             stack,
             trace_id,
+            secrets,
         },
     )
 }
