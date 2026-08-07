@@ -67,3 +67,19 @@ pub fn secret_hash_material(pairs: &[(&str, &str)]) -> Vec<u8> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_hash_material_is_order_independent_and_deduped() {
+        let a = secret_hash_material(&[("gh", "E1"), ("npm", "E2")]);
+        let b = secret_hash_material(&[("npm", "E2"), ("gh", "E1"), ("gh", "E1")]);
+        assert_eq!(a, b, "sorted + de-duplicated, so caller order can't matter");
+        // Rotating an entropy changes the material (hence the cache namespace).
+        assert_ne!(a, secret_hash_material(&[("gh", "E9"), ("npm", "E2")]));
+        // The name is part of it (same secret at a different mount is distinct).
+        assert_ne!(a, secret_hash_material(&[("GH", "E1"), ("npm", "E2")]));
+    }
+}
