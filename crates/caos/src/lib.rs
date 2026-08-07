@@ -2298,11 +2298,12 @@ fn prepare_request(
     image: &str,
     cas: Option<&Path>,
     kvs: &[String],
+    store: &[ClientSecret],
 ) -> Result<String, String> {
     // Build the call's args (paths resolve per `cas`), then hand them to the
-    // shared assembler, which folds in the image, salt and std.
+    // shared assembler, which folds in the image, salt, std and secret-hash.
     let call = build_arg_entries(t, cas, kvs)?;
-    assemble_arg_tree(t, image, call)
+    assemble_arg_tree(t, image, call, store)
 }
 
 /// Assemble a runnable ArgTree from a base `image` ref and the caller's already
