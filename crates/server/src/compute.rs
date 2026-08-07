@@ -1022,13 +1022,14 @@ fn resolve_flake_image(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<String, HttpError> {
     let builder = std_image(config, std, "flake-builder")?;
     let oid = gix::ObjectId::from_hex(flake_tree.as_bytes())
         .map_err(|e| HttpError::new(400, format!("invalid flake tree hash {flake_tree}: {e}")))?;
     let in_entry = named_entry("in", gix::objs::tree::EntryKind::Tree.into(), oid);
     // "<type> <hash>": the git-docker delta tree the outer worker produced.
-    let result = run_image(config, &builder, vec![in_entry], std, salt, stack, trace_id)?;
+    let result = run_image(config, &builder, vec![in_entry], std, salt, stack, trace_id, secrets)?;
     let delta_tree = result.split_once(' ').map(|(_, h)| h).unwrap_or(&result);
     convert_git_image(config, delta_tree).map_err(|e| {
         HttpError::new(
