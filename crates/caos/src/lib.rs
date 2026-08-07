@@ -3158,6 +3158,7 @@ fn request_compute_streamed(
     arg_tree: &str,
     trace_id: &str,
     output: &mut (dyn Write + Send),
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
     let mut response = minreq::get(&stream_url)
