@@ -305,6 +305,7 @@ fn run_dispatch(
         arg_tree,
         stack,
         trace_id,
+        secrets,
     } = *request;
     let fail = |e: HttpError| (e.status(), e.message().to_string());
 
@@ -320,19 +321,19 @@ fn run_dispatch(
     // server thread until a runner posts the result; capacity is runner-side
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
-        let image_ref =
-            resolve_image(config, image, std, salt, &child_stack, trace_id).map_err(fail)?;
+        let image_ref = resolve_image(config, image, std, salt, &child_stack, trace_id, secrets)
+            .map_err(fail)?;
         // Reuse the ArgTree's entries the tracer already read, else read them now.
         let arg_entries = match traced_arg_entries {
             Some(entries) => entries,
             None => args_entries(config, arg_tree).map_err(fail)?,
         };
         // Find the secrets this job's identity is entitled to (design/secrets.md):
-        // readers whose partial arg tree is a subset of ours. They ride out of
-        // band in the job payload — never in the ArgTree, so never in the cache
-        // key — and the container runner drops them at `/secret/<name>`.
-        let secrets = crate::secrets::for_job(config, std, &arg_entries);
-        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, secrets).map_err(fail)?
+        // carried readers whose partial arg tree is a subset of ours. They ride
+        // out of band in the job payload — never in the ArgTree, so never in the
+        // cache key — and the container runner drops them at `/secret/<name>`.
+        let granted = crate::secrets::grant(secrets, &arg_entries);
+        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, granted).map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
