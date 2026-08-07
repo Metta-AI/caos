@@ -1,25 +1,28 @@
-const tauri = window.__TAURI__?.core;
-const { renderMarkdown } = window.CaosMarkdown;
-const {
-  filePatchesFromPatch,
-  lineCountsFromPatch,
-  syntaxTokens,
-  unchangedLinesBefore
-} = window.CaosChanges;
-const {
-  modelChoices,
-  modelLabel,
-  parseComposerCommand,
-  slashCommandMatches
-} = window.CaosCommands;
-const {
+import {
   activityGroupComplete,
   activityGroupExpandable,
   activityGroupSummary,
   mergeReplayedHistory,
   scrollPositionIsNearBottom,
   toolDescription
-} = window.CaosActivity;
+} from './activity.js';
+import { copyText } from './clipboard.js';
+import {
+  modelChoices,
+  modelLabel,
+  parseComposerCommand,
+  slashCommandMatches
+} from './commands.js';
+import {
+  filePatchesFromPatch,
+  highlightedHunkLines,
+  lineCounts,
+  unchangedLinesBefore
+} from './changes.js';
+import { appendTokens, initializeHighlighting } from './highlight.js';
+import { renderMarkdown } from './markdown.js';
+
+const tauri = window.__TAURI__?.core;
 const DEFAULT_SIDEBAR_WIDTH = 226;
 const MIN_SIDEBAR_WIDTH = 180;
 const MAX_SIDEBAR_WIDTH = 420;
@@ -548,29 +551,9 @@ function iconElement(children) {
   return svg;
 }
 
-function fallbackCopyMessage(message) {
-  const fallback = document.createElement('textarea');
-  fallback.value = message;
-  fallback.style.position = 'fixed';
-  fallback.style.opacity = '0';
-  document.body.append(fallback);
-  fallback.select();
-  const copied = document.execCommand('copy');
-  fallback.remove();
-  if (!copied) throw new Error('copy command was rejected');
-}
-
 async function copyMessage(message, button) {
   try {
-    if (navigator.clipboard?.writeText) {
-      try {
-        await navigator.clipboard.writeText(message);
-      } catch (_) {
-        fallbackCopyMessage(message);
-      }
-    } else {
-      fallbackCopyMessage(message);
-    }
+    await copyText(message);
     button.setAttribute('aria-label', 'Copied message');
     button.title = 'Copied';
     window.setTimeout(() => {
@@ -1314,16 +1297,7 @@ function renderDiffFileHeader(file) {
   elements.diffFileHeader.append(identity, details);
 }
 
-function appendHighlightedCode(container, text, path) {
-  for (const token of syntaxTokens(text, path)) {
-    const span = document.createElement('span');
-    span.className = `syntax-${token.kind}`;
-    span.textContent = token.text;
-    container.append(span);
-  }
-}
-
-function diffLineElement(line, path) {
+function diffLineElement(line) {
   const row = document.createElement('div');
   row.className = `diff-row is-${line.kind}`;
   const oldNumber = document.createElement('span');
@@ -1340,7 +1314,7 @@ function diffLineElement(line, path) {
   if (line.kind === 'notice') {
     code.textContent = line.text;
   } else {
-    appendHighlightedCode(code, line.text, path);
+    appendTokens(code, line.tokens);
   }
   row.append(oldNumber, newNumber, marker, code);
   return row;
@@ -1366,9 +1340,7 @@ function renderPatch(file) {
   if (file.hunks.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'panel-empty';
-    empty.textContent = file.patch.includes('Binary files') || file.patch.includes('GIT binary patch')
-      ? 'Binary file changed.'
-      : 'File metadata changed.';
+    empty.textContent = 'File metadata or binary contents changed.';
     elements.diff.append(empty);
     return;
   }
@@ -1378,7 +1350,9 @@ function renderPatch(file) {
     if (hiddenLines > 0) {
       elements.diff.append(collapsedDiffRegion(hiddenLines));
     }
-    for (const line of hunk.lines) elements.diff.append(diffLineElement(line, file.path));
+    for (const line of highlightedHunkLines(hunk, file.path)) {
+      elements.diff.append(diffLineElement(line));
+    }
     previousHunk = hunk;
   }
   elements.diff.scrollTop = 0;
@@ -1458,7 +1432,7 @@ function renderDiff(value) {
   elements.diff.replaceChildren();
   renderDiffFileHeader(null);
   const files = filePatchesFromPatch(patch);
-  renderChangeCount(lineCountsFromPatch(patch));
+  renderChangeCount(lineCounts(files));
   if (!hasChanges || files.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'panel-empty';
@@ -1721,7 +1695,10 @@ async function initialize() {
     return;
   }
   try {
-    const payload = await tauri.invoke('bootstrap');
+    const [payload] = await Promise.all([
+      tauri.invoke('bootstrap'),
+      initializeHighlighting()
+    ]);
     state.repo = payload;
     state.initialModel = payload.initialModel || '';
     state.modelChoices = modelChoices(state.initialModel);

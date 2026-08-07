@@ -1,10 +1,10 @@
-const assert = require('node:assert/strict');
-const {
+import assert from 'node:assert/strict';
+import {
   modelChoices,
   modelLabel,
   parseComposerCommand,
   slashCommandMatches
-} = require('../ui/commands.js');
+} from '../ui/commands.js';
 
 assert.deepEqual(parseComposerCommand('/from abc123'), { kind: 'from', argument: 'abc123' });
 assert.deepEqual(parseComposerCommand('/title A useful title'), { kind: 'rename', argument: 'A useful title' });

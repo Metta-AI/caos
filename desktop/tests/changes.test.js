@@ -1,11 +1,12 @@
-const assert = require('node:assert/strict');
-const {
+import assert from 'node:assert/strict';
+import {
   filePatchesFromPatch,
   filePresentation,
-  lineCountsFromPatch,
-  syntaxTokens,
+  highlightedHunkLines,
+  lineCounts,
   unchangedLinesBefore
-} = require('../ui/changes.js');
+} from '../ui/changes.js';
+import { initializeHighlighting } from '../ui/highlight.js';
 
 const patch = [
   'diff --git a/desktop/ui/app.js b/desktop/ui/app.js',
@@ -33,9 +34,6 @@ const patch = [
 
 const files = filePatchesFromPatch(patch);
 assert.deepEqual(files.map((file) => file.path), ['desktop/ui/app.js', 'desktop/ui/new.css']);
-assert.match(files[0].patch, /\+const next/u);
-assert.doesNotMatch(files[0].patch, /color: green/u);
-assert.match(files[1].patch, /color: green/u);
 assert.deepEqual(files[0].stats, { additions: 3, deletions: 2 });
 assert.equal(files[0].status, 'modified');
 assert.equal(files[1].status, 'added');
@@ -55,15 +53,16 @@ assert.deepEqual(filePresentation('desktop/ui/app.js'), {
 });
 assert.equal(filePresentation('flake.lock').badge, 'LOCK');
 
-const tokens = syntaxTokens('const title = "Changes"; // label', 'desktop/ui/app.js');
-assert.equal(tokens.map((token) => token.text).join(''), 'const title = "Changes"; // label');
-assert.deepEqual(
-  tokens.filter((token) => token.kind !== 'plain').map((token) => token.kind),
-  ['keyword', 'string', 'comment']
+await initializeHighlighting();
+const highlighted = highlightedHunkLines(firstHunk, 'desktop/ui/app.js');
+assert.equal(
+  highlighted.map((line) => line.tokens.map((token) => token.content).join('')).join('\n'),
+  firstHunk.lines.map((line) => line.text).join('\n')
 );
+assert.ok(highlighted.flatMap((line) => line.tokens).some((token) => token.color));
 
 assert.deepEqual(filePatchesFromPatch(''), []);
-assert.deepEqual(lineCountsFromPatch(patch), { additions: 4, deletions: 2 });
-assert.deepEqual(lineCountsFromPatch(''), { additions: 0, deletions: 0 });
+assert.deepEqual(lineCounts(files), { additions: 4, deletions: 2 });
+assert.deepEqual(lineCounts([]), { additions: 0, deletions: 0 });
 
 console.log('change viewer tests passed');

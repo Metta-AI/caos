@@ -1,5 +1,5 @@
-const assert = require('node:assert/strict');
-const {
+import assert from 'node:assert/strict';
+import {
   activityGroupComplete,
   activityGroupExpandable,
   activityGroupSummary,
@@ -7,7 +7,7 @@ const {
   replayedTurnEntries,
   scrollPositionIsNearBottom,
   toolDescription
-} = require('../ui/activity.js');
+} from '../ui/activity.js';
 
 const calls = [
   { name: 'bash', summary: '$ cargo test' },

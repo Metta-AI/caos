@@ -8,9 +8,16 @@ repository you want CAOS to operate on; the repository must have a `caos`
 remote and the ordinary CAOS environment (including `ANTHROPIC_API_KEY`).
 
 ```bash
-cargo run --manifest-path desktop/src-tauri/Cargo.toml
-cargo run --manifest-path desktop/src-tauri/Cargo.toml -- --model claude-opus-4-8
+nix develop
+npm ci --prefix desktop
+npm run --prefix desktop dev
+npm run --prefix desktop dev -- --model claude-opus-4-8
 ```
+
+The frontend build bundles the maintained Markdown, syntax-highlighting, and
+diff-parsing libraries into the static assets embedded by Tauri. Nix performs
+that build automatically; `npm run --prefix desktop dev` rebuilds it before a
+local Cargo launch. The development shell supplies Node.js and the bundler.
 
 The reproducible Nix build is a separate flake output so it stays out of the
 core workspace and worker images:

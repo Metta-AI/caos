@@ -1777,11 +1777,6 @@ body.is-resizing-inspector .inspector-resizer::after { background: var(--accent)
 
 .diff-collapse svg { height: 15px; justify-self: center; width: 15px; }
 
-.syntax-keyword { color: #c678dd; }
-.syntax-string { color: #78c878; }
-.syntax-number { color: #e6a86e; }
-.syntax-comment { color: #72736f; font-style: italic; }
-
 .panel-empty {
   color: var(--muted);
   display: grid;

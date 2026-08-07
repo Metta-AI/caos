@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.caos.desktop",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../dist"
   },
   "app": {
     "macOSPrivateApi": true,
