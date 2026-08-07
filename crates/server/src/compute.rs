@@ -779,6 +779,29 @@ fn run_image(
         );
         args = merge_entries(args, vec![std_entry]);
     }
+    // Cache-isolation tag (design/secrets.md): fold in `secret-hash` when this
+    // sub-run is granted a secret — matched against the base entries, so two
+    // callers with different secrets don't collide in the cache. Matched before
+    // the entry is added (readers never pin it, so there's no self-reference),
+    // and byte-identical to what the client folds into an equivalent top-level
+    // ArgTree, so a computation shares one cache entry however it's reached.
+    let base: std::collections::BTreeMap<String, String> = args
+        .iter()
+        .map(|e| {
+            (
+                String::from_utf8_lossy(&e.filename.to_vec()).into_owned(),
+                e.oid.to_string(),
+            )
+        })
+        .collect();
+    if let Some(hash) = crate::secrets::secret_hash(secrets, &base) {
+        let entry = named_entry(
+            caos_world::SECRET_HASH_ARG,
+            EntryKind::Blob.into(),
+            store_git_blob(config, hash.as_bytes()).map_err(store_err)?,
+        );
+        args = merge_entries(args, vec![entry]);
+    }
     // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
     let arg_tree = store_git_tree(config, args).map_err(store_err)?.to_string();
     run_work_request(
