@@ -626,7 +626,14 @@ fn resolve_promise(
                             scope.spawn(move || {
                                 let arg = named_entry("in", kid.mode, kid.oid);
                                 let result = run_image(
-                                    config, img, vec![arg], std, salt, stack, trace_id, secrets,
+                                    config,
+                                    img,
+                                    vec![arg],
+                                    std,
+                                    salt,
+                                    stack,
+                                    trace_id,
+                                    secrets,
                                 )?;
                                 result_entry(&kid.name, &result)
                             })
