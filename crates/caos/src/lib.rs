@@ -3258,7 +3258,10 @@ fn resolve_reader_client(
 /// pinned tree (via eval-path — so a flake/`.caos-expr` tool resolves to the
 /// same oid the run uses).
 fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<String, String> {
-    if let Some(name) = expr.strip_prefix("/std/").or_else(|| expr.strip_prefix("std/")) {
+    if let Some(name) = expr
+        .strip_prefix("/std/")
+        .or_else(|| expr.strip_prefix("std/"))
+    {
         return resolve_std_image(t, name);
     }
     if is_hex_hash(expr) {
