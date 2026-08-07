@@ -2372,7 +2372,7 @@ fn assemble_arg_tree(
         .iter()
         .map(|e| {
             (
-                String::from_utf8_lossy(&e.filename.to_vec()).into_owned(),
+                String::from_utf8_lossy(e.filename.as_ref()).into_owned(),
                 e.oid.to_string(),
             )
         })
