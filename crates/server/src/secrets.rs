@@ -394,9 +394,13 @@ fn lookup_in_tree(
     tree: &str,
     rel: &str,
 ) -> Result<Option<(EntryMode, ObjectId)>, String> {
-    let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+    let comps: Vec<&str> = rel
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
     if comps.is_empty() {
-        let oid = ObjectId::from_hex(tree.as_bytes()).map_err(|e| format!("bad tree {tree}: {e}"))?;
+        let oid =
+            ObjectId::from_hex(tree.as_bytes()).map_err(|e| format!("bad tree {tree}: {e}"))?;
         return Ok(Some((gix::objs::tree::EntryKind::Tree.into(), oid)));
     }
     let mut current = tree.to_string();
