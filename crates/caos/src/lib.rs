@@ -2361,6 +2361,30 @@ fn assemble_arg_tree(
         arg_entries = merge_entries(arg_entries, vec![std_arg_entry(t, &std)?]);
     }
 
+    // Cache-isolation tag (design/secrets.md): fold in `secret-hash` when this
+    // run is granted a secret — matched against the entries built so far, so two
+    // callers with different secrets don't share a cache entry, while a
+    // secret-free run stays globally shared. Byte-identical to what the server
+    // folds into an equivalent sub-run ArgTree.
+    let base: std::collections::BTreeMap<String, String> = arg_entries
+        .iter()
+        .map(|e| {
+            (
+                String::from_utf8_lossy(&e.filename.to_vec()).into_owned(),
+                e.oid.to_string(),
+            )
+        })
+        .collect();
+    if let Some(hash) = client_secret_hash(store, &base)? {
+        let oid = post_object(t, "blob", hash.as_bytes())?;
+        let entry = gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
+            oid,
+        };
+        arg_entries = merge_entries(arg_entries, vec![entry]);
+    }
+
     // The request object IS the args tree — the ArgTree — so its hash *is* the
     // request id and the server's cache key, with nothing keyed alongside it
     // (image, salt and std are all entries within). Get it onto the server — a
