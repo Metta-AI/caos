@@ -90,11 +90,6 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
 /// object's `(kind, oid)`. `node` is the object at the prefix walked so far: a
 /// `.caos-expr` at the root of a tree node replaces the node with its result
 /// before the next segment is resolved within it.
-/// Walk `start_tree` from its root down to `path`, evaluating every `.caos-expr`
-/// encountered (each in the tree its parent produced) and returning the final
-/// object's `(kind, oid)`. `node` is the object at the prefix walked so far: a
-/// `.caos-expr` at the root of a tree node replaces the node with its result
-/// before the next segment is resolved within it.
 pub(crate) fn eval_path(
     t: &dyn Transport,
     start_tree: &str,
