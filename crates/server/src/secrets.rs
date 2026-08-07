@@ -32,13 +32,23 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use crate::storage::store_git_blob;
+use gix::objs::tree::EntryMode;
+use gix::ObjectId;
+
+use crate::storage::{fetch_blob, fetch_tree, store_git_blob};
 use crate::Config;
 
 /// Env var naming the git-ignored secrets directory. Unset/empty/missing ⇒ no
 /// secrets are ever injected.
 const SECRETS_DIR_ENV: &str = "CAOS_SECRETS_DIR";
+
+/// Env var (or the `.tree` file in the secrets dir, which wins) naming **the
+/// current tree** tree-relative readers resolve against: a tree/commit hash or
+/// a git ref. Unset ⇒ only `std/<name>` readers resolve (design/secrets.md:
+/// "eval the grant against the same tree revision the work runs from").
+const SECRETS_TREE_ENV: &str = "CAOS_SECRETS_TREE";
 
 /// A parsed secret file: the secret's value and its readers (raw reader
 /// expressions, resolved per job against that job's `std`).
