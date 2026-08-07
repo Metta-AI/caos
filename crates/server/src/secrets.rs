@@ -91,7 +91,10 @@ pub(crate) fn grant(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for grant in grants {
-        let visible = grant.readers.iter().any(|reader| is_subset(reader, arg_entries));
+        let visible = grant
+            .readers
+            .iter()
+            .any(|reader| is_subset(reader, arg_entries));
         if visible && seen.insert(grant.name.clone()) {
             eprintln!("secret {}: granted to this job", grant.name);
             out.push((grant.name.clone(), grant.value.clone()));
