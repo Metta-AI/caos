@@ -176,6 +176,10 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
+/// Header carrying the ephemeral secrets store on `GET /run` (design/secrets.md),
+/// out of band from the content-addressed ArgTree. Must match the server's.
+const SECRETS_HEADER: &str = "X-Caos-Secrets";
+
 /// The built-in tree hash (`std`) in effect for this run. The server sets it on
 /// each worker it spawns (materialized at `/cas/std`) and threads it into every
 /// promise sub-run, so it rides down the whole tree. At the top it's unset, and
