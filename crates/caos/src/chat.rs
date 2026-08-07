@@ -1118,7 +1118,7 @@ pub fn generate_conversation_title(
         call.push(format!("--model={model}"));
     }
     let arg_tree = prepare_request(t, &llm, None, &call)?;
-    let (kind, hash) = request_compute(&t.server_url()?, &arg_tree)?;
+    let (kind, hash) = request_compute(&t.server_url()?, &arg_tree, "")?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"
