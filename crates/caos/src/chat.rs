@@ -1377,7 +1377,7 @@ fn turn(
     let server = t.server_url()?;
     let run = {
         let (server, arg_tree) = (server.clone(), arg_tree);
-        std::thread::spawn(move || request_compute(&server, &arg_tree))
+        std::thread::spawn(move || request_compute(&server, &arg_tree, ""))
     };
 
     // While the run blocks, follow the worker's per-step progress ref and
