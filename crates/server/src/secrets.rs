@@ -425,10 +425,19 @@ fn current_tree(config: &Config, dir: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var(SECRETS_TREE_ENV).ok().filter(|s| !s.is_empty()))?;
+        .or_else(|| {
+            std::env::var(SECRETS_TREE_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+        })?;
     // `<spec>^{tree}` resolves a ref, a commit, or a tree uniformly to its tree.
     let out = Command::new("git")
-        .args(["-C", &config.git_dir, "rev-parse", &format!("{spec}^{{tree}}")])
+        .args([
+            "-C",
+            &config.git_dir,
+            "rev-parse",
+            &format!("{spec}^{{tree}}"),
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
