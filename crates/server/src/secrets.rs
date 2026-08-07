@@ -138,7 +138,7 @@ pub(crate) fn secret_hash(
         return None;
     }
     let material = caos_world::secret_hash_material(&pairs);
-    let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::object::Kind::Blob, &material)
+    let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &material)
         .expect("hashing secret material");
     Some(oid.to_string())
 }
