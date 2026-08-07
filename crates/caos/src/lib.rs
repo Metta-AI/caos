@@ -2274,16 +2274,19 @@ fn run_request(
     cas: Option<&Path>,
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
-    secrets: &str,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
-    let arg_tree = prepare_request(t, image, cas, kvs)?;
+    let arg_tree = prepare_request(t, image, cas, kvs, store)?;
+    let header = secret_store_header(store);
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
     // at it).
     let server = t.server_url()?;
     match trace {
-        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, secrets),
-        None => request_compute(&server, &arg_tree, secrets),
+        Some((id, output)) => {
+            request_compute_streamed(&server, &arg_tree, id, output, &header)
+        }
+        None => request_compute(&server, &arg_tree, &header),
     }
 }
 
