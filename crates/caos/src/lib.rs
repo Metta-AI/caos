@@ -3185,7 +3185,8 @@ fn parse_local_secret(
     file_name: &str,
     path: &Path,
 ) -> Result<(String, String, Vec<String>), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("reading secret {file_name}: {e}"))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading secret {file_name}: {e}"))?;
     let mut name = file_name.to_string();
     let mut value: Option<String> = None;
     let mut readers = Vec::new();
