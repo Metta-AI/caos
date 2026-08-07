@@ -988,7 +988,7 @@ fn resolve_image(
     if is_flake_tree(config, image)
         .map_err(|e| HttpError::new(500, format!("probing flake image {image}: {e}")))?
     {
-        return resolve_flake_image(config, image, std, salt, stack, trace_id);
+        return resolve_flake_image(config, image, std, salt, stack, trace_id, secrets);
     }
     convert_git_image(config, image)
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
