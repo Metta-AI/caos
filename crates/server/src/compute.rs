@@ -91,6 +91,10 @@ struct WorkRequest<'a> {
     stack: &'a [String],
     /// Trace id for observability, if this run is being traced.
     trace_id: Option<&'a str>,
+    /// The secrets the run carries as ephemeral context (design/secrets.md):
+    /// matched + injected at every dispatch, threaded into promise sub-runs.
+    /// NOT part of the ArgTree or the cache key.
+    secrets: &'a [crate::secrets::Grant],
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
