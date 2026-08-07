@@ -144,9 +144,13 @@ Details:
 
 **Host agent** (`caos-runnerd` — the one new daemon; config via env: server
 URL, token, `CAOS_RUNNER_SLOTS`, docker bin/network). N independent loops:
-poll `{}` → `docker run --rm … --entrypoint /bin/caos <image_ref> runner
---job=<json>` → wait for container exit → post error on nonzero exit. Always
-polls again; generic runners never idle out.
+poll `{}` → `docker run --name caos-worker-<nonce> … --entrypoint /bin/caos
+<image_ref> runner --job=<json>` → wait for container exit → `docker rm -f` it →
+post error on nonzero exit. Always polls again; generic runners never idle out.
+Not `--rm`: an attached `--rm` run waits on `condition=removed`, which podman
+services by spinning a core until the container is actually gone (and it
+sometimes never is). Containers carry a `caos.runnerd.owner` label so a
+restarted runnerd reaps whatever a crash leaked.
 
 **Container runner** (`caos runner`, successor to `serve`). Where `serve`
 shells out to `caos entrypoint` per job (three processes: serve → entrypoint →

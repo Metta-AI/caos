@@ -2780,12 +2780,14 @@ fn resolve_std_image(t: &dyn Transport, name: &str) -> Result<String, String> {
         ));
     }
     let std = std_tree()?;
-    let entries = fetch_tree_entries(t, &std)?.ok_or_else(|| format!("std {std} is not a tree"))?;
-    entries
-        .iter()
-        .find(|e| entry_name(e) == name.as_bytes())
-        .map(|e| e.oid.to_string())
-        .ok_or_else(|| format!("no builtin {name:?} in {DEFAULT_STD_REF}"))
+    // Resolve `<name>` by walking the std tree from its root down to the entry
+    // with the SAME evaluator as `caos eval-path` (design/caos-expr.md): a
+    // std-root `.caos-expr` (e.g. a whole-tree `deep-deps` transform that mounts
+    // each entry's declared deps inside it) is applied first, then the named
+    // entry's own `.caos-expr` (if any) computes its image — expressions
+    // evaluated all the way down. An entry with no `.caos-expr` resolves to its
+    // tree unchanged (a git-docker delta, a flake tree, a curry node).
+    eval::eval_std_entry(t, &std, name)
 }
 
 /// The std library tree hash from the built-ins ref ([`STD_REF_ENV`], default

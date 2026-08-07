@@ -226,8 +226,11 @@ provides two tools:
 
 - `merge --theirs=<ref|hash>` — three-way merge the given commit into the
   conversation head. A git-bearing SUB-RUN, not in-process (below).
-- `read-oid <oid>` — read a blob by hash. In-process at the hash level, like
-  `read`/`ls`/`write`/`edit` (below).
+
+`read`/`ls` default to the current workspace but accept a `root` — a commit,
+tree, or blob hash — to read/list as of another revision (below). A bare blob
+`root` with no path reads that object directly (what a standalone `read-oid`
+once did).
 
 ## Tools thread a commit, not a tree
 
@@ -235,7 +238,7 @@ To let `merge` record `theirs` as an ancestor, a tool's unit of work is a
 COMMIT, not a bare tree: the step loop threads a workspace commit through the
 call queue, and every tool is `commit -> (commit, result)`.
 
-- **Read-only tools** (`read`, `ls`, `grep`, `read-oid`) return the input
+- **Read-only tools** (`read`, `ls`, `grep`) return the input
   commit UNCHANGED — no new object, no no-op commit.
 - **Mutations** (`write`, `edit`, `bash`, tree tools) return a single-parent
   commit `commit(new tree, parent = input commit)`.
@@ -272,7 +275,7 @@ on commits.
   `merge-tree`'s exact notation, not a reimplementation. gix is a dependency
   but carries no merge (`gix-merge` is not pulled in), and its output would not
   match git's notation anyway. So `merge` is a decomposed compute tool like
-  `bash`/`build`/`test`, and only `read-oid` is in-process.
+  `bash`/`build`/`test`; the file tools (`read`/`ls`/`write`/`edit`) are in-process.
 - Its image is a small git worker — a `std/merge` flake
   (`nixpkgs.gitMinimal`) run as `curry(std/runner, worker1=<merge script>)`,
   the same flake-image pattern as `std/bash`. Not `std/cargo` (which has git
@@ -365,14 +368,18 @@ local rules, no "persistence exemption":
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.
 
-## `read-oid`
+## Reading by hash (`read`/`ls` with `root`)
 
-Bounded blob read by hash — same contract as `read` (100KB / offset+limit).
-It is load-bearing, not a convenience: the stage oids in `.caos/conflicts`
-name content that is NOT reachable through any workspace path — the base
-(stage 1), and either side of a modify/delete, binary, or type conflict, none
-of which appear at the path. Without `read-oid` the agent cannot see what it
-is choosing between. (Tree-oid listing is a cheap optional companion.)
+Both file readers default to the current workspace but accept a `root` — a
+commit, tree, or blob hash — to read/list as of another revision. A commit or
+tree `root` navigates its tree by path; a bare blob `root` (no path) reads that
+object directly. This is load-bearing, not a convenience: the stage oids in
+`.caos/conflicts` name content that is NOT reachable through any workspace path
+— the base (stage 1), and either side of a modify/delete, binary, or type
+conflict, none of which appear at the path. Without a by-hash read the agent
+cannot see what it is choosing between. It began as a standalone `read-oid`
+blob reader; folding it into `read`'s `root` generalized the same fetch to any
+revision (and made the history tools' hashes readable the same way).
 
 ## Guards and workflow
 

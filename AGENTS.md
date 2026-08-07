@@ -47,4 +47,11 @@ Every script here runs with it, and two constructs quietly break under it.
   reports `tail`'s status, so a failed command looks like a pass — that happened,
   and the next step ran against a stack that was not up. Use
   `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
+- **`run-tool test` does not cover `nix build`.** The suite compiles the tree
+  with cargo over the real `crates/` directory; `nix build` compiles a copy
+  filtered by the flake's `src`. Anything that filter drops is invisible to a
+  green suite — four `include_str!("githist/*.sh")` calls merged under a
+  passing run and broke `nix build` on arrival. `tests/std-lint` now runs
+  `./lint-flake-src.sh` for the embedded-file case; for anything else the
+  filter touches, run `nix build` yourself before committing.
 - If this doesn't catch everything, we need to add it to the above step

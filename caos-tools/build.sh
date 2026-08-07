@@ -314,7 +314,7 @@ make)
   # own curries copy these (CAOS_BIN_DIR); a test gets only the ones it names.
   mkdir -p "$OUT/bin"
   for b in worker-cargo worker-runner worker-rustc worker-bash-tool \
-           worker-llm-call worker-llm-step worker-rgrep llm-stub; do
+           worker-llm-call worker-llm-step llm-stub; do
     install -m 755 "$BIN/$b" "$OUT/bin/$b" || fail "no binary $b"
   done
   install -m 755 "$wsroot/stack/serve" "$L/caos/stack/serve"
