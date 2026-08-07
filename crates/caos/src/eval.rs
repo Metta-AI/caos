@@ -241,7 +241,7 @@ fn eval_command(
         let oid = curry_from_entries(t, &image_ref, &[], entries)?;
         return Ok(("tree".to_string(), oid.to_string()));
     }
-    let arg_tree = assemble_arg_tree(t, &image_ref, entries)?;
+    let arg_tree = assemble_arg_tree(t, &image_ref, entries, &[])?;
     let server = t.server_url()?;
     request_compute(&server, &arg_tree, "")
 }
