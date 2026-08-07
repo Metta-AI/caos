@@ -109,4 +109,43 @@ grep -q "redacted secret" shout.err \
   || fail "expected the redaction marker in the log: $(cat shout.err)"
 echo "  ok: the printed secret is replaced by the redaction marker" >&2
 
+echo "== a grant can name a tool in the current tree ==" >&2
+# A repo-local tool: a bash script curried onto /std/bash via a .caos-expr, so
+# its identity is (image=bash, worker1=run.sh) — what the grant must match.
+mkdir -p mytool
+cat > mytool/run.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+mkdir -p /tmp/out
+if [ -r /secret/deploytok ] && [ "$(cat /secret/deploytok)" = "DEPLOY-xyz-789" ]; then
+  echo "deploytok-ok" > /tmp/out/verdict
+else
+  echo "deploytok-missing" > /tmp/out/verdict
+fi
+caos put /tmp/out /cas/out
+EOF
+cat > mytool/.caos-expr <<'EOF'
+curry /std/bash -- --worker1:@=run.sh
+EOF
+# git add -A here makes the working tree == HEAD^{tree}, so eval-path (which
+# ingests the working tree) publishes exactly the tree we point the store at.
+commit "current-tree tool"
+
+# Point the store's "current tree" at this commit, and grant by repo path.
+# Push the commit so its tree closure is on the server for the grant to resolve.
+git push -q caos HEAD:refs/heads/secrets-test || fail "pushing workspace to caos"
+git rev-parse "HEAD^{tree}" > "$SECRETS_DIR/.tree"
+cat > "$SECRETS_DIR/deploytok" <<'EOF'
+value=DEPLOY-xyz-789
+reader=mytool
+EOF
+chmod -R a+rX "$SECRETS_DIR"
+
+tool=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed: $tool"
+out=$("$CAOS_CLI" run "${tool##* }" tgot --) || fail "run mytool failed: $out"
+verdict=$(cat tgot/verdict)
+[ "$verdict" = "deploytok-ok" ] \
+  || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
+echo "  ok: a reader naming a repo path (via its .caos-expr) grants the secret" >&2
+
 echo "secrets: ALL PASS" >&2
