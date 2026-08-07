@@ -132,6 +132,8 @@ EOF
 commit "current-tree tool"
 
 # Point the store's "current tree" at this commit, and grant by repo path.
+# Push the commit so its tree closure is on the server for the grant to resolve.
+git push -q caos HEAD:refs/heads/secrets-test || fail "pushing workspace to caos"
 git rev-parse "HEAD^{tree}" > "$SECRETS_DIR/.tree"
 cat > "$SECRETS_DIR/deploytok" <<'EOF'
 value=DEPLOY-xyz-789
