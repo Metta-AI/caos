@@ -20,12 +20,14 @@ use std::collections::{BTreeMap, HashSet};
 /// The header carrying the serialized store from client to server.
 pub(crate) const HEADER: &str = "X-Caos-Secrets";
 
-/// One secret the run carries: its value, and the readers (each a partial arg
-/// tree, already resolved client-side to name → oid) allowed to see it.
+/// One secret the run carries: its value, its entropy (the cache-isolation
+/// capability — hashed into `secret-hash`, never stored raw), and the readers
+/// (each a partial arg tree, already resolved client-side to name → oid).
 #[derive(Clone)]
 pub(crate) struct Grant {
     name: String,
     value: String,
+    entropy: String,
     readers: Vec<BTreeMap<String, String>>,
 }
 
@@ -63,6 +65,11 @@ pub(crate) fn parse_header(header: &str) -> Vec<Grant> {
         grants.push(Grant {
             name: name.to_string(),
             value: value.to_string(),
+            entropy: entry
+                .get("entropy")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             readers,
         });
     }
@@ -109,6 +116,31 @@ pub(crate) fn grant(
 /// wildcards.
 fn is_subset(reader: &BTreeMap<String, String>, job: &BTreeMap<String, String>) -> bool {
     reader.iter().all(|(name, oid)| job.get(name) == Some(oid))
+}
+
+/// The `secret-hash` cache-isolation tag for a job with base arg entries
+/// `arg_entries` (design/secrets.md): the git-blob digest of the
+/// `(name, entropy)` pairs of the grants whose readers match — `None` when no
+/// grant matches (a secret-free run stays globally shared). Whoever assembles
+/// the ArgTree folds this in as the reserved `secret-hash` entry, so the entropy
+/// itself never touches the tree. Client and server must agree, so both hash the
+/// shared [`caos_world::secret_hash_material`].
+pub(crate) fn secret_hash(
+    grants: &[Grant],
+    arg_entries: &BTreeMap<String, String>,
+) -> Option<String> {
+    let pairs: Vec<(&str, &str)> = grants
+        .iter()
+        .filter(|g| g.readers.iter().any(|r| is_subset(r, arg_entries)))
+        .map(|g| (g.name.as_str(), g.entropy.as_str()))
+        .collect();
+    if pairs.is_empty() {
+        return None;
+    }
+    let material = caos_world::secret_hash_material(&pairs);
+    let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &material)
+        .expect("hashing secret material");
+    Some(oid.to_string())
 }
 
 #[cfg(test)]
@@ -160,5 +192,28 @@ mod tests {
         assert!(parse_header(r#"{"not":"an array"}"#).is_empty());
         // A grant missing its value is skipped.
         assert!(parse_header(r#"[{"name":"x"}]"#).is_empty());
+    }
+
+    #[test]
+    fn secret_hash_isolates_and_is_stable() {
+        let grants = parse_header(
+            r#"[{"name":"tok","value":"v","entropy":"E1","readers":[{"image":"aa"}]}]"#,
+        );
+        let job = map(&[("image", "aa"), ("std", "z")]);
+        let h = secret_hash(&grants, &job).expect("a matching grant hashes");
+        // Stable across calls (a real cache key).
+        assert_eq!(Some(h.clone()), secret_hash(&grants, &job));
+        // No matching grant → None, so a secret-free run stays globally shared.
+        assert!(secret_hash(&grants, &map(&[("image", "zz")])).is_none());
+        // Rotating the entropy re-namespaces the cache; rotating only the value
+        // (same entropy) does not.
+        let rotated_entropy = parse_header(
+            r#"[{"name":"tok","value":"v","entropy":"E2","readers":[{"image":"aa"}]}]"#,
+        );
+        assert_ne!(Some(h.clone()), secret_hash(&rotated_entropy, &job));
+        let rotated_value = parse_header(
+            r#"[{"name":"tok","value":"DIFFERENT","entropy":"E1","readers":[{"image":"aa"}]}]"#,
+        );
+        assert_eq!(Some(h), secret_hash(&rotated_value, &job));
     }
 }

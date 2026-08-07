@@ -75,14 +75,17 @@ mkdir -p .caos-secrets
 git rev-parse "HEAD^{tree}" > .caos-secrets/.tree
 cat > .caos-secrets/token <<'EOF'
 value=SEKRET-abc-123
+entropy=7f3a9c2e1b8d4f60a5e7c9d1b3f5a7e9
 reader=std/bash
 EOF
 cat > .caos-secrets/locked <<'EOF'
 value=NOPE-do-not-leak
+entropy=1122334455667788990011223344556677
 reader=std/bash -- --marker=nope
 EOF
 cat > .caos-secrets/deploytok <<'EOF'
 value=DEPLOY-xyz-789
+entropy=aa11bb22cc33dd44ee55ff6677889900
 reader=mytool
 EOF
 
