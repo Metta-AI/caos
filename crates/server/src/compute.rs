@@ -1030,7 +1030,16 @@ fn resolve_flake_image(
         .map_err(|e| HttpError::new(400, format!("invalid flake tree hash {flake_tree}: {e}")))?;
     let in_entry = named_entry("in", gix::objs::tree::EntryKind::Tree.into(), oid);
     // "<type> <hash>": the git-docker delta tree the outer worker produced.
-    let result = run_image(config, &builder, vec![in_entry], std, salt, stack, trace_id, secrets)?;
+    let result = run_image(
+        config,
+        &builder,
+        vec![in_entry],
+        std,
+        salt,
+        stack,
+        trace_id,
+        secrets,
+    )?;
     let delta_tree = result.split_once(' ').map(|(_, h)| h).unwrap_or(&result);
     convert_git_image(config, delta_tree).map_err(|e| {
         HttpError::new(
