@@ -3291,7 +3291,10 @@ fn resolve_reader_arg(
         return Err(format!("reader arg name {name:?} must be one path component"));
     }
     let oid = if is_path {
-        if let Some(std_name) = value.strip_prefix("/std/").or_else(|| value.strip_prefix("std/")) {
+        if let Some(std_name) = value
+            .strip_prefix("/std/")
+            .or_else(|| value.strip_prefix("std/"))
+        {
             resolve_std_image(t, std_name)?
         } else {
             eval::eval_path(t, pinned, value)?.1
