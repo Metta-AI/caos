@@ -1,6 +1,9 @@
 # Secrets: identity-is-capability — design note
 
-**Status:** proposed. Design discussion only; not built. Builds on
+**Status:** partly built. Injection, matching, and the leak-prevention
+mechanisms exist in an interim *server-side* form (secrets sourced from a
+server `CAOS_SECRETS_DIR`); the per-user ephemeral-context sourcing and the
+entropy/cache-isolation hash described below are not yet built. Builds on
 `.caos-expr` (eval-path, deep-deps) and map-then (server-mediated worker
 starts).
 
@@ -52,10 +55,51 @@ Note that this means that the server sees all secrets. We can revisit if this be
 
 ## Remaining work
 
-- Output-scrub assertion (hard reject of new objects containing a secret) and log
-  masking — the two leak-prevention mechanisms.
-- Tree-relative readers and `:@=` reader args — currently only `std/<name>` readers
-  resolve (others are skipped, never granting). Full eval-path resolution of
-  repo-local tool paths is the main follow-up.
-- `value:@=` is parsed but the value stays UTF-8 (binary/multiline is a later
-  concern).
+Built so far, in an interim shape: out-of-band injection at `/secret/<name>`,
+superset matching (both `std/<name>` and tree-relative readers), the hard
+output-scrub assertion (new objects only, refused at `caos put` before
+publish), and best-effort log masking. What that version does differently from
+the design above, plus what is unbuilt:
+
+- **Carry the store as ephemeral run context.** Today the store is a server
+  property (`CAOS_SECRETS_DIR`), read at dispatch. The design wants it threaded
+  through the run like the stack — client → server → each promise sub-run — so
+  secrets are per-user and can be iterated locally. The tree a reader evaluates
+  against travels with the store (the store pins its own tree, which is what
+  makes tree-relative readers safe); this replaces the interim server-side pin
+  (`.tree` file / `CAOS_SECRETS_TREE`). Matching + injection stay server-side at
+  every dispatch (so no-delegation holds: a sub-worker is entitled by matching
+  its own arg tree, never by inheritance).
+
+- **Entropy + cache isolation.** The required `entropy` field and the
+  `/cas/args/secret-hash` entry — `H(sorted (name, entropy) pairs)` over the
+  secrets a run is *actually granted*, folded into the arg tree only when a
+  grant fires (match the base arg tree first, then append the hash, so it does
+  not chase its own tail). Without it, two users with different secrets share
+  cache entries, and a misconfigured user silently hits another's result. The
+  hash — not the raw entropy — goes in the tree, because an id is a bearer
+  capability for the cache: knowing it reconstructs the key of any run that used
+  it. Rotating `value=` keeps the entropy (cache preserved); rotating the
+  entropy re-namespaces the cache (what to do on a suspected id leak).
+
+- **`name=` field.** The worker-visible name, distinct from the filename (which
+  stays the user's own label); both the hash and the `/secret/<name>` mount use
+  it. Currently the filename is the name.
+
+- **Entropy tooling.** A `caos secrets`-style command over the dir that fills a
+  missing `entropy` with fresh entropy and warns (or refuses) on a low-entropy
+  one — so the safe default is automatic and a misconfig degrades to a cache
+  *miss* (a fresh, uncached run), never a cross-hit. Load-bearing: a
+  low-entropy id is brute-forceable out of the hash.
+
+- **Reader `:@=` args and binary `value:@=`.** `:@=` resolves inside a tool's
+  `.caos-expr` but not yet on a reader's own trailing args; `value:@=` is read
+  but kept UTF-8 (binary/multiline later).
+
+- **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
+  never trigger compute); likely permanent.
+
+- **Shared-server exposure.** Carrying the whole store means a shared server
+  sees values it never injects (sub-runs aren't known ahead of time, so the
+  client can't pre-filter to the granted subset). Moot for a per-user/local
+  server; a tighter hand-off is future work.
