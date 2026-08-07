@@ -707,6 +707,7 @@ fn resolve_promise(
 /// request, built server-side byte-identically to what a client would build, so
 /// the ArgTree hash (and cache key) is the same no matter who assembles it — and
 /// send it through [`run_work_request`]. Returns `"<type> <hash>"`.
+#[allow(clippy::too_many_arguments)] // the run context (std/salt/stack/trace/secrets) travels together
 fn run_image(
     config: &Config,
     image_ref: &str,
