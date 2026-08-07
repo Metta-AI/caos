@@ -243,7 +243,7 @@ fn eval_command(
     }
     let arg_tree = assemble_arg_tree(t, &image_ref, entries)?;
     let server = t.server_url()?;
-    request_compute(&server, &arg_tree)
+    request_compute(&server, &arg_tree, "")
 }
 
 /// Resolve the image token of a command to a ref: a `$NAME` variable, a
