@@ -957,6 +957,7 @@ fn resolve_image(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         if reference.is_empty() || reference.starts_with('-') {
