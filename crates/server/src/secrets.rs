@@ -268,9 +268,7 @@ fn eval_curry_expr(
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'));
-    let line = lines
-        .next()
-        .ok_or(".caos-expr reader has no expression")?;
+    let line = lines.next().ok_or(".caos-expr reader has no expression")?;
     if lines.next().is_some() {
         return Err("only a single-line `curry` .caos-expr reader is resolved".to_string());
     }
