@@ -687,7 +687,7 @@ fn resolve_promise(
                 args.push(extra);
             }
             Ok((
-                run_image(config, &img, args, std, salt, stack, trace_id)?,
+                run_image(config, &img, args, std, salt, stack, trace_id, secrets)?,
                 caught,
             ))
         }
