@@ -715,6 +715,7 @@ fn run_image(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
