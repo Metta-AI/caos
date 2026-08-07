@@ -41,6 +41,7 @@
 
 mod compute;
 mod git;
+mod repair;
 mod runner;
 mod storage;
 mod trace;
@@ -183,6 +184,25 @@ fn main() {
         "maintenance.geometric-repack.enabled",
         "false",
     ]);
+    // Survive an unclean shutdown. git's DEFAULT is to publish a loose object or
+    // a ref by renaming a temp file into place and never fsyncing it, so ext4
+    // can journal the rename before the data lands and a crash leaves the right
+    // filename holding zero bytes — which is not a lost object but a POISONED
+    // one, because receive-pack validates every advertised ref and one
+    // unreadable blob then rejects every push (see [`mod repair`]). `objects`
+    // covers loose objects and packs, `reference` the ref files.
+    //
+    // `fsyncMethod=batch` is what makes this affordable on the loose-object side
+    // — one hardware flush for a whole batch of writes rather than one each,
+    // which matters when a single `caos put` lands thousands of objects. This is
+    // git's own side only; the in-process gix writes are `storage`'s to sync.
+    git(&["-C", &git_dir, "config", "core.fsync", "objects,reference"]);
+    git(&["-C", &git_dir, "config", "core.fsyncMethod", "batch"]);
+
+    // Clear what a previous crash left behind BEFORE opening the repo: gix
+    // answers "is this object stored?" for a loose object with a path-exists
+    // check, so an empty file has to be gone from disk before anything asks.
+    let swept = repair::sweep_empty_loose_objects(&git_dir);
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
@@ -193,6 +213,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Then the refs the sweep just orphaned, plus any that were already dangling.
+    let dropped = repair::drop_broken_refs(&repo.to_thread_local(), &git_dir);
+    if swept + dropped > 0 {
+        eprintln!(
+            "repair: {git_dir} had crash damage — dropped {swept} empty object(s) \
+             and {dropped} broken ref(s)"
+        );
+    }
 
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
