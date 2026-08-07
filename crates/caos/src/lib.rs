@@ -90,7 +90,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // coupled every tool invocation to a ref the stack may not even have.
     all.extend(kvs.iter().cloned());
     let image = resolve_cli_image(t, "/cas/std/bash")?;
-    let (kind, result) = run_request(t, &image, None, None, &all)?;
+    let (kind, result) = run_request(t, &image, None, None, &all, "")?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
     println!("{kind} {result}");
