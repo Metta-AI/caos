@@ -92,15 +92,7 @@ pub(crate) fn for_job(
     for secret in read_secrets(&dir) {
         let visible = secret.readers.iter().any(|reader| {
             match resolve_reader(config, std, tree.as_deref(), reader) {
-                Ok(entries) => {
-                    let m = is_subset(&entries, arg_entries);
-                    if !m {
-                        eprintln!(
-                            "secrets(debug): reader {reader:?} -> {entries:?} did NOT match job {arg_entries:?}"
-                        );
-                    }
-                    m
-                }
+                Ok(entries) => is_subset(&entries, arg_entries),
                 Err(e) => {
                     eprintln!("secret {}: ignoring reader {reader:?}: {e}", secret.name);
                     false
