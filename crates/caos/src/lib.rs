@@ -3193,7 +3193,7 @@ fn request_compute_streamed(
             }
             Ok(())
         });
-        let result = request_compute_traced(base, arg_tree, trace_id);
+        let result = request_compute_traced(base, arg_tree, trace_id, secrets);
         let trace_result = trace
             .join()
             .map_err(|_| "the trace stream thread panicked".to_string())?;
