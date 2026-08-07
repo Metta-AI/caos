@@ -3110,9 +3110,6 @@ fn merge_entries(
 /// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
 /// param's historical name; its value is the arg-tree hash.)
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
-    let url = format!("{}/run?req={}", base.trim_end_matches('/'), arg_tree);
-    request_compute_url(&url, secrets)
-}
 
 fn request_compute_traced(
     base: &str,
