@@ -65,6 +65,11 @@ pub(crate) fn parse_header(header: &str) -> Vec<Grant> {
         grants.push(Grant {
             name: name.to_string(),
             value: value.to_string(),
+            entropy: entry
+                .get("entropy")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             readers,
         });
     }
