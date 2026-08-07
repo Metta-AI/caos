@@ -307,7 +307,10 @@ fn resolve_expr_image(
     subtree: &str,
     tok: &str,
 ) -> Result<String, String> {
-    if let Some(name) = tok.strip_prefix("/std/").or_else(|| tok.strip_prefix("std/")) {
+    if let Some(name) = tok
+        .strip_prefix("/std/")
+        .or_else(|| tok.strip_prefix("std/"))
+    {
         return std_image(config, std, name);
     }
     if is_hex40(tok) {
