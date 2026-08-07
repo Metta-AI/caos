@@ -347,7 +347,10 @@ fn expr_arg(
         return Err(format!("arg name {name:?} must be one path component"));
     }
     let oid = if is_path {
-        if let Some(std_name) = value.strip_prefix("/std/").or_else(|| value.strip_prefix("std/")) {
+        if let Some(std_name) = value
+            .strip_prefix("/std/")
+            .or_else(|| value.strip_prefix("std/"))
+        {
             std_image(config, std, std_name)?
         } else {
             lookup_in_tree(config, subtree, value)?
