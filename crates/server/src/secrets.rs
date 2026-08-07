@@ -381,7 +381,9 @@ fn literal_arg(config: &Config, tok: &str) -> Result<(String, String), String> {
         ));
     }
     if key.is_empty() || key.contains('/') {
-        return Err(format!("reader arg name {key:?} must be one path component"));
+        return Err(format!(
+            "reader arg name {key:?} must be one path component"
+        ));
     }
     let oid = store_git_blob(config, val.as_bytes())
         .map_err(|e| format!("storing reader literal {val:?}: {e}"))?
