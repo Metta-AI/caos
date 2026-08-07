@@ -85,12 +85,16 @@ pub(crate) fn for_job(
     };
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // The current tree tree-relative readers resolve against (design/secrets.md).
+    // Resolved once per dispatch — so, like the store itself, an edit takes
+    // effect on the next job.
+    let tree = current_tree(config, &dir);
     for secret in read_secrets(&dir) {
         let visible =
             secret
                 .readers
                 .iter()
-                .any(|reader| match resolve_reader(config, std, reader) {
+                .any(|reader| match resolve_reader(config, std, tree.as_deref(), reader) {
                     Ok(entries) => is_subset(&entries, arg_entries),
                     Err(e) => {
                         eprintln!("secret {}: ignoring reader {reader:?}: {e}", secret.name);
