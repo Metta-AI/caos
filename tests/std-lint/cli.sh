@@ -18,4 +18,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 echo "== std/refresh.sh --check: every checked-in std copy re-derives ==" >&2
 bash "$CAOS_PROJECT/std/refresh.sh" --check || fail "checked-in std copies are stale"
 
+# The other literal-tree lint, and the only check in this suite that covers
+# `nix build`. Everything else compiles the tree with cargo over the real
+# crates/ directory, so the flake's `src` filter — which hands rustc a FILTERED
+# copy — is exercised by nothing. A file it drops is invisible to a green run;
+# that is exactly how the githist/*.sh embeds landed. Same shape as the lint
+# above: it re-derives the rule rather than restating a result.
+echo "== lint-flake-src.sh: every embedded file survives the flake's src filter ==" >&2
+bash "$CAOS_PROJECT/lint-flake-src.sh" "$CAOS_PROJECT" \
+  || fail "a file the crates compile from is dropped by the flake's src filter"
+
 echo "std-lint: ALL PASS" >&2

@@ -83,18 +83,36 @@
         # under crates/ reaches into them — no crates/*/tests, no include_*,
         # no path reference — so dropping them costs the compile nothing and
         # makes this key exactly (manifests, lockfile, toolchain).
-        src = craneLib.cleanCargoSource (
-          pkgs.lib.cleanSourceWith {
-            src = ./.;
-            name = "source";
-            filter =
-              path: _type:
-              let
-                rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
-              in
-              rel != "tests" && !(pkgs.lib.hasPrefix "tests/" rel);
-          }
-        );
+        #
+        # NOT cleanCargoSource: crane's filter keeps *.rs, *.toml, Cargo.lock
+        # and .cargo/config and NOTHING else, so a `include_str!("x.sh")`
+        # compiles everywhere a full tree is present and fails HERE — which is
+        # exactly how crates/worker-llm-step/src/githist/*.sh broke this build
+        # after passing the whole suite (see caos-tools/test.sh: the compile
+        # runs over the real crates/, so the flake's filter is the one thing
+        # `run-tool test` never exercises). Keep crates/**/*.sh: scripts a
+        # worker bakes into its binary are source, not data.
+        #
+        # ./lint-flake-src.sh is the other half of this rule — it resolves every
+        # include!/include_str!/include_bytes! under crates/ and fails if the
+        # target is not kept here, WITHOUT running nix, so the suite can hold
+        # it. Widen this filter and you widen its keep_rule.
+        #
+        # This does not widen the DEPENDENCY key: buildDepsOnly builds
+        # mkDummySrc, which keeps only Cargo.lock, .cargo/config.toml and
+        # stubbed Cargo.tomls — never the .sh.
+        src = pkgs.lib.cleanSourceWith {
+          src = pkgs.lib.cleanSource ./.;
+          name = "source";
+          filter =
+            path: type:
+            let
+              rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+              isCrateScript = pkgs.lib.hasPrefix "crates/" rel && pkgs.lib.hasSuffix ".sh" rel;
+            in
+            (rel != "tests" && !(pkgs.lib.hasPrefix "tests/" rel))
+            && (craneLib.filterCargoSources path type || isCrateScript);
+        };
 
         # Build for musl so the binary is fully static (crt-static is on by
         # default for musl targets) — its runtime closure is just itself.
