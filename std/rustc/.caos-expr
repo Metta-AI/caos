@@ -1,0 +1,11 @@
+# std/rustc (design/caos-expr.md, Phase 3): the worker factory is part of the
+# irreducible SEEDED core — it can't be built by the machinery it IS (rustc
+# compiling rustc is a cycle), so like flake-builder it names a sentinel image
+# and the core-seeder-runner answers with the pre-built result. The sentinel is
+# distinct (`docker://seeded-rustc`) so rustc's key can't collide with another
+# minimal-entry core item's. bootstrap hand-builds the result —
+# curry(runner, worker1=<worker-rustc binary>, cargo=<cargo image>, worker-common)
+# — and seeds it under this expression's arg-tree key. Nothing is staged into
+# the checked-in entry: a consumer fetching this tree gets a resolvable
+# expression, and the binary rides in the seed, not here.
+run docker://seeded-rustc -- --in:@=.

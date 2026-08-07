@@ -8,10 +8,15 @@
 # inside it under `DEEP-DEPS/`. A `DEPS` line is `<path> <name>`: the path is
 # relative to the DEPS file's OWN directory (so `../..` reaches parents), and
 # the name is the mount. There is no special `packages` root — it is a
-# whole-tree transform, published as the std entry /cas/std/deep-deps
-# (curry(runner, worker1=<binary>), like rgrep). We check the deepened shape,
-# DAG sharing, incremental recompute, cycle detection, and its use THROUGH
-# eval-path (a top-level `.caos-expr` invoking it).
+# whole-tree transform, published as the std entry /cas/std/deep-deps. That
+# entry is itself a HAND-DEEPENED source entry (design/caos-expr.md, Phase 3):
+# `{.caos-expr, worker, DEEP-DEPS/runner}`, the deepened form of a checked-in
+# `{.caos-expr, DEPS, worker}` whose `.caos-expr` is `curry DEEP-DEPS/runner --
+# --worker1:@=worker` — so deep-deps names its own runner base by a LOCAL
+# deep-deps mount rather than ambient `/std/runner`, and resolving the entry
+# evaluates that expression to the same curry node bootstrap published. We check
+# the deepened shape, DAG sharing, incremental recompute, cycle detection, and
+# its use THROUGH eval-path (a top-level `.caos-expr` invoking it).
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

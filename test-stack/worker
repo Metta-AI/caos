@@ -107,6 +107,21 @@ git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head
 git -C "$SEED" update-ref refs/caos/std "$STD_HASH" \
   || fail "pointing refs/caos/std at $STD_HASH"
 
+# The seeder's records (design/caos-expr.md, Phase 3): flake-builder resolves
+# via `run docker://seeded`, answered INSIDE by the core-seeder-runner (started
+# by serve, CAOS_STACK_SEEDER=yes below). Its record and the delta it returns
+# ride in refs/caos/seed — seeded the same way as std, a git FETCH into the same
+# repo. Optional: a wrapper without a seed (a std with no seeded core) just
+# leaves the seeder idle.
+if [ -e /cas/args/in/seed ]; then
+  SEED_HASH=$(caos hash /cas/args/in/seed) || fail "reading the seed hash"
+  git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
+    "$CAOS_SERVER_URL" "$SEED_HASH" \
+    || fail "fetching seed $SEED_HASH from the outer server"
+  git -C "$SEED" update-ref refs/caos/seed "$SEED_HASH" \
+    || fail "pointing refs/caos/seed at $SEED_HASH"
+fi
+
 # The inner stack itself is `caosd serve` (design/one-stack-image.md) — the
 # ONE bring-up in the tree, shared with the host and seed placements, so this
 # script no longer carries a second copy of how a stack starts. What stays
@@ -139,6 +154,7 @@ CAOS_STACK_REDIS_PORT=6390 \
 CAOS_STACK_REDIS_PERSIST=no \
 CAOS_STACK_REGISTRY=no \
 CAOS_STACK_RUNNERD=yes \
+CAOS_STACK_SEEDER=yes \
 CAOS_STACK_SEED_GIT=$SEED \
 CAOS_RUNNER_SLOTS=6 \
 CAOS_PENDING_TIMEOUT_SECS=900 \

@@ -1,1 +1,1 @@
-bash flake-builder
+bash flake-builder deep-deps runner

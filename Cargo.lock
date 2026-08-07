@@ -54,6 +54,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bake-anchor"
+version = "0.1.0"
+dependencies = [
+ "minreq",
+ "regex",
+ "serde_json",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1249,14 +1258,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "llm-client"
-version = "0.1.0"
-dependencies = [
- "minreq",
- "serde_json",
-]
-
-[[package]]
 name = "llm-stub"
 version = "0.1.0"
 dependencies = [
@@ -2231,13 +2232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "worker-bash-tool"
-version = "0.1.0"
-dependencies = [
- "worker-common",
-]
-
-[[package]]
 name = "worker-cargo"
 version = "0.1.0"
 dependencies = [
@@ -2253,26 +2247,6 @@ version = "0.1.0"
 name = "worker-deep-deps"
 version = "0.1.0"
 dependencies = [
- "worker-common",
-]
-
-[[package]]
-name = "worker-llm-call"
-version = "0.1.0"
-dependencies = [
- "llm-client",
- "serde_json",
- "worker-common",
-]
-
-[[package]]
-name = "worker-llm-step"
-version = "0.1.0"
-dependencies = [
- "llm-client",
- "minreq",
- "regex",
- "serde_json",
  "worker-common",
 ]
 

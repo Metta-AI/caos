@@ -11,8 +11,9 @@
 # untouched placeholder subtrees intact by hash; and a failing command is a
 # VALUE ({exit, stdout, stderr, tree}), never a run error.
 #
-# The tool is the worker-bash-tool static binary run as curry(runner, bin) in
-# the shared runner pool — no image of its own.
+# The tool is /cas/std/bash-tool — a std source entry (std/bash-tool) built on
+# resolution via rustc and curried onto the runner pool (design/caos-expr.md,
+# Phase 3), no image of its own.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -31,12 +32,12 @@ echo top > ws/top.txt
 printf '#!/bin/sh\necho hi\n' > ws/run.sh
 chmod +x ws/run.sh
 
-# The tool binary, bound into the shared runner — from the harness-provided
-# bins (CAOS_BIN_DIR: the caos-built binaries the suite threads in).
-cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
-commit "workspace + bash tool binary"
+# The tool is /cas/std/bash-tool — a source std entry (std/bash-tool) built on
+# resolution via rustc, curried onto the runner pool (design/caos-expr.md,
+# Phase 3). No host binary is threaded in; the tree under test IS the source.
+commit "workspace"
 base=$(git rev-parse HEAD)
-tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
+tool=/cas/std/bash-tool
 
 echo "== targeted read: declared path only; workspace round-trips by hash ==" >&2
 "$CAOS_CLI" run "$tool" r1 -- --tree:@=ws --cmd='cat a/one.txt' --paths='a/one.txt'

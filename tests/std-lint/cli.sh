@@ -28,4 +28,8 @@ echo "== lint-flake-src.sh: every embedded file survives the flake's src filter 
 bash "$CAOS_PROJECT/lint-flake-src.sh" "$CAOS_PROJECT" \
   || fail "a file the crates compile from is dropped by the flake's src filter"
 
+echo "== lint-bake-anchor.sh: every std tool's crates.io deps are anchored ==" >&2
+bash "$CAOS_PROJECT/lint-bake-anchor.sh" \
+  || fail "a std tool's crates.io dep is missing from bake-anchor (see above)"
+
 echo "std-lint: ALL PASS" >&2

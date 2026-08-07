@@ -1,0 +1,5 @@
+# bash's dependency (format `<path> <name>`, path relative to this dir): the
+# flake-builder that builds this flake into an image — named as a LOCAL dep
+# (mounted at DEEP-DEPS/flake-builder by deepening) rather than /std, so std has
+# no ambient self-reference.
+../flake-builder flake-builder

@@ -1,0 +1,6 @@
+# bash-tool's dependencies (format `<path> <name>`, path relative to this dir):
+# the rustc worker factory that compiles it, and the runner pool its built
+# binary is curried onto — named as LOCAL deps (mounted under DEEP-DEPS/ by
+# deepening) rather than /std, so std has no ambient self-reference.
+../rustc rustc
+../runner runner

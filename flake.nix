@@ -244,9 +244,6 @@
         # The agent-harness workers (design/agent-harness.md). They have no
         # image of their own: each runs as curry(runner, bin=<static binary>)
         # in the shared runner pool, so only the binaries are exposed.
-        worker-bash-tool = workspaceBins;
-        worker-llm-call = workspaceBins;
-        worker-llm-step = workspaceBins;
         worker-deep-deps = workspaceBins;
         # The LLM worker tests' scripted API stand-in — a host binary, not a
         # worker (the musl build runs on any Linux host).
@@ -630,9 +627,6 @@
         # Handed over prebuilt so caosd needs no runtime nix. It finds each
         # binary under /bin, so these may share one consolidated output.
         builtinWorkerBins = [
-          worker-bash-tool
-          worker-llm-call
-          worker-llm-step
           worker-deep-deps
           # Not curries: these ride only in refs/caos/bins — the test
           # suite's own image pipeline stages them (std's runner bakes its
@@ -730,14 +724,15 @@
             # on macOS the engine is a VM that cannot see the host's
             # /nix/store (BUILDING_ON_MACOS.md), while $CAOS_DATA is already
             # shared with it — this is the one path that works in both places.
-            # EXACTLY the two binaries serve runs — its own documented
-            # contract is "CAOS_STACK_BIN: dir holding `server` and
-            # `runnerd`". Everything else the workspace builds reaches the
+            # EXACTLY the binaries serve runs — its documented contract is
+            # "CAOS_STACK_BIN: dir holding `server`, `runnerd`" and, when the
+            # seeder is enabled, `core-seeder-runner` (design/caos-expr.md Phase
+            # 3). Everything else the workspace builds reaches the
             # stack as refs/caos/bins and the std curries, from the store,
             # never through here.
             BINSRC=${workspaceBins}/bin
             BINDIR=$CAOS_DATA/stack/bin
-            STACK_BINS=(server runnerd)
+            STACK_BINS=(server runnerd core-seeder-runner)
 
             # Compared by BYTES, not by store path — the same way
             # build-builtins keys its image deltas. A workspace rebuild
@@ -886,6 +881,7 @@
                   -e CAOS_STACK_REDIS_PERSIST=yes \
                   -e CAOS_STACK_REGISTRY=yes \
                   -e CAOS_STACK_RUNNERD=yes \
+                  -e CAOS_STACK_SEEDER=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                   -e CAOS_DOCKER_NETWORK="$NET" \
                   -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \
@@ -955,7 +951,7 @@
           inherit caos server runnerd caos-cli caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # LLM worker tests' stub server.
-          inherit worker-bash-tool worker-llm-call worker-llm-step llm-stub;
+          inherit llm-stub;
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc
           # orchestrator (curry(runner, worker1)) — build-builtins.sh needs

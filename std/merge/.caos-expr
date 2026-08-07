@@ -1,6 +1,8 @@
 # std/merge's image (design/caos-expr.md, Phase 3): this directory is a flake
 # (flake.nix + flake.lock + worker), so its image is the flake-builder applied
-# to the directory itself. Resolving `/cas/std/merge` evaluates this expression
-# — the flake→image step made explicit here rather than left to the server's
-# implicit flake detection.
-run /std/flake-builder -- --in:@=.
+# to the directory itself. It names the builder by a LOCAL deep-deps mount
+# (DEEP-DEPS/flake-builder, declared in DEPS) rather than /std/flake-builder, so
+# std carries no ambient self-reference. Resolving `/cas/std/merge` evaluates
+# this expression — the flake→image step made explicit rather than left to the
+# server's implicit flake detection.
+run DEEP-DEPS/flake-builder -- --in:@=.

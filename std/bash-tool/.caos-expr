@@ -1,0 +1,9 @@
+# std/bash-tool's image (design/caos-expr.md, Phase 3): build this directory as
+# a Rust project with rustc — the same shape as rgrep. `--src:@=.` hands rustc
+# this tree (Cargo.toml + src/; rustc skips the caos metadata — .caos-expr,
+# DEPS, DEEP-DEPS/); `--runner:@=DEEP-DEPS/runner` is the base its `finish`
+# curries the built binary onto. Both deps are named by LOCAL deep-deps mounts
+# (declared in DEPS) rather than /std, so std carries no ambient self-reference.
+# The result is curry(runner, worker1=<the compiled binary>) — a ready-to-run
+# bounded bash tool in the shared runner pool.
+run DEEP-DEPS/rustc -- --src:@=. --runner:@=DEEP-DEPS/runner

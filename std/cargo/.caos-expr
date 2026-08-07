@@ -1,0 +1,14 @@
+# std/cargo's image (design/caos-expr.md, Phase 3). cargo is a flake
+# (flake.nix + flake.lock + bake.nix), so its image is the flake-builder applied
+# to this directory. It names the builder by a LOCAL deep-deps mount
+# (DEEP-DEPS/flake-builder, declared in DEPS) rather than /std/flake-builder, so
+# std carries no ambient self-reference.
+#
+# This is a `run` of a seeded worker, so its key can't be a pure assembly:
+# resolving DEEP-DEPS/flake-builder evaluates flake-builder's own `.caos-expr`
+# to its (seeded) image. bootstrap hand-builds the cargo image delta and seeds
+# it under the arg-tree key this expression forms — `{ image: <flake-builder
+# delta>, in: <this deepened tree> }` — so resolving /cas/std/cargo returns that
+# delta without the flake-builder worker ever running (design/caos-expr.md, the
+# hand-assembled seed keys).
+run DEEP-DEPS/flake-builder -- --in:@=.

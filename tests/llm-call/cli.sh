@@ -9,10 +9,7 @@ set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-cp "$CAOS_BIN_DIR/worker-llm-call" llm-call-bin
 stub_bin=$CAOS_BIN_DIR/llm-stub
-git add llm-call-bin
-git -c user.email=test@caos -c user.name=caos commit -qm "llm-call fixture"
 
 mkdir stub
 printf '%s' '{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"Improve sidebar titles"}],"stop_reason":"end_turn"}' \
@@ -32,7 +29,7 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 call=$(
-  "$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-call-bin \
+  "$CAOS_CLI" curry /cas/std/llm-call -- \
     --api-key=test-key --base-url="http://$stub_host:$port"
 )
 messages='[{"role":"user","content":"Name the sidebar task"}]'

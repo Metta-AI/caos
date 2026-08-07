@@ -1,1 +1,1 @@
-runner rustc cargo bash flake-builder
+runner rustc cargo bash flake-builder deep-deps

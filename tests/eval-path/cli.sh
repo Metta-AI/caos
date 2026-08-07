@@ -44,6 +44,22 @@ G=curry /std/bash -- --worker1:@=build.sh
 run $G -- --name:@=name
 EOF
 
+# The same computation with the worker described by a SUBTREE referenced as the
+# image by PATH: `tool/` carries its own `.caos-expr` (a curry over bash), and
+# `run tool` resolves that path THROUGH the subtree's expression — the mechanism
+# a core item uses to name a dependency by a local `DEEP-DEPS/<name>` path
+# rather than `/std/<name>` (design/caos-expr.md). It must again produce the
+# byte-identical arg tree, hence the same result hash.
+mkdir -p pkg-nested/tool
+cp pkg-direct/build.sh pkg-nested/tool/build.sh
+cp pkg-direct/name pkg-nested/name
+cat > pkg-nested/tool/.caos-expr <<'EOF'
+curry /std/bash -- --worker1:@=build.sh
+EOF
+cat > pkg-nested/.caos-expr <<'EOF'
+run tool -- --name:@=name
+EOF
+
 commit "eval-path fixtures"
 
 echo "== eval-path evaluates a directory's .caos-expr ==" >&2
@@ -59,6 +75,12 @@ echo "== the variable / curry form evaluates identically ==" >&2
 out2=$("$CAOS_CLI" eval-path pkg-var) || fail "eval-path pkg-var failed"
 [ "${out2##* }" = "$hash" ] || fail "var form differs: $out2 vs tree $hash"
 echo "  ok: 'NAME=curry ... ; run \$NAME' converges on the same result" >&2
+
+echo "== an image referenced by path evaluates that subtree's .caos-expr ==" >&2
+out_nested=$("$CAOS_CLI" eval-path pkg-nested) || fail "eval-path pkg-nested failed"
+[ "${out_nested##* }" = "$hash" ] \
+  || fail "path-image form differs: $out_nested vs tree $hash"
+echo "  ok: 'run tool' resolved tool/'s .caos-expr and converged on the same result" >&2
 
 echo "== descending past the expression digs into its result ==" >&2
 g=$("$CAOS_CLI" eval-path pkg-direct/greeting) || fail "eval-path pkg-direct/greeting"

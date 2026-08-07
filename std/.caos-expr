@@ -1,0 +1,21 @@
+# The std library's ROOT expression (design/caos-expr.md, "Deep deps"): std is
+# published UN-deepened — every entry carries the `DEPS` file it was checked in
+# with — and this expression is what turns that into the deepened tree callers
+# resolve against. Every `/cas/std/<name>` resolution (`resolve_std_image` →
+# `eval_std_entry` → `eval_path`) applies this first, so an entry's
+# `DEEP-DEPS/<dep>` mounts are computed by the REAL deep-deps worker at resolve
+# time instead of being baked in by bootstrap. That is what makes the checked-in
+# tree self-resolving: std is now resolved BY DESCENT, not by a pre-deepened ref.
+#
+# `deep-deps` names the sibling entry BY PATH, and that is what breaks cycle-2
+# (design/caos-expr.md, "Breaking the cycles"): `resolve_expr_image` evaluates
+# the named subtree against ITSELF, so it sees `std/deep-deps`'s own
+# `.caos-expr` — the `docker://seeded-deep-deps` sentinel the core-seeder-runner
+# answers — and never re-enters this root expression. Nothing here needs
+# deep-deps to already be deepened, because the seeded entry has no DEPS.
+#
+# bootstrap (`build-builtins.sh`) still hand-deepens, but ONLY to form the seed
+# keys: a seeded item's `in` is its DEEPENED entry, i.e. what this expression
+# produces. So the hand-deepen and this worker must agree BYTE FOR BYTE or the
+# seeder's key misses — see `deepen_entry` there.
+run deep-deps -- --in:@=.

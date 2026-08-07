@@ -20,8 +20,6 @@ mkcommit() { # <tree> <message> [parent...] -> a commit minted with plain git
 }
 
 echo "== stage bins and the workspace ==" >&2
-cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
-cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
 stub_bin=$CAOS_BIN_DIR/llm-stub
 
 # base workspace: one file. The human turn is text-only, so `ours` == base.
@@ -64,8 +62,8 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry the workers (merge-image + ref snapshot) and run the turn ==" >&2
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
-llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
+bash_tool=$("$CAOS_CLI" curry /cas/std/bash-tool --)
+llm=$("$CAOS_CLI" curry /cas/std/llm-step -- \
   --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
   --merge-image=/cas/std/merge --merge-refs="feature $feature" \
   --model=test-model --base-url="http://$stub_host:$port")

@@ -75,7 +75,8 @@ fn start() -> Result<(), String> {
         }
     }
     // The cargo worker's image ref rides as a literal (a hash string, read as
-    // content), unlike `runner`/`worker-common` which ride as tree references.
+    // content): rustc is a SEEDED core item, so bootstrap hand-builds its curry
+    // binding `--cargo=<cargo image hash>` (design/caos-expr.md, Phase 3).
     let cargo = read_arg("cargo")?;
 
     let proj = scratch("proj")?;
@@ -85,8 +86,17 @@ fn start() -> Result<(), String> {
     if Path::new(&src).is_dir() {
         // A whole project: link each of its top-level entries into proj (by CAS
         // hash — `caos put` resolves the links), then use its OWN Cargo.toml.
+        // SKIP caos metadata: a deep-deps-shaped std tool carries `.caos-expr`,
+        // `DEPS`, and a `DEEP-DEPS/` subtree of its (deepened) dependencies — none
+        // of which is part of its cargo project. `DEEP-DEPS/` especially must not
+        // reach cargo: it holds other tools' trees with their own nested
+        // `Cargo.toml`s, which would derail package/workspace discovery.
         for entry in entries(&src)? {
-            link(&entry, proj.join(file_name(&entry)))?;
+            let name = file_name(&entry);
+            if name == "DEEP-DEPS" || name == ".caos-expr" || name == "DEPS" {
+                continue;
+            }
+            link(&entry, proj.join(name))?;
         }
         if !proj.join("Cargo.toml").exists() {
             return Err("--src is a directory but has no Cargo.toml".to_string());
@@ -101,6 +111,22 @@ fn start() -> Result<(), String> {
     // worker-common as a path dep at a fixed location — the project's manifest
     // names it `worker-common = { path = "worker-common" }`.
     link(arg("worker-common"), proj.join("worker-common"))?;
+    // Extra code dependencies: numbered `--dep0`/`--dep1`/… args, each a crate
+    // tree (a deep-deps mount, e.g. DEEP-DEPS/llm-client). Numbered, not a
+    // repeated `--dep`, which would collide at /cas/args/dep. Each is spliced at
+    // its OWN package name (read from its Cargo.toml) so the tool's manifest
+    // names it naturally (`llm-client = { path = "llm-client" }`). This is how a
+    // tool declares a shared local crate beyond worker-common (design/caos-expr.md).
+    let mut i = 0;
+    loop {
+        let dep = arg(&format!("dep{i}"));
+        if !Path::new(&dep).exists() {
+            break;
+        }
+        let name = dep_crate_name(&dep)?;
+        link(&dep, proj.join(&name))?;
+        i += 1;
+    }
     caos(["put", path(&proj), "/cas/proj"])?;
 
     // No --profile: the cargo image's default is dev, which is what the bake
@@ -170,4 +196,25 @@ const CARGO_TOML: &str = "[package]\n\
 fn read_blob(cas_path: &str) -> Result<String, String> {
     caos(["get", cas_path])?;
     fs::read_to_string(cas_path).map_err(|e| format!("reading {cas_path}: {e}"))
+}
+
+/// The `[package] name` of a code-dep crate tree at CAS path `dep`, so it is
+/// spliced into the project under its own name. The first `name = "…"` line in
+/// its `Cargo.toml` is `[package].name` (the section is first by convention).
+fn dep_crate_name(dep: &str) -> Result<String, String> {
+    // Expand the dep dir one level so its Cargo.toml is a materializable
+    // placeholder (args arrive one level at a time, like `--src`).
+    caos(["get", dep])?;
+    let text = read_blob(&format!("{dep}/Cargo.toml"))?;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("name") {
+            if let Some(val) = rest.trim_start().strip_prefix('=') {
+                let name = val.trim().trim_matches('"');
+                if !name.is_empty() {
+                    return Ok(name.to_string());
+                }
+            }
+        }
+    }
+    Err(format!("no [package] name in {dep}/Cargo.toml"))
 }

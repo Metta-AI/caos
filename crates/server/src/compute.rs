@@ -1002,7 +1002,7 @@ fn resolve_flake_image(
     stack: &[String],
     trace_id: Option<&str>,
 ) -> Result<String, HttpError> {
-    let builder = std_image(config, std, "flake-builder")?;
+    let builder = flake_builder_image(config, std, salt, stack, trace_id)?;
     let oid = gix::ObjectId::from_hex(flake_tree.as_bytes())
         .map_err(|e| HttpError::new(400, format!("invalid flake tree hash {flake_tree}: {e}")))?;
     let in_entry = named_entry("in", gix::objs::tree::EntryKind::Tree.into(), oid);
@@ -1015,6 +1015,42 @@ fn resolve_flake_image(
             format!("converting built flake image {flake_tree} (delta {delta_tree}): {e}"),
         )
     })
+}
+
+/// The flake-builder image to run a flake through. Its std entry may be an image
+/// ALREADY (a git-docker delta — the old direct-image form), or a SOURCE tree
+/// whose `.caos-expr` is `run docker://seeded -- --in:@=.` (design/caos-expr.md,
+/// Phase 3). In the source case, resolving it as an image the OLD way — running
+/// flake-builder on a flake tree that IS flake-builder — cycles, so we instead
+/// form that expression's arg-tree here and dispatch it: the core-seeder-runner
+/// registered for exactly that key answers with the pre-built flake-builder
+/// image, spawning no container. (The client's `resolve_std_image` reaches the
+/// same key by actually evaluating the `.caos-expr`; the server can't eval, so
+/// it forms the one flake-builder key it knows.)
+fn flake_builder_image(
+    config: &Config,
+    std: &str,
+    salt: &str,
+    stack: &[String],
+    trace_id: Option<&str>,
+) -> Result<String, HttpError> {
+    let entry = std_image(config, std, "flake-builder")?;
+    // A delta (no flake.nix at its root) is already a runnable image — use it.
+    let is_source = is_flake_tree(config, &entry)
+        .map_err(|e| HttpError::new(500, format!("probing flake-builder entry {entry}: {e}")))?;
+    if !is_source {
+        return Ok(entry);
+    }
+    // Source form: `run docker://seeded -- --in:@=<the flake-builder source>`.
+    let oid = gix::ObjectId::from_hex(entry.as_bytes())
+        .map_err(|e| HttpError::new(500, format!("invalid flake-builder tree {entry}: {e}")))?;
+    let in_entry = named_entry("in", gix::objs::tree::EntryKind::Tree.into(), oid);
+    let seeded = format!("{DOCKER_SCHEME}seeded");
+    let result = run_image(config, &seeded, vec![in_entry], std, salt, stack, trace_id)?;
+    Ok(result
+        .split_once(' ')
+        .map(|(_, h)| h.to_string())
+        .unwrap_or(result))
 }
 
 /// Look up a named image in the `std` library tree (`refs/caos/std`), returning

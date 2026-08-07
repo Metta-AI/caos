@@ -1,0 +1,28 @@
+# std/llm-call — the stateless Messages API call worker as a caos-native std
+# tool (design/caos-expr.md, Phase 3). Built by rustc; worker-common is spliced
+# by rustc, llm-client rides as a numbered code dep (--dep0), and serde_json is
+# a crates.io dep the /std/cargo bake precompiles (anchored by crates/bake-anchor).
+[package]
+name = "llm-call"
+version = "0.0.0"
+edition = "2021"
+
+# /std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced by rustc at `worker-common/` (its curried --worker-common arg).
+worker-common = { path = "worker-common" }
+# Spliced by rustc at `llm-client/` (the --dep0 mount, DEEP-DEPS/llm-client).
+llm-client = { path = "llm-client" }
+serde_json = "1"
+
+# Match the caos workspace's dev profile so crates.io fingerprints line up with
+# the /std/cargo bake and its deps are reused rather than recompiled.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

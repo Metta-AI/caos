@@ -1,0 +1,20 @@
+# std/bash-tool — the agent harness's bounded bash tool as a caos-native std
+# tool (design/caos-expr.md, Phase 3). This directory IS the tool: its Rust
+# source (src/main.rs), this manifest, its `.caos-expr` and `DEPS`. Resolving
+# `/cas/std/bash-tool` evaluates the expression, which builds this project with
+# rustc (reached by a local DEEP-DEPS/rustc mount) and curries it onto the
+# runner pool. No crates.io deps — only worker-common, spliced by rustc — so
+# nothing rides the /std/cargo bake.
+[package]
+name = "bash-tool"
+version = "0.0.0"
+edition = "2021"
+
+# /std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }

@@ -109,6 +109,10 @@ stage3)
   # by recorded hash. Placeholders only — no content is fetched here.
   caos get /cas/args/result/std
   caos get /cas/args/result/bin
+  # The seed records (design/caos-expr.md, Phase 3), when the build carried them.
+  # A whole-tree placeholder — every wrapper gets the same one, so the inner
+  # core-seeder-runner answers flake-builder's `run docker://seeded`.
+  if [ -e /cas/args/result/seed ]; then caos get /cas/args/result/seed; fi
   caos get /cas/args/in
   caos get /cas/args/in/tests
   caos get /cas/args/in/tests/lib
@@ -160,6 +164,13 @@ stage3)
     mkdir -p "/tmp/sel/$t"
     ln -s "/cas/args/in/tests/$t" "/tmp/sel/$t/test"
     if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
+    # The seed records ride into EVERY wrapper (unlike the per-test std subset):
+    # they carry the flake-builder image the inner seeder answers with, and any
+    # test that builds a flake reaches flake-builder transitively. A symlink put,
+    # so nothing moves; test-stack/worker seeds refs/caos/seed from it.
+    if [ -e /cas/args/result/seed ]; then
+      ln -s /cas/args/result/seed "/tmp/sel/$t/seed"
+    fi
 
     # WHAT THIS TEST REACHES FOR, and nothing else. `uses-std` names the
     # /cas/std entries its jobs resolve; `uses-bin` the binaries it copies out
@@ -170,9 +181,8 @@ stage3)
     #
     # This is the whole mechanism. std used to be baked into the image, so any
     # worker binary moved the image and re-keyed all twenty tests; now a test's
-    # key holds what it named. A worker-bash-tool edit moves std/bash-tool and
-    # bin/worker-bash-tool, which the tests that name it re-key — the rest are
-    # hits.
+    # key holds what it named. A std/rgrep source edit moves /cas/std/rgrep,
+    # which the tests that name it re-key — the rest are hits.
     #
     # Undeclared is UNAVAILABLE, deliberately: an unnamed std entry will not
     # resolve and an unnamed binary will not copy. Both fail loudly inside the
@@ -202,6 +212,16 @@ stage3)
     # (tests/commit) — neither shows up in a search for /cas/std in the test
     # directory.
     mkdir -p "/tmp/sel/$t/std" "/tmp/sel/$t/bin"
+    # The std ROOT expression rides into EVERY subset. std is published
+    # un-deepened now (design/caos-expr.md), and `std/.caos-expr` —
+    # `run deep-deps -- --in:@=.` — is what deepens it on resolution, so a subset
+    # without it resolves nothing at all. Two consequences the `uses-std` lists
+    # above have to carry, and both are why every list names `deep-deps runner`:
+    #   - the transform deepens the WHOLE subset, so each list must be closed
+    #     under DEPS (an entry whose `../x` target is absent fails the deepen);
+    #   - the seeded deep-deps result is a curry over the runner delta, whose
+    #     base is a HASH BLOB — the runner tree does not ride along with it.
+    ln -s /cas/args/result/std/.caos-expr "/tmp/sel/$t/std/.caos-expr"
     if [ -e "$d/uses-std" ]; then
       caos get "/cas/args/in/tests/$t/uses-std"
       for e in $(cat "$d/uses-std"); do

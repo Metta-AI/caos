@@ -1,0 +1,51 @@
+# caos-expr Phase 3 — deep-deps migration: handoff
+
+Suite is **green (28/28)**; design state is in `design/caos-expr.md`. Nothing is
+mid-edit; the tree is green and committable as-is.
+
+## Where we are
+
+`.caos-expr` Phase 3, deep-deps migration. Landed & green:
+
+- Every std entry references deps via `DEEP-DEPS/x` (no ambient `/std` in exprs).
+- One `deepen_entry` pass in `build-builtins.sh` (replaced per-entry splices).
+- All leaf tools are checked-in source built by rustc: `bash-tool`, `rgrep`,
+  `llm-call`, `llm-step` (+ `llm-client` as a lib std entry, mounted via
+  `--dep0`). `worker-rustc` takes numbered `--depN` code deps.
+- `bake-anchor` crate + `lint-bake-anchor.sh` keep std tools' crates.io deps in
+  the `/std/cargo` bake.
+- **Seeded core = flake-builder, cargo, rustc, deep-deps** (sentinel
+  `.caos-expr`s: `run docker://seeded[-rustc|-deep-deps]`; bootstrap hand-builds
+  the result, hand-assembles the key). `stage_worker` deleted.
+- Decision (last turn): **`runner` stays raw / caosd-brought-up — NOT seeded,
+  not a std entry.** Drops the `--runner`/`own_image` cascade.
+
+## The one thing that's NOT done (the actual goal)
+
+Resolution still works only via the **pre-deepened `refs/caos/std` + `/cas/std` +
+`resolve_std_image` scaffolding**. There is **no runtime std-root `.caos-expr`**,
+so the checked-in tree isn't self-resolving and nothing resolves std *by
+descent*.
+
+## Next step (the flip)
+
+1. Add std-root `.caos-expr = run deep-deps -- --in:@=.` (cycle-2 is safe:
+   `resolve_expr_image` subtree-evaluates `std/deep-deps`'s seeded sentinel, so
+   the transform doesn't re-enter itself).
+2. Publish the **un-deepened** std; deepen at resolve time; keep seeding keys
+   from `deepen_entry` (bootstrap's bash deepen).
+3. **Byte-identity is load-bearing here** — `deepen_entry` must match the real
+   `deep-deps` worker or `cargo`/rustc-built leaves get a different key → seeder
+   misses → red.
+
+## Open questions (unanswered — decide on resume)
+
+- (a) Let the **suite be the guardrail** (a divergence turns cargo/leaves red and
+  localizes it) vs. a standalone worker-context diff test — the standalone one is
+  awkward to plumb (`cli.sh` sees std only as a resolver, inner stack holds a
+  subset).
+- (b) The flip **widens every test's `uses-std`** (each resolution now runs
+  `deep-deps` + needs transitive deps present), losing some per-test
+  incrementality — accept, or rethink the subset model first?
+
+That's the whole remaining chunk.

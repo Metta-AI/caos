@@ -1,0 +1,8 @@
+# std/llm-step's image (design/caos-expr.md, Phase 3): build this directory as a
+# Rust project with rustc. `--src:@=.` hands rustc the tool (Cargo.toml + src/,
+# including the src/githist/*.sh embeds; rustc skips the caos metadata —
+# .caos-expr, DEPS, DEEP-DEPS/); `--dep0:@=…` hands it the llm-client code crate,
+# spliced at `llm-client/`; `--runner:@=…` is the base its `finish` curries the
+# built binary onto. All deps are named by LOCAL deep-deps mounts (declared in
+# DEPS), never ambient /std.
+run DEEP-DEPS/rustc -- --src:@=. --dep0:@=DEEP-DEPS/llm-client --runner:@=DEEP-DEPS/runner

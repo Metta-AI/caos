@@ -264,6 +264,11 @@ make)
 
   # The std tree the seed stack just published, as a hash.
   STD=$(git -C "$state/git" rev-parse refs/caos/std) || fail "no refs/caos/std in the seed repo"
+  # The seed records (design/caos-expr.md, Phase 3), if bootstrap published any:
+  # flake-builder resolves via `run docker://seeded`, answered by the inner
+  # core-seeder-runner from these. Optional so a std without seeded core still
+  # builds.
+  SEED=$(git -C "$state/git" rev-parse refs/caos/seed 2>/dev/null || true)
 
   # Down before the repo is read: the server holds it open, and a half-written
   # pack is not something to hand on.
@@ -284,6 +289,16 @@ make)
   caos get-hash "$STD" /cas/std-built || fail "materializing the std placeholder"
   ts "handed std over ($STD)"
 
+  # The seed records ride over the same way — one small tree whose closure
+  # carries the flake-builder delta the seeder returns. Each test stack fetches
+  # it and its core-seeder-runner answers from it (test-stack/worker).
+  if [ -n "$SEED" ]; then
+    git -C "$state/git" push --quiet "$CAOS_SERVER_URL" "$SEED:refs/caos/seed-built-$SEED" \
+      || fail "pushing the published seed to the outer server"
+    caos get-hash "$SEED" /cas/seed-built || fail "materializing the seed placeholder"
+    ts "handed seed over ($SEED)"
+  fi
+
   # ---- 3. assemble ---------------------------------------------------------
   # {image, std, bin} — the three things a caller needs, separately, so that
   # what re-keys a job is what that job actually uses. The image holds only what
@@ -293,6 +308,10 @@ make)
   OUT=/tmp/out
   rm -rf "$OUT"; mkdir -p "$OUT"
   ln -s /cas/std-built "$OUT/std"
+  # The seed records, when bootstrap published them (a symlink put, recorded-hash
+  # reuse — no bytes move). Consumed by caos-tools/test.sh stage3 → each test
+  # wrapper → test-stack/worker, which seeds refs/caos/seed into the inner stack.
+  if [ -n "$SEED" ]; then ln -s /cas/seed-built "$OUT/seed"; fi
 
   IMG=$OUT/image
   mkdir -p "$IMG"
@@ -306,15 +325,14 @@ make)
   # made every worker edit move the image and re-key all twenty tests.
   L=$IMG/layer01
   mkdir -p "$L/caos/bin" "$L/caos/stack"
-  for b in caos caos-cli server runnerd; do
+  for b in caos caos-cli server runnerd core-seeder-runner; do
     install -m 755 "$BIN/$b" "$L/caos/bin/$b" || fail "no binary $b"
   done
 
   # The worker and helper binaries, as their own value. Tests that build their
   # own curries copy these (CAOS_BIN_DIR); a test gets only the ones it names.
   mkdir -p "$OUT/bin"
-  for b in worker-cargo worker-runner worker-rustc worker-bash-tool \
-           worker-llm-call worker-llm-step llm-stub; do
+  for b in worker-cargo worker-runner worker-rustc llm-stub; do
     install -m 755 "$BIN/$b" "$OUT/bin/$b" || fail "no binary $b"
   done
   install -m 755 "$wsroot/stack/serve" "$L/caos/stack/serve"
