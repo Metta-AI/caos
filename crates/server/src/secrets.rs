@@ -144,7 +144,10 @@ mod tests {
         let got = grant(&grants, &map(&[("image", "aa"), ("std", "z")]));
         assert_eq!(got, vec![("tok".to_string(), "s3cr3t".to_string())]);
         // Matches the second (pinned repo agrees).
-        assert_eq!(grant(&grants, &map(&[("image", "bb"), ("repo", "cc")])).len(), 1);
+        assert_eq!(
+            grant(&grants, &map(&[("image", "bb"), ("repo", "cc")])).len(),
+            1
+        );
         // Matches neither.
         assert!(grant(&grants, &map(&[("image", "xx")])).is_empty());
     }
