@@ -1,0 +1,29 @@
+[package]
+name = "caos-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Native desktop client for the CAOS agent harness"
+
+[workspace]
+members = ["."]
+resolver = "2"
+
+[lib]
+name = "caos_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "caos-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = "2.6.3"
+
+[dependencies]
+caos = { path = "../../crates/caos" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2.11.5", features = ["macos-private-api"] }
+tauri-plugin-opener = "2.5.4"
+
+[dev-dependencies]
+serde_json = "1"

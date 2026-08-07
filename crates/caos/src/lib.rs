@@ -38,6 +38,8 @@ use gix::objs::WriteTo;
 pub mod chat;
 pub use chat::{cli_chat, cli_talk};
 
+pub mod workspace;
+
 mod eval;
 pub use eval::cli_eval_path;
 

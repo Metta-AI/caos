@@ -60,6 +60,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
 | `Cargo.toml` | Workspace root (members + shared release profile) |
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
+| `desktop/` | Native Tauri client, kept in its own Cargo workspace so desktop dependencies never enter worker images |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
 | `build-builtins.sh` | Builds + publishes the `std` library to `refs/caos/std` |
@@ -87,10 +88,26 @@ the signal to trust before committing.
 > files are included, but new files are not). After adding a new source file,
 > `git add` it before building.
 
+### Desktop client
+
+The desktop client uses the same conversation engine as `caos tui` and is
+scoped to the Git repository it is launched from. Its transcript scrolls
+independently while the composer stays pinned to the bottom of the window.
+
+```bash
+nix run .#caos-desktop
+```
+
+Build it without launching with `nix build .#caos-desktop`. The desktop remains
+a separate Cargo workspace, and bare `nix build` continues to build only the
+CLI and daemon host tools. See [`desktop/README.md`](desktop/README.md) for the
+direct Cargo command, environment overrides, and current CLI-parity scope.
+
 ## Building
 
 ```bash
 nix build .#caos              # ./result/bin/{caos,caos-cli}
+nix build .#caos-desktop      # ./result/bin/caos-desktop
 nix build .#server            # ./result/bin/server
 ```
 

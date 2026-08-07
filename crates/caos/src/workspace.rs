@@ -1,16 +1,16 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use caos::chat::WorkspaceDiff;
+use crate::chat::WorkspaceDiff;
 
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
-/// the TUI chooses when to mutate the checkout and requires confirmation before
-/// calling it. Rather than applying the base-to-head diff as unstaged changes,
-/// this moves the local HEAD onto the conversation head commit so the checkout
-/// exactly matches it.
-pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
+/// clients choose when to mutate the checkout and require an explicit user
+/// action before calling it. Rather than applying the base-to-head diff as
+/// unstaged changes, this moves the local HEAD onto the conversation head
+/// commit so the checkout exactly matches it.
+pub fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -39,7 +39,7 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD`'s tree is returned. `git add -A` respects `.gitignore`, so the commit
 /// mirrors what a normal commit of the working tree would contain.
-pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, String> {
+pub fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, String> {
     capture_required("git", &["add", "-A"], cwd)?;
     // `git diff --cached --quiet` exits non-zero exactly when the index differs
     // from HEAD, i.e. there is something to commit.
@@ -60,13 +60,13 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
 /// fetched PR-base tip. Publishing to the default branch merges the complete
 /// workspace; publishing elsewhere replays this conversation's delta so a
 /// child can target its parent's clean snapshot without duplicating that work.
-pub(crate) fn publish_conversation_pr(
+pub fn publish_conversation_pr(
     name: &str,
     diff: &WorkspaceDiff,
     pr_base: &str,
     default_base: &str,
+    cwd: &Path,
 ) -> Result<String, String> {
-    let cwd = Path::new(".");
     let branch = format!("caos/{name}");
     let pr_base_commit = fetch_remote_branch_tip(pr_base, cwd)?;
     let change_base = (pr_base != default_base).then_some(diff.base_commit.as_str());
@@ -127,7 +127,7 @@ pub(crate) fn publish_conversation_pr(
 /// fetch`, so it stays instant (e.g. on every Ctrl+N) instead of blocking on
 /// round-trips to `origin`. Publishing a PR still fetches, where a fresh remote
 /// tip matters.
-pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+pub fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
     // `refs/remotes/origin/HEAD` is the local symref recording origin's default
     // branch; it is set at clone time and refreshed by `git remote set-head`.
     let head_ref = capture_required("git", &["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
@@ -147,7 +147,7 @@ pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), S
     Ok((branch, commit))
 }
 
-pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
+pub fn remote_default_branch(cwd: &Path) -> Result<String, String> {
     let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
     let stdout = require_success("git", output)?;
     parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
@@ -226,7 +226,7 @@ fn remote_branch_tip(branch_ref: &str, cwd: &Path) -> Result<Option<String>, Str
     Ok(Some(oid.to_string()))
 }
 
-pub(crate) fn prepare_publish_branch(
+fn prepare_publish_branch(
     name: &str,
     diff: &WorkspaceDiff,
     publish_base: &str,
@@ -359,7 +359,7 @@ fn merge_publish_tree(
     require_success("git merge-tree", output).map(|_| unreachable!())
 }
 
-pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
     let output = command_output(program, args, cwd)?;
     require_success(program, output).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
 }

@@ -69,13 +69,15 @@
         rustToolchain = mkRustToolchain pkgs;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # The cargo source, WITHOUT ./tests. cleanCargoSource sweeps in every
-        # Cargo.toml in the tree, and crane's mkDummySrc keeps them, so the
-        # suite's cargo fixtures — tests/cargo-check/{broken,mini} and
-        # tests/cargo-crates/ws — landed in the DEPENDENCY cache key. They
-        # contribute nothing to it: ws declares its own [workspace], the other
-        # two have no dependencies at all, and none is a member here. Yet
-        # editing one rebuilt all ~176 deps.
+        # The core cargo source, WITHOUT ./tests or ./desktop. cleanCargoSource
+        # sweeps in every Cargo.toml in the tree, and crane's mkDummySrc keeps
+        # them, so unrelated Cargo workspaces otherwise land in this workspace's
+        # dependency cache key. The suite's cargo fixtures —
+        # tests/cargo-check/{broken,mini} and tests/cargo-crates/ws — contribute
+        # nothing to it: ws declares its own [workspace], the other two have no
+        # dependencies at all, and none is a member here. Yet editing one rebuilt
+        # all ~176 deps. The desktop is likewise its own workspace and has a
+        # separate native build below; its edits must not rebuild worker binaries.
         #
         # They are runtime DATA, not source: the suite hands those directories
         # to the cargo worker as trees to check, delivered over caos by
@@ -111,6 +113,7 @@
               isCrateScript = pkgs.lib.hasPrefix "crates/" rel && pkgs.lib.hasSuffix ".sh" rel;
             in
             (rel != "tests" && !(pkgs.lib.hasPrefix "tests/" rel))
+            && (rel != "desktop" && !(pkgs.lib.hasPrefix "desktop/" rel))
             && (craneLib.filterCargoSources path type || isCrateScript);
         };
 
@@ -613,6 +616,79 @@
           '';
         };
 
+        # The Tauri client is a host-native application, not part of the
+        # static-musl workspace above. Keep its source and platform libraries
+        # separate so adding a desktop dependency cannot change worker images
+        # or the root Cargo.lock.
+        desktopManifest = builtins.fromTOML (builtins.readFile ./desktop/src-tauri/Cargo.toml);
+        desktopNodeModules = pkgs.importNpmLock.buildNodeModules {
+          npmRoot = ./desktop;
+          inherit (pkgs) nodejs;
+        };
+        desktopSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./desktop/src-tauri)
+            (craneLib.fileset.commonCargoSources ./crates/caos)
+            (craneLib.fileset.commonCargoSources ./crates/caos-world)
+            ./desktop/src-tauri/capabilities
+            ./desktop/src-tauri/icons
+            ./desktop/src-tauri/tauri.conf.json
+            ./desktop/build.mjs
+            ./desktop/package.json
+            ./desktop/package-lock.json
+            ./desktop/tests
+            ./desktop/ui
+          ];
+        };
+        desktopArgs = {
+          src = desktopSrc;
+          cargoLock = ./desktop/src-tauri/Cargo.lock;
+          cargoToml = ./desktop/src-tauri/Cargo.toml;
+          cargoExtraArgs = "--locked";
+          pname = desktopManifest.package.name;
+          version = desktopManifest.package.version;
+          strictDeps = true;
+
+          # Crane's Cargo.lock replacement hook writes in the build directory,
+          # so enter the nested workspace before any later phase runs. The
+          # sibling UI and ../../crates path dependencies remain in the source
+          # tree and keep their ordinary Cargo-relative locations.
+          postUnpack = ''
+            cd "$sourceRoot/desktop/src-tauri"
+            sourceRoot=.
+          '';
+
+          preBuild = ''
+            ln -s ${desktopNodeModules}/node_modules ../node_modules
+            (cd .. && node build.mjs)
+          '';
+
+          nativeBuildInputs = [ pkgs.esbuild pkgs.nodejs ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.pkg-config
+            pkgs.wrapGAppsHook3
+          ];
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.glib-networking
+            pkgs.webkitgtk_4_1
+          ];
+        };
+        caos-desktop = craneLib.buildPackage (
+          desktopArgs
+          // {
+            # Tauri embeds its build-time OUT_DIR in generated permission
+            # metadata, so artifacts cannot move safely between derivations.
+            cargoArtifacts = null;
+            postCheck = ''
+              (cd .. && npm test)
+            '';
+            meta = {
+              description = desktopManifest.package.description;
+              mainProgram = "caos-desktop";
+              platforms = pkgs.lib.platforms.linux ++ pkgs.lib.platforms.darwin;
+            };
+          }
+        );
 
         # The worker images that make up `std`, keyed by the same builtin name
         # build-builtins.sh maps them back to (via the <name> baked into each
@@ -954,7 +1030,7 @@
           # (another `nix build`) is the only thing that moves it. The workspace
           # binaries stay available as `.#caos`.
           default = caos-tools;
-          inherit caos server runnerd caos-cli caosd caos-tools;
+          inherit caos server runnerd caos-cli caosd caos-tools caos-desktop;
           # Agent-harness worker binaries (run as curry(runner, bin)) and the
           # LLM worker tests' stub server.
           inherit worker-bash-tool worker-llm-call worker-llm-step worker-rgrep llm-stub;
@@ -992,26 +1068,34 @@
             program = "${caosd}/bin/caosd";
           };
 
+          caos-desktop = {
+            type = "app";
+            program = "${caos-desktop}/bin/caos-desktop";
+          };
         };
 
-        # No `checks` output at all. test, clippy, doc and fmt all run in
+        # The root workspace's test, clippy, doc and fmt gates still run in
         # tests/unit-{test,clippy,doc,fmt}, through the cargo worker, and
-        # `caos-cli run-tool test` is the only runner anyone invokes —
-        # there is no CI here, and
-        # CLAUDE.md's pre-commit step is nix build + caosd up + run-tool test.
+        # `caos-cli run-tool test` remains their one runner. The desktop cannot
+        # run there without putting a native WebView stack in the worker image,
+        # so its package is also its flake check; building it runs both the Rust
+        # and browser-independent JavaScript tests.
         #
-        # Every one of them had a reason to move, and the tests had the
+        # The root checks had a reason to move, and the tests had the
         # sharpest: git_transport_tests and chat::tests spawn git, which the
         # worker's PATH carries (bake.env's gitMinimal) and a nix builder's
         # does not, so that check had been silently red — on origin/main and
         # before a56df5a. `doc` was red too, on two rustdoc links. A check
         # nobody runs is a check that goes quietly red; one runner, and it is
         # the one with the environment the work needs.
+        checks.caos-desktop = caos-desktop;
 
         devShells.default = craneLib.devShell {
           # Brings the pinned toolchain (rustc, cargo, clippy, rustfmt) onto PATH.
           packages = [
             pkgs.cargo-watch
+            pkgs.esbuild
+            pkgs.nodejs
             pkgs.rust-analyzer
             # rust-src is IDE-only (stdlib source for navigation), so it rides
             # here rather than in the build toolchain — where it would land in

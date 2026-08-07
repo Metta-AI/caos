@@ -1,0 +1,20 @@
+{
+  "name": "caos-desktop-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml --",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@shikijs/core": "4.4.2",
+    "@shikijs/engine-javascript": "4.4.2",
+    "@shikijs/langs": "4.4.2",
+    "@shikijs/themes": "4.4.2",
+    "dompurify": "3.4.13",
+    "marked": "18.0.9",
+    "parse-diff": "0.12.0"
+  }
+}
