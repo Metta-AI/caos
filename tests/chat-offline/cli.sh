@@ -25,7 +25,9 @@ echo "== stage the worker binaries and fixtures ==" >&2
 # suite threads in).
 cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
 cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
-cp "$CAOS_BIN_DIR/worker-rgrep" rgrep-bin
+# rgrep is not injected as a host binary: it is a normal std source entry
+# (std/rgrep), so the harness resolves /cas/std/rgrep and builds it via
+# /std/rustc like any tool (design/caos-expr.md, Phase 3).
 stub_bin=$CAOS_BIN_DIR/llm-stub
 
 # The conversation's workspace, and the identity chat's human commits use.
@@ -63,7 +65,7 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 conv="chat-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin CAOS_RGREP_BIN=rgrep-bin
+export CAOS_LLM_STEP_BIN=llm-step-bin CAOS_BASH_TOOL_BIN=bash-tool-bin
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}

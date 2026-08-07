@@ -86,11 +86,11 @@ echo "  ok: per-crate check clean (${cold}ms cold, ${cold_hits} cache hits)" >&2
 # working perfectly). A count of cache hits cannot be broken by making things
 # faster.
 #
-# worker-rgrep is a LEAF — nothing depends on it — so every other member's job
+# worker-runner is a LEAF — nothing depends on it — so every other member's job
 # should hit. The threshold is deliberately loose: the point is "most of the
 # workspace was reused", not an exact count that would need editing whenever a
 # crate is added.
-echo "// tripwire edit" >> ws/crates/worker-rgrep/src/main.rs
+echo "// tripwire edit" >> ws/crates/worker-runner/src/main.rs
 commit "edit one crate"
 t4=$(ms)
 "$CAOS_CLI" run --trace=edit.trace /cas/std/cargo r3 -- \
@@ -110,7 +110,7 @@ echo "  ok: one-crate edit had ${edit_hits} cache hits (cold had ${cold_hits})" 
   || fail "the cold run had ${cold_hits} cache hits vs ${edit_hits} in the edit run — the salt did not take, so nothing here is measuring what it claims"
 [ "$edit_hits" -ge 8 ] \
   || fail "one-crate edit reused only ${edit_hits} cached jobs — per-crate caching regressed.
-  Editing the leaf crate worker-rgrep should leave every other member's compile
+  Editing the leaf crate worker-runner should leave every other member's compile
   a cache hit; the cold run before it had ${cold_hits} hits by construction."
 edit=$((t5 - t4))
 # Reported, NOT asserted on. The ratio is worth seeing in the log and worthless

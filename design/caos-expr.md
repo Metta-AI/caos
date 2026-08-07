@@ -56,3 +56,102 @@ Solution:
 Later we will devise a way to expose `std` in these `DEPS` files so that a subtree may depend on any item in std that it likes. This is better than other mechanisms that we have considered:
 - Passing all of std to every worker means that any change to std invalides all cache entries
 - Having workers pass std members when they call other workers means that when a worker needs a new std member, it all of its transitive callers must be updated
+
+## Implementation plan (Phase 3: bootstrap + seeder)
+
+Status so far (landed, suite green):
+- `caos eval-path` and the `.caos-expr` grammar (Phase 1); whole-tree `deep-deps` published as `std/deep-deps` (Phase 2).
+- `resolve_std_image` resolves a `/cas/std/<name>` builtin by running the *same*
+  `eval-path` walker over the std tree (`eval::eval_std_entry`): a std-root
+  `.caos-expr` is applied first, then the named entry's own — so a std entry can
+  be a direct image OR source + a `.caos-expr`, resolved uniformly.
+- `std/bash`, `std/merge`: source + `.caos-expr` (`run /std/flake-builder -- --in:@=.`).
+- `/std/rustc` gained a **directory interface** (`--src:@=<project dir>` using the
+  tool's own `Cargo.toml`) and builds at the cargo image's default profile
+  (dev + musl) so a tool's crates.io deps are **reused from the seeded
+  `/std/cargo` bake** rather than recompiled.
+- `std/rgrep`: `{ src/main.rs, Cargo.toml, .caos-expr }` — a normal tool built by
+  `/std/rustc`; `crates/worker-rgrep` deleted (the harness resolves `/cas/std/rgrep`
+  like production).
+
+### The core idea
+
+`std/*` is uniform: **every** entry carries a `.caos-expr` describing how it is
+built, and callers never special-case anything — they resolve, which forms an
+arg-tree and dispatches. The irreducible core is *not* actually built by its
+expression; `bootstrap.sh` (the renamed `build-builtins.sh`) hand-builds each
+core artifact to be **byte-identical to what its expression would have
+produced**, and the seeder injects those artifacts under **the key the
+expression evaluates to** — so seeded keys are provably the keys callers hit.
+
+### `bootstrap.sh` (rename of `build-builtins.sh`)
+
+- Hand-builds the irreducible core **in dependency order**, each item matching
+  what its `.caos-expr` describes. Mostly this is *currying host-nix artifacts*,
+  not running workers: the worker binaries (`rustc`, `deep-deps`, cargo's image)
+  are already host-built; "build manually" = curry them onto `runner` / stream
+  the image, as today.
+- If an entry declares deep-deps, bootstrap **fills the deepened deps itself**
+  (hand-deepening), so the tree it seeds matches what the real `deep-deps`
+  worker would emit. GUARDRAIL: a test diffs bootstrap's hand-deepened tree
+  against the `deep-deps` worker's output on the same input — they must be
+  byte-identical, or the seeded key won't match the caller's.
+- Emits a **seed record** per core item: `{ required: <the arg-tree's top-level
+  name→oid entries>, result: <the hand-built delta/curry hash> }`, published
+  under a ref (e.g. `refs/caos/seed`). The `required` set is formed by
+  evaluating the item's `.caos-expr` through caos — the same code the caller
+  uses — so the key matches by construction, not by a hand-maintained table.
+- **No runner, one path.** All seeding is done without a generic runner, so the
+  host (`up`/caosd), the nix seed derivation, and the test stack all seed
+  identically. (Starting a runner mid-bootstrap is a possible *optimization*
+  later, not part of the contract.) Non-core leaf tools (`bash`, `merge`,
+  `rgrep`) are not seeded; they build at first use in the live stack.
+
+### `core-seeder-runner` (new)
+
+- A runner (uses the existing `/runner/poll` protocol — **no server change**).
+  Reads the seed records and registers one poll per record with `required` =
+  that record's arg-tree entries; on a match it **posts the pre-built result
+  directly**, spawning no container.
+- Wins over `runnerd` automatically: the server already prefers the most-specific
+  `required` match (`offer_job` / `best_pending` `max_by_key(required.len())`),
+  and a full arg-tree match beats `runnerd`'s empty `required`. Works even when
+  no generic runner exists — the bootstrap situation.
+- **Dependency-ordered with a live answerer.** Because a core item's expr names
+  its *real* builder (e.g. cargo's is `run /std/flake-builder -- --in:@=.`),
+  *forming* cargo's key dispatches `flake-builder`'s build — which must already
+  be answered. So the seeder cannot compute all keys independently up front: one
+  thread polls-and-answers from the current seed map while the main thread
+  extends the map in order (`flake-builder → runner → cargo → rustc →
+  deep-deps`). Forming key *N* only dispatches items `< N`, already registered.
+
+### Breaking the cycles
+
+1. **`flake-builder`'s self-reference** (resolution-time, in-process, before any
+   dispatch the seeder could answer). Fix: `flake-builder`'s `.caos-expr` names
+   its image as the sentinel `docker://seeded` — `run docker://seeded -- --in:@=.`.
+   A `docker://` ref passes straight through `resolve_expr_image` (needs a small
+   addition — that resolver doesn't yet handle `docker://`; `resolve_run_image`
+   already does), so evaluation never re-enters `/std/flake-builder`. The formed
+   key is `{ image: docker://seeded, in: <flake-builder tree>, std, salt }`,
+   which is exactly what the seeder registers and answers. Nothing pulls
+   `docker://seeded`: the seeder answers first; if it is absent, the job hits
+   `runnerd` and fails loudly on a bogus image (an honest "bootstrap broken"
+   signal, never a silent wrong answer). Only `flake-builder` uses the sentinel;
+   every other core item names its real builder.
+2. **The top-level `deep-deps` `.caos-expr`** (if the tree root deepens the whole
+   tree, forming any std key needs `deep-deps`, which needs `rustc`/`cargo` — a
+   cycle). Fix: bootstrap works against a **de-deep-deps'd tree** (the top-level
+   `deep-deps` call stripped), hand-fills the deepened deps itself, and seeds.
+   Once `deep-deps` is seeded, callers using the *real* top-level expr form the
+   same keys.
+
+### Build order (first cut)
+
+1. `docker://` passthrough in `resolve_expr_image`; `flake-builder`'s `.caos-expr`.
+2. Seed-record format + `bootstrap.sh` emitting records (key from caos-expr eval
+   → hand-built artifact), still hand-building the core as today.
+3. `core-seeder-runner`; start it in `stack/serve` alongside the server.
+4. Give the remaining core entries (`runner`, `cargo`, `rustc`, `deep-deps`)
+   their `.caos-expr`; wire the dependency-ordered live answerer.
+5. Hand-deepening + its byte-identity guardrail test.
