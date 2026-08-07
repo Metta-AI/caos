@@ -109,7 +109,11 @@ struct WorkRequest<'a> {
 /// CLI, which pushed the ArgTree): workers never call back into `/run` — a
 /// worker's sub-runs are promise resolutions the server performs itself
 /// ([`run_work_request`] recursion).
-pub(crate) fn run(config: &Config, query: &str, secrets_header: &str) -> Result<Vec<u8>, HttpError> {
+pub(crate) fn run(
+    config: &Config,
+    query: &str,
+    secrets_header: &str,
+) -> Result<Vec<u8>, HttpError> {
     let arg_tree = query_param(query, "req")
         .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
     if arg_tree.is_empty() || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
