@@ -3100,27 +3100,49 @@ fn merge_entries(
 /// `(type, hash)`. The server runs the container (resolving any promise it leaves
 /// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
 /// param's historical name; its value is the arg-tree hash.)
-fn request_compute(base: &str, arg_tree: &str) -> Result<(String, String), String> {
+fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
     let url = format!("{}/run?req={}", base.trim_end_matches('/'), arg_tree);
-    request_compute_url(&url)
+    request_compute_url(&url, secrets)
 }
 
 fn request_compute_traced(
     base: &str,
     arg_tree: &str,
     trace_id: &str,
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let url = format!(
         "{}/run?req={arg_tree}&trace={trace_id}",
         base.trim_end_matches('/')
     );
-    request_compute_url(&url)
+    request_compute_url(&url, secrets)
 }
 
-fn request_compute_url(url: &str) -> Result<(String, String), String> {
-    let body = http_get(url)?;
-    let text =
-        String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+/// Issue the compute `GET /run`, carrying the ephemeral secrets store in the
+/// [`SECRETS_HEADER`] header when non-empty (design/secrets.md) — out of band
+/// from the content-addressed ArgTree in the URL.
+fn request_compute_url(url: &str, secrets: &str) -> Result<(String, String), String> {
+    let mut request = minreq::get(url).with_header(caos_world::WORLD_HEADER, caos_world::WORLD);
+    if !secrets.is_empty() {
+        request = request.with_header(SECRETS_HEADER, secrets);
+    }
+    let response = request.send().map_err(|e| format!("GET {url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        // Surface the server's response body — a 500 carries the worker's
+        // failure output, which is what you actually need.
+        let body = response.as_str().unwrap_or("").trim();
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{body}")
+        };
+        return Err(format!(
+            "GET {url}: server returned {} {}{detail}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let text = String::from_utf8(response.into_bytes())
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
         .trim()
         .split_once(' ')
