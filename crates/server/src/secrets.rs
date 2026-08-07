@@ -118,6 +118,31 @@ fn is_subset(reader: &BTreeMap<String, String>, job: &BTreeMap<String, String>) 
     reader.iter().all(|(name, oid)| job.get(name) == Some(oid))
 }
 
+/// The `secret-hash` cache-isolation tag for a job with base arg entries
+/// `arg_entries` (design/secrets.md): the git-blob digest of the
+/// `(name, entropy)` pairs of the grants whose readers match — `None` when no
+/// grant matches (a secret-free run stays globally shared). Whoever assembles
+/// the ArgTree folds this in as the reserved `secret-hash` entry, so the entropy
+/// itself never touches the tree. Client and server must agree, so both hash the
+/// shared [`caos_world::secret_hash_material`].
+pub(crate) fn secret_hash(
+    grants: &[Grant],
+    arg_entries: &BTreeMap<String, String>,
+) -> Option<String> {
+    let pairs: Vec<(&str, &str)> = grants
+        .iter()
+        .filter(|g| g.readers.iter().any(|r| is_subset(r, arg_entries)))
+        .map(|g| (g.name.as_str(), g.entropy.as_str()))
+        .collect();
+    if pairs.is_empty() {
+        return None;
+    }
+    let material = caos_world::secret_hash_material(&pairs);
+    let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::object::Kind::Blob, &material)
+        .expect("hashing secret material");
+    Some(oid.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
