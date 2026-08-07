@@ -541,6 +541,7 @@ fn resolve_promise(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<(String, bool), HttpError> {
     use gix::objs::tree::EntryKind;
 
