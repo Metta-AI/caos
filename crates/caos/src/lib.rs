@@ -2283,9 +2283,7 @@ fn run_request(
     // at it).
     let server = t.server_url()?;
     match trace {
-        Some((id, output)) => {
-            request_compute_streamed(&server, &arg_tree, id, output, &header)
-        }
+        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, &header),
         None => request_compute(&server, &arg_tree, &header),
     }
 }
