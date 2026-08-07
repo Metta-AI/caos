@@ -621,6 +621,10 @@
         # separate so adding a desktop dependency cannot change worker images
         # or the root Cargo.lock.
         desktopManifest = builtins.fromTOML (builtins.readFile ./desktop/src-tauri/Cargo.toml);
+        desktopNodeModules = pkgs.importNpmLock.buildNodeModules {
+          npmRoot = ./desktop;
+          inherit (pkgs) nodejs;
+        };
         desktopSrc = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
@@ -630,6 +634,9 @@
             ./desktop/src-tauri/capabilities
             ./desktop/src-tauri/icons
             ./desktop/src-tauri/tauri.conf.json
+            ./desktop/build.mjs
+            ./desktop/package.json
+            ./desktop/package-lock.json
             ./desktop/tests
             ./desktop/ui
           ];
@@ -652,7 +659,12 @@
             sourceRoot=.
           '';
 
-          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+          preBuild = ''
+            ln -s ${desktopNodeModules}/node_modules ../node_modules
+            (cd .. && node build.mjs)
+          '';
+
+          nativeBuildInputs = [ pkgs.esbuild pkgs.nodejs ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.pkg-config
             pkgs.wrapGAppsHook3
           ];
@@ -667,9 +679,8 @@
             # Tauri embeds its build-time OUT_DIR in generated permission
             # metadata, so artifacts cannot move safely between derivations.
             cargoArtifacts = null;
-            nativeCheckInputs = [ pkgs.nodejs ];
             postCheck = ''
-              node --test ../tests/*.test.js
+              (cd .. && npm test)
             '';
             meta = {
               description = desktopManifest.package.description;
@@ -1083,6 +1094,8 @@
           # Brings the pinned toolchain (rustc, cargo, clippy, rustfmt) onto PATH.
           packages = [
             pkgs.cargo-watch
+            pkgs.esbuild
+            pkgs.nodejs
             pkgs.rust-analyzer
             # rust-src is IDE-only (stdlib source for navigation), so it rides
             # here rather than in the build toolchain — where it would land in
