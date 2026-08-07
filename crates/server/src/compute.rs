@@ -172,6 +172,7 @@ fn run_work_request_inner(
         arg_tree,
         stack,
         trace_id,
+        secrets: _,
     } = *request;
     // Unpack the ArgTree: the worker image (its reserved `image` entry — an
     // embedded tree for a git image, a ref blob for `docker://`), std (its
