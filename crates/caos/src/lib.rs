@@ -3112,15 +3112,23 @@ fn merge_entries(
 /// Directory of the caller's git-ignored secrets store (design/secrets.md).
 const SECRETS_DIR: &str = ".caos-secrets";
 
-/// Build the `X-Caos-Secrets` header value from the caller's `.caos-secrets`
-/// store: a JSON array of `{name, value, readers}`, where each reader is
-/// resolved HERE (via eval-path, against the store's pinned tree) to a partial
-/// arg tree of name → oid — so the server only subset-matches, never evals.
-/// Empty string when there is no store.
-fn build_secrets_header(t: &dyn Transport) -> Result<String, String> {
+/// A resolved secret from the caller's store: its value, its entropy (the
+/// cache-isolation capability), and each reader resolved to a partial arg tree.
+struct ClientSecret {
+    name: String,
+    value: String,
+    entropy: String,
+    readers: Vec<std::collections::BTreeMap<String, String>>,
+}
+
+/// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
+/// each reader resolved HERE (via eval-path, against the store's pinned tree)
+/// to a partial arg tree of name → oid — so the server only subset-matches,
+/// never evals. Empty when there is no store.
+fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
     let dir = Path::new(SECRETS_DIR);
     if !dir.is_dir() {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     let pinned = secrets_pinned_tree(t, dir)?;
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -3129,7 +3137,7 @@ fn build_secrets_header(t: &dyn Transport) -> Result<String, String> {
         .map(|e| e.path())
         .collect();
     paths.sort();
-    let mut grants: Vec<serde_json::Value> = Vec::new();
+    let mut store = Vec::new();
     for path in paths {
         let file_name = path
             .file_name()
@@ -3140,21 +3148,70 @@ fn build_secrets_header(t: &dyn Transport) -> Result<String, String> {
         if file_name.starts_with('.') || !path.is_file() {
             continue;
         }
-        let (name, value, readers) = parse_local_secret(&file_name, &path)?;
-        let resolved: Vec<std::collections::BTreeMap<String, String>> = readers
+        let (name, value, entropy, readers) = parse_local_secret(&file_name, &path)?;
+        let readers = readers
             .iter()
             .map(|r| resolve_reader_client(t, &pinned, r))
             .collect::<Result<_, _>>()?;
-        grants.push(serde_json::json!({
-            "name": name,
-            "value": value,
-            "readers": resolved,
-        }));
+        store.push(ClientSecret {
+            name,
+            value,
+            entropy,
+            readers,
+        });
     }
-    if grants.is_empty() {
-        return Ok(String::new());
+    Ok(store)
+}
+
+/// Serialize the store for the `X-Caos-Secrets` header — a JSON array of
+/// `{name, value, entropy, readers}`. Empty string for an empty store.
+fn secret_store_header(store: &[ClientSecret]) -> String {
+    if store.is_empty() {
+        return String::new();
     }
-    serde_json::to_string(&grants).map_err(|e| format!("serializing secrets store: {e}"))
+    let array: Vec<serde_json::Value> = store
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "value": s.value,
+                "entropy": s.entropy,
+                "readers": s.readers,
+            })
+        })
+        .collect();
+    serde_json::to_string(&array).unwrap_or_default()
+}
+
+/// The `secret-hash` cache-isolation tag for an ArgTree whose base entries are
+/// `base` (design/secrets.md): the git-blob digest of the `(name, entropy)`
+/// pairs of the store's secrets whose readers match — `None` when none match.
+/// Byte-identical to the server's [`crate::secrets`] side (both hash the shared
+/// `caos_world::secret_hash_material`), so a computation shares one cache entry
+/// whether the client or the server assembles it.
+fn client_secret_hash(
+    store: &[ClientSecret],
+    base: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let pairs: Vec<(&str, &str)> = store
+        .iter()
+        .filter(|s| s.readers.iter().any(|r| reader_subset(r, base)))
+        .map(|s| (s.name.as_str(), s.entropy.as_str()))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let material = caos_world::secret_hash_material(&pairs);
+    Ok(Some(hash_bytes("blob", &material)?.to_string()))
+}
+
+/// Is `reader` (a partial arg tree) a subset of `base`? (The client-side twin of
+/// the server's match — kept identical so both compute the same `secret-hash`.)
+fn reader_subset(
+    reader: &std::collections::BTreeMap<String, String>,
+    base: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    reader.iter().all(|(name, oid)| base.get(name) == Some(oid))
 }
 
 /// The tree tree-relative readers resolve against: the `.tree` file in the store
