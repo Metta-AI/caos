@@ -193,4 +193,27 @@ mod tests {
         // A grant missing its value is skipped.
         assert!(parse_header(r#"[{"name":"x"}]"#).is_empty());
     }
+
+    #[test]
+    fn secret_hash_isolates_and_is_stable() {
+        let grants = parse_header(
+            r#"[{"name":"tok","value":"v","entropy":"E1","readers":[{"image":"aa"}]}]"#,
+        );
+        let job = map(&[("image", "aa"), ("std", "z")]);
+        let h = secret_hash(&grants, &job).expect("a matching grant hashes");
+        // Stable across calls (a real cache key).
+        assert_eq!(Some(h.clone()), secret_hash(&grants, &job));
+        // No matching grant → None, so a secret-free run stays globally shared.
+        assert!(secret_hash(&grants, &map(&[("image", "zz")])).is_none());
+        // Rotating the entropy re-namespaces the cache; rotating only the value
+        // (same entropy) does not.
+        let rotated_entropy = parse_header(
+            r#"[{"name":"tok","value":"v","entropy":"E2","readers":[{"image":"aa"}]}]"#,
+        );
+        assert_ne!(Some(h.clone()), secret_hash(&rotated_entropy, &job));
+        let rotated_value = parse_header(
+            r#"[{"name":"tok","value":"DIFFERENT","entropy":"E1","readers":[{"image":"aa"}]}]"#,
+        );
+        assert_eq!(Some(h), secret_hash(&rotated_value, &job));
+    }
 }
