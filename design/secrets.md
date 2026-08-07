@@ -1,6 +1,9 @@
 # Secrets: identity-is-capability — design note
 
-**Status:** proposed. Design discussion only; not built. Builds on
+**Status:** partly built. Injection, matching, and the leak-prevention
+mechanisms exist in an interim *server-side* form (secrets sourced from a
+server `CAOS_SECRETS_DIR`); the per-user ephemeral-context sourcing and the
+entropy/cache-isolation hash described below are not yet built. Builds on
 `.caos-expr` (eval-path, deep-deps) and map-then (server-mediated worker
 starts).
 
