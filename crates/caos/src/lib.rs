@@ -2270,6 +2270,7 @@ fn run_request(
     cas: Option<&Path>,
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let arg_tree = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
@@ -2277,8 +2278,8 @@ fn run_request(
     // at it).
     let server = t.server_url()?;
     match trace {
-        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output),
-        None => request_compute(&server, &arg_tree),
+        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, secrets),
+        None => request_compute(&server, &arg_tree, secrets),
     }
 }
 
