@@ -91,6 +91,10 @@ struct WorkRequest<'a> {
     stack: &'a [String],
     /// Trace id for observability, if this run is being traced.
     trace_id: Option<&'a str>,
+    /// The secrets the run carries as ephemeral context (design/secrets.md):
+    /// matched + injected at every dispatch, threaded into promise sub-runs.
+    /// NOT part of the ArgTree or the cache key.
+    secrets: &'a [crate::secrets::Grant],
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
@@ -105,7 +109,11 @@ struct WorkRequest<'a> {
 /// CLI, which pushed the ArgTree): workers never call back into `/run` — a
 /// worker's sub-runs are promise resolutions the server performs itself
 /// ([`run_work_request`] recursion).
-pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
+pub(crate) fn run(
+    config: &Config,
+    query: &str,
+    secrets_header: &str,
+) -> Result<Vec<u8>, HttpError> {
     let arg_tree = query_param(query, "req")
         .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
     if arg_tree.is_empty() || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -121,6 +129,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         }
         config.trace.begin(id).map_err(|e| HttpError::new(409, e))?;
     }
+    // The carried secrets store (design/secrets.md): parsed from the request
+    // header, held for this run and threaded through every sub-run's dispatch.
+    let secrets = crate::secrets::parse_header(secrets_header);
     // An HTTP run is by definition top-level: the run stack (cycle detection)
     // exists only inside the server, threaded through promise sub-runs.
     let result = run_work_request(
@@ -129,6 +140,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
             arg_tree: &arg_tree,
             stack: &[],
             trace_id: trace_id.as_deref(),
+            secrets: &secrets,
         },
     );
     if let Some(id) = &trace_id {
@@ -164,6 +176,7 @@ fn run_work_request_inner(
         arg_tree,
         stack,
         trace_id,
+        secrets: _,
     } = *request;
     // Unpack the ArgTree: the worker image (its reserved `image` entry — an
     // embedded tree for a git image, a ref blob for `docker://`), std (its
@@ -297,6 +310,7 @@ fn run_dispatch(
         arg_tree,
         stack,
         trace_id,
+        secrets,
     } = *request;
     let fail = |e: HttpError| (e.status(), e.message().to_string());
 
@@ -312,19 +326,19 @@ fn run_dispatch(
     // server thread until a runner posts the result; capacity is runner-side
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
-        let image_ref =
-            resolve_image(config, image, std, salt, &child_stack, trace_id).map_err(fail)?;
+        let image_ref = resolve_image(config, image, std, salt, &child_stack, trace_id, secrets)
+            .map_err(fail)?;
         // Reuse the ArgTree's entries the tracer already read, else read them now.
         let arg_entries = match traced_arg_entries {
             Some(entries) => entries,
             None => args_entries(config, arg_tree).map_err(fail)?,
         };
         // Find the secrets this job's identity is entitled to (design/secrets.md):
-        // readers whose partial arg tree is a subset of ours. They ride out of
-        // band in the job payload — never in the ArgTree, so never in the cache
-        // key — and the container runner drops them at `/secret/<name>`.
-        let secrets = crate::secrets::for_job(config, std, &arg_entries);
-        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, secrets).map_err(fail)?
+        // carried readers whose partial arg tree is a subset of ours. They ride
+        // out of band in the job payload — never in the ArgTree, so never in the
+        // cache key — and the container runner drops them at `/secret/<name>`.
+        let granted = crate::secrets::grant(secrets, &arg_entries);
+        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, granted).map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
@@ -337,7 +351,8 @@ fn run_dispatch(
     let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(config, cont, std, salt, &child_stack, trace_id).map_err(fail)?
+            resolve_promise(config, cont, std, salt, &child_stack, trace_id, secrets)
+                .map_err(fail)?
         }
         _ => (result, false),
     };
@@ -530,6 +545,7 @@ fn resolve_promise(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<(String, bool), HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -609,8 +625,16 @@ fn resolve_promise(
                             let img = img.as_str();
                             scope.spawn(move || {
                                 let arg = named_entry("in", kid.mode, kid.oid);
-                                let result =
-                                    run_image(config, img, vec![arg], std, salt, stack, trace_id)?;
+                                let result = run_image(
+                                    config,
+                                    img,
+                                    vec![arg],
+                                    std,
+                                    salt,
+                                    stack,
+                                    trace_id,
+                                    secrets,
+                                )?;
                                 result_entry(&kid.name, &result)
                             })
                         })
@@ -640,7 +664,16 @@ fn resolve_promise(
     } else if let Some(img) = &run {
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_work_request`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        match run_image(config, img, vec![input.clone()], std, salt, stack, trace_id) {
+        match run_image(
+            config,
+            img,
+            vec![input.clone()],
+            std,
+            salt,
+            stack,
+            trace_id,
+            secrets,
+        ) {
             Ok(result) => Some((result_entry("result", &result)?, result)),
             // `catch`: the failure becomes `--error`, a blob of the message the
             // caller would otherwise have seen as a 500. `then` is required
@@ -674,7 +707,7 @@ fn resolve_promise(
                 args.push(extra);
             }
             Ok((
-                run_image(config, &img, args, std, salt, stack, trace_id)?,
+                run_image(config, &img, args, std, salt, stack, trace_id, secrets)?,
                 caught,
             ))
         }
@@ -694,6 +727,7 @@ fn resolve_promise(
 /// request, built server-side byte-identically to what a client would build, so
 /// the ArgTree hash (and cache key) is the same no matter who assembles it — and
 /// send it through [`run_work_request`]. Returns `"<type> <hash>"`.
+#[allow(clippy::too_many_arguments)] // the run context travels together
 fn run_image(
     config: &Config,
     image_ref: &str,
@@ -702,6 +736,7 @@ fn run_image(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -752,6 +787,7 @@ fn run_image(
             arg_tree: &arg_tree,
             stack,
             trace_id,
+            secrets,
         },
     )
 }
@@ -942,6 +978,7 @@ fn resolve_image(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         if reference.is_empty() || reference.starts_with('-') {
@@ -972,7 +1009,7 @@ fn resolve_image(
     if is_flake_tree(config, image)
         .map_err(|e| HttpError::new(500, format!("probing flake image {image}: {e}")))?
     {
-        return resolve_flake_image(config, image, std, salt, stack, trace_id);
+        return resolve_flake_image(config, image, std, salt, stack, trace_id, secrets);
     }
     convert_git_image(config, image)
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
@@ -1006,13 +1043,23 @@ fn resolve_flake_image(
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
 ) -> Result<String, HttpError> {
     let builder = std_image(config, std, "flake-builder")?;
     let oid = gix::ObjectId::from_hex(flake_tree.as_bytes())
         .map_err(|e| HttpError::new(400, format!("invalid flake tree hash {flake_tree}: {e}")))?;
     let in_entry = named_entry("in", gix::objs::tree::EntryKind::Tree.into(), oid);
     // "<type> <hash>": the git-docker delta tree the outer worker produced.
-    let result = run_image(config, &builder, vec![in_entry], std, salt, stack, trace_id)?;
+    let result = run_image(
+        config,
+        &builder,
+        vec![in_entry],
+        std,
+        salt,
+        stack,
+        trace_id,
+        secrets,
+    )?;
     let delta_tree = result.split_once(' ').map(|(_, h)| h).unwrap_or(&result);
     convert_git_image(config, delta_tree).map_err(|e| {
         HttpError::new(
@@ -1024,7 +1071,7 @@ fn resolve_flake_image(
 
 /// Look up a named image in the `std` library tree (`refs/caos/std`), returning
 /// its object hash.
-pub(crate) fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
+fn std_image(config: &Config, std: &str, name: &str) -> Result<String, HttpError> {
     fetch_tree(config, std)
         .map_err(|e| HttpError::new(500, format!("reading std {std}: {e}")))?
         .iter()

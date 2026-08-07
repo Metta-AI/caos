@@ -375,7 +375,17 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
     };
 
     match request.method() {
-        Method::Get if path == "/run" => compute::run(config, &query),
+        Method::Get if path == "/run" => {
+            // The carried secrets store rides in a header (design/secrets.md),
+            // out of band from the content-addressed ArgTree.
+            let secrets_header = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(secrets::HEADER))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap_or_default();
+            compute::run(config, &query, &secrets_header)
+        }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),

@@ -1,19 +1,123 @@
 #!/usr/bin/env bash
-# DISABLED pending the design/secrets.md redesign.
+# Runs cwd'd into a client repo with $CAOS_CLI set, INSIDE a test stack.
 #
-# Injection, superset-match grants, the output-scrub assertion, and log masking
-# were built in an interim SERVER-SIDE form: secrets sourced from a server
-# `CAOS_SECRETS_DIR`, readers matched by re-resolving image oids server-side.
-# Main has since rewired std/flake image resolution through eval-path
-# (`resolve_std_image` -> `eval::eval_std_entry`), so an arg tree now carries
-# the BUILT image oid — which the server-side matcher cannot reproduce without
-# running eval-path, and grants must never compute. The fix is the redesign
-# (see design/secrets.md "Remaining work"): carry the store as ephemeral run
-# context and match where eval-path is available.
-#
-# This test is disabled until then. Its previous body — grant/deny injection,
-# the output-leak rejection, log masking, and a current-tree tool grant — is in
-# git history and will be rewritten against the redesigned mechanism.
+# Exercises secret injection with the store carried as ephemeral run context
+# (design/secrets.md): the client reads its own git-ignored `.caos-secrets`,
+# resolves each reader with eval-path, and sends the result to the server,
+# which subset-matches and injects at `/secret/<name>`. Covers: a granted vs a
+# denied secret, the output-leak assertion, log masking, and a grant naming a
+# repo-local tool by path.
 set -euo pipefail
-echo "SKIP: secrets test disabled pending the design/secrets.md redesign" >&2
-exit 0
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
+
+# --- fixtures (committed) ----------------------------------------------------
+# A worker that reads the granted secret and reports a leak-free verdict.
+cat > check.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+mkdir -p /tmp/out
+if [ -r /secret/token ] && [ "$(cat /secret/token)" = "SEKRET-abc-123" ]; then
+  v="token-ok"
+else
+  v="token-bad"
+fi
+[ -e /secret/locked ] && v="$v locked-leaked" || v="$v locked-absent"
+echo "$v" > /tmp/out/verdict
+caos put /tmp/out /cas/out
+EOF
+
+# A worker that copies the secret into its output — the leak assertion must
+# refuse to publish it.
+cat > leak.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+mkdir -p /tmp/out
+cat /secret/token > /tmp/out/leaked
+caos put /tmp/out /cas/out
+EOF
+
+# A worker that prints the secret then fails — it must be masked from the log.
+cat > shout.sh <<'EOF'
+#!/bin/bash
+echo "debug: token=SEKRET-abc-123 (oops)" >&2
+exit 1
+EOF
+
+# A repo-local tool: a script curried onto /std/bash via a .caos-expr, so its
+# identity is (image=bash, worker1=run.sh) — what the `mytool` grant matches.
+mkdir -p mytool
+cat > mytool/run.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+mkdir -p /tmp/out
+if [ -r /secret/deploytok ] && [ "$(cat /secret/deploytok)" = "DEPLOY-xyz-789" ]; then
+  echo deploytok-ok > /tmp/out/verdict
+else
+  echo deploytok-missing > /tmp/out/verdict
+fi
+caos put /tmp/out /cas/out
+EOF
+cat > mytool/.caos-expr <<'EOF'
+curry /std/bash -- --worker1:@=run.sh
+EOF
+
+echo '.caos-secrets/' > .gitignore
+commit "secrets fixtures"
+# Publish the commit so the pinned tree (below) is on the server for the
+# `mytool` reader to resolve against.
+git push -q caos HEAD:refs/heads/secrets-test || fail "pushing workspace to caos"
+
+# --- the store (git-ignored, per-user, NOT committed) ------------------------
+mkdir -p .caos-secrets
+# Pin readers' resolution to this committed tree (excludes .caos-secrets itself).
+git rev-parse "HEAD^{tree}" > .caos-secrets/.tree
+cat > .caos-secrets/token <<'EOF'
+value=SEKRET-abc-123
+reader=std/bash
+EOF
+cat > .caos-secrets/locked <<'EOF'
+value=NOPE-do-not-leak
+reader=std/bash -- --marker=nope
+EOF
+cat > .caos-secrets/deploytok <<'EOF'
+value=DEPLOY-xyz-789
+reader=mytool
+EOF
+
+echo "== a granted secret is injected; a non-matching one is not ==" >&2
+out=$("$CAOS_CLI" run /cas/std/bash got -- --worker1:@=check.sh) || fail "run failed: $out"
+verdict=$(cat got/verdict)
+[ "$verdict" = "token-ok locked-absent" ] \
+  || fail "verdict: $verdict (expected 'token-ok locked-absent')"
+echo "  ok: /secret/token granted, /secret/locked denied" >&2
+
+echo "== a worker that leaks a secret into its output is refused ==" >&2
+if "$CAOS_CLI" run /cas/std/bash leaked -- --worker1:@=leak.sh >/dev/null 2>leak.err; then
+  fail "run leaking the secret should have failed"
+fi
+grep -qi "secret" leak.err || fail "leak error should mention a secret: $(cat leak.err)"
+if grep -q "SEKRET-abc-123" leak.err; then fail "the error must NOT echo the secret value"; fi
+echo "  ok: leaking the value fails the run, without echoing it" >&2
+
+echo "== a secret printed to the log is masked ==" >&2
+if "$CAOS_CLI" run /cas/std/bash shouted -- --worker1:@=shout.sh >/dev/null 2>shout.err; then
+  fail "the shouting worker should have failed"
+fi
+if grep -q "SEKRET-abc-123" shout.err; then
+  fail "the secret value must be masked out of the log: $(cat shout.err)"
+fi
+grep -q "redacted secret" shout.err \
+  || fail "expected the redaction marker in the log: $(cat shout.err)"
+echo "  ok: the printed secret is masked" >&2
+
+echo "== a grant can name a repo-local tool by path ==" >&2
+tool=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed: $tool"
+out=$("$CAOS_CLI" run "${tool##* }" tgot --) || fail "run mytool failed: $out"
+verdict=$(cat tgot/verdict)
+[ "$verdict" = "deploytok-ok" ] \
+  || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
+echo "  ok: a reader naming a repo path grants the secret" >&2
+
+echo "secrets: ALL PASS" >&2

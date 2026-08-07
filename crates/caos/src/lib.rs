@@ -90,7 +90,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // coupled every tool invocation to a ref the stack may not even have.
     all.extend(kvs.iter().cloned());
     let image = resolve_cli_image(t, "/cas/std/bash")?;
-    let (kind, result) = run_request(t, &image, None, None, &all)?;
+    let (kind, result) = run_request(t, &image, None, None, &all, "")?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
     println!("{kind} {result}");
@@ -175,6 +175,10 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
+
+/// Header carrying the ephemeral secrets store on `GET /run` (design/secrets.md),
+/// out of band from the content-addressed ArgTree. Must match the server's.
+const SECRETS_HEADER: &str = "X-Caos-Secrets";
 
 /// The built-in tree hash (`std`) in effect for this run. The server sets it on
 /// each worker it spawns (materialized at `/cas/std`) and threads it into every
@@ -2270,6 +2274,7 @@ fn run_request(
     cas: Option<&Path>,
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let arg_tree = prepare_request(t, image, cas, kvs)?;
     // Trigger compute; the server runs the container and returns the result's
@@ -2277,8 +2282,8 @@ fn run_request(
     // at it).
     let server = t.server_url()?;
     match trace {
-        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output),
-        None => request_compute(&server, &arg_tree),
+        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, secrets),
+        None => request_compute(&server, &arg_tree, secrets),
     }
 }
 
@@ -2560,7 +2565,11 @@ pub fn cli_run(
         return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
     }
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, trace, kvs)?;
+    // Build the ephemeral secrets store from the caller's `.caos-secrets`
+    // (design/secrets.md), resolving each reader here — where eval-path is
+    // available — so the server never evals. Empty when there's no store.
+    let secrets = build_secrets_header(t)?;
+    let (kind, result) = run_request(t, &image, None, trace, kvs, &secrets)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -3100,27 +3109,250 @@ fn merge_entries(
 /// `(type, hash)`. The server runs the container (resolving any promise it leaves
 /// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
 /// param's historical name; its value is the arg-tree hash.)
-fn request_compute(base: &str, arg_tree: &str) -> Result<(String, String), String> {
+/// Directory of the caller's git-ignored secrets store (design/secrets.md).
+const SECRETS_DIR: &str = ".caos-secrets";
+
+/// Build the `X-Caos-Secrets` header value from the caller's `.caos-secrets`
+/// store: a JSON array of `{name, value, readers}`, where each reader is
+/// resolved HERE (via eval-path, against the store's pinned tree) to a partial
+/// arg tree of name → oid — so the server only subset-matches, never evals.
+/// Empty string when there is no store.
+fn build_secrets_header(t: &dyn Transport) -> Result<String, String> {
+    let dir = Path::new(SECRETS_DIR);
+    if !dir.is_dir() {
+        return Ok(String::new());
+    }
+    let pinned = secrets_pinned_tree(t, dir)?;
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    let mut grants: Vec<serde_json::Value> = Vec::new();
+    for path in paths {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // Skip dotfiles (`.tree`, editor backups) and non-files.
+        if file_name.starts_with('.') || !path.is_file() {
+            continue;
+        }
+        let (name, value, readers) = parse_local_secret(&file_name, &path)?;
+        let resolved: Vec<std::collections::BTreeMap<String, String>> = readers
+            .iter()
+            .map(|r| resolve_reader_client(t, &pinned, r))
+            .collect::<Result<_, _>>()?;
+        grants.push(serde_json::json!({
+            "name": name,
+            "value": value,
+            "readers": resolved,
+        }));
+    }
+    if grants.is_empty() {
+        return Ok(String::new());
+    }
+    serde_json::to_string(&grants).map_err(|e| format!("serializing secrets store: {e}"))
+}
+
+/// The tree tree-relative readers resolve against: the `.tree` file in the store
+/// (a hash or ref), else the caller's current working tree (ingested — which
+/// also gets it onto the server so eval-path can walk it).
+fn secrets_pinned_tree(t: &dyn Transport, dir: &Path) -> Result<String, String> {
+    if let Ok(spec) = std::fs::read_to_string(dir.join(".tree")) {
+        let spec = spec.trim();
+        if !spec.is_empty() {
+            return if is_hex_hash(spec) {
+                Ok(spec.to_string())
+            } else {
+                resolve_ref(spec)
+            };
+        }
+    }
+    let (_, oid) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this transport cannot ingest the workspace tree for secrets".to_string())?;
+    Ok(oid.to_string())
+}
+
+/// Parse one `.caos-secrets` file (repeated-key form) into `(name, value,
+/// readers)`. `name` defaults to the filename; `value=`/`value:@=` set the
+/// value; `reader=` accumulates. `entropy=` is accepted but unused here (it
+/// keys cache isolation, a later slice).
+fn parse_local_secret(
+    file_name: &str,
+    path: &Path,
+) -> Result<(String, String, Vec<String>), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading secret {file_name}: {e}"))?;
+    let mut name = file_name.to_string();
+    let mut value: Option<String> = None;
+    let mut readers = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, val) = line
+            .split_once('=')
+            .ok_or_else(|| format!("secret {file_name}: line {line:?} is not key=value"))?;
+        match key {
+            "name" => name = val.trim().to_string(),
+            "value" => value = Some(val.to_string()),
+            "value:@" => {
+                let file = path.parent().unwrap_or_else(|| Path::new(".")).join(val);
+                let bytes = std::fs::read(&file)
+                    .map_err(|e| format!("secret {file_name} value:@={val}: {e}"))?;
+                value = Some(
+                    String::from_utf8(bytes)
+                        .map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))?,
+                );
+            }
+            "reader" => readers.push(val.trim().to_string()),
+            "entropy" => {} // reserved for cache isolation (later slice)
+            other => return Err(format!("secret {file_name}: unknown key {other:?}")),
+        }
+    }
+    let value = value.ok_or_else(|| format!("secret {file_name}: no value= line"))?;
+    Ok((name, value, readers))
+}
+
+/// Resolve a reader expression (`<image> [-- --k=v | --k:@=path …]`) to the
+/// partial arg tree it pins — the same top-level entries a job running it would
+/// carry — by resolving the image (std, hash, or a tree path via eval-path),
+/// unwrapping any curry layers, and adding the reader's own args.
+fn resolve_reader_client(
+    t: &dyn Transport,
+    pinned: &str,
+    reader: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let tokens: Vec<&str> = reader.split_whitespace().collect();
+    let image_expr = *tokens.first().ok_or("empty reader")?;
+    let image = resolve_reader_image(t, pinned, image_expr)?;
+    let (base, bound) = unwrap_curry(t, &image)?;
+    let mut entries = std::collections::BTreeMap::new();
+    for entry in bound {
+        entries.insert(
+            String::from_utf8_lossy(entry_name(&entry)).into_owned(),
+            entry.oid.to_string(),
+        );
+    }
+    let mut rest = tokens.iter().skip(1);
+    if let Some(&sep) = rest.next() {
+        if sep != "--" {
+            return Err(format!("expected `--` before reader args, got {sep:?}"));
+        }
+        for &tok in rest {
+            let (name, oid) = resolve_reader_arg(t, pinned, tok)?;
+            entries.insert(name, oid);
+        }
+    }
+    // The image entry wins over any like-named bound arg, mirroring assembly.
+    entries.insert("image".to_string(), base);
+    Ok(entries)
+}
+
+/// Resolve a reader's image token: `/std/<name>`, a bare hash, or a path in the
+/// pinned tree (via eval-path — so a flake/`.caos-expr` tool resolves to the
+/// same oid the run uses).
+fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<String, String> {
+    if let Some(name) = expr
+        .strip_prefix("/std/")
+        .or_else(|| expr.strip_prefix("std/"))
+    {
+        return resolve_std_image(t, name);
+    }
+    if is_hex_hash(expr) {
+        return Ok(expr.to_string());
+    }
+    let (_, oid) = eval::eval_path(t, pinned, expr)?;
+    Ok(oid)
+}
+
+/// Resolve one reader `--name=value` / `--name:@=path` arg to a `(name, oid)`
+/// entry (literal → a blob; `:@=` → a `/std/<name>` image or a path in the
+/// pinned tree).
+fn resolve_reader_arg(
+    t: &dyn Transport,
+    pinned: &str,
+    tok: &str,
+) -> Result<(String, String), String> {
+    let body = tok
+        .strip_prefix("--")
+        .ok_or_else(|| format!("reader arg {tok:?} must be --name=value"))?;
+    let (key, value) = body
+        .split_once('=')
+        .ok_or_else(|| format!("reader arg {tok:?} must be --name[:@]=value"))?;
+    let (name, is_path) = match key.split_once(':') {
+        None => (key, false),
+        Some((n, "@")) => (n, true),
+        Some((_, ty)) => return Err(format!("unknown reader arg type {ty:?} in {tok:?}")),
+    };
+    if name.is_empty() || name.contains('/') {
+        return Err(format!(
+            "reader arg name {name:?} must be one path component"
+        ));
+    }
+    let oid = if is_path {
+        if let Some(std_name) = value
+            .strip_prefix("/std/")
+            .or_else(|| value.strip_prefix("std/"))
+        {
+            resolve_std_image(t, std_name)?
+        } else {
+            eval::eval_path(t, pinned, value)?.1
+        }
+    } else {
+        post_object(t, "blob", value.as_bytes())?.to_string()
+    };
+    Ok((name.to_string(), oid))
+}
+
+fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
     let url = format!("{}/run?req={}", base.trim_end_matches('/'), arg_tree);
-    request_compute_url(&url)
+    request_compute_url(&url, secrets)
 }
 
 fn request_compute_traced(
     base: &str,
     arg_tree: &str,
     trace_id: &str,
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let url = format!(
         "{}/run?req={arg_tree}&trace={trace_id}",
         base.trim_end_matches('/')
     );
-    request_compute_url(&url)
+    request_compute_url(&url, secrets)
 }
 
-fn request_compute_url(url: &str) -> Result<(String, String), String> {
-    let body = http_get(url)?;
-    let text =
-        String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+/// Issue the compute `GET /run`, carrying the ephemeral secrets store in the
+/// [`SECRETS_HEADER`] header when non-empty (design/secrets.md) — out of band
+/// from the content-addressed ArgTree in the URL.
+fn request_compute_url(url: &str, secrets: &str) -> Result<(String, String), String> {
+    let mut request = minreq::get(url).with_header(caos_world::WORLD_HEADER, caos_world::WORLD);
+    if !secrets.is_empty() {
+        request = request.with_header(SECRETS_HEADER, secrets);
+    }
+    let response = request.send().map_err(|e| format!("GET {url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        // Surface the server's response body — a 500 carries the worker's
+        // failure output, which is what you actually need.
+        let body = response.as_str().unwrap_or("").trim();
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{body}")
+        };
+        return Err(format!(
+            "GET {url}: server returned {} {}{detail}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let text = String::from_utf8(response.into_bytes())
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
         .trim()
         .split_once(' ')
@@ -3136,6 +3368,7 @@ fn request_compute_streamed(
     arg_tree: &str,
     trace_id: &str,
     output: &mut (dyn Write + Send),
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
     let mut response = minreq::get(&stream_url)
@@ -3170,7 +3403,7 @@ fn request_compute_streamed(
             }
             Ok(())
         });
-        let result = request_compute_traced(base, arg_tree, trace_id);
+        let result = request_compute_traced(base, arg_tree, trace_id, secrets);
         let trace_result = trace
             .join()
             .map_err(|_| "the trace stream thread panicked".to_string())?;

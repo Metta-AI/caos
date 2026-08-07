@@ -90,7 +90,11 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
 /// object's `(kind, oid)`. `node` is the object at the prefix walked so far: a
 /// `.caos-expr` at the root of a tree node replaces the node with its result
 /// before the next segment is resolved within it.
-fn eval_path(t: &dyn Transport, start_tree: &str, path: &str) -> Result<(String, String), String> {
+pub(crate) fn eval_path(
+    t: &dyn Transport,
+    start_tree: &str,
+    path: &str,
+) -> Result<(String, String), String> {
     let comps: Vec<&str> = path
         .split('/')
         .filter(|s| !s.is_empty() && *s != ".")
@@ -239,7 +243,7 @@ fn eval_command(
     }
     let arg_tree = assemble_arg_tree(t, &image_ref, entries)?;
     let server = t.server_url()?;
-    request_compute(&server, &arg_tree)
+    request_compute(&server, &arg_tree, "")
 }
 
 /// Resolve the image token of a command to a ref: a `$NAME` variable, a
