@@ -8,14 +8,13 @@
 //!   `runner` (jobs arrive by long-poll; see `design/runner-protocol.md`). It
 //!   never triggers compute — its `map-then` records a map-then continuation
 //!   the server resolves after the worker's job finishes.
-//! * **`caos-cli`** — the user-facing client. It uses the server as a `caos` git
-//!   remote, building objects in the local working repo and exchanging them with
-//!   the server by negotiated push/fetch.
+//! * **`caos-cli`** — the user-facing client. It uses gix for local repository
+//!   operations and the configured git remote for network exchange.
 //!
 //! Everything that doesn't depend on *how* objects move — the object model,
 //! currying, args-tree assembly, CAS materialization, image import — lives here,
 //! written against the [`Transport`] trait. Each binary picks a transport
-//! ([`HttpTransport`] for the worker; the git remote for the CLI) and calls the
+//! ([`HttpTransport`] for the worker; [`GitTransport`] for the CLI) and calls the
 //! command functions below.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
@@ -24,6 +23,7 @@
 //! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
 //! `get` expand a placeholder later.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Read, Write};
@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::objs::WriteTo;
 
 pub mod chat;
@@ -260,7 +261,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The store the client reads objects from and writes objects to. The two
 /// binaries differ almost entirely in *this*: the worker speaks HTTP `/object`
 /// to the server ([`HttpTransport`]); the CLI builds objects in its local working
-/// repo and exchanges them with the server by negotiated git push/fetch.
+/// repo with gix and exchanges them with the server through the configured Git
+/// remote.
 ///
 /// `ensure_pushed`/`fetch_ref` are the network steps a *local-repo* transport
 /// needs and an HTTP one doesn't, so they default to no-ops: the worker's
@@ -281,9 +283,9 @@ pub trait Transport {
     fn has_object(&self, hash: &str) -> Result<bool, String>;
 
     /// Ensure the server's repo holds the object graph reachable from `hash`.
-    /// HTTP: a no-op — objects were already POSTed as they were built. Git: push
-    /// it (under a content-addressed `refs/caos/req/<hash>`) so a subsequent
-    /// compute can read it.
+    /// HTTP: a no-op — objects were already POSTed as they were built. A local
+    /// repository transport pushes the missing closure and records a
+    /// content-addressed `refs/caos/req/<hash>` ref for subsequent compute.
     fn ensure_pushed(&self, _hash: &str) -> Result<(), String> {
         Ok(())
     }
@@ -385,29 +387,40 @@ impl Transport for HttpTransport {
     }
 }
 
-/// The remote name a `caos-cli` working tree gives the server (`git remote add
-/// caos <url>`). Push/fetch use it.
+/// The remote name a `caos-cli` working tree gives the server.
 pub const CAOS_REMOTE: &str = "caos";
 
-/// Transport over the server as a `caos` git remote, used by `caos-cli`. Objects
-/// are built in the local working repo (cheap, in-process via gix) and exchanged
-/// with the server by negotiated git push/fetch — so a large unchanged tree costs
-/// almost nothing to "upload", and an edit ships only the changed blobs.
+/// Local-repository transport used by `caos-cli`. Local objects, refs, status,
+/// index, commits, and diffs are handled in-process through gix. Network fetch
+/// and push continue through the configured Git remote.
 ///
 /// `put_object`/`get_object` are *local*: `put` writes a loose object,
 /// `get` reads one (fetching from the remote first if it's missing, e.g. a
-/// computation result). `ensure_pushed` is the one batch network step — it pushes
-/// an object graph to the server so a `/run` can read it.
+/// computation result). `ensure_pushed` uploads an object graph and records a
+/// server-side request ref so a `/run` can read it.
 pub struct GitTransport {
     /// The discovered working repo, cached for local reads/writes.
     repo: gix::Repository,
-    /// Its git directory, to reach the real index when staging into a
-    /// throwaway one (`hash_dir`).
+    /// Repository metadata path, used to refresh the object database after a
+    /// network fetch writes a pack.
     git_dir: PathBuf,
-    /// Canonical working-tree root used by every subprocess Git operation.
-    /// Keeping it here prevents a transport from silently switching repos if
-    /// the process working directory changes after discovery.
+    /// Canonical working-tree root used by every repository operation.
     work_dir: PathBuf,
+}
+
+pub(crate) struct CommitDetails {
+    pub author: String,
+    pub message: String,
+    pub parent: Option<String>,
+    pub tree: String,
+    pub timestamp: i64,
+    pub short_id: String,
+}
+
+struct FileDiff {
+    path: String,
+    old: Option<(gix::objs::tree::EntryMode, gix::ObjectId)>,
+    new: Option<(gix::objs::tree::EntryMode, gix::ObjectId)>,
 }
 
 impl GitTransport {
@@ -439,9 +452,18 @@ impl GitTransport {
         })
     }
 
-    /// The worktree this transport and its subprocess Git commands operate on.
+    /// The worktree this transport's repository operations are bound to.
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// Run a network Git command in the discovered worktree.
+    fn run_git(&self, args: &[&str]) -> Result<(), String> {
+        self.git_capture(args).map(|_| ())
+    }
+
+    fn git_capture(&self, args: &[&str]) -> Result<String, String> {
+        git_capture_in(args, None, &self.work_dir)
     }
 
     /// Verify that the configured CAOS server accepts connections.
@@ -466,12 +488,255 @@ impl GitTransport {
             })
     }
 
-    pub(crate) fn git_capture(
+    /// Stage every non-ignored worktree change with gix, commit it when the
+    /// resulting tree differs from `HEAD`, and return the tree id.
+    pub fn commit_working_tree(&self, message: &str) -> Result<String, String> {
+        let mut index = self
+            .repo
+            .index_or_empty()
+            .map_err(|error| format!("opening worktree index: {error}"))?
+            .as_ref()
+            .clone();
+        let changes = self
+            .repo
+            .status(gix::progress::Discard)
+            .map_err(|error| format!("preparing worktree status: {error}"))?
+            .untracked_files(gix::status::UntrackedFiles::Files)
+            .into_index_worktree_iter(Vec::<BString>::new())
+            .map_err(|error| format!("reading worktree status: {error}"))?
+            .map(|item| {
+                let item = item.map_err(|error| error.to_string())?;
+                Ok((item.summary(), item.rela_path().to_owned()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (summary, path) in changes {
+            use gix::status::index_worktree::iter::Summary;
+            match summary {
+                Some(Summary::Removed) => {
+                    index.remove_entries(|_, entry_path, _| entry_path == path.as_bstr());
+                }
+                Some(Summary::Added | Summary::Modified | Summary::TypeChange) => {
+                    stage_index_path(&self.repo, &mut index, path.as_bstr())?;
+                }
+                Some(Summary::Conflict | Summary::IntentToAdd) => {
+                    return Err(format!(
+                        "cannot commit worktree while {path} has unresolved index state"
+                    ));
+                }
+                Some(Summary::Renamed | Summary::Copied) => {
+                    unreachable!("rename tracking is disabled for worktree status")
+                }
+                None => {}
+            }
+        }
+        index.sort_entries();
+        let tree_id = write_index_tree(&self.repo, &index)?;
+        index
+            .write(Default::default())
+            .map_err(|error| format!("writing worktree index: {error}"))?;
+
+        let head = self
+            .repo
+            .head_commit()
+            .map_err(|error| format!("reading HEAD commit: {error}"))?;
+        let head_tree = head
+            .tree_id()
+            .map_err(|error| format!("reading HEAD tree: {error}"))?;
+        if tree_id != head_tree.detach() {
+            self.repo
+                .commit("HEAD", message, tree_id, [head.id])
+                .map_err(|error| format!("committing worktree: {error}"))?;
+        }
+        Ok(tree_id.to_string())
+    }
+
+    pub(crate) fn resolve(&self, spec: &str) -> Result<Option<String>, String> {
+        match self.repo.rev_parse_single(spec.as_bytes()) {
+            Ok(id) => Ok(Some(id.to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn local_refs(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        let platform = self
+            .repo
+            .references()
+            .map_err(|error| format!("opening local references: {error}"))?;
+        let iter = platform
+            .prefixed(prefix.as_bytes())
+            .map_err(|error| format!("listing local references under {prefix}: {error}"))?
+            .peeled()
+            .map_err(|error| format!("opening packed references: {error}"))?;
+        let mut refs = Vec::new();
+        for reference in iter {
+            let reference =
+                reference.map_err(|error| format!("reading local reference: {error}"))?;
+            refs.push((
+                reference.name().as_bstr().to_string(),
+                reference.id().to_string(),
+            ));
+        }
+        refs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(refs)
+    }
+
+    pub(crate) fn update_local_ref(&self, name: &str, target: &str) -> Result<(), String> {
+        self.repo
+            .reference(
+                name,
+                parse_oid(target)?,
+                gix::refs::transaction::PreviousValue::Any,
+                "caos: update conversation ref",
+            )
+            .map(|_| ())
+            .map_err(|error| format!("updating {name}: {error}"))
+    }
+
+    pub(crate) fn delete_local_ref(&self, name: &str, expected: &str) -> Result<(), String> {
+        let reference = self
+            .repo
+            .try_find_reference(name)
+            .map_err(|error| format!("reading {name}: {error}"))?
+            .ok_or_else(|| format!("local reference {name} does not exist"))?;
+        if reference.try_id().map(|id| id.detach()) != Some(parse_oid(expected)?) {
+            return Err(format!(
+                "local reference {name} changed before it could be deleted"
+            ));
+        }
+        reference
+            .delete()
+            .map_err(|error| format!("deleting {name}: {error}"))
+    }
+
+    pub(crate) fn commit_details(&self, hash: &str) -> Result<CommitDetails, String> {
+        let commit = self
+            .repo
+            .find_commit(parse_oid(hash)?)
+            .map_err(|error| format!("reading commit {hash}: {error}"))?;
+        let author = commit
+            .author()
+            .map_err(|error| format!("reading author of {hash}: {error}"))?;
+        let message = commit
+            .message_raw()
+            .map_err(|error| format!("reading message of {hash}: {error}"))?;
+        let tree = commit
+            .tree_id()
+            .map_err(|error| format!("reading tree of {hash}: {error}"))?;
+        let timestamp = commit
+            .time()
+            .map_err(|error| format!("reading timestamp of {hash}: {error}"))?
+            .seconds;
+        let short_id = commit
+            .short_id()
+            .map_err(|error| format!("abbreviating commit {hash}: {error}"))?
+            .to_string();
+        let parent = commit.parent_ids().next().map(|id| id.to_string());
+        Ok(CommitDetails {
+            author: author.name.to_string(),
+            message: message.to_string(),
+            parent,
+            tree: tree.to_string(),
+            timestamp,
+            short_id,
+        })
+    }
+
+    pub(crate) fn author_name(&self) -> Result<String, String> {
+        self.repo
+            .author()
+            .ok_or_else(|| "no git author identity (set user.name/user.email)".to_string())?
+            .map(|author| author.name.to_string())
+            .map_err(|error| format!("reading git author identity: {error}"))
+    }
+
+    pub(crate) fn create_commit(
         &self,
-        args: &[&str],
-        index: Option<&Path>,
+        tree: &str,
+        parent: &str,
+        message: &str,
     ) -> Result<String, String> {
-        git_capture_in(args, index, &self.work_dir)
+        self.repo
+            .new_commit(message, parse_oid(tree)?, [parse_oid(parent)?])
+            .map(|commit| commit.id.to_string())
+            .map_err(|error| format!("creating commit: {error}"))
+    }
+
+    pub(crate) fn diff_commits(&self, old: &str, new: &str) -> Result<String, String> {
+        let old_commit = self
+            .repo
+            .find_commit(parse_oid(old)?)
+            .map_err(|error| format!("reading commit {old}: {error}"))?;
+        let old_tree = old_commit
+            .tree()
+            .map_err(|error| format!("reading tree for {old}: {error}"))?;
+        let new_commit = self
+            .repo
+            .find_commit(parse_oid(new)?)
+            .map_err(|error| format!("reading commit {new}: {error}"))?;
+        let new_tree = new_commit
+            .tree()
+            .map_err(|error| format!("reading tree for {new}: {error}"))?;
+        let mut files = Vec::new();
+        let mut changes = old_tree
+            .changes()
+            .map_err(|error| format!("preparing workspace diff: {error}"))?;
+        changes.options(|options| {
+            options.track_path().track_rewrites(None);
+        });
+        changes
+            .for_each_to_obtain_tree(&new_tree, |change| {
+                use gix::object::tree::diff::{Action, Change};
+                let file = match change {
+                    Change::Addition {
+                        location,
+                        entry_mode,
+                        id,
+                        ..
+                    } if entry_mode.kind() != gix::objs::tree::EntryKind::Tree => Some(FileDiff {
+                        path: location.to_string(),
+                        old: None,
+                        new: Some((entry_mode, id.detach())),
+                    }),
+                    Change::Deletion {
+                        location,
+                        entry_mode,
+                        id,
+                        ..
+                    } if entry_mode.kind() != gix::objs::tree::EntryKind::Tree => Some(FileDiff {
+                        path: location.to_string(),
+                        old: Some((entry_mode, id.detach())),
+                        new: None,
+                    }),
+                    Change::Modification {
+                        location,
+                        previous_entry_mode,
+                        previous_id,
+                        entry_mode,
+                        id,
+                    } if previous_entry_mode.kind() != gix::objs::tree::EntryKind::Tree
+                        && entry_mode.kind() != gix::objs::tree::EntryKind::Tree =>
+                    {
+                        Some(FileDiff {
+                            path: location.to_string(),
+                            old: Some((previous_entry_mode, previous_id.detach())),
+                            new: Some((entry_mode, id.detach())),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(file) = file {
+                    files.push(file);
+                }
+                Ok::<_, std::convert::Infallible>(Action::Continue(()))
+            })
+            .map_err(|error| format!("walking workspace diff: {error}"))?;
+
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut patch = String::new();
+        for file in files {
+            render_file_diff(&self.repo, &file, &mut patch)?;
+        }
+        Ok(patch)
     }
 }
 
@@ -525,12 +790,8 @@ impl Transport for GitTransport {
         // changes: 218 MB re-packed, re-indexed and re-inflated (~23s of a 38s
         // run) to deliver 12 MB of new bytes.
         //
-        // `fetch_object`/`fetch_object_negotiated` stay for the COMMIT case
-        // (chat turns), where a closure fetch is what you want and git has a
-        // tip to negotiate against. Those write a PACK, which the cached `repo`
-        // handle's odb will not see — so re-open before concluding the object
-        // is absent, or every read after a chat's closure fetch would go back
-        // over the wire one object at a time for objects already on disk.
+        // Network closure fetches write packs, which the cached repository
+        // handle may not see. Re-open before falling back to the object API.
         if let Ok(repo) = gix::open(&self.git_dir) {
             if let Ok(object) = repo.find_object(oid) {
                 return Ok((object.kind.to_string(), object.data.clone()));
@@ -539,8 +800,6 @@ impl Transport for GitTransport {
         let url = format!("{}/object/{hash}", self.server_url()?.trim_end_matches('/'));
         let serialized = http_get(&url)?;
         let (kind, content) = parse_object(&serialized)?;
-        // Write it into the local repo so the next ask — and the next run — is
-        // a local hit. put_object validates that the bytes hash to `hash`.
         let stored = self.put_object(kind, content)?;
         if stored != oid {
             return Err(format!("{url} returned an object hashing to {stored}"));
@@ -550,20 +809,16 @@ impl Transport for GitTransport {
 
     fn has_object(&self, hash: &str) -> Result<bool, String> {
         // LOCAL presence, deliberately: this transport's `put_object` writes
-        // locally too, and `ensure_pushed` moves the graph to the server in one
-        // negotiated push. So "already stored" here means "already in the
-        // working repo", which is exactly what lets `store` skip re-reading it.
+        // locally too, and `ensure_pushed` moves the graph to the server. So
+        // "already stored" here means "already in the working repo", which is
+        // exactly what lets `store` skip re-reading it.
         Ok(self.repo.find_object(parse_oid(hash)?).is_ok())
     }
 
     fn ensure_pushed(&self, hash: &str) -> Result<(), String> {
-        // Content-addressed ref: clobber-free across clients, idempotent (a
-        // re-push of the same content is a no-op), and it persists as the
-        // negotiation base for the next push, so an edited tree ships only its
-        // delta. The push carries the whole object graph reachable from `hash`.
         let refspec = format!("{hash}:refs/caos/req/{hash}");
         self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
-            .map_err(|e| format!("pushing {hash} to {CAOS_REMOTE}: {e}"))
+            .map_err(|error| format!("pushing {hash} to {CAOS_REMOTE}: {error}"))
     }
 
     fn ingest_path(
@@ -582,19 +837,16 @@ impl Transport for GitTransport {
     fn resolve_revspec(&self, rev: &str) -> Result<Option<gix::ObjectId>, String> {
         // `^{commit}` peels annotated tags but *requires* a commit at the end —
         // a revspec naming a tree/blob is an error, never silently accepted.
-        let out = self
-            .git_capture(
-                &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
-                None,
-            )
-            .map_err(|e| format!("resolving {rev:?} to a commit: {e}"))?;
-        parse_oid(out.trim()).map(Some)
+        let spec = format!("{rev}^{{commit}}");
+        self.repo
+            .rev_parse_single(spec.as_bytes())
+            .map(|id| Some(id.detach()))
+            .map_err(|error| format!("resolving {rev:?} to a commit: {error}"))
     }
 
     fn server_url(&self) -> Result<String, String> {
-        // The `caos` remote's URL *is* the server: the CLI already pushes/fetches
-        // objects there, and /run lives at the same host. So a person configures
-        // the server once (`git remote add caos <url>`) and never sets an env var.
+        // The `caos` remote's URL *is* the server, and /run lives at the same
+        // host. A person configures the server once and never sets an env var.
         let remote = self.repo.find_remote(CAOS_REMOTE).map_err(|e| {
             format!(
                 "no `{CAOS_REMOTE}` git remote (add it with \
@@ -609,13 +861,105 @@ impl Transport for GitTransport {
 }
 
 impl GitTransport {
+    /// Fetch object `hash` and its closure from the CAOS Git remote.
+    pub(crate) fn fetch_object(&self, hash: &str) -> Result<(), String> {
+        self.run_git(&[
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            CAOS_REMOTE,
+            hash,
+        ])
+        .map_err(|error| format!("fetching {hash} from {CAOS_REMOTE}: {error}"))
+    }
+
+    /// Fetch a returned turn while negotiating from a server-known local tip.
+    pub(crate) fn fetch_object_negotiated(&self, hash: &str, tip: &str) -> Result<(), String> {
+        self.run_git(&[
+            "-c",
+            "fetch.negotiationAlgorithm=default",
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--negotiation-tip",
+            tip,
+            CAOS_REMOTE,
+            hash,
+        ])
+        .map_err(|error| format!("fetching {hash} from {CAOS_REMOTE}: {error}"))
+    }
+
+    pub(crate) fn server_refs(&self, patterns: &[String]) -> Result<Vec<(String, String)>, String> {
+        let mut args = vec![
+            "ls-remote".to_string(),
+            "--refs".to_string(),
+            CAOS_REMOTE.to_string(),
+        ];
+        args.extend(patterns.iter().cloned());
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self.git_capture(&refs)?;
+        Ok(output
+            .lines()
+            .filter_map(|line| {
+                let (hash, name) = line.split_once('\t')?;
+                Some((name.to_string(), hash.to_string()))
+            })
+            .collect())
+    }
+
+    pub(crate) fn server_ref(&self, name: &str) -> Result<Option<String>, String> {
+        let output = self.git_capture(&["ls-remote", CAOS_REMOTE, name])?;
+        for line in output.lines() {
+            let Some((hash, found_name)) = line.split_once('\t') else {
+                continue;
+            };
+            if found_name == name {
+                return Ok(Some(hash.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn push_server_refs(
+        &self,
+        changes: &[(String, Option<String>)],
+    ) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            "push".to_string(),
+            "--quiet".to_string(),
+            "--atomic".to_string(),
+            CAOS_REMOTE.to_string(),
+        ];
+        for (name, target) in changes {
+            let _: &gix::refs::FullNameRef = name
+                .as_str()
+                .try_into()
+                .map_err(|_| format!("invalid server refname {name:?}"))?;
+            let refspec = match target {
+                None => format!(":{name}"),
+                // The user-owned conversation head must advance by fast-forward.
+                // Metadata and per-user index refs are replaceable snapshots.
+                Some(target) if name.ends_with("/from-user") => format!("{target}:{name}"),
+                Some(target) => format!("+{target}:{name}"),
+            };
+            args.push(refspec);
+        }
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        self.run_git(&refs)
+    }
+
     /// Hash a filesystem path into the local repo, reusing git's recorded objects.
     /// Only git-tracked paths inside the worktree can be ingested (the nix-flakes
     /// rule: a build sees only what git knows about). A clean, tracked path keeps
     /// its committed hash with no read at all; a tracked path with uncommitted
     /// edits is hashed now from the working tree — and for a directory only its
     /// *changed* tracked files are re-read, the rest reusing their cached hash via
-    /// a throwaway copy of the index (the same trick `git stash`/`commit` use),
+    /// a cloned in-memory index,
     /// while untracked files inside it are excluded. A path outside the worktree,
     /// or one git doesn't track, is an error.
     fn git_ingest(
@@ -654,7 +998,7 @@ impl GitTransport {
         if !self.is_tracked(&abs)? {
             return Err(format!(
                 "{}: not tracked by git; caos only ingests git-tracked paths \
-                 (add it with `git add`)",
+                 (stage it before running caos)",
                 path.display()
             ));
         }
@@ -674,27 +1018,46 @@ impl GitTransport {
         Ok((kind.into(), oid))
     }
 
-    /// Whether `abs` (inside the worktree) is clean and tracked — `git status`
-    /// reports nothing for it (a dirty or untracked path is non-empty).
+    /// Whether `abs` (inside the worktree) is clean and tracked according to
+    /// gix's status walk.
     fn is_clean(&self, abs: &Path) -> Result<bool, String> {
-        let out = self.git_capture(
-            &["status", "--porcelain", "--", &abs.to_string_lossy()],
-            None,
-        )?;
-        Ok(out.trim().is_empty())
+        let rel = self.relative_git_path(abs)?;
+        let mut status = self
+            .repo
+            .status(gix::progress::Discard)
+            .map_err(|error| format!("preparing worktree status: {error}"))?
+            .untracked_files(gix::status::UntrackedFiles::Files)
+            .into_iter(Vec::<BString>::new())
+            .map_err(|error| format!("reading worktree status: {error}"))?;
+        while let Some(item) = status
+            .next()
+            .transpose()
+            .map_err(|error| error.to_string())?
+        {
+            if git_path_in_scope(item.location(), rel.as_bstr()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    /// Whether git tracks `abs` (or, for a directory, anything under it) —
-    /// `git ls-files` lists a path only if it's in the index (staged or committed),
-    /// so an empty result means untracked. Used to reject untracked paths a clean
-    /// check can't catch (a path with uncommitted changes is "dirty" either way).
+    /// Whether the index tracks `abs` (or, for a directory, anything under it).
+    /// Used to reject untracked paths a clean check can't catch (a path with
+    /// uncommitted changes is "dirty" either way).
     fn is_tracked(&self, abs: &Path) -> Result<bool, String> {
-        let out = self.git_capture(&["ls-files", "--", &abs.to_string_lossy()], None)?;
-        Ok(!out.trim().is_empty())
+        let rel = self.relative_git_path(abs)?;
+        let index = self
+            .repo
+            .index_or_empty()
+            .map_err(|error| format!("opening worktree index: {error}"))?;
+        Ok(index
+            .entries()
+            .iter()
+            .any(|entry| git_path_in_scope(entry.path(&index), rel.as_bstr())))
     }
 
-    /// The `(mode, oid)` git records for a clean tracked path, read from `HEAD`
-    /// (`ls-tree` prints `<mode> <type> <hash>\t<name>`). No file is read.
+    /// The `(mode, oid)` recorded for a clean tracked path, read from `HEAD`.
+    /// No file is read.
     fn tracked_entry(
         &self,
         abs: &Path,
@@ -702,127 +1065,331 @@ impl GitTransport {
     ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
         use gix::objs::tree::EntryKind;
 
+        let commit = self
+            .repo
+            .head_commit()
+            .map_err(|error| format!("reading HEAD commit: {error}"))?;
+        let tree = commit
+            .tree()
+            .map_err(|error| format!("reading HEAD tree: {error}"))?;
         if rel.as_os_str().is_empty() {
-            let out = self.git_capture(&["rev-parse", "HEAD^{tree}"], None)?;
-            return Ok((EntryKind::Tree.into(), parse_oid(out.trim())?));
+            return Ok((EntryKind::Tree.into(), tree.id().detach()));
         }
-
-        let out = self.git_capture(&["ls-tree", "HEAD", "--", &abs.to_string_lossy()], None)?;
-        let line = out
-            .lines()
-            .next()
+        let entry = tree
+            .lookup_entry_by_path(rel)
+            .map_err(|error| format!("reading {} from HEAD: {error}", abs.display()))?
             .ok_or_else(|| format!("{} not found in HEAD", abs.display()))?;
-        let meta = line.split('\t').next().unwrap_or("");
-        let mut fields = meta.split_whitespace();
-        let mode = fields.next().unwrap_or("");
-        let _kind = fields.next();
-        let hash = fields.next().unwrap_or("");
-        Ok((mode_from_git(mode)?, parse_oid(hash)?))
+        Ok((entry.mode(), entry.id().detach()))
     }
 
-    /// Hash a single file into the repo (`git hash-object -w`), returning its oid.
+    /// Hash a single file into the repository, returning its object id.
     fn hash_file(&self, abs: &Path) -> Result<gix::ObjectId, String> {
-        let out = self.git_capture(&["hash-object", "-w", "--", &abs.to_string_lossy()], None)?;
-        parse_oid(out.trim())
+        let rel = self.relative_git_path(abs)?;
+        let index = self
+            .repo
+            .index_or_empty()
+            .map_err(|error| format!("opening worktree index: {error}"))?;
+        let (mut pipeline, _) = self
+            .repo
+            .filter_pipeline(None)
+            .map_err(|error| format!("preparing filters for {rel}: {error}"))?;
+        pipeline
+            .worktree_file_to_object(rel.as_bstr(), &index)
+            .map_err(|error| format!("hashing {}: {error}", abs.display()))?
+            .map(|(id, _, _)| id)
+            .ok_or_else(|| format!("{} is not a file or symlink", abs.display()))
     }
 
     /// Hash a tracked directory `abs` (worktree-relative `rel`) with uncommitted
-    /// edits into the repo, re-reading only its changed files. We copy the real
-    /// index to a throwaway one (inheriting its stat-cache), `git add -u` the
-    /// directory there, then `write-tree --prefix` to read back just that subtree.
-    /// `-u` restages only already-tracked files (picking up edits and deletions)
-    /// and skips untracked ones, so the result tree holds exactly what git knows —
-    /// the nix-flakes rule (see [`git_ingest`]).
+    /// edits into the repo, re-reading only its changed files. An in-memory copy
+    /// of the real index is updated with tracked edits and deletions, leaving
+    /// untracked entries out, then written as a tree. The result therefore holds
+    /// exactly what the repository tracks — the nix-flakes rule (see
+    /// [`git_ingest`]).
     fn hash_dir(
         &self,
         abs: &Path,
         rel: &Path,
     ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
         use gix::objs::tree::EntryKind;
-        let tmp = temp_index_path()?;
-        let real_index = self.git_dir.join("index");
-        if real_index.exists() {
-            std::fs::copy(&real_index, &tmp).map_err(|e| format!("copying index: {e}"))?;
+        let scope = self.relative_git_path(abs)?;
+        let mut index = self
+            .repo
+            .index_or_empty()
+            .map_err(|error| format!("opening worktree index: {error}"))?
+            .as_ref()
+            .clone();
+        let changes = self
+            .repo
+            .status(gix::progress::Discard)
+            .map_err(|error| format!("preparing worktree status: {error}"))?
+            .untracked_files(gix::status::UntrackedFiles::Files)
+            .into_index_worktree_iter(Vec::<BString>::new())
+            .map_err(|error| format!("reading worktree status: {error}"))?
+            .map(|item| {
+                let item = item.map_err(|error| error.to_string())?;
+                Ok((item.summary(), item.rela_path().to_owned()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (summary, path) in changes {
+            if !git_path_in_scope(path.as_bstr(), scope.as_bstr()) {
+                continue;
+            }
+            let tracked = index
+                .entry_index_by_path_and_stage(
+                    path.as_bstr(),
+                    gix::index::entry::Stage::Unconflicted,
+                )
+                .is_some();
+            use gix::status::index_worktree::iter::Summary;
+            match summary {
+                Some(Summary::Removed) if tracked => {
+                    index.remove_entries(|_, entry_path, _| entry_path == path.as_bstr());
+                }
+                Some(Summary::Added | Summary::Modified | Summary::TypeChange) if tracked => {
+                    stage_index_path(&self.repo, &mut index, path.as_bstr())?;
+                }
+                Some(Summary::Conflict | Summary::IntentToAdd) => {
+                    return Err(format!("cannot ingest {path} with unresolved index state"));
+                }
+                Some(Summary::Renamed | Summary::Copied) => {
+                    unreachable!("rename tracking is disabled for worktree status")
+                }
+                _ => {}
+            }
         }
-        let oid = (|| {
-            self.git_capture(&["add", "-u", "--", &abs.to_string_lossy()], Some(&tmp))?;
-            let tree = if rel.as_os_str().is_empty() {
-                self.git_capture(&["write-tree"], Some(&tmp))?
-            } else {
-                let prefix = format!("--prefix={}/", rel.to_string_lossy());
-                self.git_capture(&["write-tree", &prefix], Some(&tmp))?
+        index.sort_entries();
+        let root = write_index_tree(&self.repo, &index)?;
+        if rel.as_os_str().is_empty() {
+            return Ok((EntryKind::Tree.into(), root));
+        }
+        let tree = self
+            .repo
+            .find_tree(root)
+            .map_err(|error| format!("reading ingested tree: {error}"))?;
+        let entry = tree
+            .lookup_entry_by_path(rel)
+            .map_err(|error| format!("reading ingested {}: {error}", abs.display()))?
+            .ok_or_else(|| format!("{} disappeared while it was ingested", abs.display()))?;
+        Ok((entry.mode(), entry.id().detach()))
+    }
+
+    fn relative_git_path(&self, path: &Path) -> Result<BString, String> {
+        let rel = path.strip_prefix(&self.work_dir).map_err(|_| {
+            format!(
+                "{}: outside the git worktree; caos only ingests git-tracked paths",
+                path.display()
+            )
+        })?;
+        Ok(BString::from(rel.as_os_str().as_bytes()))
+    }
+}
+
+fn git_path_in_scope(path: &BStr, scope: &BStr) -> bool {
+    scope.is_empty()
+        || path == scope
+        || path
+            .strip_prefix(scope.as_bytes())
+            .is_some_and(|rest| rest.first() == Some(&b'/'))
+}
+
+fn stage_index_path(
+    repo: &gix::Repository,
+    index: &mut gix::index::State,
+    path: &BStr,
+) -> Result<(), String> {
+    let (mut pipeline, _) = repo
+        .filter_pipeline(None)
+        .map_err(|error| format!("preparing filters for {path}: {error}"))?;
+    let Some((id, kind, _)) = pipeline
+        .worktree_file_to_object(path, index)
+        .map_err(|error| format!("staging {path}: {error}"))?
+    else {
+        return Err(format!("{path} is not a file, symlink, or submodule"));
+    };
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| "caos-cli requires a working tree".to_string())?;
+    let metadata =
+        gix::index::fs::Metadata::from_path_no_follow(&workdir.join(OsStr::from_bytes(path)))
+            .map_err(|error| format!("reading metadata for {path}: {error}"))?;
+    let stat = gix::index::entry::Stat::from_fs(&metadata)
+        .map_err(|error| format!("reading timestamps for {path}: {error}"))?;
+    let mode = gix::index::entry::Mode::from(gix::objs::tree::EntryMode::from(kind));
+    if let Some(entry) =
+        index.entry_mut_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+    {
+        entry.id = id;
+        entry.mode = mode;
+        entry.stat = stat;
+    } else {
+        index.dangerously_push_entry(stat, id, gix::index::entry::Flags::empty(), mode, path);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct IndexTree {
+    entries: BTreeMap<BString, IndexTreeEntry>,
+}
+
+enum IndexTreeEntry {
+    Leaf {
+        mode: gix::objs::tree::EntryMode,
+        id: gix::ObjectId,
+    },
+    Tree(IndexTree),
+}
+
+impl IndexTree {
+    fn insert(
+        &mut self,
+        path: &BStr,
+        mode: gix::objs::tree::EntryMode,
+        id: gix::ObjectId,
+    ) -> Result<(), String> {
+        let mut components = path.split(|byte| *byte == b'/').peekable();
+        let mut tree = self;
+        while let Some(component) = components.next() {
+            let name = BString::from(component);
+            if components.peek().is_none() {
+                if tree
+                    .entries
+                    .insert(name, IndexTreeEntry::Leaf { mode, id })
+                    .is_some()
+                {
+                    return Err(format!("duplicate index path {path}"));
+                }
+                return Ok(());
+            }
+            tree = match tree
+                .entries
+                .entry(name)
+                .or_insert_with(|| IndexTreeEntry::Tree(IndexTree::default()))
+            {
+                IndexTreeEntry::Tree(tree) => tree,
+                IndexTreeEntry::Leaf { .. } => {
+                    return Err(format!("index path {path} traverses through a file"));
+                }
             };
-            parse_oid(tree.trim())
-        })();
-        let _ = std::fs::remove_file(&tmp);
-        Ok((EntryKind::Tree.into(), oid?))
+        }
+        Err("the index contains an empty path".to_string())
+    }
+
+    fn write(self, repo: &gix::Repository) -> Result<gix::ObjectId, String> {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (filename, entry) in self.entries {
+            let (mode, oid) = match entry {
+                IndexTreeEntry::Leaf { mode, id } => (mode, id),
+                IndexTreeEntry::Tree(tree) => {
+                    (gix::objs::tree::EntryKind::Tree.into(), tree.write(repo)?)
+                }
+            };
+            entries.push(gix::objs::tree::Entry {
+                mode,
+                filename,
+                oid,
+            });
+        }
+        entries.sort();
+        repo.write_object(&gix::objs::Tree { entries })
+            .map(|id| id.detach())
+            .map_err(|error| format!("writing tree object: {error}"))
     }
 }
 
-impl GitTransport {
-    /// Run a network Git command in this transport's bound working tree.
-    fn run_git(&self, args: &[&str]) -> Result<(), String> {
-        self.git_capture(args, None).map(|_| ())
+fn write_index_tree(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+) -> Result<gix::ObjectId, String> {
+    let mut root = IndexTree::default();
+    for entry in index.entries() {
+        let path = entry.path(index);
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            return Err(format!(
+                "cannot write tree with unresolved index entry {path}"
+            ));
+        }
+        let mode = entry
+            .mode
+            .to_tree_entry_mode()
+            .ok_or_else(|| format!("unsupported index mode for {path}"))?;
+        root.insert(path, mode, entry.id)?;
     }
-
-    /// Fetch object `hash` (and its closure) from the `caos` remote into the
-    /// local repo.
-    ///
-    /// `fetch.negotiationAlgorithm=noop` makes git send *no* "have" lines, so
-    /// the negotiation is a single round. That's deliberate: the server's
-    /// smart-HTTP delegate returns an empty body partway through a *multi-round*
-    /// negotiation — which a client repo with real history (many refs/commits)
-    /// triggers — and the fetch then dies with "the remote end hung up
-    /// unexpectedly". The client and the caos server share no history anyway,
-    /// so suppressing haves costs nothing here. `--no-write-fetch-head` also
-    /// avoids the one shared worktree file otherwise touched by concurrent
-    /// raw-object fetches; fetched objects still land in the shared object
-    /// database.
-    fn fetch_object(&self, hash: &str) -> Result<(), String> {
-        self.run_git(&[
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            "--quiet",
-            "--no-write-fetch-head",
-            CAOS_REMOTE,
-            hash,
-        ])
-        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
-    }
-
-    /// Fetch object `hash` like [`Self::fetch_object`], but negotiate with `tip`
-    /// (a commit the server is known to hold — e.g. just pushed) as the only
-    /// negotiation tip, so the pack carries only what's new *since* `tip`
-    /// instead of `hash`'s entire closure.
-    ///
-    /// Why not plain default negotiation: haves would walk every local ref and
-    /// can go multi-round, which the smart-HTTP delegate has been seen to break
-    /// on (see [`Self::fetch_object`]'s noop rationale). A single tip the server
-    /// certainly has is ACKed in the first round, so the negotiation stays
-    /// single-round *and* the pack stays minimal — without it, a turn fetch in
-    /// a repo with real history re-downloads the whole workspace closure every
-    /// turn (measured: ~10s of index-pack CPU per turn on a large repo).
-    pub(crate) fn fetch_object_negotiated(&self, hash: &str, tip: &str) -> Result<(), String> {
-        self.run_git(&[
-            "-c",
-            "fetch.negotiationAlgorithm=default",
-            "fetch",
-            "--quiet",
-            "--no-write-fetch-head",
-            "--negotiation-tip",
-            tip,
-            CAOS_REMOTE,
-            hash,
-        ])
-        .map_err(|e| format!("fetching {hash} from {CAOS_REMOTE}: {e}"))
-    }
+    root.write(repo)
 }
 
-/// Run `git` in the working repo and return its stdout; error on failure. With
-/// `index` set, `GIT_INDEX_FILE` points at a throwaway index (so `git add` /
-/// `write-tree` don't touch the real one). Used for both the network steps and
-/// the path-ingestion plumbing.
+fn render_file_diff(
+    repo: &gix::Repository,
+    file: &FileDiff,
+    output: &mut String,
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+
+    writeln!(output, "diff --git a/{0} b/{0}", file.path).expect("writing to a String");
+    match (file.old, file.new) {
+        (None, Some((mode, _))) => {
+            writeln!(output, "new file mode {}", git_mode(mode)).expect("writing to a String");
+        }
+        (Some((mode, _)), None) => {
+            writeln!(output, "deleted file mode {}", git_mode(mode)).expect("writing to a String");
+        }
+        (Some((old_mode, _)), Some((new_mode, _))) if old_mode != new_mode => {
+            writeln!(output, "old mode {}", git_mode(old_mode)).expect("writing to a String");
+            writeln!(output, "new mode {}", git_mode(new_mode)).expect("writing to a String");
+        }
+        _ => {}
+    }
+    let before = file
+        .old
+        .map(|(_, id)| {
+            repo.find_object(id)
+                .map(|object| object.data.clone())
+                .map_err(|error| format!("reading old version of {}: {error}", file.path))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let after = file
+        .new
+        .map(|(_, id)| {
+            repo.find_object(id)
+                .map(|object| object.data.clone())
+                .map_err(|error| format!("reading new version of {}: {error}", file.path))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let old_path = if file.old.is_some() {
+        format!("a/{}", file.path)
+    } else {
+        "/dev/null".to_string()
+    };
+    let new_path = if file.new.is_some() {
+        format!("b/{}", file.path)
+    } else {
+        "/dev/null".to_string()
+    };
+    writeln!(output, "--- {old_path}").expect("writing to a String");
+    writeln!(output, "+++ {new_path}").expect("writing to a String");
+
+    let input = gix::diff::blob::InternedInput::new(before.as_slice(), after.as_slice());
+    let diff =
+        gix::diff::blob::diff_with_slider_heuristics(gix::diff::blob::Algorithm::Histogram, &input);
+    let formatter = gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(String::new(), "\n");
+    match gix::diff::blob::UnifiedDiff::new(&diff, &input, formatter, Default::default()).consume()
+    {
+        Ok(hunks) => output.push_str(&hunks),
+        Err(_) => {
+            writeln!(output, "Binary files {old_path} and {new_path} differ")
+                .expect("writing to a String");
+        }
+    }
+    Ok(())
+}
+
+fn git_mode(mode: gix::objs::tree::EntryMode) -> String {
+    format!("{:06o}", mode.value())
+}
+
 fn git_capture(args: &[&str], index: Option<&Path>) -> Result<String, String> {
     git_capture_in(args, index, Path::new("."))
 }
@@ -844,29 +1411,6 @@ fn git_capture_in(args: &[&str], index: Option<&Path>, cwd: &Path) -> Result<Str
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Map a git tree-entry mode string (as `ls-tree` prints it) to a gix `EntryMode`.
-fn mode_from_git(mode: &str) -> Result<gix::objs::tree::EntryMode, String> {
-    use gix::objs::tree::EntryKind;
-    let kind = match mode {
-        "40000" | "040000" => EntryKind::Tree,
-        "100644" => EntryKind::Blob,
-        "100755" => EntryKind::BlobExecutable,
-        "120000" => EntryKind::Link,
-        "160000" => EntryKind::Commit,
-        other => return Err(format!("unknown git mode {other:?}")),
-    };
-    Ok(kind.into())
-}
-
-/// A fresh, unique throwaway-index path (under the system temp dir).
-fn temp_index_path() -> Result<PathBuf, String> {
-    let base = std::env::temp_dir().join("caos-index");
-    std::fs::create_dir_all(&base).map_err(|e| format!("creating {}: {e}", base.display()))?;
-    let pid = std::process::id();
-    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(base.join(format!("{pid}.{seq}")))
 }
 
 /// Base URL of the caos server (storage + compute), from [`SERVER_ENV`].
@@ -2476,8 +3020,7 @@ fn record_continuation(
 /// pipe or redirect. A tree has no single stream to print, so an output path is
 /// required for one. A `commit` result behaves like a file whose bytes are the
 /// raw commit object (headers, blank line, message) — streamed or written to
-/// `<output>` as such; fetch the real object by hash (`git fetch caos <hash>`)
-/// when you want the commit itself. There
+/// `<output>` as such. There
 /// is no `/cas` here: path-valued args are host paths the transport ingests, and
 /// `<image>` is a `docker://` ref, a bare hash, or a `/cas/std/<name>` builtin
 /// (resolved against the published library).
@@ -2730,24 +3273,21 @@ fn std_tree() -> Result<String, String> {
     if let Ok(hash) = resolve_ref(&refname) {
         return Ok(hash);
     }
-    // Not local yet — read just the root hash from the remote's advertisement
-    // (`ls-remote` — no pack negotiation, works for any object type). We
-    // deliberately do NOT `git fetch` the tree: fetching a tree pulls its entire
-    // reachable closure — every builtin, including the ~1.5GB `rustc` image — to
-    // resolve a single name, which both wastes the network and OOM-kills the
-    // server buffering that pack. Resolution needs only the std *root* tree, which
+    // Not local yet — read just the root hash from the remote's ref
+    // advertisement. We deliberately do not fetch the tree's entire reachable
+    // closure — every builtin, including the ~1.5GB `rustc` image — just to
+    // resolve a single name. Resolution needs only the std *root* tree, which
     // the HTTP transport fetches by hash on demand ([`fetch_tree_entries`]), and
     // then only the chosen builtin's subtree — so a `bash` run never pulls
     // `rustc`. We don't record the ref locally: `resolve_ref` peels by reading the
     // object, so a ref pointing at an un-fetched tree would just fail back here.
     let advertised = git_capture(&["ls-remote", CAOS_REMOTE, &refname], None)?;
-    let hash = advertised
+    advertised
         .split_whitespace()
         .next()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| format!("{refname} not found on the `{CAOS_REMOTE}` remote"))?
-        .to_string();
-    Ok(hash)
+        .filter(|hash| !hash.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{refname} not found on the `{CAOS_REMOTE}` remote"))
 }
 
 /// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — bind arguments

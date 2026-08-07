@@ -1,7 +1,10 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::AtomicBool;
 
-use caos::chat::WorkspaceDiff;
+use caos::{chat::WorkspaceDiff, GitTransport};
+use gix::bstr::{BStr, BString, ByteSlice};
 
 /// Check out a conversation's head commit in the local working tree.
 ///
@@ -11,18 +14,92 @@ use caos::chat::WorkspaceDiff;
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
 pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
-    let dirty = capture_required(
-        "git",
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-        cwd,
-    )?;
-    if !dirty.is_empty() {
+    let repo = open_repo(cwd)?;
+    let mut status = repo
+        .status(gix::progress::Discard)
+        .map_err(|error| format!("preparing worktree status: {error}"))?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .into_iter(Vec::<BString>::new())
+        .map_err(|error| format!("reading worktree status: {error}"))?;
+    if status
+        .next()
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
         return Err(
             "the working tree is not clean; commit or stash local changes before checking out the conversation head"
                 .to_string(),
         );
     }
-    capture_required("git", &["checkout", "--detach", head], cwd)?;
+
+    let commit_id = parse_oid(head)?;
+    let commit = repo
+        .find_commit(commit_id)
+        .map_err(|error| format!("reading conversation commit {head}: {error}"))?;
+    let tree_id = commit
+        .tree_id()
+        .map_err(|error| format!("reading conversation tree {head}: {error}"))?;
+    let old_index = repo
+        .index_or_empty()
+        .map_err(|error| format!("opening worktree index: {error}"))?;
+    let mut new_index = repo
+        .index_from_tree(&tree_id)
+        .map_err(|error| format!("building index for {head}: {error}"))?;
+    let new_paths = new_index
+        .entries_with_paths_by_filter_map(|path, _| Some(path.to_owned()))
+        .map(|(path, _)| path.to_owned())
+        .collect::<HashSet<_>>();
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| "the TUI requires a non-bare repository".to_string())?;
+    let mut removed = Vec::new();
+    for (path, ()) in old_index.entries_with_paths_by_filter_map(|_, _| Some(())) {
+        if !new_paths.contains(path) {
+            removed.push(git_path(workdir, path));
+        }
+    }
+    removed.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in removed {
+        remove_worktree_entry(&path)?;
+        remove_empty_parents(path.parent(), workdir)?;
+    }
+
+    let mut options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|error| format!("preparing checkout: {error}"))?;
+    options.overwrite_existing = true;
+    let objects_dir = repo.clone().into_sync().objects_dir().to_owned();
+    let objects = gix::odb::at(objects_dir)
+        .and_then(|objects| objects.into_arc())
+        .map_err(|error| format!("opening repository objects for checkout: {error}"))?;
+    let outcome = gix::worktree::state::checkout(
+        &mut new_index,
+        workdir,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &AtomicBool::new(false),
+        options,
+    )
+    .map_err(|error| format!("checking out conversation {head}: {error}"))?;
+    if !outcome.errors.is_empty() || !outcome.collisions.is_empty() {
+        return Err(format!(
+            "checking out conversation {head} left {} errors and {} path collisions",
+            outcome.errors.len(),
+            outcome.collisions.len()
+        ));
+    }
+    new_index
+        .write(Default::default())
+        .map_err(|error| format!("writing worktree index: {error}"))?;
+    repo.reference(
+        "HEAD",
+        commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        format!("checkout: moving to {head}"),
+    )
+    .map_err(|error| format!("detaching HEAD at {head}: {error}"))?;
     Ok(())
 }
 
@@ -31,25 +108,16 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 ///
 /// This is the inverse of `load_conversation_workspace`: after checking out a
 /// conversation head and editing files, `/update-tree` folds those files into a
-/// user-authored turn. It deliberately DOES commit — staging everything with
-/// `git add -A` and committing when the tree is dirty — so the checkout is left
+/// user-authored turn. It deliberately DOES commit — staging every non-ignored
+/// change and committing when the tree is dirty — so the checkout is left
 /// clean and its `HEAD` matches exactly what the turn receives. A later
 /// `Ctrl+L` onto the conversation's new head then succeeds instead of tripping
 /// the clean-tree guard. When the working tree is already clean (the user
 /// committed the changes themselves), nothing is committed and the current
-/// `HEAD`'s tree is returned. `git add -A` respects `.gitignore`, so the commit
+/// `HEAD`'s tree is returned. gix's status walk respects `.gitignore`, so the commit
 /// mirrors what a normal commit of the working tree would contain.
 pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, String> {
-    capture_required("git", &["add", "-A"], cwd)?;
-    // `git diff --cached --quiet` exits non-zero exactly when the index differs
-    // from HEAD, i.e. there is something to commit.
-    let clean = command_output("git", &["diff", "--cached", "--quiet"], cwd)?
-        .status
-        .success();
-    if !clean {
-        capture_required("git", &["commit", "--quiet", "-m", message], cwd)?;
-    }
-    capture_required("git", &["rev-parse", "HEAD^{tree}"], cwd)
+    GitTransport::discover(cwd)?.commit_working_tree(message)
 }
 
 /// Publish the virtual workspace as a clean branch without checking it out.
@@ -123,28 +191,35 @@ pub(crate) fn publish_conversation_pr(
 /// tip of your local default branch (e.g. `main`) is a fine one. This discovers
 /// the default branch *name* from the `origin/HEAD` symref, then reads the local
 /// `refs/heads/<name>` — not the `origin/<name>` tracking ref — so it reflects
-/// your checked-out branch as it is right now. It runs no `git ls-remote`/`git
-/// fetch`, so it stays instant (e.g. on every Ctrl+N) instead of blocking on
+/// your checked-out branch as it is right now. It performs no remote operation,
+/// so it stays instant (e.g. on every Ctrl+N) instead of blocking on
 /// round-trips to `origin`. Publishing a PR still fetches, where a fresh remote
 /// tip matters.
 pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
     // `refs/remotes/origin/HEAD` is the local symref recording origin's default
-    // branch; it is set at clone time and refreshed by `git remote set-head`.
-    let head_ref = capture_required("git", &["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
-        .map_err(|error| {
-            format!(
-                "could not resolve origin's default branch locally \
-             (run `git remote set-head origin -a`): {error}"
-            )
-        })?;
+    // branch; it is normally set when the repository is cloned.
+    let repo = open_repo(cwd)?;
+    let head = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .map_err(|error| format!("could not resolve origin's default branch locally: {error}"))?;
+    let head_target = head.target();
+    let head_ref = head_target
+        .try_name()
+        .ok_or_else(|| "refs/remotes/origin/HEAD is not symbolic".to_string())?
+        .as_bstr()
+        .to_str_lossy();
     let branch = head_ref
         .strip_prefix("refs/remotes/origin/")
         .ok_or_else(|| format!("origin/HEAD points outside refs/remotes/origin: {head_ref}"))?
         .to_string();
     let local_ref = format!("refs/heads/{branch}");
-    let commit = capture_required("git", &["rev-parse", "--verify", &local_ref], cwd)
+    let mut reference = repo
+        .find_reference(&local_ref)
         .map_err(|error| format!("local default branch {branch:?} not found: {error}"))?;
-    Ok((branch, commit))
+    let commit = reference
+        .peel_to_commit()
+        .map_err(|error| format!("local default branch {branch:?} is not a commit: {error}"))?;
+    Ok((branch, commit.id.to_string()))
 }
 
 pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
@@ -235,49 +310,53 @@ pub(crate) fn prepare_publish_branch(
 ) -> Result<String, String> {
     let branch = format!("caos/{name}");
     let branch_ref = format!("refs/heads/{branch}");
+    let repo = open_repo(cwd)?;
     let publish_tree = merge_publish_tree(&diff.head, publish_base, change_base, cwd)?;
-    let previous = capture_optional("git", &["rev-parse", "--verify", &branch_ref], cwd)?;
-    let reusable = if let Some(previous) = previous.as_deref() {
-        let previous_tree_spec = format!("{previous}^{{tree}}");
-        let previous_tree = capture_required("git", &["rev-parse", &previous_tree_spec], cwd)?;
-        let previous_parent =
-            capture_optional("git", &["rev-parse", &format!("{previous}^")], cwd)?;
-        previous_tree == publish_tree && previous_parent.as_deref() == Some(publish_base)
-    } else {
-        false
-    };
+    let publish_tree_id = parse_oid(&publish_tree)?;
+    let publish_base_id = parse_oid(publish_base)?;
+    let previous = repo
+        .try_find_reference(&branch_ref)
+        .map_err(|error| format!("reading {branch_ref}: {error}"))?
+        .map(|mut reference| reference.peel_to_commit())
+        .transpose()
+        .map_err(|error| format!("reading {branch_ref} commit: {error}"))?;
+    let reusable = previous.as_ref().is_some_and(|commit| {
+        commit
+            .tree_id()
+            .is_ok_and(|tree| tree.detach() == publish_tree_id)
+            && commit.parent_ids().next().map(|parent| parent.detach()) == Some(publish_base_id)
+    });
     let publish_commit = if reusable {
-        previous.clone().expect("a reusable publish commit exists")
+        previous
+            .as_ref()
+            .expect("a reusable publish commit exists")
+            .id
     } else {
-        capture_required(
-            "git",
-            &[
-                "commit-tree",
-                &publish_tree,
-                "-p",
-                publish_base,
-                "-m",
-                &format!(
-                    "CAOS conversation {} at {}",
-                    short_hash(name),
-                    short_hash(&diff.head)
-                ),
-            ],
-            cwd,
-        )?
+        repo.new_commit(
+            format!(
+                "CAOS conversation {} at {}",
+                short_hash(name),
+                short_hash(&diff.head)
+            ),
+            publish_tree_id,
+            [publish_base_id],
+        )
+        .map_err(|error| format!("creating publish commit: {error}"))?
+        .id
     };
-    match previous.as_deref() {
-        Some(old) if old != publish_commit => {
-            capture_required(
-                "git",
-                &["update-ref", &branch_ref, &publish_commit, old],
-                cwd,
-            )?;
-        }
-        None => {
-            capture_required("git", &["update-ref", &branch_ref, &publish_commit], cwd)?;
-        }
-        _ => {}
+    let previous_id = previous.as_ref().map(|commit| commit.id);
+    if previous_id != Some(publish_commit) {
+        let expected = match previous_id {
+            Some(id) => gix::refs::transaction::PreviousValue::MustExistAndMatch(id.into()),
+            None => gix::refs::transaction::PreviousValue::MustNotExist,
+        };
+        repo.reference(
+            branch_ref.as_str(),
+            publish_commit,
+            expected,
+            format!("publish: {branch}"),
+        )
+        .map_err(|error| format!("updating {branch_ref}: {error}"))?;
     }
     Ok(branch)
 }
@@ -293,70 +372,122 @@ fn merge_publish_tree(
     change_base: Option<&str>,
     cwd: &Path,
 ) -> Result<String, String> {
+    let repo = open_repo(cwd)?;
+    let head_id = parse_oid(head)?;
+    let publish_base_id = parse_oid(publish_base)?;
     // A child conversation starts from its parent's internal commit, while a
     // stacked PR targets the parent's clean snapshot commit. Those commits
     // intentionally have different histories. Give the selected snapshot a
     // temporary parent at the conversation's starting point so merge-tree
     // applies only this conversation's delta instead of re-merging its parent.
     let merge_tip = if let Some(change_base) = change_base {
-        let publish_tree = capture_required(
-            "git",
-            &["rev-parse", &format!("{publish_base}^{{tree}}")],
-            cwd,
-        )?;
-        capture_required(
-            "git",
-            &[
-                "commit-tree",
-                &publish_tree,
-                "-p",
-                change_base,
-                "-m",
-                "temporary CAOS publish merge base",
-            ],
-            cwd,
-        )?
+        let publish_commit = repo
+            .find_commit(publish_base_id)
+            .map_err(|error| format!("reading publish-base tree: {error}"))?;
+        let publish_tree = publish_commit
+            .tree_id()
+            .map_err(|error| format!("reading publish-base tree: {error}"))?;
+        repo.new_commit(
+            "temporary CAOS publish merge base",
+            publish_tree,
+            [parse_oid(change_base)?],
+        )
+        .map_err(|error| format!("creating temporary publish merge base: {error}"))?
+        .id
     } else {
-        publish_base.to_string()
+        publish_base_id
     };
-    let output = command_output(
-        "git",
-        &[
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            "--no-messages",
-            &merge_tip,
-            head,
-        ],
-        cwd,
-    )?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
-        return stdout
-            .lines()
-            .next()
-            .filter(|tree| !tree.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| "git merge-tree returned no merged tree".to_string());
-    }
-    if output.status.code() == Some(1) {
-        let conflicts = stdout
-            .lines()
-            .skip(1)
-            .filter(|path| !path.is_empty())
-            .map(|path| format!("  {path}"))
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: Some("base".into()),
+        current: Some("selected PR base".into()),
+        other: Some("conversation".into()),
+    };
+    let options = repo
+        .tree_merge_options()
+        .map_err(|error| format!("preparing publish merge: {error}"))?
+        .into();
+    let mut outcome = repo
+        .merge_commits(merge_tip, head_id, labels, options)
+        .map_err(|error| format!("merging conversation into selected PR base: {error}"))?;
+    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
+    if outcome.tree_merge.has_unresolved_conflicts(unresolved) {
+        let mut conflicts = outcome
+            .tree_merge
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.is_unresolved(unresolved))
+            .map(|conflict| conflict.ours.location().to_str_lossy().into_owned())
             .collect::<Vec<_>>();
-        let paths = if conflicts.is_empty() {
-            "  (git did not report the conflicting paths)".to_string()
-        } else {
-            conflicts.join("\n")
-        };
+        conflicts.sort();
+        conflicts.dedup();
+        let paths = conflicts
+            .iter()
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(format!(
             "conversation changes conflict with the selected PR base branch:\n{paths}\nresolve these files against the latest selected base before publishing"
         ));
     }
-    require_success("git merge-tree", output).map(|_| unreachable!())
+    outcome
+        .tree_merge
+        .tree
+        .write()
+        .map(|tree| tree.detach().to_string())
+        .map_err(|error| format!("writing publish merge tree: {error}"))
+}
+
+fn open_repo(cwd: &Path) -> Result<gix::Repository, String> {
+    gix::discover(cwd).map_err(|error| format!("opening git repository: {error}"))
+}
+
+fn parse_oid(value: &str) -> Result<gix::ObjectId, String> {
+    gix::ObjectId::from_hex(value.trim().as_bytes())
+        .map_err(|error| format!("invalid git object id {value:?}: {error}"))
+}
+
+fn git_path(workdir: &Path, path: &BStr) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        workdir.join(OsStr::from_bytes(path.as_ref()))
+    }
+    #[cfg(not(unix))]
+    {
+        workdir.join(path.to_str_lossy().as_ref())
+    }
+}
+
+fn remove_worktree_entry(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    }
+    .map_err(|error| format!("removing {}: {error}", path.display()))
+}
+
+fn remove_empty_parents(mut path: Option<&Path>, workdir: &Path) -> Result<(), String> {
+    while let Some(dir) = path {
+        if dir == workdir {
+            break;
+        }
+        match std::fs::remove_dir(dir) {
+            Ok(()) => path = dir.parent(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(format!("removing {}: {error}", dir.display())),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
@@ -364,6 +495,7 @@ pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Resu
     require_success(program, output).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
+#[cfg(test)]
 fn capture_optional(program: &str, args: &[&str], cwd: &Path) -> Result<Option<String>, String> {
     let output = command_output(program, args, cwd)?;
     if output.status.success() {
@@ -403,6 +535,9 @@ fn short_hash(hash: &str) -> &str {
 mod tests {
     use super::*;
 
+    const GIX_ONLY_REPO_ENV: &str = "CAOS_TEST_GIX_ONLY_REPO";
+    const GIX_ONLY_HEAD_ENV: &str = "CAOS_TEST_GIX_ONLY_HEAD";
+
     fn temp_repo(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -424,6 +559,56 @@ mod tests {
         capture_required("git", &["add", "file.txt"], dir).unwrap();
         capture_required("git", &["commit", "-q", "-m", message], dir).unwrap();
         capture_required("git", &["rev-parse", "HEAD"], dir).unwrap()
+    }
+
+    #[test]
+    fn workspace_checkout_and_commit_do_not_require_git_on_path() {
+        if let (Ok(repo), Ok(head)) = (
+            std::env::var(GIX_ONLY_REPO_ENV),
+            std::env::var(GIX_ONLY_HEAD_ENV),
+        ) {
+            let repo = Path::new(&repo);
+            load_conversation_workspace(&head, repo).unwrap();
+            std::fs::write(repo.join("file.txt"), "edited without git\n").unwrap();
+            let tree = commit_working_tree("gix-only edit", repo).unwrap();
+            assert_eq!(
+                gix::discover(repo)
+                    .unwrap()
+                    .head_commit()
+                    .unwrap()
+                    .tree_id()
+                    .unwrap()
+                    .to_string(),
+                tree
+            );
+            return;
+        }
+
+        let dir = temp_repo("gix-only-test");
+        let base = commit_file(&dir, "base\n", "base");
+        let head = commit_file(&dir, "conversation\n", "conversation");
+        capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
+        let empty_path = dir.join("empty-path");
+        std::fs::create_dir(&empty_path).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tui::workspace::tests::workspace_checkout_and_commit_do_not_require_git_on_path")
+            .arg("--nocapture")
+            .env(GIX_ONLY_REPO_ENV, &dir)
+            .env(GIX_ONLY_HEAD_ENV, &head)
+            .env("PATH", &empty_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            capture_required("git", &["show", "HEAD:file.txt"], &dir).unwrap(),
+            "edited without git"
+        );
+        assert_eq!(
+            capture_required("git", &["show", "-s", "--format=%s", "HEAD"], &dir).unwrap(),
+            "gix-only edit"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

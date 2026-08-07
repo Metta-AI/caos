@@ -132,9 +132,9 @@ see `design/flake-images.md`.
   from and writing results to a per-job `/cas` directory through the setuid
   `caos` binary, and may stay warm to take further jobs for its image.
 - A **user** drives it all with `caos-cli` from inside a git working tree that
-  has the server configured as a remote named `caos`. Objects are built locally
-  and exchanged with the server by **negotiated git push/fetch**, so passing a
-  large, mostly-unchanged tree only transfers the delta.
+  has the server configured as a remote named `caos`. The client uses gix for
+  local repository operations and negotiated git push/fetch for network
+  exchange, so passing a large, mostly-unchanged tree transfers only the delta.
 
 Everything — an input file, a worker image, a result — is a git object named by
 its hash, so identical work is deduplicated and memoized.
@@ -288,9 +288,9 @@ logic — the difference is the **transport** and the privilege model.
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
 - **`caos-cli`** (user-facing; also installed as plain `caos`) uses the server
-  as a **`caos` git remote**: it builds objects in the local working repo and
-  exchanges them by negotiated push/fetch. It has no `/cas` and no
-  object-level commands:
+  as a **`caos` git remote**: it builds and reads local objects in-process with
+  gix, exchanges them by negotiated push/fetch, and has no `/cas` or object-level
+  commands:
   - `run` — compute (blocking, as before), with the result checked out to any
     host path;
   - `curry` — bind args to an image, printing the curried ref;
