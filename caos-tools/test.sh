@@ -170,8 +170,9 @@ stage3)
     #
     # This is the whole mechanism. std used to be baked into the image, so any
     # worker binary moved the image and re-keyed all twenty tests; now a test's
-    # key holds what it named. A worker-rgrep edit moves std/rgrep and
-    # bin/worker-rgrep, which two tests name — the other eighteen are hits.
+    # key holds what it named. A worker-bash-tool edit moves std/bash-tool and
+    # bin/worker-bash-tool, which the tests that name it re-key — the rest are
+    # hits.
     #
     # Undeclared is UNAVAILABLE, deliberately: an unnamed std entry will not
     # resolve and an unnamed binary will not copy. Both fail loudly inside the
@@ -184,11 +185,13 @@ stage3)
     # Fetching a std entry brings its subtrees, so a curry's `args` ride along.
     # Three things do NOT, and each has to be named explicitly:
     #
-    #   - A CURRY'S BASE. `std/rgrep/base` is a BLOB holding the base image's
-    #     hash, not a reference to it, so declaring `rgrep` without `runner`
-    #     yields "object not found" on the runner tree.
+    #   - A CURRY'S BASE. `std/deep-deps/base` is a BLOB holding the base
+    #     image's hash, not a reference to it, so declaring `deep-deps` without
+    #     `runner` yields "object not found" on the runner tree.
     #   - A HASH BOUND AS A LITERAL. `std/rustc` binds `--cargo=<hash>` the same
-    #     way, so rustc needs `cargo`.
+    #     way, so rustc needs `cargo`. And a `.caos-expr` SOURCE entry names its
+    #     builders the same way: `std/rgrep` builds via `run /std/rustc` over
+    #     `/std/runner`, so a test resolving `rgrep` needs `rustc cargo runner`.
     #   - A NAME THE SERVER LOOKS UP. `std/bash` is a flake tree, and running one
     #     makes the server resolve `flake-builder` BY NAME — "std library has no
     #     flake-builder".

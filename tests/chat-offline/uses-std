@@ -1,1 +1,1 @@
-runner bash-tool llm-step rgrep bash flake-builder
+runner bash-tool llm-step rgrep rustc cargo bash flake-builder

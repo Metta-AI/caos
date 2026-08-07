@@ -30,7 +30,7 @@ const MAX_ENTRIES: usize = 1_000;
 
 /// True if `name` is one of the inline tools this module executes.
 pub fn is_inline(name: &str) -> bool {
-    matches!(name, "read" | "ls" | "write" | "edit" | "read-oid")
+    matches!(name, "read" | "ls" | "write" | "edit")
 }
 
 /// The inline tools' registry entries, alongside `bash`'s.
@@ -39,27 +39,33 @@ pub fn declarations() -> Vec<Value> {
     vec![
         json!({
             "name": "read",
-            "description": "Read a file from the workspace. Returns the raw content. Prefer \
-        this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files \
-        are truncated; use `offset`/`limit` (line-based) to page.",
+            "description": "Read a file's contents. Defaults to the current workspace; pass \
+        `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage \
+        oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree \
+        `root`, `file_path` names the file within it; with a blob `root`, omit `file_path` to \
+        read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no \
+        `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "file_path": {"type": "string", "description": path_desc},
+                    "root": {"type": "string", "description": "Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current workspace."},
                     "offset": {"type": "integer", "description": "1-based first line to return."},
                     "limit": {"type": "integer", "description": "Number of lines to return."}
-                },
-                "required": ["file_path"]
+                }
             }
         }),
         json!({
             "name": "ls",
-            "description": "List a workspace directory: one entry per line, directories with a \
-        trailing `/`. Prefer this over `ls` via bash.",
+            "description": "List a directory: one entry per line, directories with a \
+        trailing `/`. Defaults to the current workspace; pass `root` (a commit or tree hash) \
+        to list it as of another revision, and `path` to descend within that root. Prefer \
+        this over `ls` via bash.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative directory; omit for the workspace root."}
+                    "path": {"type": "string", "description": "Directory to list (relative to `root`, or to the workspace root); omit for the root itself."},
+                    "root": {"type": "string", "description": "Optional commit or tree hash to list as of another revision. Omit for the current workspace."}
                 }
             }
         }),
@@ -92,23 +98,6 @@ pub fn declarations() -> Vec<Value> {
                 "required": ["file_path", "old_string", "new_string"]
             }
         }),
-        json!({
-            "name": "read-oid",
-            "description": "Read a blob by its git object hash. Bounded exactly like `read` \
-        (large blobs truncate; use `offset`/`limit`). Use this to inspect content named by an \
-        oid that no workspace path holds — in particular a stage oid from `.caos/conflicts` \
-        (the merge base, or either side of a modify/delete, binary, or type conflict), so you \
-        can see what you are choosing between.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "oid": {"type": "string", "description": "A git object hash (a blob)."},
-                    "offset": {"type": "integer", "description": "1-based first line to return."},
-                    "limit": {"type": "integer", "description": "Number of lines to return."}
-                },
-                "required": ["oid"]
-            }
-        }),
     ]
 }
 
@@ -122,12 +111,14 @@ pub fn grep_declaration() -> Value {
         "description": "Search the workspace with a regular expression (Rust regex syntax, \
     line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or \
     file) to narrow the search; results are cached per unchanged subtree, so repeated and \
-    scoped greps are cheap. Prefer this over grep/find via bash.",
+    scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another \
+    revision. Prefer this over grep/find via bash.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "The regular expression to search for."},
-                "path": {"type": "string", "description": "Workspace-relative directory or file to search; omit for the whole workspace."}
+                "path": {"type": "string", "description": "Directory or file to search (relative to `root`, or to the workspace root); omit for everything."},
+                "root": {"type": "string", "description": "Optional commit or tree hash to search as of another revision. Omit for the current workspace."}
             },
             "required": ["pattern"]
         }
@@ -137,8 +128,12 @@ pub fn grep_declaration() -> Value {
 // ---- Tree tools (caos-tools/*.sh — design/cargo-workers.md) -----------------
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
-/// the file tools) must stay stable whatever the tree carries.
-const RESERVED_TOOLS: &[&str] = &["bash", "grep", "read", "ls", "write", "edit", "read-oid"];
+/// the file tools) must stay stable whatever the tree carries, and the
+/// built-in history tools (`log`/`show`/`diff` — see `githist.rs`) are
+/// standard, not project-defined.
+const RESERVED_TOOLS: &[&str] = &[
+    "bash", "grep", "read", "ls", "write", "edit", "log", "show", "diff",
+];
 
 /// The tree's tool directory (`caos-tools/` in the workspace), expanded one
 /// level; `None` when the tree defines no tools.
@@ -154,7 +149,9 @@ fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
 
 /// Arg names a tree tool may not declare: the interpreter binds these itself
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
-const RESERVED_ARGS: &[&str] = &["in", "worker1", "image", "std", "salt"];
+/// `wc`/`refs` are bound only for `#@git` tools, but reserved unconditionally
+/// so a tool can't declare a model arg the interpreter would then clobber.
+const RESERVED_ARGS: &[&str] = &["in", "worker1", "image", "std", "salt", "wc", "refs"];
 
 /// One tree tool as the registry sees it: its name, its `#@doc` description,
 /// and the `#@arg` parameters it accepts.
@@ -162,6 +159,11 @@ pub struct TreeTool {
     pub name: String,
     pub doc: String,
     pub args: Vec<TreeArg>,
+    /// The tool declared `#@git`: bind the workspace commit (`wc`) and the
+    /// turn's ref snapshot (`refs`) so it can walk history. Off by default —
+    /// `wc` changes every step, so binding it into a tool that doesn't need it
+    /// (build/test) would turn every cache hit into a miss.
+    pub git: bool,
 }
 
 /// One `#@arg` line: `#@arg <name> <description>` is required, `#@arg
@@ -205,9 +207,12 @@ fn read_tool(name: &str, path: &str) -> Result<TreeTool, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
+    let mut git = false;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("#@doc") {
             doc.push(rest.trim());
+        } else if line.trim_end() == "#@git" {
+            git = true;
         } else if let Some(rest) = line.strip_prefix("#@arg") {
             match parse_arg(rest.trim()) {
                 Some(a) => args.push(a),
@@ -224,6 +229,7 @@ fn read_tool(name: &str, path: &str) -> Result<TreeTool, String> {
         name: name.to_string(),
         doc,
         args,
+        git,
     })
 }
 
@@ -402,23 +408,18 @@ pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> 
     if let Err(e) = regex::Regex::new(pattern) {
         return fail(format!("invalid pattern: {e}"));
     }
-    match call["input"]["path"]
-        .as_str()
-        .filter(|p| !p.trim().is_empty())
-    {
-        None => Ok((ws.to_string(), String::new())),
-        Some(_) => {
-            let comps = match components(call, "path") {
-                Ok(c) => c,
-                Err(User(msg)) => return fail(msg),
-                Err(Infra(e)) => return fail(e),
-            };
-            match materialize(ws, &comps) {
-                Ok(p) => Ok((p.to_string_lossy().into_owned(), comps.join("/"))),
-                Err(User(msg)) => fail(msg),
-                Err(Infra(e)) => fail(e),
-            }
-        }
+    let root = opt_hash(call, "root");
+    let comps = match components_opt(call, "path") {
+        Ok(c) => c,
+        Err(User(msg)) => return fail(msg),
+        Err(Infra(e)) => return fail(e),
+    };
+    // `resolve` handles all four cases: no root + no path is the workspace
+    // root; a `root` hash roots the search at another revision's tree.
+    match resolve(root.as_deref(), ws, &comps) {
+        Ok(p) => Ok((p.to_string_lossy().into_owned(), comps.join("/"))),
+        Err(User(msg)) => fail(msg),
+        Err(Infra(e)) => fail(e),
     }
 }
 
@@ -518,7 +519,6 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
     let name = call["name"].as_str().unwrap_or("");
     let outcome = match name {
         "read" => read(call, ws).map(|text| (text, None)),
-        "read-oid" => read_oid(call).map(|text| (text, None)),
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "edit" => edit(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
@@ -548,13 +548,92 @@ fn block(id: &str, text: &str, is_error: bool) -> Value {
 // ---------------------------------------------------------------------------
 
 fn read(call: &Value, ws: &str) -> Result<String, Fail> {
-    let comps = components(call, "file_path")?;
-    let p = materialize(ws, &comps)?;
+    let root = opt_hash(call, "root");
+    let comps = components_opt(call, "file_path")?;
+    if root.is_none() && comps.is_empty() {
+        return Err(User(
+            "read needs a `file_path` (or a `root` blob hash to read directly)".to_string(),
+        ));
+    }
+    let p = resolve(root.as_deref(), ws, &comps)?;
     if p.is_dir() {
-        return Err(User(format!("{} is a directory; use ls", comps.join("/"))));
+        let what = if comps.is_empty() {
+            "that root is a tree".to_string()
+        } else {
+            format!("{} is a directory", comps.join("/"))
+        };
+        return Err(User(format!("{what}; use ls")));
     }
     let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
     bounded(&bytes, call)
+}
+
+/// Resolve `(root, path)` to a materialized node. `root` `None` reads the
+/// current workspace tree `ws`; a `root` hash may name a TREE (navigate into
+/// it), a COMMIT (navigate into its tree), or a BLOB (a leaf — valid only with
+/// no `path`). This is the one place history reads root elsewhere; `read` and
+/// `ls` share it, then each checks the node is the kind it wants.
+fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
+    let Some(hash) = root else {
+        return materialize(ws, comps);
+    };
+    if !valid_oid(hash) {
+        return Err(User(format!("{hash:?} is not a git object hash")));
+    }
+    let dst = fresh("root");
+    caos(["get-hash", hash, &dst]).map_err(|e| User(format!("cannot read {hash}: {e}")))?;
+    let p = PathBuf::from(&dst);
+    if p.is_dir() {
+        // A tree: navigate straight into it.
+        return materialize(&dst, comps);
+    }
+    // A non-tree object materializes as a file — a commit (navigate into its
+    // tree) or a blob (a leaf).
+    let _ = caos(["get", &dst]);
+    let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
+    if let Some(tree) = commit_tree_of(&bytes) {
+        let tdst = fresh("root");
+        caos(["get-hash", &tree, &tdst])
+            .map_err(|e| User(format!("cannot read tree {tree}: {e}")))?;
+        return materialize(&tdst, comps);
+    }
+    // A blob: it is the node, but only if no path was asked for.
+    if comps.is_empty() {
+        Ok(p)
+    } else {
+        Err(User(format!(
+            "{hash} is a blob; it has no paths inside it (drop `file_path`/`path` to read it)"
+        )))
+    }
+}
+
+/// If `bytes` is a git commit object, its `tree` hash. A commit's header (up to
+/// the first blank line) carries both a `tree <oid>` and an `author ` line;
+/// requiring both keeps a blob that merely starts with "tree " from passing.
+fn commit_tree_of(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let header = text.split("\n\n").next().unwrap_or("");
+    let mut tree = None;
+    let mut has_author = false;
+    for line in header.lines() {
+        if let Some(h) = line.strip_prefix("tree ").map(str::trim) {
+            if valid_oid(h) {
+                tree = Some(h.to_string());
+            }
+        } else if line.starts_with("author ") {
+            has_author = true;
+        }
+    }
+    has_author.then_some(tree).flatten()
+}
+
+/// An optional hash-valued input (`root`): trimmed, empty treated as absent.
+fn opt_hash(call: &Value, key: &str) -> Option<String> {
+    call["input"][key]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// A git object hash: hex, 40 (sha1) or 64 (sha256) chars.
@@ -562,37 +641,8 @@ fn valid_oid(oid: &str) -> bool {
     (oid.len() == 40 || oid.len() == 64) && oid.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Read a blob by hash. The load-bearing companion to `.caos/conflicts`: a
-/// stage oid there (the merge base, or a side of a modify/delete, binary, or
-/// type conflict) names content reachable through no workspace path, so the
-/// agent has no other way to see what it is choosing between. Bounded exactly
-/// like `read`. An unknown/malformed oid is the model's mistake — an is_error
-/// result to react to, not a worker failure.
-fn read_oid(call: &Value) -> Result<String, Fail> {
-    let oid = call["input"]["oid"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| User("read-oid needs a string `oid`".to_string()))?;
-    if !valid_oid(oid) {
-        return Err(User(format!("{oid:?} is not a git object hash")));
-    }
-    let dst = fresh("oid");
-    caos(["get-hash", oid, &dst]).map_err(|e| User(format!("cannot read {oid}: {e}")))?;
-    let p = Path::new(&dst);
-    if p.is_dir() {
-        return Err(User(format!(
-            "{oid} names a tree, not a blob; read-oid reads blobs"
-        )));
-    }
-    let _ = caos(["get", &dst]);
-    let bytes = fs::read(p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    bounded(&bytes, call)
-}
-
 /// Apply `read`'s bounds to raw bytes: a line window when `offset`/`limit` is
-/// set, else a head-truncation at [`MAX_READ_BYTES`]. Shared by `read` and
-/// `read-oid` so the two present content identically.
+/// set, else a head-truncation at [`MAX_READ_BYTES`].
 fn bounded(bytes: &[u8], call: &Value) -> Result<String, Fail> {
     let total = bytes.len();
     let text = String::from_utf8_lossy(bytes);
@@ -625,13 +675,9 @@ fn bounded(bytes: &[u8], call: &Value) -> Result<String, Fail> {
 }
 
 fn ls(call: &Value, ws: &str) -> Result<String, Fail> {
-    let dir = match call["input"]["path"]
-        .as_str()
-        .filter(|p| !p.trim().is_empty())
-    {
-        None => PathBuf::from(ws),
-        Some(_) => materialize(ws, &components(call, "path")?)?,
-    };
+    let root = opt_hash(call, "root");
+    let comps = components_opt(call, "path")?;
+    let dir = resolve(root.as_deref(), ws, &comps)?;
     if !dir.is_dir() {
         return Err(User(format!("{} is not a directory", dir.display())));
     }
@@ -731,6 +777,19 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
 // ---------------------------------------------------------------------------
 // Workspace plumbing.
 // ---------------------------------------------------------------------------
+
+/// Like [`components`] but for an OPTIONAL path: an absent or blank argument
+/// yields the empty path (the root), rather than an error.
+fn components_opt(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
+    match call["input"][key]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => Ok(Vec::new()),
+        Some(_) => components(call, key),
+    }
+}
 
 /// Validate and split a workspace-relative path argument. A leading `/` is
 /// tolerated (treated as the workspace root); `..` and the reserved `.caos`
@@ -866,12 +925,39 @@ mod tests {
     }
 
     #[test]
-    fn read_oid_is_inline_and_reserved() {
+    fn commit_vs_blob_root() {
+        // A commit object resolves to its tree; a lookalike blob does not.
+        let tree = "a".repeat(40);
+        let commit = format!(
+            "tree {tree}\nparent {}\nauthor x <x> 0 +0000\ncommitter x <x> 0 +0000\n\nmsg\n",
+            "b".repeat(40)
+        );
+        assert_eq!(commit_tree_of(commit.as_bytes()), Some(tree));
+        // No author line — a blob, even if it opens with "tree ...".
+        assert_eq!(
+            commit_tree_of(format!("tree {}\nsome file text\n", "c".repeat(40)).as_bytes()),
+            None
+        );
+        assert_eq!(commit_tree_of(b"just a normal file\n"), None);
+    }
+
+    #[test]
+    fn read_and_ls_are_inline_and_reserved() {
         // Routed in-process (no sub-run) and shadow-proof against a tree tool.
-        assert!(is_inline("read-oid"));
-        assert!(RESERVED_TOOLS.contains(&"read-oid"));
-        // It is offered to the model in every turn (no image gate).
-        assert!(declarations().iter().any(|d| d["name"] == "read-oid"));
+        for t in ["read", "ls"] {
+            assert!(is_inline(t));
+            assert!(RESERVED_TOOLS.contains(&t));
+            assert!(declarations().iter().any(|d| d["name"] == t));
+        }
+        // read-oid is gone — folded into `read` via `root`.
+        assert!(!is_inline("read-oid"));
+        assert!(!declarations().iter().any(|d| d["name"] == "read-oid"));
+        // read's file_path is no longer required (a blob `root` reads with none).
+        let read = declarations()
+            .into_iter()
+            .find(|d| d["name"] == "read")
+            .unwrap();
+        assert!(read["input_schema"].get("required").is_none());
     }
 
     #[test]
@@ -914,6 +1000,7 @@ mod tests {
                     required: false,
                 },
             ],
+            git: false,
         };
         let d = tree_tool_declaration(&tool);
         assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
@@ -930,6 +1017,7 @@ mod tests {
             name: "build".to_string(),
             doc: "Build.".to_string(),
             args: Vec::new(),
+            git: false,
         };
         let d = tree_tool_declaration(&bare);
         assert_eq!(
@@ -955,6 +1043,7 @@ mod tests {
                     required: false,
                 },
             ],
+            git: false,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 

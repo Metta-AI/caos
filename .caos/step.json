@@ -1,1 +1,1 @@
-{"content":[{"caller":{"type":"direct"},"id":"toolu_017crMJY1AqQdN9DyEpFAiNZ","input":{"theirs":"main"},"name":"merge","type":"tool_use"}],"results":[],"v":1}
+{"content":[{"caller":{"type":"direct"},"id":"toolu_01KTQTMSujKJLgaW8NLNQ11M","input":{},"name":"test","type":"tool_use"}],"results":[{"content":[{"text":"merge completed cleanly; the workspace is the merged result.","type":"text"}],"tool_use_id":"toolu_017crMJY1AqQdN9DyEpFAiNZ","type":"tool_result"}],"v":1}
