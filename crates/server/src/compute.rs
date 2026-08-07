@@ -109,7 +109,7 @@ struct WorkRequest<'a> {
 /// CLI, which pushed the ArgTree): workers never call back into `/run` — a
 /// worker's sub-runs are promise resolutions the server performs itself
 /// ([`run_work_request`] recursion).
-pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
+pub(crate) fn run(config: &Config, query: &str, secrets_header: &str) -> Result<Vec<u8>, HttpError> {
     let arg_tree = query_param(query, "req")
         .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
     if arg_tree.is_empty() || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -125,6 +125,9 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
         }
         config.trace.begin(id).map_err(|e| HttpError::new(409, e))?;
     }
+    // The carried secrets store (design/secrets.md): parsed from the request
+    // header, held for this run and threaded through every sub-run's dispatch.
+    let secrets = crate::secrets::parse_header(secrets_header);
     // An HTTP run is by definition top-level: the run stack (cycle detection)
     // exists only inside the server, threaded through promise sub-runs.
     let result = run_work_request(
@@ -133,6 +136,7 @@ pub(crate) fn run(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
             arg_tree: &arg_tree,
             stack: &[],
             trace_id: trace_id.as_deref(),
+            secrets: &secrets,
         },
     );
     if let Some(id) = &trace_id {
