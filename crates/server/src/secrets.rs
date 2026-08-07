@@ -20,12 +20,14 @@ use std::collections::{BTreeMap, HashSet};
 /// The header carrying the serialized store from client to server.
 pub(crate) const HEADER: &str = "X-Caos-Secrets";
 
-/// One secret the run carries: its value, and the readers (each a partial arg
-/// tree, already resolved client-side to name → oid) allowed to see it.
+/// One secret the run carries: its value, its entropy (the cache-isolation
+/// capability — hashed into `secret-hash`, never stored raw), and the readers
+/// (each a partial arg tree, already resolved client-side to name → oid).
 #[derive(Clone)]
 pub(crate) struct Grant {
     name: String,
     value: String,
+    entropy: String,
     readers: Vec<BTreeMap<String, String>>,
 }
 
