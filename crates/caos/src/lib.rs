@@ -2565,7 +2565,11 @@ pub fn cli_run(
         return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
     }
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, trace, kvs)?;
+    // Build the ephemeral secrets store from the caller's `.caos-secrets`
+    // (design/secrets.md), resolving each reader here — where eval-path is
+    // available — so the server never evals. Empty when there's no store.
+    let secrets = build_secrets_header(t)?;
+    let (kind, result) = run_request(t, &image, None, trace, kvs, &secrets)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
