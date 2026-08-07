@@ -2315,6 +2315,7 @@ fn assemble_arg_tree(
     t: &dyn Transport,
     image: &str,
     call: Vec<gix::objs::tree::Entry>,
+    store: &[ClientSecret],
 ) -> Result<String, String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it. The image is folded into the args tree below, so the server
