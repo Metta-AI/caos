@@ -3291,7 +3291,9 @@ fn resolve_reader_arg(
         Some((_, ty)) => return Err(format!("unknown reader arg type {ty:?} in {tok:?}")),
     };
     if name.is_empty() || name.contains('/') {
-        return Err(format!("reader arg name {name:?} must be one path component"));
+        return Err(format!(
+            "reader arg name {name:?} must be one path component"
+        ));
     }
     let oid = if is_path {
         if let Some(std_name) = value
