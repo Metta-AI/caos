@@ -3235,17 +3235,18 @@ fn secrets_pinned_tree(t: &dyn Transport, dir: &Path) -> Result<String, String> 
 }
 
 /// Parse one `.caos-secrets` file (repeated-key form) into `(name, value,
-/// readers)`. `name` defaults to the filename; `value=`/`value:@=` set the
-/// value; `reader=` accumulates. `entropy=` is accepted but unused here (it
-/// keys cache isolation, a later slice).
+/// entropy, readers)`. `name` defaults to the filename; `value=`/`value:@=` set
+/// the value; `reader=` accumulates; `entropy=` keys cache isolation (empty if
+/// absent — the `caos secrets` tool fills it).
 fn parse_local_secret(
     file_name: &str,
     path: &Path,
-) -> Result<(String, String, Vec<String>), String> {
+) -> Result<(String, String, String, Vec<String>), String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("reading secret {file_name}: {e}"))?;
     let mut name = file_name.to_string();
     let mut value: Option<String> = None;
+    let mut entropy = String::new();
     let mut readers = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
@@ -3257,6 +3258,7 @@ fn parse_local_secret(
             .ok_or_else(|| format!("secret {file_name}: line {line:?} is not key=value"))?;
         match key {
             "name" => name = val.trim().to_string(),
+            "entropy" => entropy = val.trim().to_string(),
             "value" => value = Some(val.to_string()),
             "value:@" => {
                 let file = path.parent().unwrap_or_else(|| Path::new(".")).join(val);
@@ -3268,12 +3270,11 @@ fn parse_local_secret(
                 );
             }
             "reader" => readers.push(val.trim().to_string()),
-            "entropy" => {} // reserved for cache isolation (later slice)
             other => return Err(format!("secret {file_name}: unknown key {other:?}")),
         }
     }
     let value = value.ok_or_else(|| format!("secret {file_name}: no value= line"))?;
-    Ok((name, value, readers))
+    Ok((name, value, entropy, readers))
 }
 
 /// Resolve a reader expression (`<image> [-- --k=v | --k:@=path …]`) to the
