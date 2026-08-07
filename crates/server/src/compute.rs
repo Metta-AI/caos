@@ -347,7 +347,8 @@ fn run_dispatch(
     let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(config, cont, std, salt, &child_stack, trace_id).map_err(fail)?
+            resolve_promise(config, cont, std, salt, &child_stack, trace_id, secrets)
+                .map_err(fail)?
         }
         _ => (result, false),
     };
