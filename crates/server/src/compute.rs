@@ -653,7 +653,7 @@ fn resolve_promise(
     } else if let Some(img) = &run {
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_work_request`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        match run_image(config, img, vec![input.clone()], std, salt, stack, trace_id) {
+        match run_image(config, img, vec![input.clone()], std, salt, stack, trace_id, secrets) {
             Ok(result) => Some((result_entry("result", &result)?, result)),
             // `catch`: the failure becomes `--error`, a blob of the message the
             // caller would otherwise have seen as a 500. `then` is required
