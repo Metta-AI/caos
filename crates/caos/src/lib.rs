@@ -2396,6 +2396,7 @@ fn assemble_arg_tree(
     // separate push. (`std` rides as a bare hash, so the std tree is not in this
     // closure — it is already on the server, published at `refs/caos/std`.)
     let arg_tree = post_tree(t, arg_entries)?;
+    eprintln!("DEBUG client assembled {arg_tree} (image={image})");
     t.ensure_pushed(&arg_tree.to_string())?;
     Ok(arg_tree.to_string())
 }
