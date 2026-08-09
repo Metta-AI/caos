@@ -89,12 +89,34 @@ fn reader_entries(value: &serde_json::Value) -> Option<BTreeMap<String, String>>
 
 /// The secrets a job is entitled to: every carried grant with at least one
 /// reader whose partial arg tree is a subset of the job's top-level arg entries
-/// (`arg_entries`, as `compute::args_entries` reads them). Returns (name, value)
-/// pairs, deduped by name.
+/// (`arg_entries`, as `compute::args_entries` reads them) — but ONLY if the arg
+/// tree *already* carries the matching `secret-hash` (design/secrets.md). That
+/// second condition proves the tree was produced by eval with this store, so a
+/// value can never reach a worker whose cache key doesn't already reflect it
+/// (injection ⟹ the isolating hash is in the key). A reader match without the
+/// matching hash is refused, fail-closed. Returns (name, value), deduped by name.
 pub(crate) fn grant(
     grants: &[Grant],
     arg_entries: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
+    // The hash this job's matched grants require. None ⇒ nothing matches.
+    let Some(digest) = secret_hash(grants, arg_entries) else {
+        return Vec::new();
+    };
+    // The `secret-hash` entry references a blob whose *content* is that digest,
+    // so the entry's oid (what's in `arg_entries`) is the blob-hash of it.
+    let expected = blob_oid(digest.as_bytes());
+    match arg_entries.get(caos_world::SECRET_HASH_ARG) {
+        Some(present) if *present == expected => {}
+        present => {
+            eprintln!(
+                "secrets: refusing injection — {} is {present:?}, expected {expected} \
+                 (worker not produced by eval with this store)",
+                caos_world::SECRET_HASH_ARG
+            );
+            return Vec::new();
+        }
+    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for grant in grants {
@@ -138,9 +160,17 @@ pub(crate) fn secret_hash(
         return None;
     }
     let material = caos_world::secret_hash_material(&pairs);
-    let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &material)
-        .expect("hashing secret material");
-    Some(oid.to_string())
+    Some(blob_oid(&material))
+}
+
+/// The git-blob object id (hex) of `bytes` — computed, not stored. The
+/// `secret-hash` digest and the tree-entry oid that references it are both blob
+/// hashes, so client and server agree by using this one function shape (the
+/// client's `hash_bytes` is its twin).
+fn blob_oid(bytes: &[u8]) -> String {
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)
+        .expect("hashing bytes")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -165,22 +195,36 @@ mod tests {
     }
 
     #[test]
-    fn grant_matches_any_reader_and_dedups() {
+    fn grant_requires_the_matching_secret_hash() {
         let grants = parse_header(
-            r#"[{"name":"tok","value":"s3cr3t","readers":[
+            r#"[{"name":"tok","value":"s3cr3t","entropy":"E","readers":[
                  {"image":"aa"},
                  {"image":"bb","repo":"cc"}
                ]}]"#,
         );
-        // Matches the first reader.
-        let got = grant(&grants, &map(&[("image", "aa"), ("std", "z")]));
-        assert_eq!(got, vec![("tok".to_string(), "s3cr3t".to_string())]);
-        // Matches the second (pinned repo agrees).
-        assert_eq!(
-            grant(&grants, &map(&[("image", "bb"), ("repo", "cc")])).len(),
-            1
+        // A worker that matches a reader but carries NO secret-hash is refused
+        // (it wasn't produced by eval with this store).
+        assert!(grant(&grants, &map(&[("image", "aa")])).is_empty());
+        // With the matching secret-hash present, the value is injected. The
+        // entry is the blob-oid of the digest (how it rides in a real tree).
+        let mut job = map(&[("image", "aa"), ("std", "z")]);
+        let digest = secret_hash(&grants, &job).unwrap();
+        job.insert(
+            caos_world::SECRET_HASH_ARG.to_string(),
+            blob_oid(digest.as_bytes()),
         );
-        // Matches neither.
+        assert_eq!(
+            grant(&grants, &job),
+            vec![("tok".to_string(), "s3cr3t".to_string())]
+        );
+        // A wrong secret-hash is refused.
+        let mut forged = map(&[("image", "aa")]);
+        forged.insert(
+            caos_world::SECRET_HASH_ARG.to_string(),
+            "deadbeef".to_string(),
+        );
+        assert!(grant(&grants, &forged).is_empty());
+        // A worker matching NO reader gets nothing (and needs no hash).
         assert!(grant(&grants, &map(&[("image", "xx")])).is_empty());
     }
 
