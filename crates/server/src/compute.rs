@@ -804,7 +804,6 @@ fn run_image(
     }
     // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
     let arg_tree = store_git_tree(config, args).map_err(store_err)?.to_string();
-    eprintln!("DEBUG run_image built {arg_tree} (image={image})");
     run_work_request(
         config,
         &WorkRequest {
