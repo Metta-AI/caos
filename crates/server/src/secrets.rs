@@ -89,12 +89,31 @@ fn reader_entries(value: &serde_json::Value) -> Option<BTreeMap<String, String>>
 
 /// The secrets a job is entitled to: every carried grant with at least one
 /// reader whose partial arg tree is a subset of the job's top-level arg entries
-/// (`arg_entries`, as `compute::args_entries` reads them). Returns (name, value)
-/// pairs, deduped by name.
+/// (`arg_entries`, as `compute::args_entries` reads them) — but ONLY if the arg
+/// tree *already* carries the matching `secret-hash` (design/secrets.md). That
+/// second condition proves the tree was produced by eval with this store, so a
+/// value can never reach a worker whose cache key doesn't already reflect it
+/// (injection ⟹ the isolating hash is in the key). A reader match without the
+/// matching hash is refused, fail-closed. Returns (name, value), deduped by name.
 pub(crate) fn grant(
     grants: &[Grant],
     arg_entries: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
+    // The hash this job's matched grants require. None ⇒ nothing matches.
+    let Some(expected) = secret_hash(grants, arg_entries) else {
+        return Vec::new();
+    };
+    match arg_entries.get(caos_world::SECRET_HASH_ARG) {
+        Some(present) if *present == expected => {}
+        present => {
+            eprintln!(
+                "secrets: refusing injection — {} is {present:?}, expected {expected} \
+                 (worker not produced by eval with this store)",
+                caos_world::SECRET_HASH_ARG
+            );
+            return Vec::new();
+        }
+    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for grant in grants {
