@@ -160,10 +160,17 @@ pub(crate) fn secret_hash(
         return None;
     }
     let material = caos_world::secret_hash_material(&pairs);
-    let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &material)
-        .expect("hashing secret material");
-    eprintln!("DEBUG server secret_hash: pairs={pairs:?} material={material:?} -> {oid}");
-    Some(oid.to_string())
+    Some(blob_oid(&material))
+}
+
+/// The git-blob object id (hex) of `bytes` — computed, not stored. The
+/// `secret-hash` digest and the tree-entry oid that references it are both blob
+/// hashes, so client and server agree by using this one function shape (the
+/// client's `hash_bytes` is its twin).
+fn blob_oid(bytes: &[u8]) -> String {
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)
+        .expect("hashing bytes")
+        .to_string()
 }
 
 #[cfg(test)]
