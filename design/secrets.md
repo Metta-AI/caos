@@ -101,42 +101,35 @@ Note that this means that the server sees all secrets. We can revisit if this be
 
 ## Remaining work
 
-Built so far, in an interim shape: out-of-band injection at `/secret/<name>`,
-superset matching (both `std/<name>` and tree-relative readers), the hard
-output-scrub assertion (new objects only, refused at `caos put` before
-publish), and best-effort log masking. What that version does differently from
-the design above, plus what is unbuilt:
+Built: the store carried as ephemeral run context and resolved client-side
+(readers via eval-path, so the server never evals); out-of-band injection at
+`/secret/<name>`; superset matching; the `entropy`/`secret-hash` tag; the hard
+output-scrub assertion (new objects only, refused at `caos put` before publish);
+and best-effort log masking. `name=` is supported.
 
-- **Carry the store as ephemeral run context.** Today the store is a server
-  property (`CAOS_SECRETS_DIR`), read at dispatch. The design wants it threaded
-  through the run like the stack — client → server → each promise sub-run — so
-  secrets are per-user and can be iterated locally. The tree a reader evaluates
-  against travels with the store (the store pins its own tree, which is what
-  makes tree-relative readers safe); this replaces the interim server-side pin
-  (`.tree` file / `CAOS_SECRETS_TREE`). Matching + injection stay server-side at
-  every dispatch (so no-delegation holds: a sub-worker is entitled by matching
-  its own arg tree, never by inheritance).
+What that build does differently from the design above, plus what is unbuilt:
 
-- **Entropy + cache isolation.** The required `entropy` field and the
-  `/cas/args/secret-hash` entry — `H(sorted (name, entropy) pairs)` over the
-  secrets a run is *actually granted*, folded into the arg tree only when a
-  grant fires (match the base arg tree first, then append the hash, so it does
-  not chase its own tail). Without it, two users with different secrets share
-  cache entries, and a misconfigured user silently hits another's result. The
-  hash — not the raw entropy — goes in the tree, because an id is a bearer
-  capability for the cache: knowing it reconstructs the key of any run that used
-  it. Rotating `value=` keeps the entropy (cache preserved); rotating the
-  entropy re-namespaces the cache (what to do on a suspected id leak).
+- **Move the `secret-hash` fold to image-eval.** Today it is folded at *run
+  assembly* (client `assemble_arg_tree` / server `run_image`) — downstream of
+  eval and off to the side, so the eval'd ref a *caller* embeds carries no
+  `secret-hash` and callers are not isolated. The fix is to fold it once, in the
+  eval funnel, matching curry-unwrapped entries against the carried store, as a
+  sibling of `image` (see "Where `secret-hash` is folded"). The real plumbing is
+  getting the store into every eval — including **deep-deps**, which is itself a
+  worker that resolves deps and so needs the store threaded into its own run.
+  Reconcile with the run-time fold so a worker isn't folded twice differently
+  (same name+entropy → same hash → the merge dedups; worth a test).
 
-- **`name=` field.** The worker-visible name, distinct from the filename (which
-  stays the user's own label); both the hash and the `/secret/<name>` mount use
-  it. Currently the filename is the name.
+- **Injection double-check.** The server must inject only when the worker
+  *already* carries the matching `secret-hash` (see "Server behavior"), not on a
+  bare reader match — so injection can't happen under a key that doesn't reflect
+  it. Today injection is a bare reader match.
 
 - **Entropy tooling.** A `caos secrets`-style command over the dir that fills a
   missing `entropy` with fresh entropy and warns (or refuses) on a low-entropy
   one — so the safe default is automatic and a misconfig degrades to a cache
-  *miss* (a fresh, uncached run), never a cross-hit. Load-bearing: a
-  low-entropy id is brute-forceable out of the hash.
+  *miss* (a fresh, uncached run), never a cross-hit. Load-bearing: a low-entropy
+  id is brute-forceable out of the hash.
 
 - **Reader `:@=` args and binary `value:@=`.** `:@=` resolves inside a tool's
   `.caos-expr` but not yet on a reader's own trailing args; `value:@=` is read
