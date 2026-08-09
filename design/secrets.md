@@ -79,10 +79,19 @@ Worker experience:
 - We attempt to scrub secret values from the logs of workers
 - We attempt to check files that are added to git with `caos put` for secret values. Any new file (hash not in git) that contains the value of a secret that is visible to this worker is rejected
 
-Correctness requirements: Neither the secret values nor the names of the secrets are part of the work's cache key. Thus:
-- A worker must fail if the secret is missing or invalid
-- If the secret is present and valid, the worker's result must not depend on the secret's value
-- For example, a worker can fail with an invalid secret, but it should not return a list that is filtered to what is visible to this secret's account
+Correctness requirements: a run's *identity* (name + entropy of each granted
+secret) is in the cache key via `secret-hash`, but the secret's **value** is
+not. So:
+- A worker must fail if the secret is missing or invalid.
+- A result may depend on *which* secret it was granted (name + entropy) — that
+  is isolated per-user by `secret-hash` — but must not depend on the value's
+  *bytes* beyond what rotating the **entropy** would refresh. Rotate the entropy
+  when you rotate a value the result genuinely depends on; a plain value
+  rotation (e.g. a token for the same account fetching the same content) keeps
+  the cache, which is the point.
+- Concretely: a worker may fail on an invalid secret, but must not return, say,
+  a listing filtered to what one value's account can see, unless that value's
+  identity is pinned by the entropy.
 
 Server behavior:
 - The server passes the list of secrets and the tree against which to evaluate them from one work request to the next, along with the stack
