@@ -100,9 +100,12 @@ pub(crate) fn grant(
     arg_entries: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
     // The hash this job's matched grants require. None ⇒ nothing matches.
-    let Some(expected) = secret_hash(grants, arg_entries) else {
+    let Some(digest) = secret_hash(grants, arg_entries) else {
         return Vec::new();
     };
+    // The `secret-hash` entry references a blob whose *content* is that digest,
+    // so the entry's oid (what's in `arg_entries`) is the blob-hash of it.
+    let expected = blob_oid(digest.as_bytes());
     match arg_entries.get(caos_world::SECRET_HASH_ARG) {
         Some(present) if *present == expected => {}
         present => {
