@@ -204,7 +204,10 @@ mod tests {
         );
         // A wrong secret-hash is refused.
         let mut forged = map(&[("image", "aa")]);
-        forged.insert(caos_world::SECRET_HASH_ARG.to_string(), "deadbeef".to_string());
+        forged.insert(
+            caos_world::SECRET_HASH_ARG.to_string(),
+            "deadbeef".to_string(),
+        );
         assert!(grant(&grants, &forged).is_empty());
         // A worker matching NO reader gets nothing (and needs no hash).
         assert!(grant(&grants, &map(&[("image", "xx")])).is_empty());
