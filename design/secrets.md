@@ -36,7 +36,43 @@ reader=tools/deploy -- --repo=github.com/me/proj
 - A reader is a partial arg set. It is evaluated against the tree at the time that `caos-cli run` or similar is called
 - A secret is visible to a worker if the worker's arg tree is a superset of one of the arg trees of the secret
 - The entropy field is required and must contain real entropy
-- The hash of the `entropy` field and worker-visible name for each exposed secret is included in the arg tree (and thus visible `/cas/args/secret-hash`). This ensures that two users, with different secrets, will not share a cache entry but avoids making the cache key depend on the value of the secret (so that rotating secrets would bust the cache). The name must be included too because that's the worker's experience of the secret -- a different name would make the worker run differently
+- Each granted secret contributes its (worker-visible name, entropy) to a
+  `secret-hash` entry folded into the worker's arg tree (visible at
+  `/cas/args/secret-hash`). This makes two users with different secrets see
+  different cache keys — but keys the secret's *value* out (so rotating a value
+  doesn't bust the cache), and stores the *digest* of the entropy, never the
+  entropy itself (the entropy is a bearer capability for the cache: knowing it
+  reconstructs the key of any run that used it). The name is included because a
+  different mount name would make the worker run differently.
+
+### Where `secret-hash` is folded, and how it reaches callers
+
+The `secret-hash` is folded in **one place: when the image is evaluated**
+(`eval-path`). That is the single chokepoint through which every use of a worker
+passes — `run` resolves its image, `curry` resolves the base it curries onto,
+deep-deps resolves the dep it mounts, and an embedder resolves the ref it
+embeds — so folding it once, at eval, gives every downstream user a per-user
+oid for free, and their arg trees (and keys) differ all the way up. This is what
+isolates *callers*, not just the leaf: `deploy`, which embeds a per-user
+`github-push`, is itself per-user, and so is everything that embeds `deploy`.
+No touched-propagation and no per-caller cache invalidation — same-secret users
+still share, only distinct-secret users diverge.
+
+Two things this depends on:
+
+- **Match the curry-unwrapped entries, not the bare image.** Evaluating a curry
+  node `github-push --repo=x` unwraps to `{image, repo}`, so an arg-pinned
+  reader (`github-push -- --repo=x`) folds at eval too — one place covers both
+  reader shapes, and `curry` needs no fold of its own.
+- **Fold as a sibling of `image`, never inside the image tree.** The image tree
+  hash must stay per-*content*, so `convert_git_image` (keyed on it) builds the
+  docker image once for everyone; only the run/result is per-user.
+
+Residual: a consumer is isolated only if it reaches the worker **through eval**
+(structurally — curried, a dep, or an eval'd ref). A worker that caches a
+*pre-eval* ref and reuses it across stores without re-evaluating would escape
+this — which is exactly the `std`-removal boundary (reach a tool as a dep, not
+as an ambient `/cas/std/...` string), not a separate hole to fortify.
 
 Worker experience:
 - If a secret is visible to a worker, it is injected into a worker in `/secret/<name>`
