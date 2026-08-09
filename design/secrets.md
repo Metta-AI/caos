@@ -1,11 +1,12 @@
 # Secrets: identity-is-capability — design note
 
-**Status:** partly built. Injection, matching, and the leak-prevention
-mechanisms exist in an interim *server-side* form (secrets sourced from a
-server `CAOS_SECRETS_DIR`); the per-user ephemeral-context sourcing and the
-entropy/cache-isolation hash described below are not yet built. Builds on
-`.caos-expr` (eval-path, deep-deps) and map-then (server-mediated worker
-starts).
+**Status:** partly built. The store is carried as ephemeral run context and
+resolved client-side; injection, superset matching, the entropy/`secret-hash`
+cache-isolation tag, the output-scrub assertion, and log masking all exist. The
+**caller-propagation** refinement below (fold `secret-hash` at image-eval, not
+at run assembly) and the injection double-check are designed but not yet built,
+as is the entropy tooling. Builds on `.caos-expr` (eval-path, deep-deps) and
+map-then (server-mediated worker starts).
 
 ## Problem
 
