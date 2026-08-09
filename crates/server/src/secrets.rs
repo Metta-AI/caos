@@ -209,7 +209,10 @@ mod tests {
         // entry is the blob-oid of the digest (how it rides in a real tree).
         let mut job = map(&[("image", "aa"), ("std", "z")]);
         let digest = secret_hash(&grants, &job).unwrap();
-        job.insert(caos_world::SECRET_HASH_ARG.to_string(), blob_oid(digest.as_bytes()));
+        job.insert(
+            caos_world::SECRET_HASH_ARG.to_string(),
+            blob_oid(digest.as_bytes()),
+        );
         assert_eq!(
             grant(&grants, &job),
             vec![("tok".to_string(), "s3cr3t".to_string())]
