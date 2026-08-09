@@ -205,10 +205,11 @@ mod tests {
         // A worker that matches a reader but carries NO secret-hash is refused
         // (it wasn't produced by eval with this store).
         assert!(grant(&grants, &map(&[("image", "aa")])).is_empty());
-        // With the matching secret-hash present, the value is injected.
+        // With the matching secret-hash present, the value is injected. The
+        // entry is the blob-oid of the digest (how it rides in a real tree).
         let mut job = map(&[("image", "aa"), ("std", "z")]);
-        let h = secret_hash(&grants, &job).unwrap();
-        job.insert(caos_world::SECRET_HASH_ARG.to_string(), h);
+        let digest = secret_hash(&grants, &job).unwrap();
+        job.insert(caos_world::SECRET_HASH_ARG.to_string(), blob_oid(digest.as_bytes()));
         assert_eq!(
             grant(&grants, &job),
             vec![("tok".to_string(), "s3cr3t".to_string())]
