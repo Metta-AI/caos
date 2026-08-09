@@ -3229,7 +3229,9 @@ fn client_secret_hash(
         return Ok(None);
     }
     let material = caos_world::secret_hash_material(&pairs);
-    Ok(Some(hash_bytes("blob", &material)?.to_string()))
+    let h = hash_bytes("blob", &material)?.to_string();
+    eprintln!("DEBUG client secret_hash: pairs={pairs:?} material={material:?} -> {h}");
+    Ok(Some(h))
 }
 
 /// Is `reader` (a partial arg tree) a subset of `base`? (The client-side twin of
