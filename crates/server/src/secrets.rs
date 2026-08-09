@@ -197,14 +197,14 @@ mod tests {
         // With the matching secret-hash present, the value is injected.
         let mut job = map(&[("image", "aa"), ("std", "z")]);
         let h = secret_hash(&grants, &job).unwrap();
-        job.insert(SECRET_HASH_ARG.to_string(), h);
+        job.insert(caos_world::SECRET_HASH_ARG.to_string(), h);
         assert_eq!(
             grant(&grants, &job),
             vec![("tok".to_string(), "s3cr3t".to_string())]
         );
         // A wrong secret-hash is refused.
         let mut forged = map(&[("image", "aa")]);
-        forged.insert(SECRET_HASH_ARG.to_string(), "deadbeef".to_string());
+        forged.insert(caos_world::SECRET_HASH_ARG.to_string(), "deadbeef".to_string());
         assert!(grant(&grants, &forged).is_empty());
         // A worker matching NO reader gets nothing (and needs no hash).
         assert!(grant(&grants, &map(&[("image", "xx")])).is_empty());
