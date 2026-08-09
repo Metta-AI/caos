@@ -86,7 +86,7 @@ Correctness requirements: Neither the secret values nor the names of the secrets
 
 Server behavior:
 - The server passes the list of secrets and the tree against which to evaluate them from one work request to the next, along with the stack
-- When dispatching a work request, at the same time that the server selects a runner based on the closest match of the arg tree, the server also finds all secrets that list arg trees that are subsets of the worker's arg tree, and provides them to the runner
+- When dispatching a work request, the server injects a secret into the worker only if **both**: (a) the worker's arg tree is a superset of one of the secret's readers (identity), **and** (b) the worker's arg tree already carries a `secret-hash` entry equal to the one the server computes for the granted set. Condition (b) proves the worker was produced by eval with this store — so a secret's value can only ever reach a worker whose cache key *already* reflects that secret. A reader-match without the matching `secret-hash` (a worker not built through eval, or a stale/forged tree) is refused, fail-closed. This ties injection to isolation: injection ⟹ the isolating hash is in the key.
 
 Note that this means that the server sees all secrets. We can revisit if this becomes a problem
 
