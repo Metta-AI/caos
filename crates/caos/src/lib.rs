@@ -3313,9 +3313,13 @@ fn resolve_reader_client(
     pinned: &str,
     reader: &str,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let tokens: Vec<&str> = reader.split_whitespace().collect();
-    let image_expr = *tokens.first().ok_or("empty reader")?;
-    let image = resolve_reader_image(t, pinned, image_expr)?;
+    if reader.split_whitespace().count() != 1 {
+        return Err(format!(
+            "reader {reader:?} must be a single path (argument pins are not supported — \
+             point at a narrower expression instead)"
+        ));
+    }
+    let image = resolve_reader_image(t, pinned, reader.trim())?;
     let (base, bound) = unwrap_curry(t, &image)?;
     let mut entries = std::collections::BTreeMap::new();
     for entry in bound {
@@ -3323,16 +3327,6 @@ fn resolve_reader_client(
             String::from_utf8_lossy(entry_name(&entry)).into_owned(),
             entry.oid.to_string(),
         );
-    }
-    let mut rest = tokens.iter().skip(1);
-    if let Some(&sep) = rest.next() {
-        if sep != "--" {
-            return Err(format!("expected `--` before reader args, got {sep:?}"));
-        }
-        for &tok in rest {
-            let (name, oid) = resolve_reader_arg(t, pinned, tok)?;
-            entries.insert(name, oid);
-        }
     }
     // The image entry wins over any like-named bound arg, mirroring assembly.
     entries.insert("image".to_string(), base);
