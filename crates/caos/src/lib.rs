@@ -3192,7 +3192,11 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
                     issues += 1;
                 } else {
                     let value = fresh_entropy()?;
-                    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+                    let sep = if text.is_empty() || text.ends_with('\n') {
+                        ""
+                    } else {
+                        "\n"
+                    };
                     std::fs::write(&path, format!("{text}{sep}entropy={value}\n"))
                         .map_err(|e| format!("writing {name}: {e}"))?;
                     println!("{name}: added entropy");
