@@ -124,7 +124,8 @@ Built: the store carried as ephemeral run context and resolved client-side
 injection at `/secret/<name>`, gated by the double-check (see "Server
 behavior"); superset matching; the `entropy`/`secret-hash` tag folded at
 arg-tree assembly; the hard output-scrub assertion (new objects only, refused at
-`caos put` before publish); best-effort log masking; and `name=`.
+`caos put` before publish); best-effort log masking; `name=`; and the `caos
+secrets` entropy tooling (fill a missing `entropy`, warn/refuse a weak one).
 
 What is unbuilt:
 
