@@ -3226,7 +3226,7 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
 
 /// A resolved secret from the caller's store: its value, its entropy (the
 /// cache-isolation capability), and each reader resolved to a partial arg tree.
-struct ClientSecret {
+pub(crate) struct ClientSecret {
     name: String,
     value: String,
     entropy: String,
