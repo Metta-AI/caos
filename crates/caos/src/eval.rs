@@ -41,8 +41,9 @@ use std::collections::HashMap;
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 
 use super::{
-    assemble_arg_tree, curry_from_entries, entry_name, fetch_tree_entries, is_hex_hash, parse_oid,
-    post_object, request_compute, resolve_std_image, Transport,
+    assemble_arg_tree, build_secret_store, curry_from_entries, entry_name, fetch_tree_entries,
+    is_hex_hash, mark_arg_tree, parse_oid, post_object, request_compute, resolve_std_image,
+    secret_store_header, ClientSecret, Transport,
 };
 
 /// Evaluate a std library entry named `<name>` within the std tree `std_tree`
@@ -57,7 +58,9 @@ pub(crate) fn eval_std_entry(
     std_tree: &str,
     name: &str,
 ) -> Result<String, String> {
-    eval_path(t, std_tree, name).map(|(_kind, oid)| oid)
+    // Std image resolution feeds `assemble_arg_tree` (which marks the run) or a
+    // reader match, so it carries no store of its own — no marking here.
+    eval_path(t, std_tree, name, &[]).map(|(_kind, oid)| oid)
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
@@ -80,7 +83,11 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
             oid.to_string()
         }
     };
-    let (kind, hash) = eval_path(t, &start, path)?;
+    // The caller's secret store, resolved once — so eval-path marks the arg
+    // trees it returns (and the `:@=` worker args it resolves), giving callers
+    // per-user isolation (design/secrets.md).
+    let store = build_secret_store(t)?;
+    let (kind, hash) = eval_path(t, &start, path, &store)?;
     println!("{kind} {hash}");
     Ok(())
 }
@@ -94,6 +101,7 @@ pub(crate) fn eval_path(
     t: &dyn Transport,
     start_tree: &str,
     path: &str,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let comps: Vec<&str> = path
         .split('/')
@@ -107,7 +115,7 @@ pub(crate) fn eval_path(
         if node_kind == "tree" {
             if let Some((mode, oid)) = lookup_in_tree(t, &node_oid, ".caos-expr")? {
                 if !mode.is_tree() {
-                    let (k, o) = eval_expr(t, &node_oid, &oid.to_string())?;
+                    let (k, o) = eval_expr(t, &node_oid, &oid.to_string(), store)?;
                     node_kind = k;
                     node_oid = o;
                 }
@@ -137,6 +145,7 @@ fn eval_expr(
     t: &dyn Transport,
     input_tree: &str,
     expr_oid: &str,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let (kind, content) = t.get_object(expr_oid)?;
     if kind != "blob" {
@@ -156,10 +165,10 @@ fn eval_expr(
             return Err("eval-path: .caos-expr has content after its final expression".to_string());
         }
         if let Some((name, cmd)) = parse_assignment(line) {
-            let v = eval_command(t, input_tree, cmd, &env)?;
+            let v = eval_command(t, input_tree, cmd, &env, store)?;
             env.insert(name.to_string(), v);
         } else {
-            value = Some(eval_value(t, input_tree, line, &env)?);
+            value = Some(eval_value(t, input_tree, line, &env, store)?);
         }
     }
     value.ok_or_else(|| "eval-path: .caos-expr has no final expression".to_string())
@@ -196,6 +205,7 @@ fn eval_value(
     input_tree: &str,
     line: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     if let Some(var) = line.strip_prefix('$') {
         if var.is_empty() || var.split_whitespace().count() != 1 {
@@ -206,7 +216,7 @@ fn eval_value(
             .cloned()
             .ok_or_else(|| format!("eval-path: undefined variable ${var}"));
     }
-    eval_command(t, input_tree, line, env)
+    eval_command(t, input_tree, line, env, store)
 }
 
 /// Evaluate a single `run <image> -- …` or `curry <image> -- …` command against
@@ -217,6 +227,7 @@ fn eval_command(
     input_tree: &str,
     cmd: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     let verb = tokens.first().copied().unwrap_or("");
@@ -235,15 +246,20 @@ fn eval_command(
         ));
     }
     let image_ref = resolve_expr_image(t, input_tree, tokens[1], env)?;
-    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env)?;
+    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env, store)?;
 
     if verb == "curry" {
+        // Mark the returned arg tree, so a caller that embeds it is per-user too
+        // (design/secrets.md, caller-propagation).
         let oid = curry_from_entries(t, &image_ref, &[], entries)?;
-        return Ok(("tree".to_string(), oid.to_string()));
+        let marked = mark_arg_tree(t, store, &oid.to_string())?;
+        return Ok(("tree".to_string(), marked));
     }
-    let arg_tree = assemble_arg_tree(t, &image_ref, entries, &[])?;
+    // A `run` marks via `assemble_arg_tree` and must carry the store to the
+    // server (to inject and pass the double-check), exactly like `caos-cli run`.
+    let arg_tree = assemble_arg_tree(t, &image_ref, entries, store)?;
     let server = t.server_url()?;
-    request_compute(&server, &arg_tree, "")
+    request_compute(&server, &arg_tree, &secret_store_header(store))
 }
 
 /// Resolve the image token of a command to a ref: a `$NAME` variable, a
@@ -283,6 +299,7 @@ fn resolve_expr_args(
     input_tree: &str,
     toks: &[&str],
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for &tok in toks {
@@ -314,7 +331,7 @@ fn resolve_expr_args(
                 .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
             (mode_of_kind(kind), parse_oid(oid)?)
         } else if is_path {
-            resolve_expr_path(t, input_tree, value)?
+            resolve_expr_path(t, input_tree, value, store)?
         } else {
             (
                 EntryKind::Blob.into(),
@@ -330,16 +347,23 @@ fn resolve_expr_args(
     Ok(entries)
 }
 
-/// Resolve a `:@=` path value: a `/std/<name>` builtin, or a path within
-/// `input_tree` (relative to the `.caos-expr`'s directory).
+/// Resolve a `:@=` path value to a tree entry. A `/std/<name>` builtin is a
+/// worker reference — evaluated and marked (so an embedder becomes per-user).
+/// A path within `input_tree` is taken as-is (a raw reference): we can't tell a
+/// worker dir from a data dir by type, and blindly evaluating would re-run the
+/// container's own `.caos-expr` on a self/ancestor reference like `--in:@=.`
+/// (infinite recursion). Marking embedded *tree-path* workers awaits a
+/// worker-vs-data distinction (design/secrets.md, caller-propagation).
 fn resolve_expr_path(
     t: &dyn Transport,
     input_tree: &str,
     value: &str,
+    store: &[ClientSecret],
 ) -> Result<(EntryMode, gix::ObjectId), String> {
     if let Some(name) = value.strip_prefix("/std/") {
         let hash = resolve_std_image(t, name)?;
-        return Ok((EntryKind::Tree.into(), parse_oid(&hash)?));
+        let marked = mark_arg_tree(t, store, &hash)?;
+        return Ok((EntryKind::Tree.into(), parse_oid(&marked)?));
     }
     lookup_in_tree(t, input_tree, value)?
         .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))

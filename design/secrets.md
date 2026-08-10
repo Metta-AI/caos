@@ -129,14 +129,18 @@ What is unbuilt:
 
 - **Caller-propagation.** Today `secret-hash` is folded at *run assembly*
   (client `assemble_arg_tree` / server `run_image`), which isolates the running
-  worker but not its callers (see "Where `secret-hash` is folded"). Isolating
-  callers needs the mark folded where an expression forms an *embeddable* tree
-  (curry and eval-path's `curry`/`run` results), the store threaded into
-  eval-path (which today assembles with an empty store), and — for dep-mounted
-  tools — into **deep-deps** (itself a worker). Gated on the convention for how
-  a dependent references a dep (source subtree vs marked arg-tree ref), which
-  isn't built. Reconcile with the run-assembly fold so a tree isn't folded twice
-  differently (same name+entropy → same hash → the merge dedups; worth a test).
+  worker but not its callers (see "Where `secret-hash` is folded"). The fix is
+  compositional: **eval-path marks the arg tree it *returns*** (match readers,
+  fold `secret-hash`), and **`:@=` args are resolved by eval-path** rather than
+  a raw tree lookup. Then a caller that pulls in a worker as an arg embeds that
+  worker's *already-marked* (per-user) arg tree — so the caller's own tree hash
+  is per-user, and so is everything that embeds it, with no mark needed *on* the
+  caller. The worker-vs-data split falls out of matching, not a rule: a
+  worker-arg resolves to an arg tree that matches a reader (marked); a data-arg
+  (`--config:@=config.json`) resolves to a blob/plain tree that matches nothing
+  (untouched). All client-side — deep-deps only restructures *source*, and never
+  sees values or entropy. Reconcile with the run-assembly fold so a tree isn't
+  folded twice differently (same name+entropy → same hash → the merge dedups).
 
 - **Entropy tooling** *(highest-value remaining item)***.** A `caos
   secrets`-style command over the dir that fills a missing `entropy` with fresh
