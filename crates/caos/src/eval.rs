@@ -347,12 +347,13 @@ fn resolve_expr_args(
     Ok(entries)
 }
 
-/// Resolve a `:@=` path value to a tree entry. A worker reference is evaluated
-/// (so it carries its `secret-hash` mark and the embedder becomes per-user); a
-/// data reference is taken as-is. Cases: a `/std/<name>` builtin (evaluated and
-/// marked); a path within `input_tree` that is a directory (evaluated as an
-/// arg tree — its *own* `.caos-expr`, not the container's — and marked); a data
-/// blob/tree (referenced unchanged).
+/// Resolve a `:@=` path value to a tree entry. A `/std/<name>` builtin is a
+/// worker reference — evaluated and marked (so an embedder becomes per-user).
+/// A path within `input_tree` is taken as-is (a raw reference): we can't tell a
+/// worker dir from a data dir by type, and blindly evaluating would re-run the
+/// container's own `.caos-expr` on a self/ancestor reference like `--in:@=.`
+/// (infinite recursion). Marking embedded *tree-path* workers awaits a
+/// worker-vs-data distinction (design/secrets.md, caller-propagation).
 fn resolve_expr_path(
     t: &dyn Transport,
     input_tree: &str,
@@ -364,17 +365,8 @@ fn resolve_expr_path(
         let marked = mark_arg_tree(t, store, &hash)?;
         return Ok((EntryKind::Tree.into(), parse_oid(&marked)?));
     }
-    let (mode, oid) = lookup_in_tree(t, input_tree, value)?
-        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))?;
-    // A directory may be a worker: evaluate it starting AT its own subtree (so
-    // its `.caos-expr`, if any, runs — never the container's), which marks a
-    // curry/run result. A plain data dir with no `.caos-expr` comes back
-    // unchanged; a blob is data, referenced as-is.
-    if mode.is_tree() {
-        let (kind, evaluated) = eval_path(t, &oid.to_string(), ".", store)?;
-        return Ok((mode_of_kind(&kind), parse_oid(&evaluated)?));
-    }
-    Ok((mode, oid))
+    lookup_in_tree(t, input_tree, value)?
+        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))
 }
 
 /// Look up `rel` (a `/`-separated path) within the tree `tree_oid`, returning
