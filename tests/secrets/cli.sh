@@ -23,7 +23,9 @@ if [ -r /secret/token ] && [ "$(cat /secret/token)" = "SEKRET-abc-123" ]; then
 else
   v="token-bad"
 fi
-[ -e /secret/locked ] && v="$v locked-leaked" || v="$v locked-absent"
+# deploytok's reader (mytool) is a DIFFERENT expression, so it must NOT be
+# granted to this plain bash worker.
+[ -e /secret/deploytok ] && v="$v deploy-leaked" || v="$v deploy-absent"
 echo "$v" > /tmp/out/verdict
 caos put /tmp/out /cas/out
 EOF
@@ -78,11 +80,6 @@ value=SEKRET-abc-123
 entropy=7f3a9c2e1b8d4f60a5e7c9d1b3f5a7e9
 reader=std/bash
 EOF
-cat > .caos-secrets/locked <<'EOF'
-value=NOPE-do-not-leak
-entropy=1122334455667788990011223344556677
-reader=std/bash -- --marker=nope
-EOF
 cat > .caos-secrets/deploytok <<'EOF'
 value=DEPLOY-xyz-789
 entropy=aa11bb22cc33dd44ee55ff6677889900
@@ -92,9 +89,9 @@ EOF
 echo "== a granted secret is injected; a non-matching one is not ==" >&2
 out=$("$CAOS_CLI" run /cas/std/bash got -- --worker1:@=check.sh) || fail "run failed: $out"
 verdict=$(cat got/verdict)
-[ "$verdict" = "token-ok locked-absent" ] \
-  || fail "verdict: $verdict (expected 'token-ok locked-absent')"
-echo "  ok: /secret/token granted, /secret/locked denied" >&2
+[ "$verdict" = "token-ok deploy-absent" ] \
+  || fail "verdict: $verdict (expected 'token-ok deploy-absent')"
+echo "  ok: /secret/token granted, the differently-scoped /secret/deploytok denied" >&2
 
 echo "== a worker that leaks a secret into its output is refused ==" >&2
 if "$CAOS_CLI" run /cas/std/bash leaked -- --worker1:@=leak.sh >/dev/null 2>leak.err; then

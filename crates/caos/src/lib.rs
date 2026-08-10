@@ -3308,14 +3308,25 @@ fn parse_local_secret(
 /// partial arg tree it pins — the same top-level entries a job running it would
 /// carry — by resolving the image (std, hash, or a tree path via eval-path),
 /// unwrapping any curry layers, and adding the reader's own args.
+/// Resolve a reader — a single path/expression, no argument pins
+/// (design/secrets.md: a reader names an *expression*; narrow by pointing at a
+/// narrower one, not by pinning args here) — to the partial arg tree it stands
+/// for: eval-path the path (so a flake/`.caos-expr` tool resolves to the same
+/// arg tree the run uses), unwrap any curry layers, and take its entries. That
+/// tree already carries whatever the expression bakes in (e.g. a curried
+/// `worker1` script), so it is as specific as the expression is.
 fn resolve_reader_client(
     t: &dyn Transport,
     pinned: &str,
     reader: &str,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let tokens: Vec<&str> = reader.split_whitespace().collect();
-    let image_expr = *tokens.first().ok_or("empty reader")?;
-    let image = resolve_reader_image(t, pinned, image_expr)?;
+    if reader.split_whitespace().count() != 1 {
+        return Err(format!(
+            "reader {reader:?} must be a single path (argument pins are not supported — \
+             point at a narrower expression instead)"
+        ));
+    }
+    let image = resolve_reader_image(t, pinned, reader.trim())?;
     let (base, bound) = unwrap_curry(t, &image)?;
     let mut entries = std::collections::BTreeMap::new();
     for entry in bound {
@@ -3323,16 +3334,6 @@ fn resolve_reader_client(
             String::from_utf8_lossy(entry_name(&entry)).into_owned(),
             entry.oid.to_string(),
         );
-    }
-    let mut rest = tokens.iter().skip(1);
-    if let Some(&sep) = rest.next() {
-        if sep != "--" {
-            return Err(format!("expected `--` before reader args, got {sep:?}"));
-        }
-        for &tok in rest {
-            let (name, oid) = resolve_reader_arg(t, pinned, tok)?;
-            entries.insert(name, oid);
-        }
     }
     // The image entry wins over any like-named bound arg, mirroring assembly.
     entries.insert("image".to_string(), base);
@@ -3354,45 +3355,6 @@ fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<S
     }
     let (_, oid) = eval::eval_path(t, pinned, expr)?;
     Ok(oid)
-}
-
-/// Resolve one reader `--name=value` / `--name:@=path` arg to a `(name, oid)`
-/// entry (literal → a blob; `:@=` → a `/std/<name>` image or a path in the
-/// pinned tree).
-fn resolve_reader_arg(
-    t: &dyn Transport,
-    pinned: &str,
-    tok: &str,
-) -> Result<(String, String), String> {
-    let body = tok
-        .strip_prefix("--")
-        .ok_or_else(|| format!("reader arg {tok:?} must be --name=value"))?;
-    let (key, value) = body
-        .split_once('=')
-        .ok_or_else(|| format!("reader arg {tok:?} must be --name[:@]=value"))?;
-    let (name, is_path) = match key.split_once(':') {
-        None => (key, false),
-        Some((n, "@")) => (n, true),
-        Some((_, ty)) => return Err(format!("unknown reader arg type {ty:?} in {tok:?}")),
-    };
-    if name.is_empty() || name.contains('/') {
-        return Err(format!(
-            "reader arg name {name:?} must be one path component"
-        ));
-    }
-    let oid = if is_path {
-        if let Some(std_name) = value
-            .strip_prefix("/std/")
-            .or_else(|| value.strip_prefix("std/"))
-        {
-            resolve_std_image(t, std_name)?
-        } else {
-            eval::eval_path(t, pinned, value)?.1
-        }
-    } else {
-        post_object(t, "blob", value.as_bytes())?.to_string()
-    };
-    Ok((name.to_string(), oid))
 }
 
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
