@@ -41,8 +41,9 @@ use std::collections::HashMap;
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 
 use super::{
-    assemble_arg_tree, curry_from_entries, entry_name, fetch_tree_entries, is_hex_hash, parse_oid,
-    post_object, request_compute, resolve_std_image, Transport,
+    assemble_arg_tree, build_secret_store, curry_from_entries, entry_name, fetch_tree_entries,
+    is_hex_hash, mark_arg_tree, parse_oid, post_object, request_compute, resolve_std_image,
+    secret_store_header, ClientSecret, Transport,
 };
 
 /// Evaluate a std library entry named `<name>` within the std tree `std_tree`
