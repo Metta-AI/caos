@@ -138,9 +138,6 @@ What is unbuilt:
   isn't built. Reconcile with the run-assembly fold so a tree isn't folded twice
   differently (same name+entropy → same hash → the merge dedups; worth a test).
 
-- **Injection double-check** — built (in the Built list above); listed here
-  before, kept as a pointer.
-
 - **Entropy tooling** *(highest-value remaining item)***.** A `caos
   secrets`-style command over the dir that fills a missing `entropy` with fresh
   entropy and warns (or refuses) on a low-entropy one — so the safe default is
