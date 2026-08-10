@@ -3,10 +3,12 @@
 **Status:** partly built. The store is carried as ephemeral run context and
 resolved client-side; injection (gated by the double-check below), superset
 matching over path-only readers, the entropy/`secret-hash` cache-isolation tag,
-the output-scrub assertion, and log masking all exist and isolate the *running*
-worker. **Caller-propagation** (isolating a worker's callers) and the entropy
-tooling are not yet built. Builds on `.caos-expr` (eval-path, deep-deps) and
-map-then (server-mediated worker starts).
+the output-scrub assertion, log masking, and the `caos secrets` entropy tooling
+all exist. Cache isolation covers the running worker and eval-path's returns;
+the one remaining gap is a worker embedded via a **tree-path `:@=` arg** (see
+"Remaining work" — closed by the eval-path-stripping rule). Builds on
+`.caos-expr` (eval-path, deep-deps) and map-then (server-mediated worker
+starts).
 
 ## Problem
 
