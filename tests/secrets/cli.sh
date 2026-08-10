@@ -89,9 +89,9 @@ EOF
 echo "== a granted secret is injected; a non-matching one is not ==" >&2
 out=$("$CAOS_CLI" run /cas/std/bash got -- --worker1:@=check.sh) || fail "run failed: $out"
 verdict=$(cat got/verdict)
-[ "$verdict" = "token-ok locked-absent" ] \
-  || fail "verdict: $verdict (expected 'token-ok locked-absent')"
-echo "  ok: /secret/token granted, /secret/locked denied" >&2
+[ "$verdict" = "token-ok deploy-absent" ] \
+  || fail "verdict: $verdict (expected 'token-ok deploy-absent')"
+echo "  ok: /secret/token granted, the differently-scoped /secret/deploytok denied" >&2
 
 echo "== a worker that leaks a secret into its output is refused ==" >&2
 if "$CAOS_CLI" run /cas/std/bash leaked -- --worker1:@=leak.sh >/dev/null 2>leak.err; then
