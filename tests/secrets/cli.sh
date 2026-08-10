@@ -120,6 +120,17 @@ verdict=$(cat tgot/verdict)
   || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
 echo "  ok: a reader naming a repo path grants the secret" >&2
 
+echo "== eval-path folds secret-hash, so a worker's callers become per-user ==" >&2
+# mytool matches the deploytok reader, so eval-path marks its returned arg tree.
+# With the secret removed it matches nothing, so the result differs — which is
+# exactly what makes anything embedding mytool per-user.
+withsecret=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed"
+rm .caos-secrets/deploytok
+without=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool (no secret) failed"
+[ "$withsecret" != "$without" ] \
+  || fail "eval-path mytool should depend on the secret store (got '$withsecret' both times)"
+echo "  ok: mytool's eval result differs with vs without its granted secret" >&2
+
 echo "== caos-cli secrets fills missing entropy and --check gates weak ones ==" >&2
 mkdir -p /tmp/sectool/.caos-secrets
 cd /tmp/sectool
