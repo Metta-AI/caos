@@ -23,7 +23,9 @@ if [ -r /secret/token ] && [ "$(cat /secret/token)" = "SEKRET-abc-123" ]; then
 else
   v="token-bad"
 fi
-[ -e /secret/locked ] && v="$v locked-leaked" || v="$v locked-absent"
+# deploytok's reader (mytool) is a DIFFERENT expression, so it must NOT be
+# granted to this plain bash worker.
+[ -e /secret/deploytok ] && v="$v deploy-leaked" || v="$v deploy-absent"
 echo "$v" > /tmp/out/verdict
 caos put /tmp/out /cas/out
 EOF
