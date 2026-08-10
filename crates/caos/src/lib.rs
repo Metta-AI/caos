@@ -3146,21 +3146,13 @@ const MIN_ENTROPY_LEN: usize = 16;
 
 /// Fresh entropy for a secret: 128 random bits as 32 hex chars.
 fn fresh_entropy() -> Result<String, String> {
-    let bytes = std::fs::read("/dev/urandom")
-        .map(|_| ())
-        .err()
-        .map(|e| Err(format!("reading /dev/urandom: {e}")))
-        .unwrap_or_else(|| {
-            // Read exactly 16 bytes.
-            use std::io::Read;
-            let mut f = std::fs::File::open("/dev/urandom")
-                .map_err(|e| format!("opening /dev/urandom: {e}"))?;
-            let mut buf = [0u8; 16];
-            f.read_exact(&mut buf)
-                .map_err(|e| format!("reading /dev/urandom: {e}"))?;
-            Ok(buf.iter().map(|b| format!("{b:02x}")).collect::<String>())
-        })?;
-    Ok(bytes)
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open("/dev/urandom").map_err(|e| format!("opening /dev/urandom: {e}"))?;
+    let mut buf = [0u8; 16];
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("reading /dev/urandom: {e}"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `caos-cli secrets [--check]` — tend the local `.caos-secrets` store: fill a
