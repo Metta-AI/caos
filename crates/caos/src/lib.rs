@@ -3277,7 +3277,7 @@ pub(crate) fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>,
 
 /// Serialize the store for the `X-Caos-Secrets` header — a JSON array of
 /// `{name, value, entropy, readers}`. Empty string for an empty store.
-fn secret_store_header(store: &[ClientSecret]) -> String {
+pub(crate) fn secret_store_header(store: &[ClientSecret]) -> String {
     if store.is_empty() {
         return String::new();
     }
