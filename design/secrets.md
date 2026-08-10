@@ -148,7 +148,6 @@ What is unbuilt:
   never a cross-hit. Load-bearing: a low-entropy id is brute-forceable out of
   the hash, and until this exists a missing `entropy=` silently weakens
   isolation (the hash defaults to the empty entropy).
-
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
 
 - **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
