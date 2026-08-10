@@ -1,11 +1,11 @@
 # Secrets: identity-is-capability — design note
 
 **Status:** partly built. The store is carried as ephemeral run context and
-resolved client-side; injection, superset matching, the entropy/`secret-hash`
-cache-isolation tag, the output-scrub assertion, and log masking all exist. The
-**caller-propagation** refinement below (fold `secret-hash` at image-eval, not
-at run assembly) and the injection double-check are designed but not yet built,
-as is the entropy tooling. Builds on `.caos-expr` (eval-path, deep-deps) and
+resolved client-side; injection (gated by the double-check below), superset
+matching over path-only readers, the entropy/`secret-hash` cache-isolation tag,
+the output-scrub assertion, and log masking all exist and isolate the *running*
+worker. **Caller-propagation** (isolating a worker's callers) and the entropy
+tooling are not yet built. Builds on `.caos-expr` (eval-path, deep-deps) and
 map-then (server-mediated worker starts).
 
 ## Problem
