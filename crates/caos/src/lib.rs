@@ -3357,45 +3357,6 @@ fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<S
     Ok(oid)
 }
 
-/// Resolve one reader `--name=value` / `--name:@=path` arg to a `(name, oid)`
-/// entry (literal → a blob; `:@=` → a `/std/<name>` image or a path in the
-/// pinned tree).
-fn resolve_reader_arg(
-    t: &dyn Transport,
-    pinned: &str,
-    tok: &str,
-) -> Result<(String, String), String> {
-    let body = tok
-        .strip_prefix("--")
-        .ok_or_else(|| format!("reader arg {tok:?} must be --name=value"))?;
-    let (key, value) = body
-        .split_once('=')
-        .ok_or_else(|| format!("reader arg {tok:?} must be --name[:@]=value"))?;
-    let (name, is_path) = match key.split_once(':') {
-        None => (key, false),
-        Some((n, "@")) => (n, true),
-        Some((_, ty)) => return Err(format!("unknown reader arg type {ty:?} in {tok:?}")),
-    };
-    if name.is_empty() || name.contains('/') {
-        return Err(format!(
-            "reader arg name {name:?} must be one path component"
-        ));
-    }
-    let oid = if is_path {
-        if let Some(std_name) = value
-            .strip_prefix("/std/")
-            .or_else(|| value.strip_prefix("std/"))
-        {
-            resolve_std_image(t, std_name)?
-        } else {
-            eval::eval_path(t, pinned, value)?.1
-        }
-    } else {
-        post_object(t, "blob", value.as_bytes())?.to_string()
-    };
-    Ok((name.to_string(), oid))
-}
-
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
     let url = format!("{}/run?req={}", base.trim_end_matches('/'), arg_tree);
     request_compute_url(&url, secrets)
