@@ -138,10 +138,9 @@ What is unbuilt:
   isn't built. Reconcile with the run-assembly fold so a tree isn't folded twice
   differently (same name+entropy → same hash → the merge dedups; worth a test).
 
-- **Injection double-check.** The server must inject only when the worker
-  *already* carries the matching `secret-hash` (see "Server behavior"), not on a
-  bare reader match — so injection can't happen under a key that doesn't reflect
-  it. Today injection is a bare reader match.
+- **Injection double-check.** *(Built.)* The server injects only when the
+  worker already carries the matching `secret-hash` (see "Server behavior"), so
+  a value can't reach a worker whose key doesn't reflect it.
 
 - **Entropy tooling.** A `caos secrets`-style command over the dir that fills a
   missing `entropy` with fresh entropy and warns (or refuses) on a low-entropy
