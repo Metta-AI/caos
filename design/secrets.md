@@ -140,9 +140,7 @@ What that build does differently from the design above, plus what is unbuilt:
   *miss* (a fresh, uncached run), never a cross-hit. Load-bearing: a low-entropy
   id is brute-forceable out of the hash.
 
-- **Reader `:@=` args and binary `value:@=`.** `:@=` resolves inside a tool's
-  `.caos-expr` but not yet on a reader's own trailing args; `value:@=` is read
-  but kept UTF-8 (binary/multiline later).
+- **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
 
 - **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
   never trigger compute); likely permanent.
