@@ -145,6 +145,7 @@ fn eval_expr(
     t: &dyn Transport,
     input_tree: &str,
     expr_oid: &str,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let (kind, content) = t.get_object(expr_oid)?;
     if kind != "blob" {
@@ -164,10 +165,10 @@ fn eval_expr(
             return Err("eval-path: .caos-expr has content after its final expression".to_string());
         }
         if let Some((name, cmd)) = parse_assignment(line) {
-            let v = eval_command(t, input_tree, cmd, &env)?;
+            let v = eval_command(t, input_tree, cmd, &env, store)?;
             env.insert(name.to_string(), v);
         } else {
-            value = Some(eval_value(t, input_tree, line, &env)?);
+            value = Some(eval_value(t, input_tree, line, &env, store)?);
         }
     }
     value.ok_or_else(|| "eval-path: .caos-expr has no final expression".to_string())
