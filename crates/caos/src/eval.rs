@@ -101,6 +101,7 @@ pub(crate) fn eval_path(
     t: &dyn Transport,
     start_tree: &str,
     path: &str,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let comps: Vec<&str> = path
         .split('/')
@@ -114,7 +115,7 @@ pub(crate) fn eval_path(
         if node_kind == "tree" {
             if let Some((mode, oid)) = lookup_in_tree(t, &node_oid, ".caos-expr")? {
                 if !mode.is_tree() {
-                    let (k, o) = eval_expr(t, &node_oid, &oid.to_string())?;
+                    let (k, o) = eval_expr(t, &node_oid, &oid.to_string(), store)?;
                     node_kind = k;
                     node_oid = o;
                 }
