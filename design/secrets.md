@@ -78,13 +78,12 @@ Two things this depends on:
   docker image once for everyone; only the run/result is per-user.
 
 This isolates the **running worker** (the leaf `github-push`, however reached,
-gets its own per-user key and injection). It does **not** yet isolate *callers*:
-`deploy` embeds `github-push` by a ref carrying no `secret-hash`, so `deploy`'s
-own tree is identical across users while its resolved result holds
-`github-push`'s per-user output. **Caller-propagation is unbuilt** (see Remaining
-work): it needs the mark folded where an expression forms an *embeddable* tree
-(curry / eval-path), the store threaded into eval-path, and — for dep-mounted
-tools — into deep-deps.
+gets its own per-user key and injection) **and eval-path's returns** —
+eval-path folds the mark into the arg tree it returns (a `curry` result, a
+`/std/<name>` `:@=` ref), so an eval-path'd worker is per-user and anyone
+embedding *that* result is per-user too. The remaining gap is a worker embedded
+via a **tree-path `:@=` arg** (`--pusher:@=github-push`), still referenced raw
+and so unmarked — closed by the eval-path-stripping change in Remaining work.
 
 Residual even then: a consumer is isolated only if it reaches the worker
 **through eval** (a dep or an eval'd ref), not by caching a *pre-eval* ambient
