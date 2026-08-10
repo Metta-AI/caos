@@ -28,13 +28,20 @@ entropy=...
 value=<secret key>
 # External key
 value:@=<file containing key>
-# Reader with no args
+# A reader is a PATH to an expression — no argument pins. It is eval-path'd to
+# an arg tree; a worker whose arg tree is a superset of that is granted.
 reader=std/github-push
-# Reader with args. `=`, `@=`, etc are valid here. Paths are evaluated with `caos eval-path`
-reader=tools/deploy -- --repo=github.com/me/proj
+reader=tools/deploy
 ```
-- A reader is a partial arg set. It is evaluated against the tree at the time that `caos-cli run` or similar is called
-- A secret is visible to a worker if the worker's arg tree is a superset of one of the arg trees of the secret
+- A reader names an **expression** (a `/std/<name>` builtin or a tree path),
+  evaluated with `caos eval-path` at `caos-cli run` time. Its resolved arg tree
+  already carries whatever the expression bakes in (e.g. a curried `worker1`
+  script), so it is as specific as the expression is. To narrow a grant (e.g.
+  github-push for one repo), point the reader at a **narrower expression**, not
+  at arg pins in this file — narrowing then lives in the content-addressed,
+  reviewable expression layer, and the whole narrowed worker is what the
+  `secret-hash` marks. This also keeps "secret-eligible" meaning exactly "the
+  arg tree an expression produces," which is the one thing eval-path can stamp.
 - The entropy field is required and must contain real entropy
 - Each granted secret contributes its (worker-visible name, entropy) to a
   `secret-hash` entry folded into the worker's arg tree (visible at
