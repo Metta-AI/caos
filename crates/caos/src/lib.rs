@@ -3326,6 +3326,46 @@ fn reader_subset(
     reader.iter().all(|(name, oid)| base.get(name) == Some(oid))
 }
 
+/// Fold `secret-hash` into an existing arg tree `oid` when the carried store
+/// grants it a secret — the caller-propagation mark (design/secrets.md): a
+/// worker embedded (as a `:@=` arg, or returned by a `curry` expression) carries
+/// its per-user identity, so whoever embeds it is per-user too. Unwraps any
+/// curry layers, matches the store's readers against the flattened entries, and
+/// on a match returns a flat args tree `{image, …bound, secret-hash}`; otherwise
+/// returns `oid` unchanged. Idempotent (re-marking recomputes the same digest;
+/// the merge dedups), and a no-op for an empty store.
+pub(crate) fn mark_arg_tree(
+    t: &dyn Transport,
+    store: &[ClientSecret],
+    oid: &str,
+) -> Result<String, String> {
+    if store.is_empty() {
+        return Ok(oid.to_string());
+    }
+    let (image_ref, bound) = unwrap_curry(t, oid)?;
+    let image_entry = image_arg_entry(t, &image_ref)?;
+    let mut base: std::collections::BTreeMap<String, String> = bound
+        .iter()
+        .map(|e| {
+            (
+                String::from_utf8_lossy(entry_name(e)).into_owned(),
+                e.oid.to_string(),
+            )
+        })
+        .collect();
+    base.insert("image".to_string(), image_entry.oid.to_string());
+    let Some(digest) = client_secret_hash(store, &base)? else {
+        return Ok(oid.to_string());
+    };
+    let secret_hash = gix::objs::tree::Entry {
+        mode: gix::objs::tree::EntryKind::Blob.into(),
+        filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
+        oid: post_object(t, "blob", digest.as_bytes())?,
+    };
+    let entries = merge_entries(merge_entries(bound, vec![image_entry]), vec![secret_hash]);
+    Ok(post_tree(t, entries)?.to_string())
+}
+
 /// The tree tree-relative readers resolve against: the `.tree` file in the store
 /// (a hash or ref), else the caller's current working tree (ingested — which
 /// also gets it onto the server so eval-path can walk it).
