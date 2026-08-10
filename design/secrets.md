@@ -119,23 +119,24 @@ Note that this means that the server sees all secrets. We can revisit if this be
 ## Remaining work
 
 Built: the store carried as ephemeral run context and resolved client-side
-(readers via eval-path, so the server never evals); out-of-band injection at
-`/secret/<name>`; superset matching; the `entropy`/`secret-hash` tag; the hard
-output-scrub assertion (new objects only, refused at `caos put` before publish);
-and best-effort log masking. `name=` is supported.
+(path-only readers via eval-path, so the server never evals); out-of-band
+injection at `/secret/<name>`, gated by the double-check (see "Server
+behavior"); superset matching; the `entropy`/`secret-hash` tag folded at
+arg-tree assembly; the hard output-scrub assertion (new objects only, refused at
+`caos put` before publish); best-effort log masking; and `name=`.
 
-What that build does differently from the design above, plus what is unbuilt:
+What is unbuilt:
 
-- **Move the `secret-hash` fold to image-eval.** Today it is folded at *run
-  assembly* (client `assemble_arg_tree` / server `run_image`) — downstream of
-  eval and off to the side, so the eval'd ref a *caller* embeds carries no
-  `secret-hash` and callers are not isolated. The fix is to fold it once, in the
-  eval funnel, matching curry-unwrapped entries against the carried store, as a
-  sibling of `image` (see "Where `secret-hash` is folded"). The real plumbing is
-  getting the store into every eval — including **deep-deps**, which is itself a
-  worker that resolves deps and so needs the store threaded into its own run.
-  Reconcile with the run-time fold so a worker isn't folded twice differently
-  (same name+entropy → same hash → the merge dedups; worth a test).
+- **Caller-propagation.** Today `secret-hash` is folded at *run assembly*
+  (client `assemble_arg_tree` / server `run_image`), which isolates the running
+  worker but not its callers (see "Where `secret-hash` is folded"). Isolating
+  callers needs the mark folded where an expression forms an *embeddable* tree
+  (curry and eval-path's `curry`/`run` results), the store threaded into
+  eval-path (which today assembles with an empty store), and — for dep-mounted
+  tools — into **deep-deps** (itself a worker). Gated on the convention for how
+  a dependent references a dep (source subtree vs marked arg-tree ref), which
+  isn't built. Reconcile with the run-assembly fold so a tree isn't folded twice
+  differently (same name+entropy → same hash → the merge dedups; worth a test).
 
 - **Injection double-check.** The server must inject only when the worker
   *already* carries the matching `secret-hash` (see "Server behavior"), not on a
