@@ -42,6 +42,8 @@ reader=tools/deploy
   reviewable expression layer, and the whole narrowed worker is what the
   `secret-hash` marks. This also keeps "secret-eligible" meaning exactly "the
   arg tree an expression produces," which is the one thing eval-path can stamp.
+- A secret is visible to a worker if the worker's arg tree is a superset of one
+  of the secret's (eval-path'd) reader arg trees.
 - The entropy field is required and must contain real entropy
 - Each granted secret contributes its (worker-visible name, entropy) to a
   `secret-hash` entry folded into the worker's arg tree (visible at
