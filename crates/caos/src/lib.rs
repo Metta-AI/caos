@@ -3184,7 +3184,9 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
             continue;
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {name}: {e}"))?;
-        let entropy = text.lines().find_map(|l| l.trim().strip_prefix("entropy=").map(str::trim));
+        let entropy = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("entropy=").map(str::trim));
         match entropy {
             None => {
                 if check {
