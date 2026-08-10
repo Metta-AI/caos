@@ -120,4 +120,17 @@ verdict=$(cat tgot/verdict)
   || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
 echo "  ok: a reader naming a repo path grants the secret" >&2
 
+echo "== caos-cli secrets fills missing entropy and --check gates weak ones ==" >&2
+mkdir -p /tmp/sectool/.caos-secrets
+cd /tmp/sectool
+printf 'value=abc\nreader=std/bash\n' > .caos-secrets/needs-entropy
+"$CAOS_CLI" secrets || fail "secrets fill failed"
+grep -q '^entropy=' .caos-secrets/needs-entropy || fail "entropy was not filled in"
+# A present-but-weak entropy is never overwritten, and --check must gate on it.
+printf 'value=abc\nentropy=short\nreader=std/bash\n' > .caos-secrets/weak
+if "$CAOS_CLI" secrets --check 2>/dev/null; then
+  fail "--check should exit non-zero on weak entropy"
+fi
+echo "  ok: entropy autofilled; --check gates weak entropy" >&2
+
 echo "secrets: ALL PASS" >&2
