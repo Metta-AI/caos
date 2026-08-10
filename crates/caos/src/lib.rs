@@ -3308,6 +3308,13 @@ fn parse_local_secret(
 /// partial arg tree it pins — the same top-level entries a job running it would
 /// carry — by resolving the image (std, hash, or a tree path via eval-path),
 /// unwrapping any curry layers, and adding the reader's own args.
+/// Resolve a reader — a single path/expression, no argument pins
+/// (design/secrets.md: a reader names an *expression*; narrow by pointing at a
+/// narrower one, not by pinning args here) — to the partial arg tree it stands
+/// for: eval-path the path (so a flake/`.caos-expr` tool resolves to the same
+/// arg tree the run uses), unwrap any curry layers, and take its entries. That
+/// tree already carries whatever the expression bakes in (e.g. a curried
+/// `worker1` script), so it is as specific as the expression is.
 fn resolve_reader_client(
     t: &dyn Transport,
     pinned: &str,
