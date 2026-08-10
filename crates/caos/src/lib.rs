@@ -3478,7 +3478,9 @@ fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<S
     if is_hex_hash(expr) {
         return Ok(expr.to_string());
     }
-    let (_, oid) = eval::eval_path(t, pinned, expr)?;
+    // Empty store: a reader's own resolution must not be marked (its arg tree is
+    // what the match compares against; marking it would be circular).
+    let (_, oid) = eval::eval_path(t, pinned, expr, &[])?;
     Ok(oid)
 }
 
