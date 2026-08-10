@@ -146,7 +146,9 @@ What is unbuilt:
   missing `entropy` with fresh entropy and warns (or refuses) on a low-entropy
   one — so the safe default is automatic and a misconfig degrades to a cache
   *miss* (a fresh, uncached run), never a cross-hit. Load-bearing: a low-entropy
-  id is brute-forceable out of the hash.
+  id is brute-forceable out of the hash. Until it exists, a missing `entropy=`
+  silently weakens isolation (the hash defaults to the empty entropy), so it's
+  the highest-value remaining item.
 
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
 
