@@ -58,7 +58,9 @@ pub(crate) fn eval_std_entry(
     std_tree: &str,
     name: &str,
 ) -> Result<String, String> {
-    eval_path(t, std_tree, name).map(|(_kind, oid)| oid)
+    // Std image resolution feeds `assemble_arg_tree` (which marks the run) or a
+    // reader match, so it carries no store of its own — no marking here.
+    eval_path(t, std_tree, name, &[]).map(|(_kind, oid)| oid)
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
