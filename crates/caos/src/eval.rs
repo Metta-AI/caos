@@ -83,7 +83,11 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
             oid.to_string()
         }
     };
-    let (kind, hash) = eval_path(t, &start, path)?;
+    // The caller's secret store, resolved once — so eval-path marks the arg
+    // trees it returns (and the `:@=` worker args it resolves), giving callers
+    // per-user isolation (design/secrets.md).
+    let store = build_secret_store(t)?;
+    let (kind, hash) = eval_path(t, &start, path, &store)?;
     println!("{kind} {hash}");
     Ok(())
 }
