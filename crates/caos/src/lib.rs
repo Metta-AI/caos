@@ -3139,6 +3139,90 @@ fn merge_entries(
 /// Directory of the caller's git-ignored secrets store (design/secrets.md).
 const SECRETS_DIR: &str = ".caos-secrets";
 
+/// Minimum entropy length (chars) not flagged weak. A `secret-hash` is only
+/// unguessable if the entropy is: below this, it's brute-forceable out of the
+/// hash (like GitHub Actions refusing to mask short secrets).
+const MIN_ENTROPY_LEN: usize = 16;
+
+/// Fresh entropy for a secret: 128 random bits as 32 hex chars.
+fn fresh_entropy() -> Result<String, String> {
+    let bytes = std::fs::read("/dev/urandom")
+        .map(|_| ())
+        .err()
+        .map(|e| Err(format!("reading /dev/urandom: {e}")))
+        .unwrap_or_else(|| {
+            // Read exactly 16 bytes.
+            use std::io::Read;
+            let mut f = std::fs::File::open("/dev/urandom")
+                .map_err(|e| format!("opening /dev/urandom: {e}"))?;
+            let mut buf = [0u8; 16];
+            f.read_exact(&mut buf)
+                .map_err(|e| format!("reading /dev/urandom: {e}"))?;
+            Ok(buf.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        })?;
+    Ok(bytes)
+}
+
+/// `caos-cli secrets [--check]` — tend the local `.caos-secrets` store: fill a
+/// missing `entropy=` with fresh entropy and warn on a weak one, so a secret's
+/// cache isolation is safe by default (design/secrets.md). `--check` writes
+/// nothing and errors on any issue (a CI gate). Offline — reads/writes only the
+/// local dir.
+pub fn cli_secrets(check: bool) -> Result<(), String> {
+    let dir = Path::new(SECRETS_DIR);
+    if !dir.is_dir() {
+        println!("no {SECRETS_DIR} directory — nothing to do");
+        return Ok(());
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+
+    let mut issues = 0;
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.starts_with('.') || !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {name}: {e}"))?;
+        let entropy = text.lines().find_map(|l| l.trim().strip_prefix("entropy=").map(str::trim));
+        match entropy {
+            None => {
+                if check {
+                    eprintln!("{name}: missing entropy");
+                    issues += 1;
+                } else {
+                    let value = fresh_entropy()?;
+                    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+                    std::fs::write(&path, format!("{text}{sep}entropy={value}\n"))
+                        .map_err(|e| format!("writing {name}: {e}"))?;
+                    println!("{name}: added entropy");
+                }
+            }
+            Some(value) if value.len() < MIN_ENTROPY_LEN => {
+                // Never overwrite a user's value; just flag it.
+                eprintln!("{name}: weak entropy ({} chars < {MIN_ENTROPY_LEN})", value.len());
+                issues += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    if check && issues > 0 {
+        return Err(format!("{issues} secret(s) with missing or weak entropy"));
+    }
+    if !check && issues > 0 {
+        eprintln!("warning: {issues} secret(s) have weak entropy (edit them; not overwritten)");
+    }
+    Ok(())
+}
+
 /// A resolved secret from the caller's store: its value, its entropy (the
 /// cache-isolation capability), and each reader resolved to a partial arg tree.
 struct ClientSecret {
