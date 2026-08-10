@@ -331,7 +331,7 @@ fn resolve_expr_args(
                 .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
             (mode_of_kind(kind), parse_oid(oid)?)
         } else if is_path {
-            resolve_expr_path(t, input_tree, value)?
+            resolve_expr_path(t, input_tree, value, store)?
         } else {
             (
                 EntryKind::Blob.into(),
