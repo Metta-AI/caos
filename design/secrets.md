@@ -128,19 +128,30 @@ arg-tree assembly; the hard output-scrub assertion (new objects only, refused at
 What is unbuilt:
 
 - **Caller-propagation.** Today `secret-hash` is folded at *run assembly*
-  (client `assemble_arg_tree` / server `run_image`), which isolates the running
-  worker but not its callers (see "Where `secret-hash` is folded"). The fix is
-  compositional: **eval-path marks the arg tree it *returns*** (match readers,
-  fold `secret-hash`), and **`:@=` args are resolved by eval-path** rather than
-  a raw tree lookup. Then a caller that pulls in a worker as an arg embeds that
-  worker's *already-marked* (per-user) arg tree — so the caller's own tree hash
-  is per-user, and so is everything that embeds it, with no mark needed *on* the
-  caller. The worker-vs-data split falls out of matching, not a rule: a
-  worker-arg resolves to an arg tree that matches a reader (marked); a data-arg
-  (`--config:@=config.json`) resolves to a blob/plain tree that matches nothing
-  (untouched). All client-side — deep-deps only restructures *source*, and never
-  sees values or entropy. Reconcile with the run-assembly fold so a tree isn't
-  folded twice differently (same name+entropy → same hash → the merge dedups).
+  (client `assemble_arg_tree` / server `run_image`) and on eval-path's
+  *returns* (a `curry` result, a `/std/<name>` `:@=` ref) — which isolates the
+  running worker and eval-path'd workers, but not a worker embedded via a
+  *tree-path* `:@=` arg (e.g. `--pusher:@=github-push`), which is still
+  referenced raw. Finishing it is compositional: **eval-path a `:@=` target
+  too**, so an embedded worker carries its own mark and the embedder becomes
+  per-user. The blocker was that blindly evaluating every `:@=` tree arg
+  infinite-loops on a self-reference like deep-deps' `--in:@=.` (evaluating `.`
+  re-runs the very expression). The fix is a cleaner **eval-path definition,
+  not a special case**: *a `.caos-expr` computes a replacement for its directory
+  from the directory's contents **excluding the `.caos-expr` itself***. Then `.`
+  resolves to that stripped tree — no `.caos-expr`, so evaluating it is the
+  identity, and the self-reference is inert by construction, at every nesting
+  level. It also gives the worker-vs-data distinction as a real signal: a `:@=`
+  target **with** a `.caos-expr` is an expression → eval + mark (a worker); one
+  **without** evaluates to itself → referenced raw (data). Not `/std`-specific
+  (the current trigger is `/std` resolution, but `--in:@=.` merely moves to the
+  repo-root `.caos-expr` when `/std` is removed). Implementation: hand the
+  expression its input tree *minus* the `.caos-expr` entry, then re-enable
+  evaluating `:@=` targets that carry a `.caos-expr`. (Re-keys deep-deps once —
+  its `--in` loses the root directive entry.) The eval-path stripping rule
+  belongs in `design/caos-expr.md` too. Reconcile with the run-assembly fold so
+  a tree isn't folded twice differently (same name+entropy → same hash → the
+  merge dedups).
 
 - **Entropy tooling** *(highest-value remaining item)***.** A `caos
   secrets`-style command over the dir that fills a missing `entropy` with fresh
