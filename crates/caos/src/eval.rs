@@ -299,6 +299,7 @@ fn resolve_expr_args(
     input_tree: &str,
     toks: &[&str],
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for &tok in toks {
