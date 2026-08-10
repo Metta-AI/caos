@@ -227,6 +227,7 @@ fn eval_command(
     input_tree: &str,
     cmd: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     let verb = tokens.first().copied().unwrap_or("");
@@ -245,15 +246,20 @@ fn eval_command(
         ));
     }
     let image_ref = resolve_expr_image(t, input_tree, tokens[1], env)?;
-    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env)?;
+    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env, store)?;
 
     if verb == "curry" {
+        // Mark the returned arg tree, so a caller that embeds it is per-user too
+        // (design/secrets.md, caller-propagation).
         let oid = curry_from_entries(t, &image_ref, &[], entries)?;
-        return Ok(("tree".to_string(), oid.to_string()));
+        let marked = mark_arg_tree(t, store, &oid.to_string())?;
+        return Ok(("tree".to_string(), marked));
     }
-    let arg_tree = assemble_arg_tree(t, &image_ref, entries, &[])?;
+    // A `run` marks via `assemble_arg_tree` and must carry the store to the
+    // server (to inject and pass the double-check), exactly like `caos-cli run`.
+    let arg_tree = assemble_arg_tree(t, &image_ref, entries, store)?;
     let server = t.server_url()?;
-    request_compute(&server, &arg_tree, "")
+    request_compute(&server, &arg_tree, &secret_store_header(store))
 }
 
 /// Resolve the image token of a command to a ref: a `$NAME` variable, a
