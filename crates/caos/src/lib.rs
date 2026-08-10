@@ -3237,7 +3237,7 @@ pub(crate) struct ClientSecret {
 /// each reader resolved HERE (via eval-path, against the store's pinned tree)
 /// to a partial arg tree of name → oid — so the server only subset-matches,
 /// never evals. Empty when there is no store.
-fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
+pub(crate) fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
     let dir = Path::new(SECRETS_DIR);
     if !dir.is_dir() {
         return Ok(Vec::new());
