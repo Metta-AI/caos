@@ -201,6 +201,7 @@ fn usage(args: &[String]) -> String {
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
-         {prog} get <hash> <path>"
+         {prog} get <hash> <path>\n  \
+         {prog} secrets [--check]"
     )
 }
