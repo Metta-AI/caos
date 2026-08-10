@@ -347,19 +347,34 @@ fn resolve_expr_args(
     Ok(entries)
 }
 
-/// Resolve a `:@=` path value: a `/std/<name>` builtin, or a path within
-/// `input_tree` (relative to the `.caos-expr`'s directory).
+/// Resolve a `:@=` path value to a tree entry. A worker reference is evaluated
+/// (so it carries its `secret-hash` mark and the embedder becomes per-user); a
+/// data reference is taken as-is. Cases: a `/std/<name>` builtin (evaluated and
+/// marked); a path within `input_tree` that is a directory (evaluated as an
+/// arg tree — its *own* `.caos-expr`, not the container's — and marked); a data
+/// blob/tree (referenced unchanged).
 fn resolve_expr_path(
     t: &dyn Transport,
     input_tree: &str,
     value: &str,
+    store: &[ClientSecret],
 ) -> Result<(EntryMode, gix::ObjectId), String> {
     if let Some(name) = value.strip_prefix("/std/") {
         let hash = resolve_std_image(t, name)?;
-        return Ok((EntryKind::Tree.into(), parse_oid(&hash)?));
+        let marked = mark_arg_tree(t, store, &hash)?;
+        return Ok((EntryKind::Tree.into(), parse_oid(&marked)?));
     }
-    lookup_in_tree(t, input_tree, value)?
-        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))
+    let (mode, oid) = lookup_in_tree(t, input_tree, value)?
+        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))?;
+    // A directory may be a worker: evaluate it starting AT its own subtree (so
+    // its `.caos-expr`, if any, runs — never the container's), which marks a
+    // curry/run result. A plain data dir with no `.caos-expr` comes back
+    // unchanged; a blob is data, referenced as-is.
+    if mode.is_tree() {
+        let (kind, evaluated) = eval_path(t, &oid.to_string(), ".", store)?;
+        return Ok((mode_of_kind(&kind), parse_oid(&evaluated)?));
+    }
+    Ok((mode, oid))
 }
 
 /// Look up `rel` (a `/`-separated path) within the tree `tree_oid`, returning
