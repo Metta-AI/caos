@@ -54,34 +54,42 @@ reader=tools/deploy
   reconstructs the key of any run that used it). The name is included because a
   different mount name would make the worker run differently.
 
-### Where `secret-hash` is folded, and how it reaches callers
+### Where `secret-hash` is folded
 
-The `secret-hash` is folded in **one place: when the image is evaluated**
-(`eval-path`). That is the single chokepoint through which every use of a worker
-passes — `run` resolves its image, `curry` resolves the base it curries onto,
-deep-deps resolves the dep it mounts, and an embedder resolves the ref it
-embeds — so folding it once, at eval, gives every downstream user a per-user
-oid for free, and their arg trees (and keys) differ all the way up. This is what
-isolates *callers*, not just the leaf: `deploy`, which embeds a per-user
-`github-push`, is itself per-user, and so is everything that embeds `deploy`.
-No touched-propagation and no per-caller cache invalidation — same-secret users
-still share, only distinct-secret users diverge.
+The `secret-hash` is folded wherever a **runnable arg tree is assembled** — the
+client's `assemble_arg_tree` (a top-level `caos-cli run`, and eval-path's own
+`run`, both go through it) and its server-side twin `run_image` (map-then/
+run-then sub-runs, which the server assembles from a worker's continuation, never
+through client eval-path). It has to be at assembly, not at image resolution,
+because the match is against the *full* arg tree (a path-only reader
+`std/github-push` resolves to `{image: bash, worker1: push-script}`, so
+`worker1` must be present to match) — and because a worker runs either top-level
+(client assemble) or as a sub-run (server `run_image`), and the server must fold
+independently, since a worker reaches it by continuation, not by calling
+eval-path.
 
 Two things this depends on:
 
-- **Match the curry-unwrapped entries, not the bare image.** Evaluating a curry
-  node `github-push --repo=x` unwraps to `{image, repo}`, so an arg-pinned
-  reader (`github-push -- --repo=x`) folds at eval too — one place covers both
-  reader shapes, and `curry` needs no fold of its own.
+- **Match the curry-unwrapped entries.** A curried worker unwraps to its flat
+  entries (`{image, worker1, …}`) before matching, so a scripted tool is
+  distinguished by its script, not just its base image.
 - **Fold as a sibling of `image`, never inside the image tree.** The image tree
-  hash must stay per-*content*, so `convert_git_image` (keyed on it) builds the
+  hash stays per-*content*, so `convert_git_image` (keyed on it) builds the
   docker image once for everyone; only the run/result is per-user.
 
-Residual: a consumer is isolated only if it reaches the worker **through eval**
-(structurally — curried, a dep, or an eval'd ref). A worker that caches a
-*pre-eval* ref and reuses it across stores without re-evaluating would escape
-this — which is exactly the `std`-removal boundary (reach a tool as a dep, not
-as an ambient `/cas/std/...` string), not a separate hole to fortify.
+This isolates the **running worker** (the leaf `github-push`, however reached,
+gets its own per-user key and injection). It does **not** yet isolate *callers*:
+`deploy` embeds `github-push` by a ref carrying no `secret-hash`, so `deploy`'s
+own tree is identical across users while its resolved result holds
+`github-push`'s per-user output. **Caller-propagation is unbuilt** (see Remaining
+work): it needs the mark folded where an expression forms an *embeddable* tree
+(curry / eval-path), the store threaded into eval-path, and — for dep-mounted
+tools — into deep-deps.
+
+Residual even then: a consumer is isolated only if it reaches the worker
+**through eval** (a dep or an eval'd ref), not by caching a *pre-eval* ambient
+`/cas/std/...` ref — which is the `std`-removal boundary, not a separate hole to
+fortify.
 
 Worker experience:
 - If a secret is visible to a worker, it is injected into a worker in `/secret/<name>`
