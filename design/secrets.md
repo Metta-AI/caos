@@ -154,13 +154,6 @@ What is unbuilt:
   a tree isn't folded twice differently (same name+entropy → same hash → the
   merge dedups).
 
-- **Entropy tooling** *(highest-value remaining item)***.** A `caos
-  secrets`-style command over the dir that fills a missing `entropy` with fresh
-  entropy and warns (or refuses) on a low-entropy one — so the safe default is
-  automatic and a misconfig degrades to a cache *miss* (a fresh, uncached run),
-  never a cross-hit. Load-bearing: a low-entropy id is brute-forceable out of
-  the hash, and until this exists a missing `entropy=` silently weakens
-  isolation (the hash defaults to the empty entropy).
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
 
 - **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
