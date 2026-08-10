@@ -3204,7 +3204,10 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
             }
             Some(value) if value.len() < MIN_ENTROPY_LEN => {
                 // Never overwrite a user's value; just flag it.
-                eprintln!("{name}: weak entropy ({} chars < {MIN_ENTROPY_LEN})", value.len());
+                eprintln!(
+                    "{name}: weak entropy ({} chars < {MIN_ENTROPY_LEN})",
+                    value.len()
+                );
                 issues += 1;
             }
             Some(_) => {}
