@@ -205,6 +205,7 @@ fn eval_value(
     input_tree: &str,
     line: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     if let Some(var) = line.strip_prefix('$') {
         if var.is_empty() || var.split_whitespace().count() != 1 {
@@ -215,7 +216,7 @@ fn eval_value(
             .cloned()
             .ok_or_else(|| format!("eval-path: undefined variable ${var}"));
     }
-    eval_command(t, input_tree, line, env)
+    eval_command(t, input_tree, line, env, store)
 }
 
 /// Evaluate a single `run <image> -- …` or `curry <image> -- …` command against
