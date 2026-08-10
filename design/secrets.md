@@ -142,13 +142,13 @@ What is unbuilt:
   worker already carries the matching `secret-hash` (see "Server behavior"), so
   a value can't reach a worker whose key doesn't reflect it.
 
-- **Entropy tooling.** A `caos secrets`-style command over the dir that fills a
-  missing `entropy` with fresh entropy and warns (or refuses) on a low-entropy
-  one — so the safe default is automatic and a misconfig degrades to a cache
-  *miss* (a fresh, uncached run), never a cross-hit. Load-bearing: a low-entropy
-  id is brute-forceable out of the hash. Until it exists, a missing `entropy=`
-  silently weakens isolation (the hash defaults to the empty entropy), so it's
-  the highest-value remaining item.
+- **Entropy tooling** *(highest-value remaining item)***.** A `caos
+  secrets`-style command over the dir that fills a missing `entropy` with fresh
+  entropy and warns (or refuses) on a low-entropy one — so the safe default is
+  automatic and a misconfig degrades to a cache *miss* (a fresh, uncached run),
+  never a cross-hit. Load-bearing: a low-entropy id is brute-forceable out of
+  the hash, and until this exists a missing `entropy=` silently weakens
+  isolation (the hash defaults to the empty entropy).
 
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
 
