@@ -34,45 +34,56 @@ landed history; this file has the live state.
   `f7d48b06` with `layer00/tmp` — the world-writable /tmp — GONE. `node_dir` now
   answers leaf directories directly (also saves two containers per leaf).
 
-## Empty directories: FIXED (real bug, verified)
+## RESOLVED — suite 29/29, `nix build` green
+
+Two independent bugs, both found by reading real artifacts rather than
+reconstructing them.
+
+### 1. Empty directories were lost by any tree round trip
 
 Where the empty dir came from: `build-builtins.sh` MADE it, at the object layer
-— `git mktree </dev/null` plus a hand-spliced `040000 tree <empty> tmp`. Git's
-object model can hold that; a worktree cannot, which is why it existed nowhere
-else. It is now an ordinary directory carrying `tmp/.caos-keep`, and the splice
-is gone.
+(`git mktree </dev/null` plus a hand-spliced entry), for the runner image's 1777
+`/tmp` — a worktree cannot hold one, so the script went around the index. It does
+not survive materialize -> read -> re-put, so deep-deps dropped it and the
+worker-deepened `rustc` stopped matching bootstrap's hand-deepen (`2b142170` vs
+`fd5f4c63`). `/tmp` now carries `.caos-keep` and the two agree byte-for-byte
+(`499a719b`). Nothing anywhere has to special-case an empty directory now.
 
-Proof it mattered and is fixed: the worker-deepened `rustc` and bootstrap's
-`deepen_entry` disagreed (`2b142170` vs `fd5f4c63`) purely over `layer00/tmp`;
-they are now byte-identical (`499a719b` both sides).
+### 2. The client could not PUSH what the server already had
 
-## The 7 failures — STILL OPEN (not the empty-dir bug)
+The 7 rustc-tool failures (`fatal: bad tree object <runner layer00>`) were NOT
+that bug — fixing it changed nothing. The real chain, each step read off a
+`tests/deps-dump` run inside a real wrapper:
 
-`bash-tool caos-tools chat-offline llm-call llm-step merge-harness rgrep` —
-every one a rustc-built std tool, all failing client-side with
+- the wrapper DOES contain the object (`rgrep/DEEP-DEPS/rustc/DEEP-DEPS/runner/
+  layer00` == the "missing" hash) — delivery was never wrong;
+- the inner SERVER has it, and advertises `refs/caos/std` covering it;
+- the inner CLIENT does not — and git can only mark an advertised tip
+  uninteresting by traversing it LOCALLY, so the push dies on the first
+  unreadable object.
 
-    git push … failed: fatal: bad tree object c55ef2d2…
+A client never fetches the std tree (`std_tree` says so deliberately — a tree
+fetch pulls the whole closure). Evaluation fetches only what it WALKS, and
+nothing walks into `runner/layer00`. But an arg tree carries `std` whole, and a
+rustc-built tool's image IS the runner delta — so only those tools tripped it.
 
-`c55ef2d2` is a runner-delta `layer00` — and it DOES carry the keep-file, so it
-is current, not stale.
+Fix: `tests/lib/run-test.sh` points the client repo's
+`objects/info/alternates` at `/tmp/seed-git/objects`, the repo the interpreter
+already fetched the wrapper's std into. No bytes move, and it stays honest about
+the subset — the seed repo holds exactly what the test declared.
 
-**Flaw in my own investigation, stated so it is not repeated:** every check so
-far reconstructed the deepened tree from the HOST's std
-(`caos-cli get <std> && run /cas/std/deep-deps`). The wrapper is built from the
-TREE-UNDER-TEST's std (`build.sh`'s `result/std`). Those are different builds —
-the host's runner layer00 is `92b8aa78`, the missing one is `c55ef2d2`. So the
-mount-chain verification (`rgrep → DEEP-DEPS/rustc → DEEP-DEPS/runner`, which
-does check out) was performed on the wrong artifact.
+`tests/deps-dump` is kept: a diagnostic test that asserts nothing and prints
+what the harness delivered plus what the inner stack knows about it. It is what
+broke this open after three wrong theories.
 
-NEXT: inspect the REAL artifact — the `deepen` stage's output for `tests/rgrep`
-— and check whether `DEEP-DEPS/rustc/DEEP-DEPS/runner/layer00` is `c55ef2d2`.
-That splits it: either the wrapper genuinely lacks it (harness bug in
-`test.sh`'s assembly/routing) or it has it and the gap is in what
-`test-stack/worker` fetches into the inner stack.
+## Lesson worth keeping: verify the REAL artifact
 
-Cheap fallback if that dead-ends: name `runner` directly in the DEPS of the
-tests that build rustc tools. Correct by the existing rule (a curry base / hash
-literal is not a tree reference), just less minimal.
+Three failed theories in a row all came from reconstructing the deepened tree
+from the HOST's std (`caos-cli get <std> && run /cas/std/deep-deps`), while a
+wrapper is built from the TREE UNDER TEST's std — different builds, different
+runner deltas. The reconstruction only ever agreed with itself. `/cas/std` seen
+from inside a test container is the OUTER job's std, not the inner one, for the
+same reason. When a delivery chain is suspect, dump the artifact.
 
 ## Gotcha worth keeping
 

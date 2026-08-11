@@ -1,0 +1,5 @@
+# The SAME declaration as tests/rgrep — this test exists to show what that
+# declaration actually delivers. Deliberately not minimal in spirit: whatever
+# rgrep names, this names, so the dump describes rgrep's wrapper.
+../../std/rgrep rgrep
+../../std/cargo cargo
