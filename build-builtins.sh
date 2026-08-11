@@ -391,11 +391,13 @@ stage_source() { # <name>
 # (rustc, deep-deps) has its curry hand-built as a SEED RESULT below — the
 # checked-in entry is just a `.caos-expr` sentinel. So there is no `stage_worker`.
 
-[ -n "$runner_delta" ] && undeepened[runner]=$runner_delta
 for name in "${names[@]}"; do
-  # runner is the leaf image (set above); everything else is a checked-in source
-  # dir (cargo/flake-builder/bash/merge/rgrep/bash-tool/llm-*/rustc/deep-deps).
-  [ "$name" = runner ] || stage_source "$name"
+  # EVERY entry is now a checked-in source dir — `runner` included. It used to be
+  # published as the raw delta, which meant `std/runner` was a name with no
+  # directory behind it: `std/rustc/DEPS` says `../runner`, and a tree cannot be
+  # self-resolving when a declared dependency is not IN it. It is a
+  # `{.caos-expr}` sentinel now, seeded like flake-builder (below).
+  stage_source "$name"
 done
 
 # The hand-deepen — SEED KEYS ONLY, never published (see the block header).
@@ -554,6 +556,17 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   rustc_blob=$(printf 'docker://seeded-rustc' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record rustc \
     "$(printf '{"image":"%s","in":"%s"}' "$rustc_blob" "${hash_of[rustc]}")" "$rustc_curry"
+fi
+
+# runner: the pooled interpreter, a self-contained nix closure with no source to
+# build from — so it is seeded exactly like flake-builder. Its checked-in entry
+# is the `docker://seeded-runner` sentinel and the host-built delta is the seed
+# RESULT. This is what gives `std/rustc/DEPS`'s `../runner` a directory to point
+# at, and so what lets the tree deepen itself.
+if [ -n "$runner_delta" ] && [ -n "${hash_of[runner]:-}" ]; then
+  runner_blob=$(printf 'docker://seeded-runner' | git -C "$CLIENT" hash-object -w --stdin)
+  add_seed_record runner \
+    "$(printf '{"image":"%s","in":"%s"}' "$runner_blob" "${hash_of[runner]}")" "$runner_delta"
 fi
 
 if [ -n "$seed_entries" ]; then

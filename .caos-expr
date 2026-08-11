@@ -1,0 +1,24 @@
+# The REPO's root expression (design/caos-expr.md, "Deep deps"): "Most repos
+# will have a top-level `.caos-expr` that invokes `std/deep-deps` on the tree,
+# allowing any directory to declare deps outside its subtree." This is that.
+#
+# Any directory in this tree may carry a `DEPS` file naming what it depends on
+# by PATH, and evaluating the tree mounts each dependency — recursively deepened
+# and shared by hash — inside the directory that declared it, at
+# `DEEP-DEPS/<name>`. `tests/<name>/DEPS` is the live consumer: a test declares
+# `../../std/rgrep rgrep` and the suite hands it exactly that subgraph, so what
+# re-keys a test is what the test actually reaches for.
+#
+# `std/deep-deps` is named BY PATH, and that is what breaks the cycle:
+# `resolve_expr_image` evaluates a path-named subtree against ITSELF, so it sees
+# `std/deep-deps`'s own `.caos-expr` — the `docker://seeded-deep-deps` sentinel
+# the core-seeder-runner answers — and never re-enters this expression. Nor does
+# the result: `eval_path` descends into what an expression produced without
+# re-checking that result's own root, so the deepened tree's copy of this file
+# is inert.
+#
+# This works only because every dependency a directory names is IN the tree.
+# That is why `std/runner` exists as a seeded `{.caos-expr}` sentinel rather
+# than a name published straight from a host-built delta, and why the test
+# fixture binary moved to `std/llm-stub` instead of riding in a build output.
+run std/deep-deps -- --in:@=.

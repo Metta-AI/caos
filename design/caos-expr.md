@@ -446,3 +446,57 @@ and the widening was the mechanism asking to be replaced.
   descent (`./std/foo`, or `./inputs/caos/std/foo` in a consumer) is the end
   state — and the last thing standing between this project and the "kill `/std`
   entirely" north star above.
+
+### Landed: the repo deepens ITSELF (root `.caos-expr`)
+
+The tree now carries `/.caos-expr` = `run std/deep-deps -- --in:@=.` — the
+top-level expression this design always called for ("Most repos will have a
+top-level `.caos-expr` that invokes `std/deep-deps` on the tree"). The suite no
+longer assembles a look-alike tree out of build outputs and invoke the transform
+imperatively; `caos-tools/test.sh` runs the transform over the WORKSPACE, and
+`tests/<name>/DEPS` paths like `../../std/rgrep` resolve against the real repo.
+
+Two things had to land first, and both were real, not incidental:
+
+- **`std/runner` exists as an entry.** It was published straight from the
+  host-built delta, so `std/runner` was a NAME WITH NO DIRECTORY — and
+  `std/rustc/DEPS` says `../runner`. A tree cannot deepen itself while a declared
+  dependency is not in it. It is a `{.caos-expr}` sentinel now
+  (`run docker://seeded-runner`), seeded exactly like flake-builder, which also
+  completes the rule that every std entry has an expression: the ones that cannot
+  be built that way are seeded, not exempted. (This reverses the earlier "runner
+  stays raw / not a std entry" note.)
+- **The test fixture binary is a std entry** (`std/llm-stub`), not a build
+  output, so no test declares a path that only exists after a build.
+
+Cycle safety is the same rule as the std root's, one level up: `std/deep-deps` is
+named BY PATH, `resolve_expr_image` evaluates a path-named subtree against
+ITSELF, so it reaches the seeded sentinel and never re-enters this expression;
+and `eval_path` descends into a result without re-checking that result's root, so
+the deepened tree's copy of the file is inert.
+
+Seeded core is now **flake-builder, cargo, rustc, deep-deps, runner**.
+
+### Remaining: retire ambient `/std` itself
+
+`refs/caos/std` is still here, and it is bigger than a ref: `std` is a RESERVED
+ARG on every arg tree (`assemble_arg_tree` merges `std_arg_entry` into every
+request), so it is in every cache key and the server materializes it at
+`/cas/std` in every container. Order:
+
+1. the ~57 `/cas/std/*` sites in `tests/*/cli.sh` become DEPS-mount paths;
+2. `caos-tools` and `worker-common::std_image` — these run IN WORKERS, which
+   cannot evaluate, so they need the resolved image handed in as an arg;
+3. `crates/caos` (chat.rs constants, tui, `resolve_std_image`) — the consumer
+   model: chat needs a project tree with std in it to descend;
+4. the `std` ARG and the ref, last, since everything above reads them.
+
+One blocker sits outside that order: `crates/server/src/compute.rs` looks up
+`flake-builder` BY NAME when a worker hands it a raw flake tree. The server holds
+an arg tree, not a project tree, so descent does not help it — the flake-builder
+image has to ride IN the arg tree instead.
+
+Note: `tests/lib/run-test.sh`'s `objects/info/alternates` pointing at the seed
+repo is a SYMPTOM of ambient std — it exists because `std` rides as a whole tree
+in every arg tree, so a push must traverse objects nobody walked. It goes away
+with the `std` arg.

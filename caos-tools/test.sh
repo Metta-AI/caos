@@ -24,10 +24,10 @@
 #   suite      (default) run-then THE BUILD TOOL (caos-tools/build.sh — the
 #              same job an agent's `build` call fires, sharing its cache),
 #              whose result is the TEST STACK IMAGE
-#   stage3     assemble {std, every test's DEPS}, then resolve the
-#              deep-deps image by running its sentinel (a worker cannot eval)
-#   deepen     run that image over the assembled tree — the real transform
-#              delivers every test its deps (design/caos-expr.md)
+#   stage3     resolve the deep-deps image by running its sentinel (a worker
+#              cannot eval a `.caos-expr`)
+#   deepen     run it over the WORKSPACE, whose root `.caos-expr` is exactly
+#              this transform — every test's DEPS resolve in the real tree
 #   fanout     the `then` of that: --result is the deepened tree, so the
 #              per-test wrappers can be built — one job per tests/<name>/cli.sh,
 #              each running the image with tests/lib/run-test.sh as worker1
@@ -109,10 +109,6 @@ stage3)
   # gone with the wrapper: there is no longer a per-test choice of which
   # binaries and images ride along, because they all ride in the one image.
   caos get /cas/args/result
-  # One level further: the per-test subsets below symlink to individual entries,
-  # so `std` must exist as a placeholder for `caos put` to resolve entries
-  # by recorded hash. Placeholders only — no content is fetched here.
-  caos get /cas/args/result/std
   # The seed records (design/caos-expr.md, Phase 3), when the build carried them.
   # A whole-tree placeholder — every wrapper gets the same one, so the inner
   # core-seeder-runner answers flake-builder's `run docker://seeded`.
@@ -128,8 +124,8 @@ stage3)
   # transform's job now — each test carries a `DEPS` file and the real worker
   # mounts its deps, recursively deepened and shared by hash.
   #
-  # ONE transform for the whole suite, not one per test: the assembled tree
-  # below holds std and every test's DEPS, so a dep reached by two
+  # ONE transform for the whole suite, not one per test: the workspace holds std
+  # and every test's DEPS, so a dep reached by two
   # tests is one node computed once. What a test re-keys on is its own deepened
   # subgraph — narrower than the old lists, because a std entry now brings its
   # own deps (std/<e>/DEPS) instead of each test restating them.
@@ -139,21 +135,20 @@ stage3)
   # to form seed keys. If the two ever disagree, the seeded key stops matching
   # the key resolution forms and the tests that resolve that entry go red.
   #
-  # Symlinks throughout — `caos put` resolves a symlink into /cas to its
-  # recorded hash, so assembling this moves no bytes.
-  mkdir -p /tmp/dd/std /tmp/dd/tests
-  for e in /cas/args/result/std/*; do
-    ln -s "$e" "/tmp/dd/std/$(basename "$e")"
-  done
-  for d in /cas/args/in/tests/*/; do
-    t=$(basename "$d")
-    caos get "/cas/args/in/tests/$t"
-    if [ -e "$d/DEPS" ]; then
-      mkdir -p "/tmp/dd/tests/$t"
-      ln -s "/cas/args/in/tests/$t/DEPS" "/tmp/dd/tests/$t/DEPS"
-    fi
-  done
-  caos put /tmp/dd /cas/dd || fail "assembling the deep-deps input"
+  # NOTHING IS ASSEMBLED. The tree deepened here is the WORKSPACE ITSELF
+  # (`/cas/args/in`), because the workspace now carries the root `.caos-expr`
+  # this transform implements — `run std/deep-deps -- --in:@=.` — and every path
+  # a `DEPS` file names is a real path in it. `tests/rgrep/DEPS` says
+  # `../../std/rgrep`, and that resolves against the repo, not against a
+  # look-alike the harness built out of build outputs.
+  #
+  # It used to assemble `{std/*, tests/*/DEPS}` from the build result. That
+  # worked, but it made the DEPS paths a fiction: they were repo-shaped only
+  # because the fabricated tree was made repo-shaped, and deep-deps was invoked
+  # imperatively by a script rather than by the tree describing itself. Two
+  # things had to land before this could be honest — `std/runner` becoming a
+  # real entry, and the test fixture binary moving to `std/llm-stub` — because
+  # a tree can only deepen itself when everything it declares is IN it.
 
   # THE DEEP-DEPS IMAGE — resolved the way its own `.caos-expr` resolves it.
   #
@@ -184,11 +179,11 @@ stage3)
   # blocking. So resolving the image ends THIS stage, `deepen` does the
   # transform, and `fanout` builds the wrappers. Everything a later stage needs
   # from here has to be curried through, because run-then passes only `--in`
-  # and `--result`: `dd` is the assembled tree, `build` what the build tool
+  # and `--result`: `build` is what the build tool
   # returned (image, std, seed, time) and `ws` the workspace — all named
   # away from the reserved `in`/`result`.
   fwd=("--worker1:@=/cas/args/worker1" --stage=deepen
-       "--dd:@=/cas/dd" "--build:@=/cas/args/result" "--ws:@=/cas/args/in"
+       "--build:@=/cas/args/result" "--ws:@=/cas/args/in"
        "--build-ws:@=/cas/args/build-ws")
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
@@ -208,7 +203,7 @@ deepen)
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
   fanout=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the fan-out stage"
-  caos run-then /cas/args/dd -- --run=/cas/args/result --then="$fanout"
+  caos run-then /cas/args/ws -- --run=/cas/args/result --then="$fanout"
   ;;
 
 fanout)
