@@ -280,7 +280,7 @@ fanout)
     # WHAT THIS TEST REACHES FOR, and nothing else — read back off the test's
     # own DEPS, which the transform above has already turned into a
     # DEEP-DEPS/<name> mount per line. The wrapper still hands the inner stack
-    # `std`, which becomes the inner refs/caos/std, so all this does is place each
+    # `std`, which the interpreter fetches into the inner stack, so all this does is place each
     # so all that happens here is routing each mount to the one its DEPS path
     # named. The CLOSURE is not computed here any more; deep-deps did it.
     #

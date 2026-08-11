@@ -84,12 +84,12 @@ SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
 
 INNER=http://127.0.0.1
 
-# ---- the seed, from the CALLER's std ----------------------------------------
+# ---- the seed, from the CALLER's declared deps -------------------------------
 # std used to be baked into this image (/caos/seed-git), which meant the image
 # moved whenever any worker binary did, and every test re-keyed on every worker
 # edit. It arrives as an arg instead, and the caller hands each job only the
-# entries that job uses (caos-tools/test.sh, stage3) — so what re-keys a test is
-# what the test actually reaches for.
+# entries that job declared (its `DEPS`, expanded by deep-deps — see
+# caos-tools/test.sh) — so what re-keys a test is what the test reaches for.
 #
 # Seeding is a git FETCH of the tree's closure from the outer server, not a
 # publish: build-builtins already did the expensive half (building and pushing
@@ -99,14 +99,19 @@ INNER=http://127.0.0.1
 #
 # It has to happen HERE, before the env flips, because $CAOS_SERVER_URL is the
 # outer server only until then.
-STD_HASH=$(caos hash /cas/args/in/std) || fail "no std in the wrapper — the caller hands each job the entries it uses"
+#
+# The ref is an ANCHOR, not a lookup. Nothing resolves a builtin by name any more
+# (there is no `refs/caos/std` and no `/cas/std/<name>`); a test reaches its deps
+# by path, through the `DEEP-DEPS/` copy run-test.sh puts in its repo. This just
+# keeps the fetched objects reachable so they are not collectable.
+DEPS_HASH=$(caos hash /cas/args/in/std) || fail "no deps in the wrapper — the caller hands each job the entries it declared"
 SEED=/tmp/seed-git
 git init -q --bare "$SEED" || fail "creating the seed repo"
 git -c fetch.negotiationAlgorithm=noop -C "$SEED" fetch -q --no-write-fetch-head \
-  "$CAOS_SERVER_URL" "$STD_HASH" \
-  || fail "fetching std $STD_HASH from the outer server"
-git -C "$SEED" update-ref refs/caos/std "$STD_HASH" \
-  || fail "pointing refs/caos/std at $STD_HASH"
+  "$CAOS_SERVER_URL" "$DEPS_HASH" \
+  || fail "fetching the declared deps $DEPS_HASH from the outer server"
+git -C "$SEED" update-ref refs/caos/deps "$DEPS_HASH" \
+  || fail "anchoring refs/caos/deps at $DEPS_HASH"
 
 # The seeder's records (design/caos-expr.md, Phase 3): flake-builder resolves
 # via `run docker://seeded`, answered INSIDE by the core-seeder-runner (started

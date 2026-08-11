@@ -116,8 +116,8 @@ reduce)
   # sentinel as `--run`, which forms exactly the key the core-seeder-runner
   # registered — so it answers with the pre-built image, no container.
   #
-  # It used to name the entry through an ambient library, reaching outside
-  # library. A worker cannot evaluate a `.caos-expr` (that blocks on a run,
+  # It used to name the entry through an ambient library. A worker cannot
+  # evaluate a `.caos-expr` (that blocks on a run,
   # which a worker may not do), and naming the entry directly hands the SERVER a
   # raw flake tree to build — flake-builder building flake-builder. The entry we
   # need is in the tree we were handed, at `in/std/flake-builder`, so nothing
@@ -287,10 +287,8 @@ make)
   CAOS_REGISTRY_HTTP=caos-registry:5000 \
   CAOS_BUILTIN_IMAGES="$(echo /caos/images/*.tar.gz)" \
   CAOS_BUILTIN_BINS="$STAGED" \
-    bash "$wsroot/build-builtins.sh" >&2 || fail "publishing std"
+    bash "$wsroot/build-builtins.sh" >&2 || fail "bootstrapping the seeded core"
 
-  # The std tree the seed stack just published, as a hash.
-  STD=$(git -C "$state/git" rev-parse refs/caos/std) || fail "no refs/caos/std in the seed repo"
   # The seed records (design/caos-expr.md, Phase 3), if bootstrap published any:
   # flake-builder resolves via `run docker://seeded`, answered by the inner
   # core-seeder-runner from these. Optional so a std without seeded core still
@@ -301,20 +299,8 @@ make)
   # pack is not something to hand on.
   kill "$serve" 2>/dev/null || true
   wait "$serve" 2>/dev/null || true
-  ts "published std"
+  ts "bootstrapped the seeded core"
 
-  # std LEAVES this stage as a value, not baked into the image, so a caller can
-  # hand each job only the entries it needs (caos-tools/test.sh, stage3).
-  #
-  # It was published into the seed stack's repo, so move it the way values move:
-  # push the closure to the outer server (a bare tree to a ref, as
-  # GitTransport::ensure_pushed does), then symlink a PLACEHOLDER of it into the
-  # result. `caos put` resolves a symlink into /cas to its recorded hash, so the
-  # tree rides on by identity and nothing is materialized.
-  git -C "$state/git" push --quiet "$CAOS_SERVER_URL" "$STD:refs/caos/std-built-$STD" \
-    || fail "pushing the published std to the outer server"
-  caos get-hash "$STD" /cas/std-built || fail "materializing the std placeholder"
-  ts "handed std over ($STD)"
 
   # The seed records ride over the same way — one small tree whose closure
   # carries the flake-builder delta the seeder returns. Each test stack fetches
@@ -334,7 +320,6 @@ make)
   # (measured: 1 of 11 binaries changes, and the four in the image are not it).
   OUT=/tmp/out
   rm -rf "$OUT"; mkdir -p "$OUT"
-  ln -s /cas/std-built "$OUT/std"
   # The seed records, when bootstrap published them (a symlink put, recorded-hash
   # reuse — no bytes move). Consumed by caos-tools/test.sh stage3 → each test
   # wrapper → test-stack/worker, which seeds refs/caos/seed into the inner stack.

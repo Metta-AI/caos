@@ -1,28 +1,34 @@
 #!/usr/bin/env bash
-# Populate the caos `std` library — the workers clients reach as
-# `/cas/std/<name>` — and publish it to the server as `refs/caos/std`.
+# Bootstrap the SEEDED CORE: build the handful of images that cannot be built by
+# the machinery they are, and publish them as seed records under `refs/caos/seed`.
 #
-# Every entry but one is the checked-in `std/<name>` SOURCE DIR, published
-# verbatim: a `.caos-expr` says how it is built and resolving the entry evaluates
-# that expression (design/caos-expr.md, Phase 3). `runner` is the exception — a
-# leaf image with no source, published as the host-built git-docker DELTA
-# {base, config.json, layer<NN>} whose clean image this script streams to the
-# registry once, keyed on its store path, for the server to stack on first use.
+# It no longer publishes a std library. Every `std/<name>` is a checked-in source
+# directory whose `.caos-expr` says how it is built, and a consumer reaches it by
+# DESCENT — a `DEPS` line naming a path, expanded by a root `.caos-expr` into a
+# `DEEP-DEPS/<name>` mount (design/caos-expr.md). There is no `refs/caos/std`, no
+# `/cas/std/<name>`, and nothing resolves a builtin by an ambient name.
 #
-# The published tree is `{ .caos-expr, <name> -> <source> }`: entries are
-# UN-DEEPENED (each keeps its `DEPS`), and the std-root `std/.caos-expr`
-# (`run deep-deps -- --in:@=.`) deepens them at RESOLVE time. So std resolves by
-# descent, and nothing about the deepened shape is baked into the ref. This
-# script still hand-deepens — but only to form SEED KEYS (see the seed block).
+# What is left is the irreducible core. Five entries name a `docker://seeded…`
+# sentinel instead of a real builder, because each would otherwise have to build
+# itself:
 #
-# Three of the entries (flake-builder, cargo, and the rustc/deep-deps sentinels)
-# cannot be built by the machinery they ARE, so their images are hand-built here
-# and published as SEED RECORDS under `refs/caos/seed` instead; the
-# core-seeder-runner answers the exact arg-tree key their expressions form.
+#   flake-builder  a flake built by the flake-builder
+#   cargo          a flake, so likewise
+#   runner         the pooled interpreter: a nix closure with no source here
+#   rustc          the worker factory; rustc compiling rustc
+#   deep-deps      the transform a tree needs before it can be deepened
 #
-# The tree is pushed to the server under `refs/caos/std` (uploading every
-# referenced object, negotiated). Clients then `git fetch caos refs/caos/std`
-# and resolve it locally to reach the library.
+# For each, this script hand-builds the artifact its expression WOULD have
+# produced and records it as `{ required: <the arg-tree key>, result: <what to
+# answer with> }`. The core-seeder-runner registers one poll per record and
+# answers that exact key, spawning no container. `required` is assembled from the
+# deltas already built here rather than by running the evaluator, so no seeder has
+# to be live during bootstrap.
+#
+# The keys must match what resolution forms, which is why the deepen pass below
+# exists: a seeded item's `in` is its DEEPENED entry, and this has to know that
+# hash before any stack exists to compute it. It must agree with the deep-deps
+# worker BYTE FOR BYTE (tests/deep-deps and the suite are the guardrail).
 #
 # Usage: ./build-builtins.sh [name ...]   (default: all)
 # Requires the dev server running and git + skopeo + curl on PATH. No docker:
@@ -34,46 +40,28 @@ PROJECT=$PWD
 names=("$@")
 [ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step deep-deps rustc llm-stub)
 
-# std entries that are SOURCE DIRS published whole (design/caos-expr.md,
-# Phase 3): the checked-in std/<name> directory IS the published tree, copied
-# verbatim — nothing generated (std/refresh.sh maintains the checked-in
-# redundancies, tests/std-lint verifies them). Each carries a `.caos-expr`, so
-# resolving `/cas/std/<name>` evaluates that expression to build the image:
-#   bash, merge  — flake dirs; the expr runs /std/flake-builder on the dir.
-#   rgrep        — a Rust project; the expr builds it with rustc (its
-#                  regex dep rides the seeded /std/cargo bake).
-#   bash-tool    — a Rust project too (worker-common only, no crates.io deps),
-#                  built with rustc exactly like rgrep. No binary is staged here
-#                  — rustc compiles it on resolution.
-#   llm-call,    — Rust projects built with rustc; their crates.io deps ride the
-#   llm-step       bake (anchored by crates/bake-anchor) and they link the
-#                  llm-client crate via a numbered --dep0 mount.
-#   llm-stub     — a Rust project too, but built by CARGO DIRECTLY (its expr runs
-#                  DEEP-DEPS/cargo --cmd=build): the tests run it as a plain
-#                  sidecar HTTP server, so what they need is the produced FILE
-#                  at bin/llm-stub, not a runner-pool image.
-#   llm-client   — a LIBRARY entry (no .caos-expr): source mounted into the llm
-#                  tools as a code dep, never resolved as an image itself.
-#   deep-deps,   — SEEDED core: a minimal {.caos-expr} sentinel entry; bootstrap
-#   rustc          hand-builds the curry result and seeds it (below). No binary
-#                  is staged into the entry.
-is_source_entry() {
+# Which entries have a HOST-BUILT nix image behind them. This is the whole
+# partition now: everything else is a checked-in source directory this script
+# only reads (to compute a seed key), never builds.
+#
+#   flake-builder  the bootstrap image
+#   runner         the pooled interpreter
+#   cargo          built by the root flake from the same `src` and toolchain as
+#                  the binaries, so its deps are cargoArtifacts rather than a
+#                  second compile of them
+#
+# It used to be an `is_source_entry` list of everything EXCEPT these three, which
+# had to be edited every time an entry was added — and said nothing, since a
+# source entry is just the default.
+has_host_image() {
   case "$1" in
-    bash | bash-tool | deep-deps | llm-call | llm-client | llm-step | merge | rgrep | rustc | llm-stub) return 0 ;;
+    flake-builder | runner | cargo) return 0 ;;
     *) return 1 ;;
   esac
 }
-# Everything else is a DELTA entry: the flake-builder (the bootstrap image),
-# the runner (the pooled interpreter) — both self-contained nix closures — and
-# cargo, whose image the root flake builds from the same `src` and toolchain as
-# the binaries (so its deps are cargoArtifacts, not a second compile of them).
-# The partition is exactly two-way, so "not a source entry" IS the predicate.
-# (flake-builder is a special hybrid: it BUILDS as an image delta here, but its
-# std ENTRY is later swapped to a source tree + a seed record — see the seed
-# block near the end, design/caos-expr.md Phase 3.)
 image_names=()
 for name in "${names[@]}"; do
-  is_source_entry "$name" || image_names+=("$name")
+  if has_host_image "$name"; then image_names+=("$name"); fi
 done
 
 # caos-cli: a prebuilt binary if the caller injected one (CAOS_CLI — how caosd
@@ -455,27 +443,6 @@ for name in "${names[@]}"; do
   echo "$name: deepened entry (seed key) ${hash_of[$name]}" >&2
 done
 
-# Assemble the published tree — the UN-deepened entries plus the std-root
-# `.caos-expr` that deepens them on resolution (a ref can name any object; std is
-# a tree, so there's no commit to wrap it) — and push it to the server under
-# refs/caos/std in one push, which uploads every builtin image the server doesn't
-# already have. The root expression is the ONLY generated part of the std root:
-# `std/refresh.sh` is a maintenance script and is deliberately not published.
-# `--stdin` (not a path argument): PROJECT may be an image layout of symlinks
-# into the nix store, and a redirect dereferences where `hash-object <path>`
-# would hash the link. It also sidesteps hashing a file outside CLIENT.
-root_expr=$(git -C "$CLIENT" hash-object -w --stdin < "$PROJECT/std/.caos-expr")
-entries="100644 blob $root_expr"$'\t'".caos-expr"$'\n'
-for name in "${names[@]}"; do
-  entries+="040000 tree ${undeepened[$name]}"$'\t'"$name"$'\n'
-done
-tree=$(printf '%s' "$entries" | git -C "$CLIENT" mktree)
-# --force: refs/caos/std points at a tree, and git refuses to update a non-commit
-# ref (or move it) without it. Re-publishing always replaces it.
-git -C "$CLIENT" push -q --force caos "$tree:refs/caos/std"
-# Record it locally too, so this repo can also resolve refs/caos/std.
-git -C "$CLIENT" update-ref refs/caos/std "$tree"
-echo "refs/caos/std -> $tree (published to $SERVER_URL)" >&2
 
 # ---- seed records (design/caos-expr.md, Phase 3) ----------------------------
 # The irreducible core can't be built by the machinery it IS, so bootstrap
@@ -576,4 +543,4 @@ if [ -n "$seed_entries" ]; then
   echo "refs/caos/seed -> $seed_tree" >&2
 fi
 
-echo "$tree"
+echo "$seed_tree"

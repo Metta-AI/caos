@@ -23,7 +23,7 @@
 # The inner std is published by the tree's OWN build-builtins.sh — the same
 # script the host runs — but ONCE, when the image was built (the seed,
 # design/one-stack-image.md), not once per test. So nothing here publishes:
-# the stack /worker brought up already answers refs/caos/std. The expensive
+# the stack /worker brought up already has the declared deps. The expensive
 # half is still memoized in the host's registry by content (each std flake
 # keyed on its tree hash), so the first suite pays the builds and every later
 # one is a tag hit.

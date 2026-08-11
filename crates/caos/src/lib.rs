@@ -2270,7 +2270,7 @@ fn assemble_arg_tree(
     // push carries the whole graph reachable from the tree, which includes any
     // embedded git-image tree, so the image lands on the server without a
     // separate push. (`std` rides as a bare hash, so the std tree is not in this
-    // closure — it is already on the server, published at `refs/caos/std`.)
+    // closure — it is already on the server.)
     let arg_tree = post_tree(t, arg_entries)?;
     t.ensure_pushed(&arg_tree.to_string())?;
     Ok(arg_tree.to_string())
@@ -2543,7 +2543,7 @@ fn run_salt() -> String {
     std::env::var(SALT_ENV).unwrap_or_default()
 }
 
-/// Resolve a git ref (e.g. `refs/caos/std`) to its tree hash, read from the local
+/// Resolve a git ref to its tree hash, read from the local
 /// repository. Peels tags and commits to a tree. No server round-trip: the CLI
 /// already has the refs (it fetched them from the `caos` remote).
 pub fn resolve_ref(name: &str) -> Result<String, String> {
