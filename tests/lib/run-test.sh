@@ -1,6 +1,6 @@
 #!/bin/bash
 # The per-test worker1 (design/test-stack-image.md), mapped over by
-# caos-tools/test.sh's stage3. Runs INSIDE a test stack: the image's /worker
+# caos-tools/test.sh's fanout. Runs INSIDE a test stack: the image's /worker
 # has already brought up the inner server, runnerd and a private redis, and put
 # the tree's binaries first on PATH with CAOS_SERVER_URL aimed at them.
 #
@@ -20,13 +20,10 @@
 # it here would either 404 (its calls go to the inner server too) or, worse,
 # quietly run host code where the tested code was the point.
 #
-# The inner std is published by the tree's OWN build-builtins.sh — the same
-# script the host runs — but ONCE, when the image was built (the seed,
-# design/one-stack-image.md), not once per test. So nothing here publishes:
-# the stack /worker brought up already has the declared deps. The expensive
-# half is still memoized in the host's registry by content (each std flake
-# keyed on its tree hash), so the first suite pays the builds and every later
-# one is a tag hit.
+# Nothing here publishes: the stack the image's /worker brought up already holds
+# the deps this test declared, fetched by the interpreter. The expensive half is
+# memoized in the host's registry by content (each std flake keyed on its tree
+# hash), so the first suite pays the builds and every later one is a tag hit.
 #
 # The test's OUTCOME is a value, not a job error: the result tree carries the
 # verdict, the test's full output and the inner stack's logs, so one failing
@@ -49,31 +46,19 @@
 # "no runner"` vs `... || fail "tests failed"`.
 #
 # An UNGUARDED command that trips `set -e` lands on the ERR trap, which calls
-# `abort` — a VERDICT. It used to call `infra`, on the reasoning that an
-# unexpected abort is environment and so must never cache as a spurious red.
-# That reasoning was wrong on both halves, measured twice in a row: an agent's
-# half-written cli.sh, and a genuine push bug in a half-built feature the test
-# was driving. Both were the tree under test being wrong — deterministic,
-# reproducible, and exactly what the author needed to read — and both got filed
-# as "the environment broke". Only the four `|| infra "cargo worker did not
-# run"` guards in tests/unit-* have ever meant it.
+# `abort` — a VERDICT, not `infra`. Do not reclassify it: an unexpected abort is
+# almost always the tree under test being wrong (a half-written cli.sh, a real
+# bug in the feature the test drives) — deterministic, reproducible, and exactly
+# what the author needs to read. Only the `|| infra "cargo worker did not run"`
+# guards in tests/unit-* have ever meant "the environment broke".
 #
-# The cost of caching an abort is small and self-clearing: a per-test job keys
-# on the test's own tree AND the image digest, so fixing either the cli.sh or
-# the code it drives re-keys the job. `--test-salt` forces a re-run when a
-# genuine flake did cache.
-#
-# The cost of the old default was not small. A job error fails the whole map,
-# taking the summary with it — so one aborted cli.sh discarded every other
-# test's result, errored the `test` tool's sub-run, and killed the agent turn
-# that called it. This header used to end "getting the split wrong only ever
-# costs a re-run, never a false green", which was not true while it cost a turn.
-#
-# It is true again, and not only because of the reclassification above: tool
-# sub-runs now launch through `run-then --catch` (design/map-then.md), so even a
-# real `infra` job error reaches the agent as an is_error tool_result over an
-# unchanged workspace instead of killing the turn. Both halves matter — this one
-# puts aborts in the right bucket, that one makes the wrong bucket survivable.
+# Caching an abort is cheap and self-clearing: a per-test job keys on the test's
+# own tree AND the image digest, so fixing either re-keys it, and `--test-salt`
+# forces a re-run when a genuine flake did cache. Calling it `infra` is not
+# cheap: a job error fails the whole map, discarding every other test's result.
+# (Tool sub-runs launch through `run-then --catch` — design/map-then.md — so a
+# real `infra` error reaches the agent as an is_error tool_result rather than
+# killing the turn.)
 set -euo pipefail
 
 fail() {
@@ -86,9 +71,9 @@ fail() {
   exit 1
 }
 
-# The map child: {test, workspace?, api-key?}, already materialized by the
-# interpreter. Binaries and images no longer ride in the wrapper — they are
-# in the image, which IS the tree under test.
+# The map child: {test, std, seed, workspace?, api-key?}, already materialized
+# by the interpreter. Everything else a test runs on is in the image, which IS
+# the tree under test.
 
 TEST=/cas/args/in/test
 [ -d "$TEST" ] || fail "no test tree at $TEST
@@ -139,15 +124,9 @@ fi
 # CAOS_STUB_HOST points workers at in-job stub servers — siblings share this
 # container's netns, so localhost is the stub's address, not the engine host.
 #
-# There is NO CAOS_BIN_DIR any more. It handed tests host binaries staged into
-# the wrapper by the suite, which meant a second delivery mechanism alongside
-# std — and exactly one binary was ever named through it (llm-stub). That is a
-# std entry now, built by cargo rather than rustc because it is a plain sidecar
-# process and not a worker image, so a test declares it in DEPS like anything
-# else and takes it out of its own mount. The read-only-CAS lesson survives in
-# the tests that do so: materialized content is read-only and owner-only, so a
-# test `install`s a real executable copy before running it ("Permission denied"
-# straight out of /cas, measured).
+# A test that EXECs something out of its own mounts must `install` a copy first:
+# materialized CAS content is read-only and owner-only, so running it straight
+# out of /cas is "Permission denied".
 export CAOS_STUB_HOST=127.0.0.1
 # A real-API test's key arrives in its wrapper (chat-online; absent = its
 # cli.sh self-skips).

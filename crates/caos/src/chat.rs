@@ -1228,20 +1228,8 @@ fn turn(
         .trim()
         .to_string();
 
-    // The workers: resolved from std, which builds them from source on demand.
-    //
-    // There were `--llm-step-bin`/`--bash-tool-bin`/`--rgrep-bin` overrides
-    // (and `$CAOS_*_BIN`) that curried a locally-built binary onto the
-    // runner-pool image here instead. They are gone. Their documented purpose
-    // was "the stub tests' path", and the stub tests do not use them — they run
-    // llm-stub as a sidecar server and point `--base-url` at it, and
-    // tests/chat-offline went as far as UNSETTING the env vars so a developer's
-    // shell could not leak into the run. The workflow they existed for (skip a
-    // slow publish to try a local binary) is what a source std entry does by
-    // itself now: edit `std/llm-step/src`, and resolving it rebuilds it.
-    //
-    // Removing them also takes the last hard-coded runner-pool shape out of the
-    // client: nothing here needs to know that a tool is `curry(runner, bin)`.
+    // The workers are resolved from the workspace's own declaration, and build
+    // from source on demand.
     let phase = std::time::Instant::now();
     // NO TOOL IMAGES HERE. `bash-image`, `grep-image`, `tools-image` and
     // `merge-image` are llm-step's DEPENDENCIES, so llm-step declares them

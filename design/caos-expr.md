@@ -21,7 +21,7 @@ Examples:
   Variable names are `[A-Z][A-Z0-9_]*`; the verbs are lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`. A `$NAME` in an image position is the object that variable produced; `--k=$NAME` binds that object by reference (at its own kind); `--k=value` is a literal blob. (This replaces an earlier `$( ... )` command-substitution sketch — the variable form is easier to write, read and parse.)
 - A `run` expression evaluates to the run's result; a `curry` expression to the curried ArgTree. In practice we dig into `run` results, not through `curry`.
 
-- Arguments are parsed as with a normal curry/run-then command, except that paths are relative to the directory containing the `.caos-expr` file. `/std/...` is interpreted as normal for now (until we remove it later)
+- Arguments are parsed as with a normal curry/run-then command, except that paths are relative to the directory containing the `.caos-expr` file. A path names a directory in the tree; there is no ambient `/std/...`
 - There is no lazy evaluation here
 - `eval-path` converts the expression into an arg tree and then requests that the arg tree is run, providing normal caching
 

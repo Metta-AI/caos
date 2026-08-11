@@ -319,15 +319,16 @@ refused if its tree carries a top-level `.caos`), `--system <text>` /
 walk — and run nothing). The API key comes only from `$ANTHROPIC_API_KEY`
 (checked before anything is minted).
 
-The workers come ready-made from the published library: `/cas/std/bash-tool`,
-`/cas/std/llm-call`, and `/cas/std/llm-step` are
-`curry(runner, bin=<static binary>)` nodes
-(published by build-builtins.sh next to the images), so a turn needs nothing
-built or committed locally — the bash curry rides as a literal image ref and
-the per-turn state (key, system, model…) is curried onto the llm-step curry
-(layers flatten). `--llm-step-bin`/`--bash-tool-bin` (or
-`$CAOS_LLM_STEP_BIN`/`$CAOS_BASH_TOOL_BIN`) override with a git-tracked local
-binary curried onto `/cas/std/runner` — the stub tests' path.
+The workers are resolved from the WORKSPACE, which declares them in its own
+`DEPS` (`./std/llm-step llm-step`); the root `.caos-expr` expands that into a
+`DEEP-DEPS/` mount and the client descends it (design/caos-expr.md). Each
+resolves to a `curry(runner, bin=<static binary>)` node, so the per-turn state
+(key, system, model…) is curried onto the llm-step curry and layers flatten.
+
+The tools a turn drives — bash-tool, rgrep, bash, merge — are NOT named by the
+caller. They are llm-step's dependencies, so `std/llm-step/DEPS` declares them
+and its `.caos-expr` binds them: resolving llm-step yields a step that already
+knows its tools. A caller says what the TURN is.
 
 `llm-call` is the smaller sibling of `llm-step`: it accepts a system prompt
 and messages array and returns response text as a blob, with no tools, commits,

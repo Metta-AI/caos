@@ -321,7 +321,7 @@ make)
   OUT=/tmp/out
   rm -rf "$OUT"; mkdir -p "$OUT"
   # The seed records, when bootstrap published them (a symlink put, recorded-hash
-  # reuse — no bytes move). Consumed by caos-tools/test.sh stage3 → each test
+  # reuse — no bytes move). Consumed by caos-tools/test.sh deepener → each test
   # wrapper → test-stack/worker, which seeds refs/caos/seed into the inner stack.
   if [ -n "$SEED" ]; then ln -s /cas/seed-built "$OUT/seed"; fi
 
@@ -341,12 +341,6 @@ make)
     install -m 755 "$BIN/$b" "$L/caos/bin/$b" || fail "no binary $b"
   done
 
-  # NO `bin` OUTPUT. It carried four host binaries for tests to copy out of
-  # CAOS_BIN_DIR, and exactly one was ever named by a test: llm-stub. That is a
-  # std entry now (std/llm-stub, built by cargo — it is a plain sidecar process,
-  # not a worker image), so a test reaches it the way it reaches everything
-  # else: a DEPS ref, mounted by deep-deps. The other three were named by
-  # nothing at all.
   install -m 755 "$wsroot/stack/serve" "$L/caos/stack/serve"
   install -m 755 "$wsroot/test-stack/worker" "$L/worker"
   # NO /caos/seed-git. std arrives as an arg now and the stack's /worker seeds
@@ -357,7 +351,7 @@ make)
 
   # This stage's elapsed seconds, as a FOURTH output. Callers that want to
   # report it read it; the per-test wrappers never carry it, so a build whose
-  # image/std/bin come out identical but took a different time re-keys stage3
+  # image/std/bin come out identical but took a different time re-keys deepener
   # and the summariser (one cheap container each) and leaves every test a hit.
   #
   # Only this stage's own time — reduce and launch are ~2s of container churn

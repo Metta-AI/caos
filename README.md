@@ -62,7 +62,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
-| `build-builtins.sh` | Builds + publishes the `std` library to `refs/caos/std` |
+| `build-builtins.sh` | Bootstraps the seeded core and publishes `refs/caos/seed` |
 | `caos-tools/`, `tests/` | The `build`/`test`/`test-result` tools and the integration suites |
 
 ## Development
@@ -337,10 +337,8 @@ setuid `caos`.
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — the **ArgTree** — including the
-   `<image>` under a reserved `image` entry, the standard library `std` under a
-   reserved `std` entry (a blob naming the std tree, resolved from
-   `refs/caos/std`, see [built-ins](#built-ins-casstd)), and (when set) the
-   cache-busting salt under a reserved `salt` entry (see
+   `<image>` under a reserved `image` entry and (when set) the cache-busting
+   salt under a reserved `salt` entry (see
    [arguments](#arguments-literals-and-paths));
 2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —
    nothing wraps it, so the ArgTree is the whole cache key;
@@ -387,9 +385,10 @@ one such case.)
 
 `<image>` (and a `--map`/`--then` value) is a **git image by default**: a bare
 git hash (e.g. an `import-image` output or a `caos curry` ref), or — on
-`caos-cli` — a `/cas/std/<name>` builtin resolved against the published
-library. Inside a worker it can also be any `/cas` path, resolved to the hash
-recorded on it. An **ordinary docker image** is written `docker://<ref>`.
+`caos-cli` — a path to a directory, which is INGESTED and then EVALUATED: a
+tree carrying a `.caos-expr` resolves to what that expression builds, and one
+without it to itself. Inside a worker an image can be any `/cas` path, resolved
+to the hash recorded on it. An **ordinary docker image** is written `docker://<ref>`.
 
 ### Arguments: literals and paths
 
@@ -446,7 +445,7 @@ filesystem (only `/cas`), so a non-`/cas` path there is an error.
   runs (call args win, and the base is folded into the args tree as its
   `image` entry) — so a request only ever carries a plain args tree. Currying
   flattens, so it's canonical. On `caos-cli`, path args are host paths to
-  ingest, or `/cas/std/<name>` builtin refs.
+  ingest.
 - `runner --job=<json>` (`caos`) — the container runner; see below.
 
 ### `runner`
@@ -455,10 +454,10 @@ filesystem (only `/cas`), so a non-`/cas` path there is an error.
 passes (see `design/runner-protocol.md`). Per job:
 
 1. **unpack** — fetch the request tree named by the job's `req` (it IS the
-   ArgTree) and read its reserved `std`/`salt` entries (image, std and salt all
-   ride inside it);
+   ArgTree) and read its reserved `salt` entry (image and salt both ride inside
+   it);
 2. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
-   materialize the args at `/cas/args` and the standard library at `/cas/std`;
+   materialize the args at `/cas/args`;
 3. **run `/worker`** — dropped to the unprivileged `worker` user so it can't
    touch the root-owned `/cas` except through setuid `caos`; the runner stays
    root to tear down. The worker's output is relayed to the container log and
@@ -472,8 +471,8 @@ passes (see `design/runner-protocol.md`). Per job:
    the container; a job goes back to step 1 — that's the warm-worker win: no
    container start between jobs.
 
-So a `/worker` reads inputs from `/cas/args`, reaches built-ins at `/cas/std`,
-and writes its result to `/cas/out`.
+So a `/worker` reads inputs from `/cas/args` and writes its result to
+`/cas/out`.
 
 ### Permissions: load-before-read, and no tampering
 
@@ -522,24 +521,35 @@ same flow for consumers. The fixtures worth reading:
   `curry(runner, worker1=<binary>)`. So building a worker is itself a (memoized)
   worker, and no toolchain image is dedicated to it.
 
-### Built-ins (`/cas/std`)
+### The standard library (`std/`)
 
-The standard library is a `{name: git-docker-image}` tree reached by workers as
-`/cas/std/<name>`. It's published to the server under `refs/caos/std` by
-`./build-builtins.sh` (which imports each worker image into a client repo and
-`git push`es the assembled tree — one push uploads every referenced image).
-`caos-cli run` resolves a `/cas/std/<name>` image against this library (fetching
-`refs/caos/std` from the server if needed) and threads its tree hash through as
-the request's `std`.
+There is no ambient standard library: no `/cas/std`, no `refs/caos/std`, and no
+`std` entry in a request. Every `std/<name>` is a checked-in source directory
+whose `.caos-expr` says how it is built, and a caller reaches one by DESCENT — a
+`DEPS` line naming a path, expanded by a root `.caos-expr` into a
+`DEEP-DEPS/<name>` mount (`design/caos-expr.md`).
 
-Because `std` is part of every request (hence every cache key), bumping the
-built-ins recomputes everything that could reach them — coarse but correct. The
-name→hash binding lives outside any worker (in the request), so it's captured in
-the cache key, never hidden inside a memoized computation.
+A workspace declares what it reaches for in its own `DEPS`:
+
+```
+./std/bash bash
+./std/llm-step llm-step
+```
+
+and a repo that mounted caos writes the same lines against
+`./flake-inputs/caos/std/...`. Relative paths are stable under mounting, so the
+declaration moves and the code does not.
+
+The five entries that cannot be built by the machinery they ARE — `flake-builder`
+(a flake built by the flake-builder), `cargo`, `runner`, `rustc` and `deep-deps`
+— name a `docker://seeded…` sentinel instead of a builder. `./build-builtins.sh`
+hand-builds what each expression would have produced and publishes it as a seed
+record under `refs/caos/seed`; the core-seeder-runner answers that exact key,
+spawning no container.
 
 ```bash
-./build-builtins.sh                 # publish all built-ins to refs/caos/std
-./build-builtins.sh bash cargo      # publish a subset
+./build-builtins.sh                 # bootstrap the seeded core
+./build-builtins.sh bash cargo      # a subset
 ```
 
 ## Local testing

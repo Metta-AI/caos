@@ -192,7 +192,7 @@ instead calls `std-check` once, before the fan-out, and a wipe is one clear
 error up front rather than nineteen confusing ones inside. Convenience for
 people, strictness for the suite.
 
-`std-check` resolves `refs/caos/std` and confirms every digest it names is
+`std-check` resolves `refs/caos/seed` and confirms every digest it names is
 still in the registry — **through the same name the engine will pull with**,
 and it reports which name it checked. A check that passes over one name while
 `docker pull` fails over another is precisely the confusing failure this
@@ -357,7 +357,7 @@ tags. What is unresolved is whether the delta emit belongs in
    `registry:2`. The biggest single step, and the one that pays off even if
    nothing after it lands.
 4. **`std-build` / `std-check`** — DONE. The publish is a function `up` calls
-   and `std-build` exposes alone; `std-check` walks `refs/caos/std`, reads each
+   and `std-build` exposes alone; `std-check` walks `refs/caos/seed`, reads each
    delta entry's `base` digest and confirms the registry still has it, naming
    which of the registry's two names it checked. `up` publishes rather than
    checking (a person should get a working stack, not homework), so
