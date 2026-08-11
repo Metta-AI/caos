@@ -13,132 +13,141 @@
 //! its `DEPS` is replaced by a `DEEP-DEPS/` subtree whose children are the named
 //! dependencies, each ITSELF deepened.
 //!
-//! It recurses through `map_then`, with this same image on both sides:
-//!   * `node` lists a directory, resolves its `DEPS` (relative paths against the
-//!     WHOLE tree, curried in as `--tree`), and maps `node` over both its
-//!     sub-directories and its dependency targets, finishing with `assemble`;
-//!   * `assemble` rebuilds the directory from its own files (`--own`) plus the
-//!     deepened children (`--children`), placing each by the key it was mapped
-//!     under: a sub-directory back at its name, a dependency under `DEEP-DEPS`.
+//! ONE RUN, one pass. This used to recurse through `map_then` with this same
+//! image on both sides — a `node` job per directory to enumerate it, an
+//! `assemble` job per directory to rebuild it — so a tree of N directories cost
+//! ~2N containers.
 //!
-//! Every child is addressed by its ABSOLUTE path from the tree root, so a
-//! dependency reached from two places is one node — one memoized computation,
-//! shared by hash. `assemble` is keyed only on a directory's own files and its
-//! deepened subgraph, so real recompute is O(changed directory + its
-//! dependents); `node` carries the whole tree and re-runs on any edit, but it is
-//! pure orchestration. A dependency cycle re-enters the same `node` request and
-//! is caught by the server's run-cycle detection.
+//! The split bought narrow cache keys for `assemble` (a directory's own files
+//! plus its deepened subgraph, so recompute was O(changed + dependents)) — but
+//! it never delivered them, because `node` is keyed on the WHOLE TREE and so
+//! re-ran for every directory on any edit. The tree changes on every edit that
+//! matters, so the common case paid ~N container spawns of pure orchestration to
+//! reach a cache that the same edit had already invalidated.
+//!
+//! Deepening is tree rewriting: no compiling, no network, nothing but reading a
+//! materialized tree and staging symlinks. One worker doing all of it is far
+//! cheaper than N containers doing it in pieces, and it stays cheap until the
+//! tree is very large — at which point the answer is to make the ONE pass
+//! incremental, not to reintroduce a per-directory container.
+//!
+//! Sharing is by absolute path: a dependency reached from two places is deepened
+//! once and staged twice (as symlinks, so no bytes move), and `caos put` gives
+//! the identical subtree one hash. That is what makes bootstrap's hand-deepen
+//! (`build-builtins.sh`) reproducible — it must match this byte for byte, or the
+//! seeded keys stop matching the keys resolution forms.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use worker_common::{
-    arg, caos, caos_curry, entries, file_name, link, map_then, own_image, path, read_arg_opt,
-    run_worker, scratch, Arg,
-};
+use worker_common::{arg, caos, entries, file_name, link, path, run_worker, scratch};
 
 fn main() -> ExitCode {
     run_worker("deep-deps", run)
 }
 
 fn run() -> Result<(), String> {
-    // `--mode` is absent for the public call (deepen the whole `--in` tree). The
-    // internal `node`/`assemble` modes are reached only by curry in the
-    // recursion, never passed by a caller.
-    match read_arg_opt("mode")?.as_deref() {
-        None | Some("") => node_dir(&arg("in"), ""),
-        Some("node") => {
-            // `--in` is a blob naming the absolute path (from the tree root) of
-            // the directory to deepen; the whole tree rides curried as `--tree`.
-            let rel = read_blob(&arg("in"))?;
-            node_dir(&arg("tree"), &rel)
-        }
-        Some("assemble") => assemble(),
-        Some(other) => Err(format!("unknown mode {other:?}")),
-    }
+    let input = arg("in");
+    // The whole tree, in full: this pass reads every directory, and one
+    // recursive fetch is one round trip instead of one per directory.
+    caos(["get", "-r", &input])?;
+
+    let staged = scratch("out")?;
+    let mut memo: HashMap<String, PathBuf> = HashMap::new();
+    deepen(&input, "", &staged, &mut memo, &mut Vec::new())?;
+    caos(["put", path(&staged), "/cas/out"])
 }
 
-/// Deepen the directory at `rel` within the tree rooted at CAS path `base`:
-/// stage its own files (minus `DEPS`), enumerate the children to recurse on —
-/// its sub-directories (mounted back at their names) and its `DEPS` targets
-/// (mounted under `DEEP-DEPS`) — then map `node` over them and `assemble` the
-/// result. Sharing is by absolute path, so a target reached twice is one node.
-fn node_dir(base: &str, rel: &str) -> Result<(), String> {
-    let dir = fetch_dir(base, rel)?;
+/// Deepen the directory at `rel` within the materialized tree at `base`, staging
+/// the result at `into`: its own files (minus `DEPS`), its sub-directories
+/// deepened in place, and its `DEPS` targets deepened under `DEEP-DEPS/`.
+///
+/// `memo` maps an absolute tree path to a staged directory already deepened, so
+/// a dependency reached twice is computed once. `visiting` is the current
+/// dependency chain, which is what catches a cycle: the recursion used to
+/// re-enter the same `node` request and rely on the server's run-cycle
+/// detection, and a single pass has no server round trip to be caught by.
+fn deepen(
+    base: &str,
+    rel: &str,
+    into: &Path,
+    memo: &mut HashMap<String, PathBuf>,
+    visiting: &mut Vec<String>,
+) -> Result<(), String> {
+    let dir = if rel.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{rel}")
+    };
 
-    let own = scratch("own")?;
-    let work = scratch("work")?;
     let mut deps_file: Option<PathBuf> = None;
+    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
     for entry in entries(&dir)? {
         let name = file_name(&entry);
         let meta =
             fs::symlink_metadata(&entry).map_err(|e| format!("stat {}: {e}", entry.display()))?;
         if meta.is_dir() {
-            // A sub-directory: recurse on it, mount the result back at its name.
-            let child = join(rel, &name);
-            write_blob(&work.join(format!("n_{name}")), &child)?;
+            subdirs.push((name, entry));
         } else if name == "DEPS" {
             deps_file = Some(entry); // replaced by DEEP-DEPS, never an own file
         } else {
-            link(&entry, own.join(&name))?; // a plain file, kept as-is
+            link(&entry, into.join(&name))?; // a plain file, kept as-is
         }
     }
 
-    if let Some(deps) = deps_file {
-        for (dep_path, mount) in parse_deps(&deps)? {
-            let target = normalize(&join(rel, &dep_path))?;
-            let key = format!("d_{mount}");
-            if work.join(&key).exists() {
-                return Err(format!(
-                    "directory {rel:?} declares two deps mounted as {mount:?}"
-                ));
-            }
-            write_blob(&work.join(&key), &target)?;
+    // Sub-directories stay at their own names.
+    for (name, _) in &subdirs {
+        let child = into.join(name);
+        fs::create_dir_all(&child).map_err(|e| format!("creating {}: {e}", child.display()))?;
+        deepen(base, &join(rel, name), &child, memo, visiting)?;
+    }
+
+    let Some(deps) = deps_file else {
+        return Ok(());
+    };
+    let parsed = parse_deps(&deps)?;
+    if parsed.is_empty() {
+        // A DEPS of nothing but comments drops the file and adds NO `DEEP-DEPS`.
+        // Creating an empty one would be a real (empty-tree) entry in the output
+        // and would diverge from bootstrap's hand-deepen.
+        return Ok(());
+    }
+    let dd = into.join("DEEP-DEPS");
+    fs::create_dir_all(&dd).map_err(|e| format!("creating {}: {e}", dd.display()))?;
+    for (dep_path, mount) in parsed {
+        let target = normalize(&join(rel, &dep_path))?;
+        let at = dd.join(&mount);
+        if at.exists() {
+            return Err(format!(
+                "directory {rel:?} declares two deps mounted as {mount:?}"
+            ));
         }
-    }
-
-    caos(["put", path(&own), "/cas/own"])?;
-    caos(["put", path(&work), "/cas/work"])?;
-    map_then(
-        "/cas/work",
-        Some(&node_image(base)?),
-        Some(&assemble_image()?),
-    )
-}
-
-/// Rebuild a directory: its own files (`--own`) plus the deepened `--children`,
-/// each placed by the key it was mapped under — `n_<name>` back at `<name>`,
-/// `d_<name>` under `DEEP-DEPS/<name>`. Curried with only `--own`, so its cache
-/// key is just this directory's own files and its deepened subgraph.
-fn assemble() -> Result<(), String> {
-    let node = scratch("node")?;
-
-    let own = arg("own");
-    caos(["get", &own])?; // one level: the directory's own files
-    for entry in entries(&own)? {
-        link(&entry, node.join(file_name(&entry)))?;
-    }
-
-    let children = arg("children");
-    caos(["get", &children])?; // one level: a deepened node per key
-    let mut deep_deps: Option<PathBuf> = None;
-    for entry in entries(&children)? {
-        let key = file_name(&entry);
-        if let Some(name) = key.strip_prefix("n_") {
-            link(&entry, node.join(name))?;
-        } else if let Some(name) = key.strip_prefix("d_") {
-            let dd = deep_deps
-                .get_or_insert_with(|| node.join("DEEP-DEPS"))
-                .clone();
-            fs::create_dir_all(&dd).map_err(|e| format!("creating {}: {e}", dd.display()))?;
-            link(&entry, dd.join(name))?;
-        } else {
-            return Err(format!("unexpected child key {key:?}"));
+        // Already deepened somewhere else: re-stage that result rather than
+        // walking it again. NOT a symlink to it — `caos put` resolves a symlink
+        // into /cas to its recorded hash, but one pointing at a staging
+        // directory is recorded AS A SYMLINK, which would put a link where the
+        // subtree belongs. Copying the staged structure (all symlinks, so no
+        // content moves) yields the identical tree, and identical trees are one
+        // object.
+        if let Some(done) = memo.get(&target) {
+            copy_staged(&done.clone(), &at)?;
+            continue;
         }
+        if visiting.contains(&target) {
+            return Err(format!(
+                "dependency cycle: {} -> {target:?}",
+                visiting.join(" -> ")
+            ));
+        }
+        visiting.push(target.clone());
+        fs::create_dir_all(&at).map_err(|e| format!("creating {}: {e}", at.display()))?;
+        deepen(base, &target, &at, memo, visiting)?;
+        visiting.pop();
+        memo.insert(target, at);
     }
-
-    caos(["put", path(&node), "/cas/out"])
+    Ok(())
 }
 
 // ---- helpers -------------------------------------------------------------------
@@ -146,7 +155,6 @@ fn assemble() -> Result<(), String> {
 /// The `(path, name)` pairs in a `DEPS` file: one per non-empty, non-`#` line,
 /// each two whitespace-separated fields.
 fn parse_deps(deps: &Path) -> Result<Vec<(String, String)>, String> {
-    caos(["get", path(deps)])?; // expand the blob so it's readable
     let text = fs::read_to_string(deps).map_err(|e| format!("reading DEPS: {e}"))?;
     let mut out = Vec::new();
     for line in text.lines() {
@@ -164,64 +172,6 @@ fn parse_deps(deps: &Path) -> Result<Vec<(String, String)>, String> {
         out.push((dep_path.to_string(), name.to_string()));
     }
     Ok(out)
-}
-
-/// Materialize (one level each) the directory at `rel` within the tree rooted at
-/// `base`, walking from the root so every ancestor is fetched, and return its
-/// CAS path. `rel` is empty for the tree root itself.
-fn fetch_dir(base: &str, rel: &str) -> Result<String, String> {
-    let mut cur = base.to_string();
-    caos(["get", &cur])?;
-    for comp in rel.split('/').filter(|c| !c.is_empty()) {
-        cur = format!("{cur}/{comp}");
-        caos(["get", &cur])?;
-    }
-    Ok(cur)
-}
-
-/// The recursion's `map` image: this image, in `node` mode, carrying the whole
-/// tree so a child's own relative deps resolve against it. Its `--in` is each
-/// child's absolute-path blob.
-fn node_image(base: &str) -> Result<String, String> {
-    let mut kvs: Vec<(&str, Arg)> = vec![("mode", Arg::Lit("node")), ("tree", Arg::Path(base))];
-    rebind_worker1(&mut kvs);
-    caos_curry(&own_image(), &kvs)
-}
-
-/// The recursion's `then` image: this image in `assemble` mode, carrying only
-/// this directory's own files (`--own`) — so it keys narrowly.
-fn assemble_image() -> Result<String, String> {
-    let mut kvs: Vec<(&str, Arg)> = vec![
-        ("mode", Arg::Lit("assemble")),
-        ("own", Arg::Path("/cas/own")),
-    ];
-    rebind_worker1(&mut kvs);
-    caos_curry(&own_image(), &kvs)
-}
-
-/// Rebind the runner-pool `worker1` binary (when present) so the recursion
-/// re-execs this binary. A no-op for a baked image (see the fixture rgrep).
-fn rebind_worker1<'a>(kvs: &mut Vec<(&'a str, Arg<'a>)>) {
-    if Path::new(WORKER1).exists() {
-        kvs.push(("worker1", Arg::Path(WORKER1)));
-    }
-}
-
-/// The runner-pool binary's CAS path (`/cas/args/worker1`).
-const WORKER1: &str = "/cas/args/worker1";
-
-/// Read a CAS blob's trimmed contents (expanding the placeholder first).
-fn read_blob(cas_path: &str) -> Result<String, String> {
-    caos(["get", cas_path])?;
-    Ok(fs::read_to_string(cas_path)
-        .map_err(|e| format!("reading {cas_path}: {e}"))?
-        .trim()
-        .to_string())
-}
-
-/// Write `content` as a file at `at` (a work-tree entry).
-fn write_blob(at: &Path, content: &str) -> Result<(), String> {
-    fs::write(at, content).map_err(|e| format!("writing {}: {e}", at.display()))
 }
 
 /// Join a tree-relative directory `rel` with a further `comp` (a name or a
@@ -250,4 +200,27 @@ fn normalize(p: &str) -> Result<String, String> {
         }
     }
     Ok(stack.join("/"))
+}
+
+/// Recreate a staged directory at `to`: directories are made, symlinks are
+/// remade with the same target. Everything a staged tree holds is one or the
+/// other (a plain file is staged as a symlink into `/cas`), so this reproduces
+/// it exactly while moving no content.
+fn copy_staged(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| format!("creating {}: {e}", to.display()))?;
+    for entry in entries(path(from))? {
+        let name = file_name(&entry);
+        let meta =
+            fs::symlink_metadata(&entry).map_err(|e| format!("stat {}: {e}", entry.display()))?;
+        if meta.is_symlink() {
+            let target =
+                fs::read_link(&entry).map_err(|e| format!("readlink {}: {e}", entry.display()))?;
+            link(&target, to.join(&name))?;
+        } else if meta.is_dir() {
+            copy_staged(&entry, &to.join(&name))?;
+        } else {
+            return Err(format!("unexpected staged entry {}", entry.display()));
+        }
+    }
+    Ok(())
 }

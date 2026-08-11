@@ -81,17 +81,18 @@ diff -r outA/app outC/app >/dev/null && fail "app should change when bar changes
   || fail "foo's shared bar not updated"
 echo "  ok: every node reaching bar recomputed" >&2
 
-echo "== a dependency cycle is detected (by the server) ==" >&2
-# Close a loop: lib/bar -> app, so app -> bar -> app. The recursion re-enters
-# the same node request and the server's run-cycle detection catches it.
+echo "== a dependency cycle is detected (by the worker) ==" >&2
+# Close a loop: lib/bar -> app, so app -> bar -> app. The deepen is ONE pass in
+# one worker, so it tracks the chain itself and NAMES it. It used to recurse
+# through map_then and be caught by the SERVER's run-cycle detection instead.
 printf '../../app loop\n' > tree/lib/bar/DEPS
 commit "cycle"
 if deepen tree outD 2>cyc.err; then
   fail "expected the cyclic graph to fail, but the run succeeded"
 fi
-grep -q "run cycle detected" cyc.err || fail "no cycle reported; got: $(cat cyc.err)"
+grep -q "dependency cycle" cyc.err || fail "no cycle reported; got: $(cat cyc.err)"
 rm -f tree/lib/bar/DEPS
-echo "  ok: run failed with a run-cycle error" >&2
+echo "  ok: run failed, naming the cycle" >&2
 
 echo "== through eval-path: a top-level .caos-expr invokes deep-deps ==" >&2
 # A `.caos-expr` at the tree root deepens the whole tree; eval-path then
