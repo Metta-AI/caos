@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, caos_curry, cas_hash, path, read_commit, run_then, run_worker, scratch, std_image,
+    arg, caos, caos_curry, cas_hash, path, read_arg, read_commit, run_then, run_worker, scratch,
     write_commit, Arg,
 };
 
@@ -28,7 +28,9 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// First position: stage the tool's input, curry the tool (the bash builtin
+/// First position: stage the tool's input, curry the tool (the bash image,
+/// handed in as `--bash` — a worker cannot evaluate a `.caos-expr`, so the
+/// CALLER resolves it and binds the hash, exactly as rustc takes `--cargo`)
 /// bound to `--tool-script`) and ourselves, and tail-call run-then.
 fn start() -> Result<(), String> {
     let input = scratch("toolin")?.join("input");
@@ -36,7 +38,7 @@ fn start() -> Result<(), String> {
     caos(["put", path(&input), "/cas/toolin"])?;
 
     let tool = caos_curry(
-        &std_image("bash"),
+        &read_arg("bash")?,
         &[("worker1", Arg::Path(&arg("tool-script")))],
     )?;
     // A source-built worker is curry(runner, bin), unwrapped into args by the

@@ -30,7 +30,11 @@ head=$(git rev-parse HEAD)
 head_tree=$(git rev-parse 'HEAD^{tree}')
 
 echo "== HEAD as a :commit= arg -> worker -> child commit on stdout ==" >&2
+# --bash: the worker curries its tool onto the bash image, and a worker cannot
+# evaluate a `.caos-expr` — so we resolve it here and bind the hash.
+bash_img=$("$CAOS_CLI" curry DEEP-DEPS/bash --)
 "$CAOS_CLI" run "$worker" -- --head:commit=HEAD --tool-script:@=test/tool.sh \
+  --bash="$bash_img" \
   > child.commit
 grep -q "^tree $head_tree\$" child.commit \
   || fail "child commit does not snapshot HEAD's tree: $(cat child.commit)"

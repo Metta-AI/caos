@@ -16,7 +16,7 @@
 //! currying takes an ArgTree and args and returns a new ArgTree, and its in-code
 //! form is a curry node (`{base, args, .caos-curry}`). An image is just one arg
 //! (the reserved `image`), so the *simplest* ArgTree is a bare image — which is
-//! exactly what `own_image`/`std_image` hand you: image refs, the value under
+//! exactly what `own_image` hands you: an image ref, the value under
 //! that one arg. `caos curry` binds args onto such a ref to build a richer
 //! ArgTree; the `map`/`then`/`run` operands are ArgTree refs (a bare image, or a
 //! curry node carrying an image plus other args).
@@ -54,15 +54,6 @@ pub const MUSL_TARGET: &str = if cfg!(target_arch = "aarch64") {
 /// Absolute path of an argument under `/cas/args`.
 pub fn arg(name: &str) -> String {
     format!("{ARGS}/{name}")
-}
-
-/// A built-in's image ref: a path into the standard-library tree the server
-/// materialized at `/cas/std`. Pass the result to `caos map-then`/`caos curry`
-/// as the ArgTree to call or curry onto — a bare image is the simplest ArgTree,
-/// and `caos` resolves the recorded hash. The binding rides in `std` (and thus
-/// the cache key), not in env.
-pub fn std_image(name: &str) -> String {
-    format!("/cas/std/{name}")
 }
 
 /// This worker's *own* image ref — the request's reserved `image` args entry,

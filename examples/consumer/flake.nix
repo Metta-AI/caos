@@ -32,8 +32,8 @@
       #   git remote add caos http://localhost:9090
       # then build + run your own worker (see README.md; hello.rs here is
       # the whole worker):
-      #   caos-cli run "$(caos-cli curry /cas/std/rustc -- \
-      #     --runner:@=/cas/std/runner)" img -- --src:@=hello.rs
+      #   caos-cli run "$(caos-cli curry ./inputs/caos/std/rustc --)" img \
+      #     -- --src:@=hello.rs
       devShells.${system}.default = pkgs.mkShell {
         # One package, both commands (caos-cli + caosd) on PATH.
         packages = [ caosPkgs.caos-tools ];

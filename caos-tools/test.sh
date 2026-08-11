@@ -65,7 +65,7 @@ suite)
   done
   caos put /tmp/build-ws /cas/build-ws
 
-  build=$(caos curry /cas/std/bash -- \
+  build=$(caos curry /cas/args/image -- \
     "--worker1:@=/cas/args/in/caos-tools/build.sh") || fail "currying the build tool"
 
   # `stage3` reads the workspace as /cas/args/in: run-then hands its `then` the
@@ -84,7 +84,7 @@ suite)
   # to tests/lib/run-test.sh.
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
 
-  stage3=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the fan-out stage"
+  stage3=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the fan-out stage"
   caos run-then /cas/args/in -- --run="$build" --then="$stage3"
   ;;
 
@@ -152,7 +152,7 @@ stage3)
 
   # THE DEEP-DEPS IMAGE — resolved the way its own `.caos-expr` resolves it.
   #
-  # Two things stand in the way of just naming `/cas/std/deep-deps`, and both
+  # Two things stand in the way of just naming the entry as an image, and both
   # are load-bearing rules rather than accidents:
   #
   #   - A WORKER CANNOT EVALUATE. `resolve_run_image` reads a /cas path as the
@@ -173,7 +173,8 @@ stage3)
   # worker, no blocking run, no world crossing. If the sentinel ever changes,
   # this forms a key nothing answers and the job fails loudly on the pending
   # timeout; it cannot quietly deepen with the wrong thing.
-  caos get /cas/std/deep-deps
+  caos get /cas/args/in/std
+  caos get /cas/args/in/std/deep-deps
 
   # Each run ends a stage: a worker delegates its continuation instead of
   # blocking. So resolving the image ends THIS stage, `deepen` does the
@@ -188,8 +189,8 @@ stage3)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
-  deepen=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the deepen stage"
-  caos run-then /cas/std/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
+  deepen=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the deepen stage"
+  caos run-then /cas/args/in/std/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
   ;;
 
 deepen)
@@ -202,7 +203,7 @@ deepen)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
-  fanout=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the fan-out stage"
+  fanout=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the fan-out stage"
   caos run-then /cas/args/ws -- --run=/cas/args/result --then="$fanout"
   ;;
 
@@ -305,7 +306,7 @@ fanout)
     #     anything built by rustc still names `cargo`.
     #   - A NAME THE SERVER OR CLIENT LOOKS UP. Running a raw flake tree makes
     #     the server resolve `flake-builder` BY NAME, and `std_image("bash")`
-    #     builds a `/cas/std/bash` path — a nested mount does not satisfy
+    #     resolves `flake-builder` by name — a nested mount does not satisfy
     #     either, so both stay named even where an edge also supplies them.
     #
     # And grep the CLIENT too, not just the test: `caos-cli talk` resolves
@@ -376,7 +377,7 @@ fanout)
   #
   # A timestamp in args means the summariser never caches. That is the point: it
   # is one cheap container, and it only runs at all when this stage does.
-  then_img=$(caos curry /cas/std/bash -- \
+  then_img=$(caos curry /cas/args/image -- \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
     "--build-time:@=/cas/args/build/time" "--start-time=$(date +%s)") \
     || fail "currying the summarize stage"

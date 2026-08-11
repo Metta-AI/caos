@@ -3,11 +3,13 @@
 #@doc the BUILD ENVIRONMENT (#caosImage) from a REDUCED tree; this tool then
 #@doc compiles the live sources in it and assembles the stack image.
 #
-# THREE STAGES, one script, selected by a curried --stage (the std/flake-builder
+# FOUR STAGES, one script, selected by a curried --stage (the std/flake-builder
 # pattern).
 #
-#   reduce   (default) cut the tree down to what determines the ENVIRONMENT and
-#            hand THAT to the flake-builder
+#   reduce   (default) cut the tree down to what determines the ENVIRONMENT,
+#            then resolve the flake-builder image through its sentinel
+#   build-env run the flake-builder over the reduced tree to get the BUILD
+#            ENVIRONMENT image
 #   launch   the builder image's ref is only knowable once the flake-builder has
 #            run, so currying the compile onto it needs its own stage
 #   make     runs IN the builder image: compile the passed-in source, construct
@@ -109,13 +111,38 @@ reduce)
   done
   caos put "$S" /cas/src
 
-  # The build source rides into `launch` as a curried arg so `make` can reach
-  # it: run-then passes only --in (here, the reduced tree) and --result.
-  launch=$(caos curry /cas/std/bash -- \
-    "--worker1:@=/cas/args/worker1" --stage=launch "--src:@=/cas/src") \
+  # THE FLAKE-BUILDER IMAGE, resolved the way its own `.caos-expr` resolves it:
+  # `run docker://seeded -- --in:@=.` IS a run-then over the entry with the
+  # sentinel as `--run`, which forms exactly the key the core-seeder-runner
+  # registered — so it answers with the pre-built image, no container.
+  #
+  # It used to name the entry through an ambient library, reaching outside
+  # library. A worker cannot evaluate a `.caos-expr` (that blocks on a run,
+  # which a worker may not do), and naming the entry directly hands the SERVER a
+  # raw flake tree to build — flake-builder building flake-builder. The entry we
+  # need is in the tree we were handed, at `in/std/flake-builder`, so nothing
+  # ambient is involved.
+  #
+  # Each run ends a stage, so resolving it ends this one; `build-env` runs it.
+  env=$(caos curry /cas/args/image -- \
+    "--worker1:@=/cas/args/worker1" --stage=build-env \
+    "--reduced:@=/cas/reduced" "--src:@=/cas/src") \
+    || fail "currying the build-env stage"
+
+  caos run-then /cas/args/in/std/flake-builder -- --run=docker://seeded --then="$env"
+  ;;
+
+build-env)
+  # --result is the FLAKE-BUILDER image. Run it over the reduced tree to get the
+  # BUILD ENVIRONMENT image, and hand that to `launch`. The build source rides
+  # through as a curried arg so `make` can reach it: run-then passes only --in
+  # and --result.
+  caos get /cas/args/result
+  launch=$(caos curry /cas/args/image -- \
+    "--worker1:@=/cas/args/worker1" --stage=launch "--src:@=/cas/args/src") \
     || fail "currying the launch stage"
 
-  caos run-then /cas/reduced -- --run=/cas/std/flake-builder --then="$launch"
+  caos run-then /cas/args/reduced -- --run=/cas/args/result --then="$launch"
   ;;
 
 launch)
