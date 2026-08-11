@@ -67,14 +67,9 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry the workers (merge-image + ref snapshot) and run the turn ==" >&2
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-bash_tool=$("$CAOS_CLI" curry DEEP-DEPS/bash-tool --)
-# The merge image as a RESOLVED hash: llm-step takes it as a literal string and
-# resolves it worker-side, where a `.caos-expr` cannot be evaluated — so the
-# caller, which can, resolves it here (design/caos-expr.md, the migration gotcha).
-merge_img=$("$CAOS_CLI" curry DEEP-DEPS/merge --)
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
-  --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
-  --merge-image="$merge_img" --merge-refs="feature $feature" \
+  --api-key=test-key --system:@=system.txt \
+  --merge-refs="feature $feature" \
   --model=test-model --base-url="http://$stub_host:$port")
 
 "$CAOS_CLI" run "$llm" -- --head:commit="$human" > turn.commit

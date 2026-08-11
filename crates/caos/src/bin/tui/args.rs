@@ -45,9 +45,6 @@ impl Args {
                 "--system-file" => parsed.turn.system_file = Some(value(&mut args, arg)?),
                 "--model" => parsed.turn.model = Some(value(&mut args, arg)?),
                 "--base-url" => parsed.turn.base_url = Some(value(&mut args, arg)?),
-                "--llm-step-bin" => parsed.turn.llm_step_bin = Some(value(&mut args, arg)?),
-                "--bash-tool-bin" => parsed.turn.bash_tool_bin = Some(value(&mut args, arg)?),
-                "--rgrep-bin" => parsed.turn.rgrep_bin = Some(value(&mut args, arg)?),
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }

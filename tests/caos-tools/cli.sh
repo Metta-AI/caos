@@ -110,11 +110,9 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 echo "== run the turn ==" >&2
 conv="ct-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-bash_tool=$("$CAOS_CLI" curry DEEP-DEPS/bash-tool --)
-tools_img=$("$CAOS_CLI" curry DEEP-DEPS/bash --)
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
-  --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
-  --tools-image="$tools_img" --model=test-model \
+  --api-key=test-key --system:@=system.txt \
+  --model=test-model \
   --base-url="http://$stub_host:$port" --conversation="$conv")
 "$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)

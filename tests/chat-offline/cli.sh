@@ -165,12 +165,12 @@ grep -qx "base" log.out && fail "--log printed the base commit"
 echo "  ok: both turns, no base" >&2
 
 echo "== talk (std worker curries): sticky pick continues $conv ==" >&2
-# No CAOS_*_BIN overrides: the workers must resolve from the published std
-# (refs/caos/std — build-builtins.sh publishes std/bash-tool and std/llm-step).
+# The workers resolve from std, which builds them from source. (The CAOS_*_BIN
+# overrides this used to unset are deleted — see chat.rs.)
 T3_TEXT="sticky turn reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T3_TEXT" > stub/response-4.json
-env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
-  "$CAOS_CLI" talk "still there?" "${opts[@]}" > talk1.out 2>talk1.err
+
+"$CAOS_CLI" talk "still there?" "${opts[@]}" > talk1.out 2>talk1.err
 sed 's/^/  talk1| /' talk1.out >&2
 grep -qF "[conversation $conv]" talk1.err \
   || fail "talk did not announce the sticky conversation: $(cat talk1.err)"
@@ -187,8 +187,8 @@ echo "  ok: std workers, sticky conversation continued and advanced" >&2
 echo "== talk --new starts an auto-named conversation ==" >&2
 T4_TEXT="fresh conversation reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T4_TEXT" > stub/response-5.json
-env -u CAOS_LLM_STEP_BIN -u CAOS_BASH_TOOL_BIN -u CAOS_RGREP_BIN \
-  "$CAOS_CLI" talk --new "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
+
+"$CAOS_CLI" talk --new "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
 sed 's/^/  talk2| /' talk2.out >&2
 grep -qF "[conversation talk-1 — new]" talk2.err \
   || fail "talk --new did not announce a new talk-1: $(cat talk2.err)"

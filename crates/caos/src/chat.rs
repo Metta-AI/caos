@@ -18,9 +18,7 @@
 //! The workers run as `curry(runner, bin=<static binary>)` on the shared
 //! runner pool. By default both come ready-made from the published library
 //! (`/cas/std/bash-tool`, `/cas/std/llm-step` — see build-builtins.sh), so
-//! there is nothing to build or commit locally; `--llm-step-bin` /
-//! `--bash-tool-bin` (or the env vars) override with a local, git-tracked
-//! binary — the stub tests' path.
+//! there is nothing to build or commit locally.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};
@@ -67,29 +65,14 @@ const RESERVED_CHANNELS: [&str; 4] = [
 /// in shell history and process listings).
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
-/// Env fallbacks for the worker-binary paths.
-const LLM_STEP_BIN_ENV: &str = "CAOS_LLM_STEP_BIN";
-const BASH_TOOL_BIN_ENV: &str = "CAOS_BASH_TOOL_BIN";
-const RGREP_BIN_ENV: &str = "CAOS_RGREP_BIN";
-
-/// The std builtin the worker binaries run under (`curry(runner, bin=...)`),
-/// used when a `--*-bin` override supplies the binary.
-const RUNNER_IMAGE: &str = "/cas/std/runner";
-
 /// The std-published, ready-to-run worker curries (build-builtins.sh) — the
 /// defaults when no `--*-bin` override is given.
-const BASH_TOOL_IMAGE: &str = "/cas/std/bash-tool";
 const LLM_CALL_IMAGE: &str = "/cas/std/llm-call";
 const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
-const RGREP_IMAGE: &str = "/cas/std/rgrep";
 /// The script-worker image TREE TOOLS run on (the workspace's caos-tools/*.sh,
 /// discovered per round, resolved at invocation time — design/cargo-workers.md).
 /// Optional: a stack whose std predates it just doesn't register tree tools.
 const TOOLS_IMAGE: &str = "/cas/std/bash";
-
-/// The git-bearing merge worker (SPEC "Merging and conflict resolution").
-/// Optional: a stack whose std predates it just doesn't offer the merge tool.
-const MERGE_IMAGE: &str = "/cas/std/merge";
 
 /// Refs snapshotted to hashes at turn start so the `merge` tool can resolve
 /// `--theirs=<name>` (SPEC "Resolving `--theirs`"). Curated to the names a
@@ -121,9 +104,6 @@ pub struct TurnOptions {
     pub system_file: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
-    pub llm_step_bin: Option<String>,
-    pub bash_tool_bin: Option<String>,
-    pub rgrep_bin: Option<String>,
 }
 
 /// One project-defined tool available to the selected conversation.
@@ -343,16 +323,12 @@ struct ChatArgs {
     system_file: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
-    llm_step_bin: Option<String>,
-    bash_tool_bin: Option<String>,
-    rgrep_bin: Option<String>,
     log: bool,
 }
 
 fn usage(verb: Verb) -> String {
     let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
-         [--model <model>] [--base-url <url>] [--llm-step-bin <path>] \
-         [--bash-tool-bin <path>] [--rgrep-bin <path>] [--log]";
+         [--model <model>] [--base-url <url>] [--log]";
     match verb {
         Verb::Chat => format!(
             "usage: chat <name> [-m <message>] {common}\n\
@@ -381,9 +357,6 @@ impl ChatArgs {
             system_file: None,
             model: None,
             base_url: None,
-            llm_step_bin: None,
-            bash_tool_bin: None,
-            rgrep_bin: None,
             log: false,
         };
         let mut positional: Option<String> = None;
@@ -402,9 +375,6 @@ impl ChatArgs {
                 "--system-file" => a.system_file = Some(value(arg)?),
                 "--model" => a.model = Some(value(arg)?),
                 "--base-url" => a.base_url = Some(value(arg)?),
-                "--llm-step-bin" => a.llm_step_bin = Some(value(arg)?),
-                "--bash-tool-bin" => a.bash_tool_bin = Some(value(arg)?),
-                "--rgrep-bin" => a.rgrep_bin = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other}\n{}", usage(verb)))
@@ -445,9 +415,6 @@ impl ChatArgs {
             system_file: self.system_file.clone(),
             model: self.model.clone(),
             base_url: self.base_url.clone(),
-            llm_step_bin: self.llm_step_bin.clone(),
-            bash_tool_bin: self.bash_tool_bin.clone(),
-            rgrep_bin: self.rgrep_bin.clone(),
         }
     }
 }
@@ -1191,9 +1158,6 @@ fn turn(
     let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
         format!("{API_KEY_ENV} must be set (it rides, curried, into the llm-step run)")
     })?;
-    let llm_bin = worker_bin(options.llm_step_bin.as_deref(), LLM_STEP_BIN_ENV);
-    let bash_bin = worker_bin(options.bash_tool_bin.as_deref(), BASH_TOOL_BIN_ENV);
-    let rgrep_bin = worker_bin(options.rgrep_bin.as_deref(), RGREP_BIN_ENV);
     let system = match (&options.system, &options.system_file) {
         (Some(text), _) => text.clone(),
         (None, Some(path)) => {
@@ -1264,82 +1228,50 @@ fn turn(
         .trim()
         .to_string();
 
-    // The workers: by default the std-published curries (`curry(runner, bin)`,
-    // build-builtins.sh) — already server-side under refs/caos/std, nothing to
-    // build or push. An explicit `--*-bin` override (the stub tests' path)
-    // curries that binary onto the runner-pool image here instead; the bash
-    // curry's hash is passed to llm-step as a *literal* (an image ref string),
-    // so its closure doesn't ride in the request graph — push it (and the
-    // runner image) explicitly.
+    // The workers: resolved from std, which builds them from source on demand.
+    //
+    // There were `--llm-step-bin`/`--bash-tool-bin`/`--rgrep-bin` overrides
+    // (and `$CAOS_*_BIN`) that curried a locally-built binary onto the
+    // runner-pool image here instead. They are gone. Their documented purpose
+    // was "the stub tests' path", and the stub tests do not use them — they run
+    // llm-stub as a sidecar server and point `--base-url` at it, and
+    // tests/chat-offline went as far as UNSETTING the env vars so a developer's
+    // shell could not leak into the run. The workflow they existed for (skip a
+    // slow publish to try a local binary) is what a source std entry does by
+    // itself now: edit `std/llm-step/src`, and resolving it rebuilds it.
+    //
+    // Removing them also takes the last hard-coded runner-pool shape out of the
+    // client: nothing here needs to know that a tool is `curry(runner, bin)`.
     let phase = std::time::Instant::now();
-    let runner = match (&llm_bin, &bash_bin, &rgrep_bin) {
-        (None, None, None) => None,
-        _ => Some(resolve_cli_image(t, RUNNER_IMAGE)?),
-    };
-    let bash_image = match &bash_bin {
-        Some(bin) => {
-            let runner = runner.as_deref().expect("resolved when a bin is given");
-            let img =
-                curry_object(t, runner, None, &[], &[format!("--worker1:@={bin}")])?.to_string();
-            t.ensure_pushed(&img)?;
-            t.ensure_pushed(runner)?;
-            img
-        }
-        None => resolve_cli_image(t, BASH_TOOL_IMAGE)?,
-    };
+    // NO TOOL IMAGES HERE. `bash-image`, `grep-image`, `tools-image` and
+    // `merge-image` are llm-step's DEPENDENCIES, so llm-step declares them
+    // (std/llm-step/DEPS) and its own `.caos-expr` binds them — resolving
+    // llm-step yields a step that already knows its tools. A caller should say
+    // what the turn IS, not which shell the agent greps with.
 
-    let grep_image = match &rgrep_bin {
-        Some(bin) => {
-            let runner = runner.as_deref().expect("resolved when a bin is given");
-            let img =
-                curry_object(t, runner, None, &[], &[format!("--worker1:@={bin}")])?.to_string();
-            t.ensure_pushed(&img)?;
-            t.ensure_pushed(runner)?;
-            img
-        }
-        None => resolve_cli_image(t, RGREP_IMAGE)?,
-    };
-
-    // Optional: a stack whose std predates the bash script worker simply
-    // doesn't register tree tools (llm-step treats a missing tools_image
-    // that way too).
-    let tools_image = resolve_cli_image(t, TOOLS_IMAGE).ok();
-
-    // The merge worker and the turn-start ref snapshot (SPEC "Resolving
-    // `--theirs`"): resolve a curated set of refs to hashes, push each closure
-    // (onto its content-addressed `refs/caos/req/<hash>`, so no semantic ref is
-    // written to the shared server), and carry a name→hash map into the turn.
+    // The turn-start ref snapshot (SPEC "Resolving `--theirs`"): resolve a
+    // curated set of refs to hashes, push each closure (onto its
+    // content-addressed `refs/caos/req/<hash>`, so no semantic ref is written to
+    // the shared server), and carry a name→hash map into the turn.
     // ensure_pushed negotiates, so an unmoved ref re-pushes nothing.
-    let merge_image = resolve_cli_image(t, MERGE_IMAGE).ok();
-    let merge_refs = match &merge_image {
-        None => None,
-        Some(_) => {
-            let mut lines = String::new();
-            for spec in MERGE_REF_CANDIDATES {
-                if let Some(hash) = rev_parse_opt(t, spec)? {
-                    t.ensure_pushed(&hash)?;
-                    lines.push_str(&format!("{spec} {hash}\n"));
-                }
+    let merge_refs = {
+        let mut lines = String::new();
+        for spec in MERGE_REF_CANDIDATES {
+            if let Some(hash) = rev_parse_opt(t, spec)? {
+                t.ensure_pushed(&hash)?;
+                lines.push_str(&format!("{spec} {hash}\n"));
             }
-            Some(lines)
         }
+        lines
     };
 
     let mut kvs = vec![
         format!("--api-key={api_key}"),
         format!("--system={system}"),
-        format!("--bash-image={bash_image}"),
-        format!("--grep-image={grep_image}"),
         format!("--conversation={name}"),
     ];
-    if let Some(tools) = &tools_image {
-        kvs.push(format!("--tools-image={tools}"));
-    }
-    if let Some(merge) = &merge_image {
-        kvs.push(format!("--merge-image={merge}"));
-    }
-    if let Some(refs) = &merge_refs {
-        kvs.push(format!("--merge-refs={refs}"));
+    if !merge_refs.is_empty() {
+        kvs.push(format!("--merge-refs={merge_refs}"));
     }
     if let Some(model) = &options.model {
         kvs.push(format!("--model={model}"));
@@ -1348,15 +1280,8 @@ fn turn(
         kvs.push(format!("--base-url={url}"));
     }
     // Per-turn state currying: onto the std llm-step curry (layers flatten, so
-    // the result is exactly curry(runner, bin, <state>)), or onto the runner
-    // with the override binary.
-    let llm_base = match &llm_bin {
-        Some(bin) => {
-            kvs.push(format!("--worker1:@={bin}"));
-            runner.clone().expect("resolved when a bin is given")
-        }
-        None => resolve_cli_image(t, LLM_STEP_IMAGE)?,
-    };
+    // the result is exactly curry(runner, bin, <state>)).
+    let llm_base = resolve_cli_image(t, LLM_STEP_IMAGE)?;
     let llm = curry_object(t, &llm_base, None, &[], &kvs)?.to_string();
     emit(TurnEvent::PhaseComplete {
         label: "resolving the workers".to_string(),
@@ -1465,14 +1390,6 @@ fn turn(
     };
     emit(TurnEvent::Completed(outcome.clone()));
     Ok(outcome)
-}
-
-/// An explicit worker-binary override: the flag, else its env var, else `None`
-/// — the std-published curry is used.
-fn worker_bin(flag_value: Option<&str>, env: &str) -> Option<String> {
-    flag_value
-        .map(str::to_string)
-        .or_else(|| std::env::var(env).ok())
 }
 
 /// The turn's message: the given one, or stdin read to EOF.

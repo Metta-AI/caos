@@ -84,15 +84,28 @@ struct Config {
     conversation: Option<String>,
 }
 
+/// A tool image bound by this entry's own `.caos-expr`. `--k=$VAR` in an
+/// expression binds the object BY REFERENCE, so the arg materializes as a tree
+/// (or a curry node) at `/cas/args/<name>` — its ref is the recorded hash, not
+/// the file contents. Absent = the entry did not bind it.
+fn image_arg(name: &str) -> Result<Option<String>, String> {
+    let p = arg(name);
+    if Path::new(&p).exists() {
+        cas_hash(&p).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 impl Config {
     fn read() -> Result<Config, String> {
         Ok(Config {
             api_key: read_arg("api-key")?,
             system: read_arg("system")?,
-            bash_image: read_arg("bash-image")?,
-            grep_image: read_arg_opt("grep-image")?,
-            tools_image: read_arg_opt("tools-image")?,
-            merge_image: read_arg_opt("merge-image")?,
+            bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
+            grep_image: image_arg("grep-image")?,
+            tools_image: image_arg("tools-image")?,
+            merge_image: image_arg("merge-image")?,
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
