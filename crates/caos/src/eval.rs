@@ -33,8 +33,6 @@
 //! - `--k=value` — a literal blob, unless `value` is exactly `$NAME`, which
 //!   binds the object that variable holds (by reference, at its own kind).
 //! - `--k:@=path` — the object at `path` within the input subtree.
-//! - `/std/<name>` (image position or a `:@=` value) — the published builtin,
-//!   resolved as elsewhere ("interpreted as normal for now").
 
 use std::collections::HashMap;
 
@@ -42,8 +40,32 @@ use gix::objs::tree::{Entry, EntryKind, EntryMode};
 
 use super::{
     assemble_arg_tree, curry_from_entries, entry_name, fetch_tree_entries, is_hex_hash, parse_oid,
-    post_object, request_compute, resolve_std_image, Transport,
+    post_object, request_compute, Transport,
 };
+
+/// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
+/// tree and descend to `DEEP-DEPS/<name>`.
+///
+/// This is how a client reaches a tool without an ambient library. The workspace
+/// declares what it needs in a `DEPS` file (`./std/llm-step llm-step` here,
+/// `./flake-inputs/caos/std/llm-step llm-step` in a repo that mounted caos), the
+/// root `.caos-expr` expands that into `DEEP-DEPS/`, and this descends it — the
+/// same declaration, the same transform and the same mount names a worker sees.
+///
+/// Evaluating is not optional. A std entry's expression names its own
+/// dependencies by mount (`run DEEP-DEPS/rustc -- …`), and those exist only in
+/// the DEEPENED tree — so resolving the raw `std/llm-step` directory out of the
+/// worktree cannot work, whatever the path is spelled.
+pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String, String> {
+    let (_, oid) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+    eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"))
+        .map(|(_kind, hash)| hash)
+        .map_err(|e| {
+            format!("resolving {name:?} from the workspace: {e}\n  declare it in ./DEPS, e.g. `./std/{name} {name}`")
+        })
+}
 
 /// Evaluate a tree's own root `.caos-expr` to the object it builds; a tree
 /// carrying none evaluates to itself.
@@ -54,21 +76,6 @@ use super::{
 /// instead of by an ambient `/cas/std/<name>`.
 pub(crate) fn eval_tree(t: &dyn Transport, tree: &str) -> Result<String, String> {
     eval_path(t, tree, "").map(|(_kind, oid)| oid)
-}
-
-/// Evaluate a std library entry named `<name>` within the std tree `std_tree`
-/// (design/caos-expr.md, Phase 3). This is just [`eval_path`] with the entry
-/// name as the path: a std-root `.caos-expr` is applied to the whole tree first
-/// (e.g. a `deep-deps` transform), then the named entry's own `.caos-expr` (if
-/// any) computes its image — so both the direct-image form and the
-/// source-plus-`.caos-expr` form resolve identically for every
-/// `/cas/std/<name>` consumer.
-pub(crate) fn eval_std_entry(
-    t: &dyn Transport,
-    std_tree: &str,
-    name: &str,
-) -> Result<String, String> {
-    eval_path(t, std_tree, name).map(|(_kind, oid)| oid)
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
@@ -268,9 +275,6 @@ fn resolve_expr_image(
             .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
         return Ok(oid.clone());
     }
-    if let Some(name) = tok.strip_prefix("/std/") {
-        return resolve_std_image(t, name);
-    }
     // A `docker://<ref>` image passes straight through — it names a registry
     // image, not a tree, so there is nothing to resolve. This is how a core
     // item breaks a resolution-time cycle: `flake-builder`'s `.caos-expr` names
@@ -366,10 +370,6 @@ fn resolve_expr_path(
     input_tree: &str,
     value: &str,
 ) -> Result<(EntryMode, gix::ObjectId), String> {
-    if let Some(name) = value.strip_prefix("/std/") {
-        let hash = resolve_std_image(t, name)?;
-        return Ok((EntryKind::Tree.into(), parse_oid(&hash)?));
-    }
     lookup_in_tree(t, input_tree, value)?
         .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))
 }

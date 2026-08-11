@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use super::{
     curry_object, entry_name, fetch_blob_string, fetch_tree_entries, prepare_request,
-    request_compute, resolve_cli_image, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
+    request_compute, GitTransport, HttpTransport, Transport, CAOS_REMOTE,
 };
 
 /// Author name on agent step/turn commits (see design/agent-harness.md): the
@@ -67,12 +67,12 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 /// The std-published, ready-to-run worker curries (build-builtins.sh) — the
 /// defaults when no `--*-bin` override is given.
-const LLM_CALL_IMAGE: &str = "/cas/std/llm-call";
-const LLM_STEP_IMAGE: &str = "/cas/std/llm-step";
 /// The script-worker image TREE TOOLS run on (the workspace's caos-tools/*.sh,
 /// discovered per round, resolved at invocation time — design/cargo-workers.md).
 /// Optional: a stack whose std predates it just doesn't register tree tools.
-const TOOLS_IMAGE: &str = "/cas/std/bash";
+/// The label a project tool shows in the tui. Display only — the image a tool
+/// actually runs on is resolved from the workspace's own `DEPS` declaration.
+const TOOLS_IMAGE: &str = "bash";
 
 /// Refs snapshotted to hashes at turn start so the `merge` tool can resolve
 /// `--theirs=<name>` (SPEC "Resolving `--theirs`"). Curated to the names a
@@ -1071,7 +1071,7 @@ pub fn generate_conversation_title(
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = resolve_cli_image(t, LLM_CALL_IMAGE)?;
+    let llm_base = crate::eval::eval_workspace_dep(t, "llm-call")?;
     let llm = curry_object(t, &llm_base, None, &[], &kvs)?.to_string();
     let messages = title_messages(first_message);
     let messages = serde_json::to_string(&messages)
@@ -1281,7 +1281,7 @@ fn turn(
     }
     // Per-turn state currying: onto the std llm-step curry (layers flatten, so
     // the result is exactly curry(runner, bin, <state>)).
-    let llm_base = resolve_cli_image(t, LLM_STEP_IMAGE)?;
+    let llm_base = crate::eval::eval_workspace_dep(t, "llm-step")?;
     let llm = curry_object(t, &llm_base, None, &[], &kvs)?.to_string();
     emit(TurnEvent::PhaseComplete {
         label: "resolving the workers".to_string(),

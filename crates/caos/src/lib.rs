@@ -88,7 +88,8 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // suite compiles the tree under test from source — so passing it only
     // coupled every tool invocation to a ref the stack may not even have.
     all.extend(kvs.iter().cloned());
-    let image = resolve_cli_image(t, "/cas/std/bash")?;
+    // The workspace declares the image its tool scripts run on (./DEPS: `bash`).
+    let image = eval::eval_workspace_dep(t, "bash")?;
     let (kind, result) = run_request(t, &image, None, None, &all)?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
@@ -150,18 +151,13 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
 /// hash, and this is how you then read the thing. Costs only the objects the
 /// working repo is missing.
 pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> {
-    // `/cas/std/<name>` is accepted here for the same reason `run` and `curry`
-    // accept it: it is THE vocabulary for naming a builtin, and resolving it is
-    // resolution, not running. It matters for an entry whose resolved value is
-    // DATA rather than an image — `std/llm-stub` evaluates to a cargo result
-    // tree, and what a caller wants from it is the produced file at `bin/`.
-    // A `/cas/std/<name>` builtin or an EVALUABLE DIRECTORY resolves first —
-    // resolving is not running, and it matters for an entry whose resolved value
-    // is DATA rather than an image (`std/llm-stub` evaluates to a cargo result
-    // tree, and what a caller wants from it is the produced file under `bin/`).
-    // Narrow on purpose: anything else is taken as the hash it looks like, so a
-    // mistyped hash cannot quietly become an ingest of a same-named directory.
-    let hash = &if hash.starts_with(&std_arg_prefix()) || Path::new(hash).is_dir() {
+    // An EVALUABLE DIRECTORY resolves first: resolving is not running, and it
+    // matters for an entry whose resolved value is DATA rather than an image —
+    // `std/llm-stub` evaluates to a cargo result tree, and what a caller wants
+    // from it is the produced file under `bin/`. Narrow on purpose: anything
+    // else is taken as the hash it looks like, so a mistyped hash cannot
+    // quietly become an ingest of a same-named directory.
+    let hash = &if Path::new(hash).is_dir() {
         resolve_cli_image(t, hash)?
     } else {
         hash.to_string()
@@ -190,16 +186,6 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
-
-/// The built-in tree hash (`std`) in effect for this run. The server sets it on
-/// each worker it spawns (materialized at `/cas/std`) and threads it into every
-/// promise sub-run, so it rides down the whole tree. At the top it's unset, and
-/// the ref named by [`STD_REF_ENV`] is resolved instead. `std` *is* part of the
-/// result cache key (it names the standard library a worker can reach).
-/// Ref resolved to `std` at the top of a run (overridable). Default
-/// `refs/caos/std`, read from the local repo.
-pub const STD_REF_ENV: &str = "CAOS_STD_REF";
-pub const DEFAULT_STD_REF: &str = "refs/caos/std";
 
 /// An opaque cache-busting value mixed into every run's ArgTree — and so into its
 /// arg-tree hash and cache key. Empty by default, so runs are cached purely by
@@ -834,14 +820,9 @@ impl GitTransport {
     }
 }
 
-/// Run `git` in the working repo and return its stdout; error on failure. With
-/// `index` set, `GIT_INDEX_FILE` points at a throwaway index (so `git add` /
-/// `write-tree` don't touch the real one). Used for both the network steps and
-/// the path-ingestion plumbing.
-fn git_capture(args: &[&str], index: Option<&Path>) -> Result<String, String> {
-    git_capture_in(args, index, Path::new("."))
-}
-
+/// Run `git` in `cwd` and return its stdout; error on failure. With `index` set,
+/// `GIT_INDEX_FILE` points at a throwaway index (so `git add` / `write-tree` do
+/// not touch the real one). The path-ingestion plumbing.
 fn git_capture_in(args: &[&str], index: Option<&Path>, cwd: &Path) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
     command.args(args).current_dir(cwd);
@@ -2054,15 +2035,6 @@ fn build_arg_entries(
                 }
                 cas_entry(&canon)?
             }
-            // `--name:@=/cas/std/<name>` off-worker — the CLI has no `/cas`, but
-            // a builtin ref is meaningful there too (e.g. currying the runner
-            // image into the rustc builder): resolve it against the published
-            // library, the same vocabulary the image argument uses.
-            ArgValue::Path(p) if cas.is_none() && p.starts_with(&std_arg_prefix()) => {
-                let name = &p[std_arg_prefix().len()..];
-                let hash = resolve_std_image(t, name)?;
-                (EntryKind::Tree.into(), parse_oid(&hash)?)
-            }
             // `--name:@=path` elsewhere — ingest a host path (git transport only;
             // the worker has no host filesystem, so it errors clearly).
             ArgValue::Path(p) => t.ingest_path(p)?.ok_or_else(|| {
@@ -2657,9 +2629,6 @@ fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// the same path directly against the published library, so one vocabulary works
 /// in both places.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    if let Some(name) = image.strip_prefix(&std_arg_prefix()) {
-        return resolve_std_image(t, name);
-    }
     // A directory is an image tree to ingest — notably a flake dir (flake.nix +
     // flake.lock), which the server builds into a real image via the
     // flake-builder (design/flake-images.md). Ingest it exactly like a
@@ -2679,60 +2648,6 @@ pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, Strin
         return eval::eval_tree(t, &oid.to_string());
     }
     Ok(image.to_string())
-}
-
-/// The path prefix that names a builtin off-worker (`/cas/std/`).
-fn std_arg_prefix() -> String {
-    format!("{DEFAULT_CAS_DIR}/std/")
-}
-
-/// Resolve a std builtin `<name>` to its git-docker image hash by looking it up in
-/// the published library (`refs/caos/std`).
-fn resolve_std_image(t: &dyn Transport, name: &str) -> Result<String, String> {
-    if name.is_empty() || name.contains('/') {
-        return Err(format!(
-            "a std image is {DEFAULT_CAS_DIR}/std/<name> (a single builtin name), got: {name:?}"
-        ));
-    }
-    let std = std_tree()?;
-    // Resolve `<name>` by walking the std tree from its root down to the entry
-    // with the SAME evaluator as `caos eval-path` (design/caos-expr.md): a
-    // std-root `.caos-expr` (e.g. a whole-tree `deep-deps` transform that mounts
-    // each entry's declared deps inside it) is applied first, then the named
-    // entry's own `.caos-expr` (if any) computes its image — expressions
-    // evaluated all the way down. An entry with no `.caos-expr` resolves to its
-    // tree unchanged (a git-docker delta, a flake tree, a curry node).
-    eval::eval_std_entry(t, &std, name)
-}
-
-/// The std library tree hash from the built-ins ref ([`STD_REF_ENV`], default
-/// `refs/caos/std`), fetched from the `caos` remote if it isn't in the local repo
-/// yet (the CLI may never have pulled it). This is the single resolution path for
-/// resolving a `/cas/std/<name>` builtin. (It no longer threads a `std` arg into
-/// a run — `std` is not an arg any more.)
-fn std_tree() -> Result<String, String> {
-    let refname = std::env::var(STD_REF_ENV).unwrap_or_else(|_| DEFAULT_STD_REF.to_string());
-    if let Ok(hash) = resolve_ref(&refname) {
-        return Ok(hash);
-    }
-    // Not local yet — read just the root hash from the remote's advertisement
-    // (`ls-remote` — no pack negotiation, works for any object type). We
-    // deliberately do NOT `git fetch` the tree: fetching a tree pulls its entire
-    // reachable closure — every builtin, including the ~1.5GB `rustc` image — to
-    // resolve a single name, which both wastes the network and OOM-kills the
-    // server buffering that pack. Resolution needs only the std *root* tree, which
-    // the HTTP transport fetches by hash on demand ([`fetch_tree_entries`]), and
-    // then only the chosen builtin's subtree — so a `bash` run never pulls
-    // `rustc`. We don't record the ref locally: `resolve_ref` peels by reading the
-    // object, so a ref pointing at an un-fetched tree would just fail back here.
-    let advertised = git_capture(&["ls-remote", CAOS_REMOTE, &refname], None)?;
-    let hash = advertised
-        .split_whitespace()
-        .next()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| format!("{refname} not found on the `{CAOS_REMOTE}` remote"))?
-        .to_string();
-    Ok(hash)
 }
 
 /// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — bind arguments

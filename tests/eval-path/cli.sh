@@ -16,6 +16,12 @@ set -euo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
+# The bash entry this test's DEPS declared, copied into each fixture. An image
+# named in a `.caos-expr` is a path WITHIN that subtree — the fixture cannot
+# reach out of itself — so a real package would mount it via DEPS and get
+# exactly this. There is no ambient `/std/<name>` to name instead.
+BASH=DEEP-DEPS/bash
+
 # A package whose `.caos-expr` builds its own directory: run the bash worker
 # over the package's files, producing a tree with a `greeting` file.
 mkdir -p pkg-direct
@@ -28,9 +34,10 @@ echo "hello $(cat /cas/args/name)" > /tmp/out/greeting
 caos put /tmp/out /cas/out
 EOF
 echo world > pkg-direct/name
+cp -r "$BASH" pkg-direct/bash
 cat > pkg-direct/.caos-expr <<'EOF'
 # build this directory by running the bash worker over its files
-run /std/bash -- --worker1:@=build.sh --name:@=name
+run bash -- --worker1:@=build.sh --name:@=name
 EOF
 
 # The same computation written with a bound variable: curry the worker in,
@@ -39,22 +46,24 @@ EOF
 mkdir -p pkg-var
 cp pkg-direct/build.sh pkg-var/build.sh
 cp pkg-direct/name pkg-var/name
+cp -r "$BASH" pkg-var/bash
 cat > pkg-var/.caos-expr <<'EOF'
-G=curry /std/bash -- --worker1:@=build.sh
+G=curry bash -- --worker1:@=build.sh
 run $G -- --name:@=name
 EOF
 
 # The same computation with the worker described by a SUBTREE referenced as the
 # image by PATH: `tool/` carries its own `.caos-expr` (a curry over bash), and
 # `run tool` resolves that path THROUGH the subtree's expression — the mechanism
-# a core item uses to name a dependency by a local `DEEP-DEPS/<name>` path
-# rather than `/std/<name>` (design/caos-expr.md). It must again produce the
+# a core item uses to name a dependency by a local `DEEP-DEPS/<name>` mount
+# (design/caos-expr.md). It must again produce the
 # byte-identical arg tree, hence the same result hash.
 mkdir -p pkg-nested/tool
 cp pkg-direct/build.sh pkg-nested/tool/build.sh
 cp pkg-direct/name pkg-nested/name
+cp -r "$BASH" pkg-nested/tool/bash
 cat > pkg-nested/tool/.caos-expr <<'EOF'
-curry /std/bash -- --worker1:@=build.sh
+curry bash -- --worker1:@=build.sh
 EOF
 cat > pkg-nested/.caos-expr <<'EOF'
 run tool -- --name:@=name

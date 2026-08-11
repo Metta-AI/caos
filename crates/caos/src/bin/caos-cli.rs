@@ -104,7 +104,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // `curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]` —
         // bind args to an ArgTree (a bare image, a curry node, or a flat args
         // tree), printing a ref to the curried ArgTree (run it like any other).
-        // Path args are host paths to ingest, or `/cas/std/<name>` builtin refs;
+        // Path args are host paths to ingest;
         // `--unbind` releases a bound arg so it can be rebound.
         Some("curry") => match &args[2..] {
             [arg_tree, rest @ ..] => caos::cli_curry(&transport()?, arg_tree, rest),

@@ -96,9 +96,12 @@ echo "  ok: run failed, naming the cycle" >&2
 
 echo "== through eval-path: a top-level .caos-expr invokes deep-deps ==" >&2
 # A `.caos-expr` at the tree root deepens the whole tree; eval-path then
-# descends into the deepened result.
+# descends into the deepened result. The worker is named by a path INSIDE the
+# tree (there is no ambient `/std/<name>`), so the entry this test declared is
+# copied in — which is what a DEPS mount would have produced.
 build_fixture evtree
-printf 'run /std/deep-deps -- --in:@=.\n' > evtree/.caos-expr
+cp -r DEEP-DEPS/deep-deps evtree/deep-deps
+printf 'run deep-deps -- --in:@=.\n' > evtree/.caos-expr
 commit "evtree with .caos-expr"
 out=$("$CAOS_CLI" eval-path evtree/app/DEEP-DEPS/foo) || fail "eval-path failed"
 kind=${out%% *}; hash=${out##* }
