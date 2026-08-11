@@ -183,8 +183,8 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  \
-         {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]\n  \
-         {prog} curry <arg tree | /cas/std/<name>> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
+         {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path ...]\n  \
+         {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
          {prog} tui [--new | --from <commit>] [options]\n  \
