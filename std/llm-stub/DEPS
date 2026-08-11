@@ -1,0 +1,4 @@
+# llm-stub's dependency (format `<path> <name>`, path relative to this dir): the
+# cargo worker that compiles it — a LOCAL dep (mounted at DEEP-DEPS/cargo by
+# deepening) rather than /std, so std has no ambient self-reference.
+../cargo cargo

@@ -16,16 +16,21 @@
 # full-suite cache hit means literally nothing changed; salt to force. The
 # result is {report, results/<test>/...}.
 #
-# THREE STAGES, one script, selected by a curried --stage (the
-# caos-tools/build.sh pattern).
+# FIVE STAGES, one script, selected by a curried --stage (the
+# caos-tools/build.sh pattern). Each stage exists because the thing it needs is
+# only knowable once the previous run finished — a worker delegates its
+# continuation rather than blocking on a run (design/map-then.md).
 #
 #   suite      (default) run-then THE BUILD TOOL (caos-tools/build.sh — the
 #              same job an agent's `build` call fires, sharing its cache),
 #              whose result is the TEST STACK IMAGE
-#   stage3     the image's ref is only knowable once the build has run, so
-#              fanning out over it needs its own stage: one job per
-#              tests/<name>/cli.sh, each running that image with the per-test
-#              runner (tests/lib/run-test.sh) as worker1
+#   stage3     assemble {std, every test's DEPS}, then resolve the
+#              deep-deps image by running its sentinel (a worker cannot eval)
+#   deepen     run that image over the assembled tree — the real transform
+#              delivers every test its deps (design/caos-expr.md)
+#   fanout     the `then` of that: --result is the deepened tree, so the
+#              per-test wrappers can be built — one job per tests/<name>/cli.sh,
+#              each running the image with tests/lib/run-test.sh as worker1
 #   summarize  the `then` of the fan-out — assemble the report
 #
 # Test = build + run tests, literally. There is no --bins: the tree under test
@@ -105,10 +110,9 @@ stage3)
   # binaries and images ride along, because they all ride in the one image.
   caos get /cas/args/result
   # One level further: the per-test subsets below symlink to individual entries,
-  # so `std` and `bin` must exist as placeholders for `caos put` to resolve them
+  # so `std` must exist as a placeholder for `caos put` to resolve entries
   # by recorded hash. Placeholders only — no content is fetched here.
   caos get /cas/args/result/std
-  caos get /cas/args/result/bin
   # The seed records (design/caos-expr.md, Phase 3), when the build carried them.
   # A whole-tree placeholder — every wrapper gets the same one, so the inner
   # core-seeder-runner answers flake-builder's `run docker://seeded`.
@@ -117,8 +121,113 @@ stage3)
   caos get /cas/args/in/tests
   caos get /cas/args/in/tests/lib
 
+  # ---- deliver each test its deps WITH deep-deps (design/caos-expr.md) ------
+  # `uses-std`/`uses-bin` were the hand-run prototype of this: per-test lists of
+  # "what I reach for", expanded by a symlink loop, with the TRANSITIVE half
+  # maintained by hand. That is exactly the deep-deps transform, so it is the
+  # transform's job now — each test carries a `DEPS` file and the real worker
+  # mounts its deps, recursively deepened and shared by hash.
+  #
+  # ONE transform for the whole suite, not one per test: the assembled tree
+  # below holds std and every test's DEPS, so a dep reached by two
+  # tests is one node computed once. What a test re-keys on is its own deepened
+  # subgraph — narrower than the old lists, because a std entry now brings its
+  # own deps (std/<e>/DEPS) instead of each test restating them.
+  #
+  # It is also the byte-identity guardrail the seeding needs: this is the REAL
+  # deep-deps worker deepening the same entries `build-builtins.sh` hand-deepens
+  # to form seed keys. If the two ever disagree, the seeded key stops matching
+  # the key resolution forms and the tests that resolve that entry go red.
+  #
+  # Symlinks throughout — `caos put` resolves a symlink into /cas to its
+  # recorded hash, so assembling this moves no bytes.
+  mkdir -p /tmp/dd/std /tmp/dd/tests
+  for e in /cas/args/result/std/*; do
+    ln -s "$e" "/tmp/dd/std/$(basename "$e")"
+  done
+  for d in /cas/args/in/tests/*/; do
+    t=$(basename "$d")
+    caos get "/cas/args/in/tests/$t"
+    if [ -e "$d/DEPS" ]; then
+      mkdir -p "/tmp/dd/tests/$t"
+      ln -s "/cas/args/in/tests/$t/DEPS" "/tmp/dd/tests/$t/DEPS"
+    fi
+  done
+  caos put /tmp/dd /cas/dd || fail "assembling the deep-deps input"
+
+  # THE DEEP-DEPS IMAGE — resolved the way its own `.caos-expr` resolves it.
+  #
+  # Two things stand in the way of just naming `/cas/std/deep-deps`, and both
+  # are load-bearing rules rather than accidents:
+  #
+  #   - A WORKER CANNOT EVALUATE. `resolve_run_image` reads a /cas path as the
+  #     object it was made from, so the sentinel entry arrives as its own
+  #     one-file tree ("image tree has no config.json"). Evaluation is a CLIENT
+  #     capability, and it must stay one: `eval_path` on a `run` BLOCKS on the
+  #     result, which is exactly what a worker may not do (design/map-then.md).
+  #   - THE WORLD MUST MATCH. The build's own seed record holds a ready-made
+  #     deep-deps image, but it is built from the TREE UNDER TEST — a `test`
+  #     world binary, which the outer `host` server refuses to serve (measured:
+  #     "caos world mismatch"). This stage runs in the host world, so it needs
+  #     the HOST's deep-deps.
+  #
+  # Both dissolve the same way: `run docker://seeded-deep-deps -- --in:@=.` IS
+  # `run-then` over the std entry with the sentinel as `--run`. That forms
+  # precisely the arg-tree key the entry's expression forms, so the host's own
+  # core-seeder-runner answers it with the host's image — no evaluator in the
+  # worker, no blocking run, no world crossing. If the sentinel ever changes,
+  # this forms a key nothing answers and the job fails loudly on the pending
+  # timeout; it cannot quietly deepen with the wrong thing.
+  caos get /cas/std/deep-deps
+
+  # Each run ends a stage: a worker delegates its continuation instead of
+  # blocking. So resolving the image ends THIS stage, `deepen` does the
+  # transform, and `fanout` builds the wrappers. Everything a later stage needs
+  # from here has to be curried through, because run-then passes only `--in`
+  # and `--result`: `dd` is the assembled tree, `build` what the build tool
+  # returned (image, std, seed, time) and `ws` the workspace — all named
+  # away from the reserved `in`/`result`.
+  fwd=("--worker1:@=/cas/args/worker1" --stage=deepen
+       "--dd:@=/cas/dd" "--build:@=/cas/args/result" "--ws:@=/cas/args/in"
+       "--build-ws:@=/cas/args/build-ws")
+  if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
+  if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
+  if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
+  deepen=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the deepen stage"
+  caos run-then /cas/std/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
+  ;;
+
+deepen)
+  # `--result` is the deep-deps IMAGE the sentinel resolved to. Run it over the
+  # assembled tree; `fanout` gets the deepened tree as its own `--result`.
+  caos get /cas/args/result
+  fwd=("--worker1:@=/cas/args/worker1" --stage=fanout
+       "--build:@=/cas/args/build" "--ws:@=/cas/args/ws"
+       "--build-ws:@=/cas/args/build-ws")
+  if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
+  if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
+  if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
+  fanout=$(caos curry /cas/std/bash -- "${fwd[@]}") || fail "currying the fan-out stage"
+  caos run-then /cas/args/dd -- --run=/cas/args/result --then="$fanout"
+  ;;
+
+fanout)
+  # The `then` of the deepening: `--result` is the DEEPENED tree, so each test's
+  # deps are at `/cas/args/result/tests/<name>/DEEP-DEPS/<mount>`. `--build` is
+  # the build tool's result and `--ws` the workspace (curried by stage3).
+  caos get /cas/args/build
+  if [ -e /cas/args/build/seed ]; then caos get /cas/args/build/seed; fi
+  caos get /cas/args/ws
+  caos get /cas/args/ws/tests
+  caos get /cas/args/ws/tests/lib
+  # Placeholders down to each test's mounts: `caos put` resolves a symlink into
+  # /cas by RECORDED HASH, but the path has to exist to be resolved. One level
+  # at a time — no mount content is fetched.
+  caos get /cas/args/result
+  caos get /cas/args/result/tests
+
   # The per-test map worker is curried HERE, where the image is a genuine
-  # --result tree. Passing the image itself as a curried arg to a later stage
+  # tree. Passing the image itself as a curried arg to a later stage
   # does not work: `caos curry /cas/args/<argname>` curries over the arg NODE,
   # so the resulting worker inherits this job's own bindings (observed: a map
   # job whose args were `image in worker1`, running as uid 1000 because the
@@ -129,8 +238,8 @@ stage3)
   # client aimed at the inner server, so it can neither fetch this file's args
   # nor reach the outer stack (test-stack/worker materializes its args before
   # flipping the env).
-  map=$(caos curry /cas/args/result/image -- \
-    "--worker1:@=/cas/args/in/tests/lib/run-test.sh") || fail "currying the per-test runner"
+  map=$(caos curry /cas/args/build/image -- \
+    "--worker1:@=/cas/args/ws/tests/lib/run-test.sh") || fail "currying the per-test runner"
 
   # The test selection: every tests/<name> with a cli.sh — or just the names in
   # --only (a filtered suite; its per-test jobs share their cache with full
@@ -154,85 +263,76 @@ stage3)
   fi
 
   mkdir /tmp/sel
-  for d in /cas/args/in/tests/*/; do
+  for d in /cas/args/ws/tests/*/; do
     t=$(basename "$d")
     if [ -n "$only" ]; then
       case "$only" in *" $t "*) ;; *) continue ;; esac
     fi
-    caos get "/cas/args/in/tests/$t"
-    [ -e "/cas/args/in/tests/$t/cli.sh" ] || continue
+    caos get "/cas/args/ws/tests/$t"
+    [ -e "/cas/args/ws/tests/$t/cli.sh" ] || continue
     mkdir -p "/tmp/sel/$t"
-    ln -s "/cas/args/in/tests/$t" "/tmp/sel/$t/test"
+    ln -s "/cas/args/ws/tests/$t" "/tmp/sel/$t/test"
     if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
     # The seed records ride into EVERY wrapper (unlike the per-test std subset):
     # they carry the flake-builder image the inner seeder answers with, and any
     # test that builds a flake reaches flake-builder transitively. A symlink put,
     # so nothing moves; test-stack/worker seeds refs/caos/seed from it.
-    if [ -e /cas/args/result/seed ]; then
-      ln -s /cas/args/result/seed "/tmp/sel/$t/seed"
+    if [ -e /cas/args/build/seed ]; then
+      ln -s /cas/args/build/seed "/tmp/sel/$t/seed"
     fi
 
-    # WHAT THIS TEST REACHES FOR, and nothing else. `uses-std` names the
-    # /cas/std entries its jobs resolve; `uses-bin` the binaries it copies out
-    # of CAOS_BIN_DIR to build its own curries. Each becomes a subtree of
-    # symlinks into the build result, so the wrapper carries those entries BY
-    # HASH — `caos put` resolves a symlink into /cas to its recorded hash, so
-    # not one byte moves here.
+    # WHAT THIS TEST REACHES FOR, and nothing else — read back off the test's
+    # own DEPS, which the transform above has already turned into a
+    # DEEP-DEPS/<name> mount per line. The wrapper still hands the inner stack
+    # `std`, which becomes the inner refs/caos/std, so all this does is place each
+    # so all that happens here is routing each mount to the one its DEPS path
+    # named. The CLOSURE is not computed here any more; deep-deps did it.
     #
-    # This is the whole mechanism. std used to be baked into the image, so any
-    # worker binary moved the image and re-keyed all twenty tests; now a test's
-    # key holds what it named. A std/rgrep source edit moves /cas/std/rgrep,
-    # which the tests that name it re-key — the rest are hits.
+    # The mounts are DEEPENED entries, which is what the inner stack should
+    # receive: a `DEEP-DEPS/<dep>` mount is how a consumer reaches a std item
+    # (design/caos-expr.md, the north star), and it is why these subsets carry
+    # no std-root `.caos-expr` — they are already the transform's output, and
+    # re-running it on them would only be an expensive identity.
     #
-    # Undeclared is UNAVAILABLE, deliberately: an unnamed std entry will not
-    # resolve and an unnamed binary will not copy. Both fail loudly inside the
-    # test, where a wrong declaration can only cost a red run, never a stale
-    # green one. It cost four rounds of red to get these lists right, and every
-    # one was the same rule:
+    # Undeclared is still UNAVAILABLE, deliberately, and the old rule still
+    # says what an edge cannot reach for you:
     #
     #   THE GIT CLOSURE COVERS TREE REFERENCES AND NOTHING ELSE.
     #
-    # Fetching a std entry brings its subtrees, so a curry's `args` ride along.
-    # Three things do NOT, and each has to be named explicitly:
+    # A std entry's own `DEPS` edges now ride along (that is the transform), so
+    # what a test must still name itself is only what is NOT a tree reference:
     #
-    #   - A CURRY'S BASE. `std/deep-deps/base` is a BLOB holding the base
-    #     image's hash, not a reference to it, so declaring `deep-deps` without
-    #     `runner` yields "object not found" on the runner tree.
-    #   - A HASH BOUND AS A LITERAL. `std/rustc` binds `--cargo=<hash>` the same
-    #     way, so rustc needs `cargo`. And a `.caos-expr` SOURCE entry names its
-    #     builders the same way: `std/rgrep` builds via `run /std/rustc` over
-    #     `/std/runner`, so a test resolving `rgrep` needs `rustc cargo runner`.
-    #   - A NAME THE SERVER LOOKS UP. `std/bash` is a flake tree, and running one
-    #     makes the server resolve `flake-builder` BY NAME — "std library has no
-    #     flake-builder".
+    #   - A CURRY'S BASE — a BLOB holding the base image's hash. `deep-deps`
+    #     resolves to a curry over the runner delta, so a test naming
+    #     `deep-deps` still names `runner`.
+    #   - A HASH BOUND AS A LITERAL. `rustc`'s seed result binds `--cargo=<hash>`
+    #     that way, and `rustc` is a sentinel entry with no DEPS of its own — so
+    #     anything built by rustc still names `cargo`.
+    #   - A NAME THE SERVER OR CLIENT LOOKS UP. Running a raw flake tree makes
+    #     the server resolve `flake-builder` BY NAME, and `std_image("bash")`
+    #     builds a `/cas/std/bash` path — a nested mount does not satisfy
+    #     either, so both stay named even where an edge also supplies them.
     #
     # And grep the CLIENT too, not just the test: `caos-cli talk` resolves
     # runner/bash-tool/llm-call/llm-step/rgrep/bash from constants in chat.rs,
     # and a Rust worker builds its path with `std_image("bash")`
     # (tests/commit) — neither shows up in a search for /cas/std in the test
     # directory.
-    mkdir -p "/tmp/sel/$t/std" "/tmp/sel/$t/bin"
-    # The std ROOT expression rides into EVERY subset. std is published
-    # un-deepened now (design/caos-expr.md), and `std/.caos-expr` —
-    # `run deep-deps -- --in:@=.` — is what deepens it on resolution, so a subset
-    # without it resolves nothing at all. Two consequences the `uses-std` lists
-    # above have to carry, and both are why every list names `deep-deps runner`:
-    #   - the transform deepens the WHOLE subset, so each list must be closed
-    #     under DEPS (an entry whose `../x` target is absent fails the deepen);
-    #   - the seeded deep-deps result is a curry over the runner delta, whose
-    #     base is a HASH BLOB — the runner tree does not ride along with it.
-    ln -s /cas/args/result/std/.caos-expr "/tmp/sel/$t/std/.caos-expr"
-    if [ -e "$d/uses-std" ]; then
-      caos get "/cas/args/in/tests/$t/uses-std"
-      for e in $(cat "$d/uses-std"); do
-        ln -s "/cas/args/result/std/$e" "/tmp/sel/$t/std/$e"
-      done
-    fi
-    if [ -e "$d/uses-bin" ]; then
-      caos get "/cas/args/in/tests/$t/uses-bin"
-      for e in $(cat "$d/uses-bin"); do
-        ln -s "/cas/args/result/bin/$e" "/tmp/sel/$t/bin/$e"
-      done
+    mkdir -p "/tmp/sel/$t/std"
+    if [ -e "$d/DEPS" ]; then
+      caos get "/cas/args/ws/tests/$t/DEPS"
+      caos get "/cas/args/result/tests/$t"
+      caos get "/cas/args/result/tests/$t/DEEP-DEPS"
+      # A bash read loop, not sed/awk: this runs in the std/bash image, whose
+      # flake carries neither (CLAUDE.md).
+      while read -r dep_path mount; do
+        case "${dep_path:-}" in "" | \#*) continue ;; esac
+        case "$dep_path" in
+          ../../std/*) ln -s "/cas/args/result/tests/$t/DEEP-DEPS/$mount" \
+                             "/tmp/sel/$t/std/$mount" ;;
+          *) fail "tests/$t/DEPS: $dep_path is not ../../std/*" ;;
+        esac
+      done < "$d/DEPS"
     fi
 
     case "$t" in
@@ -249,7 +349,7 @@ stage3)
         # sources of truth ACROSS the tree, so this test gets the whole
         # workspace and honestly re-keys on any edit to it. It is a fast lint,
         # so that trade is fine.
-        ln -s /cas/args/in "/tmp/sel/$t/workspace"
+        ln -s /cas/args/ws "/tmp/sel/$t/workspace"
         ;;
       chat-online)
         # The real-API key, when the suite was given one: same key, same cache
@@ -283,7 +383,7 @@ stage3)
   # is one cheap container, and it only runs at all when this stage does.
   then_img=$(caos curry /cas/std/bash -- \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
-    "--build-time:@=/cas/args/result/time" "--start-time=$(date +%s)") \
+    "--build-time:@=/cas/args/build/time" "--start-time=$(date +%s)") \
     || fail "currying the summarize stage"
   caos map-then /cas/sel -- --map="$map" --then="$then_img"
   ;;

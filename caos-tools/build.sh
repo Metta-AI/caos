@@ -216,7 +216,7 @@ make)
   STAGED=/tmp/staged-bins
   rm -rf "$STAGED"; mkdir -p "$STAGED/bin"
   for b in "$BIN"/caos "$BIN"/caos-cli "$BIN"/server "$BIN"/runnerd \
-           "$BIN"/llm-stub "$BIN"/worker-*; do
+           "$BIN"/worker-*; do
     [ -x "$b" ] && [ -f "$b" ] && install -m 755 "$b" "$STAGED/bin/$(basename "$b")"
   done
   [ -x "$STAGED/bin/caos" ] || fail "no caos binary staged from $BIN"
@@ -329,12 +329,12 @@ make)
     install -m 755 "$BIN/$b" "$L/caos/bin/$b" || fail "no binary $b"
   done
 
-  # The worker and helper binaries, as their own value. Tests that build their
-  # own curries copy these (CAOS_BIN_DIR); a test gets only the ones it names.
-  mkdir -p "$OUT/bin"
-  for b in worker-cargo worker-runner worker-rustc llm-stub; do
-    install -m 755 "$BIN/$b" "$OUT/bin/$b" || fail "no binary $b"
-  done
+  # NO `bin` OUTPUT. It carried four host binaries for tests to copy out of
+  # CAOS_BIN_DIR, and exactly one was ever named by a test: llm-stub. That is a
+  # std entry now (std/llm-stub, built by cargo — it is a plain sidecar process,
+  # not a worker image), so a test reaches it the way it reaches everything
+  # else: a DEPS ref, mounted by deep-deps. The other three were named by
+  # nothing at all.
   install -m 755 "$wsroot/stack/serve" "$L/caos/stack/serve"
   install -m 755 "$wsroot/test-stack/worker" "$L/worker"
   # NO /caos/seed-git. std arrives as an arg now and the stack's /worker seeds

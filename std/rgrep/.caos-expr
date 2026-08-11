@@ -1,9 +1,8 @@
 # std/rgrep's image (design/caos-expr.md, Phase 3): build this directory as a
 # Rust project with rustc. `--src:@=.` hands rustc this whole tree (its
 # Cargo.toml + src/; rustc skips the caos metadata — .caos-expr, DEPS,
-# DEEP-DEPS/); `--runner:@=DEEP-DEPS/runner` is the base its `finish` curries the
-# built binary onto. Both deps are named by LOCAL deep-deps mounts (declared in
-# DEPS) rather than /std, so std carries no ambient self-reference. The result is
-# curry(runner, worker1=<the compiled binary>) — a ready-to-run worker in the
-# shared runner pool.
-run DEEP-DEPS/rustc -- --src:@=. --runner:@=DEEP-DEPS/runner
+# DEEP-DEPS/), named by a LOCAL deep-deps mount (declared in DEPS) rather than
+# /std, so std carries no ambient self-reference. No runner is named: rustc
+# DEPENDS on the pool and curries the built binary onto it itself, so the result
+# is curry(runner, worker1=<the compiled binary>) — a ready-to-run worker.
+run DEEP-DEPS/rustc -- --src:@=.

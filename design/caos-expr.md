@@ -390,14 +390,53 @@ self-resolving, and std resolves by descent.**
   matching the seeded one, the job falls through to the generic runner, dies on a
   sentinel image, and every test that resolves the item goes red — which
   localizes to the item, since the items are independent.
-- **The cost, accepted: every test's `uses-std` widened.** Resolving *anything*
-  now runs the transform over the test's std **subset**, so each subset must be
-  closed under `DEPS` and must additionally name `deep-deps` (the transform) and
-  `runner` (the seeded deep-deps result is a curry whose `base` is a hash *blob*,
-  so the runner tree does not ride along with the seed). `caos-tools/test.sh`
-  symlinks `std/.caos-expr` into every subset. Per-test incrementality drops a
-  little — a `runner` or `deep-deps` edit now re-keys every test — but the lists
-  are still honest: those are real dependencies now, not ambient ones.
+### Landed: the harness delivers deps WITH deep-deps (`uses-std`/`uses-bin` gone)
+
+`uses-std`/`uses-bin` were the **hand-run prototype of deep-deps** — per-test
+"declare what you reach, key on exactly that", expanded by a symlink loop with
+the transitive half maintained by hand. Fusing them with the transform and
+lifting them into the tree is what this whole design was *for* (the spec's
+founding note), so the harness now runs the real worker instead:
+
+- Each `tests/<name>/DEPS` declares what that test reaches. `caos-tools/test.sh`
+  assembles ONE tree — `{std/*, bin/*/<binary>, tests/*/DEPS}` — runs the
+  deep-deps worker over it once for the whole suite, and each test's wrapper is
+  built from its own `DEEP-DEPS/<mount>` nodes. A dep reached by two tests is one
+  node, computed once and shared by hash. Measured: the test phase went from
+  **362s to 104s** against the per-test transform it replaced.
+- **Getting the transform's own image took two rules seriously.** A worker
+  cannot name `/cas/std/deep-deps` and get an image: `resolve_run_image` reads a
+  /cas path as the object it was made from, so the sentinel entry arrives as its
+  own one-file tree. Evaluation is a CLIENT capability and must stay one —
+  `eval_path` on a `run` blocks, which is exactly what a worker may not do. And
+  the build's own seed record can't stand in: that image is built from the tree
+  under test, a `test`-world binary the outer `host` server refuses to serve
+  ("caos world mismatch", measured). Both dissolve at once, because
+  `run docker://seeded-deep-deps -- --in:@=.` IS `run-then` over the std entry
+  with the sentinel as `--run` — it forms exactly the key the expression forms,
+  so the host's own seeder answers it. No evaluator in the worker, no blocking
+  run, no world crossing. That is why `test.sh` now has a `deepen` stage between
+  `stage3` and `fanout`: each run ends a stage.
+- **The closure is no longer maintained by hand.** A std entry brings its own
+  `DEPS` edges with it, so a test naming `rgrep` no longer restates
+  `rustc runner`. What a test must still name is only what is *not a tree
+  reference*: a curry's base (`deep-deps` → `runner`), a hash bound as a literal
+  (anything rustc-built → `cargo`, since `rustc` is a DEPS-free sentinel), and a
+  name the server or client looks up (`flake-builder`, `bash`) — a nested mount
+  satisfies neither of those two lookups.
+- **The subsets are the transform's output, so they carry no std-root
+  `.caos-expr`** — re-running the transform on an already-deepened tree is an
+  expensive identity. This also makes the delivery match the north star: a
+  `DEEP-DEPS/<dep>` mount is precisely how a consumer reaches a std item.
+- **This is where the byte-identity guardrail actually lives.** The harness now
+  deepens with the REAL worker over the same entries `build-builtins.sh`
+  hand-deepens to form seed keys. Divergence stops the seeded key matching the
+  key resolution forms, and the tests resolving that entry go red.
+
+An earlier pass went the other way — hand-expanding all 26 `uses-std` lists to
+the DEPS closure and calling the lost incrementality an accepted cost. That was
+backwards: computing closures with hash-shared subgraphs is what deep-deps is,
+and the widening was the mechanism asking to be replaced.
 
 ### Remaining
 

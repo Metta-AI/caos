@@ -150,6 +150,18 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
 /// hash, and this is how you then read the thing. Costs only the objects the
 /// working repo is missing.
 pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> {
+    // `/cas/std/<name>` is accepted here for the same reason `run` and `curry`
+    // accept it: it is THE vocabulary for naming a builtin, and resolving it is
+    // resolution, not running. It matters for an entry whose resolved value is
+    // DATA rather than an image — `std/llm-stub` evaluates to a cargo result
+    // tree, and what a caller wants from it is the produced file at `bin/`.
+    // Only that prefix: `resolve_cli_image` also ingests a DIRECTORY as an
+    // image, which would quietly turn a mistyped hash into an ingest.
+    let hash = &if hash.starts_with(&std_arg_prefix()) {
+        resolve_std_image(t, &hash[std_arg_prefix().len()..])?
+    } else {
+        hash.to_string()
+    };
     let (kind, _) = t.get_object(hash)?;
     let root = match kind.as_str() {
         "tree" => gix::objs::tree::EntryKind::Tree,

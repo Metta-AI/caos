@@ -1,0 +1,13 @@
+# std/llm-stub's binary (design/caos-expr.md): built by cargo DIRECTLY, not by
+# rustc. rustc exists to turn source into a runner-pool IMAGE — it curries the
+# built binary onto the runner — and that is not what a stub is. The tests run
+# llm-stub as a plain sidecar process inside their own container and netns, so
+# what they need is the executable file.
+#
+# `worker-cargo --cmd=build` already stages the produced executables at `bin/`,
+# which is what rustc itself consumes; this entry just stops one step earlier.
+# The result tree is `{exit, stdout, stderr, bin}`, so a consumer reaches the
+# binary at `<mount>/bin/llm-stub`. No `--target`: `--cmd=build` defaults to
+# musl-static (worker_common::MUSL_TARGET), which a `.caos-expr` could not
+# compute for itself.
+run DEEP-DEPS/cargo -- --cmd=build --tree:@=.

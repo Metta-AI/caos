@@ -1,0 +1,15 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). deep-deps mounts each of these RECURSIVELY
+# DEEPENED at DEEP-DEPS/<name>, so a std entry brings its own deps
+# (std/<e>/DEPS) with it and only what an edge cannot reach is listed
+# here: a curry base, a hash bound as a literal, or a name the server
+# or client looks up (design/caos-expr.md). A nested mount does not
+# satisfy a BY-NAME lookup — flake-builder (the server, for any raw
+# flake tree) and bash (std_image) are named even where an edge also
+# supplies them. chat.rs also resolves /cas/std/runner by name, but
+# only behind a --llm-bin/--bash-bin/--rgrep-bin override, which no
+# test passes; one that does will fail loudly and add it here.
+../../std/llm-call llm-call
+../../std/cargo cargo
+../../std/flake-builder flake-builder
+../../std/llm-stub llm-stub

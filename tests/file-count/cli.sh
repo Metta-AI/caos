@@ -19,7 +19,9 @@ ms() { date +%s%3N; }   # epoch milliseconds
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
 echo "== build the fixture worker from its source ==" >&2
-builder=$("$CAOS_CLI" curry /cas/std/rustc -- --runner:@=/cas/std/runner)
+# No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
+# the built binary onto it itself, so a caller says only what it is building.
+builder=$("$CAOS_CLI" curry /cas/std/rustc --)
 "$CAOS_CLI" run "$builder" img -- --src:@=test/worker.rs
 commit "built file-count"
 worker=$(git rev-parse HEAD:img)

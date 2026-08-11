@@ -9,10 +9,12 @@
 //! mtimes, so workspace crates always rebuild — only the baked deps are
 //! reused) and runs cargo `--offline`.
 //!
-//! Optional args: `--target` (a rustc target triple — e.g. musl, so a
-//! produced binary is static and runs on any base) and `--profile` (default
+//! Optional args: `--target` (a rustc target triple) and `--profile` (default
 //! `dev`; the caos deps bake is dev, other profiles compile from scratch).
-//! Both ride the cache key like any arg.
+//! Both ride the cache key like any arg. `--cmd=build` defaults `--target` to
+//! [`worker_common::MUSL_TARGET`], so a produced binary is static and runs on
+//! any base — which is what lets a std entry be built by cargo *directly* from
+//! a `.caos-expr` (static text cannot compute a triple).
 //!
 //! **Any cargo outcome is a value, never a worker error** — a compile error or
 //! failing test is something the model must see and react to (and it caches:
@@ -43,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use worker_common::{
-    arg, caos, entries, file_name, path, read_arg, read_arg_opt, run_worker, scratch,
+    arg, caos, entries, file_name, path, read_arg, read_arg_opt, run_worker, scratch, MUSL_TARGET,
 };
 
 /// Keep at most this many bytes (the tail) of each captured stream.
@@ -81,7 +83,16 @@ fn run() -> Result<(), String> {
 }
 
 fn flat(cmd: &str) -> Result<(), String> {
-    let target = read_arg_opt("target")?;
+    // `build` is the only cmd that PRODUCES something a caller keeps, so it is
+    // the only one that defaults its target: a staged binary must run on a base
+    // that is not this image, which means musl-static. check/test/clippy stage
+    // nothing and keep building for the host — forcing a cross target on them
+    // would change what they check and stop `test` from running its binaries.
+    let target = match read_arg_opt("target")? {
+        Some(t) => Some(t),
+        None if cmd == "build" => Some(MUSL_TARGET.to_string()),
+        None => None,
+    };
     let profile = read_arg_opt("profile")?.unwrap_or_else(|| "dev".to_string());
     let mut argv: Vec<&str> = match cmd {
         "check" => vec!["check", "--workspace", "--all-targets"],

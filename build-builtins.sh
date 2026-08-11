@@ -32,7 +32,7 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step deep-deps rustc)
+[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step deep-deps rustc llm-stub)
 
 # std entries that are SOURCE DIRS published whole (design/caos-expr.md,
 # Phase 3): the checked-in std/<name> directory IS the published tree, copied
@@ -48,6 +48,10 @@ names=("$@")
 #   llm-call,    — Rust projects built with rustc; their crates.io deps ride the
 #   llm-step       bake (anchored by crates/bake-anchor) and they link the
 #                  llm-client crate via a numbered --dep0 mount.
+#   llm-stub     — a Rust project too, but built by CARGO DIRECTLY (its expr runs
+#                  DEEP-DEPS/cargo --cmd=build): the tests run it as a plain
+#                  sidecar HTTP server, so what they need is the produced FILE
+#                  at bin/llm-stub, not a runner-pool image.
 #   llm-client   — a LIBRARY entry (no .caos-expr): source mounted into the llm
 #                  tools as a code dep, never resolved as an image itself.
 #   deep-deps,   — SEEDED core: a minimal {.caos-expr} sentinel entry; bootstrap
@@ -55,7 +59,7 @@ names=("$@")
 #                  is staged into the entry.
 is_source_entry() {
   case "$1" in
-    bash | bash-tool | deep-deps | llm-call | llm-client | llm-step | merge | rgrep | rustc) return 0 ;;
+    bash | bash-tool | deep-deps | llm-call | llm-client | llm-step | merge | rgrep | rustc | llm-stub) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -225,18 +229,28 @@ ln -s /bin/env "$ADD/usr/bin/env"
 printf 'root:x:0:0:root:/root:/sbin/nologin\nworker:x:1000:1000:caos worker:/tmp:/sbin/nologin\n' \
   > "$ADD/etc/passwd"
 printf 'root:x:0:\nworker:x:1000:\n' > "$ADD/etc/group"
-# The world-writable /tmp is an EMPTY directory, which git cannot record at
-# all — so its 1777 sidecar is staged here and the directory itself is
-# spliced into the tree below as the empty tree.
+# The world-writable /tmp. Its 1777 mode is a sidecar because git records no
+# modes beyond the exec bit — but the DIRECTORY is now carried by a keep-file
+# rather than as an empty tree, and that is load-bearing.
+#
+# It used to be spliced in below as git's empty tree. That is a legal tree entry
+# and git transfers it fine, but an empty directory does not survive a
+# materialize -> read -> re-put round trip, so ANY worker that rebuilds a tree
+# from the filesystem silently drops it. deep-deps is such a worker: deepening
+# the runner delta returned a tree with `layer00/tmp` GONE, which made the
+# worker-deepened entry disagree with this script's hand-deepen and broke every
+# seeded key that reached the runner (measured: 7 tests, all rustc-built tools).
+#
+# A keep-file makes the directory ordinary, so nothing anywhere has to special
+# case it — the same move as the sidecar beside it, one step further.
+mkdir -p "$ADD/tmp"
+printf 'This file exists so that /tmp is a NON-EMPTY directory.\n\nAn empty directory is not representable in a git worktree and does not survive\na materialize -> read -> re-put round trip, so a worker that rebuilds a tree\nfrom the filesystem (deep-deps) drops it. /tmp must exist in the image, so it\ncarries this file. Its 1777 mode rides in the tmp.caosmeta sidecar.\n' \
+  > "$ADD/tmp/.caos-keep"
 printf '{"mode":"1777","uid":0,"gid":0}' > "$ADD/tmp.caosmeta"
 git -C "$CLIENT" add layer-additions
-EMPTY_TREE=$(git -C "$CLIENT" mktree </dev/null)
-additions_tree=$(
-  {
-    git -C "$CLIENT" ls-tree "$(git -C "$CLIENT" write-tree --prefix=layer-additions/)"
-    printf '040000 tree %s\ttmp\n' "$EMPTY_TREE"
-  } | git -C "$CLIENT" mktree
-)
+# No splice any more: `tmp` is an ordinary directory in the staged layout, so
+# `write-tree` carries it like everything else.
+additions_tree=$(git -C "$CLIENT" write-tree --prefix=layer-additions/)
 
 # Each streamed image's /worker, its own layer. worker-runner is the pool
 # protocol's in-image half; worker-cargo is what the cargo image is FOR — and
@@ -527,9 +541,16 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   chmod -R u+w "$CLIENT/seed-rustc-wc"
   git -C "$CLIENT" add seed-rustc-wc
   # curry(runner, worker1=<rustc bin>, cargo=<cargo image, a literal hash blob>,
-  # worker-common=<tree>) — the worker factory's ready-to-run form.
+  # runner=<the same, for what rustc CURRIES ONTO>, worker-common=<tree>) — the
+  # worker factory's ready-to-run form.
+  #
+  # `--runner` is bootstrap REALIZING std/rustc/DEPS: rustc depends on the runner
+  # pool and curries every built binary onto it, so no caller passes one. A hash
+  # literal like `--cargo`, because that is what a seed result can bind — when
+  # rustc stops being seeded its expression binds DEEP-DEPS/runner instead.
   rustc_curry=$(cd "$CLIENT" && "$caos" curry "$runner_delta" -- \
-    "--worker1:@=seed-rustc" "--cargo=$cargo_delta" "--worker-common:@=seed-rustc-wc")
+    "--worker1:@=seed-rustc" "--cargo=$cargo_delta" "--runner=$runner_delta" \
+    "--worker-common:@=seed-rustc-wc")
   rustc_blob=$(printf 'docker://seeded-rustc' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record rustc \
     "$(printf '{"image":"%s","in":"%s"}' "$rustc_blob" "${hash_of[rustc]}")" "$rustc_curry"

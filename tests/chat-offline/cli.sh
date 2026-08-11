@@ -24,7 +24,12 @@ echo "== stage the worker binaries and fixtures ==" >&2
 # The agent workers are std source entries now, not host binaries: chat resolves
 # /cas/std/{llm-step,bash-tool,rgrep} and builds each via rustc (design/caos-expr.md,
 # Phase 3). Only the LLM API stub stays a host binary.
-stub_bin=$CAOS_BIN_DIR/llm-stub
+# The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
+# the executable is at bin/<name>. Copied out because materialized CAS content
+# is read-only and owner-only — exec straight from /cas is "Permission denied".
+"$CAOS_CLI" get /cas/std/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
+stub_bin=/tmp/llm-stub-bin
+install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
 
 # The conversation's workspace, and the identity chat's human commits use.
 mkdir -p ws/notes

@@ -1,7 +1,7 @@
-# llm-step's dependencies (format `<path> <name>`, path relative to this dir):
-# the rustc worker factory that compiles it, the runner pool its binary curries
-# onto, and the llm-client code crate it links. All LOCAL deps (mounted under
-# DEEP-DEPS/ by deepening) rather than /std, so std has no ambient self-reference.
+# llm-step's dependencies (format `<path> <name>`, path relative to this dir): the
+# rustc worker factory that compiles it, and the llm-client code crate it links. rustc DEPENDS on the runner pool
+# itself and curries the built binary onto it, so no tool names a runner.
+# LOCAL deps (mounted under DEEP-DEPS/ by deepening) rather than /std, so std
+# has no ambient self-reference.
 ../rustc rustc
-../runner runner
 ../llm-client llm-client

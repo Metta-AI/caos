@@ -1,0 +1,8 @@
+# rustc's dependency (format `<path> <name>`, path relative to this dir): the
+# runner pool its `finish` step curries every built binary onto. It is DECLARED
+# here rather than passed by each caller — a tool says what it is building, not
+# what base the result rides. rustc is SEEDED, so bootstrap realizes this dep by
+# binding the same runner into the seed result as a hash literal (`--runner`),
+# the way it already does for `--cargo`; when rustc stops being seeded the
+# expression will bind DEEP-DEPS/runner directly.
+../runner runner

@@ -1,0 +1,22 @@
+# std/llm-stub — the scripted stand-in for the LLM API (`POST /v1/messages`)
+# that the llm tests point `base_url` at. This directory IS the tool: its Rust
+# source, this manifest, its `.caos-expr` and `DEPS`.
+#
+# NOT a worker, which is why it is built by cargo DIRECTLY rather than by rustc:
+# a test runs it as a plain sidecar HTTP server in its own container and netns,
+# so what it needs is an executable FILE, not a runner-pool image. `worker-cargo`
+# already produces exactly that (`--cmd=build` stages `bin/<name>`), and defaults
+# the target to musl-static so the binary runs on the test stack's base.
+[package]
+name = "llm-stub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The same minimal synchronous HTTP server the caos server uses. Anchored in
+# crates/bake-anchor so the /std/cargo bake keeps vendoring it (tests/std-lint).
+tiny_http = "0.12"
+
+[[bin]]
+name = "llm-stub"
+path = "src/main.rs"

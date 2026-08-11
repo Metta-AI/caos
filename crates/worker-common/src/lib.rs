@@ -36,6 +36,21 @@ use std::process::{Command, ExitCode};
 /// Where the `caos` runner materializes this run's arguments.
 pub const ARGS: &str = "/cas/args";
 
+/// The target triple a produced binary is built for: musl, so it is static and
+/// runs on ANY base — the runner pool's image today, a scratch image tomorrow,
+/// or (llm-stub) as a plain sidecar process in a test's own container. The arch
+/// follows this worker's own build, which is the image's arch.
+///
+/// It lives here because two workers need the same answer: `worker-cargo`
+/// defaults `--target` to it for `--cmd=build`, and `worker-rustc` is a wrapper
+/// around exactly that call. A `.caos-expr` is static text and cannot compute a
+/// triple, so a std entry built straight by cargo relies on this default.
+pub const MUSL_TARGET: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64-unknown-linux-musl"
+} else {
+    "x86_64-unknown-linux-musl"
+};
+
 /// Absolute path of an argument under `/cas/args`.
 pub fn arg(name: &str) -> String {
     format!("{ARGS}/{name}")

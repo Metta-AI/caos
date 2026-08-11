@@ -10,14 +10,16 @@
 //! dependencies reuse the cargo image's seeded, precompiled `target/` (the
 //! bake) rather than recompiling. The `finish` continuation takes the built
 //! binary and emits at `/cas/out` a ready-to-run worker:
-//! `curry(runner, worker1=<the binary>)` — the shared, warm-pooled runner
+//! `curry(runner, worker1=<the binary>)` — the shared, warm-pooled runner it
+//! DEPENDS on (std/rustc/DEPS) and binds itself, so no caller passes one —
 //! bound to this binary, so the worker needs no image of its own. Static musl
 //! means the binary runs on any base (the glibc runner today, scratch
 //! eventually).
 //!
 //! So building a worker is itself a worker — memoized end to end: this run on
-//! `(src, runner, cargo, worker-common)` — the bound `cargo` and `worker-common`
-//! are its LINKER INPUTS, wired in at publish (build-builtins.sh; see
+//! `(src, cargo, runner, worker-common)` — the bound `cargo`, `runner` and
+//! `worker-common` are its LINKER INPUTS, wired in at publish
+//! (build-builtins.sh; see
 //! design/flake-images.md "rustc: the worker factory") — the inner compile on
 //! the project tree. rustc itself runs as
 //! `curry(runner, worker1=worker-rustc)` in the shared
@@ -34,14 +36,6 @@ use std::process::ExitCode;
 use worker_common::{
     arg, caos, caos_curry, entries, file_name, link, own_image, path, read_arg, read_arg_opt,
     run_then, run_worker, scratch, Arg,
-};
-
-/// Build user workers static (musl): the binary then runs on any base. The
-/// arch follows this worker's own build (e.g. Apple Silicon hosts).
-const TARGET: &str = if cfg!(target_arch = "aarch64") {
-    "aarch64-unknown-linux-musl"
-} else {
-    "x86_64-unknown-linux-musl"
 };
 
 fn main() -> ExitCode {
@@ -69,7 +63,7 @@ fn run() -> Result<(), String> {
 /// MATCHING the bake so it reuses the seeded dependency artifacts instead of
 /// recompiling them (design/caos-expr.md, Phase 3; std/cargo/bake.nix).
 fn start() -> Result<(), String> {
-    for required in ["src", "runner", "worker-common"] {
+    for required in ["src", "worker-common"] {
         if !Path::new(&arg(required)).exists() {
             return Err(format!("--{required} is required"));
         }
@@ -78,6 +72,13 @@ fn start() -> Result<(), String> {
     // content): rustc is a SEEDED core item, so bootstrap hand-builds its curry
     // binding `--cargo=<cargo image hash>` (design/caos-expr.md, Phase 3).
     let cargo = read_arg("cargo")?;
+    // The runner arrives the SAME way, and is NOT a caller's argument: rustc
+    // DEPENDS on the runner (std/rustc/DEPS) and curries onto it itself, so a
+    // caller says only what it is building. Every tool used to repeat
+    // `--runner:@=DEEP-DEPS/runner`, which made the pool base part of every
+    // tool's interface for no reason — and, once `runner` became a seeded
+    // sentinel entry, a `:@=` path could not have named its image anyway.
+    let runner = read_arg("runner")?;
 
     let proj = scratch("proj")?;
     let src = arg("src");
@@ -133,18 +134,14 @@ fn start() -> Result<(), String> {
     // (musl, dev) precompiled the dependency graph at — so the tool's deps are
     // reused from the seeded target/ rather than recompiled. musl still links
     // static regardless of profile, so the binary runs on any base.
-    let build = caos_curry(
-        &cargo,
-        &[("cmd", Arg::Lit("build")), ("target", Arg::Lit(TARGET))],
-    )?;
+    let build = caos_curry(&cargo, &[("cmd", Arg::Lit("build"))])?;
     // Ourselves, in the `finish` position: rebuild our own curry (the runner
     // image with our bin re-bound) plus what finish needs. `cargo` and
     // `worker-common` deliberately don't ride — finish's cache key is just
     // (bin, runner, result).
     let bin = arg("worker1");
-    let runner = arg("runner");
     let mut kvs: Vec<(&str, Arg)> =
-        vec![("mode", Arg::Lit("finish")), ("runner", Arg::Path(&runner))];
+        vec![("mode", Arg::Lit("finish")), ("runner", Arg::Lit(&runner))];
     if Path::new(&bin).exists() {
         kvs.insert(0, ("worker1", Arg::Path(&bin)));
     }
@@ -171,7 +168,10 @@ fn finish() -> Result<(), String> {
     if !Path::new(&bin).exists() {
         return Err("cargo result carries no bin/worker".to_string());
     }
-    let curried = caos_curry(&arg("runner"), &[("worker1", Arg::Path(&bin))])?;
+    // `read_arg`, not `arg`: the runner rides as a hash LITERAL (like `cargo`),
+    // and `resolve_run_image` takes a bare hash — so this curries onto the
+    // runner image itself, not onto the blob that names it.
+    let curried = caos_curry(&read_arg("runner")?, &[("worker1", Arg::Path(&bin))])?;
     caos(["get-hash", &curried, "/cas/out"])
 }
 

@@ -1,51 +1,84 @@
-# caos-expr Phase 3 — deep-deps migration: handoff
+# caos-expr — no-ambient-std: MID-FLIGHT. Suite 21/28. Do not commit as green.
 
-Suite is **green (28/28)**; design state is in `design/caos-expr.md`. Nothing is
-mid-edit; the tree is green and committable as-is.
+Working tree is uncommitted on `caos-expr-finish`. `design/caos-expr.md` has the
+landed history; this file has the live state.
 
-## Where we are
+## Landed earlier and green (28/28 at the time)
 
-`.caos-expr` Phase 3, deep-deps migration. Landed & green:
+- **The flip**: `std/.caos-expr` = `run deep-deps -- --in:@=.`; std published
+  un-deepened; `deepen_entry` survives only to form seed keys.
+- **`uses-std`/`uses-bin` deleted**: each `tests/<t>/DEPS` declares what no edge
+  supplies; `test.sh` assembles `{std/*, tests/*/DEPS}` and runs the real
+  transform ONCE for the suite. Test phase 362s → 104s.
 
-- Every std entry references deps via `DEEP-DEPS/x` (no ambient `/std` in exprs).
-- One `deepen_entry` pass in `build-builtins.sh` (replaced per-entry splices).
-- All leaf tools are checked-in source built by rustc: `bash-tool`, `rgrep`,
-  `llm-call`, `llm-step` (+ `llm-client` as a lib std entry, mounted via
-  `--dep0`). `worker-rustc` takes numbered `--depN` code deps.
-- `bake-anchor` crate + `lint-bake-anchor.sh` keep std tools' crates.io deps in
-  the `/std/cargo` bake.
-- **Seeded core = flake-builder, cargo, rustc, deep-deps** (sentinel
-  `.caos-expr`s: `run docker://seeded[-rustc|-deep-deps]`; bootstrap hand-builds
-  the result, hand-assembles the key). `stage_worker` deleted.
-- Decision (last turn): **`runner` stays raw / caosd-brought-up — NOT seeded,
-  not a std entry.** Drops the `--runner`/`own_image` cascade.
+## This turn (7 tests red — see below)
 
-## The one thing that's NOT done (the actual goal)
+- **`worker-cargo` defaults `--target`** to `worker_common::MUSL_TARGET` for
+  `--cmd=build` only. `worker-rustc` drops its duplicate triple and stops
+  passing one. Nothing else omitted `--target`, so no blast radius.
+- **`std/llm-stub`** is a source entry built by CARGO DIRECTLY
+  (`run DEEP-DEPS/cargo -- --cmd=build --tree:@=.`) — the tests run it as a
+  plain sidecar process, so they need the FILE at `<mount>/bin/llm-stub`, not a
+  runner-pool image. `crates/llm-stub` deleted; `tiny_http` anchored in
+  bake-anchor. **`bin/` is gone** from `build.sh`'s outputs, the wrappers, and
+  `run-test.sh` (`CAOS_BIN_DIR` deleted) — it only ever delivered llm-stub.
+- **`cli_get` accepts `/cas/std/<name>`** — resolution is not running, and it
+  matters for an entry whose value is DATA (a cargo result tree).
+- **rustc DEPENDS on the runner**: `std/rustc/DEPS` = `../runner`; bootstrap
+  binds it into the seed result as a hash literal (like `--cargo`); rustc curries
+  automatically. `--runner` is gone from every caller — 4 std exprs, 4 test
+  cli.sh, and `../runner` from 4 std DEPS.
+- **REAL BUG FIXED — deep-deps dropped EMPTY DIRECTORIES.** `map_then` over an
+  empty input has no children, so the branch produced nothing and the directory
+  vanished. Proved standalone: deepening the runner delta `19c9182b` gave
+  `f7d48b06` with `layer00/tmp` — the world-writable /tmp — GONE. `node_dir` now
+  answers leaf directories directly (also saves two containers per leaf).
 
-Resolution still works only via the **pre-deepened `refs/caos/std` + `/cas/std` +
-`resolve_std_image` scaffolding**. There is **no runtime std-root `.caos-expr`**,
-so the checked-in tree isn't self-resolving and nothing resolves std *by
-descent*.
+## Empty directories: FIXED (real bug, verified)
 
-## Next step (the flip)
+Where the empty dir came from: `build-builtins.sh` MADE it, at the object layer
+— `git mktree </dev/null` plus a hand-spliced `040000 tree <empty> tmp`. Git's
+object model can hold that; a worktree cannot, which is why it existed nowhere
+else. It is now an ordinary directory carrying `tmp/.caos-keep`, and the splice
+is gone.
 
-1. Add std-root `.caos-expr = run deep-deps -- --in:@=.` (cycle-2 is safe:
-   `resolve_expr_image` subtree-evaluates `std/deep-deps`'s seeded sentinel, so
-   the transform doesn't re-enter itself).
-2. Publish the **un-deepened** std; deepen at resolve time; keep seeding keys
-   from `deepen_entry` (bootstrap's bash deepen).
-3. **Byte-identity is load-bearing here** — `deepen_entry` must match the real
-   `deep-deps` worker or `cargo`/rustc-built leaves get a different key → seeder
-   misses → red.
+Proof it mattered and is fixed: the worker-deepened `rustc` and bootstrap's
+`deepen_entry` disagreed (`2b142170` vs `fd5f4c63`) purely over `layer00/tmp`;
+they are now byte-identical (`499a719b` both sides).
 
-## Open questions (unanswered — decide on resume)
+## The 7 failures — STILL OPEN (not the empty-dir bug)
 
-- (a) Let the **suite be the guardrail** (a divergence turns cargo/leaves red and
-  localizes it) vs. a standalone worker-context diff test — the standalone one is
-  awkward to plumb (`cli.sh` sees std only as a resolver, inner stack holds a
-  subset).
-- (b) The flip **widens every test's `uses-std`** (each resolution now runs
-  `deep-deps` + needs transitive deps present), losing some per-test
-  incrementality — accept, or rethink the subset model first?
+`bash-tool caos-tools chat-offline llm-call llm-step merge-harness rgrep` —
+every one a rustc-built std tool, all failing client-side with
 
-That's the whole remaining chunk.
+    git push … failed: fatal: bad tree object c55ef2d2…
+
+`c55ef2d2` is a runner-delta `layer00` — and it DOES carry the keep-file, so it
+is current, not stale.
+
+**Flaw in my own investigation, stated so it is not repeated:** every check so
+far reconstructed the deepened tree from the HOST's std
+(`caos-cli get <std> && run /cas/std/deep-deps`). The wrapper is built from the
+TREE-UNDER-TEST's std (`build.sh`'s `result/std`). Those are different builds —
+the host's runner layer00 is `92b8aa78`, the missing one is `c55ef2d2`. So the
+mount-chain verification (`rgrep → DEEP-DEPS/rustc → DEEP-DEPS/runner`, which
+does check out) was performed on the wrong artifact.
+
+NEXT: inspect the REAL artifact — the `deepen` stage's output for `tests/rgrep`
+— and check whether `DEEP-DEPS/rustc/DEEP-DEPS/runner/layer00` is `c55ef2d2`.
+That splits it: either the wrapper genuinely lacks it (harness bug in
+`test.sh`'s assembly/routing) or it has it and the gap is in what
+`test-stack/worker` fetches into the inner stack.
+
+Cheap fallback if that dead-ends: name `runner` directly in the DEPS of the
+tests that build rustc tools. Correct by the existing rule (a curry base / hash
+literal is not a tree reference), just less minimal.
+
+## Gotcha worth keeping
+
+`nix build` with TWO installables and TWO `-o` flags
+(`nix build .#a -o result-a .#b -o result-b`) does NOT create both symlinks —
+one is left pointing at a previous build, and the other can be missing entirely.
+That cost an hour of chasing "stale" publishes that were really a stale symlink.
+Build one output per invocation. (`--refresh` is NOT needed: nix picks up
+dirty-tree edits fine — verified directly.)

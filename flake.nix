@@ -245,9 +245,6 @@
         # image of their own: each runs as curry(runner, bin=<static binary>)
         # in the shared runner pool, so only the binaries are exposed.
         worker-deep-deps = workspaceBins;
-        # The LLM worker tests' scripted API stand-in — a host binary, not a
-        # worker (the musl build runs on any Linux host).
-        llm-stub = workspaceBins;
 
         # Minimal images: each contains *only* its static binary — no shell, no
         # libc, no /nix/store. Crates are unprefixed (caos, server) but
@@ -949,9 +946,7 @@
           # binaries stay available as `.#caos`.
           default = caos-tools;
           inherit caos server runnerd caos-cli caosd caos-tools;
-          # Agent-harness worker binaries (run as curry(runner, bin)) and the
-          # LLM worker tests' stub server.
-          inherit llm-stub;
+          # Agent-harness worker binaries (run as curry(runner, bin)).
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc
           # orchestrator (curry(runner, worker1)) — build-builtins.sh needs
