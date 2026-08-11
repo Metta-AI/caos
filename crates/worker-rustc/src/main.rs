@@ -74,10 +74,9 @@ fn start() -> Result<(), String> {
     let cargo = read_arg("cargo")?;
     // The runner arrives the SAME way, and is NOT a caller's argument: rustc
     // DEPENDS on the runner (std/rustc/DEPS) and curries onto it itself, so a
-    // caller says only what it is building. Every tool used to repeat
-    // `--runner:@=DEEP-DEPS/runner`, which made the pool base part of every
-    // tool's interface for no reason — and, once `runner` became a seeded
-    // sentinel entry, a `:@=` path could not have named its image anyway.
+    // caller says only what it is building. Do not add a `--runner` parameter
+    // back: it would make the pool base part of every tool's interface, and
+    // `runner` is a seeded sentinel entry, so a `:@=` path cannot name its image.
     let runner = read_arg("runner")?;
 
     let proj = scratch("proj")?;

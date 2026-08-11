@@ -42,6 +42,9 @@ caos-cli run "$(git rev-parse HEAD:img)" "$CAOS_CAS_DIR/out" -- --greeting=hi
 
 ## Updating the stdlib
 
-`caosd` republishes the builtin library on every startup (rebuilding the images
-— a cache hit when unchanged — and atomically repointing `refs/caos/std`), so
-after editing a builtin worker in the caos tree just restart `caosd`.
+There is nothing to republish: `./inputs/caos/std/<name>` is a source directory
+in the tree you already have, and naming it resolves it — `caos-cli` ingests the
+directory and evaluates its `.caos-expr`. So after editing a builtin worker in
+the caos tree, update this repo's pin to it and the next run picks it up (a cache
+hit for everything the edit didn't touch). No `caosd` restart, and no library ref
+to repoint.

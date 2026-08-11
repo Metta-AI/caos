@@ -1,5 +1,5 @@
 # cargo's dependencies (design/caos-expr.md, Phase 3; format `<path> <name>`,
 # path relative to this dir). cargo's flake is built by the flake-builder, named
-# here as a LOCAL dep (mounted at DEEP-DEPS/flake-builder by deepening) rather
-# than /std/flake-builder, so std has no ambient self-reference.
+# here as a LOCAL dep (mounted at DEEP-DEPS/flake-builder by deepening) — the
+# only way it CAN be named, since nothing resolves a builtin by name.
 ../flake-builder flake-builder

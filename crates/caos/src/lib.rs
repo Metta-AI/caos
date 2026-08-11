@@ -82,11 +82,10 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
         .to_string();
 
     let mut all: Vec<String> = vec![format!("--worker1:@={script}"), "--in:@=.".to_string()];
-    // No `--bins`. It used to carry the deploy's nix-built binaries in as a
-    // literal hash, so build/test tools could assemble images from them rather
-    // than recompile the workspace in-caos. Nothing reads it any more — the
-    // suite compiles the tree under test from source — so passing it only
-    // coupled every tool invocation to a ref the stack may not even have.
+    // Do not add a `--bins` carrying the deploy's nix-built binaries. A tool
+    // gets the tree under test and builds from source; handing it prebuilt host
+    // binaries would couple every invocation to the deploy and let the suite
+    // pass against something other than the tree it was given.
     all.extend(kvs.iter().cloned());
     // The workspace declares the image its tool scripts run on (./DEPS: `bash`).
     let image = eval::eval_workspace_dep(t, "bash")?;
@@ -2443,7 +2442,7 @@ fn record_continuation(
     write_placeholder(&out, "promise", &continuation.to_string())
 }
 
-/// `run <image | /cas/std/<name>> [output] -- [--name=value | --name:@=path ...]`
+/// `run <image | dir> [output] -- [--name=value | --name:@=path ...]`
 /// — the *CLI* form. `<output>`, if given, is any path on the host; the whole
 /// result tree is checked out there in full as ordinary rw files. If `<output>`
 /// is omitted and the result is a file, its bytes are written to stdout — with a
@@ -2455,8 +2454,8 @@ fn record_continuation(
 /// `<output>` as such; fetch the real object by hash (`git fetch caos <hash>`)
 /// when you want the commit itself. There
 /// is no `/cas` here: path-valued args are host paths the transport ingests, and
-/// `<image>` is a `docker://` ref, a bare hash, or a `/cas/std/<name>` builtin
-/// (resolved against the published library).
+/// `<image>` is a `docker://` ref, a bare hash, or a host DIRECTORY — evaluated
+/// if it carries a `.caos-expr` (see [`resolve_cli_image`]).
 pub fn cli_run(
     t: &dyn Transport,
     image: &str,
@@ -2620,14 +2619,15 @@ fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
     ))
 }
 
-/// Map a `caos-cli run` image argument that names a std builtin to its git hash,
-/// leaving every other form (`docker://…`, a hash, a CAS path) untouched.
+/// Resolve a `caos-cli run` image argument to something the server can run: a
+/// DIRECTORY is ingested (and evaluated, if it is evaluable), and every other
+/// form (`docker://…`, a bare hash) is left untouched.
 ///
-/// `<DEFAULT_CAS_DIR>/std/<name>` (i.e. `/cas/std/<name>`) is the path a *worker*
-/// uses to reach a builtin — the server materializes the std library at
-/// `/cas/std` inside the container. The CLI has no such directory, so it resolves
-/// the same path directly against the published library, so one vocabulary works
-/// in both places.
+/// A directory is the only name a caller needs, because a tree says how it is
+/// built. There is deliberately no name-to-image lookup here: the CLI resolves
+/// a dependency by DESCENT through the tree it was handed (`DEEP-DEPS/<name>`),
+/// which is what makes a caller's dependencies its own declared edges rather
+/// than whatever an ambient library happens to hold.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
     // A directory is an image tree to ingest — notably a flake dir (flake.nix +
     // flake.lock), which the server builds into a real image via the
@@ -2642,9 +2642,9 @@ pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, Strin
         // says how it is built, so resolving it means evaluating it — the same
         // rule `resolve_expr_image` applies to a path named inside an
         // expression. This is what lets a caller name a dependency by its
-        // deep-deps mount (`run DEEP-DEPS/rgrep`) instead of reaching for an
-        // ambient `/cas/std/<name>`; a tree with no `.caos-expr` (a plain flake
-        // dir, a git-docker image) evaluates to itself and nothing changes.
+        // deep-deps mount (`run DEEP-DEPS/rgrep`) — a path it holds, not a name
+        // it looks up; a tree with no `.caos-expr` (a plain flake dir, a
+        // git-docker image) evaluates to itself and nothing changes.
         return eval::eval_tree(t, &oid.to_string());
     }
     Ok(image.to_string())
@@ -2680,8 +2680,8 @@ pub fn caos_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<
 }
 
 /// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — the *CLI* form
-/// of [`caos_curry`]: `<arg tree>` may be a `/cas/std/<name>` builtin, path args
-/// are host paths to ingest (or `/cas/std/<name>` builtin refs), and the curried
+/// of [`caos_curry`]: `<arg tree>` may be a directory to ingest and evaluate,
+/// path args are host paths to ingest, and the curried
 /// arg tree is pushed so a later `run` can use the printed ref directly.
 pub fn cli_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<(), String> {
     let (unbind, kvs) = split_curry_args(rest)?;

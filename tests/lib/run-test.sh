@@ -142,9 +142,9 @@ cp -r "$TEST" ./test
 #
 # They have to be IN the repo (not just in the wrapper) because the CLI ingests
 # git-tracked paths: `caos-cli run DEEP-DEPS/rgrep` resolves by INGESTING that
-# directory and then EVALUATING its `.caos-expr`. That is what replaces
-# `/cas/std/rgrep` — a name resolved out of an ambient library — with a path the
-# test actually holds.
+# directory and then EVALUATING its `.caos-expr`. A dependency the repo does not
+# hold is one the CLI cannot name, which is the point — the test's DEPS is the
+# whole of what it can reach.
 #
 # `cp -rL` because CAS content is a tree of read-only, hash-tagged files; the
 # copy is small now that every entry is source (the runner is a `{.caos-expr}`
@@ -161,8 +161,8 @@ mkdir /tmp/out
 # pole. Only a DURATION: absolute times were here once, so the summariser could
 # reconstruct the phase as max(end) - min(start), and that cannot work. They are
 # files in the result, so a cache hit replays the pair from whenever the test
-# last ran and the span reaches back to that run. The phase is stamped by
-# stage3 instead, across jobs that really ran.
+# last ran and the span reaches back to that run. The phase is stamped by the
+# `fanout` stage instead, across jobs that really ran.
 t0=$SECONDS
 
 # The pass/fail/abort/infra vocabulary, sourced into cli.sh via BASH_ENV so it

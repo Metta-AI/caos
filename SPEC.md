@@ -129,7 +129,9 @@ Run `time result/bin/caos-cli run-tool test`
 
 - `run-tool` does not fetch the output of the tool that it runs. It just prints the hash and the stdout part
 - `caos put` checks whether the server has each object while descending the tree, to avoid putting things that are already there
-- Mentions of `refs/caos/bins` are inconsistent. Does it still exist?
+- `refs/caos/bins` does NOT exist. Nothing creates it and nothing reads it: a
+  tool gets the tree under test and builds from source, so there is no ref of
+  prebuilt host binaries to resolve. Do not reintroduce one.
 
 # From agents
 

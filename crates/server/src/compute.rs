@@ -165,13 +165,11 @@ fn run_work_request_inner(
         stack,
         trace_id,
     } = *request;
-    // Unpack the ArgTree: the worker image (its reserved `image` entry — an
-    // embedded tree for a git image, a ref blob for `docker://`), std (its
-    // reserved `std` entry, a blob naming the std tree), and the cache-busting
-    // salt (its reserved `salt` entry). `std` names the standard library,
-    // materialized at `/cas/std` in the worker; `salt` is a cache-buster. All are
-    // part of the ArgTree (hence the key), threaded into the worker, and inherited
-    // by any promise sub-runs this request leaves behind.
+    // Unpack the ArgTree's two reserved entries: the worker `image` (an embedded
+    // tree for a git image, a ref blob for `docker://`) and the cache-busting
+    // `salt`. Both are part of the ArgTree — hence part of the cache key —
+    // threaded into the worker and inherited by any promise sub-runs this request
+    // leaves behind.
     let (image, salt) = read_arg_tree(config, arg_tree)?;
     let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
         Some(args_entries(config, arg_tree)?)
@@ -928,18 +926,13 @@ fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
     if std::env::var("CAOS_IMAGE_RESOLVE").as_deref() == Ok("none") {
         return Ok(image.to_string());
     }
-    // IMPLICIT FLAKE DETECTION IS GONE. The server used to notice that an image
-    // tree held `flake.nix` + `flake.lock` and quietly build it by looking
-    // `flake-builder` up BY NAME in the std library — which was its only
-    // semantic use of `std`, and the last thing keeping an ambient std alive
-    // (design/caos-expr.md). `.caos-expr` is what replaced it: a flake directory
-    // says `run DEEP-DEPS/flake-builder -- --in:@=.`, the CLIENT evaluates that,
-    // and the server is handed a real image. Making the step explicit is the
-    // whole point — the server holds an arg tree, not a project tree, so it
-    // could never resolve a dependency by descent the way a client can.
-    //
-    // Verified unreachable before removal: the suite ran with this branch
-    // replaced by an error and no job hit it.
+    // A git image tree, converted. NOT a flake: do not add a branch here that
+    // notices `flake.nix` + `flake.lock` and builds it. Doing so needs a builder
+    // resolved BY NAME out of an ambient library, which is the one thing the
+    // server must not have — it holds an arg tree, not a project tree, so it
+    // cannot resolve a dependency by descent the way a client can. A flake
+    // directory says `run DEEP-DEPS/flake-builder -- --in:@=.` and the CLIENT
+    // evaluates it, so what arrives here is already an image (design/caos-expr.md).
     convert_git_image(config, image)
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
 }

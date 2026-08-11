@@ -78,9 +78,10 @@ contract for that directory, and it compares them by BYTES rather than by store
 path — the same key `build-builtins.sh` uses for its image deltas. A workspace
 rebuild renames every store path but usually changes neither file, so editing a
 *worker* leaves the daemons untouched and `up` has only the std publish to do.
-Everything else the workspace builds reaches the stack as `refs/caos/bins` and
-the std curries, published from the store; nothing else travels through
-`/state/bin`.
+Everything else the workspace builds reaches the stack as the seeded core,
+published from the store by `build-builtins.sh`; nothing else travels through
+`/state/bin`. (`refs/caos/bins`, named here when this note was written, no
+longer exists — see `caos-expr.md`.)
 
 Staged, not bind-mounted from `/nix/store`: on macOS the engine is a VM that
 cannot see the host store, while `$CAOS_DATA` is already shared with it.

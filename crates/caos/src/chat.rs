@@ -16,9 +16,11 @@
 //! `chat <name>` is the explicit, scriptable form of the same turn.
 //!
 //! The workers run as `curry(runner, bin=<static binary>)` on the shared
-//! runner pool. By default both come ready-made from the published library
-//! (`/cas/std/bash-tool`, `/cas/std/llm-step` — see build-builtins.sh), so
-//! there is nothing to build or commit locally.
+//! runner pool. `llm-step` and `llm-call` are resolved through the WORKSPACE's
+//! own declared deps (`eval::eval_workspace_dep`, reading `/DEPS`) and built
+//! from source, so the tools a session talks to are the ones this checkout
+//! describes. `llm-step` binds its own tool images (std/llm-step/DEPS), so
+//! nothing here names bash-tool, rgrep or merge.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};

@@ -21,9 +21,10 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
 }
 
 echo "== stage the worker binaries and fixtures ==" >&2
-# The agent workers are std source entries now, not host binaries: chat resolves
-# /cas/std/{llm-step,bash-tool,rgrep} and builds each via rustc (design/caos-expr.md,
-# Phase 3). Only the LLM API stub stays a host binary.
+# The agent workers are std SOURCE entries, not host binaries: chat resolves
+# llm-step/llm-call through the workspace's own DEPS and builds each via rustc
+# (design/caos-expr.md, Phase 3). Only the LLM API stub is staged here, and only
+# because the test needs a server it can point the workers at.
 # The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
 # the executable is at bin/<name>. Copied out because materialized CAS content
 # is read-only and owner-only — exec straight from /cas is "Permission denied".
@@ -165,8 +166,7 @@ grep -qx "base" log.out && fail "--log printed the base commit"
 echo "  ok: both turns, no base" >&2
 
 echo "== talk (std worker curries): sticky pick continues $conv ==" >&2
-# The workers resolve from std, which builds them from source. (The CAOS_*_BIN
-# overrides this used to unset are deleted — see chat.rs.)
+# The workers resolve from the workspace's declared deps and build from source.
 T3_TEXT="sticky turn reply"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T3_TEXT" > stub/response-4.json
 

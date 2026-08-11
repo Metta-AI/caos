@@ -182,9 +182,9 @@ fn runner(job_json: &str) -> Result<(), String> {
 
 /// One job through the staged lifecycle: unpack the ArgTree, set up `/cas`,
 /// run `/worker`, read back `/cas/out`, tear down. The process is reused across
-/// jobs, so std/salt come from the ArgTree rather than our env: `/cas/std` is
-/// materialized from the ArgTree's value, and the worker child gets both as
-/// env vars — `caos map-then`/`curry` running under it read them from there.
+/// jobs, so the salt must come from the ArgTree rather than our env: the worker
+/// child gets it as an env var — `caos map-then`/`curry` running under it read
+/// it from there — and it is re-derived per job, never inherited.
 fn run_runner_job(
     t: &HttpTransport,
     job: &RunnerJob,
@@ -319,9 +319,10 @@ fn runner_post(
     req.send().map_err(|e| format!("POST {url}: {e}"))
 }
 
-/// Reset the worker-writable surface between jobs — the guarantees the disposable
-/// container used to give for free. `entrypoint` already wipes `/cas` on each run;
-/// here we reap any strays and clear the scratch dirs (`scratch()` writes /tmp).
+/// Reset the worker-writable surface between jobs. A pooled runner keeps the
+/// container across jobs, so nothing is disposed for us: `entrypoint` wipes
+/// `/cas` on each run, and here we reap strays and clear the scratch dirs
+/// (`scratch()` writes /tmp).
 fn reset_after_job() {
     let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
     reap_uid(uid);
@@ -332,7 +333,7 @@ fn reset_after_job() {
 
 /// SIGKILL every process owned by `uid`. The slot means one job at a time and the
 /// worker uid is dedicated, so this only reaps strays the just-finished worker
-/// left behind (the container teardown used to kill these implicitly).
+/// left behind — nothing else tears them down in a pooled container.
 fn reap_uid(uid: u32) {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
@@ -402,8 +403,7 @@ fn usage(args: &[String]) -> String {
 /// Set up a fresh `/cas` for one job: wipe whatever a prior job left, recreate
 /// it empty (fail if we can't), verify it supports the xattrs we rely on, then
 /// populate `/cas/args` from `args_hash` (one level, like `get-hash`), so the
-/// worker can read its inputs there. There is no `/cas/std`: std was a reserved
-/// arg on every request and no worker reads it any more (design/caos-expr.md).
+/// worker can read its inputs there.
 fn cas_setup(args_hash: Option<&str>) -> Result<std::path::PathBuf, String> {
     let cas = caos::cas_dir();
     remove_cas(&cas)?;

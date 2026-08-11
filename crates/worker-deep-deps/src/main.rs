@@ -13,23 +13,16 @@
 //! its `DEPS` is replaced by a `DEEP-DEPS/` subtree whose children are the named
 //! dependencies, each ITSELF deepened.
 //!
-//! ONE RUN, one pass. This used to recurse through `map_then` with this same
-//! image on both sides — a `node` job per directory to enumerate it, an
-//! `assemble` job per directory to rebuild it — so a tree of N directories cost
-//! ~2N containers.
-//!
-//! The split bought narrow cache keys for `assemble` (a directory's own files
-//! plus its deepened subgraph, so recompute was O(changed + dependents)) — but
-//! it never delivered them, because `node` is keyed on the WHOLE TREE and so
-//! re-ran for every directory on any edit. The tree changes on every edit that
-//! matters, so the common case paid ~N container spawns of pure orchestration to
-//! reach a cache that the same edit had already invalidated.
+//! ONE RUN, one pass — do not split it back into per-directory jobs. Recursing
+//! through `map_then` (a job to enumerate each directory, another to rebuild it)
+//! costs ~2N containers for N directories, and buys nothing: the enumerating
+//! job has to carry the WHOLE TREE to resolve relative deps, so it is keyed on
+//! the whole tree and re-runs for every directory on any edit — paying N
+//! container spawns to reach a cache that same edit just invalidated.
 //!
 //! Deepening is tree rewriting: no compiling, no network, nothing but reading a
-//! materialized tree and staging symlinks. One worker doing all of it is far
-//! cheaper than N containers doing it in pieces, and it stays cheap until the
-//! tree is very large — at which point the answer is to make the ONE pass
-//! incremental, not to reintroduce a per-directory container.
+//! materialized tree and staging symlinks. If this ever gets slow on a very
+//! large tree, make the ONE pass incremental.
 //!
 //! Sharing is by absolute path: a dependency reached from two places is deepened
 //! once and staged twice (as symlinks, so no bytes move), and `caos put` gives
@@ -66,9 +59,8 @@ fn run() -> Result<(), String> {
 ///
 /// `memo` maps an absolute tree path to a staged directory already deepened, so
 /// a dependency reached twice is computed once. `visiting` is the current
-/// dependency chain, which is what catches a cycle: the recursion used to
-/// re-enter the same `node` request and rely on the server's run-cycle
-/// detection, and a single pass has no server round trip to be caught by.
+/// dependency chain, and it is what catches a cycle — one pass makes no server
+/// round trip, so there is no run-cycle detection to fall back on.
 fn deepen(
     base: &str,
     rel: &str,

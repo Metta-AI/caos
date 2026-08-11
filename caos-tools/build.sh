@@ -116,12 +116,10 @@ reduce)
   # sentinel as `--run`, which forms exactly the key the core-seeder-runner
   # registered — so it answers with the pre-built image, no container.
   #
-  # It used to name the entry through an ambient library. A worker cannot
-  # evaluate a `.caos-expr` (that blocks on a run,
-  # which a worker may not do), and naming the entry directly hands the SERVER a
-  # raw flake tree to build — flake-builder building flake-builder. The entry we
-  # need is in the tree we were handed, at `in/std/flake-builder`, so nothing
-  # ambient is involved.
+  # Do not name the entry as the image instead: that hands the SERVER a raw
+  # flake tree to build — flake-builder building flake-builder. And a worker
+  # cannot evaluate the `.caos-expr` itself, because that blocks on a run. The
+  # entry is in the tree we were handed, at `in/std/flake-builder`.
   #
   # Each run ends a stage, so resolving it ends this one; `build-env` runs it.
   env=$(caos curry /cas/args/image -- \

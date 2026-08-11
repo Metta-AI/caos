@@ -275,16 +275,11 @@ fanout)
     #   - A HASH BOUND AS A LITERAL. `rustc`'s seed result binds `--cargo=<hash>`
     #     that way, and `rustc` is a sentinel entry with no DEPS of its own — so
     #     anything built by rustc still names `cargo`.
-    #   - A NAME THE SERVER OR CLIENT LOOKS UP. Running a raw flake tree makes
-    #     the server resolve `flake-builder` BY NAME, and `std_image("bash")`
-    #     resolves `flake-builder` by name — a nested mount does not satisfy
-    #     either, so both stay named even where an edge also supplies them.
     #
-    # And grep the CLIENT too, not just the test: `caos-cli talk` resolves
-    # runner/bash-tool/llm-call/llm-step/rgrep/bash from constants in chat.rs,
-    # and a Rust worker builds its path with `std_image("bash")`
-    # (tests/commit) — neither shows up in a search for /cas/std in the test
-    # directory.
+    # Read the CLIENT too, not just the test directory: what `caos-cli talk`
+    # reaches for comes from the WORKSPACE's `/DEPS` (chat.rs, via
+    # `eval::eval_workspace_dep`), so a test that drives the CLI inherits that
+    # list and has to name it here.
     mkdir -p "/tmp/sel/$t/std"
     if [ -e "$d/DEPS" ]; then
       caos get "/cas/args/ws/tests/$t/DEPS"

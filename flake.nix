@@ -618,16 +618,16 @@
           workerCargoImage
         ];
 
-        # The worker binaries build-builtins.sh needs at publish — curried
-        # onto std/runner (the agent harness, rustc, the example workers) and
-        # published whole as refs/caos/bins (the build/test tools' input).
-        # Handed over prebuilt so caosd needs no runtime nix. It finds each
-        # binary under /bin, so these may share one consolidated output.
+        # The worker binaries build-builtins.sh needs at publish, to curry onto
+        # std/runner (rustc, deep-deps). Handed over prebuilt so caosd needs no
+        # runtime nix. It finds each binary under /bin, so these may share one
+        # consolidated output.
         builtinWorkerBins = [
           worker-deep-deps
-          # Not curries: these ride only in refs/caos/bins — the test
-          # suite's own image pipeline stages them (std's runner bakes its
-          # /worker in workerRunnerImage; std/cargo compiles its own).
+          # Not curried, and not reached from here at all: the test suite's own
+          # image pipeline stages these (std's runner bakes its /worker in
+          # workerRunnerImage; std/cargo compiles its own). They are listed so
+          # the deploy carries them, nothing more.
           worker-cargo
           worker-runner
           # Published as curry(runner, worker1) with the cargo ref and the
@@ -724,9 +724,9 @@
             # EXACTLY the binaries serve runs — its documented contract is
             # "CAOS_STACK_BIN: dir holding `server`, `runnerd`" and, when the
             # seeder is enabled, `core-seeder-runner` (design/caos-expr.md Phase
-            # 3). Everything else the workspace builds reaches the
-            # stack as refs/caos/bins and the std curries, from the store,
-            # never through here.
+            # 3). Everything else the workspace builds reaches the stack as the
+            # seeded core (build-builtins.sh publishes it from the store), never
+            # through here — do not widen STACK_BINS to smuggle a worker in.
             BINSRC=${workspaceBins}/bin
             BINDIR=$CAOS_DATA/stack/bin
             STACK_BINS=(server runnerd core-seeder-runner)
@@ -774,29 +774,24 @@
                 bash ${self}/build-builtins.sh >/dev/null
             }
 
-            # Does the registry still hold everything std NAMES? A delta entry's
-            # `base` is a digest ref, and a wiped registry leaves std pointing at
-            # blobs that are gone — which otherwise surfaces as every test
-            # failing deep inside the fan-out rather than as one clear statement
-            # here (design/one-stack-image.md).
+            # Does the registry still hold every image the SEED RECORDS name? A
+            # seeded item's RESULT is a delta whose `base` is a digest ref, and a
+            # wiped registry leaves the seed pointing at blobs that are gone —
+            # which otherwise surfaces as every test failing deep inside the
+            # fan-out rather than as one clear statement here
+            # (design/one-stack-image.md).
+            #
+            # Walk `refs/caos/seed`, NOT the entries under `std/`: an entry is a
+            # source directory carrying a `.caos-expr`, so it names no digest at
+            # all and a walk over entries would verify nothing.
             #
             # Checked through localhost:5000 — the name the DOCKER DAEMON pulls
-            # with. std's refs spell the same registry caos-registry:5000, which
-            # is how the SERVER reaches it; one registry, two names, so the check
-            # says which one it used.
-            # Does the registry still hold every image the SEED RECORDS name?
+            # with. The seed's refs spell the same registry caos-registry:5000,
+            # which is how the SERVER reaches it; one registry, two names, so the
+            # check says which one it used.
             #
-            # This used to walk `refs/caos/std` looking for a delta entry's
-            # `base`. It checked nothing at all once every std entry became a
-            # source dir carrying a `.caos-expr` (design/caos-expr.md): no entry
-            # has a `base` any more, so every iteration hit `continue` and it
-            # reported "std is intact" having verified zero digests. The images
-            # moved to `refs/caos/seed` — a seeded item's RESULT is the delta,
-            # and that is what names a registry digest.
-            #
-            # The `checked` counter exists because of exactly that failure: a
-            # guard that silently verifies nothing is worse than no guard, so
-            # finding no digests is itself an error.
+            # `checked` must stay: a guard that silently verifies nothing is worse
+            # than no guard, so finding no digests is itself an error.
             std_check() {
               local reg=localhost:5000 tree missing=0 checked=0 oid name base digest code
               [ -d "$CLIENT" ] \

@@ -31,7 +31,7 @@
 //! The design sketches a *live answerer* — a thread answering from the current
 //! seed map while a main thread extends it in dependency order — because
 //! forming a core item's key can dispatch *another* core item's build (e.g.
-//! cargo's expr runs `/std/flake-builder`). That is only needed once we convert
+//! cargo's expr runs std/flake-builder). That is only needed once we convert
 //! a core item whose `.caos-expr` names another *core std* item as its
 //! builder/image. `flake-builder` names the `docker://seeded` sentinel, which
 //! `resolve_expr_image` passes straight through with **no dispatch**, so

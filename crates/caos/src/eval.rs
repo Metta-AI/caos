@@ -73,7 +73,7 @@ pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String
 /// This is the rule [`resolve_expr_image`] applies to a path named *inside* an
 /// expression, lifted to the CLI boundary — so a caller reaches a dependency by
 /// its deep-deps mount (`run DEEP-DEPS/rgrep`) exactly as an expression does,
-/// instead of by an ambient `/cas/std/<name>`.
+/// rather than by any name looked up outside the tree it was handed.
 pub(crate) fn eval_tree(t: &dyn Transport, tree: &str) -> Result<String, String> {
     eval_path(t, tree, "").map(|(_kind, oid)| oid)
 }
@@ -261,8 +261,10 @@ fn eval_command(
 }
 
 /// Resolve the image token of a command to a ref: a `$NAME` variable, a
-/// `/std/<name>` builtin, a bare hash, or a relative path naming an image tree
-/// (a flake dir or a git-docker image) within `input_tree`.
+/// `docker://` ref, a bare hash, or a relative path naming an image tree (a
+/// flake dir, a git-docker image, or an evaluable directory) within
+/// `input_tree`. A path is the only way to name another tree — there is no
+/// by-name lookup, so an expression can reach only what its own tree holds.
 fn resolve_expr_image(
     t: &dyn Transport,
     input_tree: &str,
@@ -279,7 +281,7 @@ fn resolve_expr_image(
     // image, not a tree, so there is nothing to resolve. This is how a core
     // item breaks a resolution-time cycle: `flake-builder`'s `.caos-expr` names
     // its own image as the sentinel `docker://seeded`, so evaluating it never
-    // re-enters `/std/flake-builder` (design/caos-expr.md, "Breaking the
+    // re-enters flake-builder's own entry (design/caos-expr.md, "Breaking the
     // cycles"). The formed arg-tree carries the ref as a blob (image_arg_entry),
     // exactly what the seeder registers and answers.
     if tok.starts_with(crate::DOCKER_SCHEME) {
@@ -295,11 +297,11 @@ fn resolve_expr_image(
     }
     // Evaluate the subtree's own `.caos-expr` (if any) to the image it builds,
     // so a path to an EVALUABLE dependency resolves to its image, not its raw
-    // source. This is what lets a core item name a dep by a local path instead
-    // of `/std/<name>`: a deep-deps mount at `DEEP-DEPS/<name>` carries that
-    // dep's (deepened) source, and `run DEEP-DEPS/<name>` here resolves it
-    // through the dep's own `.caos-expr` — the same resolution `/std/<name>`
-    // gets. A subtree with NO `.caos-expr` evaluates to itself, so a plain flake
+    // source. This is what lets a core item name a dep by a LOCAL path: a
+    // deep-deps mount at `DEEP-DEPS/<name>` carries that dep's (deepened)
+    // source, and `run DEEP-DEPS/<name>` here resolves it through the dep's own
+    // `.caos-expr`, so the dep's build is the dep's business.
+    // A subtree with NO `.caos-expr` evaluates to itself, so a plain flake
     // dir or a git-docker image tree passes through unchanged. (For a seeded
     // worker this dispatches its build — which is why forming a `run` expr's
     // key needs that worker already seeded; see design/caos-expr.md, the
@@ -310,7 +312,7 @@ fn resolve_expr_image(
 
 /// Resolve a command's `--name[:@]=value` args to tree entries, against
 /// `input_tree`. See the module grammar: `$NAME`, a literal blob, or a `:@=`
-/// path (within the tree, or a `/std/<name>` builtin).
+/// path (within the tree, relative to the `.caos-expr`'s directory).
 fn resolve_expr_args(
     t: &dyn Transport,
     input_tree: &str,
@@ -363,8 +365,9 @@ fn resolve_expr_args(
     Ok(entries)
 }
 
-/// Resolve a `:@=` path value: a `/std/<name>` builtin, or a path within
-/// `input_tree` (relative to the `.caos-expr`'s directory).
+/// Resolve a `:@=` path value: a path within `input_tree`, relative to the
+/// `.caos-expr`'s directory. Paths only — a `:@=` value cannot name anything
+/// outside the tree being evaluated.
 fn resolve_expr_path(
     t: &dyn Transport,
     input_tree: &str,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs *inside* a bash worker (launched by this test's cli.sh). The test directory is at
-# /cas/args/test and builtins are at /cas/std/<name>, all in a real /cas.
+# Runs *inside* a bash worker (launched by this test's cli.sh). The test
+# directory is at /cas/args/test, in a real /cas.
 #
 # Proves a git symlink survives the round trip into a worker: the fixture tree/
 # holds a real file and a symlink to it. caos ingests the directory (reusing git's

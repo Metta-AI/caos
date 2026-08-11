@@ -14,7 +14,7 @@ edition = "2021"
 
 [dependencies]
 # The same minimal synchronous HTTP server the caos server uses. Anchored in
-# crates/bake-anchor so the /std/cargo bake keeps vendoring it (tests/std-lint).
+# crates/bake-anchor so the std/cargo bake keeps vendoring it (tests/std-lint).
 tiny_http = "0.12"
 
 [[bin]]

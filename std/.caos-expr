@@ -1,11 +1,11 @@
 # The std library's ROOT expression (design/caos-expr.md, "Deep deps"): std is
 # published UN-deepened — every entry carries the `DEPS` file it was checked in
 # with — and this expression is what turns that into the deepened tree callers
-# resolve against. Every `/cas/std/<name>` resolution (`resolve_std_image` →
-# `eval_std_entry` → `eval_path`) applies this first, so an entry's
-# `DEEP-DEPS/<dep>` mounts are computed by the REAL deep-deps worker at resolve
-# time instead of being baked in by bootstrap. That is what makes the checked-in
-# tree self-resolving: std is now resolved BY DESCENT, not by a pre-deepened ref.
+# resolve against. `eval-path` into `std/<name>` applies this first, so an
+# entry's `DEEP-DEPS/<dep>` mounts are computed by the REAL deep-deps worker at
+# resolve time instead of being baked in by bootstrap. That is what makes the
+# checked-in tree self-resolving: an entry is reached BY DESCENT through this
+# expression, never by a name looked up against a pre-deepened ref.
 #
 # `deep-deps` names the sibling entry BY PATH, and that is what breaks cycle-2
 # (design/caos-expr.md, "Breaking the cycles"): `resolve_expr_image` evaluates

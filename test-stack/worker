@@ -76,7 +76,6 @@ caos get -r /cas/args
 
 # The OUTER run's salt must not reach the inner client (the phase-3
 # isolation lesson). Scrubbed here, so nothing worker1 starts inherits it.
-# (CAOS_STD went with the `std` arg — nothing threads a std tree any more.)
 unset CAOS_SALT
 
 SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
@@ -100,10 +99,10 @@ INNER=http://127.0.0.1
 # It has to happen HERE, before the env flips, because $CAOS_SERVER_URL is the
 # outer server only until then.
 #
-# The ref is an ANCHOR, not a lookup. Nothing resolves a builtin by name any more
-# (there is no `refs/caos/std` and no `/cas/std/<name>`); a test reaches its deps
-# by path, through the `DEEP-DEPS/` copy run-test.sh puts in its repo. This just
-# keeps the fetched objects reachable so they are not collectable.
+# The ref is an ANCHOR, not a lookup — do not add a by-name resolution over it.
+# A test reaches its deps by PATH, through the `DEEP-DEPS/` copy run-test.sh puts
+# in its repo; this ref exists only to keep the fetched objects reachable so they
+# are not collectable.
 DEPS_HASH=$(caos hash /cas/args/in/std) || fail "no deps in the wrapper — the caller hands each job the entries it declared"
 SEED=/tmp/seed-git
 git init -q --bare "$SEED" || fail "creating the seed repo"

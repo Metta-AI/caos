@@ -573,15 +573,17 @@ caos-cli run-tool test --only="unit-test rgrep" # just these tests (cache shared
 CAOS_SALT=$(date +%s) caos-cli run-tool test   # force a re-run (retry a flake)
 ```
 
-Compiling is nix's job: `caosd up` publishes the nix-built workspace
-binaries as `refs/caos/bins`, `run-tool` resolves that ref and passes its
-hash as `--bins`, and nothing recompiles inside caos. (After a Rust edit:
-`nix build && caosd up`, then test.)
+nix builds only the *host* stack — the server, the runner daemon, the seeder,
+and the seeded core images. Everything the suite tests is compiled from the
+tree under test, inside caos, by `std/cargo` and `std/rustc`; no host binary
+is handed in. (After a Rust edit: `nix build && caosd up`, then test. After
+editing anything under `std/`, the same — a std tree is part of the seed keys.)
 
 The test tool (`caos-tools/test.sh`, carried by this tree) is the suite
-worker, in three stages of one script: build the worker images via
-`caos-tools/build.sh`, fan out one job per `tests/<name>/cli.sh`,
-summarize. A test is a directory `tests/<name>/`
+worker, in five stages of one script: `suite` builds the worker images via
+`caos-tools/build.sh`, `deepener` and `deepen` expand every test's `DEPS`
+into `DEEP-DEPS/` mounts, `fanout` runs one job per `tests/<name>/cli.sh`,
+and `summarize` assembles the report. A test is a directory `tests/<name>/`
 with a `cli.sh`, which runs inside a test-stack worker, cwd'd into a client
 repo with the test tree at `./test` and `$CAOS_CLI` set, driving
 computations through `caos-cli` against a nested caos stack built from

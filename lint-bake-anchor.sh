@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/std-lint check: every crates.io dependency a source-built std tool
 # declares must be present in the bake-anchor crate (crates/bake-anchor), so the
-# /std/cargo bake vendors+precompiles it (design/caos-expr.md, Phase 3). Source
+# std/cargo bake vendors+precompiles it (design/caos-expr.md, Phase 3). Source
 # std tools live OUTSIDE the workspace and compile against that bake; a dep the
 # anchor lacks would recompile from scratch or fail (workers have no network).
 #
@@ -33,7 +33,7 @@ for toml in std/*/Cargo.toml; do
     [ -n "$dep" ] || continue
     if ! grep -qxF "$dep" <<<"$anchored"; then
       echo "lint-bake-anchor: $toml needs crates.io dep '$dep', but $anchor does not anchor it" >&2
-      echo "  add '$dep' to $anchor so the /std/cargo bake precompiles it" >&2
+      echo "  add '$dep' to $anchor so the std/cargo bake precompiles it" >&2
       fail=1
     fi
   done < <(crates_io_deps "$toml")

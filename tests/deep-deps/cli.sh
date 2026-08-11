@@ -8,7 +8,7 @@
 # inside it under `DEEP-DEPS/`. A `DEPS` line is `<path> <name>`: the path is
 # relative to the DEPS file's OWN directory (so `../..` reaches parents), and
 # the name is the mount. There is no special `packages` root — it is a
-# whole-tree transform, published as the std entry /cas/std/deep-deps. That
+# whole-tree transform, published as the std entry std/deep-deps. That
 # entry is itself a HAND-DEEPENED source entry (design/caos-expr.md, Phase 3):
 # `{.caos-expr, worker, DEEP-DEPS/runner}`, the deepened form of a checked-in
 # `{.caos-expr, DEPS, worker}` whose `.caos-expr` is `curry DEEP-DEPS/runner --
@@ -83,8 +83,9 @@ echo "  ok: every node reaching bar recomputed" >&2
 
 echo "== a dependency cycle is detected (by the worker) ==" >&2
 # Close a loop: lib/bar -> app, so app -> bar -> app. The deepen is ONE pass in
-# one worker, so it tracks the chain itself and NAMES it. It used to recurse
-# through map_then and be caught by the SERVER's run-cycle detection instead.
+# one worker, so nothing else can catch this: there is no server round trip, and
+# so no run-cycle detection to fall back on. The worker tracks the chain itself
+# and must NAME it.
 printf '../../app loop\n' > tree/lib/bar/DEPS
 commit "cycle"
 if deepen tree outD 2>cyc.err; then

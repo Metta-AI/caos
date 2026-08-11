@@ -5,8 +5,8 @@
 # delta. The sentinel is distinct (`docker://seeded-runner`) so its key cannot
 # collide with another minimal-entry core item's.
 #
-# It exists as an ENTRY, rather than the raw delta it used to be published as,
-# because a `DEPS` line has to name a PATH: `std/rustc/DEPS` says `../runner`,
-# and a tree cannot be self-resolving if one of its dependencies is not in it.
-# That is also what lets the repo-root `.caos-expr` deepen this tree at all.
+# It must exist as an ENTRY, not a bare delta, because a `DEPS` line names a
+# PATH: `std/rustc/DEPS` says `../runner`, and a tree cannot be self-resolving
+# if one of its dependencies is not in it. That is also what lets the repo-root
+# `.caos-expr` deepen this tree at all.
 run docker://seeded-runner -- --in:@=.

@@ -4579,7 +4579,7 @@ mod tests {
             tools: vec![caos::chat::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),
-                image: "/cas/std/bash".to_string(),
+                image: "docker://caos-std-bash".to_string(),
             }],
         }));
         let (mut app, _) = app_with(vec![conversation]);
@@ -4608,7 +4608,7 @@ mod tests {
         assert!(rendered.contains("talk-1/from-user:caos-tools"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("Build everything the tree defines."));
-        assert!(rendered.contains("[/cas/std/bash]"));
+        assert!(rendered.contains("[docker://caos-std-bash]"));
 
         app.handle_key(KeyEvent::new(
             KeyCode::Char('T'),

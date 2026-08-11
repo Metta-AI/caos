@@ -1,5 +1,5 @@
 # bake-anchor — this crate exists ONLY to keep the std tools' crates.io
-# dependencies in the workspace, so the /std/cargo bake (std/cargo/bake.nix,
+# dependencies in the workspace, so the std/cargo bake (std/cargo/bake.nix,
 # built `--workspace`) vendors and precompiles them. Source-built std tools
 # (rgrep, llm-call, llm-step, …) live OUTSIDE the workspace and are compiled by
 # rustc against that bake; without an anchor, deleting their old workspace crates

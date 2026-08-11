@@ -47,6 +47,13 @@ runner image, one warm pool, per-worker cost of one small blob.
 
 ## Resolution: how a flake becomes a digest
 
+> **Superseded by `caos-expr.md` (2026-08).** The server no longer detects
+> flakes: `resolve_flake_image` and its by-name builder lookup are DELETED.
+> A flake directory carries a `.caos-expr` (`run DEEP-DEPS/flake-builder --
+> --in:@=.`) and the CLIENT evaluates it, so what reaches the server is
+> already an image. The stage machinery below is still what
+> `std/flake-builder/worker` does; only the entry point changed.
+
 `resolve_image` (server `compute.rs`): `docker://` passes through; a flake
 tree goes to `resolve_flake_image`; anything else hex is a git-docker tree.
 

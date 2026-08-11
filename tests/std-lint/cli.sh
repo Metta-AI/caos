@@ -10,7 +10,7 @@
 # The check IS the generator run in --check mode (one script, one code
 # path), so the lint cannot drift from what a refresh would write. The
 # workspace arrives in this test's wrapper, staged as $CAOS_PROJECT
-# (caos-tools/test.sh, stage3). Fast: no compiles, no caos jobs.
+# (caos-tools/test.sh, the `fanout` stage). Fast: no compiles, no caos jobs.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
