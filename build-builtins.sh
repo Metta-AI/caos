@@ -2,15 +2,14 @@
 # Bootstrap the SEEDED CORE: build the handful of images that cannot be built by
 # the machinery they are, and publish them as seed records under `refs/caos/seed`.
 #
-# It no longer publishes a std library. Every `std/<name>` is a checked-in source
+# It publishes NO std library: every `std/<name>` is a checked-in source
 # directory whose `.caos-expr` says how it is built, and a consumer reaches it by
 # DESCENT — a `DEPS` line naming a path, expanded by a root `.caos-expr` into a
-# `DEEP-DEPS/<name>` mount (design/caos-expr.md). There is no `refs/caos/std`, no
-# `/cas/std/<name>`, and nothing resolves a builtin by an ambient name.
+# `DEEP-DEPS/<name>` mount (design/caos-expr.md). Nothing resolves a builtin by
+# an ambient name, so do not add a ref for one.
 #
-# What is left is the irreducible core. Five entries name a `docker://seeded…`
-# sentinel instead of a real builder, because each would otherwise have to build
-# itself:
+# The irreducible core: five entries name a `docker://seeded…` sentinel instead
+# of a real builder, because each would otherwise have to build itself:
 #
 #   flake-builder  a flake built by the flake-builder
 #   cargo          a flake, so likewise
@@ -41,7 +40,7 @@ names=("$@")
 [ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step deep-deps rustc llm-stub)
 
 # Which entries have a HOST-BUILT nix image behind them. This is the whole
-# partition now: everything else is a checked-in source directory this script
+# partition: everything else is a checked-in source directory this script
 # only reads (to compute a seed key), never builds.
 #
 #   flake-builder  the bootstrap image
@@ -50,9 +49,6 @@ names=("$@")
 #                  the binaries, so its deps are cargoArtifacts rather than a
 #                  second compile of them
 #
-# It used to be an `is_source_entry` list of everything EXCEPT these three, which
-# had to be edited every time an entry was added — and said nothing, since a
-# source entry is just the default.
 has_host_image() {
   case "$1" in
     flake-builder | runner | cargo) return 0 ;;
@@ -120,7 +116,7 @@ done
 # The worker binaries published as curries over runner (bin_names below).
 # Prebuilt store paths arrive via CAOS_BUILTIN_BINS (how caosd avoids
 # runtime nix), else they're nix-built here. Nothing is staged into flake
-# trees anymore: runner's /worker bakes into its streamed image, cargo's
+# trees: runner's /worker bakes into its streamed image, cargo's
 # compiles in-flake from the vendored source.
 bin_names=(deep-deps rustc)
 if [ -n "${CAOS_BUILTIN_BINS:-}" ]; then
@@ -217,27 +213,23 @@ ln -s /bin/env "$ADD/usr/bin/env"
 printf 'root:x:0:0:root:/root:/sbin/nologin\nworker:x:1000:1000:caos worker:/tmp:/sbin/nologin\n' \
   > "$ADD/etc/passwd"
 printf 'root:x:0:\nworker:x:1000:\n' > "$ADD/etc/group"
-# The world-writable /tmp. Its 1777 mode is a sidecar because git records no
-# modes beyond the exec bit — but the DIRECTORY is now carried by a keep-file
-# rather than as an empty tree, and that is load-bearing.
+# The world-writable /tmp. Its 1777 mode rides in a sidecar because git records
+# no modes beyond the exec bit, and the DIRECTORY is carried by a keep-file
+# because it must not be EMPTY.
 #
-# It used to be spliced in below as git's empty tree. That is a legal tree entry
-# and git transfers it fine, but an empty directory does not survive a
-# materialize -> read -> re-put round trip, so ANY worker that rebuilds a tree
-# from the filesystem silently drops it. deep-deps is such a worker: deepening
-# the runner delta returned a tree with `layer00/tmp` GONE, which made the
-# worker-deepened entry disagree with this script's hand-deepen and broke every
-# seeded key that reached the runner (measured: 7 tests, all rustc-built tools).
-#
-# A keep-file makes the directory ordinary, so nothing anywhere has to special
-# case it — the same move as the sidecar beside it, one step further.
+# An empty directory is a legal git tree entry, but it does not survive a
+# materialize -> read -> re-put round trip, so any worker that rebuilds a tree
+# from the filesystem silently drops it — deep-deps is one, and a dropped
+# `layer00/tmp` makes the worker-deepened entry disagree with the hand-deepen
+# below, which breaks every seeded key that reaches the runner. Do not replace
+# the keep-file with an empty tree.
 mkdir -p "$ADD/tmp"
 printf 'This file exists so that /tmp is a NON-EMPTY directory.\n\nAn empty directory is not representable in a git worktree and does not survive\na materialize -> read -> re-put round trip, so a worker that rebuilds a tree\nfrom the filesystem (deep-deps) drops it. /tmp must exist in the image, so it\ncarries this file. Its 1777 mode rides in the tmp.caosmeta sidecar.\n' \
   > "$ADD/tmp/.caos-keep"
 printf '{"mode":"1777","uid":0,"gid":0}' > "$ADD/tmp.caosmeta"
 git -C "$CLIENT" add layer-additions
-# No splice any more: `tmp` is an ordinary directory in the staged layout, so
-# `write-tree` carries it like everything else.
+# `tmp` is an ordinary directory in the staged layout, so `write-tree` carries
+# it like everything else.
 additions_tree=$(git -C "$CLIENT" write-tree --prefix=layer-additions/)
 
 # Each streamed image's /worker, its own layer. worker-runner is the pool
@@ -316,34 +308,17 @@ for name in "${image_names[@]}"; do
   echo "$name: git-docker delta ${hash_of[$name]} over $ctag" >&2
 done
 
-# refs/caos/bins is GONE (2026-07-30). It carried the HOST's nix-built binaries
-# into caos so in-caos tools would not have to compile the workspace themselves
-# — `run-tool` resolved the ref and passed its hash as `--bins`. The suite has
-# compiled from source for some time now (caos-tools/test.sh: "There is no
-# --bins: the tree under test is compiled from source"), so the ref had
-# no reader left; only this publisher and the auto-arg in cli_run_tool.
+# ---- the hand-deepen: SEED KEYS ONLY, never published -----------------------
+# A seeded core item's arg-tree `in` is its DEEPENED entry — what a root
+# `.caos-expr` produces — and bootstrap must know that hash before any stack
+# exists to compute it. So it hand-deepens here, and the hand-deepen must match
+# the deep-deps worker BYTE FOR BYTE or the seeder registers a key no caller ever
+# forms. Only `cargo` has DEPS among the seeded core (the rest are DEPS-free, so
+# their deepened form is identity), which is where that identity bites.
 
-# ---- std entries: published UN-deepened; hand-deepened only for seed keys ----
-# Every std entry is a checked-in SOURCE tree whose `.caos-expr` builds it on
-# resolution (design/caos-expr.md, Phase 3), EXCEPT `runner` — a leaf image with
-# no source. What we PUBLISH is that source verbatim, DEPS and all, under a std
-# root carrying `std/.caos-expr` (`run deep-deps -- --in:@=.`): resolving
-# `/cas/std/<name>` evaluates that root expression first, so the REAL deep-deps
-# worker computes each entry's `DEEP-DEPS/<dep>` mounts at resolve time. std is
-# resolved BY DESCENT; nothing here bakes the deepened shape into the ref.
-#
-# `deepen_entry` below survives for ONE purpose: forming SEED KEYS. A seeded core
-# item's arg-tree `in` is its DEEPENED entry — what the root expression produces
-# — and bootstrap must know that hash before any stack exists to compute it. So
-# it hand-deepens, and the hand-deepen must match the worker BYTE FOR BYTE or the
-# seeder registers a key no caller ever forms. Today only `cargo` has DEPS among
-# the seeded core (flake-builder, rustc and deep-deps are DEPS-free, so their
-# deepened form is identity), which is where that identity is load-bearing.
-
-# runner/cargo/flake-builder were hand-built as git-docker deltas into hash_of[]
-# by the image loop above. Capture those deltas before the deepen pass overwrites
-# the std entries with source trees: runner STAYS a delta (a leaf image), while
-# cargo's and flake-builder's deltas become SEED RESULTS.
+# The image loop above left git-docker deltas in hash_of[]. Capture them before
+# the deepen pass overwrites those entries with their source trees: each delta is
+# a SEED RESULT.
 runner_delta=${hash_of[runner]:-}
 cargo_delta=${hash_of[cargo]:-}
 fb_delta=${hash_of[flake-builder]:-}
@@ -374,17 +349,12 @@ stage_source() { # <name>
   undeepened[$1]=$(git -C "$CLIENT" write-tree --prefix="$1/")
 }
 
-# A compiled-worker BINARY is no longer staged into any std entry: the runner-
-# pool leaves (bash-tool, llm-*) are source-built by rustc, and the seeded core
-# (rustc, deep-deps) has its curry hand-built as a SEED RESULT below — the
-# checked-in entry is just a `.caos-expr` sentinel. So there is no `stage_worker`.
-
 for name in "${names[@]}"; do
-  # EVERY entry is now a checked-in source dir — `runner` included. It used to be
-  # published as the raw delta, which meant `std/runner` was a name with no
-  # directory behind it: `std/rustc/DEPS` says `../runner`, and a tree cannot be
-  # self-resolving when a declared dependency is not IN it. It is a
-  # `{.caos-expr}` sentinel now, seeded like flake-builder (below).
+  # EVERY entry is a checked-in source dir, `runner` included: `std/rustc/DEPS`
+  # says `../runner`, and a tree cannot be self-resolving when a declared
+  # dependency is not IN it. Publishing runner as a bare delta would leave
+  # `std/runner` a name with no directory behind it; it is a `{.caos-expr}`
+  # sentinel, seeded like flake-builder (below).
   stage_source "$name"
 done
 
@@ -443,7 +413,6 @@ for name in "${names[@]}"; do
   echo "$name: deepened entry (seed key) ${hash_of[$name]}" >&2
 done
 
-
 # ---- seed records (design/caos-expr.md, Phase 3) ----------------------------
 # The irreducible core can't be built by the machinery it IS, so bootstrap
 # hand-builds each core artifact and publishes a SEED RECORD per item under
@@ -491,8 +460,8 @@ fi
 # rustc/deep-deps: SEEDED core. Their `.caos-expr` is a distinct sentinel
 # (`run docker://seeded-{rustc,deep-deps} -- --in:@=.`), so the caller's key is
 # `{ image: <blob of that sentinel>, in: <the {.caos-expr} entry> }`. The RESULT
-# is the hand-built curry over the runner pool — the shape these used to be
-# published as directly, now a seed result instead of a staged-binary entry.
+# is the hand-built curry over the runner pool: a binary bound onto the runner,
+# which is what the entry would have resolved to if it could build itself.
 if [ -n "$runner_delta" ] && [ -n "${bin_path[deep-deps]:-}" ] && [ -n "${hash_of[deep-deps]:-}" ]; then
   install -m 755 "${bin_path[deep-deps]}/bin/worker-deep-deps" "$CLIENT/seed-deep-deps"
   git -C "$CLIENT" add seed-deep-deps
