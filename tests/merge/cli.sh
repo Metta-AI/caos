@@ -20,7 +20,7 @@ mkcommit() { # <tree> <message> [parent...] -> a commit minted with plain git
 # The merged commit M's hash from a std/merge run: run streams a commit result
 # as raw bytes, so hash them and fetch M's closure into the local repo.
 run_merge() { # <ours> <theirs> -> prints M, fetches it
-  "$CAOS_CLI" run /cas/std/merge -- --ours:commit="$1" --theirs:commit="$2" > m.commit \
+  "$CAOS_CLI" run DEEP-DEPS/merge -- --ours:commit="$1" --theirs:commit="$2" > m.commit \
     || fail "merge run failed"
   local m; m=$(git hash-object -t commit --stdin < m.commit)
   git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$m" || fail "fetch M ($m)"

@@ -29,7 +29,7 @@ tgt="$(uname -m)-unknown-linux-musl"
 
 echo "== cargo clippy of the workspace, per-crate, in caos workers ==" >&2
 ok=1
-"$CAOS_CLI" run /cas/std/cargo r2 -- --tree:@=ws --cmd=clippy --mode=all \
+"$CAOS_CLI" run DEEP-DEPS/cargo r2 -- --tree:@=ws --cmd=clippy --mode=all \
   "--target=$tgt" >/tmp/r2.log 2>&1 || ok=0
 cat /tmp/r2.log >&2
 if [ "$ok" = 0 ] || [ ! -e r2/exit ] || [ "$(cat r2/exit)" != "0" ]; then

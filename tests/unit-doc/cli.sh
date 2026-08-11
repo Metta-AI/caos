@@ -22,7 +22,7 @@ tgt="$(uname -m)-unknown-linux-musl"
 
 echo "== cargo doc of the workspace, per-crate, in caos workers ==" >&2
 ok=1
-"$CAOS_CLI" run /cas/std/cargo r3 -- --tree:@=ws --cmd=doc --mode=all \
+"$CAOS_CLI" run DEEP-DEPS/cargo r3 -- --tree:@=ws --cmd=doc --mode=all \
   "--target=$tgt" >/tmp/r3.log 2>&1 || ok=0
 cat /tmp/r3.log >&2
 if [ "$ok" = 0 ] || [ ! -e r3/exit ] || [ "$(cat r3/exit)" != "0" ]; then

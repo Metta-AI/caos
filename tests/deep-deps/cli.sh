@@ -37,7 +37,7 @@ build_fixture() { # <root-dir>
 }
 
 deepen() { # <in-dir> <out-dir>
-  "$CAOS_CLI" run /cas/std/deep-deps "$2" -- --in:@="$1"
+  "$CAOS_CLI" run DEEP-DEPS/deep-deps "$2" -- --in:@="$1"
 }
 
 build_fixture tree

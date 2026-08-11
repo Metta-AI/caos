@@ -21,7 +21,7 @@ commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -q
 echo "== build the fixture worker from its source ==" >&2
 # No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
 # the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry /cas/std/rustc --)
+builder=$("$CAOS_CLI" curry DEEP-DEPS/rustc --)
 "$CAOS_CLI" run "$builder" img -- --src:@=test/worker.rs
 commit "built file-count"
 worker=$(git rev-parse HEAD:img)

@@ -35,7 +35,7 @@ commit "salted sources"
 # builder compiles src and curries the result into this runner.
 # No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
 # the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry /cas/std/rustc --)
+builder=$("$CAOS_CLI" curry DEEP-DEPS/rustc --)
 
 # The builder's result is a worker image (a curry node over the runner). The CLI
 # checks results out as files, so re-ingest the checkout through git to get the

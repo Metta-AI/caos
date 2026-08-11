@@ -27,7 +27,7 @@ echo "== stage the worker binaries and fixtures ==" >&2
 # The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
 # the executable is at bin/<name>. Copied out because materialized CAS content
 # is read-only and owner-only — exec straight from /cas is "Permission denied".
-"$CAOS_CLI" get /cas/std/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
+"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
 stub_bin=/tmp/llm-stub-bin
 install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
 

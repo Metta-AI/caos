@@ -45,6 +45,17 @@ use super::{
     post_object, request_compute, resolve_std_image, Transport,
 };
 
+/// Evaluate a tree's own root `.caos-expr` to the object it builds; a tree
+/// carrying none evaluates to itself.
+///
+/// This is the rule [`resolve_expr_image`] applies to a path named *inside* an
+/// expression, lifted to the CLI boundary — so a caller reaches a dependency by
+/// its deep-deps mount (`run DEEP-DEPS/rgrep`) exactly as an expression does,
+/// instead of by an ambient `/cas/std/<name>`.
+pub(crate) fn eval_tree(t: &dyn Transport, tree: &str) -> Result<String, String> {
+    eval_path(t, tree, "").map(|(_kind, oid)| oid)
+}
+
 /// Evaluate a std library entry named `<name>` within the std tree `std_tree`
 /// (design/caos-expr.md, Phase 3). This is just [`eval_path`] with the entry
 /// name as the path: a std-root `.caos-expr` is applied to the whole tree first

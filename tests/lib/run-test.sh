@@ -155,6 +155,25 @@ if [ -e /cas/args/in/api-key ]; then
 fi
 
 cp -r "$TEST" ./test
+
+# The test's declared dependencies, at DEEP-DEPS/ in its own repo — the mount
+# names its `DEPS` file used, and the same vocabulary any consumer uses.
+#
+# They have to be IN the repo (not just in the wrapper) because the CLI ingests
+# git-tracked paths: `caos-cli run DEEP-DEPS/rgrep` resolves by INGESTING that
+# directory and then EVALUATING its `.caos-expr`. That is what replaces
+# `/cas/std/rgrep` — a name resolved out of an ambient library — with a path the
+# test actually holds.
+#
+# `cp -rL` because CAS content is a tree of read-only, hash-tagged files; the
+# copy is small now that every entry is source (the runner is a `{.caos-expr}`
+# sentinel, not a 200MB delta).
+if [ -d /cas/args/in/std ]; then
+  mkdir -p DEEP-DEPS
+  cp -rL /cas/args/in/std/. DEEP-DEPS/
+  chmod -R u+w DEEP-DEPS
+fi
+
 git add -A && git commit -qm testtree
 mkdir /tmp/out
 # This test's own elapsed, for its line in the report — which test is the long

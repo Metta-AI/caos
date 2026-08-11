@@ -19,4 +19,4 @@ chmod +x ws/run.sh
 echo plain > ws/plain.txt
 git add -A && git -c user.email=test@caos -c user.name=caos commit -qm exec-bit-ws
 
-"$CAOS_CLI" run /cas/std/bash -- --worker1:@=test/check.sh --ws:@=ws
+"$CAOS_CLI" run DEEP-DEPS/bash -- --worker1:@=test/check.sh --ws:@=ws

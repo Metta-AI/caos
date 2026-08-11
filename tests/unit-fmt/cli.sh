@@ -19,7 +19,7 @@ commit "workspace snapshot"
 
 echo "== cargo fmt --check of the workspace, in a caos worker ==" >&2
 ok=1
-"$CAOS_CLI" run /cas/std/cargo r4 -- --tree:@=ws --cmd=fmt >/tmp/r4.log 2>&1 || ok=0
+"$CAOS_CLI" run DEEP-DEPS/cargo r4 -- --tree:@=ws --cmd=fmt >/tmp/r4.log 2>&1 || ok=0
 cat /tmp/r4.log >&2
 if [ "$ok" = 0 ] || [ ! -e r4/exit ] || [ "$(cat r4/exit)" != "0" ]; then
   echo "== cargo fmt FAILED (exit $(cat r4/exit 2>/dev/null)) — full output ==" >&2

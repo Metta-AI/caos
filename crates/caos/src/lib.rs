@@ -155,10 +155,14 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
     // resolution, not running. It matters for an entry whose resolved value is
     // DATA rather than an image — `std/llm-stub` evaluates to a cargo result
     // tree, and what a caller wants from it is the produced file at `bin/`.
-    // Only that prefix: `resolve_cli_image` also ingests a DIRECTORY as an
-    // image, which would quietly turn a mistyped hash into an ingest.
-    let hash = &if hash.starts_with(&std_arg_prefix()) {
-        resolve_std_image(t, &hash[std_arg_prefix().len()..])?
+    // A `/cas/std/<name>` builtin or an EVALUABLE DIRECTORY resolves first —
+    // resolving is not running, and it matters for an entry whose resolved value
+    // is DATA rather than an image (`std/llm-stub` evaluates to a cargo result
+    // tree, and what a caller wants from it is the produced file under `bin/`).
+    // Narrow on purpose: anything else is taken as the hash it looks like, so a
+    // mistyped hash cannot quietly become an ingest of a same-named directory.
+    let hash = &if hash.starts_with(&std_arg_prefix()) || Path::new(hash).is_dir() {
+        resolve_cli_image(t, hash)?
     } else {
         hash.to_string()
     };
@@ -2705,7 +2709,14 @@ pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, Strin
         let (_, oid) = t
             .ingest_path(image)?
             .ok_or_else(|| format!("this transport cannot ingest the image dir {image}"))?;
-        return Ok(oid.to_string());
+        // ...unless the directory is EVALUABLE. A tree carrying a `.caos-expr`
+        // says how it is built, so resolving it means evaluating it — the same
+        // rule `resolve_expr_image` applies to a path named inside an
+        // expression. This is what lets a caller name a dependency by its
+        // deep-deps mount (`run DEEP-DEPS/rgrep`) instead of reaching for an
+        // ambient `/cas/std/<name>`; a tree with no `.caos-expr` (a plain flake
+        // dir, a git-docker image) evaluates to itself and nothing changes.
+        return eval::eval_tree(t, &oid.to_string());
     }
     Ok(image.to_string())
 }

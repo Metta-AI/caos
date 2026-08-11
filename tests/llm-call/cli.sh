@@ -12,7 +12,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
 # the executable is at bin/<name>. Copied out because materialized CAS content
 # is read-only and owner-only — exec straight from /cas is "Permission denied".
-"$CAOS_CLI" get /cas/std/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
+"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
 stub_bin=/tmp/llm-stub-bin
 install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
 
@@ -34,7 +34,7 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 call=$(
-  "$CAOS_CLI" curry /cas/std/llm-call -- \
+  "$CAOS_CLI" curry DEEP-DEPS/llm-call -- \
     --api-key=test-key --base-url="http://$stub_host:$port"
 )
 messages='[{"role":"user","content":"Name the sidebar task"}]'

@@ -784,18 +784,36 @@
             # with. std's refs spell the same registry caos-registry:5000, which
             # is how the SERVER reaches it; one registry, two names, so the check
             # says which one it used.
+            # Does the registry still hold every image the SEED RECORDS name?
+            #
+            # This used to walk `refs/caos/std` looking for a delta entry's
+            # `base`. It checked nothing at all once every std entry became a
+            # source dir carrying a `.caos-expr` (design/caos-expr.md): no entry
+            # has a `base` any more, so every iteration hit `continue` and it
+            # reported "std is intact" having verified zero digests. The images
+            # moved to `refs/caos/seed` — a seeded item's RESULT is the delta,
+            # and that is what names a registry digest.
+            #
+            # The `checked` counter exists because of exactly that failure: a
+            # guard that silently verifies nothing is worse than no guard, so
+            # finding no digests is itself an error.
             std_check() {
-              local reg=localhost:5000 tree missing=0 oid name base digest code
+              local reg=localhost:5000 tree missing=0 checked=0 oid name base digest code
               [ -d "$CLIENT" ] \
                 || { echo "caosd: no client repo at $CLIENT — run 'caosd std-build'" >&2; exit 1; }
-              tree=$(git -C "$CLIENT" rev-parse --verify -q refs/caos/std) \
-                || { echo "caosd: no refs/caos/std — run 'caosd std-build'" >&2; exit 1; }
-              echo "==> checking std ($tree) against the registry at $reg" >&2
+              tree=$(git -C "$CLIENT" rev-parse --verify -q refs/caos/seed) \
+                || { echo "caosd: no refs/caos/seed — run 'caosd std-build'" >&2; exit 1; }
+              echo "==> checking the seeded core ($tree) against the registry at $reg" >&2
               while read -r _ _ oid name; do
-                # Only delta entries carry a `base`; a flake tree names no image.
-                base=$(git -C "$CLIENT" cat-file -p "$oid:base" 2>/dev/null) || continue
+                # A seed result is either a git-docker DELTA, whose `base` is a
+                # `docker://…@sha256:…` ref, or a CURRY, whose `base` names
+                # another tree by hash. Only the former names the registry; a
+                # curry reaches it through the delta it is built on, which is a
+                # seed record in its own right (runner) and checked on its turn.
+                base=$(git -C "$CLIENT" cat-file -p "$oid:result/base" 2>/dev/null) || continue
                 digest=''${base##*@}
                 [ "$digest" != "$base" ] || continue
+                checked=$((checked + 1))
                 code=$(curl -sS -o /dev/null -w '%{http_code}' \
                   -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
                   -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
@@ -808,12 +826,18 @@
                   missing=1
                 fi
               done < <(git -C "$CLIENT" ls-tree "$tree")
+              if [ "$checked" = 0 ]; then
+                echo "caosd: found NO registry digests to check — this check is" >&2
+                echo "       verifying nothing, which means it has drifted from" >&2
+                echo "       where the images are recorded. Fix the check." >&2
+                exit 1
+              fi
               if [ "$missing" != 0 ]; then
-                echo "caosd: std names images this registry no longer has." >&2
+                echo "caosd: the seeded core names images this registry no longer has." >&2
                 echo "       The registry was wiped; run 'caosd std-build'." >&2
                 exit 1
               fi
-              echo "==> std is intact" >&2
+              echo "==> the seeded core is intact ($checked images)" >&2
             }
 
             case "''${1:-up}" in
