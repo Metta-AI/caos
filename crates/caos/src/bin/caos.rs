@@ -190,32 +190,25 @@ fn run_runner_job(
     job: &RunnerJob,
     image_oid: &mut Option<String>,
 ) -> Result<String, String> {
-    let (arg_tree, std, salt) = read_arg_tree(t, &job.arg_tree)?;
-    let cas = cas_setup(Some(&arg_tree), std.as_deref())?;
+    let (arg_tree, salt) = read_arg_tree(t, &job.arg_tree)?;
+    let cas = cas_setup(Some(&arg_tree))?;
     // Our image's CAS-level name, for the follow-up poll's required args — read
     // off the placeholder cas_setup just materialized (every entry is tagged
     // with its hash).
     if image_oid.is_none() {
         *image_oid = caos::read_hash(&cas.join("args").join("image")).ok();
     }
-    let envs = [
-        (caos::STD_ENV, std.as_deref().unwrap_or("")),
-        (caos::SALT_ENV, salt.as_str()),
-    ];
+    let envs = [(caos::SALT_ENV, salt.as_str())];
     run_worker(&envs)?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
     Ok(result)
 }
 
-/// Unpack an ArgTree: its hash (returned back for `/cas/args`), the std tree hash
-/// (its reserved `std` entry is a blob *naming* the tree; `None` if empty or
-/// absent), and the salt (its reserved `salt` entry, empty if absent).
-/// `image`/`std`/`salt` are all entries of this one tree, per SPEC's ArgTree.
-fn read_arg_tree(
-    t: &dyn Transport,
-    arg_tree: &str,
-) -> Result<(String, Option<String>, String), String> {
+/// Unpack an ArgTree: its hash (returned back for `/cas/args`) and the salt
+/// (its reserved `salt` entry, empty if absent). `image`/`salt` are entries of
+/// this one tree, per SPEC's ArgTree.
+fn read_arg_tree(t: &dyn Transport, arg_tree: &str) -> Result<(String, String), String> {
     let (kind, content) = t.get_object(arg_tree)?;
     if kind != "tree" {
         return Err(format!("arg tree {arg_tree} is a {kind}, not a tree"));
@@ -226,15 +219,13 @@ fn read_arg_tree(
         let (_, content) = t.get_object(&oid.to_string())?;
         Ok(String::from_utf8_lossy(&content).trim().to_string())
     };
-    let (mut std, mut salt) = (None, String::new());
+    let mut salt = String::new();
     for entry in tree.entries {
-        match entry.filename.to_vec().as_slice() {
-            b"std" => std = Some(blob(entry.oid.into())?).filter(|s| !s.is_empty()),
-            b"salt" => salt = blob(entry.oid.into())?,
-            _ => {}
+        if entry.filename.to_vec().as_slice() == b"salt" {
+            salt = blob(entry.oid.into())?;
         }
     }
-    Ok((arg_tree.to_string(), std, salt))
+    Ok((arg_tree.to_string(), salt))
 }
 
 /// POST the job's outcome to `/runner/result`. A 410 means the nonce was
@@ -410,12 +401,10 @@ fn usage(args: &[String]) -> String {
 
 /// Set up a fresh `/cas` for one job: wipe whatever a prior job left, recreate
 /// it empty (fail if we can't), verify it supports the xattrs we rely on, then
-/// populate `/cas/args` from `args_hash` and `/cas/std` from `std_hash` (each
-/// one level, like `get-hash`), so the worker can read its inputs there.
-fn cas_setup(
-    args_hash: Option<&str>,
-    std_hash: Option<&str>,
-) -> Result<std::path::PathBuf, String> {
+/// populate `/cas/args` from `args_hash` (one level, like `get-hash`), so the
+/// worker can read its inputs there. There is no `/cas/std`: std was a reserved
+/// arg on every request and no worker reads it any more (design/caos-expr.md).
+fn cas_setup(args_hash: Option<&str>) -> Result<std::path::PathBuf, String> {
     let cas = caos::cas_dir();
     remove_cas(&cas)?;
     std::fs::create_dir_all(&cas).map_err(|e| format!("creating {}: {e}", cas.display()))?;
@@ -425,9 +414,6 @@ fn cas_setup(
     caos::probe_xattr(&cas)?;
     if let Some(hash) = args_hash {
         caos::fetch_and_materialize(&http()?, &cas.join("args"), hash)?;
-    }
-    if let Some(std) = std_hash {
-        caos::fetch_and_materialize(&http()?, &cas.join("std"), std)?;
     }
     Ok(cas)
 }

@@ -104,22 +104,24 @@ git config user.name caos
 git config gc.auto 0
 git remote add caos "$CAOS_SERVER_URL"
 
-# The seed repo as an ALTERNATE object store, so the client can READ std's
-# objects without fetching them.
+# The seed repo as an ALTERNATE object store, so the client can READ objects it
+# references but never fetched.
 #
-# A client never fetches the std tree — `std_tree` says so and means it: a tree
-# fetch pulls the whole closure, which is how you pull a 1.5GB rustc image to
-# resolve one name. Evaluation fetches only what it WALKS. But an arg tree
-# carries `std` whole, and a rustc-built tool's image IS the runner delta, so a
-# push has to traverse objects nothing ever walked into (`runner/layer00`) and
-# git dies on the first one it cannot read — even though the server already has
-# it and advertises a ref covering it, because git can only mark an advertised
-# tip uninteresting by traversing it LOCALLY.
+# A client pushes a request by walking the arg tree's closure, and git can only
+# skip an object the remote advertises by traversing that ref LOCALLY. The arg
+# tree's `image` is a RESOLVED image the client got back as a hash from a
+# server-side run — for a rustc-built tool that is `curry(runner, …)`, whose base
+# is the runner delta. The client has the hash and not the objects, so the push
+# dies on the first one it cannot read.
+#
+# (This was first blamed on `std` riding in every arg tree. That was wrong:
+# removing the `std` arg did not fix it, because the image closure is a separate
+# path to the same missing objects.)
 #
 # The objects are already on this filesystem: /tmp/seed-git is what the
-# interpreter fetched the wrapper's std into, one directory away. Pointing at it
-# costs nothing and moves no bytes — and it stays honest about the subset,
-# because the seed repo holds exactly what this test declared.
+# interpreter fetched the wrapper's deps and seed records into. Pointing at it
+# moves no bytes, and stays honest about the subset — the seed repo holds exactly
+# what this test declared.
 if [ -d /tmp/seed-git/objects ]; then
   echo /tmp/seed-git/objects > /tmp/client/.git/objects/info/alternates
 fi

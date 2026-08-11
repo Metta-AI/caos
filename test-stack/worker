@@ -74,9 +74,10 @@ fail() {
 # ask the INNER server for an outer object (it 404s — measured).
 caos get -r /cas/args
 
-# The OUTER run's std and salt must not reach the inner client (the phase-3
-# isolation lesson). Scrubbed here, so nothing worker1 starts inherits them.
-unset CAOS_STD CAOS_SALT
+# The OUTER run's salt must not reach the inner client (the phase-3
+# isolation lesson). Scrubbed here, so nothing worker1 starts inherits it.
+# (CAOS_STD went with the `std` arg — nothing threads a std tree any more.)
+unset CAOS_SALT
 
 SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
 [ -S "$SOCK" ] || fail "engine socket $SOCK is not a socket"

@@ -172,7 +172,7 @@ fn run_work_request_inner(
     // materialized at `/cas/std` in the worker; `salt` is a cache-buster. All are
     // part of the ArgTree (hence the key), threaded into the worker, and inherited
     // by any promise sub-runs this request leaves behind.
-    let (image, std, salt) = read_arg_tree(config, arg_tree)?;
+    let (image, salt) = read_arg_tree(config, arg_tree)?;
     let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
         Some(args_entries(config, arg_tree)?)
     } else {
@@ -185,9 +185,6 @@ fn run_work_request_inner(
     }
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
-    }
-    if !std.is_empty() && !std.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(HttpError::new(400, format!("invalid std hash: {std:?}")));
     }
 
     // The ArgTree hash is the cache key (it captures image, std, salt and every
@@ -267,15 +264,7 @@ fn run_work_request_inner(
             }
         }
     }
-    let outcome = run_dispatch(
-        config,
-        request,
-        &image,
-        &std,
-        &salt,
-        &key,
-        traced_arg_entries,
-    );
+    let outcome = run_dispatch(config, request, &image, &salt, &key, traced_arg_entries);
     finish_flight(arg_tree, &outcome);
     outcome.map_err(|(status, msg)| HttpError::new(status, msg))
 }
@@ -288,7 +277,6 @@ fn run_dispatch(
     config: &Config,
     request: &WorkRequest,
     image: &str,
-    std: &str,
     salt: &str,
     key: &str,
     traced_arg_entries: Option<std::collections::BTreeMap<String, String>>,
@@ -331,7 +319,7 @@ fn run_dispatch(
     let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(config, cont, std, salt, &child_stack, trace_id).map_err(fail)?
+            resolve_promise(config, cont, salt, &child_stack, trace_id).map_err(fail)?
         }
         _ => (result, false),
     };
@@ -520,7 +508,6 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 fn resolve_promise(
     config: &Config,
     cont: &str,
-    std: &str,
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
@@ -604,7 +591,7 @@ fn resolve_promise(
                             scope.spawn(move || {
                                 let arg = named_entry("in", kid.mode, kid.oid);
                                 let result =
-                                    run_image(config, img, vec![arg], std, salt, stack, trace_id)?;
+                                    run_image(config, img, vec![arg], salt, stack, trace_id)?;
                                 result_entry(&kid.name, &result)
                             })
                         })
@@ -634,7 +621,7 @@ fn resolve_promise(
     } else if let Some(img) = &run {
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_work_request`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        match run_image(config, img, vec![input.clone()], std, salt, stack, trace_id) {
+        match run_image(config, img, vec![input.clone()], salt, stack, trace_id) {
             Ok(result) => Some((result_entry("result", &result)?, result)),
             // `catch`: the failure becomes `--error`, a blob of the message the
             // caller would otherwise have seen as a 500. `then` is required
@@ -668,7 +655,7 @@ fn resolve_promise(
                 args.push(extra);
             }
             Ok((
-                run_image(config, &img, args, std, salt, stack, trace_id)?,
+                run_image(config, &img, args, salt, stack, trace_id)?,
                 caught,
             ))
         }
@@ -692,7 +679,6 @@ fn run_image(
     config: &Config,
     image_ref: &str,
     call_args: Vec<gix::objs::tree::Entry>,
-    std: &str,
     salt: &str,
     stack: &[String],
     trace_id: Option<&str>,
@@ -729,14 +715,6 @@ fn run_image(
             store_git_blob(config, salt.as_bytes()).map_err(store_err)?,
         );
         args = merge_entries(args, vec![salt_entry]);
-    }
-    if !std.is_empty() {
-        let std_entry = named_entry(
-            "std",
-            EntryKind::Blob.into(),
-            store_git_blob(config, std.as_bytes()).map_err(store_err)?,
-        );
-        args = merge_entries(args, vec![std_entry]);
     }
     // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
     let arg_tree = store_git_tree(config, args).map_err(store_err)?.to_string();
@@ -861,11 +839,10 @@ fn args_entries(
 /// entries of this one tree, so the ArgTree's hash *is* the cache key with
 /// nothing keyed alongside it — the ArgTree hash itself is the request identity,
 /// so it is not returned here.
-fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String, String), HttpError> {
+fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), HttpError> {
     let entries = fetch_tree(config, arg_tree)
         .map_err(|e| HttpError::new(400, format!("reading arg tree: {e}")))?;
     let mut image = None;
-    let mut std = String::new();
     let mut salt = String::new();
     for entry in entries {
         match entry.name.as_str() {
@@ -881,13 +858,12 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String, Str
                 });
             }
             // std and salt are plain blobs (std NAMES the std tree; salt is opaque).
-            "std" => std = blob_string(config, &entry.oid.to_string())?,
             "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }
     }
     let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'image'"))?;
-    Ok((image, std, salt))
+    Ok((image, salt))
 }
 
 /// Fetch a blob and return its content as a trimmed string.

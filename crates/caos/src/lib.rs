@@ -196,7 +196,6 @@ pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 /// promise sub-run, so it rides down the whole tree. At the top it's unset, and
 /// the ref named by [`STD_REF_ENV`] is resolved instead. `std` *is* part of the
 /// result cache key (it names the standard library a worker can reach).
-pub const STD_ENV: &str = "CAOS_STD";
 /// Ref resolved to `std` at the top of a run (overridable). Default
 /// `refs/caos/std`, read from the local repo.
 pub const STD_REF_ENV: &str = "CAOS_STD_REF";
@@ -2286,26 +2285,15 @@ fn assemble_arg_tree(
     // as a sibling of `args` in the request. Since the args tree is the cache key,
     // a salted run is simply a different args tree; it needs no keying of its own.
     // Absent (the common case) it adds nothing, so an unsalted run's args tree —
-    // and request — is unchanged. Threaded into sub-runs via CAOS_SALT like std.
+    // and request — is unchanged. Threaded into sub-runs via CAOS_SALT.
     let salt = run_salt();
     if !salt.is_empty() {
         arg_entries = merge_entries(arg_entries, vec![salt_arg_entry(t, &salt)?]);
     }
 
-    // The built-in tree (`std`): inherited from CAOS_STD inside a worker, or
-    // resolved from the `refs/caos/std` ref at the top. It too rides *in* the args
-    // tree, under the reserved `std` entry — a blob NAMING the std tree (not the
-    // tree embedded), so the args-tree closure stays small while its hash still
-    // turns over when std changes. The server threads it down and materializes it
-    // at `/cas/std`; the reserved entry is only written when std is non-empty.
-    let std = run_std()?;
-    if !std.is_empty() {
-        arg_entries = merge_entries(arg_entries, vec![std_arg_entry(t, &std)?]);
-    }
-
     // The request object IS the args tree — the ArgTree — so its hash *is* the
     // request id and the server's cache key, with nothing keyed alongside it
-    // (image, salt and std are all entries within). Get it onto the server — a
+    // (image and salt are entries within). Get it onto the server — a
     // no-op POST-as-you-go for the HTTP transport, a push for the git one. The
     // push carries the whole graph reachable from the tree, which includes any
     // embedded git-image tree, so the image lands on the server without a
@@ -2565,7 +2553,7 @@ fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::En
 }
 
 /// Build the args tree's reserved `salt` entry: the cache-busting salt as a plain
-/// blob. The counterpart of [`image_arg_entry`] / [`std_arg_entry`] for the other
+/// blob. The counterpart of [`image_arg_entry`] for the other
 /// reserved ArgTree member; merged in only when the salt is non-empty.
 fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entry, String> {
     use gix::objs::tree::{Entry, EntryKind};
@@ -2574,34 +2562,6 @@ fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entr
         filename: b"salt".to_vec().into(),
         oid: post_object(t, "blob", salt.as_bytes())?,
     })
-}
-
-/// Build the args tree's reserved `std` entry: a blob NAMING the std tree (its
-/// hash), not the tree embedded — so the args-tree closure stays small while its
-/// hash still turns over when std changes. Merged in only when std is non-empty;
-/// the server materializes the named tree at `/cas/std`.
-fn std_arg_entry(t: &dyn Transport, std: &str) -> Result<gix::objs::tree::Entry, String> {
-    use gix::objs::tree::{Entry, EntryKind};
-    Ok(Entry {
-        mode: EntryKind::Blob.into(),
-        filename: b"std".to_vec().into(),
-        oid: post_object(t, "blob", std.as_bytes())?,
-    })
-}
-
-/// The built-in tree hash (`std`) for a run. Inside a worker the server sets
-/// [`STD_ENV`], so reuse it (threading). At the top, resolve the built-ins via
-/// [`std_tree`] — the *same* path image resolution uses, so the request's `std`
-/// always matches the builtins the CLI just resolved `/cas/std/<name>` against.
-/// That matters because `std_tree` resolves a not-yet-local ref over `ls-remote`
-/// (it never fetches the tree's closure); a local-only lookup here would leave
-/// `std` empty and the worker with no `/cas/std`. Tolerate absence (no built-ins
-/// published) — a worker that needs them will fail clearly.
-fn run_std() -> Result<String, String> {
-    if let Ok(std) = std::env::var(STD_ENV) {
-        return Ok(std);
-    }
-    Ok(std_tree().unwrap_or_default())
 }
 
 /// The cache-busting salt for this run (see [`SALT_ENV`]): read from `CAOS_SALT`,
@@ -2748,8 +2708,8 @@ fn resolve_std_image(t: &dyn Transport, name: &str) -> Result<String, String> {
 /// The std library tree hash from the built-ins ref ([`STD_REF_ENV`], default
 /// `refs/caos/std`), fetched from the `caos` remote if it isn't in the local repo
 /// yet (the CLI may never have pulled it). This is the single resolution path for
-/// both running a `/cas/std/<name>` builtin and threading `std` into a run (see
-/// [`run_std`]), so the two never disagree.
+/// resolving a `/cas/std/<name>` builtin. (It no longer threads a `std` arg into
+/// a run — `std` is not an arg any more.)
 fn std_tree() -> Result<String, String> {
     let refname = std::env::var(STD_REF_ENV).unwrap_or_else(|_| DEFAULT_STD_REF.to_string());
     if let Ok(hash) = resolve_ref(&refname) {
