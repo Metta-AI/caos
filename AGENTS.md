@@ -40,6 +40,11 @@ Every script here runs with it, and two constructs quietly break under it.
   with your script text glued to the end — and it evaluates, builds, and fails
   much later with something like `<store-path># my comment: No such file or
   directory`. Parenthesize the whole script when appending to it.
+- **`nix build` with TWO installables and TWO `-o` flags does not create both
+  symlinks.** `nix build .#a -o result-a .#b -o result-b` leaves one pointing at
+  a previous build, and the other can be missing entirely — so you read a stale
+  binary and blame the code. Build one output per invocation. (`--refresh` is not
+  needed: nix picks up dirty-tree edits fine.)
 
 # Before committing
 
@@ -55,3 +60,4 @@ Every script here runs with it, and two constructs quietly break under it.
   `./lint-flake-src.sh` for the embedded-file case; for anything else the
   filter touches, run `nix build` yourself before committing.
 - If this doesn't catch everything, we need to add it to the above step
+

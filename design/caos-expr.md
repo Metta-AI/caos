@@ -477,26 +477,70 @@ the deepened tree's copy of the file is inert.
 
 Seeded core is now **flake-builder, cargo, rustc, deep-deps, runner**.
 
-### Remaining: retire ambient `/std` itself
+### Landed: ambient `/std` is gone
 
-`refs/caos/std` is still here, and it is bigger than a ref: `std` is a RESERVED
-ARG on every arg tree (`assemble_arg_tree` merges `std_arg_entry` into every
-request), so it is in every cache key and the server materializes it at
-`/cas/std` in every container. Order:
+No `refs/caos/std`, no `/cas/std/<name>`, no `std` arg. Each piece, and the rule
+it turned on:
 
-1. the ~57 `/cas/std/*` sites in `tests/*/cli.sh` become DEPS-mount paths;
-2. `caos-tools` and `worker-common::std_image` — these run IN WORKERS, which
-   cannot evaluate, so they need the resolved image handed in as an arg;
-3. `crates/caos` (chat.rs constants, tui, `resolve_std_image`) — the consumer
-   model: chat needs a project tree with std in it to descend;
-4. the `std` ARG and the ref, last, since everything above reads them.
+- **Clients resolve by descent.** A workspace declares its entry points in
+  `./DEPS` (`./std/llm-step llm-step`), the root `.caos-expr` expands that into
+  `DEEP-DEPS/`, and `eval_workspace_dep` descends it. A repo that mounted caos
+  writes the same lines pointing at `./flake-inputs/caos/std/...`; the
+  declaration moves, the code does not, because relative paths are stable under
+  mounting. Evaluating is not optional — a std entry's expression names its deps
+  by mount (`run DEEP-DEPS/rustc`), which exist only in the DEEPENED tree, so
+  resolving the raw directory could never work.
+- **`std` is not an arg.** It rode in every arg tree (so every cache key) and was
+  materialized at `/cas/std` in every container. No worker reads it; the client
+  no longer merges it; the in-image runner no longer creates `/cas/std`.
+- **The server has no std at all.** Its one semantic use was looking up
+  `flake-builder` BY NAME when handed a raw flake tree. That is deleted:
+  `.caos-expr` replaced implicit flake detection, so a flake directory says
+  `run DEEP-DEPS/flake-builder -- --in:@=.` and the CLIENT evaluates it. Verified
+  unreachable before removal — the branch was replaced with an error and the
+  suite ran without any job hitting it.
+- **llm-step declares its own tools.** bash-tool, rgrep, bash and merge are
+  llm-step's dependencies, not its caller's, so its `DEPS` names them and its
+  `.caos-expr` binds them. Resolving llm-step yields a step that already knows
+  its tools; a caller says what the TURN is. The `--llm-step-bin`/`--bash-tool-bin`
+  /`--rgrep-bin` overrides are deleted with it.
+- **build-builtins publishes no library.** It bootstraps the seeded core and
+  emits `refs/caos/seed`, nothing else. The chain behind the old std ref —
+  publish, read back in build.sh, emit as the `std` build output — had no
+  consumer at its far end.
 
-One blocker sits outside that order: `crates/server/src/compute.rs` looks up
-`flake-builder` BY NAME when a worker hands it a raw flake tree. The server holds
-an arg tree, not a project tree, so descent does not help it — the flake-builder
-image has to ride IN the arg tree instead.
+### Landed: deep-deps is ONE pass
 
-Note: `tests/lib/run-test.sh`'s `objects/info/alternates` pointing at the seed
-repo is a SYMPTOM of ambient std — it exists because `std` rides as a whole tree
-in every arg tree, so a push must traverse objects nobody walked. It goes away
-with the `std` arg.
+The recursion through `map_then` (a `node` job per directory, an `assemble` job
+per directory, ~2N containers) is gone. The split bought narrow `assemble` keys
+but never delivered them: `node` is keyed on the WHOLE TREE, so it re-ran for
+every directory on any edit, paying ~N container spawns to reach a cache the same
+edit had invalidated. Deepening is tree rewriting — read a materialized tree,
+stage symlinks, put once. Measured on std: ~1s against tens of seconds.
+
+A single pass owns two things the split got for free: CYCLES (it tracks the chain
+and names it, rather than re-entering a request and hitting the server's
+run-cycle detection) and SHARING (a dep reached twice is deepened once and the
+staged result re-staged by COPYING the symlink structure — NOT by symlinking to
+it, since `caos put` records a symlink pointing at a staging directory as a
+symlink, which would put a link where the subtree belongs).
+
+This also removed the reason to avoid whole-tree evaluation on the client, which
+is what made resolution-by-descent affordable.
+
+### Remaining
+
+- **The consumer story.** A repo that is not caos needs caos in its tree: expand
+  a pinned caos COMMIT into a tree inside a `.caos-expr`, then refer to
+  `./flake-inputs/caos/std/foo`. The expander is small — a commit already
+  materializes via `--name:commit=`, and `read_commit` gives its tree — but it
+  does not exist, and nothing in this repo needs it yet.
+- **`tests/lib/run-test.sh`'s `objects/info/alternates`.** A client pushes by
+  walking the arg tree's closure, and git can only skip an advertised object by
+  traversing that ref LOCALLY. The arg tree's `image` is a resolved image the
+  client holds only as a hash (for a rustc-built tool, `curry(runner, …)` whose
+  base is the runner delta). Verified still load-bearing: removing it fails 11
+  tests. Verified NOT user-facing: a fresh client repo on the host resolves
+  llm-step and pushes a request embedding it successfully. Why the inner client
+  differs from a fresh host client is NOT established. (An earlier note here
+  claimed this was a symptom of the `std` arg and would die with it. It did not.)
