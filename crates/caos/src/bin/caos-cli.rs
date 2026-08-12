@@ -162,6 +162,16 @@ fn run(args: &[String]) -> Result<(), String> {
             [hash, path] => caos::cli_get(&transport()?, hash, path),
             _ => Err(usage(args)),
         },
+        // `secrets [--check]` — tend the local `.caos-secrets` store: fill a
+        // missing `entropy=` with fresh entropy and warn on a weak one, so
+        // cache isolation is safe by default (design/secrets.md). `--check`
+        // only reports (writes nothing) and exits non-zero on any issue — a CI
+        // gate. Offline: no server, no transport.
+        Some("secrets") => match &args[2..] {
+            [] => caos::cli_secrets(false),
+            [flag] if flag == "--check" => caos::cli_secrets(true),
+            _ => Err(usage(args)),
+        },
         _ => Err(usage(args)),
     }
 }
@@ -191,6 +201,7 @@ fn usage(args: &[String]) -> String {
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
-         {prog} get <hash> <path>"
+         {prog} get <hash> <path>\n  \
+         {prog} secrets [--check]"
     )
 }

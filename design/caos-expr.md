@@ -22,6 +22,24 @@ Examples:
 - A `run` expression evaluates to the run's result; a `curry` expression to the curried ArgTree. In practice we dig into `run` results, not through `curry`.
 
 - Arguments are parsed as with a normal curry/run-then command, except that paths are relative to the directory containing the `.caos-expr` file. A path names a directory in the tree; there is no ambient `/std/...`
+- **An expression is evaluated against its directory MINUS the `.caos-expr`
+  itself.** A `.caos-expr` computes a replacement for its directory from the
+  directory's contents *excluding the directive*. The directive describes the
+  input; it is not part of it. Three things follow, and the third is why the
+  rule exists:
+  - `--in:@=.` is **inert**. `.` resolves to the stripped tree, which carries no
+    `.caos-expr`, so evaluating it is the identity — at every nesting level, by
+    construction rather than by a special case.
+  - Editing a comment in `std/bash/.caos-expr` no longer re-keys the flake build
+    that expression describes.
+  - **Worker-vs-data becomes a structural signal**, which is what lets a `:@=`
+    target be evaluated at all (next bullet).
+- **A `:@=` target that carries a `.caos-expr` is an EXPRESSION and is
+  evaluated; one that does not is DATA and is referenced raw.** So
+  `--pusher:@=github-push` binds the *worker* the expression builds, not its
+  source directory. Nothing recurses, because the stripping rule above has
+  already made a self-reference land on a tree with no directive. (This is also
+  what propagates secret isolation to a caller — design/secrets.md.)
 - There is no lazy evaluation here
 - `eval-path` converts the expression into an arg tree and then requests that the arg tree is run, providing normal caching
 

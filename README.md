@@ -296,7 +296,10 @@ logic — the difference is the **transport** and the privilege model.
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
   - `talk` / `chat` — agent conversations over the harness
-    (design/agent-harness.md); `caos talk "<prompt>"` is the everyday form.
+    (design/agent-harness.md); `caos talk "<prompt>"` is the everyday form;
+  - `secrets [--check]` — tend the git-ignored `.caos-secrets` store: fill a
+    missing `entropy=`, warn on a weak one (`--check` reports only and exits
+    non-zero, for CI). Offline — no server (design/secrets.md).
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are

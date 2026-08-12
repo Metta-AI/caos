@@ -1086,8 +1086,8 @@ pub fn generate_conversation_title(
     if let Some(model) = &options.model {
         call.push(format!("--model={model}"));
     }
-    let arg_tree = prepare_request(t, &llm, None, &call)?;
-    let (kind, hash) = request_compute(&t.server_url()?, &arg_tree)?;
+    let arg_tree = prepare_request(t, &llm, None, &call, &[])?;
+    let (kind, hash) = request_compute(&t.server_url()?, &arg_tree, "")?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"
@@ -1283,7 +1283,11 @@ fn turn(
     // thread: request_compute needs only two strings, so the transport (and
     // the repo handle) stay on this thread for progress polling.
     let phase = std::time::Instant::now();
-    let arg_tree = prepare_request(t, &llm, None, &[format!("--head:commit={human}")])?;
+    // Empty secret store: a turn is granted nothing, so neither is any tool it
+    // invokes. Not a decision — see design/secrets.md, "The agent harness
+    // carries no store": filling it is one call, but it makes every matching
+    // chat per-user keyed, which is a policy call.
+    let arg_tree = prepare_request(t, &llm, None, &[format!("--head:commit={human}")], &[])?;
     emit(TurnEvent::PhaseComplete {
         label: "pushing the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
@@ -1292,7 +1296,7 @@ fn turn(
     let server = t.server_url()?;
     let run = {
         let (server, arg_tree) = (server.clone(), arg_tree);
-        std::thread::spawn(move || request_compute(&server, &arg_tree))
+        std::thread::spawn(move || request_compute(&server, &arg_tree, ""))
     };
 
     // While the run blocks, follow the worker's per-step progress ref and

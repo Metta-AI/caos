@@ -94,6 +94,115 @@ We have various kinds of salt to control what work gets redone:
 If these become slow:
 - Sample `ps` during a run
 
+# Secrets
+
+**Status:** partly built. The store is carried as ephemeral run context and
+resolved client-side; injection (gated by the double-check below), superset
+matching over path-only readers, the entropy/`secret-hash` cache-isolation tag,
+the output-scrub assertion, log masking, and the `caos secrets` entropy tooling
+all exist. **Cache isolation is now complete for the eval path**: the running
+worker, eval-path's `curry` returns, and — via the eval-path stripping rule —
+a worker embedded through a `:@=` arg, which makes its embedder per-user too.
+Builds on `.caos-expr` (eval-path, deep-deps) and map-then (server-mediated
+worker starts).
+
+**Since the ambient-`std` removal landed** (design/caos-expr.md, "Landed:
+ambient `/std` is gone"), a reader is a **tree path and nothing else** — there
+is no `/std/<name>` to name, so the two reader forms collapsed into one, which
+is what this note always wanted. It also briefly *widened* the
+caller-propagation gap: eval-path used to mark a `/std/<name>` `:@=` target, and
+that was the only `:@=` marking there was. Closing it properly covers all of
+`:@=` and needs no `/std` special case at all.
+
+What remains is not about the eval path: the agent harness carries no store,
+and `value:@=` is UTF-8 only. See "Remaining work".
+
+## Problem
+
+Some tools need secrets: the github-push tool needs an auth token, and there will be many like it. But:
+- we don't want secrets in content-addressed stores, where they might leak
+- we don't want secrets in keys, because we don't want to invalidate (most) keys if a secret is rotated
+- we don't want secrets in one worker/arg tree to be able to be read from it by another worker
+
+## Solution
+
+`.caos-secrets`:
+- Secrets live in a git-ignored .caos-secrets directory
+- Each secret file contains the secret's value and a list of workers that can read the secret. This is formatted as a repeated-key file. For example:
+```
+# Optional name. Defalts to the name of the file. This is the name that is used in the worker for /secret/<name>
+name=<name>
+entropy=...
+# Inline secret
+value=<secret key>
+# External key
+value:@=<file containing key>
+# A reader is a PATH to an expression, without arguments. It is eval-path'd to
+# an arg tree
+reader=std/github-push
+reader=tools/deploy
+```
+- When a call stack is started, such as `caos-cli run`, we read the current source tree and the list of secrets. Readers in secrets are matched against the tree. Any worker named as a reader is granted access to the secret. These workers have a hash of the names and entropy of all exposed secrets injected into them as /cas/args/secret-hash
+- Something is considered to be the same worker (ie, to have access to the secret) if it its arg tree is a superset of the reader's arg tree and secret-hash matches the set of secrets that the server computes for it
+- Each granted secret contributes its (worker-visible name, entropy) to a
+  `secret-hash` entry folded into the worker's arg tree (visible at
+  `/cas/args/secret-hash`). This makes two users with different secrets see
+  different cache keys — but keps the secret's *value* out (so rotating a value
+  doesn't bust the cache), and stores the *digest* of the entropy, never the
+  entropy itself (the entropy is a bearer capability for the cache: knowing it
+  reconstructs the key of any run that used it). The name is included because a
+  different mount name would make the worker run differently
+- `secret-hash` in the arg tree also means that the cache key of a worker will depend on the secrets exposed to things that it calls, which is required to avoid accidentally sharing data derived from secrets through the cache
+
+Worker experience:
+- If a secret is visible to a worker, it is injected into a worker in `/secret/<name>`
+- We attempt to scrub secret values from the logs of workers
+- We attempt to check files that are added to git with `caos put` for secret values. Any new file (hash not in git) that contains the value of a secret that is visible to this worker is rejected
+
+Correctness requirements: a run's *identity* (name + entropy of each granted
+secret) is in the cache key via `secret-hash`, but the secret's **value** is
+not. So:
+- A worker must fail if the secret is missing or invalid.
+- A result may depend on *which* secret it was granted (name + entropy) — that
+  is isolated per-user by `secret-hash` — but must not depend on the value's
+  *bytes* beyond what rotating the **entropy** would refresh. Rotate the entropy
+  when you rotate a value the result genuinely depends on; a plain value
+  rotation (e.g. a token for the same account fetching the same content) keeps
+  the cache, which is the point.
+- Concretely: a worker may fail on an invalid secret, but must not return, say,
+  a listing filtered to what one value's account can see, unless that value's
+  identity is pinned by the entropy.
+
+Server behavior:
+- The server passes the list of secrets and the tree against which to evaluate them from one work request to the next, along with the stack
+- When dispatching a work request, the server injects a secret into the worker only if **both**: (a) the worker's arg tree is a superset of one of the secret's readers (identity), **and** (b) the worker's arg tree already carries a `secret-hash` entry equal to the one the server computes for the granted set. Condition (b) proves the worker was produced by eval with this store — so a secret's value can only ever reach a worker whose cache key *already* reflects that secret. A reader-match without the matching `secret-hash` (a worker not built through eval, or a stale/forged tree) is refused, fail-closed. This ties injection to isolation: injection ⟹ the isolating hash is in the key.
+
+Note that this means that the server sees all secrets. We can revisit if this becomes a problem
+
+## Remaining work
+
+- **The agent harness carries no store.** `caos talk`/`chat` (`chat.rs`'s
+  `turn` and `generate_conversation_title`) pass an empty store and an empty
+  header, so an agent turn — and every tool it invokes as a sub-run — is granted
+  nothing. This is where the note's own motivating example lives (an agent
+  reaching for github-push), so it is a hole, not a boundary. It was never
+  decided: the `&[]` is what the parameter-threading left behind. Filling it is
+  one call (`build_secret_store` before `prepare_request`, its header on
+  `request_compute`), but it is a **policy** choice first: a store-carrying turn
+  is per-user keyed via `secret-hash`, so every chat that matches a reader stops
+  sharing cache with other users. Worth deciding explicitly rather than by
+  default.
+
+- **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
+
+- **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
+  never trigger compute); likely permanent.
+
+- **Shared-server exposure.** Carrying the whole store means a shared server
+  sees values it never injects (sub-runs aren't known ahead of time, so the
+  client can't pre-filter to the granted subset). Moot for a per-user/local
+  server; a tighter hand-off is future work.
+
 # Codebase
 
 ## Before committing

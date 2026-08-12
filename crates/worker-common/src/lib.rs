@@ -36,6 +36,10 @@ use std::process::{Command, ExitCode};
 /// Where the `caos` runner materializes this run's arguments.
 pub const ARGS: &str = "/cas/args";
 
+/// Where the `caos` runner drops the secrets this job was granted, one file per
+/// secret (design/secrets.md). Read one with [`secret`].
+pub const SECRETS: &str = "/secret";
+
 /// The target triple a produced binary is built for: musl, so it is static and
 /// runs on ANY base — the runner pool's image today, a scratch image tomorrow,
 /// or (llm-stub) as a plain sidecar process in a test's own container. The arch
@@ -54,6 +58,17 @@ pub const MUSL_TARGET: &str = if cfg!(target_arch = "aarch64") {
 /// Absolute path of an argument under `/cas/args`.
 pub fn arg(name: &str) -> String {
     format!("{ARGS}/{name}")
+}
+
+/// Read the granted secret `name` from `/secret/<name>` (design/secrets.md).
+/// The server injects it out of band only when this worker's ArgTree is a
+/// superset of one of the secret's readers, so a worker that isn't entitled
+/// (or a rotated-away secret) gets a plain not-found error — which a tool that
+/// needs the secret should surface as a failure, never a silent no-op. The
+/// bytes are returned verbatim (no trimming): a token is used as-is.
+pub fn secret(name: &str) -> Result<String, String> {
+    let path = format!("{SECRETS}/{name}");
+    fs::read_to_string(&path).map_err(|e| format!("reading secret {name}: {e}"))
 }
 
 /// This worker's *own* image ref — the request's reserved `image` args entry,

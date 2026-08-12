@@ -413,6 +413,28 @@ for name in "${names[@]}"; do
   echo "$name: deepened entry (seed key) ${hash_of[$name]}" >&2
 done
 
+# What a caller's `--in:@=.` actually resolves to: the entry MINUS its own
+# `.caos-expr`. eval-path hands an expression its directory excluding the
+# directive (crates/caos/src/eval.rs `strip_caos_expr`), so every seeded item —
+# each of whose expressions is `run <builder> -- --in:@=.` — forms an `in` that
+# is the stripped tree. Strip here too or the seeder registers a key no caller
+# ever forms, and the job falls through to the generic runner and dies on a
+# sentinel image.
+#
+# For the sentinel entries (`runner`, `rustc`, `deep-deps`) the whole directory
+# IS the `.caos-expr`, so this is the empty tree — honest: there is no source,
+# which is why they are seeded. Their sentinels differ, so their keys still do.
+strip_caos_expr() { # <tree> -> tree hash (stdout)
+  git -C "$CLIENT" ls-tree "$1" | while IFS=$'\t' read -r meta file; do
+    if [ "$file" != .caos-expr ]; then printf '%s\t%s\n' "$meta" "$file"; fi
+  done | git -C "$CLIENT" mktree
+}
+
+declare -A in_of
+for name in "${names[@]}"; do
+  in_of[$name]=$(strip_caos_expr "${hash_of[$name]}")
+done
+
 # ---- seed records (design/caos-expr.md, Phase 3) ----------------------------
 # The irreducible core can't be built by the machinery it IS, so bootstrap
 # hand-builds each core artifact and publishes a SEED RECORD per item under
@@ -446,7 +468,7 @@ if [ -n "$fb_delta" ] && [ -n "${hash_of[flake-builder]:-}" ]; then
   # so identity) flake-builder source entry.
   seeded_blob=$(printf 'docker://seeded' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record flake-builder \
-    "$(printf '{"image":"%s","in":"%s"}' "$seeded_blob" "${hash_of[flake-builder]}")" "$fb_delta"
+    "$(printf '{"image":"%s","in":"%s"}' "$seeded_blob" "${in_of[flake-builder]}")" "$fb_delta"
 fi
 
 if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; then
@@ -454,7 +476,7 @@ if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; 
   # the flake-builder image (fb_delta), so the caller's arg-tree `image` is that
   # tree oid and `in` is the deepened cargo entry — both known here.
   add_seed_record cargo \
-    "$(printf '{"image":"%s","in":"%s"}' "$fb_delta" "${hash_of[cargo]}")" "$cargo_delta"
+    "$(printf '{"image":"%s","in":"%s"}' "$fb_delta" "${in_of[cargo]}")" "$cargo_delta"
 fi
 
 # rustc/deep-deps: SEEDED core. Their `.caos-expr` is a distinct sentinel
@@ -468,7 +490,7 @@ if [ -n "$runner_delta" ] && [ -n "${bin_path[deep-deps]:-}" ] && [ -n "${hash_o
   dd_curry=$(cd "$CLIENT" && "$caos" curry "$runner_delta" -- "--worker1:@=seed-deep-deps")
   dd_blob=$(printf 'docker://seeded-deep-deps' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record deep-deps \
-    "$(printf '{"image":"%s","in":"%s"}' "$dd_blob" "${hash_of[deep-deps]}")" "$dd_curry"
+    "$(printf '{"image":"%s","in":"%s"}' "$dd_blob" "${in_of[deep-deps]}")" "$dd_curry"
 fi
 
 if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}" ] && [ -n "${hash_of[rustc]:-}" ]; then
@@ -491,7 +513,7 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
     "--worker-common:@=seed-rustc-wc")
   rustc_blob=$(printf 'docker://seeded-rustc' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record rustc \
-    "$(printf '{"image":"%s","in":"%s"}' "$rustc_blob" "${hash_of[rustc]}")" "$rustc_curry"
+    "$(printf '{"image":"%s","in":"%s"}' "$rustc_blob" "${in_of[rustc]}")" "$rustc_curry"
 fi
 
 # runner: the pooled interpreter, a self-contained nix closure with no source to
@@ -502,7 +524,7 @@ fi
 if [ -n "$runner_delta" ] && [ -n "${hash_of[runner]:-}" ]; then
   runner_blob=$(printf 'docker://seeded-runner' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record runner \
-    "$(printf '{"image":"%s","in":"%s"}' "$runner_blob" "${hash_of[runner]}")" "$runner_delta"
+    "$(printf '{"image":"%s","in":"%s"}' "$runner_blob" "${in_of[runner]}")" "$runner_delta"
 fi
 
 if [ -n "$seed_entries" ]; then

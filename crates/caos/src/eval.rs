@@ -39,8 +39,9 @@ use std::collections::HashMap;
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 
 use super::{
-    assemble_arg_tree, curry_from_entries, entry_name, fetch_tree_entries, is_hex_hash, parse_oid,
-    post_object, request_compute, Transport,
+    assemble_arg_tree, build_secret_store, curry_from_entries, entry_name, fetch_tree_entries,
+    is_hex_hash, mark_arg_tree, parse_oid, post_object, post_tree, request_compute,
+    secret_store_header, ClientSecret, Transport,
 };
 
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
@@ -60,7 +61,9 @@ pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String
     let (_, oid) = t
         .ingest_path(".")?
         .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
-    eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"))
+    // Entry-point resolution feeds `assemble_arg_tree` (which marks the run) or
+    // a reader match, so it carries no store of its own — no marking here.
+    eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"), &[])
         .map(|(_kind, hash)| hash)
         .map_err(|e| {
             format!("resolving {name:?} from the workspace: {e}\n  declare it in ./DEPS, e.g. `./std/{name} {name}`")
@@ -75,7 +78,9 @@ pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String
 /// its deep-deps mount (`run DEEP-DEPS/rgrep`) exactly as an expression does,
 /// rather than by any name looked up outside the tree it was handed.
 pub(crate) fn eval_tree(t: &dyn Transport, tree: &str) -> Result<String, String> {
-    eval_path(t, tree, "").map(|(_kind, oid)| oid)
+    // As in [`eval_workspace_dep`]: the result is an image that the caller's own
+    // arg-tree assembly marks, so this walk carries no store.
+    eval_path(t, tree, "", &[]).map(|(_kind, oid)| oid)
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
@@ -98,7 +103,12 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
             oid.to_string()
         }
     };
-    let (kind, hash) = eval_path(t, &start, path)?;
+    // The caller's secret store, resolved once — so eval-path marks the `curry`
+    // arg trees it returns, giving their callers per-user isolation, and carries
+    // the store to any `run` it dispatches (design/secrets.md). A `:@=` target is
+    // NOT marked; see `resolve_expr_path`.
+    let store = build_secret_store(t)?;
+    let (kind, hash) = eval_path(t, &start, path, &store)?;
     println!("{kind} {hash}");
     Ok(())
 }
@@ -108,7 +118,16 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
 /// object's `(kind, oid)`. `node` is the object at the prefix walked so far: a
 /// `.caos-expr` at the root of a tree node replaces the node with its result
 /// before the next segment is resolved within it.
-fn eval_path(t: &dyn Transport, start_tree: &str, path: &str) -> Result<(String, String), String> {
+///
+/// **An expression is evaluated against its directory MINUS the `.caos-expr`
+/// itself** ([`strip_caos_expr`]) — the directive is not part of the input it
+/// describes. See [`resolve_expr_path`] for what that buys.
+pub(crate) fn eval_path(
+    t: &dyn Transport,
+    start_tree: &str,
+    path: &str,
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
     let comps: Vec<&str> = path
         .split('/')
         .filter(|s| !s.is_empty() && *s != ".")
@@ -117,11 +136,13 @@ fn eval_path(t: &dyn Transport, start_tree: &str, path: &str) -> Result<(String,
     let mut node_oid = start_tree.to_string();
     let mut i = 0usize;
     loop {
-        // A `.caos-expr` at the root of this tree node transforms the node.
+        // A `.caos-expr` at the root of this tree node transforms the node — from
+        // the node's contents WITHOUT the directive (see `strip_caos_expr`).
         if node_kind == "tree" {
             if let Some((mode, oid)) = lookup_in_tree(t, &node_oid, ".caos-expr")? {
                 if !mode.is_tree() {
-                    let (k, o) = eval_expr(t, &node_oid, &oid.to_string())?;
+                    let input = strip_caos_expr(t, &node_oid)?;
+                    let (k, o) = eval_expr(t, &input, &oid.to_string(), store)?;
                     node_kind = k;
                     node_oid = o;
                 }
@@ -145,12 +166,44 @@ fn eval_path(t: &dyn Transport, start_tree: &str, path: &str) -> Result<(String,
     Ok((node_kind, node_oid))
 }
 
+/// `tree` without its own `.caos-expr` entry — the input an expression is
+/// evaluated against.
+///
+/// **A `.caos-expr` computes a replacement for its directory from the
+/// directory's contents excluding the directive itself.** That is the
+/// definition, not an optimization, and three things fall out of it:
+///
+/// - **A self-reference is inert.** `--in:@=.` resolves to the stripped tree,
+///   which carries no `.caos-expr`, so evaluating it is the identity. Without
+///   this, evaluating a `:@=` target re-runs the very expression doing the
+///   evaluating — unbounded recursion, at every nesting level. This is what
+///   makes [`resolve_expr_path`] able to evaluate at all.
+/// - **Worker-vs-data becomes a real signal.** A `:@=` target *with* a
+///   `.caos-expr` is an expression; one *without* evaluates to itself. The
+///   distinction is structural, so nothing has to guess.
+/// - **The directive stops keying its own input.** Editing a comment in
+///   `std/bash/.caos-expr` no longer re-keys the flake build it describes.
+///
+/// A tree with no `.caos-expr` is returned unchanged, so this costs nothing on
+/// the common path.
+fn strip_caos_expr(t: &dyn Transport, tree: &str) -> Result<String, String> {
+    let entries =
+        fetch_tree_entries(t, tree)?.ok_or_else(|| format!("eval-path: {tree} is not a tree"))?;
+    let kept: Vec<Entry> = entries
+        .into_iter()
+        .filter(|e| entry_name(e) != b".caos-expr")
+        .collect();
+    Ok(post_tree(t, kept)?.to_string())
+}
+
 /// Evaluate one `.caos-expr` blob against `input_tree` (the subtree the file
-/// sits at the root of), returning the value's `(kind, oid)`.
+/// sits at the root of, minus the file — see [`strip_caos_expr`]), returning
+/// the value's `(kind, oid)`.
 fn eval_expr(
     t: &dyn Transport,
     input_tree: &str,
     expr_oid: &str,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let (kind, content) = t.get_object(expr_oid)?;
     if kind != "blob" {
@@ -170,10 +223,10 @@ fn eval_expr(
             return Err("eval-path: .caos-expr has content after its final expression".to_string());
         }
         if let Some((name, cmd)) = parse_assignment(line) {
-            let v = eval_command(t, input_tree, cmd, &env)?;
+            let v = eval_command(t, input_tree, cmd, &env, store)?;
             env.insert(name.to_string(), v);
         } else {
-            value = Some(eval_value(t, input_tree, line, &env)?);
+            value = Some(eval_value(t, input_tree, line, &env, store)?);
         }
     }
     value.ok_or_else(|| "eval-path: .caos-expr has no final expression".to_string())
@@ -210,6 +263,7 @@ fn eval_value(
     input_tree: &str,
     line: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     if let Some(var) = line.strip_prefix('$') {
         if var.is_empty() || var.split_whitespace().count() != 1 {
@@ -220,7 +274,7 @@ fn eval_value(
             .cloned()
             .ok_or_else(|| format!("eval-path: undefined variable ${var}"));
     }
-    eval_command(t, input_tree, line, env)
+    eval_command(t, input_tree, line, env, store)
 }
 
 /// Evaluate a single `run <image> -- …` or `curry <image> -- …` command against
@@ -231,6 +285,7 @@ fn eval_command(
     input_tree: &str,
     cmd: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     let verb = tokens.first().copied().unwrap_or("");
@@ -248,16 +303,21 @@ fn eval_command(
             "eval-path: `{verb}` takes exactly one image before `--`"
         ));
     }
-    let image_ref = resolve_expr_image(t, input_tree, tokens[1], env)?;
-    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env)?;
+    let image_ref = resolve_expr_image(t, input_tree, tokens[1], env, store)?;
+    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env, store)?;
 
     if verb == "curry" {
+        // Mark the returned arg tree, so a caller that embeds it is per-user too
+        // (design/secrets.md, caller-propagation).
         let oid = curry_from_entries(t, &image_ref, &[], entries)?;
-        return Ok(("tree".to_string(), oid.to_string()));
+        let marked = mark_arg_tree(t, store, &oid.to_string())?;
+        return Ok(("tree".to_string(), marked));
     }
-    let arg_tree = assemble_arg_tree(t, &image_ref, entries)?;
+    // A `run` marks via `assemble_arg_tree` and must carry the store to the
+    // server (to inject and pass the double-check), exactly like `caos-cli run`.
+    let arg_tree = assemble_arg_tree(t, &image_ref, entries, store)?;
     let server = t.server_url()?;
-    request_compute(&server, &arg_tree)
+    request_compute(&server, &arg_tree, &secret_store_header(store))
 }
 
 /// Resolve the image token of a command to a ref: a `$NAME` variable, a
@@ -270,6 +330,7 @@ fn resolve_expr_image(
     input_tree: &str,
     tok: &str,
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<String, String> {
     if let Some(var) = tok.strip_prefix('$') {
         let (_, oid) = env
@@ -305,8 +366,11 @@ fn resolve_expr_image(
     // dir or a git-docker image tree passes through unchanged. (For a seeded
     // worker this dispatches its build — which is why forming a `run` expr's
     // key needs that worker already seeded; see design/caos-expr.md, the
-    // dependency-ordered seeding.)
-    let (_kind, hash) = eval_path(t, &oid.to_string(), "")?;
+    // dependency-ordered seeding.) That dispatch carries this evaluation's
+    // secret store, like any other `run` eval-path performs — so a builder is
+    // isolated and injected only if a reader actually names it, and stays
+    // globally shared otherwise (design/secrets.md).
+    let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
     Ok(hash)
 }
 
@@ -318,6 +382,7 @@ fn resolve_expr_args(
     input_tree: &str,
     toks: &[&str],
     env: &HashMap<String, (String, String)>,
+    store: &[ClientSecret],
 ) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for &tok in toks {
@@ -349,7 +414,7 @@ fn resolve_expr_args(
                 .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
             (mode_of_kind(kind), parse_oid(oid)?)
         } else if is_path {
-            resolve_expr_path(t, input_tree, value)?
+            resolve_expr_path(t, input_tree, value, store)?
         } else {
             (
                 EntryKind::Blob.into(),
@@ -368,13 +433,40 @@ fn resolve_expr_args(
 /// Resolve a `:@=` path value: a path within `input_tree`, relative to the
 /// `.caos-expr`'s directory. Paths only — a `:@=` value cannot name anything
 /// outside the tree being evaluated.
+///
+/// **A target carrying a `.caos-expr` is an EXPRESSION and is evaluated; one
+/// without is DATA and is referenced raw.** The two cases are told apart
+/// structurally, not guessed, because [`strip_caos_expr`] has already removed
+/// the directive from `input_tree` — so a self-reference like `--in:@=.` lands
+/// on a tree with no `.caos-expr` and evaluates to itself. Nothing recurses.
+///
+/// Evaluating is what closes caller-propagation (design/secrets.md): an
+/// embedded worker is no longer referenced raw, so `--pusher:@=github-push`
+/// binds whatever eval produced — a `curry` result already marked with
+/// `secret-hash`, or a `run` result computed under a marked arg tree. Either
+/// way the embedder's own tree turns over per-user, without this function
+/// marking anything itself. Marking here would be wrong: an expression may be
+/// `run`-valued, and folding a `secret-hash` entry into a *data* tree would
+/// corrupt it.
 fn resolve_expr_path(
     t: &dyn Transport,
     input_tree: &str,
     value: &str,
+    store: &[ClientSecret],
 ) -> Result<(EntryMode, gix::ObjectId), String> {
-    lookup_in_tree(t, input_tree, value)?
-        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))
+    let (mode, oid) = lookup_in_tree(t, input_tree, value)?
+        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))?;
+    if !mode.is_tree() {
+        return Ok((mode, oid));
+    }
+    let tree = oid.to_string();
+    match lookup_in_tree(t, &tree, ".caos-expr")? {
+        Some((m, _)) if !m.is_tree() => {
+            let (kind, hash) = eval_path(t, &tree, "", store)?;
+            Ok((mode_of_kind(&kind), parse_oid(&hash)?))
+        }
+        _ => Ok((mode, oid)),
+    }
 }
 
 /// Look up `rel` (a `/`-separated path) within the tree `tree_oid`, returning

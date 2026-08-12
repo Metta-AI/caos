@@ -31,6 +31,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
@@ -89,7 +90,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     all.extend(kvs.iter().cloned());
     // The workspace declares the image its tool scripts run on (./DEPS: `bash`).
     let image = eval::eval_workspace_dep(t, "bash")?;
-    let (kind, result) = run_request(t, &image, None, None, &all)?;
+    let (kind, result) = run_request(t, &image, None, None, &all, &[])?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
     println!("{kind} {result}");
@@ -185,6 +186,10 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
+
+/// Header carrying the ephemeral secrets store on `GET /run` (design/secrets.md),
+/// out of band from the content-addressed ArgTree. Must match the server's.
+const SECRETS_HEADER: &str = "X-Caos-Secrets";
 
 /// An opaque cache-busting value mixed into every run's ArgTree — and so into its
 /// arg-tree hash and cache key. Empty by default, so runs are cached purely by
@@ -1510,6 +1515,11 @@ pub fn put_commit(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String>
     let bytes = std::fs::read(src).map_err(|e| format!("{src}: {e}"))?;
     gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
         .map_err(|e| format!("{src} is not a valid commit: {e}"))?;
+    // A minted commit isn't stored via `send`, so assert here too: its message
+    // (or tree/parent bytes) must not carry an injected secret.
+    if !t.has_object(&hash_bytes("commit", &bytes)?.to_string())? {
+        refuse_if_leaks(&bytes, "a commit")?;
+    }
     let oid = post_object(t, "commit", &bytes)?;
     write_placeholder(&target, "commit", &oid.to_string())?;
     // The minted commit's hash — the caller's handle (e.g. the next parent).
@@ -1707,11 +1717,22 @@ fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
     if matches!(h.body, Body::Stored) || t.has_object(&h.oid.to_string())? {
         return Ok(());
     }
+    // The output-leak assertion (design/secrets.md): scan each NEW blob for any
+    // secret injected into this run BEFORE it is published. We reach here only
+    // for objects the store lacks, so — by git's closure invariant — only for
+    // objects this run is introducing; an output that dedups to something
+    // already stored can't be a new leak. On a hit the whole `put` fails, so
+    // the offending object is never posted. (Off-worker there is no `/secret`,
+    // so this is a no-op for the host CLI.)
     let stored = match &h.body {
         Body::Stored => unreachable!("filtered above"),
-        Body::Link(target) => t.put_object("blob", target)?,
+        Body::Link(target) => {
+            refuse_if_leaks(target, "a symlink target")?;
+            t.put_object("blob", target)?
+        }
         Body::File(path) => {
             let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            refuse_if_leaks(&data, &path.display().to_string())?;
             t.put_object("blob", &data)?
         }
         Body::Dir(encoded, children) => {
@@ -1728,6 +1749,57 @@ fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The in-container directory the runner drops this run's granted secrets into,
+/// one file per secret (design/secrets.md). Shared with the container runner
+/// (`bin/caos.rs`), which writes it.
+pub const SECRET_DIR: &str = "/secret";
+
+/// The raw values of every secret injected into this run, read once from
+/// [`SECRET_DIR`]. Empty off-worker (no such dir) — so the leak scan costs
+/// nothing for the host CLI. Empty values are dropped (nothing to match).
+fn injected_secret_values() -> &'static [Vec<u8>] {
+    static VALUES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    VALUES.get_or_init(|| {
+        let mut values = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(SECRET_DIR) {
+            for entry in entries.flatten() {
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if !bytes.is_empty() {
+                        values.push(bytes);
+                    }
+                }
+            }
+        }
+        values
+    })
+}
+
+/// Fail if `data` contains any injected secret's raw bytes — the hard output
+/// assertion. `what` names the object for the error, and the error deliberately
+/// never quotes the value. Raw-byte only: a secret the worker base64'd or
+/// otherwise transformed slips through (design/secrets.md — this catches bugs,
+/// a token swept into an error file or a stray credential, not a determined
+/// exfiltrator, which is inside the trust boundary anyway).
+fn refuse_if_leaks(data: &[u8], what: &str) -> Result<(), String> {
+    for secret in injected_secret_values() {
+        if contains_subslice(data, secret) {
+            return Err(format!(
+                "refusing to store {what}: it contains an injected secret value \
+                 (design/secrets.md: outputs must not carry secrets)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does `haystack` contain `needle` as a contiguous byte subslice?
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The git object id `kind`/`data` would have, computed locally — no store.
@@ -2188,15 +2260,17 @@ fn run_request(
     cas: Option<&Path>,
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
+    store: &[ClientSecret],
 ) -> Result<(String, String), String> {
-    let arg_tree = prepare_request(t, image, cas, kvs)?;
+    let arg_tree = prepare_request(t, image, cas, kvs, store)?;
+    let header = secret_store_header(store);
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
     // at it).
     let server = t.server_url()?;
     match trace {
-        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output),
-        None => request_compute(&server, &arg_tree),
+        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, &header),
+        None => request_compute(&server, &arg_tree, &header),
     }
 }
 
@@ -2211,11 +2285,12 @@ fn prepare_request(
     image: &str,
     cas: Option<&Path>,
     kvs: &[String],
+    store: &[ClientSecret],
 ) -> Result<String, String> {
     // Build the call's args (paths resolve per `cas`), then hand them to the
-    // shared assembler, which folds in the image, salt and std.
+    // shared assembler, which folds in the image, salt, std and secret-hash.
     let call = build_arg_entries(t, cas, kvs)?;
-    assemble_arg_tree(t, image, call)
+    assemble_arg_tree(t, image, call, store)
 }
 
 /// Assemble a runnable ArgTree from a base `image` ref and the caller's already
@@ -2228,6 +2303,7 @@ fn assemble_arg_tree(
     t: &dyn Transport,
     image: &str,
     call: Vec<gix::objs::tree::Entry>,
+    store: &[ClientSecret],
 ) -> Result<String, String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it. The image is folded into the args tree below, so the server
@@ -2262,14 +2338,37 @@ fn assemble_arg_tree(
         arg_entries = merge_entries(arg_entries, vec![salt_arg_entry(t, &salt)?]);
     }
 
+    // Cache-isolation tag (design/secrets.md): fold in `secret-hash` when this
+    // run is granted a secret — matched against the entries built so far, so two
+    // callers with different secrets don't share a cache entry, while a
+    // secret-free run stays globally shared. Byte-identical to what the server
+    // folds into an equivalent sub-run ArgTree.
+    let base: std::collections::BTreeMap<String, String> = arg_entries
+        .iter()
+        .map(|e| {
+            (
+                String::from_utf8_lossy(e.filename.as_ref()).into_owned(),
+                e.oid.to_string(),
+            )
+        })
+        .collect();
+    if let Some(hash) = client_secret_hash(store, &base)? {
+        let oid = post_object(t, "blob", hash.as_bytes())?;
+        let entry = gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
+            oid,
+        };
+        arg_entries = merge_entries(arg_entries, vec![entry]);
+    }
+
     // The request object IS the args tree — the ArgTree — so its hash *is* the
     // request id and the server's cache key, with nothing keyed alongside it
     // (image and salt are entries within). Get it onto the server — a
     // no-op POST-as-you-go for the HTTP transport, a push for the git one. The
     // push carries the whole graph reachable from the tree, which includes any
     // embedded git-image tree, so the image lands on the server without a
-    // separate push. (`std` rides as a bare hash, so the std tree is not in this
-    // closure — it is already on the server.)
+    // separate push.
     let arg_tree = post_tree(t, arg_entries)?;
     t.ensure_pushed(&arg_tree.to_string())?;
     Ok(arg_tree.to_string())
@@ -2467,7 +2566,11 @@ pub fn cli_run(
         return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
     }
     let image = resolve_cli_image(t, image)?;
-    let (kind, result) = run_request(t, &image, None, trace, kvs)?;
+    // Build the ephemeral secrets store from the caller's `.caos-secrets`
+    // (design/secrets.md), resolving each reader here — where eval-path is
+    // available — so the server never evals. Empty when there's no store.
+    let store = build_secret_store(t)?;
+    let (kind, result) = run_request(t, &image, None, trace, kvs, &store)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2629,11 +2732,11 @@ fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// which is what makes a caller's dependencies its own declared edges rather
 /// than whatever an ambient library happens to hold.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    // A directory is an image tree to ingest — notably a flake dir (flake.nix +
-    // flake.lock), which the server builds into a real image via the
-    // flake-builder (design/flake-images.md). Ingest it exactly like a
+    // A directory is an image tree to ingest: ingest it exactly like a
     // `--name:@=path` arg (git-tracked paths only) and hand the server its tree
-    // hash; the server decides whether it's a flake or a git-docker image.
+    // hash. A flake dir is NOT special-cased here or on the server — it carries
+    // a `.caos-expr` naming its builder, and the evaluation below turns it into
+    // an image, so what the server receives is already one (design/caos-expr.md).
     if Path::new(image).is_dir() {
         let (_, oid) = t
             .ingest_path(image)?
@@ -2930,27 +3033,393 @@ fn merge_entries(
 /// `(type, hash)`. The server runs the container (resolving any promise it leaves
 /// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
 /// param's historical name; its value is the arg-tree hash.)
-fn request_compute(base: &str, arg_tree: &str) -> Result<(String, String), String> {
+/// Directory of the caller's git-ignored secrets store (design/secrets.md).
+const SECRETS_DIR: &str = ".caos-secrets";
+
+/// Minimum entropy length (chars) not flagged weak. A `secret-hash` is only
+/// unguessable if the entropy is: below this, it's brute-forceable out of the
+/// hash (like GitHub Actions refusing to mask short secrets).
+const MIN_ENTROPY_LEN: usize = 16;
+
+/// Fresh entropy for a secret: 128 random bits as 32 hex chars.
+fn fresh_entropy() -> Result<String, String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open("/dev/urandom").map_err(|e| format!("opening /dev/urandom: {e}"))?;
+    let mut buf = [0u8; 16];
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("reading /dev/urandom: {e}"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `caos-cli secrets [--check]` — tend the local `.caos-secrets` store: fill a
+/// missing `entropy=` with fresh entropy and warn on a weak one, so a secret's
+/// cache isolation is safe by default (design/secrets.md). `--check` writes
+/// nothing and errors on any issue (a CI gate). Offline — reads/writes only the
+/// local dir.
+pub fn cli_secrets(check: bool) -> Result<(), String> {
+    let dir = Path::new(SECRETS_DIR);
+    if !dir.is_dir() {
+        println!("no {SECRETS_DIR} directory — nothing to do");
+        return Ok(());
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+
+    let mut issues = 0;
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.starts_with('.') || !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {name}: {e}"))?;
+        let entropy = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("entropy=").map(str::trim));
+        match entropy {
+            None => {
+                if check {
+                    eprintln!("{name}: missing entropy");
+                    issues += 1;
+                } else {
+                    let value = fresh_entropy()?;
+                    let sep = if text.is_empty() || text.ends_with('\n') {
+                        ""
+                    } else {
+                        "\n"
+                    };
+                    std::fs::write(&path, format!("{text}{sep}entropy={value}\n"))
+                        .map_err(|e| format!("writing {name}: {e}"))?;
+                    println!("{name}: added entropy");
+                }
+            }
+            Some(value) if value.len() < MIN_ENTROPY_LEN => {
+                // Never overwrite a user's value; just flag it.
+                eprintln!(
+                    "{name}: weak entropy ({} chars < {MIN_ENTROPY_LEN})",
+                    value.len()
+                );
+                issues += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    if check && issues > 0 {
+        return Err(format!("{issues} secret(s) with missing or weak entropy"));
+    }
+    if !check && issues > 0 {
+        eprintln!("warning: {issues} secret(s) have weak entropy (edit them; not overwritten)");
+    }
+    Ok(())
+}
+
+/// A resolved secret from the caller's store: its value, its entropy (the
+/// cache-isolation capability), and each reader resolved to a partial arg tree.
+pub(crate) struct ClientSecret {
+    name: String,
+    value: String,
+    entropy: String,
+    readers: Vec<std::collections::BTreeMap<String, String>>,
+}
+
+/// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
+/// each reader resolved HERE (via eval-path, against the store's pinned tree)
+/// to a partial arg tree of name → oid — so the server only subset-matches,
+/// never evals. Empty when there is no store.
+pub(crate) fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
+    let dir = Path::new(SECRETS_DIR);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let pinned = secrets_pinned_tree(t, dir)?;
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    let mut store = Vec::new();
+    for path in paths {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // Skip dotfiles (`.tree`, editor backups) and non-files.
+        if file_name.starts_with('.') || !path.is_file() {
+            continue;
+        }
+        let (name, value, entropy, readers) = parse_local_secret(&file_name, &path)?;
+        let readers = readers
+            .iter()
+            .map(|r| resolve_reader_client(t, &pinned, r))
+            .collect::<Result<_, _>>()?;
+        store.push(ClientSecret {
+            name,
+            value,
+            entropy,
+            readers,
+        });
+    }
+    Ok(store)
+}
+
+/// Serialize the store for the `X-Caos-Secrets` header — a JSON array of
+/// `{name, value, entropy, readers}`. Empty string for an empty store.
+pub(crate) fn secret_store_header(store: &[ClientSecret]) -> String {
+    if store.is_empty() {
+        return String::new();
+    }
+    let array: Vec<serde_json::Value> = store
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "value": s.value,
+                "entropy": s.entropy,
+                "readers": s.readers,
+            })
+        })
+        .collect();
+    serde_json::to_string(&array).unwrap_or_default()
+}
+
+/// The `secret-hash` cache-isolation tag for an ArgTree whose base entries are
+/// `base` (design/secrets.md): the git-blob digest of the `(name, entropy)`
+/// pairs of the store's secrets whose readers match — `None` when none match.
+/// Byte-identical to the server's [`crate::secrets`] side (both hash the shared
+/// `caos_world::secret_hash_material`), so a computation shares one cache entry
+/// whether the client or the server assembles it.
+fn client_secret_hash(
+    store: &[ClientSecret],
+    base: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let pairs: Vec<(&str, &str)> = store
+        .iter()
+        .filter(|s| s.readers.iter().any(|r| reader_subset(r, base)))
+        .map(|s| (s.name.as_str(), s.entropy.as_str()))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let material = caos_world::secret_hash_material(&pairs);
+    Ok(Some(hash_bytes("blob", &material)?.to_string()))
+}
+
+/// Is `reader` (a partial arg tree) a subset of `base`? (The client-side twin of
+/// the server's match — kept identical so both compute the same `secret-hash`.)
+fn reader_subset(
+    reader: &std::collections::BTreeMap<String, String>,
+    base: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    reader.iter().all(|(name, oid)| base.get(name) == Some(oid))
+}
+
+/// Fold `secret-hash` into an existing arg tree `oid` when the carried store
+/// grants it a secret — the caller-propagation mark (design/secrets.md): a
+/// worker embedded (as a `:@=` arg, or returned by a `curry` expression) carries
+/// its per-user identity, so whoever embeds it is per-user too. Unwraps any
+/// curry layers, matches the store's readers against the flattened entries, and
+/// on a match returns a flat args tree `{image, …bound, secret-hash}`; otherwise
+/// returns `oid` unchanged. Idempotent (re-marking recomputes the same digest;
+/// the merge dedups), and a no-op for an empty store.
+pub(crate) fn mark_arg_tree(
+    t: &dyn Transport,
+    store: &[ClientSecret],
+    oid: &str,
+) -> Result<String, String> {
+    if store.is_empty() {
+        return Ok(oid.to_string());
+    }
+    let (image_ref, bound) = unwrap_curry(t, oid)?;
+    let image_entry = image_arg_entry(t, &image_ref)?;
+    let mut base: std::collections::BTreeMap<String, String> = bound
+        .iter()
+        .map(|e| {
+            (
+                String::from_utf8_lossy(entry_name(e)).into_owned(),
+                e.oid.to_string(),
+            )
+        })
+        .collect();
+    base.insert("image".to_string(), image_entry.oid.to_string());
+    let Some(digest) = client_secret_hash(store, &base)? else {
+        return Ok(oid.to_string());
+    };
+    let secret_hash = gix::objs::tree::Entry {
+        mode: gix::objs::tree::EntryKind::Blob.into(),
+        filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
+        oid: post_object(t, "blob", digest.as_bytes())?,
+    };
+    let entries = merge_entries(merge_entries(bound, vec![image_entry]), vec![secret_hash]);
+    Ok(post_tree(t, entries)?.to_string())
+}
+
+/// The tree tree-relative readers resolve against: the `.tree` file in the store
+/// (a hash or ref), else the caller's current working tree (ingested — which
+/// also gets it onto the server so eval-path can walk it).
+fn secrets_pinned_tree(t: &dyn Transport, dir: &Path) -> Result<String, String> {
+    if let Ok(spec) = std::fs::read_to_string(dir.join(".tree")) {
+        let spec = spec.trim();
+        if !spec.is_empty() {
+            return if is_hex_hash(spec) {
+                Ok(spec.to_string())
+            } else {
+                resolve_ref(spec)
+            };
+        }
+    }
+    let (_, oid) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this transport cannot ingest the workspace tree for secrets".to_string())?;
+    Ok(oid.to_string())
+}
+
+/// Parse one `.caos-secrets` file (repeated-key form) into `(name, value,
+/// entropy, readers)`. `name` defaults to the filename; `value=`/`value:@=` set
+/// the value; `reader=` accumulates; `entropy=` keys cache isolation (empty if
+/// absent — the `caos secrets` tool fills it).
+fn parse_local_secret(
+    file_name: &str,
+    path: &Path,
+) -> Result<(String, String, String, Vec<String>), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading secret {file_name}: {e}"))?;
+    let mut name = file_name.to_string();
+    let mut value: Option<String> = None;
+    let mut entropy = String::new();
+    let mut readers = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, val) = line
+            .split_once('=')
+            .ok_or_else(|| format!("secret {file_name}: line {line:?} is not key=value"))?;
+        match key {
+            "name" => name = val.trim().to_string(),
+            "entropy" => entropy = val.trim().to_string(),
+            "value" => value = Some(val.to_string()),
+            "value:@" => {
+                let file = path.parent().unwrap_or_else(|| Path::new(".")).join(val);
+                let bytes = std::fs::read(&file)
+                    .map_err(|e| format!("secret {file_name} value:@={val}: {e}"))?;
+                value = Some(
+                    String::from_utf8(bytes)
+                        .map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))?,
+                );
+            }
+            "reader" => readers.push(val.trim().to_string()),
+            other => return Err(format!("secret {file_name}: unknown key {other:?}")),
+        }
+    }
+    let value = value.ok_or_else(|| format!("secret {file_name}: no value= line"))?;
+    Ok((name, value, entropy, readers))
+}
+
+/// Resolve a reader — a single path/expression, no argument pins
+/// (design/secrets.md: a reader names an *expression*; narrow by pointing at a
+/// narrower one, not by pinning args here) — to the partial arg tree it stands
+/// for: eval-path the path (so a flake/`.caos-expr` tool resolves to the same
+/// arg tree the run uses), unwrap any curry layers, and take its entries. That
+/// tree already carries whatever the expression bakes in (e.g. a curried
+/// `worker1` script), so it is as specific as the expression is.
+fn resolve_reader_client(
+    t: &dyn Transport,
+    pinned: &str,
+    reader: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    if reader.split_whitespace().count() != 1 {
+        return Err(format!(
+            "reader {reader:?} must be a single path (argument pins are not supported — \
+             point at a narrower expression instead)"
+        ));
+    }
+    let image = resolve_reader_image(t, pinned, reader.trim())?;
+    let (base, bound) = unwrap_curry(t, &image)?;
+    let mut entries = std::collections::BTreeMap::new();
+    for entry in bound {
+        entries.insert(
+            String::from_utf8_lossy(entry_name(&entry)).into_owned(),
+            entry.oid.to_string(),
+        );
+    }
+    // The image entry wins over any like-named bound arg, mirroring assembly.
+    entries.insert("image".to_string(), base);
+    Ok(entries)
+}
+
+/// Resolve a reader's image token: a bare hash, or a path in the pinned tree
+/// (via eval-path — so a flake/`.caos-expr` tool resolves to the same oid the
+/// run uses).
+///
+/// A path only: there is no ambient library to name, so a reader says
+/// `std/github-push` and it is read out of the tree, exactly as an expression
+/// reaches a dependency. That is also why it converges with the run's own
+/// resolution — the root `.caos-expr` deepens the tree, and the entry a reader
+/// descends to is the same node a `DEEP-DEPS/<name>` mount points at.
+fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<String, String> {
+    if is_hex_hash(expr) {
+        return Ok(expr.to_string());
+    }
+    // Empty store: a reader's own resolution must not be marked (its arg tree is
+    // what the match compares against; marking it would be circular).
+    let (_, oid) = eval::eval_path(t, pinned, expr, &[])?;
+    Ok(oid)
+}
+
+fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
     let url = format!("{}/run?req={}", base.trim_end_matches('/'), arg_tree);
-    request_compute_url(&url)
+    request_compute_url(&url, secrets)
 }
 
 fn request_compute_traced(
     base: &str,
     arg_tree: &str,
     trace_id: &str,
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let url = format!(
         "{}/run?req={arg_tree}&trace={trace_id}",
         base.trim_end_matches('/')
     );
-    request_compute_url(&url)
+    request_compute_url(&url, secrets)
 }
 
-fn request_compute_url(url: &str) -> Result<(String, String), String> {
-    let body = http_get(url)?;
-    let text =
-        String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+/// Issue the compute `GET /run`, carrying the ephemeral secrets store in the
+/// [`SECRETS_HEADER`] header when non-empty (design/secrets.md) — out of band
+/// from the content-addressed ArgTree in the URL.
+fn request_compute_url(url: &str, secrets: &str) -> Result<(String, String), String> {
+    let mut request = minreq::get(url).with_header(caos_world::WORLD_HEADER, caos_world::WORLD);
+    if !secrets.is_empty() {
+        request = request.with_header(SECRETS_HEADER, secrets);
+    }
+    let response = request.send().map_err(|e| format!("GET {url}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        // Surface the server's response body — a 500 carries the worker's
+        // failure output, which is what you actually need.
+        let body = response.as_str().unwrap_or("").trim();
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{body}")
+        };
+        return Err(format!(
+            "GET {url}: server returned {} {}{detail}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let text = String::from_utf8(response.into_bytes())
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
         .trim()
         .split_once(' ')
@@ -2966,6 +3435,7 @@ fn request_compute_streamed(
     arg_tree: &str,
     trace_id: &str,
     output: &mut (dyn Write + Send),
+    secrets: &str,
 ) -> Result<(String, String), String> {
     let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
     let mut response = minreq::get(&stream_url)
@@ -3000,7 +3470,7 @@ fn request_compute_streamed(
             }
             Ok(())
         });
-        let result = request_compute_traced(base, arg_tree, trace_id);
+        let result = request_compute_traced(base, arg_tree, trace_id, secrets);
         let trace_result = trace
             .join()
             .map_err(|_| "the trace stream thread panicked".to_string())?;

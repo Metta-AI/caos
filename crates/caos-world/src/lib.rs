@@ -41,3 +41,45 @@ pub fn mismatch(server: &str, client: &str) -> String {
          design/test-stack-image.md."
     )
 }
+
+/// The reserved ArgTree entry carrying a run's secret-cache-isolation tag
+/// (design/secrets.md). Present only when the run is granted ≥1 secret.
+pub const SECRET_HASH_ARG: &str = "secret-hash";
+
+/// Canonical bytes to hash for the [`SECRET_HASH_ARG`] entry: the granted
+/// secrets' `(worker-visible name, entropy)` pairs, sorted and de-duplicated,
+/// each serialized `name\0entropy\n`. Whoever assembles an ArgTree hashes THIS
+/// (as a git blob) and stores the resulting digest as the entry — so the key
+/// depends on the entropy's DIGEST, never the entropy itself (which is a bearer
+/// capability for the cache). The canonical form lives here, in the crate the
+/// client and server share, because both compute it and a disagreement would
+/// silently split or merge their caches.
+pub fn secret_hash_material(pairs: &[(&str, &str)]) -> Vec<u8> {
+    let mut pairs: Vec<(&str, &str)> = pairs.to_vec();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut out = Vec::new();
+    for (name, entropy) in pairs {
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(entropy.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_hash_material_is_order_independent_and_deduped() {
+        let a = secret_hash_material(&[("gh", "E1"), ("npm", "E2")]);
+        let b = secret_hash_material(&[("npm", "E2"), ("gh", "E1"), ("gh", "E1")]);
+        assert_eq!(a, b, "sorted + de-duplicated, so caller order can't matter");
+        // Rotating an entropy changes the material (hence the cache namespace).
+        assert_ne!(a, secret_hash_material(&[("gh", "E9"), ("npm", "E2")]));
+        // The name is part of it (same secret at a different mount is distinct).
+        assert_ne!(a, secret_hash_material(&[("GH", "E1"), ("npm", "E2")]));
+    }
+}

@@ -15,6 +15,7 @@
 //! `run-then`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 
@@ -129,6 +130,9 @@ struct RunnerJob {
     arg_tree: String,
     nonce: String,
     token: Option<String>,
+    /// Secrets the server granted this job (design/secrets.md): name → value.
+    /// Dropped at `/secret/<name>` for the worker, out of band from its args.
+    secrets: Vec<(String, String)>,
 }
 
 impl RunnerJob {
@@ -145,10 +149,23 @@ impl RunnerJob {
         if arg_tree.is_empty() || nonce.is_empty() {
             return Err("job missing req/nonce".to_string());
         }
+        let secrets = match v.get("secrets") {
+            Some(serde_json::Value::Object(map)) => map
+                .iter()
+                .map(|(name, value)| {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| format!("secret {name:?} value is not a string"))?;
+                    Ok((name.clone(), value.to_string()))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            _ => Vec::new(),
+        };
         Ok(RunnerJob {
             arg_tree,
             nonce,
             token: field("token").map(str::to_string),
+            secrets,
         })
     }
 }
@@ -199,10 +216,54 @@ fn run_runner_job(
         *image_oid = caos::read_hash(&cas.join("args").join("image")).ok();
     }
     let envs = [(caos::SALT_ENV, salt.as_str())];
-    run_worker(&envs)?;
+    // Drop the granted secrets at `/secret/<name>` just before the worker runs
+    // (design/secrets.md). `write_secrets` wipes any prior job's `/secret`
+    // first, so a warm runner never leaks a secret into a later job that wasn't
+    // granted it.
+    write_secrets(&job.secrets)?;
+    let ran = run_worker(&envs, &job.secrets);
+    // Remove the secrets whether the worker passed or failed; the next job's
+    // `write_secrets` also wipes, but don't leave plaintext around meanwhile.
+    remove_secrets();
+    ran?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
     Ok(result)
+}
+
+/// In-container directory the runner drops granted secrets into, one file per
+/// secret, for the worker to read (design/secrets.md, `/secret/<name>`).
+const SECRET_DIR: &str = caos::SECRET_DIR;
+
+/// Write `secrets` (name → value) into `/secret/<name>`, wiping any prior
+/// contents first. Written root-owned but world-readable so the unprivileged
+/// worker can read them; a name with a path separator is rejected (it must be a
+/// single file component).
+fn write_secrets(secrets: &[(String, String)]) -> Result<(), String> {
+    remove_secrets();
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(SECRET_DIR).map_err(|e| format!("creating {SECRET_DIR}: {e}"))?;
+    std::fs::set_permissions(SECRET_DIR, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {SECRET_DIR}: {e}"))?;
+    for (name, value) in secrets {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(format!(
+                "secret name {name:?} is not a single path component"
+            ));
+        }
+        let path = format!("{SECRET_DIR}/{name}");
+        std::fs::write(&path, value).map_err(|e| format!("writing secret {name}: {e}"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .map_err(|e| format!("chmod secret {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Remove `/secret` and everything in it. Succeeds if it's already gone.
+fn remove_secrets() {
+    let _ = std::fs::remove_dir_all(SECRET_DIR);
 }
 
 /// Unpack an ArgTree: its hash (returned back for `/cas/args`) and the salt
@@ -421,9 +482,15 @@ fn cas_setup(args_hash: Option<&str>) -> Result<std::path::PathBuf, String> {
 /// Run `/worker` with `envs` added to its environment. We stay root (to tear
 /// down `/cas` after), but drop the worker to an unprivileged user so it can't
 /// tamper with the root-owned `/cas` — only the setuid-root `caos` it invokes
-/// can. Its output is captured, relayed to our stderr (the container log), and
-/// included in the error on failure so the failure post carries the log.
-fn run_worker(envs: &[(&str, &str)]) -> Result<(), String> {
+/// can. Its output is captured, MASKED (any injected `secrets` value replaced —
+/// design/secrets.md log masking), then relayed to our stderr (the container
+/// log) and included in the error on failure. Masking here is the one
+/// chokepoint that covers the whole chain: every downstream log (this
+/// container's stderr, runnerd's relay, the server's failure message) derives
+/// from this string. Best-effort and transform-blind — a value the worker
+/// base64'd or split slips through; this catches an accidental echo, not a
+/// determined exfiltrator.
+fn run_worker(envs: &[(&str, &str)], secrets: &[(String, String)]) -> Result<(), String> {
     let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
     let gid = caos::env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
     let mut command = std::process::Command::new(DEFAULT_WORKER);
@@ -446,10 +513,13 @@ fn run_worker(envs: &[(&str, &str)]) -> Result<(), String> {
     let out = command
         .output()
         .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let log = mask_secrets(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        secrets,
     );
     eprint!("{log}");
     if !out.status.success() {
@@ -459,6 +529,24 @@ fn run_worker(envs: &[(&str, &str)]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Replace every injected secret value in `log` with a fixed marker. Longest
+/// values first, so a secret that contains another is masked whole. Empty
+/// values are skipped (they'd match everywhere). The marker names no secret.
+fn mask_secrets(mut log: String, secrets: &[(String, String)]) -> String {
+    let mut values: Vec<&str> = secrets
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for value in values {
+        if log.contains(value) {
+            log = log.replace(value, "[redacted secret]");
+        }
+    }
+    log
 }
 
 /// Read back the result the worker recorded at `/cas/out`, as `"<type> <hash>"`.

@@ -69,6 +69,55 @@ cat > pkg-nested/.caos-expr <<'EOF'
 run tool -- --name:@=name
 EOF
 
+# A `:@=` ARG whose target carries a `.caos-expr` is an EXPRESSION, so it is
+# evaluated and the arg binds what it BUILT — not the source directory
+# (design/caos-expr.md). `dep/` produces a tree holding `name`; the outer
+# worker reads `/cas/args/namedir/name`, which exists only in dep's RESULT
+# (the raw dir holds `gen.sh`, `bash` and `.caos-expr` instead). So this
+# asserts evaluation happened, not just that something was bound.
+mkdir -p pkg-argexpr/dep
+cp -r "$BASH" pkg-argexpr/bash
+cp -r "$BASH" pkg-argexpr/dep/bash
+cat > pkg-argexpr/dep/gen.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+mkdir -p /tmp/out
+echo world > /tmp/out/name
+caos put /tmp/out /cas/out
+EOF
+cat > pkg-argexpr/dep/.caos-expr <<'EOF'
+run bash -- --worker1:@=gen.sh
+EOF
+cat > pkg-argexpr/read.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+# Two gets: `caos get` materializes ONE level, so a nested blob needs its own —
+# without the second, `name` is an unmaterialized placeholder that reads EMPTY
+# rather than failing, which looks exactly like "the arg was bound raw".
+caos get /cas/args/namedir
+caos get /cas/args/namedir/name
+mkdir -p /tmp/out
+# Carried into the RESULT, not echoed to stderr: a passing worker's stderr never
+# reaches the test record, so a diagnostic only helps if it is part of the output.
+ls -a /cas/args/namedir | tr '\n' ' ' > /tmp/out/listing
+echo "hello $(cat /cas/args/namedir/name)" > /tmp/out/greeting
+caos put /tmp/out /cas/out
+EOF
+cat > pkg-argexpr/.caos-expr <<'EOF'
+run bash -- --worker1:@=read.sh --namedir:@=dep
+EOF
+
+# A `:@=` target with NO `.caos-expr` is DATA and stays raw — the other half of
+# the same rule. `data/` is a plain directory; the worker must see its literal
+# file, so binding it must NOT go looking for an expression to run.
+mkdir -p pkg-argdata/data
+cp -r "$BASH" pkg-argdata/bash
+echo world > pkg-argdata/data/name
+cp pkg-argexpr/read.sh pkg-argdata/read.sh
+cat > pkg-argdata/.caos-expr <<'EOF'
+run bash -- --worker1:@=read.sh --namedir:@=data
+EOF
+
 commit "eval-path fixtures"
 
 echo "== eval-path evaluates a directory's .caos-expr ==" >&2
@@ -98,6 +147,21 @@ gkind=${g%% *}; ghash=${g##* }
 "$CAOS_CLI" get "$ghash" got-greeting || fail "get greeting blob"
 [ "$(cat got-greeting)" = "hello world" ] || fail "greeting blob: $(cat got-greeting)"
 echo "  ok: eval-path pkg-direct/greeting -> the produced blob" >&2
+
+echo "== a :@= arg naming an EXPRESSION binds what it built ==" >&2
+out_arg=$("$CAOS_CLI" eval-path pkg-argexpr) || fail "eval-path pkg-argexpr failed"
+[ "${out_arg%% *}" = tree ] || fail "expected a tree, got: $out_arg"
+"$CAOS_CLI" get "${out_arg##* }" got-argexpr || fail "get ${out_arg##* }"
+[ "$(cat got-argexpr/greeting)" = "hello world" ] \
+  || fail "argexpr greeting: '$(cat got-argexpr/greeting)' — namedir held: $(cat got-argexpr/listing)"
+echo "  ok: --namedir:@=dep resolved through dep/'s .caos-expr" >&2
+
+echo "== a :@= arg naming plain DATA stays raw ==" >&2
+out_dat=$("$CAOS_CLI" eval-path pkg-argdata) || fail "eval-path pkg-argdata failed"
+"$CAOS_CLI" get "${out_dat##* }" got-argdata || fail "get ${out_dat##* }"
+[ "$(cat got-argdata/greeting)" = "hello world" ] \
+  || fail "argdata greeting: $(cat got-argdata/greeting)"
+echo "  ok: a target with no .caos-expr is referenced as-is" >&2
 
 echo "== a repeated eval is a cache hit (same hash) ==" >&2
 out3=$("$CAOS_CLI" eval-path pkg-direct)
