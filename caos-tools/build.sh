@@ -121,13 +121,26 @@ reduce)
   # cannot evaluate the `.caos-expr` itself, because that blocks on a run. The
   # entry is in the tree we were handed, at `in/std/flake-builder`.
   #
+  # MINUS THE `.caos-expr`. An expression is evaluated against its directory
+  # WITHOUT the directive (crates/caos/src/eval.rs `strip_caos_expr`), so the
+  # `in` a client's `--in:@=.` forms — and the one build-builtins.sh records as
+  # the seed key — is the stripped tree. Hand-simulating the expression means
+  # stripping too: pass the entry verbatim and the key matches no seed record,
+  # the job falls through to the generic runner, and it dies trying to pull
+  # `seeded:latest`.
+  F=/tmp/flake-builder
+  rm -rf "$F"; mkdir -p "$F"
+  cp -RL --preserve=mode /cas/args/in/std/flake-builder/. "$F/"
+  rm -f "$F/.caos-expr"
+  caos put "$F" /cas/flake-builder
+
   # Each run ends a stage, so resolving it ends this one; `build-env` runs it.
   env=$(caos curry /cas/args/image -- \
     "--worker1:@=/cas/args/worker1" --stage=build-env \
     "--reduced:@=/cas/reduced" "--src:@=/cas/src") \
     || fail "currying the build-env stage"
 
-  caos run-then /cas/args/in/std/flake-builder -- --run=docker://seeded --then="$env"
+  caos run-then /cas/flake-builder -- --run=docker://seeded --then="$env"
   ;;
 
 build-env)

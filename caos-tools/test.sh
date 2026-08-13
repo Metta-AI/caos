@@ -148,6 +148,23 @@ deepener)
   caos get /cas/args/in/std
   caos get /cas/args/in/std/deep-deps
 
+  # MINUS THE `.caos-expr`. An expression is evaluated against its directory
+  # WITHOUT the directive (crates/caos/src/eval.rs `strip_caos_expr`), so the
+  # `in` the expression forms — and the one build-builtins.sh records as the
+  # seed key — is the stripped tree. For a sentinel entry the whole directory
+  # IS the directive, so this is the EMPTY tree; pass the entry verbatim and
+  # the key matches no seed record, the job falls through to the generic
+  # runner, and it dies trying to pull `seeded-deep-deps:latest`.
+  # `-r`: a plain `get` leaves the entry's children as owner-only placeholders
+  # the unprivileged worker cannot read, so the copy below needs the content.
+  caos get -r /cas/args/in/std/deep-deps
+  D=/tmp/deep-deps
+  rm -rf "$D"; mkdir -p "$D"
+  cp -RL --preserve=mode /cas/args/in/std/deep-deps/. "$D/"
+  rm -f "$D/.caos-expr"
+  chmod -R u+w "$D"
+  caos put "$D" /cas/deep-deps
+
   # Each run ends a stage: a worker delegates its continuation instead of
   # blocking. So resolving the image ends THIS stage, `deepen` does the
   # transform, and `fanout` builds the wrappers. Everything a later stage needs
@@ -162,7 +179,7 @@ deepener)
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
   deepen=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the deepen stage"
-  caos run-then /cas/args/in/std/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
+  caos run-then /cas/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
   ;;
 
 deepen)
