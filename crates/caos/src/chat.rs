@@ -1550,13 +1550,6 @@ fn turn(
         let (server, arg_tree) = (server.clone(), arg_tree);
         std::thread::spawn(move || request_compute(&server, &arg_tree, ""))
     };
-    // "Accepted" is user-visible only after the request thread has handed the
-    // already-published work to the server. Closing the TUI after this event
-    // can drop the response connection, but not the server's running worker.
-    emit(TurnEvent::Accepted {
-        commit: human.clone(),
-    });
-
     // While the run blocks, follow the worker's per-step progress ref and
     // print each new step (assistant text + one-line tool calls); alongside
     // it, the in-round status ref — what the API call is doing right now —
@@ -1566,6 +1559,28 @@ fn turn(
     let status_ref = conv_ref(name, STATUS_CHANNEL);
     let mut printed: HashSet<String> = HashSet::new();
     let mut last_status: Option<String> = None;
+    // Do not call the message accepted merely because the local request thread
+    // exists. Wait until the worker publishes this turn's first status (or has
+    // already completed), proving the server owns the run before the TUI may
+    // safely close.
+    let worker_started = loop {
+        if run.is_finished() {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        match poll_status(t, &http, &status_ref, &human, &mut last_status, emit) {
+            Ok(true) => break true,
+            Ok(false) => {}
+            Err(error) => emit(TurnEvent::Status(format!(
+                "handoff check failed (retrying): {error}"
+            ))),
+        }
+    };
+    if worker_started {
+        emit(TurnEvent::Accepted {
+            commit: human.clone(),
+        });
+    }
     while !run.is_finished() {
         for _ in 0..(POLL_MS / 100) {
             if run.is_finished() {
@@ -1602,6 +1617,13 @@ fn turn(
     };
     if kind != "commit" {
         return Err(format!("the run returned a {kind}, expected a commit"));
+    }
+    if !worker_started {
+        // A very fast successful run may finish before the first status poll;
+        // completion itself is an even stronger handoff acknowledgement.
+        emit(TurnEvent::Accepted {
+            commit: human.clone(),
+        });
     }
 
     // Fetch the turn (and so the whole step chain — it's tree-reachable), then
@@ -1720,27 +1742,28 @@ fn poll_status(
     human: &str,
     last: &mut Option<String>,
     emit: &mut dyn FnMut(TurnEvent),
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let out = t.git_capture(&["ls-remote", CAOS_REMOTE, status_ref], None)?;
     let Some(tip) = out.split_whitespace().next().filter(|h| !h.is_empty()) else {
-        return Ok(()); // no ref yet
+        return Ok(false); // no ref yet
     };
     if last.as_deref() == Some(tip) {
-        return Ok(());
+        return Ok(false);
     }
     let (kind, content) = http.get_object(tip)?;
     if kind != "blob" {
-        return Ok(());
+        return Ok(false);
     }
     let text = String::from_utf8_lossy(&content);
     let Some((turn_root, line)) = text.split_once('\n') else {
-        return Ok(());
+        return Ok(false);
     };
-    if turn_root == human {
+    let current = turn_root == human;
+    if current {
         emit(TurnEvent::Status(line.trim_end().to_string()));
     }
     *last = Some(tip.to_string());
-    Ok(())
+    Ok(current)
 }
 
 /// Walk the step chain down from `tip` to the first known commit (`human`, or
