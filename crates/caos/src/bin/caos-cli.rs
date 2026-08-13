@@ -110,6 +110,13 @@ fn run(args: &[String]) -> Result<(), String> {
             [arg_tree, rest @ ..] => caos::cli_curry(&transport()?, arg_tree, rest),
             _ => Err(usage(args)),
         },
+        // Build and push the exact flat runnable request without executing it.
+        Some("prepare-request") => match &args[2..] {
+            [image, sep, kvs @ ..] if sep == "--" => {
+                caos::cli_prepare_request(&transport()?, image, kvs)
+            }
+            _ => Err(usage(args)),
+        },
         // `import-image [--base docker://<ref>] <docker-archive>` — store a
         // docker-archive image into caos and print the git hash of the resulting
         // git-docker image. With `--base`, the archive's layers are stored as a
@@ -128,10 +135,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("talk") => caos::cli_talk(&transport()?, &args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
-        // conversation: mint the human commit, run llm-step over it, print
-        // progress, advance `refs/caos/conversations/<name>/from-user` on
-        // success. Flag parsing (and the chat-specific usage) lives in
-        // `caos::cli_chat`.
+        // conversation on its shared canonical head. Flag parsing (and the
+        // chat-specific usage) lives in `caos::cli_chat`.
         Some("chat") => caos::cli_chat(&transport()?, &args[2..]),
         // `run-tool <script | name> [--name=value ...]` — run a caos-tool (a
         // worker script, `caos-tools/<name>.sh` for a bare name) as a caos
@@ -195,10 +200,11 @@ fn usage(args: &[String]) -> String {
         "usage:\n  \
          {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
+         {prog} prepare-request <image-or-arg-tree> -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
-         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
-         {prog} tui [--new | --from <commit>] [options]\n  \
-         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
+         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [--username <name>] [options]\n  \
+         {prog} tui [-c <name>] [--new] [--username <name>] [options]\n  \
+         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [options]\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \

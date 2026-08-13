@@ -30,6 +30,6 @@ git config user.email chat-online-test@caos
   "Use the bash tool to run \`echo pong\`, then reply with just its output."
 
 # A fresh repo has no conversations, so talk auto-named the first one talk-1.
-git rev-parse -q --verify refs/caos/conversations/talk-1/from-user >/dev/null \
+git rev-parse -q --verify refs/caos/v2/conversations/talk-1/head >/dev/null \
   || { echo "chat-online: FAIL — conversation ref missing" >&2; exit 1; }
 echo "chat-online: one real turn PASSED (conversation talk-1)" >&2

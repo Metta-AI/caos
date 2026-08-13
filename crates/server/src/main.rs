@@ -5,6 +5,8 @@
 //! * `GET  /object/<hash>` — return the serialized object (`<type> <size>\0…`).
 //! * `HEAD /object/<hash>` — 200/404, no body: is it stored? (`put` prunes on it.)
 //! * `POST /object/` — store the serialized object in the body, return its hash.
+//! * `POST /ref/read` — read one exact ref without a repository-wide advertisement.
+//! * `POST /ref/append` — atomically compare-and-append a commit-valued ref.
 //!
 //! Compute:
 //!
@@ -41,12 +43,14 @@
 
 mod compute;
 mod git;
+mod refs;
 mod repair;
 mod runner;
 mod secrets;
 mod storage;
 mod trace;
 
+use std::io::Read;
 use std::sync::Arc;
 
 use tiny_http::{Method, Request, Response, Server, StatusCode};
@@ -122,7 +126,10 @@ fn main() {
     // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
     // `git init --bare` is idempotent, so this is a no-op once seeded.
     let git = |args: &[&str]| {
-        let _ = std::process::Command::new("git").args(args).status();
+        run_required_git(args).unwrap_or_else(|error| {
+            eprintln!("fatal: {error}");
+            std::process::exit(1);
+        });
     };
     if gix::open(&git_dir).is_err() {
         git(&["init", "-q", "--bare", &git_dir]);
@@ -142,6 +149,21 @@ fn main() {
         "uploadpack.allowAnySHA1InWant",
         "true",
     ]);
+    // Request refs are transient negotiation anchors and result refs are a
+    // server-owned lookup index. Neither belongs in repository-wide fetch
+    // advertisements; exact result lookup goes through `/ref/read`. Both remain
+    // visible to receive-pack negotiation: a client can form its next request
+    // from a result object that exists only on the server, so hiding that result
+    // makes send-pack try (and fail) to read it locally. The pre-receive hook
+    // rejects client writes to the server-owned result namespace.
+    configure_ref_advertisements(&git_dir).unwrap_or_else(|error| {
+        eprintln!("fatal: {error}");
+        std::process::exit(1);
+    });
+    refs::install_hook(&git_dir).unwrap_or_else(|error| {
+        eprintln!("fatal: {error}");
+        std::process::exit(1);
+    });
     // Serve partial-clone (`--filter`) fetches: the std/merge worker fetches
     // the commit GRAPH only (`--filter=tree:0`) and lazily faults in just the
     // three trees `git merge-tree` needs, rather than the whole history's
@@ -199,6 +221,10 @@ fn main() {
     // git's own side only; the in-process gix writes are `storage`'s to sync.
     git(&["-C", &git_dir, "config", "core.fsync", "objects,reference"]);
     git(&["-C", &git_dir, "config", "core.fsyncMethod", "batch"]);
+    // Keep previous values as a generic recovery path if a ref tip is damaged
+    // despite the fsync policy above. `always` includes refs outside
+    // refs/heads. Ordinary Git expiry bounds these logs.
+    git(&["-C", &git_dir, "config", "core.logAllRefUpdates", "always"]);
 
     // Clear what a previous crash left behind BEFORE opening the repo: gix
     // answers "is this object stored?" for a loose object with a path-exists
@@ -258,11 +284,100 @@ fn main() {
     for request in server.incoming_requests() {
         let config = Arc::clone(&config);
         std::thread::spawn(move || {
-            if let Err(err) = handle(&config, request) {
+            if let Err(err) = handle(config, request) {
                 // Only reachable if writing the response itself fails.
                 eprintln!("failed to send response: {err}");
             }
         });
+    }
+}
+
+/// Run one of the Git commands that establishes the server's storage
+/// contract. Ignoring one of these failures lets the server start in a mode
+/// where pushes, object fetches, or crash recovery are silently unsafe.
+fn run_required_git(args: &[&str]) -> Result<(), String> {
+    let command = format!(
+        "git {}",
+        args.iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|error| format!("cannot run required command {command}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    Err(if detail.is_empty() {
+        format!("required command {command} exited with {}", output.status)
+    } else {
+        format!(
+            "required command {command} exited with {}: {detail}",
+            output.status
+        )
+    })
+}
+
+fn configure_ref_advertisements(git_dir: &str) -> Result<(), String> {
+    ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/req/")?;
+    ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/res/")?;
+    // Undo the setting written by the first exact-ref implementation. Server
+    // repositories survive binary upgrades, so merely ceasing to add it would
+    // leave existing installations unable to negotiate result objects.
+    remove_git_config_value(git_dir, "receive.hideRefs", "refs/caos/res/")
+}
+
+/// Add one multi-valued Git setting once, preserving administrator-supplied
+/// values and avoiding duplicate entries across server restarts.
+fn ensure_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", git_dir, "config", "--get-all", key])
+        .output()
+        .map_err(|error| format!("reading git config {key}: {error}"))?;
+    match output.status.code() {
+        Some(0) => {
+            let values = String::from_utf8(output.stdout)
+                .map_err(|error| format!("git config {key} is not UTF-8: {error}"))?;
+            if values.lines().any(|configured| configured == value) {
+                return Ok(());
+            }
+        }
+        Some(1) => {}
+        _ => {
+            return Err(format!(
+                "reading git config {key}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    run_required_git(&["-C", git_dir, "config", "--add", key, value])
+}
+
+/// Remove one formerly server-owned multi-valued Git setting without touching
+/// administrator-supplied values alongside it.
+fn remove_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_dir,
+            "config",
+            "--fixed-value",
+            "--unset-all",
+            key,
+            value,
+        ])
+        .output()
+        .map_err(|error| format!("removing git config {key}: {error}"))?;
+    match output.status.code() {
+        Some(0) | Some(5) => Ok(()), // removed, or no exact value was present
+        _ => Err(format!(
+            "removing git config {key}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
     }
 }
 
@@ -302,12 +417,12 @@ impl From<std::io::Error> for HttpError {
 }
 
 /// Dispatch a single request and send its response.
-fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
+fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     // Git smart-HTTP (the `caos` remote) is served by a separate CGI delegate that
     // sets its own status/headers, so it bypasses the `route` -> `from_data` path.
     let path = request.url().split('?').next().unwrap_or("").to_string();
     if git::is_git_path(&path) {
-        return git::serve(config, request);
+        return git::serve(&config, request);
     }
     // The WORLD guard (design/test-stack-image.md): a caos client built for
     // the other world must not drive this stack. The dangerous crossing is
@@ -357,7 +472,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
         }
     }
 
-    match route(config, &mut request) {
+    match route(&config, &mut request) {
         Ok(body) => request.respond(Response::from_data(body)),
         Err(err) => request.respond(
             Response::from_string(format!("{}\n", err.message))
@@ -369,7 +484,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
 /// Match the request to a handler and produce the response body. Serves the
 /// storage endpoints (`/object*`), compute (`/run`), and the runner protocol
 /// (`/runner/poll`, `/runner/result`).
-fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
+fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpError> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -400,6 +515,18 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
             let mut body = Vec::new();
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
+        }
+        Method::Post if path == "/ref/read" || path == "/ref/append" => {
+            let mut body = String::new();
+            request
+                .as_reader()
+                .take(16 * 1024)
+                .read_to_string(&mut body)?;
+            if path == "/ref/read" {
+                refs::read(config, &body)
+            } else {
+                refs::append(config, &body)
+            }
         }
         Method::Post if path == "/runner/poll" || path == "/runner/result" => {
             let authorization = request
@@ -493,4 +620,135 @@ fn spawn_request_ref_pruner(git_dir: String) {
             Err(e) => eprintln!("caos-server: pruning request refs: {e}"),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{configure_ref_advertisements, run_required_git};
+    use std::process::Command;
+
+    #[test]
+    fn required_git_command_reports_nonzero_status() {
+        let absent = std::env::temp_dir().join(format!(
+            "caos-required-git-test-{}-absent",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&absent).ok();
+        let error = run_required_git(&[
+            "-C",
+            absent.to_str().unwrap(),
+            "config",
+            "http.receivepack",
+            "true",
+        ])
+        .unwrap_err();
+        assert!(error.contains("required command git"), "{error}");
+        assert!(error.contains("exited with"), "{error}");
+    }
+
+    #[test]
+    fn server_owned_refs_are_hidden_from_fetch_but_available_for_push_negotiation() {
+        let dir = std::env::temp_dir().join(format!("caos-hidden-ref-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let git = |args: &[&str]| {
+            let output = Command::new("git").args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        git(&["init", "-q", "--bare", dir.to_str().unwrap()]);
+        git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "config",
+            "--add",
+            "uploadpack.hideRefs",
+            "refs/private/",
+        ]);
+        git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "config",
+            "--add",
+            "receive.hideRefs",
+            "refs/private-write/",
+        ]);
+        git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "config",
+            "--add",
+            "receive.hideRefs",
+            "refs/caos/res/",
+        ]);
+        let blob = git(&["-C", dir.to_str().unwrap(), "hash-object", "-w", "--stdin"]);
+        let blob = blob.trim();
+        for refname in [
+            "refs/caos/req/request",
+            "refs/caos/res/result",
+            "refs/caos/v2/users/u-1/conversations/active/test",
+        ] {
+            git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
+        }
+        configure_ref_advertisements(dir.to_str().unwrap()).unwrap();
+        configure_ref_advertisements(dir.to_str().unwrap()).unwrap();
+        let hidden = git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "config",
+            "--get-all",
+            "uploadpack.hideRefs",
+        ]);
+        assert_eq!(hidden.lines().count(), 3, "{hidden}");
+        assert!(hidden.lines().any(|value| value == "refs/private/"));
+        let receive_hidden = git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "config",
+            "--get-all",
+            "receive.hideRefs",
+        ]);
+        assert_eq!(receive_hidden.trim(), "refs/private-write/");
+
+        let upload = git(&[
+            "upload-pack",
+            "--stateless-rpc",
+            "--advertise-refs",
+            dir.to_str().unwrap(),
+        ]);
+        assert!(!upload.contains("refs/caos/req/"));
+        assert!(!upload.contains("refs/caos/res/"));
+        assert!(upload.contains("refs/caos/v2/users/"));
+
+        let receive = git(&[
+            "receive-pack",
+            "--stateless-rpc",
+            "--advertise-refs",
+            dir.to_str().unwrap(),
+        ]);
+        assert!(receive.contains("refs/caos/req/"));
+        assert!(receive.contains("refs/caos/res/"));
+        assert!(receive.contains("refs/caos/v2/users/"));
+
+        let config = super::Config {
+            registry_push_url: String::new(),
+            registry_pull_host: String::new(),
+            redis_addr: String::new(),
+            git_dir: dir.to_string_lossy().into_owned(),
+            repo: gix::open(&dir).unwrap().into_sync(),
+            trace: crate::trace::Hub::default(),
+        };
+        let exact = crate::refs::read(
+            &config,
+            &serde_json::json!({"ref": "refs/caos/res/result"}).to_string(),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(String::from_utf8(exact).unwrap().trim(), blob);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -34,7 +34,7 @@ impl Args {
                     .ok_or_else(|| format!("{flag} needs a value\n{}", usage()))
             };
             match arg.as_str() {
-                "--user" => user_flag = Some(value(&mut args, arg)?),
+                "--user" | "--username" => user_flag = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
                 "-c" | "--conversation" => parsed.conversation = Some(value(&mut args, arg)?),
@@ -51,7 +51,7 @@ impl Args {
         }
         parsed.user = user_flag
             .or(default_user)
-            .ok_or_else(|| "--user is required when $USER is not set".to_string())?;
+            .ok_or_else(|| "--username is required when $USER is not set".to_string())?;
         if parsed.turn.system.is_some() && parsed.turn.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
         }
@@ -81,12 +81,13 @@ impl Args {
                     .to_string(),
             );
         }
+        parsed.turn.username = Some(parsed.user.clone());
         Ok(parsed)
     }
 }
 
 pub(crate) fn usage() -> String {
-    "usage: caos tui [--user <id>] [--list-archived | --unarchive <conversation-id>] \
+    "usage: caos tui [--username <name>] [--list-archived | --unarchive <conversation-id>] \
      [--new | --from <commit>] [--base <revspec>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
         .to_string()

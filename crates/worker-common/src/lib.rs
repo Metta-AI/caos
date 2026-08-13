@@ -286,6 +286,11 @@ pub fn cas_hash(cas_path: &str) -> Result<String, String> {
     caos_capture(&["hash", cas_path])
 }
 
+/// Record the object at `src` at the fresh CAS path `dst` without copying it.
+pub fn forward(src: &str, dst: &str) -> Result<(), String> {
+    caos(["forward", src, dst])
+}
+
 /// Fetch and parse the commit at a CAS path (e.g. a `--name:commit=` arg, which
 /// materializes as a file holding the raw commit object). Walk the history by
 /// hash from here: `caos get-hash <commit.tree> <path>` for the snapshot,

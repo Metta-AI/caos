@@ -11,16 +11,14 @@
 //!
 //! One such object takes the whole server down for writes. `git-receive-pack`
 //! validates every advertised ref before accepting an update, so a single
-//! unreadable blob under `refs/caos/conversations/<id>/status` — pure
-//! observability, nothing depends on it — rejects EVERY push with
-//! `bad object …/status`, including pushes that never mention that ref.
+//! unreadable ref rejects every push, including pushes that never mention it.
 //!
 //! So we sweep at startup, in the same spirit as the repo config `main` reasserts
-//! on every boot: expected damage, fixed each time we start. Deleting is the
-//! right repair here and not a loss — this repo is a CAS whose contents are
-//! recomputable, and a ref whose object is gone is already broken. We say loudly
-//! what went.
+//! on every boot: expected damage, fixed each time we start. Before removing a
+//! broken ref, we restore its newest readable reflog value when one exists.
+//! This rule is deliberately generic: the server does not interpret ref names.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Delete every zero-length loose object under `git_dir`, returning how many
@@ -65,9 +63,8 @@ pub(crate) fn sweep_empty_loose_objects(git_dir: &str) -> usize {
     removed
 }
 
-/// Delete every loose ref that does not name a readable object, returning how
-/// many went: an empty or unparsable ref file (what a crash leaves behind), or
-/// one whose target object is missing from the store.
+/// Repair from the reflog or delete every loose ref that does not name a
+/// readable object, returning how many were deleted.
 ///
 /// Must run AFTER [`sweep_empty_loose_objects`], so the existence question is
 /// asked of a store the empty files are already out of.
@@ -80,10 +77,13 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
     collect_files(&Path::new(git_dir).join("refs"), &mut paths);
     let mut removed = 0;
     for path in paths {
+        let name = ref_name(git_dir, &path);
         let Some(reason) = breakage(repo, &path) else {
             continue;
         };
-        let name = ref_name(git_dir, &path);
+        if recover_ref(repo, git_dir, &name, &path) {
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 eprintln!("repair: removed broken ref {name} ({reason})");
@@ -93,6 +93,135 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
         }
     }
     removed
+}
+
+/// Replace a broken ref with its newest readable reflog value.
+fn recover_ref(repo: &gix::Repository, git_dir: &str, name: &str, path: &Path) -> bool {
+    let log = Path::new(git_dir).join("logs").join(name);
+    let Ok(contents) = std::fs::read_to_string(&log) else {
+        return false;
+    };
+    for line in contents.lines().rev() {
+        let mut fields = line.split_whitespace();
+        let old = fields.next().unwrap_or("");
+        let new = fields.next().unwrap_or("");
+        // Try the new value first, then the value it replaced.
+        for candidate in [new, old] {
+            let Ok(id) = gix::ObjectId::from_hex(candidate.as_bytes()) else {
+                continue;
+            };
+            if intact_ref_target(repo, id).is_err() {
+                continue;
+            }
+            match replace_ref_file(path, candidate) {
+                Ok(()) => {
+                    eprintln!("repair: restored ref {name} to {candidate} from its reflog");
+                    return true;
+                }
+                Err(error) => {
+                    eprintln!("repair: cannot restore {name} from its reflog: {error}");
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum ClosureKind {
+    Tree,
+    Blob,
+}
+
+/// Validate a ref target. Commit targets include their workspace tree, but not
+/// their parents: this lets recovery roll back past one damaged append without
+/// making the server understand what the ref represents.
+fn intact_ref_target(repo: &gix::Repository, id: gix::ObjectId) -> Result<(), String> {
+    let object = repo
+        .find_object(id)
+        .map_err(|error| format!("object {id} is unreadable: {error}"))?;
+    if object.kind != gix::object::Kind::Commit {
+        return Ok(());
+    }
+    let commit = gix::objs::CommitRef::from_bytes(&object.data, gix::hash::Kind::Sha1)
+        .map_err(|error| format!("commit {id} is malformed: {error}"))?;
+    intact_tree(repo, commit.tree())
+}
+
+fn intact_tree(repo: &gix::Repository, root: gix::ObjectId) -> Result<(), String> {
+    use gix::objs::tree::EntryKind;
+    use std::collections::HashSet;
+
+    let mut pending = vec![(root, ClosureKind::Tree)];
+    let mut checked = HashSet::new();
+    while let Some((id, expected)) = pending.pop() {
+        if !checked.insert((id, expected)) {
+            continue;
+        }
+        let object = repo
+            .find_object(id)
+            .map_err(|error| format!("reachable object {id} is unreadable: {error}"))?;
+        match expected {
+            ClosureKind::Blob if object.kind != gix::object::Kind::Blob => {
+                return Err(format!(
+                    "reachable object {id} is a {}, not a blob",
+                    object.kind
+                ));
+            }
+            ClosureKind::Tree if object.kind != gix::object::Kind::Tree => {
+                return Err(format!(
+                    "reachable object {id} is a {}, not a tree",
+                    object.kind
+                ));
+            }
+            ClosureKind::Blob => {}
+            ClosureKind::Tree => {
+                let tree = gix::objs::TreeRef::from_bytes(&object.data, gix::hash::Kind::Sha1)
+                    .map_err(|error| format!("reachable tree {id} is malformed: {error}"))?;
+                for entry in tree.entries {
+                    let expected = match entry.mode.kind() {
+                        EntryKind::Tree => Some(ClosureKind::Tree),
+                        EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                            Some(ClosureKind::Blob)
+                        }
+                        EntryKind::Commit => None,
+                    };
+                    if let Some(expected) = expected {
+                        pending.push((entry.oid.to_owned(), expected));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Publish a repaired loose ref with the same write/sync/rename/sync sequence
+/// Git's `core.fsync=reference` gives normal updates. Startup is single-writer,
+/// so a process-unique sibling is sufficient as the lock file here.
+fn replace_ref_file(path: &Path, hash: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("ref has no parent directory"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("ref has no UTF-8 file name"))?;
+    let temporary = parent.join(format!(".{name}.repair-{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = (|| {
+        writeln!(file, "{hash}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })() {
+        std::fs::remove_file(&temporary).ok();
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Why `path` is not a usable ref, or `None` if it is fine (or if we could not
@@ -119,7 +248,7 @@ fn breakage(repo: &gix::Repository, path: &Path) -> Option<String> {
     let Ok(id) = gix::ObjectId::from_hex(text.as_bytes()) else {
         return Some(format!("unparsable content {text:?}"));
     };
-    (!repo.has_object(id)).then(|| format!("object {id} is missing"))
+    intact_ref_target(repo, id).err()
 }
 
 /// Every regular file under `dir`, recursively.
@@ -148,6 +277,7 @@ fn ref_name(git_dir: &str, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -176,6 +306,62 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    fn empty_commit(dir: &Path, message: &str) -> String {
+        let tree = Command::new("git")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "hash-object",
+                "-t",
+                "tree",
+                "--stdin",
+            ])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let commit = Command::new("git")
+            .env("GIT_AUTHOR_NAME", "caos")
+            .env("GIT_AUTHOR_EMAIL", "caos@caos")
+            .env("GIT_COMMITTER_NAME", "caos")
+            .env("GIT_COMMITTER_EMAIL", "caos@caos")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "commit-tree",
+                tree.trim(),
+                "-m",
+                message,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        String::from_utf8(commit.stdout).unwrap().trim().to_string()
+    }
+
+    fn git_stdin(dir: &Path, args: &[&str], input: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .env("GIT_AUTHOR_NAME", "caos")
+            .env("GIT_AUTHOR_EMAIL", "caos@caos")
+            .env("GIT_COMMITTER_NAME", "caos")
+            .env("GIT_COMMITTER_EMAIL", "caos@caos")
+            .args(["-C", dir.to_str().unwrap()])
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), input).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     #[test]
@@ -274,6 +460,84 @@ mod tests {
         assert_eq!(sweep_empty_loose_objects(&git_dir), 1);
         assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
         assert!(!status.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broken_ref_without_reflog_is_removed() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let head = plant_ref(
+            &dir,
+            "refs/caos/conversations/c95/head",
+            "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a\n",
+        );
+
+        assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
+        assert!(!head.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broken_ref_rolls_back_to_latest_intact_reflog_value() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let intact = empty_commit(&dir, "intact event");
+        let missing = "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a";
+        let head = plant_ref(&dir, "refs/heads/work", &format!("{missing}\n"));
+        plant_ref(
+            &dir,
+            "logs/refs/heads/work",
+            &format!(
+                "0000000000000000000000000000000000000000 {intact} caos <caos@caos> 0 +0000\tcreated\n\
+                 {intact} {missing} caos <caos@caos> 1 +0000\tcrashed append\n"
+            ),
+        );
+
+        assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 0);
+        assert_eq!(
+            std::fs::read_to_string(&head).unwrap(),
+            format!("{intact}\n")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_skips_a_commit_with_a_missing_workspace_blob() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let intact = empty_commit(&dir, "intact");
+        let blob = git_stdin(&dir, &["hash-object", "-w", "--stdin"], b"lost");
+        let tree = git_stdin(
+            &dir,
+            &["mktree"],
+            format!("100644 blob {blob}\tfile\n").as_bytes(),
+        );
+        let damaged = git_stdin(
+            &dir,
+            &["commit-tree", &tree, "-p", &intact, "-m", "damaged"],
+            b"",
+        );
+        let head = plant_ref(&dir, "refs/heads/work", &format!("{damaged}\n"));
+        plant_ref(
+            &dir,
+            "logs/refs/heads/work",
+            &format!(
+                "0000000000000000000000000000000000000000 {intact} x <x@x> 0 +0000\tcreated\n\
+                 {intact} {damaged} x <x@x> 1 +0000\tdamaged\n"
+            ),
+        );
+        let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
+        std::fs::remove_file(blob_path).unwrap();
+
+        assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 0);
+        assert_eq!(
+            std::fs::read_to_string(head).unwrap(),
+            format!("{intact}\n")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -207,9 +207,12 @@ if [ "$CAOS_STACK_RUNNERD" = yes ]; then
   # whether or not runnerd was already up — and it still failed spuriously if
   # runnerd happened to be slower than the sleep.
   ok=""
+  runnerd_pid=${pids[$((${#pids[@]} - 1))]}
   for _ in $(seq 1 300); do
     if grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" 2>/dev/null; then ok=1; break; fi
-    kill -0 "${pids[-1]}" 2>/dev/null || break
+    if ! kill -0 "$runnerd_pid" 2>/dev/null; then
+      break
+    fi
     sleep 0.05
   done
   [ -n "$ok" ] || fail "runnerd did not start"

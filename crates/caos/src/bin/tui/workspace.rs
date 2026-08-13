@@ -26,8 +26,7 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
     Ok(())
 }
 
-/// Commit the current working tree onto the local `HEAD` and return the tree
-/// hash the commit carries.
+/// Commit the current working tree onto the local `HEAD` and return that commit.
 ///
 /// This is the inverse of `load_conversation_workspace`: after checking out a
 /// conversation head and editing files, `/update-tree` folds those files into a
@@ -37,7 +36,7 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 /// `Ctrl+L` onto the conversation's new head then succeeds instead of tripping
 /// the clean-tree guard. When the working tree is already clean (the user
 /// committed the changes themselves), nothing is committed and the current
-/// `HEAD`'s tree is returned. `git add -A` respects `.gitignore`, so the commit
+/// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit
 /// mirrors what a normal commit of the working tree would contain.
 pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, String> {
     capture_required("git", &["add", "-A"], cwd)?;
@@ -49,7 +48,7 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
     if !clean {
         capture_required("git", &["commit", "--quiet", "-m", message], cwd)?;
     }
-    capture_required("git", &["rev-parse", "HEAD^{tree}"], cwd)
+    capture_required("git", &["rev-parse", "HEAD^{commit}"], cwd)
 }
 
 /// Publish the virtual workspace as a clean branch without checking it out.
@@ -451,16 +450,16 @@ mod tests {
     }
 
     #[test]
-    fn update_tree_commits_the_working_tree_and_returns_its_tree() {
+    fn update_tree_commits_the_working_tree_and_returns_its_commit() {
         let dir = temp_repo("snapshot-test");
         let _base = commit_file(&dir, "base\n", "base");
         let head = commit_file(&dir, "head\n", "turn");
 
-        // With a clean checkout nothing is committed and the head's tree is
+        // With a clean checkout nothing is committed and the head commit is
         // returned unchanged.
         let head_tree =
             capture_required("git", &["rev-parse", &format!("{head}^{{tree}}")], &dir).unwrap();
-        assert_eq!(commit_working_tree("noop", &dir).unwrap(), head_tree);
+        assert_eq!(commit_working_tree("noop", &dir).unwrap(), head);
         assert_eq!(
             capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap(),
             head
@@ -471,9 +470,11 @@ mod tests {
         std::fs::write(dir.join("file.txt"), "local edit\n").unwrap();
         std::fs::write(dir.join("new.txt"), "added\n").unwrap();
 
-        let tree = commit_working_tree("fold in my edits", &dir).unwrap();
+        let proposal = commit_working_tree("fold in my edits", &dir).unwrap();
+        let tree =
+            capture_required("git", &["rev-parse", &format!("{proposal}^{{tree}}")], &dir).unwrap();
 
-        // The returned tree is exactly the working tree.
+        // The returned commit carries exactly the working tree and its base.
         assert_ne!(tree, head_tree);
         assert_eq!(
             capture_required("git", &["show", &format!("{tree}:file.txt")], &dir).unwrap(),

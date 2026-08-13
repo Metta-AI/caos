@@ -819,7 +819,7 @@ impl GitTransport {
     /// avoids the one shared worktree file otherwise touched by concurrent
     /// raw-object fetches; fetched objects still land in the shared object
     /// database.
-    fn fetch_object(&self, hash: &str) -> Result<(), String> {
+    pub(crate) fn fetch_object(&self, hash: &str) -> Result<(), String> {
         self.run_git(&[
             "-c",
             "fetch.negotiationAlgorithm=noop",
@@ -844,6 +844,7 @@ impl GitTransport {
     /// single-round *and* the pack stays minimal — without it, a turn fetch in
     /// a repo with real history re-downloads the whole workspace closure every
     /// turn (measured: ~10s of index-pack CPU per turn on a large repo).
+    #[cfg(test)]
     pub(crate) fn fetch_object_negotiated(&self, hash: &str, tip: &str) -> Result<(), String> {
         self.run_git(&[
             "-c",
@@ -1572,6 +1573,22 @@ pub fn cas_hash(path: &str) -> Result<(), String> {
     let target = validate_descendant(&cas, path)?;
     println!("{}", read_hash(&target)?);
     Ok(())
+}
+
+/// `forward <src-cas-path> <dst-cas-path>` — record the object already named
+/// by `src` at a fresh CAS path `dst`, preserving its result kind. This is the
+/// zero-copy pass-through a continuation callback needs when its own result is
+/// exactly the prior step's blob/tree/commit.
+pub fn forward(src: &str, dst: &str) -> Result<(), String> {
+    let cas = cas_dir();
+    let source = validate_descendant(&cas, src)?;
+    let target = validate_target(&cas, dst)?;
+    probe_xattr(&cas)?;
+    let kind = result_kind(&source)?;
+    match kind.as_str() {
+        "blob" | "tree" | "commit" => write_placeholder(&target, &kind, &read_hash(&source)?),
+        other => Err(format!("cannot forward a {other} result")),
+    }
 }
 
 /// Recursively store `path` via the transport, returning the git tree entry
@@ -2338,6 +2355,30 @@ fn prepare_request(
     assemble_arg_tree(t, image, call, store)
 }
 
+/// `prepare-request <image-or-arg-tree> -- [--name=value | --name:@=path ...]`
+/// — construct the exact flat runnable ArgTree and print its hash without
+/// executing it. This is the worker-side half: CAS paths use `/cas` semantics.
+///
+/// Unlike [`caos_curry`], the result is not a partial curry node. It is the same
+/// request `run_request` would send to `/run`, so its hash can be recorded as a
+/// durable request identity before execution begins.
+pub fn caos_prepare_request(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+    let cas = cas_dir();
+    let image = resolve_run_image(t, &cas, image)?;
+    println!("{}", prepare_request(t, &image, Some(&cas), kvs, &[])?);
+    Ok(())
+}
+
+/// User-facing [`caos_prepare_request`]. Host paths are ingested with the same
+/// semantics as [`cli_run`], and the flat request is pushed before its hash is
+/// printed so another process can immediately run it.
+pub fn cli_prepare_request(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+    let image = resolve_cli_image(t, image)?;
+    let store = build_secret_store(t)?;
+    println!("{}", prepare_request(t, &image, None, kvs, &store)?);
+    Ok(())
+}
+
 /// Assemble a runnable ArgTree from a base image ref and the caller's already
 /// resolved `call` args, folding in the reserved `base`/`salt`/`std` entries,
 /// storing it, and getting it onto the server. Returns the ArgTree hash (the
@@ -2479,14 +2520,8 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     )
 }
 
-/// Shared body of [`caos_map_then`] / [`caos_run_then`]: record a continuation
-/// `{in, <images>}` over `input` as this worker's result at `/cas/out` (a
-/// `promise` placeholder the server resolves once the job is posted). `allowed`
-/// names the image-valued entries this verb accepts — the surface split is the
-/// client-side mutual exclusion of `map` and `run` — `markers` names its bare
-/// flags (recorded as one-byte blobs; the interpreter reads only their
-/// presence), and `check` validates the set actually given, before anything is
-/// sealed.
+/// Shared continuation recorder. `allowed` names image-valued entries and
+/// `markers` names bare presence flags.
 fn record_continuation(
     t: &dyn Transport,
     verb: &str,
@@ -2510,14 +2545,13 @@ fn record_continuation(
     }
 
     // `in` is the data node the continuation is over: an existing CAS path,
-    // referenced as a real tree entry (mode + recorded hash) so the server knows
-    // its shape without fetching anything.
-    let in_path = validate_descendant(&cas, input)?;
-    let (in_mode, in_oid) = cas_entry(&in_path)?;
+    // referenced as a real tree entry (mode + recorded hash).
+    let path = validate_descendant(&cas, input)?;
+    let (mode, oid) = cas_entry(&path)?;
     let mut entries = vec![Entry {
-        mode: in_mode,
+        mode,
         filename: b"in".to_vec().into(),
-        oid: in_oid,
+        oid,
     }];
 
     let mut given: Vec<&str> = Vec::new();

@@ -250,17 +250,19 @@ fn run_work_request_inner(
     // thread's stack). `park_would_deadlock` walks the parked-waiter graph
     // for exactly that reachability; an unsafe arrival runs independently —
     // the duplicate grows its descendants' stacks and the genuine cycle then
-    // errors cleanly. The recv timeout stays as a belt-and-suspenders
-    // backstop (e.g. an owner that dies without broadcasting).
-    match join_flight(arg_tree, stack) {
-        Flight::Owner => {}
+    // errors cleanly. An owner guard clears and broadcasts if its thread
+    // unwinds; a waiter never promotes itself merely because a valid run is
+    // slow, since duplicate execution may repeat external side effects.
+    let owner = match join_flight(arg_tree, stack) {
+        Flight::Owner(owner) => Some(owner),
         Flight::Unsafe => {
             eprintln!(
                 "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
             );
+            None
         }
         Flight::Waiter(rx, guard) => {
-            let outcome = rx.recv_timeout(SINGLE_FLIGHT_TIMEOUT);
+            let outcome = rx.recv();
             drop(guard);
             match outcome {
                 Ok(outcome) => {
@@ -268,15 +270,18 @@ fn run_work_request_inner(
                     return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
                 }
                 Err(_) => {
-                    eprintln!(
-                        "single-flight: arg_tree={arg_tree} wait expired; running independently"
-                    );
+                    return Err(HttpError::new(
+                        500,
+                        format!("single-flight owner for {arg_tree} ended without an outcome"),
+                    ))
                 }
             }
         }
-    }
+    };
     let outcome = run_dispatch(config, request, &image, &salt, &key, traced_arg_entries);
-    finish_flight(arg_tree, &outcome);
+    if let Some(owner) = owner {
+        owner.finish(&outcome);
+    }
     outcome.map_err(|(status, msg)| HttpError::new(status, msg))
 }
 
@@ -372,13 +377,6 @@ fn run_dispatch(
 /// A run's outcome in plain data, so it can be sent to every parked waiter.
 type Outcome = Result<String, (u16, String)>;
 
-/// How long a waiter parks on someone else's in-flight run before giving up
-/// and running the request itself. Generous — the flight covers the whole
-/// promise resolution of a possibly deep DAG — but finite, so a cross-thread
-/// cycle degrades to duplicate work (and a clean stack-based cycle error)
-/// instead of a deadlock.
-const SINGLE_FLIGHT_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// In-flight runs: ArgTree hash → the channels of parked waiters.
 fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
     static FLIGHTS: OnceLock<Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>>> = OnceLock::new();
@@ -421,12 +419,42 @@ fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
 
 enum Flight {
     /// Nobody is running this request: run it (and `finish_flight` after).
-    Owner,
+    Owner(FlightOwner),
     /// Someone is: park here for their outcome. The guard unregisters the
     /// waits-for edge when the wait ends (either way).
     Waiter(mpsc::Receiver<Outcome>, ParkGuard),
     /// Someone is, but parking would deadlock: run independently.
     Unsafe,
+}
+
+/// The unique owner of one in-process flight. Normal completion explicitly
+/// broadcasts its outcome. Unwinding is a provable owner loss, so Drop clears
+/// the entry and wakes waiters with an error; a later request may then own it.
+struct FlightOwner {
+    arg_tree: String,
+    finished: bool,
+}
+
+impl FlightOwner {
+    fn finish(mut self, outcome: &Outcome) {
+        self.finished = true;
+        finish_flight(&self.arg_tree, outcome);
+    }
+}
+
+impl Drop for FlightOwner {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        finish_flight(
+            &self.arg_tree,
+            &Err((
+                500,
+                format!("single-flight owner for {} was lost", self.arg_tree),
+            )),
+        );
+    }
 }
 
 /// Removes this waiter's waits-for edge on drop.
@@ -473,15 +501,17 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
         }
         None => {
             table.insert(arg_tree.to_string(), Vec::new());
-            Flight::Owner
+            Flight::Owner(FlightOwner {
+                arg_tree: arg_tree.to_string(),
+                finished: false,
+            })
         }
     }
 }
 
-/// Broadcast the outcome to every parked waiter and clear the entry. A
-/// timed-out waiter that ran independently also lands here: whoever finishes
-/// first serves the waiters (a valid result is a valid result) and clears the
-/// entry; later finishers broadcast to nobody.
+/// Broadcast the outcome to every parked waiter and clear the entry. Only the
+/// owner calls this; an unsafe cycle-breaking duplicate must not steal its
+/// waiters or publish a cycle error as the canonical flight outcome.
 fn finish_flight(arg_tree: &str, outcome: &Outcome) {
     let waiters = {
         let mut table = flights().lock().expect("flights lock");
@@ -1669,5 +1699,54 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    use super::*;
+
+    #[test]
+    fn waiter_receives_the_owners_outcome() {
+        let request = "d".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        let outcome = Ok(format!("blob {}", "a".repeat(40)));
+        owner.finish(&outcome);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+    }
+
+    #[test]
+    fn losing_an_owner_wakes_waiters_and_allows_a_new_owner() {
+        let request = "e".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        drop(owner);
+        let error = rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.0, 500);
+        assert!(error.1.contains("owner"), "{}", error.1);
+        drop(guard);
+
+        let replacement = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("proven owner loss did not release the flight"),
+        };
+        drop(replacement);
     }
 }

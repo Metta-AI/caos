@@ -119,7 +119,10 @@ reduce)
   # Do not name the entry as the image instead: that hands the SERVER a raw
   # flake tree to build — flake-builder building flake-builder. And a worker
   # cannot evaluate the `.caos-expr` itself, because that blocks on a run. The
-  # entry is in the tree we were handed, at `in/std/flake-builder`.
+  # entry is in the tree we were handed, at `in/std/flake-builder`. Expression
+  # evaluation removes `.caos-expr` before binding `--in`; reproduce that small
+  # projection here rather than accidentally asking runnerd to pull the
+  # sentinel as a real image.
   #
   # MINUS THE `.caos-expr`. An expression is evaluated against its directory
   # WITHOUT the directive (crates/caos/src/eval.rs `strip_caos_expr`), so the
