@@ -98,16 +98,25 @@ mod tests {
     use super::Args;
 
     #[test]
-    fn user_defaults_to_the_supplied_username_and_can_be_overridden() {
+    fn user_and_username_are_the_same_identity() {
         let default = Args::parse_with_default_user(&[], Some("alice".to_string())).unwrap();
         assert_eq!(default.user, "alice");
 
         let explicit = Args::parse_with_default_user(
-            &["--user".to_string(), "bob".to_string()],
+            &["--username".to_string(), "Bob".to_string()],
             Some("alice".to_string()),
         )
         .unwrap();
-        assert_eq!(explicit.user, "bob");
+        assert_eq!(explicit.user, "Bob");
+        assert_eq!(explicit.turn.username.as_deref(), Some("Bob"));
+
+        let alias = Args::parse_with_default_user(
+            &["--user".to_string(), "Bob".to_string()],
+            Some("alice".to_string()),
+        )
+        .unwrap();
+        assert_eq!(alias.user, explicit.user);
+        assert_eq!(alias.turn.username, explicit.turn.username);
 
         let no_ambient =
             Args::parse_with_default_user(&["--user".to_string(), "bob".to_string()], None)
