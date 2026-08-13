@@ -4122,6 +4122,18 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
+        let header = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .take(100)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let selection_end = header
+            .find("copy-anywhere")
+            .map(|column| column + "copy-anywhere".len() - 1)
+            .unwrap() as u16;
         app.capture_screen(terminal.backend().buffer());
         let area = Rect::new(0, 0, 100, 30);
         let mouse = |kind, column| MouseEvent {
@@ -4136,10 +4148,16 @@ mod tests {
             MouseAction::Redraw
         );
         assert_eq!(
-            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20), area),
+            app.handle_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), selection_end),
+                area
+            ),
             MouseAction::Redraw
         );
-        let copied = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 20), area);
+        let copied = app.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), selection_end),
+            area,
+        );
 
         assert!(
             matches!(copied, MouseAction::Copy(ref text) if text.contains("caos") && text.contains("copy-anywhere"))
@@ -4148,10 +4166,10 @@ mod tests {
 
     #[test]
     fn cli_options_match_the_line_client_surface() {
-        // --user rides along so the test never depends on ambient $USER
+        // --username rides along so the test never depends on ambient $USER
         // (the cargo worker's environment has none).
         let args = Args::parse(&[
-            "--user".into(),
+            "--username".into(),
             "tester".into(),
             "--from".into(),
             "5ec3751".into(),
@@ -4169,7 +4187,7 @@ mod tests {
     #[test]
     fn from_commit_rejects_conflicting_conversation_options() {
         assert!(Args::parse(&[
-            "--user".into(),
+            "--username".into(),
             "tester".into(),
             "--from".into(),
             "5ec3751".into(),
@@ -4178,7 +4196,7 @@ mod tests {
         ])
         .is_err());
         assert!(Args::parse(&[
-            "--user".into(),
+            "--username".into(),
             "tester".into(),
             "--from".into(),
             "5ec3751".into(),
@@ -4736,6 +4754,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(header.contains("caos"));
+        assert!(header.contains("user tester"));
         assert!(header.contains("A concise title"));
         assert!(header.contains("head bbbbbbb"));
         assert!(!header.contains("idle"));

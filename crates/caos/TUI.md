@@ -35,14 +35,14 @@ you to check the running service and the `caos` git remote.
 
 ```text
 caos tui                  continue the most recent conversation
-caos tui --user alice     use alice's active conversation list
+caos tui --username alice use alice's active conversation list
 caos tui --new            start a fresh conversation
 caos tui --from 5ec3751   branch from a completed turn
 caos tui --list-archived  list archived conversation IDs and titles
 caos tui --unarchive ID   restore one conversation to the active list
 ```
 
-`--user` defaults to `$USER`. Active and archived membership is stored on the
+`--username` defaults to `$USER`. Active and archived membership is stored on the
 CAOS server under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
 not in local TUI state. `<user-key>` is `u-` plus lowercase hex of the
 normalized username's UTF-8 bytes; usernames are limited to 126 UTF-8 bytes.

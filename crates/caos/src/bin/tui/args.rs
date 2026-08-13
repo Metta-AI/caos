@@ -18,8 +18,8 @@ impl Args {
         Self::parse_with_default_user(raw, std::env::var("USER").ok())
     }
 
-    /// `default_user` is only consulted when `--user` is absent, so `--user`
-    /// works (and tests run) without `$USER` in the environment.
+    /// `default_user` is only consulted when `--username` is absent, so an
+    /// explicit identity works (and tests run) without `$USER`.
     fn parse_with_default_user(
         raw: &[String],
         default_user: Option<String>,
@@ -34,7 +34,7 @@ impl Args {
                     .ok_or_else(|| format!("{flag} needs a value\n{}", usage()))
             };
             match arg.as_str() {
-                "--user" | "--username" => user_flag = Some(value(&mut args, arg)?),
+                "--username" => user_flag = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
                 "-c" | "--conversation" => parsed.conversation = Some(value(&mut args, arg)?),
@@ -98,19 +98,20 @@ mod tests {
     use super::Args;
 
     #[test]
-    fn user_defaults_to_the_supplied_username_and_can_be_overridden() {
+    fn username_is_the_one_user_identity() {
         let default = Args::parse_with_default_user(&[], Some("alice".to_string())).unwrap();
         assert_eq!(default.user, "alice");
 
         let explicit = Args::parse_with_default_user(
-            &["--user".to_string(), "bob".to_string()],
+            &["--username".to_string(), "Bob".to_string()],
             Some("alice".to_string()),
         )
         .unwrap();
-        assert_eq!(explicit.user, "bob");
+        assert_eq!(explicit.user, "Bob");
+        assert_eq!(explicit.turn.username.as_deref(), Some("Bob"));
 
         let no_ambient =
-            Args::parse_with_default_user(&["--user".to_string(), "bob".to_string()], None)
+            Args::parse_with_default_user(&["--username".to_string(), "bob".to_string()], None)
                 .unwrap();
         assert_eq!(no_ambient.user, "bob");
 
