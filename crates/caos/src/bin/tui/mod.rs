@@ -3,10 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use caos::chat::{
-    list_user_conversations, publish_unindexed_conversations, unarchive_user_conversation,
-    UserConversationStatus,
-};
+use caos::chat::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
 use caos::GitTransport;
 use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
@@ -234,7 +231,6 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     if args.list_archived || args.unarchive.is_some() {
         let transport = GitTransport::from_cwd()?;
         transport.ensure_server_reachable()?;
-        publish_unindexed_conversations(&transport, &args.user)?;
         if args.list_archived {
             for conversation in
                 list_user_conversations(&transport, &args.user, UserConversationStatus::Archived)?
