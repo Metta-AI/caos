@@ -105,6 +105,17 @@ pub struct ConversationReplay {
     pub turn_events: Vec<ConversationTurnEvents>,
 }
 
+/// One consistent read of the durable conversation spine for rich clients.
+/// Keeping these projections together prevents a reload from walking the same
+/// inherited history once for the transcript, again for the workspace, and a
+/// third time for status.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationLoad {
+    pub snapshot: ConversationSnapshot,
+    pub replay: ConversationReplay,
+    pub workspace_diff: WorkspaceDiff,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UserConversationSummary {
     pub id: String,
@@ -186,6 +197,14 @@ struct StoredEvent {
     value: Value,
 }
 
+#[derive(Clone, Debug)]
+struct DurableConversation {
+    events: Vec<StoredEvent>,
+    base_commit: String,
+    head: String,
+    snapshot: ConversationSnapshot,
+}
+
 /// Choose an explicit conversation, the newest existing one, or a fresh
 /// `talk-N`. The remote canonical refs are the source of truth.
 pub fn pick_conversation(
@@ -240,18 +259,7 @@ pub fn conversation_snapshot(
     t: &GitTransport,
     id: &str,
 ) -> Result<Option<ConversationSnapshot>, String> {
-    let refname = conversation_ref(id)?;
-    let Some(head) = remote_ref(t, &refname)? else {
-        return Ok(None);
-    };
-    fetch_conversation_commit(t, &refname, &head)?;
-
-    let snapshot = conversation_snapshot_at(t, id, &head)?;
-    // This ref is only a fetch-negotiation cache. Once the remote head has
-    // been read successfully, a local lock race or read-only checkout must not
-    // turn that authoritative state into a failed refresh.
-    let _ = update_local_cache(t, &refname, &head);
-    Ok(Some(snapshot))
+    durable_conversation(t, id).map(|conversation| conversation.map(|state| state.snapshot))
 }
 
 /// Read only the authoritative pointer. Followers use this cheap check before
@@ -278,10 +286,40 @@ fn conversation_snapshot_at(
     id: &str,
     head: &str,
 ) -> Result<ConversationSnapshot, String> {
-    fetch_commit(t, head)?;
+    durable_conversation_at(t, id, head).map(|state| state.snapshot)
+}
 
+fn durable_conversation(t: &GitTransport, id: &str) -> Result<Option<DurableConversation>, String> {
+    let refname = conversation_ref(id)?;
+    let Some(head) = remote_ref(t, &refname)? else {
+        return Ok(None);
+    };
+    fetch_conversation_commit(t, &refname, &head)?;
+    let conversation = durable_conversation_from_local(t, id, &head)?;
+    // This ref is only a fetch-negotiation cache. Once the remote head has
+    // been read successfully, a local lock race or read-only checkout must not
+    // turn that authoritative state into a failed refresh.
+    let _ = update_local_cache(t, &refname, &head);
+    Ok(Some(conversation))
+}
+
+fn durable_conversation_at(
+    t: &GitTransport,
+    id: &str,
+    head: &str,
+) -> Result<DurableConversation, String> {
+    fetch_commit(t, head)?;
+    durable_conversation_from_local(t, id, head)
+}
+
+fn durable_conversation_from_local(
+    t: &GitTransport,
+    id: &str,
+    head: &str,
+) -> Result<DurableConversation, String> {
     let mut newest_first = Vec::new();
     let mut current = head.to_string();
+    let mut fork_base = None;
     loop {
         let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
         let value = match serde_json::from_str::<Value>(message.trim()) {
@@ -297,22 +335,34 @@ fn conversation_snapshot_at(
                 ))
             }
         };
+        let parent = t
+            .git_capture(
+                &["rev-parse", "--verify", "--quiet", &format!("{current}^1")],
+                None,
+            )
+            .map_err(|error| format!("conversation event {current} has no first parent: {error}"))?
+            .trim()
+            .to_string();
+        validate_hash(&parent, "conversation event parent")?;
+        if fork_base.is_none() && validate_fork_marker(&value, &parent)? {
+            // The commit graph is authoritative. `forked_from` is retained as
+            // readable metadata, but it may never choose a Git argument.
+            fork_base = Some(parent.clone());
+        }
         newest_first.push(StoredEvent {
             commit: current.clone(),
             value,
         });
-        let parent = t
-            .git_capture(
-                &["rev-parse", "--verify", "--quiet", &format!("{current}^")],
-                None,
-            )
-            .map_err(|_| format!("conversation event {current} has no first parent"))?;
-        let parent = parent.trim();
-        validate_hash(parent, "conversation event parent")?;
-        current = parent.to_string();
+        current = parent;
     }
     newest_first.reverse();
-    fold_events(id, head, &newest_first)
+    let snapshot = fold_events(id, head, &newest_first)?;
+    Ok(DurableConversation {
+        events: newest_first,
+        base_commit: fork_base.unwrap_or(current),
+        head: head.to_string(),
+        snapshot,
+    })
 }
 
 /// Persist a user message before returning. An idle submit atomically publishes
@@ -1235,6 +1285,55 @@ fn push_active_membership_create_only(
     .map(|_| ())
 }
 
+/// Materialize a fork before its first new message. Replay follows the marker's
+/// first parent, while workspace diffing treats `from` as the fork's base.
+pub fn fork_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+    from: &str,
+) -> Result<String, String> {
+    validate_hash(from, "fork source")?;
+    let title = validate_conversation_title(title)?;
+    let refname = conversation_ref(id)?;
+    let title_ref = conversation_title_ref(id)?;
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    fetch_commit(t, from)?;
+    let source_message = t.git_capture(&["show", "-s", "--format=%B", from], None)?;
+    let source_event = serde_json::from_str::<Value>(source_message.trim())
+        .map_err(|_| format!("fork source {from} is not a conversation event"))?;
+    if !is_conversation_event(&source_event) {
+        return Err(format!("fork source {from} is not a conversation event"));
+    }
+    let tree = t
+        .git_capture(&["rev-parse", &format!("{from}^{{tree}}")], None)?
+        .trim()
+        .to_string();
+    let event = json!({
+        "kind": EVENT_KIND,
+        "forked_from": from,
+        "title": title,
+        "status": "idle",
+        "request": Value::Null,
+    });
+    let fork = create_event_commit(t, &tree, from, &event)?;
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    push_new_conversation(
+        t,
+        id,
+        &refname,
+        &title_ref,
+        &active_ref,
+        &archived_ref,
+        &fork,
+        &title_hash,
+    )?;
+    let _ = update_local_cache(t, &refname, &fork);
+    Ok(fork)
+}
+
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
     let title = validate_conversation_title(title)?;
     let hash = t.put_object("blob", title.as_bytes())?.to_string();
@@ -1251,8 +1350,8 @@ pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result
     .map(|_| ())
 }
 
-/// Replace an automatically chosen title only while the deterministic title
-/// published with the first message is still current. Any manual rename wins.
+/// Replace a generated title only while the caller's last observed title is
+/// still current. A manual rename from another client wins the lease race.
 pub fn compare_and_set_conversation_title(
     t: &GitTransport,
     id: &str,
@@ -1502,32 +1601,6 @@ pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a
     unreachable!("the integer conversation-name space is not finite")
 }
 
-fn durable_conversation_events(
-    t: &GitTransport,
-    id: &str,
-) -> Result<(Vec<StoredEvent>, String, String), String> {
-    let snapshot =
-        conversation_snapshot(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
-    let mut newest_first = Vec::new();
-    let mut current = snapshot.head.clone();
-    loop {
-        let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
-        let value = serde_json::from_str::<Value>(message.trim()).ok();
-        if !value.as_ref().is_some_and(is_conversation_event) {
-            newest_first.reverse();
-            return Ok((newest_first, current, snapshot.head));
-        }
-        newest_first.push(StoredEvent {
-            commit: current.clone(),
-            value: value.expect("checked above"),
-        });
-        current = t
-            .git_capture(&["rev-parse", &format!("{current}^1")], None)?
-            .trim()
-            .to_string();
-    }
-}
-
 fn value_text(value: &Value) -> String {
     value
         .as_str()
@@ -1610,11 +1683,10 @@ fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
     events
 }
 
-pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationReplay, String> {
-    let (events, _base, head) = durable_conversation_events(t, id)?;
+fn replay_from_events(events: &[StoredEvent], head: &str) -> ConversationReplay {
     let mut turns = Vec::new();
     let mut activity = Vec::new();
-    for event in &events {
+    for event in events {
         activity.extend(durable_turn_events(event));
         let Some(content) = event.value.get("content").and_then(Value::as_str) else {
             continue;
@@ -1646,27 +1718,38 @@ pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationRep
             message: content.to_string(),
         });
     }
-    Ok(ConversationReplay {
+    ConversationReplay {
         turns,
         turn_events: (!activity.is_empty())
             .then_some(ConversationTurnEvents {
-                turn_commit: head,
+                turn_commit: head.to_string(),
                 events: activity,
             })
             .into_iter()
             .collect(),
-    })
+    }
 }
 
-pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<WorkspaceDiff, String> {
-    let (_events, base_commit, head) = durable_conversation_events(t, id)?;
+pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationReplay, String> {
+    let conversation =
+        durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    Ok(replay_from_events(&conversation.events, &conversation.head))
+}
+
+fn workspace_diff(
+    t: &GitTransport,
+    base_commit: &str,
+    head: &str,
+) -> Result<WorkspaceDiff, String> {
+    validate_hash(base_commit, "conversation workspace base")?;
+    validate_hash(head, "conversation workspace head")?;
     let patch = t.git_capture(
         &[
             "diff",
             "--no-ext-diff",
             "--no-color",
-            &base_commit,
-            &head,
+            base_commit,
+            head,
             "--",
             ".",
             ":(exclude).caos",
@@ -1674,9 +1757,48 @@ pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<Workspa
         None,
     )?;
     Ok(WorkspaceDiff {
-        base_commit,
-        head,
+        base_commit: base_commit.to_string(),
+        head: head.to_string(),
         patch,
+    })
+}
+
+pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<WorkspaceDiff, String> {
+    let conversation =
+        durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    workspace_diff(t, &conversation.base_commit, &conversation.head)
+}
+
+/// Build the transcript, status, and workspace projection from one remote read
+/// and one first-parent traversal.
+pub fn conversation_load(t: &GitTransport, id: &str) -> Result<Option<ConversationLoad>, String> {
+    let Some(conversation) = durable_conversation(t, id)? else {
+        return Ok(None);
+    };
+    load_durable_conversation(t, conversation).map(Some)
+}
+
+/// Build all rich-client projections at a head the caller already proved and
+/// holds locally, such as a fork commit accepted by the preceding atomic push.
+pub fn conversation_load_at(
+    t: &GitTransport,
+    id: &str,
+    head: &str,
+) -> Result<ConversationLoad, String> {
+    let conversation = durable_conversation_at(t, id, head)?;
+    load_durable_conversation(t, conversation)
+}
+
+fn load_durable_conversation(
+    t: &GitTransport,
+    conversation: DurableConversation,
+) -> Result<ConversationLoad, String> {
+    let replay = replay_from_events(&conversation.events, &conversation.head);
+    let workspace_diff = workspace_diff(t, &conversation.base_commit, &conversation.head)?;
+    Ok(ConversationLoad {
+        snapshot: conversation.snapshot,
+        replay,
+        workspace_diff,
     })
 }
 
@@ -2097,6 +2219,32 @@ fn push_head_cas_git(
 
 /// Publish a new canonical head, title, and active membership as one create-only
 /// transaction while proving archived membership absent.
+fn push_new_conversation(
+    t: &GitTransport,
+    id: &str,
+    head_ref: &str,
+    title_ref: &str,
+    active_ref: &str,
+    archived_ref: &str,
+    head: &str,
+    title_hash: &str,
+) -> Result<(), String> {
+    if try_push_new_conversation(
+        t,
+        id,
+        head_ref,
+        title_ref,
+        active_ref,
+        archived_ref,
+        head,
+        title_hash,
+    )? {
+        Ok(())
+    } else {
+        Err(format!("conversation {id:?} was created concurrently"))
+    }
+}
+
 fn try_push_initial_conversation(
     t: &GitTransport,
     user: &str,
@@ -2109,9 +2257,31 @@ fn try_push_initial_conversation(
     let title_ref = conversation_title_ref(id)?;
     let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
     let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    try_push_new_conversation(
+        t,
+        id,
+        head_ref,
+        &title_ref,
+        &active_ref,
+        &archived_ref,
+        head,
+        &title_hash,
+    )
+}
+
+fn try_push_new_conversation(
+    t: &GitTransport,
+    id: &str,
+    head_ref: &str,
+    title_ref: &str,
+    active_ref: &str,
+    archived_ref: &str,
+    head: &str,
+    title_hash: &str,
+) -> Result<bool, String> {
     validate_hash(head, "new conversation head")?;
-    validate_hash(&title_hash, "new conversation title")?;
-    let leases = [head_ref, &title_ref, &active_ref, &archived_ref]
+    validate_hash(title_hash, "new conversation title")?;
+    let leases = [head_ref, title_ref, active_ref, archived_ref]
         .map(|refname| format!("--force-with-lease={refname}:"));
     let updates = [
         format!("{head}:{head_ref}"),
@@ -2147,9 +2317,9 @@ fn try_push_initial_conversation(
         t,
         [
             head_ref.to_string(),
-            title_ref.clone(),
-            active_ref.clone(),
-            archived_ref.clone(),
+            title_ref.to_string(),
+            active_ref.to_string(),
+            archived_ref.to_string(),
         ],
     )?;
     if let Some(observed_head) = observed.get(head_ref) {
@@ -2164,10 +2334,9 @@ fn try_push_initial_conversation(
         }
         return Ok(true);
     }
-    let occupied = [&title_ref, &active_ref, &archived_ref]
+    let occupied = [title_ref, active_ref, archived_ref]
         .into_iter()
         .filter(|refname| observed.contains_key(*refname))
-        .map(String::as_str)
         .collect::<Vec<_>>();
     if !occupied.is_empty() {
         return Err(format!(
@@ -2278,8 +2447,8 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
     let mut current = hash.to_string();
     // Worker events deliberately use epoch-zero commit identities so recovery
     // recreates the same proposal. Follow raw commit objects (not their trees)
-    // to the newest user event, whose ordinary client timestamp is the useful
-    // measure of which conversation was most recently used.
+    // to the newest user event or locally-created fork marker, whose ordinary
+    // client timestamp is the useful measure of recent activity.
     for _ in 0..4096 {
         let (kind, content) = t.get_object(&current)?;
         if kind != "commit" {
@@ -2301,31 +2470,40 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
                 ))
             }
         };
-        let parent = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("parent "))
+        let parent = first_parent_header(headers)
             .ok_or_else(|| format!("conversation event {current} has no first parent"))?;
         validate_hash(parent, "conversation event parent")?;
+        if event.get("forked_from").is_some() {
+            validate_fork_marker(&event, parent)?;
+            return commit_timestamp(headers, &current);
+        }
         if event.get("author").and_then(Value::as_str) == Some("user") {
-            let line = headers
-                .lines()
-                .find(|line| line.starts_with("committer "))
-                .ok_or_else(|| format!("conversation event {current} has no committer header"))?;
-            return line
-                .split_whitespace()
-                .rev()
-                .nth(1)
-                .ok_or_else(|| format!("conversation event {current} has no commit timestamp"))?
-                .parse::<i64>()
-                .map_err(|error| {
-                    format!("conversation event {current} has an invalid timestamp: {error}")
-                });
+            return commit_timestamp(headers, &current);
         }
         current = parent.to_string();
     }
     Err(format!(
         "conversation history from {hash} exceeded 4096 commits before a user event"
     ))
+}
+
+fn first_parent_header(headers: &str) -> Option<&str> {
+    headers
+        .lines()
+        .find_map(|line| line.strip_prefix("parent "))
+}
+
+fn commit_timestamp(headers: &str, commit: &str) -> Result<i64, String> {
+    let line = headers
+        .lines()
+        .find(|line| line.starts_with("committer "))
+        .ok_or_else(|| format!("conversation event {commit} has no committer header"))?;
+    line.split_whitespace()
+        .rev()
+        .nth(1)
+        .ok_or_else(|| format!("conversation event {commit} has no commit timestamp"))?
+        .parse::<i64>()
+        .map_err(|error| format!("conversation event {commit} has an invalid timestamp: {error}"))
 }
 
 fn fetch_commit(t: &GitTransport, hash: &str) -> Result<(), String> {
@@ -2465,6 +2643,22 @@ fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
 
 fn is_conversation_event(value: &Value) -> bool {
     value.is_object() && value.get("kind").and_then(Value::as_str) == Some(EVENT_KIND)
+}
+
+fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(declared) = event.get("forked_from") else {
+        return Ok(false);
+    };
+    let declared = declared
+        .as_str()
+        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
+    validate_hash(declared, "forked_from")?;
+    if declared != first_parent {
+        return Err(format!(
+            "conversation fork marker declares {declared}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
 }
 
 fn fold_events(
@@ -2779,11 +2973,11 @@ fn run_line_turn(
         if let Some(request) = request {
             resume_request(t, &request)?;
         }
-        let snapshot = conversation_snapshot(t, id)?
+        let durable = durable_conversation(t, id)?
             .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;
-        let (events, _, _) = durable_conversation_events(t, id)?;
+        let snapshot = durable.snapshot;
         let mut current_turn = before_head.is_none();
-        for event in events {
+        for event in durable.events {
             if before_head.as_deref() == Some(event.commit.as_str()) {
                 current_turn = true;
                 continue;
@@ -2885,6 +3079,78 @@ mod tests {
         let base = test_git(&repo, &["rev-parse", "HEAD"]);
         let transport = GitTransport::discover(&repo).unwrap();
         (root, repo, transport, base)
+    }
+
+    fn fork_fixture(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caos-chat-v2-fork-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let remote = root.join("remote.git");
+        let source_repo = root.join("source");
+        let client_repo = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+
+        std::fs::create_dir_all(&source_repo).unwrap();
+        test_git(&source_repo, &["init", "--quiet"]);
+        configure_test_repo(&source_repo, "source");
+        std::fs::write(source_repo.join("workspace"), "source tree\n").unwrap();
+        test_git(&source_repo, &["add", "workspace"]);
+        test_git(&source_repo, &["commit", "--quiet", "-m", "base"]);
+        test_git(
+            &source_repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        let source_transport = GitTransport::discover(&source_repo).unwrap();
+        let base = test_git(&source_repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&source_repo, &["rev-parse", "HEAD^{tree}"]);
+        let source = create_event_commit(
+            &source_transport,
+            &tree,
+            &base,
+            &json!({
+                "v": EVENT_VERSION,
+                "author": "user",
+                "username": "Source",
+                "content": "inherited message",
+                "status": "idle"
+            }),
+        )
+        .unwrap();
+        let source_ref = conversation_ref("source").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{source}:{source_ref}"),
+            ],
+        );
+
+        std::fs::create_dir_all(&client_repo).unwrap();
+        test_git(&client_repo, &["init", "--quiet"]);
+        configure_test_repo(&client_repo, "client");
+        std::fs::write(client_repo.join("client-only"), "different tree\n").unwrap();
+        test_git(&client_repo, &["add", "client-only"]);
+        test_git(&client_repo, &["commit", "--quiet", "-m", "client base"]);
+        test_git(
+            &client_repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        (root, source_repo, client_repo, source)
     }
 
     fn event(value: Value) -> StoredEvent {
@@ -3883,6 +4149,304 @@ mod tests {
         assert_eq!(event["request"], request);
         assert_eq!(event["workspace_conflict"]["proposal"], proposal);
         assert_eq!(event["workspace_conflict"]["paths"], json!(["shared.txt"]));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_fetches_a_tree_closure_for_a_tip_only_source() {
+        let (root, source_repo, client_repo, source) = fork_fixture("tip-only");
+        let source_transport = GitTransport::discover(&source_repo).unwrap();
+        let client_transport = GitTransport::discover(&client_repo).unwrap();
+        let (kind, raw_commit) = source_transport.get_object(&source).unwrap();
+        assert_eq!(kind, "commit");
+        assert_eq!(
+            client_transport
+                .put_object("commit", &raw_commit)
+                .unwrap()
+                .to_string(),
+            source
+        );
+        let tree = source_transport
+            .git_capture(&["rev-parse", &format!("{source}^{{tree}}")], None)
+            .unwrap()
+            .trim()
+            .to_string();
+        let (kind, raw_tree) = source_transport.get_object(&tree).unwrap();
+        assert_eq!(kind, "tree");
+        assert_eq!(
+            client_transport
+                .put_object("tree", &raw_tree)
+                .unwrap()
+                .to_string(),
+            tree
+        );
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^{{commit}}")], None)
+            .is_ok());
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^{{tree}}")], None)
+            .is_ok());
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^1^{{commit}}")], None)
+            .is_err());
+
+        let fork =
+            fork_conversation(&client_transport, "Alice", "forked", "talk-1", &source).unwrap();
+
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^{{tree}}")], None)
+            .is_ok());
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^1^{{commit}}")], None)
+            .is_ok());
+        let load = conversation_load(&client_transport, "forked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(load.snapshot.head, fork);
+        assert_eq!(load.replay.turns[0].message, "inherited message");
+        assert_eq!(load.workspace_diff.base_commit, source);
+        assert!(load.workspace_diff.patch.is_empty());
+
+        let head_ref = conversation_ref("forked").unwrap();
+        let title_ref = conversation_title_ref("forked").unwrap();
+        let active_ref =
+            user_conversation_ref("Alice", UserConversationStatus::Active, "forked").unwrap();
+        assert_eq!(
+            remote_ref(&client_transport, &head_ref).unwrap().as_deref(),
+            Some(fork.as_str())
+        );
+        assert_eq!(
+            remote_ref(&client_transport, &active_ref)
+                .unwrap()
+                .as_deref(),
+            Some(fork.as_str())
+        );
+        let title = remote_ref(&client_transport, &title_ref).unwrap().unwrap();
+        assert_eq!(client_transport.get_object(&title).unwrap().1, b"talk-1");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_ref_publication_is_atomic_and_create_only() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("atomic");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let id = "occupied-title";
+        let title_ref = conversation_title_ref(id).unwrap();
+        let existing = transport
+            .put_object("blob", b"existing")
+            .unwrap()
+            .to_string();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{existing}:{title_ref}"),
+            ],
+        );
+
+        let error = fork_conversation(&transport, "Alice", id, "talk-2", &source).unwrap_err();
+        assert!(error.contains("presentation refs"));
+        assert!(remote_ref(&transport, &conversation_ref(id).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(remote_ref(
+            &transport,
+            &user_conversation_ref("Alice", UserConversationStatus::Active, id).unwrap()
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            remote_ref(&transport, &title_ref).unwrap().as_deref(),
+            Some(existing.as_str())
+        );
+
+        let empty =
+            fork_conversation(&transport, "Alice", "empty-title", "  ", &source).unwrap_err();
+        assert!(empty.contains("title"));
+        assert!(
+            remote_ref(&transport, &conversation_ref("empty-title").unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        let first = fork_conversation(&transport, "Alice", "same-fork", "talk-3", &source).unwrap();
+        let duplicate =
+            fork_conversation(&transport, "Bob", "same-fork", "talk-3", &source).unwrap();
+        assert_eq!(duplicate, first);
+        assert_eq!(
+            remote_ref(&transport, &conversation_ref("same-fork").unwrap())
+                .unwrap()
+                .as_deref(),
+            Some(first.as_str())
+        );
+        assert!(remote_ref(
+            &transport,
+            &user_conversation_ref("Bob", UserConversationStatus::Active, "same-fork").unwrap()
+        )
+        .unwrap()
+        .as_deref()
+        .is_some_and(|head| head == first));
+
+        let occupied_active =
+            user_conversation_ref("Charlie", UserConversationStatus::Active, "same-fork").unwrap();
+        let unrelated = test_git(&source_repo, &["rev-parse", &format!("{source}^1")]);
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{unrelated}:{occupied_active}"),
+            ],
+        );
+        let rejected =
+            fork_conversation(&transport, "Charlie", "same-fork", "talk-3", &source).unwrap_err();
+        assert!(
+            rejected.contains("did not publish required refs")
+                || rejected.contains("was created concurrently"),
+            "{rejected}"
+        );
+        assert_eq!(
+            remote_ref(&transport, &occupied_active).unwrap().as_deref(),
+            Some(unrelated.as_str())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_metadata_must_match_the_actual_first_parent() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("marker-validation");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let tree = test_git(&source_repo, &["rev-parse", &format!("{source}^{{tree}}")]);
+        let output = root.join("must-not-be-created");
+        let malicious = create_event_commit(
+            &transport,
+            &tree,
+            &source,
+            &json!({
+                "v": EVENT_VERSION,
+                "forked_from": format!("--output={}", output.display()),
+                "status": "idle"
+            }),
+        )
+        .unwrap();
+        let malicious_ref = conversation_ref("malicious").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{malicious}:{malicious_ref}"),
+            ],
+        );
+        let error = conversation_workspace_diff(&transport, "malicious").unwrap_err();
+        assert!(error.contains("forked_from"));
+        assert!(!output.exists());
+
+        let base = test_git(&source_repo, &["rev-parse", &format!("{source}^1")]);
+        let mismatched = create_event_commit(
+            &transport,
+            &tree,
+            &source,
+            &json!({"v": EVENT_VERSION, "forked_from": base, "status": "idle"}),
+        )
+        .unwrap();
+        let mismatch_ref = conversation_ref("mismatch").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{mismatched}:{mismatch_ref}"),
+            ],
+        );
+        let error = conversation_workspace_diff(&transport, "mismatch").unwrap_err();
+        assert!(error.contains("first parent"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_marker_counts_as_fresh_conversation_activity() {
+        let (root, source_repo, _client_repo, _source) = fork_fixture("timestamp");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let base = test_git(&source_repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&source_repo, &["rev-parse", "HEAD^{tree}"]);
+        let message = serde_json::to_string(&json!({
+            "v": EVENT_VERSION,
+            "author": "user",
+            "username": "Source",
+            "content": "old source",
+            "status": "idle"
+        }))
+        .unwrap();
+        let output = std::process::Command::new("git")
+            .args(["commit-tree", &tree, "-p", &base, "-m", &message])
+            .env("GIT_AUTHOR_DATE", "2001-09-09T01:46:40 +0000")
+            .env("GIT_COMMITTER_DATE", "2001-09-09T01:46:40 +0000")
+            .current_dir(&source_repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let source = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let source_ref = conversation_ref("old-source").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{source}:{source_ref}"),
+            ],
+        );
+        let old = remote_commit_timestamp(&transport, &source).unwrap();
+        let fork = fork_conversation(&transport, "Alice", "fresh-fork", "talk-3", &source).unwrap();
+        let fork_timestamp = remote_commit_timestamp(&transport, &fork).unwrap();
+        let commit_timestamp = test_git(&source_repo, &["show", "-s", "--format=%ct", &fork])
+            .parse::<i64>()
+            .unwrap();
+
+        assert_eq!(fork_timestamp, commit_timestamp);
+        assert!(fork_timestamp > old);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_title_cas_preserves_a_concurrent_manual_rename() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("title-cas");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        fork_conversation(&transport, "Alice", "title-fork", "talk-4", &source).unwrap();
+
+        assert!(compare_and_set_conversation_title(
+            &transport,
+            "title-fork",
+            "talk-4",
+            "generated"
+        )
+        .unwrap());
+        set_conversation_title(&transport, "title-fork", "manual").unwrap();
+        assert!(!compare_and_set_conversation_title(
+            &transport,
+            "title-fork",
+            "generated",
+            "late generated"
+        )
+        .unwrap());
+        let title_ref = conversation_title_ref("title-fork").unwrap();
+        let title = remote_ref(&transport, &title_ref).unwrap().unwrap();
+        assert_eq!(transport.get_object(&title).unwrap().1, b"manual");
 
         std::fs::remove_dir_all(root).unwrap();
     }

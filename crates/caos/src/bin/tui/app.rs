@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use caos::chat::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_head,
-    conversation_reference, conversation_replay, conversation_snapshot,
-    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
+    conversation_load, conversation_load_at, conversation_reference, conversation_snapshot,
+    describe_tool_set, first_available_conversation_name, fork_conversation,
     generate_conversation_title, invite_user_to_conversation, list_user_conversations,
     publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationReplay, ConversationRole,
+    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
     ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
     TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
@@ -117,13 +117,6 @@ struct PendingSubmission {
     commit: Option<String>,
 }
 
-#[derive(Clone)]
-struct LoadedConversation {
-    snapshot: ConversationSnapshot,
-    replay: ConversationReplay,
-    workspace_diff: WorkspaceDiff,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReferenceNotice {
     refname: String,
@@ -133,33 +126,8 @@ struct ReferenceNotice {
 struct RemotePollEntry {
     summary: UserConversationSummary,
     observed_head: Option<String>,
-    observed_title: String,
-    load: Option<Result<Box<LoadedConversation>, String>>,
-}
-
-fn load_conversation(
-    transport: &GitTransport,
-    id: &str,
-) -> Result<Option<LoadedConversation>, String> {
-    for _attempt in 0..3 {
-        let Some(snapshot) = conversation_snapshot(transport, id)? else {
-            return Ok(None);
-        };
-        let replay = conversation_replay(transport, id)?;
-        let workspace_diff = conversation_workspace_diff(transport, id)?;
-        if workspace_diff.head == snapshot.head
-            && conversation_head(transport, id)?.as_deref() == Some(snapshot.head.as_str())
-        {
-            return Ok(Some(LoadedConversation {
-                snapshot,
-                replay,
-                workspace_diff,
-            }));
-        }
-    }
-    Err(format!(
-        "conversation {id:?} kept changing while it was being refreshed"
-    ))
+    observed_title: Option<String>,
+    load: Option<Result<Box<ConversationLoad>, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -907,6 +875,7 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    remote_title: Option<String>,
     sidebar_attention: Option<String>,
     automatic_title: bool,
     automatic_title_fallback_applied: bool,
@@ -933,6 +902,7 @@ struct ConversationState {
     reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
+    forking: bool,
     scroll: ScrollState,
     unread_below: bool,
     transcript_selection: Option<TranscriptSelection>,
@@ -943,9 +913,11 @@ struct ConversationState {
 
 impl ConversationState {
     fn new(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
+        let remote_title = Some(title.clone());
         Self {
             id,
             title,
+            remote_title,
             sidebar_attention: None,
             automatic_title: false,
             automatic_title_fallback_applied: false,
@@ -972,6 +944,7 @@ impl ConversationState {
             reconcile_after: None,
             turn_phase: TurnPhase::System,
             publishing: false,
+            forking: false,
             scroll: ScrollState::default(),
             unread_below: false,
             transcript_selection: None,
@@ -984,10 +957,11 @@ impl ConversationState {
     fn new_virtual(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         let mut state = Self::new(id, title, turn_options, status);
         state.automatic_title = true;
+        state.remote_title = None;
         state
     }
 
-    fn apply_load(&mut self, load: LoadedConversation, current_user: &str) {
+    fn apply_load(&mut self, load: ConversationLoad, current_user: &str) {
         if self
             .reference_notice
             .as_ref()
@@ -1086,7 +1060,7 @@ impl ConversationState {
         transport: &GitTransport,
         current_user: &str,
     ) -> Option<ConversationSnapshot> {
-        match load_conversation(transport, &self.id) {
+        match conversation_load(transport, &self.id) {
             Ok(Some(load)) => {
                 let snapshot = load.snapshot.clone();
                 self.apply_load(load, current_user);
@@ -1142,7 +1116,7 @@ impl ConversationState {
     }
 
     fn is_busy(&self) -> bool {
-        self.running || self.publishing
+        self.running || self.publishing || self.forking
     }
 
     fn push_error(&mut self, error: impl Into<String>) {
@@ -1308,6 +1282,12 @@ impl ConversationState {
 }
 
 enum UiMessage {
+    Forked {
+        conversation: String,
+        origin: String,
+        source: String,
+        result: Result<(String, Box<ConversationLoad>), String>,
+    },
     Turn {
         conversation: String,
         event: TurnEvent,
@@ -1329,7 +1309,7 @@ enum UiMessage {
     InterjectionRefreshed {
         conversation: String,
         observed_head: Option<String>,
-        load: Result<Box<LoadedConversation>, String>,
+        load: Result<Box<ConversationLoad>, String>,
     },
     InterjectionFailed {
         conversation: String,
@@ -1588,18 +1568,16 @@ impl App {
         let mut states: Vec<ConversationState> = conversations
             .iter()
             .map(|summary| {
-                let mut state = ConversationState::new(
+                ConversationState::new(
                     summary.id.clone(),
                     summary.title.clone(),
                     args.turn.clone(),
                     "ready".to_string(),
-                );
-                state.remote_head = Some(summary.head.clone());
-                state
+                )
             })
             .collect();
         for state in &mut states {
-            state.reload(&transport, &args.user);
+            let _ = state.reload(&transport, &args.user);
         }
         let selected_id = match choice {
             ConversationChoice::Existing(id) => id,
@@ -1920,6 +1898,11 @@ impl App {
     }
 
     fn start_turn(&mut self) {
+        if self.selected().forking {
+            self.selected_mut()
+                .show_command_error("wait for this conversation fork to finish");
+            return;
+        }
         if self.selected().publishing {
             self.selected_mut()
                 .show_command_error("finish publishing before sending another message");
@@ -2072,7 +2055,7 @@ impl App {
                             pending_id,
                             commit,
                         });
-                        let load = load_conversation(&transport, &conversation)
+                        let load = conversation_load(&transport, &conversation)
                             .and_then(|load| {
                                 load.ok_or_else(|| {
                                     format!(
@@ -2194,6 +2177,12 @@ impl App {
         while let Ok(message) = self.rx.try_recv() {
             changed = true;
             match message {
+                UiMessage::Forked {
+                    conversation,
+                    origin,
+                    source,
+                    result,
+                } => self.finish_fork(&conversation, &origin, &source, result),
                 UiMessage::Turn {
                     conversation,
                     event,
@@ -2219,6 +2208,8 @@ impl App {
                         if refreshed.is_none() {
                             state.running = false;
                             state.active_request = None;
+                            state.reconciling_request = None;
+                            state.remote_head = None;
                         }
                         state.restore_pending_submission(pending_id);
                         if state.running {
@@ -2405,7 +2396,11 @@ impl App {
             .map(|state| {
                 (
                     state.id.clone(),
-                    (state.remote_head.clone(), state.title.clone()),
+                    (
+                        state.remote_head.clone(),
+                        state.remote_title.clone(),
+                        state.forking,
+                    ),
                 )
             })
             .collect();
@@ -2419,23 +2414,24 @@ impl App {
                 Ok(summaries
                     .into_iter()
                     .map(|summary| {
-                        let (observed_head, observed_title) = observed
+                        let (observed_head, observed_title, forking) = observed
                             .get(&summary.id)
                             .cloned()
-                            .unwrap_or((None, summary.title.clone()));
-                        let load =
-                            (observed_head.as_deref() != Some(summary.head.as_str())).then(|| {
-                                load_conversation(&transport, &summary.id)
-                                    .and_then(|load| {
-                                        load.ok_or_else(|| {
-                                            format!(
-                                                "conversation {:?} disappeared during refresh",
-                                                summary.id
-                                            )
-                                        })
+                            .unwrap_or((None, None, false));
+                        let load = (!forking
+                            && observed_head.as_deref() != Some(summary.head.as_str()))
+                        .then(|| {
+                            conversation_load(&transport, &summary.id)
+                                .and_then(|load| {
+                                    load.ok_or_else(|| {
+                                        format!(
+                                            "conversation {:?} disappeared during refresh",
+                                            summary.id
+                                        )
                                     })
-                                    .map(Box::new)
-                            });
+                                })
+                                .map(Box::new)
+                        });
                         RemotePollEntry {
                             summary,
                             observed_head,
@@ -2454,12 +2450,21 @@ impl App {
         for entry in entries {
             if let Some(index) = self.conversation_index(&entry.summary.id) {
                 let state = &mut self.conversations[index];
-                if state.remote_head != entry.observed_head || state.title != entry.observed_title {
+                if state.forking
+                    || state.remote_head != entry.observed_head
+                    || state.remote_title != entry.observed_title
+                {
                     continue;
                 }
-                if state.title != entry.summary.title {
-                    state.title = entry.summary.title.clone();
-                    state.automatic_title = false;
+                if state.remote_title.as_deref() != Some(entry.summary.title.as_str()) {
+                    let first_automatic_publication = state.generating_title
+                        && state.automatic_title
+                        && entry.observed_title.is_none();
+                    state.remote_title = Some(entry.summary.title.clone());
+                    if !first_automatic_publication {
+                        state.title = entry.summary.title.clone();
+                        state.automatic_title = false;
+                    }
                     changed = true;
                 }
                 if let Some(load) = entry.load {
@@ -2580,23 +2585,30 @@ impl App {
         state.status = format!("completed {}", outcome.short_commit);
         match transport {
             Ok(transport) => {
-                match publish_user_conversation(&transport, &user, &state.id, &state.title) {
+                let published_title = state.title.clone();
+                let initial_title = state
+                    .automatic_title_fallback
+                    .as_deref()
+                    .unwrap_or(&published_title);
+                match publish_user_conversation(&transport, &user, &state.id, initial_title) {
                     Ok(()) => {
                         if let Some(fallback) = state.automatic_title_fallback.clone() {
-                            if !state.automatic_title
-                                && state.title != fallback
-                                && compare_and_set_conversation_title(
+                            state.remote_title.get_or_insert_with(|| fallback.clone());
+                            if !state.automatic_title && state.title != fallback {
+                                if compare_and_set_conversation_title(
                                     &transport,
                                     &state.id,
                                     &fallback,
                                     &state.title,
                                 )
                                 .unwrap_or(false)
-                            {
-                                state.automatic_title_fallback = None;
+                                {
+                                    state.remote_title = Some(state.title.clone());
+                                    state.automatic_title_fallback = None;
+                                }
                             }
                         }
-                        state.reload(&transport, &user);
+                        let _ = state.reload(&transport, &user);
                         state.remote_head = Some(outcome.commit);
                     }
                     Err(error) => {
@@ -2614,6 +2626,45 @@ impl App {
         }
     }
 
+    fn finish_fork(
+        &mut self,
+        conversation: &str,
+        origin: &str,
+        source: &str,
+        result: Result<(String, Box<ConversationLoad>), String>,
+    ) {
+        let Some(index) = self.conversation_index(conversation) else {
+            return;
+        };
+        match result {
+            Ok((fork, load)) => {
+                let remote_title = load.snapshot.title.clone();
+                let state = &mut self.conversations[index];
+                state.forking = false;
+                state.apply_load(*load, &self.user);
+                state.remote_head = Some(fork);
+                state.remote_title = Some(remote_title);
+                state.status = format!("forked from {}", short_hash(source));
+            }
+            Err(error) => {
+                let selected_fork = self.selected == index;
+                self.conversations.remove(index);
+                if self.selected > index {
+                    self.selected -= 1;
+                }
+                if selected_fork {
+                    self.selected = self
+                        .conversation_index(origin)
+                        .unwrap_or_else(|| self.selected.min(self.conversations.len() - 1));
+                }
+                if let Some(origin) = self.conversation_index(origin) {
+                    self.conversations[origin]
+                        .show_command_error(format!("creating conversation fork failed: {error}"));
+                }
+            }
+        }
+    }
+
     fn finish_title_generation(&mut self, index: usize, result: Result<String, String>) {
         let transport = self.transport();
         let state = &mut self.conversations[index];
@@ -2621,24 +2672,29 @@ impl App {
         if !state.automatic_title {
             return;
         }
-        state.automatic_title = false;
         let title = match result {
             Ok(title) => title,
             Err(_) => return,
         };
+        state.automatic_title = false;
         if state.current_hash().is_some() {
-            let Some(expected) = state.automatic_title_fallback.as_deref() else {
+            let Some(expected) = state
+                .remote_title
+                .clone()
+                .or_else(|| state.automatic_title_fallback.clone())
+            else {
                 return;
             };
             let Ok(transport) = transport else {
                 return;
             };
-            if !compare_and_set_conversation_title(&transport, &state.id, expected, &title)
-                .unwrap_or(false)
-            {
-                return;
+            match compare_and_set_conversation_title(&transport, &state.id, &expected, &title) {
+                Ok(true) => {
+                    state.remote_title = Some(title.clone());
+                    state.automatic_title_fallback = None;
+                }
+                Ok(false) | Err(_) => return,
             }
-            state.automatic_title_fallback = None;
         }
         state.title = title;
     }
@@ -3067,7 +3123,7 @@ impl App {
             match self.transport() {
                 Ok(transport) => {
                     let user = self.user.clone();
-                    self.selected_mut().reload(&transport, &user);
+                    let _ = self.selected_mut().reload(&transport, &user);
                     self.selected_mut().status = "reloaded".to_string();
                 }
                 Err(error) => self.selected_mut().show_command_error(error),
@@ -3163,25 +3219,67 @@ impl App {
                 return;
             }
         };
-        let (options, base) = match new_conversation_options(
-            self.selected().turn_options.clone(),
-            base,
-            &self.repo_dir,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                self.selected_mut().show_command_error(error);
-                return;
+        let origin = self.selected().id.clone();
+        let previous_options = self.selected().turn_options.clone();
+        let (state, fork_source) = match base {
+            None => {
+                let (options, base) =
+                    match new_conversation_options(previous_options, None, &self.repo_dir) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.selected_mut().show_command_error(error);
+                            return;
+                        }
+                    };
+                (
+                    ConversationState::new_virtual(
+                        id.clone(),
+                        title.clone(),
+                        options,
+                        format!("ready from {}; enter a prompt", short_hash(&base)),
+                    ),
+                    None,
+                )
+            }
+            Some(from) => {
+                // Once materialized, the canonical first parent carries the
+                // fork source. Keeping it as a fallback base would let a lost
+                // remote ref silently recreate a marker-less conversation.
+                let mut options = previous_options;
+                options.base = None;
+                let mut state = ConversationState::new_virtual(
+                    id.clone(),
+                    title.clone(),
+                    options,
+                    format!("forking from {}", short_hash(&from)),
+                );
+                state.forking = true;
+                state.remote_title = Some(title.clone());
+                (state, Some(from))
             }
         };
-        let status = format!("ready from {}; enter a prompt", short_hash(&base));
-        self.conversations.insert(
-            0,
-            ConversationState::new_virtual(id, title, options, status),
-        );
+        self.conversations.insert(0, state);
         self.selected = 0;
         self.view = View::Chat;
         self.confirm_action = None;
+        if let Some(source) = fork_source {
+            let tx = self.tx.clone();
+            let repo_dir = self.repo_dir.clone();
+            let user = self.user.clone();
+            std::thread::spawn(move || {
+                let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                    let fork = fork_conversation(&transport, &user, &id, &title, &source)?;
+                    let load = conversation_load_at(&transport, &id, &fork)?;
+                    Ok((fork, Box::new(load)))
+                });
+                let _ = tx.send(UiMessage::Forked {
+                    conversation: id,
+                    origin,
+                    source,
+                    result,
+                });
+            });
+        }
     }
 
     fn select_relative(&mut self, amount: isize) {
@@ -3276,7 +3374,8 @@ impl App {
                 .show_command_error("conversation title must be one line");
             return;
         }
-        if self.selected().current_hash().is_some() {
+        let published = self.selected().current_hash().is_some();
+        if published {
             let id = self.selected().id.clone();
             if let Err(error) = self
                 .transport()
@@ -3288,7 +3387,11 @@ impl App {
         }
         let state = self.selected_mut();
         state.title = title.to_string();
+        if published {
+            state.remote_title = Some(title.to_string());
+        }
         state.automatic_title = false;
+        state.automatic_title_fallback = None;
         state.status = format!("renamed conversation to {title:?}");
     }
 
@@ -3684,6 +3787,23 @@ mod tests {
         )
     }
 
+    fn wait_for_fork(app: &mut App, id: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.drain_messages();
+            match app.conversation_index(id) {
+                Some(index) if !app.conversations[index].forking => return true,
+                None => return false,
+                Some(_) => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for fork {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn wait_for_remote_poll(app: &mut App) {
         app.poll_remote();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3935,6 +4055,113 @@ mod tests {
 
         app.finish_title_generation(0, Ok("Late replacement".to_string()));
         assert_eq!(app.selected().title, "Generated task title");
+    }
+
+    #[test]
+    fn first_remote_title_publication_does_not_cancel_generation() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.title = "local fallback".to_string();
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "internal-id".to_string(),
+                title: "published fallback".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: None,
+            observed_title: None,
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "local fallback");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("published fallback")
+        );
+        assert!(app.selected().automatic_title);
+        assert!(app.selected().generating_title);
+    }
+
+    #[test]
+    fn later_remote_title_change_cancels_generation_as_a_manual_rename() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "local fallback".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.remote_title = Some("published fallback".to_string());
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "internal-id".to_string(),
+                title: "manual rename".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: None,
+            observed_title: Some("published fallback".to_string()),
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "manual rename");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("manual rename")
+        );
+        assert!(!app.selected().automatic_title);
+    }
+
+    #[test]
+    fn completed_first_turn_publishes_a_title_generated_before_its_first_reload() {
+        let (repo, remote, _) = repo_with_default_branch("early-generated-title", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let head = seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        publish_user_conversation(&transport, "tester", "new-talk", "fallback prompt").unwrap();
+
+        let mut conversation = ConversationState::new_virtual(
+            "new-talk".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("fallback prompt");
+        conversation.title = "Generated title".to_string();
+        conversation.automatic_title = false;
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+
+        app.finish_turn(
+            0,
+            TurnOutcome {
+                conversation: "new-talk".to_string(),
+                commit: head.clone(),
+                short_commit: short_hash(&head).to_string(),
+            },
+        );
+
+        assert_eq!(app.selected().title, "Generated title");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("Generated title")
+        );
+        let listed =
+            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed[0].title, "Generated title");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
     }
 
     #[test]
@@ -5389,7 +5616,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let transport = GitTransport::discover(&repo).unwrap();
-        let load = load_conversation(&transport, "talk-1").unwrap().unwrap();
+        let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         let durable_commit = load.replay.turns[0].commit.clone();
         let mut conversation = state("talk-1");
         let pending_id = conversation.queue_pending_submission("another prompt".to_string());
@@ -5428,7 +5655,7 @@ mod tests {
         assert!(conversation.active_request.is_none());
 
         conversation.apply_load(
-            LoadedConversation {
+            ConversationLoad {
                 snapshot: ConversationSnapshot {
                     id: "talk-1".to_string(),
                     head: head.clone(),
@@ -5507,7 +5734,7 @@ mod tests {
         tx.send(UiMessage::InterjectionRefreshed {
             conversation: "talk-1".to_string(),
             observed_head: Some(old_head.clone()),
-            load: Ok(Box::new(LoadedConversation {
+            load: Ok(Box::new(ConversationLoad {
                 snapshot: ConversationSnapshot {
                     id: "talk-1".to_string(),
                     head: old_head.clone(),
@@ -5554,7 +5781,7 @@ mod tests {
                 updated_unix: 1,
             },
             observed_head: Some("a".repeat(40)),
-            observed_title: "old local title".to_string(),
+            observed_title: Some("old local title".to_string()),
             load: None,
         }]));
 
@@ -5811,7 +6038,7 @@ mod tests {
         assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
         conversation.scroll.scroll_up(5);
         let transport = GitTransport::discover(&dir).unwrap();
-        conversation.reload(&transport, "alice");
+        let _ = conversation.reload(&transport, "alice");
         assert!(conversation.diff.is_none());
         assert!(conversation.status.is_empty());
         let error = conversation.transcript.last().unwrap();
@@ -5909,7 +6136,7 @@ mod tests {
 
         // A coherent reload must not erase this presentation-only result.
         let transport = GitTransport::discover(&repo).unwrap();
-        let load = load_conversation(&transport, id).unwrap().unwrap();
+        let load = conversation_load(&transport, id).unwrap().unwrap();
         app.selected_mut().apply_load(load.clone(), "Alice");
         assert_eq!(
             app.selected().reference_notice,
@@ -5981,6 +6208,136 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.selected().reference_notice.is_none());
         assert_eq!(app.focus, Focus::Conversation);
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn from_materializes_inherited_history_immediately() {
+        let (repo, remote, _) = repo_with_default_branch("durable-fork", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source.clone()));
+
+        let fork_id = app.selected().id.clone();
+        assert_ne!(fork_id, "original");
+        assert!(app.selected().forking);
+        assert!(app.selected().is_busy());
+        assert!(app.selected().transcript.is_empty());
+        assert!(wait_for_fork(&mut app, &fork_id));
+        assert_eq!(app.selected().transcript[0].text, "inherited message");
+        assert!(conversation_head(&transport, &fork_id).unwrap().is_some());
+        assert_eq!(app.selected().diff.as_ref().unwrap().base_commit, source);
+        assert!(app.selected().diff.as_ref().unwrap().patch.is_empty());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn fork_placeholder_does_not_cancel_automatic_title_generation() {
+        let (repo, remote, _) = repo_with_default_branch("fork-title", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source));
+        let fork_id = app.selected().id.clone();
+        assert!(wait_for_fork(&mut app, &fork_id));
+        let placeholder = app.selected().title.clone();
+        app.selected_mut()
+            .apply_automatic_title("fallback from the first prompt");
+        app.selected_mut().generating_title = true;
+
+        wait_for_remote_poll(&mut app);
+        assert_eq!(app.selected().title, "fallback from the first prompt");
+        assert!(app.selected().automatic_title);
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some(placeholder.as_str())
+        );
+
+        app.finish_title_generation(0, Ok("Generated fork title".to_string()));
+        assert_eq!(app.selected().title, "Generated fork title");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("Generated fork title")
+        );
+        let summary = list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == fork_id)
+            .unwrap();
+        assert_eq!(summary.title, "Generated fork title");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn generated_fork_title_does_not_overwrite_an_external_rename() {
+        let (repo, remote, _) = repo_with_default_branch("fork-title-race", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source));
+        let fork_id = app.selected().id.clone();
+        assert!(wait_for_fork(&mut app, &fork_id));
+        app.selected_mut().apply_automatic_title("fallback");
+        app.selected_mut().generating_title = true;
+        set_conversation_title(&transport, &fork_id, "External rename").unwrap();
+
+        app.finish_title_generation(0, Ok("Late generated title".to_string()));
+        assert_ne!(app.selected().title, "Late generated title");
+        wait_for_remote_poll(&mut app);
+        assert_eq!(app.selected().title, "External rename");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn plain_commit_fork_failure_never_becomes_a_markerless_conversation() {
+        let (repo, remote, plain_commit) = repo_with_default_branch("plain-fork", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let (mut app, _) = app_with(vec![state("origin")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(plain_commit));
+        let pending_id = app.selected().id.clone();
+        app.selected_mut().composer.insert_str("must not submit");
+        app.start_turn();
+        assert!(app.selected().forking);
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("fork"));
+
+        assert!(!wait_for_fork(&mut app, &pending_id));
+        assert_eq!(app.selected().id, "origin");
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("not a conversation event"));
+        assert!(conversation_head(&transport, &pending_id)
+            .unwrap()
+            .is_none());
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
