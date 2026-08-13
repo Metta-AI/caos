@@ -1111,6 +1111,27 @@ pub fn publish_user_conversation(
     .map_err(|error| format!("publishing conversation {id:?}: {error}"))
 }
 
+/// Add an existing conversation to another user's active sidebar. The
+/// canonical conversation head is unchanged; this writes presentation refs
+/// only.
+pub fn invite_user_to_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+    let head = conversation_head(t, id)?
+        .ok_or_else(|| format!("cannot invite to conversation {id:?} before its first turn"))?;
+    fetch_commit(t, &head)?;
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    t.git_capture(
+        &[
+            "push",
+            "--quiet",
+            CAOS_REMOTE,
+            &format!("+{head}:{active_ref}"),
+        ],
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("inviting {user:?} to conversation {id:?}: {error}"))
+}
+
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
     let title = validate_conversation_title(title)?;
     let hash = t.put_object("blob", title.as_bytes())?.to_string();

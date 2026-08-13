@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use caos::chat::{
     archive_user_conversation, conversation_head, conversation_reference, conversation_replay,
     conversation_snapshot, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, generate_conversation_title, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, resume_request, run_chat_turn,
+    first_available_conversation_name, generate_conversation_title, invite_user_to_conversation,
+    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
     set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationReplay,
     ConversationRole, ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions,
     TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
@@ -819,6 +819,7 @@ impl Composer {
 enum CommandAction {
     From,
     Help,
+    Invite,
     Palette,
     Reference,
     Title,
@@ -834,7 +835,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 6] = [
+const COMMANDS: [Command; 7] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -876,6 +877,13 @@ const COMMANDS: [Command; 6] = [
         description: "show the copyable conversation ref and full head hash",
         action: CommandAction::Reference,
         takes_argument: false,
+    },
+    Command {
+        name: "/invite",
+        usage: "/invite <username>",
+        description: "add this conversation to another username's sidebar (case-sensitive)",
+        action: CommandAction::Invite,
+        takes_argument: true,
     },
 ];
 
@@ -1520,10 +1528,9 @@ impl App {
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        publish_unindexed_conversations(&transport, &args.user)?;
         let mut conversations =
             list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
-        if let Some(requested) = args.conversation.as_deref() {
+        if let Some(requested) = args.conversation.clone() {
             if conversations
                 .iter()
                 .all(|conversation| conversation.id != requested)
@@ -1537,7 +1544,17 @@ impl App {
                     .iter()
                     .any(|conversation| conversation.id == requested)
                 {
-                    unarchive_user_conversation(&transport, &args.user, requested)?;
+                    unarchive_user_conversation(&transport, &args.user, &requested)?;
+                    conversations = list_user_conversations(
+                        &transport,
+                        &args.user,
+                        UserConversationStatus::Active,
+                    )?;
+                } else if let Some(snapshot) = conversation_snapshot(&transport, &requested)? {
+                    if args.new_conversation {
+                        return Err(format!("conversation {requested:?} already exists"));
+                    }
+                    publish_user_conversation(&transport, &args.user, &requested, &snapshot.title)?;
                     conversations = list_user_conversations(
                         &transport,
                         &args.user,
@@ -1943,6 +1960,10 @@ impl App {
                     }
                     return;
                 }
+                CommandAction::Invite => {
+                    self.invite_selected(arguments);
+                    return;
+                }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
                     return;
@@ -2136,6 +2157,19 @@ impl App {
                 result,
             });
         });
+    }
+
+    fn invite_selected(&mut self, user: &str) {
+        let id = self.selected().id.clone();
+        match self
+            .transport()
+            .and_then(|transport| invite_user_to_conversation(&transport, user, &id))
+        {
+            Ok(()) => self.selected_mut().push_info(format!(
+                "Invited user {user}. Their TUI must use exactly `--username {user}`."
+            )),
+            Err(error) => self.selected_mut().show_command_error(error),
+        }
     }
 
     pub(crate) fn drain_messages(&mut self) -> bool {
@@ -2363,7 +2397,6 @@ impl App {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                publish_unindexed_conversations(&transport, &user)?;
                 let summaries =
                     list_user_conversations(&transport, &user, UserConversationStatus::Active)?;
                 Ok(summaries
@@ -3865,7 +3898,8 @@ mod tests {
                 "/title",
                 "/update-tree",
                 "/commands",
-                "/ref"
+                "/ref",
+                "/invite"
             ]
         );
 
@@ -3902,6 +3936,10 @@ mod tests {
         let (command, arguments) = parse_command("/ref").unwrap();
         assert_eq!(command.action, CommandAction::Reference);
         assert!(arguments.is_empty());
+
+        let (command, arguments) = parse_command("/invite Bob").unwrap();
+        assert_eq!(command.action, CommandAction::Invite);
+        assert_eq!(arguments, "Bob");
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
@@ -5708,39 +5746,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_poll_discovers_shared_conversations_and_names_the_other_user() {
+    fn remote_poll_discovers_invited_conversations_and_names_the_other_user() {
         let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        let base = git_output(&repo, &["rev-parse", "HEAD"]);
-        let tree = git_output(&repo, &["rev-parse", "HEAD^{tree}"]);
-        let user = git_output(
-            &repo,
-            &[
-                "commit-tree",
-                &tree,
-                "-p",
-                &base,
-                "-m",
-                r#"{"kind": "caos-chat-event","author":"user","username":"Alice","content":"hello from Alice"}"#,
-            ],
-        );
-        let request = "b".repeat(40);
-        let admission_message = format!(
-            r#"{{"kind": "caos-chat-event","status":"queued","request":"{request}","request_head":"{user}"}}"#
-        );
-        let admitted = git_output(
-            &repo,
-            &["commit-tree", &tree, "-p", &user, "-m", &admission_message],
-        );
-        git_ok(
-            &repo,
-            &[
-                "push",
-                "-q",
-                "caos",
-                &format!("{admitted}:refs/caos/conversations/shared/head"),
-            ],
-        );
+        let transport = GitTransport::discover(&repo).unwrap();
+        let (_, request) = seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
+        invite_user_to_conversation(&transport, "Bob", "shared").unwrap();
 
         let (mut app, _) = app_with(vec![state("local")]);
         app.repo_dir = repo.clone();
@@ -5753,6 +5764,11 @@ mod tests {
             .find(|conversation| conversation.id == "shared")
             .unwrap();
         assert!(shared.running);
+        assert_eq!(shared.active_request.as_deref(), Some(request.as_str()));
+        assert_eq!(
+            shared.reconciling_request.as_deref(),
+            Some(request.as_str())
+        );
         assert!(matches!(
             &shared.transcript[0].role,
             EntryRole::Peer(author) if author == "Alice"
