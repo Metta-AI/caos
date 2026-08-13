@@ -148,13 +148,14 @@ deepener)
   caos get /cas/args/in/std
   caos get /cas/args/in/std/deep-deps
 
-  # MINUS THE `.caos-expr`. An expression is evaluated against its directory
-  # WITHOUT the directive (crates/caos/src/eval.rs `strip_caos_expr`), so the
-  # `in` the expression forms — and the one build-builtins.sh records as the
-  # seed key — is the stripped tree. For a sentinel entry the whole directory
-  # IS the directive, so this is the EMPTY tree; pass the entry verbatim and
-  # the key matches no seed record, the job falls through to the generic
-  # runner, and it dies trying to pull `seeded-deep-deps:latest`.
+  # MINUS THE `.caos-expr` — the same strip as caos-tools/build.sh, for the same
+  # reason. An expression is evaluated against its directory WITHOUT the
+  # directive (crates/caos/src/eval.rs `strip_caos_expr`), so the `in` the
+  # expression forms — and the one build-builtins.sh records as the seed key —
+  # is the stripped tree. For a sentinel entry the whole directory IS the
+  # directive, so this is the EMPTY tree; pass the entry verbatim and the key
+  # matches no seed record, and the job waits instead of running (the server
+  # 503s on it after CAOS_SEEDED_GRACE_SECS — see the note in build.sh).
   # `-r`: a plain `get` leaves the entry's children as owner-only placeholders
   # the unprivileged worker cannot read, so the copy below needs the content.
   caos get -r /cas/args/in/std/deep-deps
@@ -258,6 +259,18 @@ fanout)
     mkdir -p "/tmp/sel/$t"
     ln -s "/cas/args/ws/tests/$t" "/tmp/sel/$t/test"
     if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
+    # ONE SHARED STACK for the whole suite, instead of one per test
+    # (design/faster-tests.md). Every test asks for it and the first to ask
+    # starts it, so the fan-out needs no shape of its own — this line is the
+    # whole of the change here. The name is a CONSTANT, deliberately: it says
+    # which role the job plays, not which run it belongs to, so it re-keys
+    # nothing. The stack itself is named after the image, which every test's
+    # key already carries.
+    #
+    # REQUIRED by test-stack/worker, which has no default role to fall back to:
+    # it used to default to a `private` stack, and that path went on looking
+    # live for as long as it took someone to notice this line has no `else`.
+    printf 'client' > "/tmp/sel/$t/role"
     # The seed records ride into EVERY wrapper (unlike the per-test std subset):
     # they carry the flake-builder image the inner seeder answers with, and any
     # test that builds a flake reaches flake-builder transitively. A symlink put,

@@ -121,13 +121,37 @@ if [ -e /cas/args/in/workspace ]; then
   export CAOS_PROJECT=/tmp/ws
 fi
 
-# CAOS_STUB_HOST points workers at in-job stub servers — siblings share this
-# container's netns, so localhost is the stub's address, not the engine host.
+# CAOS_STUB_HOST points workers at in-job stub servers. THIS CONTAINER'S OWN
+# ADDRESS ON THE NETWORK, deliberately, and not `127.0.0.1`.
+#
+# Loopback happens to work while every worker is a sibling in this container's
+# netns, and stops working the moment they are not — which is exactly what
+# design/faster-tests.md does: with one test stack shared by every test, the
+# workers are launched into THAT stack's netns, and `127.0.0.1` would be the
+# stack rather than the test that scripted the stub. A routable address is
+# right under both arrangements (a netns can reach its own address), so this
+# does not wait for that change and cannot become a mystery failure inside it.
+#
+# Read from /etc/hosts, in bash. The container runtime writes a line mapping
+# this container's hostname to its address, and there is no `hostname`,
+# `getent`, `ip` or `ifconfig` in this image to ask instead (checked) — an
+# absent binary is exit 127 at runtime, not a build error.
+#
+# The stub binds 0.0.0.0 already (every caller passes it), so nothing on the
+# test side changes.
+self=$(cat /etc/hostname) || fail "no /etc/hostname; cannot find this container's address"
+CAOS_STUB_HOST=""
+while read -r ip names; do
+  case " $names " in *" $self "*) CAOS_STUB_HOST=$ip; break ;; esac
+done < /etc/hosts
+[ -n "$CAOS_STUB_HOST" ] \
+  || fail "no /etc/hosts entry for $self — a stub server would be unreachable"
+export CAOS_STUB_HOST
+echo "run-test: stubs reachable at $CAOS_STUB_HOST" >&2
 #
 # A test that EXECs something out of its own mounts must `install` a copy first:
 # materialized CAS content is read-only and owner-only, so running it straight
 # out of /cas is "Permission denied".
-export CAOS_STUB_HOST=127.0.0.1
 # A real-API test's key arrives in its wrapper (chat-online; absent = its
 # cli.sh self-skips).
 if [ -e /cas/args/in/api-key ]; then
@@ -213,7 +237,11 @@ echo $((SECONDS - t0)) > /tmp/out/seconds
 # human or agent, would want to read. No streaming, no archaeology: address
 # the byte you need by path.
 cp /tmp/test.out /tmp/out/output
-for log in server runnerd redis serve; do
+# `phases` is the interpreter's clock for everything BEFORE this script ran —
+# arg materialization, finding the stack, fetching deps. None of it is in the
+# `seconds` below, which starts once the stack is in hand, so without this the
+# suite's per-test times describe a fraction of what a test job costs.
+for log in server runnerd redis serve phases; do
   # `|| continue`, not `&& cp`: this loop is the last statement in the
   # script, so under set -e a missing final log would fail the whole job.
   [ -e "/tmp/$log.log" ] || continue

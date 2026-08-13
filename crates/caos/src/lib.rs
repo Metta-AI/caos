@@ -567,8 +567,44 @@ impl Transport for GitTransport {
         // negotiation base for the next push, so an edited tree ships only its
         // delta. The push carries the whole object graph reachable from `hash`.
         let refspec = format!("{hash}:refs/caos/req/{hash}");
-        self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
-            .map_err(|e| format!("pushing {hash} to {CAOS_REMOTE}: {e}"))
+        let push = || self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec]);
+
+        // RETRIED, for the create race between clients pushing the same object.
+        // They all read an advertisement without the ref, so they all plan a
+        // CREATE, and every one that locks after the first dies with "cannot
+        // lock ref …: reference already exists". `--force` does not help — the
+        // create precondition comes from the advertised state, not from the
+        // refspec.
+        //
+        // A retry usually succeeds because the winner has landed both the
+        // objects and the ref (receive-pack updates the ref last), so the next
+        // advertisement HAS it and the push becomes a no-op update — the ref
+        // can only be at `hash`, the name is the content.
+        //
+        // MORE THAN ONE RETRY, because under load that is not guaranteed: two
+        // losers can both re-read the advertisement before the winner's update
+        // lands, both plan a create again, and one loses again. Measured with
+        // six concurrent clients inside a loaded suite — a single retry left
+        // five of six failing (tests/push-race).
+        //
+        // Retried on ANY error rather than by matching git's wording, which
+        // varies by version: a few extra pushes on the failure path are cheaper
+        // than a fragile string test, and a genuine failure just fails N times.
+        let mut last = String::new();
+        for attempt in 0..4 {
+            match push() {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e,
+            }
+            // Widening pause: the thing we are waiting for is another client's
+            // ref update landing, which is brief but not instant.
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+        }
+        // The LAST error, not the first: reporting attempt one's message hides
+        // whatever actually defeated the retries, which is the only interesting
+        // one (it cost a debugging session — the visible error said "reference
+        // already exists" while the real failure was unknown).
+        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
     }
 
     fn ingest_path(

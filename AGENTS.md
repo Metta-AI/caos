@@ -15,6 +15,20 @@ Every script here runs with it, and two constructs quietly break under it.
   "absent" answer is a 404 dies instead of returning empty. Distinguish absent
   from broken explicitly — a swallowed error here silently hides an unreachable
   service.
+- **A comment inside a backslash-continued command severs it.** An env prefix
+  written one-assignment-per-line (`FOO=1 \` … `bash serve &`) breaks the
+  moment a comment lands between two of those lines: the continuation joins
+  INTO the comment and the command runs with none of the environment. It is
+  not a parse error, so `bash -n` passes and the damage shows up far away —
+  in `test-stack/worker` it was a stack dying at bring-up with "serve needs
+  CAOS_STACK_STATE", 28 clients polling for an address that never appeared,
+  and a suite that read as SLOW rather than broken. Put the comment above the
+  block.
+- **`${VAR:?message}` is word-split unless you quote it.** An apostrophe in
+  the message (`${X:?the socket's path}`) opens a single-quoted string that
+  never closes and swallows the REST OF THE FILE; bash then reports an
+  unterminated `if` hundreds of lines away, nowhere near the cause. Write
+  `X="${VAR:?message}"` — inside double quotes the message is literal.
 - **A worker script only has what its image's flake lists.** `std/bash` is
   bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
   `sed`**, and no awk. `sed 's/^/  /'` in `caos-tools/test.sh` passed two
@@ -45,6 +59,48 @@ Every script here runs with it, and two constructs quietly break under it.
   a previous build, and the other can be missing entirely — so you read a stale
   binary and blame the code. Build one output per invocation. (`--refresh` is not
   needed: nix picks up dirty-tree edits fine.)
+
+# Caches and defaults, when a suite fans out
+
+Both of these presented as "the tests are slow", cost a long time to find, and
+are the kind of thing that is invisible until 29 clients arrive at once.
+
+- **A redis cache read followed by a redis cache write is CHECK-THEN-ACT.** The
+  server answers on a thread pool, so a fan-out means every client misses the
+  same key in the same instant and every client does the whole job. Measured:
+  29 tests produced 29 identical `converted image` lines, each materializing a
+  ~200 MB tree to a temp dir, tarring it, hashing it and pushing it — 24 seconds
+  in which the suite started no containers. Single-flight anything expensive
+  behind a per-key lock and RE-READ the cache after acquiring it. There is one
+  server process per stack, so an in-process lock is the whole requirement.
+- **A default is dead if every caller passes the variable.** `test-stack/worker`
+  read `CAOS_TEST_STACK_IDLE_SECS` with a 900s default, and the `docker run`
+  three hundred lines away that starts that role always passed the variable,
+  defaulting it to 120. The 900 was decoration; every shared stack died two
+  minutes after the suite that created it and every later run paid a cold start.
+  When a value is read in one place and supplied in another, the SUPPLIER wins —
+  grep for the variable, do not read the default and believe it.
+- **A dead container address does not refuse connections, it swallows them.**
+  Nothing listens on an IP whose container is gone, and the bridge drops the SYN
+  rather than sending RST, so anything that dials it waits out a TCP retransmit
+  — `git ls-remote` sat there for 2.1s, three retries made 11.3s, and the caller
+  did that twice. Bound any probe of an address that might be stale
+  (`timeout 1 bash -c "exec 3<>/dev/tcp/$host/$port"`), and do not re-probe an
+  address already proven dead — wait for it to CHANGE.
+
+- **An idle machine mid-run means a job is waiting, and a `docker://seeded…`
+  job is the one that waits in silence.** A seeded sentinel defers generic
+  runners for its whole pending window (900s in a stack), so when its key
+  doesn't match the seed record NOTHING happens — no container, no log line —
+  and the eventual `no runner for arg_tree …` blames capacity, the one thing
+  that isn't wrong. The server now proves this instead: a parked poll whose
+  `required["image"]` equals the job's `image` IS that sentinel's seeder, so a
+  disagreement is permanent, and after `CAOS_SEEDED_GRACE_SECS` (45s) the 503
+  names the differing args. **Read that message rather than re-deriving it** —
+  it prints both oids, and the fix is always one of the two sides being stale.
+  Anything you hand-roll that forms a seeded key (a `caos run-then` against a
+  sentinel, in `caos-tools/*.sh`) must match `build-builtins.sh`'s record
+  exactly, `strip_caos_expr` included; nothing else checks that agreement.
 
 # Before committing
 
