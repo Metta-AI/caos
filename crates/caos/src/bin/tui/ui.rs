@@ -550,10 +550,13 @@ fn transcript_paragraph(state: &ConversationState, width: u16) -> Paragraph<'sta
     }
     for entry in &state.transcript {
         let (label, color) = match entry.role {
-            EntryRole::Human => ("You", Color::Cyan),
-            EntryRole::Agent => ("Agent", Color::Green),
-            EntryRole::Info => ("CAOS", Color::Cyan),
-            EntryRole::Notice => ("Error", Color::Red),
+            EntryRole::Human => (
+                entry.author.clone().unwrap_or_else(|| "You".to_string()),
+                Color::Cyan,
+            ),
+            EntryRole::Agent => ("Agent".to_string(), Color::Green),
+            EntryRole::Info => ("CAOS".to_string(), Color::Cyan),
+            EntryRole::Notice => ("Error".to_string(), Color::Red),
         };
         let mut heading = vec![Span::styled(
             label,

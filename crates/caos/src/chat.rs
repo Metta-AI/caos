@@ -4,11 +4,11 @@
 //! One turn: mint the human-turn commit (parent = the conversation head, or
 //! the base for a new conversation; tree = the parent's tree — human turns
 //! are text-only for now), hand it to an `llm-step` run, watch the turn's
-//! progress ref while the run blocks, and on success advance
-//! `refs/caos/conversations/<name>/from-user` to the returned turn commit.
-//! Conversation identity is that ref — the only mutable thing, owned by this
-//! client. On a failed run the ref is untouched; the minted human commit is
-//! harmlessly orphaned.
+//! progress ref while the run blocks. The human turn is compare-and-swap
+//! appended to `refs/caos/conversations/<name>/from-user` before compute is
+//! triggered, and the remote worker advances that same ref to the returned
+//! agent turn. Conversation identity is therefore shared remote state rather
+//! than state owned by whichever client happened to start the turn.
 //!
 //! `talk` is the everyday surface: the positional argument is the prompt, the
 //! conversation defaults to the repo's most recently used one (`--new` starts
@@ -40,9 +40,9 @@ const AGENT_AUTHOR: &str = "caos-agent";
 /// The conversation namespace. Every ref of a conversation lives together
 /// under `<prefix><id>/<channel>` (see design/talk-while-thinking.md, "Refs"):
 ///
-/// * `from-user` — the user branch tip: the engine's local HEAD *and* the
-///   server's canonical HEAD (now identically named), advancing to the turn
-///   merge on completion. Client is its sole writer.
+/// * `from-user` — the shared canonical head. A client compare-and-swap appends
+///   an accepted human commit; its worker compare-and-swap advances that exact
+///   commit to the completed agent turn. Local refs are caches of this value.
 /// * `from-agent` — the agent's step-chain tip, pushed by the worker.
 /// * `title` — the display-name blob (client).
 /// * `status` — the worker's in-round status blob `"<human hash>\n<text>"`
@@ -106,6 +106,9 @@ pub struct TurnOptions {
     pub system_file: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    /// Human-facing author name for user turns. When absent, Git's user.name
+    /// is used; the protocol-level agent author remains reserved.
+    pub username: Option<String>,
 }
 
 /// One project-defined tool available to the selected conversation.
@@ -194,6 +197,11 @@ pub enum TurnEvent {
         elapsed_secs: f64,
     },
     Status(String),
+    /// The human commit is now the canonical remote head. From this point the
+    /// message is durable and compute no longer depends on client UI state.
+    Accepted {
+        commit: String,
+    },
     AssistantText(String),
     ToolCall {
         step_commit: String,
@@ -257,6 +265,18 @@ pub struct ConversationTurnEvents {
 pub struct ConversationReplay {
     pub turns: Vec<ConversationTurn>,
     pub turn_events: Vec<ConversationTurnEvents>,
+}
+
+/// Best-effort state for a human turn that is currently being processed.
+///
+/// The canonical `from-user` ref identifies `human`. The other two remote
+/// channels are observability only, so stale values are ignored unless they
+/// root at that exact commit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationLiveState {
+    pub human: String,
+    pub status: Option<String>,
+    pub events: Vec<TurnEvent>,
 }
 
 /// A locally-known conversation ref, ordered newest-first by
@@ -325,12 +345,13 @@ struct ChatArgs {
     system_file: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
+    username: Option<String>,
     log: bool,
 }
 
 fn usage(verb: Verb) -> String {
     let common = "[--base <revspec>] [--system <text> | --system-file <path>] \
-         [--model <model>] [--base-url <url>] [--log]";
+         [--model <model>] [--base-url <url>] [--username <name>] [--log]";
     match verb {
         Verb::Chat => format!(
             "usage: chat <name> [-m <message>] {common}\n\
@@ -359,6 +380,7 @@ impl ChatArgs {
             system_file: None,
             model: None,
             base_url: None,
+            username: None,
             log: false,
         };
         let mut positional: Option<String> = None;
@@ -377,6 +399,7 @@ impl ChatArgs {
                 "--system-file" => a.system_file = Some(value(arg)?),
                 "--model" => a.model = Some(value(arg)?),
                 "--base-url" => a.base_url = Some(value(arg)?),
+                "--username" => a.username = Some(value(arg)?),
                 "--log" => a.log = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other}\n{}", usage(verb)))
@@ -417,6 +440,7 @@ impl ChatArgs {
             system_file: self.system_file.clone(),
             model: self.model.clone(),
             base_url: self.base_url.clone(),
+            username: self.username.clone(),
         }
     }
 }
@@ -496,7 +520,8 @@ fn run_cli_turn(
         TurnEvent::Completed(outcome) => {
             println!("[{} {}]", outcome.conversation, outcome.short_commit)
         }
-        TurnEvent::PhaseStarted(_)
+        TurnEvent::Accepted { .. }
+        | TurnEvent::PhaseStarted(_)
         | TurnEvent::PhaseComplete { .. }
         | TurnEvent::ToolResult { .. } => {}
     })?;
@@ -720,6 +745,30 @@ fn validate_conversation_title(title: &str) -> Result<&str, String> {
     Ok(title)
 }
 
+/// Resolve the display name stored on user-authored commits.
+///
+/// `--username` is deliberately presentation-only: Git's configured email and
+/// committer identity remain unchanged, while the commit's author name is what
+/// existing conversation replay already exposes to every client.
+pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<String, String> {
+    let username = match explicit {
+        Some(username) => username.to_string(),
+        None => t
+            .git_capture(&["config", "--get", "user.name"], None)
+            .map_err(|_| "--username was not provided and Git user.name is not set".to_string())?,
+    };
+    let username = username.trim();
+    if username.is_empty() || username.chars().any(char::is_control) {
+        return Err("--username must be nonempty and contain no control characters".to_string());
+    }
+    if username == AGENT_AUTHOR {
+        return Err(format!(
+            "username {AGENT_AUTHOR:?} is reserved for agent commits; choose another --username"
+        ));
+    }
+    Ok(username.to_string())
+}
+
 fn remote_refs(
     t: &GitTransport,
     patterns: impl IntoIterator<Item = String>,
@@ -743,6 +792,41 @@ fn remote_refs(
             Some((refname.to_string(), hash.to_string()))
         })
         .collect())
+}
+
+fn remote_conversation_head(t: &GitTransport, id: &str) -> Result<Option<String>, String> {
+    let refname = conversation_head_ref(id);
+    Ok(remote_refs(t, [refname.clone()])?.remove(&refname))
+}
+
+/// Advance the canonical conversation ref only when it still has `expected`.
+/// A rejected lease is a normal multiplayer race and returns `false`; a
+/// transport failure with the ref unchanged remains a loud error.
+fn push_conversation_head_cas(
+    t: &GitTransport,
+    refname: &str,
+    expected: Option<&str>,
+    candidate: &str,
+) -> Result<bool, String> {
+    let lease = match expected {
+        Some(expected) => format!("--force-with-lease={refname}:{expected}"),
+        None => format!("--force-with-lease={refname}:"),
+    };
+    let update = format!("{candidate}:{refname}");
+    let pushed = t.git_capture(&["push", "--quiet", &lease, CAOS_REMOTE, &update], None);
+    if pushed.is_ok() {
+        return Ok(true);
+    }
+
+    let observed = remote_refs(t, [refname.to_string()])?.remove(refname);
+    if observed.as_deref() == Some(candidate) {
+        // The server accepted the update but the response was lost.
+        return Ok(true);
+    }
+    if observed.as_deref() != expected {
+        return Ok(false);
+    }
+    Err(pushed.expect_err("the failed push was checked above"))
 }
 
 /// Publish a local conversation into the server-owned conversation namespace
@@ -784,6 +868,93 @@ pub fn publish_user_conversation(
     )
     .map(|_| ())
     .map_err(|error| format!("publishing conversation {id:?}: {error}"))
+}
+
+/// Add metadata and user membership for a conversation whose canonical head
+/// has already been accepted remotely. This deliberately does not update the
+/// head ref, so a very fast worker completion cannot turn indexing into a
+/// non-fast-forward push.
+pub fn index_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+) -> Result<(), String> {
+    validate_user_conversation(user, id)?;
+    let title = validate_conversation_title(title)?;
+    let head = remote_conversation_head(t, id)?
+        .ok_or_else(|| format!("cannot index conversation {id:?} before its first turn"))?;
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    t.ensure_pushed(&title_hash)?;
+    let title_ref = conversation_title_ref(id);
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id);
+    let title_update = format!("+{title_hash}:{title_ref}");
+    let active_update = format!("+{head}:{active_ref}");
+    t.git_capture(
+        &[
+            "push",
+            "--quiet",
+            "--atomic",
+            CAOS_REMOTE,
+            &title_update,
+            &active_update,
+        ],
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("indexing conversation {id:?}: {error}"))
+}
+
+/// Add an existing shared conversation to one user's active list.
+///
+/// This is the explicit `-c/--conversation` join path. The canonical head is
+/// read from the server and cached locally; no conversation content or title
+/// is rewritten. A just-submitted first turn may not have title metadata yet,
+/// in which case the stable id is a temporary display fallback.
+pub fn join_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+) -> Result<Option<UserConversationSummary>, String> {
+    validate_user_conversation(user, id)?;
+    let head_ref = conversation_head_ref(id);
+    let title_ref = conversation_title_ref(id);
+    let refs = remote_refs(t, [head_ref.clone(), title_ref.clone()])?;
+    let Some(head) = refs.get(&head_ref).cloned() else {
+        return Ok(None);
+    };
+    t.fetch_object(&head)?;
+    let local_ref = validated_refname(id)?;
+    t.git_capture(&["update-ref", &local_ref, &head], None)?;
+
+    let title = match refs.get(&title_ref) {
+        Some(title_hash) => {
+            let (kind, title) = t.get_object(title_hash)?;
+            if kind != "blob" {
+                return Err(format!(
+                    "conversation title {title_hash} is a {kind}, not a blob"
+                ));
+            }
+            String::from_utf8(title)
+                .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?
+        }
+        None => id.to_string(),
+    };
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id);
+    let active_update = format!("+{head}:{active_ref}");
+    t.git_capture(&["push", "--quiet", CAOS_REMOTE, &active_update], None)
+        .map_err(|error| format!("joining conversation {id:?}: {error}"))?;
+    let updated_unix = t
+        .git_capture(&["show", "-s", "--format=%ct", &head], None)?
+        .trim()
+        .parse()
+        .map_err(|error| format!("conversation {id:?} has an invalid timestamp: {error}"))?;
+    Ok(Some(UserConversationSummary {
+        id: id.to_string(),
+        title,
+        head,
+        updated_unix,
+    }))
 }
 
 /// Change a conversation's shared title without changing its identity or HEAD.
@@ -944,17 +1115,19 @@ pub fn list_user_conversations(
         t.git_capture(&["update-ref", &local_ref, &head], None)?;
 
         let title_ref = conversation_title_ref(&id);
-        let title_hash = metadata
-            .get(&title_ref)
-            .ok_or_else(|| format!("conversation {id:?} has no title"))?;
-        let (kind, title) = t.get_object(title_hash)?;
-        if kind != "blob" {
-            return Err(format!(
-                "conversation title {title_hash} is a {kind}, not a blob"
-            ));
-        }
-        let title = String::from_utf8(title)
-            .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?;
+        let title = match metadata.get(&title_ref) {
+            Some(title_hash) => {
+                let (kind, title) = t.get_object(title_hash)?;
+                if kind != "blob" {
+                    return Err(format!(
+                        "conversation title {title_hash} is a {kind}, not a blob"
+                    ));
+                }
+                String::from_utf8(title)
+                    .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?
+            }
+            None => id.clone(),
+        };
         let updated_unix = t
             .git_capture(&["show", "-s", "--format=%ct", &head], None)?
             .trim()
@@ -1002,6 +1175,51 @@ pub fn conversation_replay(t: &GitTransport, name: &str) -> Result<ConversationR
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ConversationReplay { turns, turn_events })
+}
+
+/// Read the current worker-authored progress for an in-flight human turn.
+///
+/// Both observability refs can outlive the turn they described, so their
+/// contents are accepted only when the step chain/status blob is rooted at the
+/// supplied canonical human commit.
+pub fn conversation_live_state(
+    t: &GitTransport,
+    name: &str,
+    human: &str,
+) -> Result<ConversationLiveState, String> {
+    validated_refname(name)?;
+    let progress_ref = conv_ref(name, FROM_AGENT_CHANNEL);
+    let status_ref = conv_ref(name, STATUS_CHANNEL);
+    let refs = remote_refs(t, [progress_ref.clone(), status_ref.clone()])?;
+    let http = HttpTransport {
+        base: t.server_url()?,
+    };
+    let mut events = Vec::new();
+    if let Some(tip) = refs.get(&progress_ref) {
+        let mut printed = HashSet::new();
+        drain_steps(&http, tip, human, &mut printed, None, &mut |event| {
+            events.push(event)
+        })?;
+    }
+    let status = match refs.get(&status_ref) {
+        Some(tip) => {
+            let (kind, content) = http.get_object(tip)?;
+            if kind != "blob" {
+                None
+            } else {
+                let text = String::from_utf8_lossy(&content);
+                text.split_once('\n')
+                    .filter(|(root, _)| *root == human)
+                    .map(|(_, line)| line.trim_end().to_string())
+            }
+        }
+        None => None,
+    };
+    Ok(ConversationLiveState {
+        human: human.to_string(),
+        status,
+        events,
+    })
 }
 
 /// Diff the conversation's current workspace against the commit it started
@@ -1168,68 +1386,6 @@ fn turn(
         (None, None) => DEFAULT_SYSTEM.to_string(),
     };
 
-    // The human commit's parent: the conversation head, or — for a new
-    // conversation — the base commit (HEAD unless --base overrides).
-    let parent = match rev_parse_opt(t, refname)? {
-        Some(head) => head,
-        None => {
-            let rev = options.base.as_deref().unwrap_or("HEAD");
-            let base = t
-                .resolve_revspec(rev)?
-                .ok_or_else(|| format!("cannot resolve --base {rev:?}"))?
-                .to_string();
-            // `.caos` is the harness's reserved top-level workspace entry
-            // (step transcripts live there): refuse to start a conversation
-            // over a tree that already carries one.
-            if rev_parse_opt(t, &format!("{base}:.caos"))?.is_some() {
-                return Err(
-                    "the base commit's tree contains a top-level `.caos` entry, which \
-                     is reserved for the agent harness; start from a tree without one"
-                        .to_string(),
-                );
-            }
-            base
-        }
-    };
-
-    // The agent author name is the turn-walk marker; a human commit carrying it
-    // would corrupt every future transcript walk.
-    let ident = t
-        .git_capture(&["var", "GIT_AUTHOR_IDENT"], None)
-        .map_err(|e| format!("no git author identity (set user.name/user.email): {e}"))?;
-    if ident.split(" <").next().unwrap_or("").trim() == AGENT_AUTHOR {
-        return Err(format!(
-            "your git author name is {AGENT_AUTHOR:?}, which is reserved for agent commits; \
-             set a different user.name"
-        ));
-    }
-
-    // Mint the human turn: parent = head/base, message = the user's text,
-    // author = the user's git identity. The tree is the parent's (human turns
-    // are text-only) unless the client supplied one — a working-tree snapshot
-    // folded in by `/update-tree`, which must not carry the harness's reserved
-    // top-level `.caos` entry.
-    let tree = match human_tree {
-        Some(tree) => {
-            if rev_parse_opt(t, &format!("{tree}:.caos"))?.is_some() {
-                return Err(
-                    "the working tree contains a top-level `.caos` entry, which is reserved \
-                     for the agent harness; remove it before folding the tree into a turn"
-                        .to_string(),
-                );
-            }
-            tree.to_string()
-        }
-        None => t
-            .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
-            .trim()
-            .to_string(),
-    };
-    let human = t
-        .git_capture(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?
-        .trim()
-        .to_string();
-
     // The workers are resolved from the workspace's own declaration, and build
     // from source on demand.
     let phase = std::time::Instant::now();
@@ -1251,6 +1407,16 @@ fn turn(
                 t.ensure_pushed(&hash)?;
                 lines.push_str(&format!("{spec} {hash}\n"));
             }
+        }
+        // A fork is still an ordinary conversation commit. Snapshotting shared
+        // conversation heads here lets the existing merge worker consume one
+        // by its full ref name without adding a chat-specific merge endpoint.
+        let pattern = format!("{CONV_REF_PREFIX}*/{FROM_USER_CHANNEL}");
+        let mut conversations: Vec<(String, String)> =
+            remote_refs(t, [pattern])?.into_iter().collect();
+        conversations.sort_by(|a, b| a.0.cmp(&b.0));
+        for (refname, hash) in conversations {
+            lines.push_str(&format!("{refname} {hash}\n"));
         }
         lines
     };
@@ -1278,18 +1444,104 @@ fn turn(
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
 
-    // Build + push the request (this also pushes the human commit's closure —
-    // the `:commit=` machinery), then trigger the blocking compute on its own
-    // thread: request_compute needs only two strings, so the transport (and
-    // the repo handle) stay on this thread for progress polling.
+    let username = resolve_username(t, options.username.as_deref())?;
+    let author_config = format!("user.name={username}");
+    t.git_capture(&["-c", &author_config, "var", "GIT_AUTHOR_IDENT"], None)
+        .map_err(|e| format!("no git author identity (set user.email): {e}"))?;
+
+    // Build each candidate request before attempting the canonical ref update.
+    // Once the compare-and-swap succeeds, every object needed to start compute
+    // is already on the server and this client can trigger it immediately.
     let phase = std::time::Instant::now();
-    // Empty secret store: a turn is granted nothing, so neither is any tool it
-    // invokes. Not a decision — see design/secrets.md, "The agent harness
-    // carries no store": filling it is one call, but it makes every matching
-    // chat per-user keyed, which is a policy call.
-    let arg_tree = prepare_request(t, &llm, None, &[format!("--head:commit={human}")], &[])?;
+    let (human, arg_tree) = {
+        let mut races = 0;
+        loop {
+            let observed = remote_conversation_head(t, name)?;
+            let parent = match observed.as_deref() {
+                Some(head) => {
+                    t.fetch_object(head)?;
+                    let author = t
+                        .git_capture(&["show", "-s", "--format=%an", head], None)?
+                        .trim()
+                        .to_string();
+                    if author != AGENT_AUTHOR {
+                        emit(TurnEvent::Status(
+                            "another client already started this conversation turn".to_string(),
+                        ));
+                        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                        continue;
+                    }
+                    head.to_string()
+                }
+                None => {
+                    let rev = options.base.as_deref().unwrap_or("HEAD");
+                    let base = t
+                        .resolve_revspec(rev)?
+                        .ok_or_else(|| format!("cannot resolve --base {rev:?}"))?
+                        .to_string();
+                    if rev_parse_opt(t, &format!("{base}:.caos"))?.is_some() {
+                        return Err(
+                            "the base commit's tree contains a top-level `.caos` entry, which \
+                             is reserved for the agent harness; start from a tree without one"
+                                .to_string(),
+                        );
+                    }
+                    base
+                }
+            };
+
+            let tree = match human_tree {
+                Some(tree) => {
+                    if rev_parse_opt(t, &format!("{tree}:.caos"))?.is_some() {
+                        return Err(
+                            "the working tree contains a top-level `.caos` entry, which is reserved \
+                             for the agent harness; remove it before folding the tree into a turn"
+                                .to_string(),
+                        );
+                    }
+                    tree.to_string()
+                }
+                None => t
+                    .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
+                    .trim()
+                    .to_string(),
+            };
+            let human = t
+                .git_capture(
+                    &[
+                        "-c",
+                        &author_config,
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        &parent,
+                        "-m",
+                        message,
+                    ],
+                    None,
+                )?
+                .trim()
+                .to_string();
+            // Empty secret store: agent turns and their tool sub-runs are
+            // granted nothing (SPEC "The agent harness carries no store").
+            let arg_tree =
+                prepare_request(t, &llm, None, &[format!("--head:commit={human}")], &[])?;
+            if push_conversation_head_cas(t, refname, observed.as_deref(), &human)? {
+                // Local refs are caches. A concurrent watcher may write the
+                // same value, so failure here cannot undo accepted remote work.
+                let _ = t.git_capture(&["update-ref", refname, &human], None);
+                break (human, arg_tree);
+            }
+            races += 1;
+            if races >= 32 {
+                return Err(format!(
+                    "conversation {name:?} kept advancing while appending the message"
+                ));
+            }
+        }
+    };
     emit(TurnEvent::PhaseComplete {
-        label: "pushing the turn".to_string(),
+        label: "accepting the turn".to_string(),
         elapsed_secs: phase.elapsed().as_secs_f64(),
     });
     emit(TurnEvent::PhaseStarted(TurnPhase::Model));
@@ -1298,6 +1550,12 @@ fn turn(
         let (server, arg_tree) = (server.clone(), arg_tree);
         std::thread::spawn(move || request_compute(&server, &arg_tree, ""))
     };
+    // "Accepted" is user-visible only after the request thread has handed the
+    // already-published work to the server. Closing the TUI after this event
+    // can drop the response connection, but not the server's running worker.
+    emit(TurnEvent::Accepted {
+        commit: human.clone(),
+    });
 
     // While the run blocks, follow the worker's per-step progress ref and
     // print each new step (assistant text + one-line tool calls); alongside
@@ -1333,11 +1591,13 @@ fn turn(
     let (kind, turn_hash) = match outcome {
         Ok(result) => result,
         Err(e) => {
-            // Show whatever steps did land before the failure, then fail; the
-            // conversation ref is untouched (the human commit is harmlessly
-            // orphaned — see design/agent-harness.md).
+            // Show whatever steps landed before the failure. The accepted
+            // human commit remains canonical so another client can see the
+            // failure instead of silently losing submitted text.
             let _ = poll_progress(t, &http, &progress_ref, &human, &mut printed, emit);
-            return Err(format!("turn failed; {refname} was not advanced.\n{e}"));
+            return Err(format!(
+                "turn failed after its user message was accepted.\n{e}"
+            ));
         }
     };
     if kind != "commit" {
@@ -1368,6 +1628,18 @@ fn turn(
         }
     }
 
+    // New workers advance the remote ref themselves before returning, which is
+    // what makes completion independent of this client's lifetime. Retain a
+    // guarded client-side completion for mixed deployments and lost worker
+    // push responses; it is a no-op when the worker already won.
+    if !push_conversation_head_cas(t, refname, Some(&human), &turn_hash)? {
+        let observed = remote_conversation_head(t, name)?;
+        if observed.as_deref() != Some(&turn_hash) {
+            return Err(format!(
+                "conversation {name:?} advanced away from accepted turn {human} before completion"
+            ));
+        }
+    }
     t.git_capture(&["update-ref", refname, &turn_hash], None)?;
     let text = t.git_capture(&["show", "-s", "--format=%B", &turn_hash], None)?;
     let short = t
@@ -1700,16 +1972,16 @@ fn history_from_head(
 ) -> Result<(Vec<ConversationTurn>, String), String> {
     let mut turns = Vec::new();
     let mut cur = head.to_string();
-    let mut prev_was_agent = false;
+    let mut expected_agent: Option<bool> = None;
     loop {
         let author = t
             .git_capture(&["show", "-s", "--format=%an", &cur], None)?
             .trim()
             .to_string();
         let is_agent = author == AGENT_AUTHOR;
-        if !is_agent && !prev_was_agent {
+        if expected_agent.is_some_and(|expected| expected != is_agent) {
             turns.reverse();
-            return Ok((turns, cur)); // the base commit — conversation starts above it
+            return Ok((turns, cur)); // role mismatch marks the base below the conversation
         }
         let short = t
             .git_capture(&["rev-parse", "--short", &cur], None)?
@@ -1735,7 +2007,7 @@ fn history_from_head(
                 "conversation rooted at {cur} has no distinct base commit"
             ));
         };
-        prev_was_agent = is_agent;
+        expected_agent = Some(!is_agent);
         cur = parent;
     }
 }
@@ -1805,6 +2077,80 @@ mod tests {
         assert!(validated_refname("bad name").is_err());
         assert!(validate_conversation_user("nishadsingh").is_ok());
         assert!(validate_conversation_user("bad user").is_err());
+    }
+
+    #[test]
+    fn usernames_are_explicit_or_fall_back_to_git_user_name() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        assert_eq!(resolve_username(&transport, None).unwrap(), "tester");
+        assert_eq!(
+            resolve_username(&transport, Some("  Alice Smith  ")).unwrap(),
+            "Alice Smith"
+        );
+        assert!(resolve_username(&transport, Some("Alice\nBob")).is_err());
+        assert!(resolve_username(&transport, Some(AGENT_AUTHOR)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_accepted_human_head_is_replayable_while_the_agent_runs() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let human = git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Alice",
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                "please make the change",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "update-ref",
+                "refs/caos/conversations/live/from-user",
+                &human,
+            ],
+        );
+
+        let history = conversation_history(&transport, "live").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, ConversationRole::Human);
+        assert_eq!(history[0].author, "Alice");
+        assert_eq!(history[0].message, "please make the change");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_head_updates_use_compare_and_swap() {
+        let (root, repo) = conversation_repo();
+        let transport = GitTransport::discover(&repo).unwrap();
+        publish_user_conversation(&transport, "alice", "first", "First").unwrap();
+        let refname = conversation_head_ref("first");
+        let old = remote_conversation_head(&transport, "first")
+            .unwrap()
+            .unwrap();
+        let tree = git(&repo, &["rev-parse", &format!("{old}^{{tree}}")]);
+        let winner = git(&repo, &["commit-tree", &tree, "-p", &old, "-m", "winner"]);
+        assert!(push_conversation_head_cas(&transport, &refname, Some(&old), &winner).unwrap());
+
+        let loser = git(&repo, &["commit-tree", &tree, "-p", &old, "-m", "loser"]);
+        assert!(!push_conversation_head_cas(&transport, &refname, Some(&old), &loser).unwrap());
+        assert_eq!(
+            remote_conversation_head(&transport, "first")
+                .unwrap()
+                .as_deref(),
+            Some(winner.as_str())
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

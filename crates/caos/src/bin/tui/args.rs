@@ -5,6 +5,7 @@ use caos::chat::TurnOptions;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Args {
     pub(crate) user: String,
+    pub(crate) username: Option<String>,
     pub(crate) list_archived: bool,
     pub(crate) unarchive: Option<String>,
     pub(crate) conversation: Option<String>,
@@ -35,6 +36,7 @@ impl Args {
             };
             match arg.as_str() {
                 "--user" => user_flag = Some(value(&mut args, arg)?),
+                "--username" => parsed.username = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
                 "-c" | "--conversation" => parsed.conversation = Some(value(&mut args, arg)?),
@@ -67,6 +69,7 @@ impl Args {
             parsed.new_conversation = true;
             parsed.turn.base = Some(from.clone());
         }
+        parsed.turn.username = parsed.username.clone();
         if parsed.list_archived && parsed.unarchive.is_some() {
             return Err("--list-archived and --unarchive are mutually exclusive".to_string());
         }
@@ -86,8 +89,8 @@ impl Args {
 }
 
 pub(crate) fn usage() -> String {
-    "usage: caos tui [--user <id>] [--list-archived | --unarchive <conversation-id>] \
-     [--new | --from <commit>] [--base <revspec>] \
+    "usage: caos tui [--user <id>] [--username <name>] [-c <conversation-id>] \
+     [--list-archived | --unarchive <conversation-id>] [--new | --from <commit>] [--base <revspec>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
         .to_string()
 }
@@ -102,11 +105,18 @@ mod tests {
         assert_eq!(default.user, "alice");
 
         let explicit = Args::parse_with_default_user(
-            &["--user".to_string(), "bob".to_string()],
+            &[
+                "--user".to_string(),
+                "bob".to_string(),
+                "--username".to_string(),
+                "Bob Smith".to_string(),
+            ],
             Some("alice".to_string()),
         )
         .unwrap();
         assert_eq!(explicit.user, "bob");
+        assert_eq!(explicit.username.as_deref(), Some("Bob Smith"));
+        assert_eq!(explicit.turn.username.as_deref(), Some("Bob Smith"));
 
         let no_ambient =
             Args::parse_with_default_user(&["--user".to_string(), "bob".to_string()], None)

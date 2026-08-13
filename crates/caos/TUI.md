@@ -36,6 +36,8 @@ you to check the running service and the `caos` git remote.
 ```text
 caos tui                  continue the most recent conversation
 caos tui --user alice     use alice's active conversation list
+caos tui --username Alice label Alice's user messages (defaults to Git user.name)
+caos tui -c ID            open or join the shared conversation ID
 caos tui --new            start a fresh conversation
 caos tui --from 5ec3751   branch from a completed turn
 caos tui --list-archived  list archived conversation IDs and titles
@@ -46,6 +48,19 @@ caos tui --unarchive ID   restore one conversation to the active list
 CAOS server under `refs/caos/users/<user>/conversations/{active,archived}/`,
 not in local TUI state. Existing local conversation refs are imported the first
 time that user opens the TUI.
+
+Conversation content is shared independently of those per-user lists. A TUI
+polls the canonical conversation head and its live progress/status refs twice a
+second, so two clients on the same CAOS remote see one another's accepted user
+messages, agent activity, and completed turns without manual reloads. Passing
+`-c ID` adds an existing remote conversation to the current user's active list.
+
+A submitted user message is pushed to the canonical ref before agent compute
+starts. The remote worker compare-and-swap advances that ref when it finishes,
+so closing the submitting TUI does not abandon server-side work. A client that
+sees a user-authored canonical head follows the existing work instead of
+launching it again. Each user entry is labeled with `--username`, falling back
+to Git's `user.name`.
 
 ## Controls
 

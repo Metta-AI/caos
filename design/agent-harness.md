@@ -247,6 +247,13 @@ errors), the minted steps are orphaned but still reachable via the progress
 ref; a retry restarts from the human commit today, but the ref head is a
 valid conversation state a future resume could start from.
 
+The canonical `from-user` ref is the durable handoff. A client first pushes
+the human commit with a compare-and-swap update, then starts `/run`; the worker
+compare-and-swap advances that exact commit to the completed agent turn before
+returning its result. Thus the server-side run can finish after every TUI has
+closed, and another client following the refs observes both the accepted
+message and its eventual completion without relaunching the turn.
+
 **In-round status** (finer than the step): the API call is the one slow,
 silent part of a turn — a toolless turn mints no step until it's over, and a
 rate-limited round sleeps invisibly. So the worker also force-updates
@@ -341,9 +348,11 @@ ordinary git commit (any author *except* `caos-agent` — enforced) whose
 message is the user's text, first parent the previous turn (or the base),
 tree the parent's tree (human turns are text-only for now); the run is
 `llm-step` with `--head:commit=<that commit>` plus the curried config above
-(the `:commit=` machinery pushes the commit's closure). While the run blocks
+(the `:commit=` machinery pushes the commit's closure). The client first
+compare-and-swap appends that human commit to the remote canonical ref. While
+the run blocks
 — on its own thread; `/run` returns `commit <hash>` directly — the client
-polls the progress ref every 2s (`ls-remote` for the tip, the `/object` API
+polls the progress ref every 500ms (`ls-remote` for the tip, the `/object` API
 for the step commits, so nothing mid-turn lands in the local repo) and prints
 each new step's text blocks and `$ <cmd>` tool-call lines; a chain that roots
 at some other human commit is a stale ref and prints nothing. On success the
@@ -352,9 +361,10 @@ negotiated with the human commit as the sole tip, so the pack is this turn's
 new objects — a no-negotiation fetch re-downloads the base's entire history
 every turn, ~10s of index-pack CPU on a large repo, while a full multi-ref
 negotiation can go multi-round, which the smart-HTTP delegate has been seen
-to break on) and the ref advances; on failure the error prints and the ref
-is untouched —
-the human commit is harmlessly orphaned. `tests/chat-online` runs one tiny real-API
+to break on). The worker advances the shared ref before returning; the client
+retains a guarded completion update for mixed deployments and caches the final
+tip locally. On failure the accepted human commit remains visible on the
+shared ref. `tests/chat-online` runs one tiny real-API
 turn as part of the regular suite (self-skipped unless `ANTHROPIC_API_KEY` is
 set — the only check the scripted stub can't make).
 

@@ -197,7 +197,7 @@ fn usage(args: &[String]) -> String {
          {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
-         {prog} tui [--new | --from <commit>] [options]\n  \
+         {prog} tui [-c <conversation>] [--username <name>] [--new | --from <commit>] [options]\n  \
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [options]\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \

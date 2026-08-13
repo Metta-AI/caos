@@ -114,6 +114,7 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --api-key=test-key --system:@=system.txt \
   --model=test-model \
   --base-url="http://$stub_host:$port" --conversation="$conv")
+git push --quiet caos "$human1:refs/caos/conversations/$conv/from-user"
 "$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"

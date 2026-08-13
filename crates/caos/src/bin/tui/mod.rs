@@ -31,6 +31,7 @@ use args::{usage, Args};
 
 const TICK: Duration = Duration::from_millis(50);
 const ANIMATION_TICK: Duration = Duration::from_millis(250);
+const REMOTE_POLL_TICK: Duration = Duration::from_millis(500);
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -41,6 +42,7 @@ fn run_app(
         .map_err(|error| format!("drawing terminal: {error}"))?;
     app.capture_screen(terminal.current_buffer_mut());
     let mut next_animation = Instant::now() + ANIMATION_TICK;
+    let mut next_remote_poll = Instant::now();
     while !app.should_quit() {
         // Selection lock deliberately freezes the frame: background turn messages
         // remain queued so redraws cannot invalidate a native terminal
@@ -51,6 +53,10 @@ fn run_app(
             app.drain_messages()
         };
         let now = Instant::now();
+        if !app.selection_locked() && now >= next_remote_poll {
+            app.poll_remote();
+            next_remote_poll = now + REMOTE_POLL_TICK;
+        }
         let animating = app.has_visible_animation();
         if !app.selection_locked() && animating && now >= next_animation {
             app.advance_animation();

@@ -9,6 +9,9 @@
 //!   force-updated around each API attempt (calling / retrying-in-Ns /
 //!   answered-in-Xs), so a slow round says *why* while nothing else moves.
 //!   The human hash lets a client ignore a previous turn's stale status.
+//! * `refs/caos/conversations/<name>/from-user` — compare-and-swap advanced
+//!   from the accepted human commit to the completed turn. Unlike the two
+//!   observability refs, this update is required for correctness.
 //!
 //! The worker image has no `git`, so this speaks just enough of the smart-HTTP
 //! receive-pack protocol directly: every object the ref needs is already on
@@ -17,8 +20,9 @@
 //! update plus the well-known *empty* packfile. The old value comes from the
 //! receive-pack ref advertisement, exactly as git's own push would learn it.
 //!
-//! Best-effort by design: both refs are observability, not correctness, so a
-//! failed push warns and moves on.
+//! The progress/status refs are best-effort observability. Completing
+//! `from-user` is correctness-critical and a failed compare-and-swap fails the
+//! worker instead of being hidden.
 
 /// The empty packfile: header (`PACK`, version 2, zero objects) plus its
 /// SHA-1 trailer — constant, since it has no contents.
@@ -54,6 +58,24 @@ pub fn status(conversation: Option<&str>, head: &str, text: &str) {
     }
 }
 
+/// Complete a remotely accepted turn. The canonical head must still be the
+/// exact human commit this worker was started for; otherwise this result must
+/// not overwrite whichever actor advanced it.
+pub fn complete(conversation: &str, human: &str, turn: &str) -> Result<(), String> {
+    let refname = format!("refs/caos/conversations/{conversation}/from-user");
+    let base = server_base()?;
+    match advertised(&base, &refname)? {
+        Some(current) if current == turn => Ok(()),
+        Some(current) if current == human => send_push(&base, &refname, human, turn),
+        Some(current) => Err(format!(
+            "conversation {conversation:?} moved from accepted turn {human} to {current}"
+        )),
+        None => Err(format!(
+            "conversation {conversation:?} lost its accepted turn ref before completion"
+        )),
+    }
+}
+
 /// Store `content` as a blob via the server's `/object` API, returning its
 /// hash (the same store the step objects go through).
 fn store_blob(content: &str) -> Result<String, String> {
@@ -85,12 +107,13 @@ fn server_base() -> Result<String, String> {
 
 fn try_push(refname: &str, new_hash: &str) -> Result<(), String> {
     let base = server_base()?;
-    let base = base.as_str();
-
     // Learn the ref's current value from the receive-pack advertisement — the
     // update must name it as `old` or the server rejects the push.
-    let old = advertised(base, refname)?.unwrap_or_else(|| ZERO_HASH.to_string());
+    let old = advertised(&base, refname)?.unwrap_or_else(|| ZERO_HASH.to_string());
+    send_push(&base, refname, &old, new_hash)
+}
 
+fn send_push(base: &str, refname: &str, old: &str, new_hash: &str) -> Result<(), String> {
     // One command pkt-line (with the capability list after NUL), flush, then
     // the empty pack — the objects are already server-side.
     let command = format!("{old} {new_hash} {refname}\0report-status");

@@ -485,11 +485,11 @@ fn llm_round(
     match stop.as_str() {
         "end_turn" => {
             let text = response_text(&blocks);
-            if prev == head_hash && sent_results.is_empty() {
+            let turn_hash = if prev == head_hash && sent_results.is_empty() {
                 // No tool calls anywhere in this turn: no steps — the turn
                 // commit's sole parent is the human turn, its tree unchanged.
                 let tree = cas_hash(ws)?;
-                write_commit_as(&tree, &[head_hash], &text, agent_now(), "/cas/out")?;
+                write_commit_as(&tree, &[head_hash], &text, agent_now(), "/cas/out")?
             } else {
                 // The turn used tools: mint a final step (so this round's
                 // blocks and the last tool results stay tree-reachable), then
@@ -502,7 +502,13 @@ fn llm_round(
                     &text,
                     agent_now(),
                     "/cas/out",
-                )?;
+                )?
+            };
+            if let Some(conversation) = &cfg.conversation {
+                // The worker, not the submitting TUI, owns completion. The
+                // guarded ref update happens before the result is returned, so
+                // closing every client cannot strand finished server work.
+                progress::complete(conversation, head_hash, &turn_hash)?;
             }
             Ok(())
         }

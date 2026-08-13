@@ -84,6 +84,7 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")
 
+git push --quiet caos "$human1:refs/caos/conversations/$conv/from-user"
 "$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
@@ -150,6 +151,9 @@ echo "  ok: refs/caos/conversations/$conv/from-agent = step3" >&2
 
 echo "== a second turn replays the first from the commit chain ==" >&2
 human2=$(mkcommit "$turn^{tree}" "and now?" "$turn")
+git push --quiet \
+  --force-with-lease="refs/caos/conversations/$conv/from-user:$turn" \
+  caos "$human2:refs/caos/conversations/$conv/from-user"
 "$CAOS_CLI" run "$llm" -- --head:commit="$human2" > turn2.commit
 turn2=$(git hash-object -t commit --stdin < turn2.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn2"

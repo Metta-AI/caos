@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
-    archive_user_conversation, conversation_replay, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, generate_conversation_title, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
-    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
-    UserConversationSummary, WorkspaceDiff,
+    archive_user_conversation, conversation_live_state, conversation_replay,
+    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
+    generate_conversation_title, index_user_conversation, join_user_conversation,
+    list_user_conversations, publish_unindexed_conversations, publish_user_conversation,
+    resolve_username, run_chat_turn, set_conversation_title, unarchive_user_conversation,
+    ConversationLiveState, ConversationReplay, ConversationRole, ToolSetDescription, TurnEvent,
+    TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary,
+    WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -100,6 +102,7 @@ enum EntryRole {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TranscriptEntry {
     role: EntryRole,
+    author: Option<String>,
     commit: Option<String>,
     text: String,
 }
@@ -833,6 +836,10 @@ struct ConversationState {
     command_error: Option<String>,
     publish_prompt: bool,
     running: bool,
+    owns_turn: bool,
+    /// The canonical remote human commit currently being processed. This is
+    /// discovered by polling as well as set locally when this TUI submits.
+    live_human: Option<String>,
     turn_phase: TurnPhase,
     publishing: bool,
     scroll: ScrollState,
@@ -861,6 +868,8 @@ impl ConversationState {
             command_error: None,
             publish_prompt: false,
             running: false,
+            owns_turn: false,
+            live_human: None,
             turn_phase: TurnPhase::System,
             publishing: false,
             scroll: ScrollState::default(),
@@ -895,6 +904,7 @@ impl ConversationState {
                             ConversationRole::Human => EntryRole::Human,
                             ConversationRole::Agent => EntryRole::Agent,
                         },
+                        author: (turn.role == ConversationRole::Human).then_some(turn.author),
                         commit: Some(turn.commit),
                         text: turn.message,
                     })
@@ -935,6 +945,7 @@ impl ConversationState {
         self.status.clear();
         self.transcript.push(TranscriptEntry {
             role: EntryRole::Notice,
+            author: None,
             commit: None,
             text: error.into(),
         });
@@ -946,6 +957,7 @@ impl ConversationState {
         self.status.clear();
         self.transcript.push(TranscriptEntry {
             role: EntryRole::Info,
+            author: None,
             commit: None,
             text: message.into(),
         });
@@ -1044,6 +1056,14 @@ enum UiMessage {
         conversation: String,
         result: Result<String, String>,
     },
+    RemotePolled(Result<Vec<RemoteConversation>, String>),
+}
+
+struct RemoteConversation {
+    summary: UserConversationSummary,
+    replay: ConversationReplay,
+    diff: WorkspaceDiff,
+    live: Option<ConversationLiveState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1187,6 +1207,7 @@ pub(crate) enum MouseAction {
 pub(crate) struct App {
     repo_dir: PathBuf,
     user: String,
+    username: String,
     conversations: Vec<ConversationState>,
     selected: usize,
     should_quit: bool,
@@ -1205,6 +1226,7 @@ pub(crate) struct App {
     focus: Focus,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
+    polling_remote: bool,
 }
 
 impl App {
@@ -1212,6 +1234,7 @@ impl App {
         // Fail before taking over the terminal if the repo or remote is invalid.
         let transport = GitTransport::from_cwd()?;
         let repo_dir = transport.work_dir().to_path_buf();
+        let username = resolve_username(&transport, args.username.as_deref())?;
         if let Some(from) = args.from_commit.clone() {
             let commit = transport
                 .resolve_revspec(&from)?
@@ -1243,6 +1266,10 @@ impl App {
                         &args.user,
                         UserConversationStatus::Active,
                     )?;
+                } else if let Some(joined) =
+                    join_user_conversation(&transport, &args.user, requested)?
+                {
+                    conversations.push(joined);
                 }
             }
         }
@@ -1297,6 +1324,7 @@ impl App {
         Ok(Self {
             repo_dir,
             user: args.user,
+            username,
             conversations: states,
             selected,
             should_quit: false,
@@ -1315,6 +1343,7 @@ impl App {
             focus: Focus::Conversation,
             tx,
             rx,
+            polling_remote: false,
         })
     }
 
@@ -1591,6 +1620,7 @@ impl App {
         };
         let should_generate_title =
             self.selected().automatic_title && !self.selected().generating_title;
+        let username = self.username.clone();
         {
             let state = self.selected_mut();
             state.apply_automatic_title(&message);
@@ -1599,6 +1629,7 @@ impl App {
             }
             state.transcript.push(TranscriptEntry {
                 role: EntryRole::Human,
+                author: Some(username),
                 commit: None,
                 text: message.clone(),
             });
@@ -1606,6 +1637,7 @@ impl App {
             state.activity_selection = None;
             state.activity_detail_scroll = 0;
             state.running = true;
+            state.owns_turn = true;
             state.sidebar_attention = None;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
@@ -1676,7 +1708,26 @@ impl App {
                     event,
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
+                        let accepted = matches!(event, TurnEvent::Accepted { .. });
                         self.on_turn_event(index, event);
+                        if accepted {
+                            let title = self.conversations[index].title.clone();
+                            let user = self.user.clone();
+                            if let Ok(transport) = self.transport() {
+                                if let Err(error) = index_user_conversation(
+                                    &transport,
+                                    &user,
+                                    &conversation,
+                                    &title,
+                                ) {
+                                    self.conversations[index].sidebar_attention =
+                                        Some("Failed to index conversation".to_string());
+                                    self.conversations[index].show_command_error(format!(
+                                        "saving the accepted conversation failed: {error}"
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 UiMessage::Failed {
@@ -1686,6 +1737,7 @@ impl App {
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.running = false;
+                        state.owns_turn = false;
                         state.status = "turn failed".to_string();
                         state.sidebar_attention = Some("Failed — open for details".to_string());
                         state.push_error(error);
@@ -1724,9 +1776,130 @@ impl App {
                         }
                     }
                 }
+                UiMessage::RemotePolled(result) => {
+                    self.polling_remote = false;
+                    if let Ok(conversations) = result {
+                        self.apply_remote_conversations(conversations);
+                    }
+                }
             }
         }
         changed
+    }
+
+    /// Start one nonblocking refresh of the user's remote conversation refs.
+    /// The event loop calls this frequently; overlapping polls are collapsed so
+    /// a slow network cannot build an unbounded queue of Git processes.
+    pub(crate) fn poll_remote(&mut self) {
+        if self.polling_remote {
+            return;
+        }
+        self.polling_remote = true;
+        let repo_dir = self.repo_dir.clone();
+        let user = self.user.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                let summaries =
+                    list_user_conversations(&transport, &user, UserConversationStatus::Active)?;
+                summaries
+                    .into_iter()
+                    .map(|summary| {
+                        let replay = conversation_replay(&transport, &summary.id)?;
+                        let diff = conversation_workspace_diff(&transport, &summary.id)?;
+                        let live = replay
+                            .turns
+                            .last()
+                            .filter(|turn| turn.role == ConversationRole::Human)
+                            .map(|turn| {
+                                conversation_live_state(&transport, &summary.id, &turn.commit)
+                            })
+                            .transpose()?;
+                        Ok(RemoteConversation {
+                            summary,
+                            replay,
+                            diff,
+                            live,
+                        })
+                    })
+                    .collect()
+            });
+            let _ = tx.send(UiMessage::RemotePolled(result));
+        });
+    }
+
+    fn apply_remote_conversations(&mut self, remote: Vec<RemoteConversation>) {
+        for item in remote {
+            let index = match self.conversation_index(&item.summary.id) {
+                Some(index) => index,
+                None => {
+                    self.conversations.push(ConversationState::new(
+                        item.summary.id.clone(),
+                        item.summary.title.clone(),
+                        self.selected().turn_options.clone(),
+                        "ready".to_string(),
+                    ));
+                    self.conversations.len() - 1
+                }
+            };
+            let state = &mut self.conversations[index];
+            let previous_head = state.current_hash().map(str::to_string);
+            let remote_head = item.summary.head.clone();
+            if previous_head.as_deref() != Some(remote_head.as_str()) {
+                state.note_transcript_append();
+            }
+            state.title = item.summary.title;
+            state.diff = Some(item.diff);
+            state.transcript = item
+                .replay
+                .turns
+                .into_iter()
+                .map(|turn| TranscriptEntry {
+                    role: match turn.role {
+                        ConversationRole::Human => EntryRole::Human,
+                        ConversationRole::Agent => EntryRole::Agent,
+                    },
+                    author: (turn.role == ConversationRole::Human).then_some(turn.author),
+                    commit: Some(turn.commit),
+                    text: turn.message,
+                })
+                .collect();
+
+            if let Some(live) = item.live {
+                state.live_human = Some(live.human);
+                state.running = true;
+                state.status = live.status.unwrap_or_else(|| "agent running".to_string());
+                state.activities = replayed_activities(&live.events);
+                for event in live.events {
+                    if let TurnEvent::AssistantText(text) = event {
+                        state.transcript.push(TranscriptEntry {
+                            role: EntryRole::Agent,
+                            author: None,
+                            commit: None,
+                            text,
+                        });
+                    }
+                }
+            } else {
+                state.live_human = None;
+                if !state.owns_turn {
+                    state.running = false;
+                }
+                state.activities = item
+                    .replay
+                    .turn_events
+                    .last()
+                    .map(|turn| replayed_activities(&turn.events))
+                    .unwrap_or_default();
+                if !state.running && !state.publishing {
+                    state.status = "ready".to_string();
+                    state.sidebar_attention = None;
+                }
+            }
+            state.activity_selection = state.activities.len().checked_sub(1);
+            state.activity_detail_scroll = 0;
+            state.transcript_selection = None;
+        }
     }
 
     fn conversation_index(&self, id: &str) -> Option<usize> {
@@ -1747,10 +1920,23 @@ impl App {
                 elapsed_secs,
             } => state.status = format!("{label}: {elapsed_secs:.1}s"),
             TurnEvent::Status(status) => state.status = status,
+            TurnEvent::Accepted { commit } => {
+                if let Some(entry) = state
+                    .transcript
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.role == EntryRole::Human && entry.commit.is_none())
+                {
+                    entry.commit = Some(commit.clone());
+                }
+                state.live_human = Some(commit);
+                state.status = "accepted; agent running".to_string();
+            }
             TurnEvent::AssistantText(text) => {
                 state.note_transcript_append();
                 state.transcript.push(TranscriptEntry {
                     role: EntryRole::Agent,
+                    author: None,
                     commit: None,
                     text,
                 });
@@ -1812,6 +1998,8 @@ impl App {
         let user = self.user.clone();
         let state = &mut self.conversations[index];
         state.running = false;
+        state.owns_turn = false;
+        state.live_human = None;
         state.sidebar_attention = None;
         state.status = format!("completed {}", outcome.short_commit);
         match transport {
@@ -1845,7 +2033,7 @@ impl App {
             Ok(title) => title,
             Err(_) => return,
         };
-        if state.current_hash().is_some() {
+        if state.current_hash().is_some() || state.live_human.is_some() {
             let Ok(transport) = transport else {
                 return;
             };
@@ -2767,6 +2955,7 @@ mod tests {
             App {
                 repo_dir: PathBuf::from("."),
                 user: "tester".to_string(),
+                username: "Test User".to_string(),
                 conversations,
                 selected: 0,
                 should_quit: false,
@@ -2785,6 +2974,7 @@ mod tests {
                 tx: tx.clone(),
                 rx,
                 palette: None,
+                polling_remote: false,
             },
             tx,
         )
@@ -3561,6 +3751,7 @@ mod tests {
         let mut conversation = state("talk-1");
         conversation.transcript.push(TranscriptEntry {
             role: EntryRole::Agent,
+            author: None,
             commit: None,
             text: (0..60)
                 .map(|line| format!("existing line {line}"))
@@ -3744,6 +3935,7 @@ mod tests {
         conversation.status = "calling model".to_string();
         conversation.transcript.push(TranscriptEntry {
             role: EntryRole::Agent,
+            author: None,
             commit: None,
             text: (0..60)
                 .map(|line| format!("line {line:02}"))
@@ -3815,6 +4007,46 @@ mod tests {
     }
 
     #[test]
+    fn remote_poll_results_make_another_clients_turn_live() {
+        let (mut app, _) = app_with(vec![state("shared")]);
+        let human = "a".repeat(40);
+        app.apply_remote_conversations(vec![RemoteConversation {
+            summary: UserConversationSummary {
+                id: "shared".to_string(),
+                title: "Shared task".to_string(),
+                head: human.clone(),
+                updated_unix: 1,
+            },
+            replay: ConversationReplay {
+                turns: vec![caos::chat::ConversationTurn {
+                    commit: human.clone(),
+                    short_commit: "aaaaaaa".to_string(),
+                    author: "Bob".to_string(),
+                    role: ConversationRole::Human,
+                    message: "make the second change".to_string(),
+                }],
+                turn_events: Vec::new(),
+            },
+            diff: WorkspaceDiff {
+                base_commit: "b".repeat(40),
+                head: human.clone(),
+                patch: String::new(),
+            },
+            live: Some(ConversationLiveState {
+                human: human.clone(),
+                status: Some("calling model".to_string()),
+                events: vec![TurnEvent::AssistantText("Working on it".to_string())],
+            }),
+        }]);
+
+        assert!(app.selected().running);
+        assert_eq!(app.selected().live_human.as_deref(), Some(human.as_str()));
+        assert_eq!(app.selected().transcript[0].author.as_deref(), Some("Bob"));
+        assert_eq!(app.selected().transcript[1].text, "Working on it");
+        assert_eq!(app.selected().status, "calling model");
+    }
+
+    #[test]
     fn live_activity_indicator_pulses_while_busy() {
         let mut conversation = state("talk-1");
         conversation.running = true;
@@ -3850,6 +4082,7 @@ mod tests {
         let mut selected = state("talk-1");
         selected.transcript.push(TranscriptEntry {
             role: EntryRole::Human,
+            author: None,
             commit: None,
             text: "hello".to_string(),
         });
@@ -3903,11 +4136,13 @@ mod tests {
         selected.transcript = vec![
             TranscriptEntry {
                 role: EntryRole::Human,
+                author: Some("Alice".to_string()),
                 commit: Some("a".repeat(40)),
                 text: "Please run the tests".to_string(),
             },
             TranscriptEntry {
                 role: EntryRole::Agent,
+                author: None,
                 commit: Some("b".repeat(40)),
                 text: "Running them now.".to_string(),
             },
@@ -3938,6 +4173,7 @@ mod tests {
         assert!(rendered.contains("review-api"));
         assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
+        assert!(rendered.contains("Alice  aaaaaaa"));
         assert!(rendered.contains("Please run the tests"));
         assert!(rendered.contains("Running…"));
         assert!(rendered.contains("$ cargo test"));
@@ -4049,6 +4285,7 @@ mod tests {
         let mut conversation = state("A concise title");
         conversation.transcript.push(TranscriptEntry {
             role: EntryRole::Agent,
+            author: None,
             commit: Some("b".repeat(40)),
             text: "done".to_string(),
         });
@@ -4123,6 +4360,7 @@ mod tests {
         let mut selected = state("markdown");
         selected.transcript.push(TranscriptEntry {
             role: EntryRole::Agent,
+            author: None,
             commit: None,
             text: "plain **bold** and _italic_".to_string(),
         });

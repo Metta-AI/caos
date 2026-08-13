@@ -8,10 +8,12 @@ Steer and cancel a running turn. Extends `agent-harness.md`; terms from there
 - **Done — refs + migration** (Stage 0 below): the four-ref scheme,
   `validated_refname` reservation, `list_conversations`, both migrations, and
   their unit tests, in `crates/caos/src/chat.rs` and
-  `crates/worker-llm-step/src/progress.rs`. Behaviour-preserving: the turn
-  lifecycle is unchanged — a turn still advances `from-user` (the renamed
-  conversation ref) only on success, to `M`. Nothing reads or advances
-  `from-user` mid-turn yet.
+  `crates/worker-llm-step/src/progress.rs`.
+- **Done — minimal multiplayer lifecycle**: a client compare-and-swap advances
+  `from-user` to `H` before launch, followers poll that ref plus progress and
+  status, and the worker compare-and-swap advances `H` to `M` on completion.
+  There is still only one message per turn; the interjection and cancellation
+  model below remains future work.
 - **Designed, not built** — everything mid-turn: interjection, step-as-merge,
   the `end_turn` re-check, cancellation, concurrent host edits. The **Client /
   Worker / Commits / Transcript / Cancellation** sections below are the TARGET
@@ -91,7 +93,8 @@ H ← S1 ← S2(⊕Hi1) ← S3(⊕Hi2) ← … ← M    (agent branch; M seals t
 - Interjection: mint the user commit, push, advance `from-user`.
 - Cancel: reset `from-user` — to the previous `M` (abandon) or a new `H'`
   (restart; new `GET /run`). A failed turn is an abandon.
-- Success: advance `from-user` to `M`.
+- Success: the worker CAS-advances `from-user` from this turn's user tip to
+  `M`; the client only refreshes its local cache.
 - Poll loop: watch `from-agent` + `status`; read stdin (interactive) / composer
   event (TUI) to interject.
 
