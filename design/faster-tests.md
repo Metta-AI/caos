@@ -1,7 +1,7 @@
 # Faster tests
 
 A salted full run (`CAOS_SALT=$(date --iso=s) caos-cli run-tool test`) is **~26s**
-against a warm stack — 31/31, `build` ~10s — from **103s**. The rest of this
+against a warm stack — 33/33, `build` ~10s — from **103s**. The rest of this
 document is how that was found, including the parts that were wrong, because
 the things that mattered were not on anyone's list and most of the things on
 the list were not measurable.
@@ -13,6 +13,12 @@ to 6.5s, then profiling the test phase found the one that mattered — 29
 identical image conversions per run — and took a real source edit from 54-99s
 to 32.5s. Measured spread at the end of it: 24.8-31.8s over five consecutive
 runs, so treat anything under a couple of seconds here as noise.
+
+A fourth pass ("The longest test", below) went after the tail — chat-offline,
+which was the whole `tests` phase on its own. It halved the longest test and
+moved the total by nothing, because by then the total was not the tail's to
+move. That is the section worth reading if you are about to optimise this
+suite again.
 
 ## Read the timeline, not the total
 
@@ -155,6 +161,85 @@ ordering.
   Reverted rather than kept on the strength of the argument.
 - **Resolver options** (`ndots:0`, `single-request`, `timeout:1`, `no-aaaa`):
   all still ~1012ms. Only an address, or `curl -4`, avoids the stall.
+
+## The longest test: chat-offline, and what splitting it did not buy
+
+After the three passes above, `tests` was 12s and **chat-offline was 12s of it**
+— the next test was 5s. One test WAS the phase, so it looked like the obvious
+last win.
+
+It is not one slow thing. chat-offline drives the whole agent loop end to end,
+seven times in a row: turn 1 with a bash sub-run, turn 2 on stdin, `talk`
+sticky, `talk --new`, the inline file-tool batch, the mixed inline/bash queue,
+and the grep fold. The LLM is the stub and answers in 0.0s, so essentially none
+of it is the model. Warm, alone, ~8s:
+
+| | |
+|---|---|
+| setup (fetch the stub, start the stub) | 1.30s |
+| 7 turns of client-side work | ~2.6s |
+| 7 turns of server-side job execution | ~4.1s |
+
+Per turn, from the client's own phase events: `resolving the workers` 0.19s,
+`pushing the turn` 0.08s, `the run` 0.30-0.93s, `fetching the turn` 0.08s. The
+run time tracks job count exactly — ~15 jobs across the test, one per LLM round
+plus one per bash/grep sub-run, at **~0.27s each**. That per-job figure is the
+platform's floor, and a test that needs fifteen jobs pays it fifteen times.
+
+**Two ways to see this that did not exist before.** The client already timed
+every turn phase and then threw the numbers away — `run_cli_turn` prints a
+`PhaseComplete` only above 1.0s, and every phase here is under it. Dropping
+that threshold is a one-character edit and is how the table above was measured;
+`the run` itself was not timed at all and now is. On the test side, `seconds` in
+a record is one number for a dozen round trips, so tests/chat-* carry a
+`stage()` clock that stamps `[+Nms]` into the record. Reach for those two before
+re-instrumenting anything.
+
+### The two things that were actually waste
+
+**`std/llm-stub`'s build result was 45 MB to carry a 6 MB stub.**
+worker-cargo's flat path staged *every* executable in the profile dir — but
+that dir is the image's BAKED one, so each `--cmd=build` result also carried
+all ten caos binaries, ~39 MB nobody asked for. The decomposed path already got
+this right (`stage_fresh_binaries`, mtime >= job start); the flat path now does
+the same. Fetching the stub: **735ms -> ~25ms**, and every `--cmd=build` result
+tree-wide shrinks, including the ones rustc consumes.
+
+**A flat `sleep 0.5` waiting for the stub to bind**, in all four stub tests,
+when it binds in a few ms. Now a `/dev/tcp` probe, which also distinguishes
+"died, retry another port" from "still coming up". Setup, with both: **1.30s ->
+0.20s**.
+
+### The split, and the honest result
+
+The rest is fifteen serial jobs, irreducible in place, so chat-offline became
+three tests the fan-out can run at once — `chat-offline` (the `chat` verb),
+`chat-talk` (the `talk` verb, seeding its own two-turn history), `chat-tools`
+(inline / mixed / grep, which chain onto each other's trees and so stay
+together). It did what it was supposed to:
+
+| | before | after |
+|---|---|---|
+| longest chat test, in the suite | 12s | 7s |
+| longest chat test, alone | 8s | 3-4s |
+| the `tests` phase | 12s | 12-14s |
+| a full `CAOS_SALT` run | ~26s | 23.6s |
+
+**The phase did not move, and that is the finding.** The suite stopped being
+critical-path-bound the moment chat-offline stopped being the tail. Sum the
+per-test seconds of a salted run and you get **56s across a 14s span** —
+effective concurrency ~4, against 8 slots — with the longest single test now
+caos-tools at 7s. Neither the tail (7s) nor the slot arithmetic (56/8 = 7s)
+accounts for a 14s span; the missing half is per-job SETUP, which `seconds`
+excludes by construction (run-test.sh starts its clock once the stack is in
+hand) and which two more jobs made two units worse.
+
+So the split is kept on its merits — `--only=chat-offline` is 3s instead of 8s,
+which is what you actually iterate against, and the tail is no longer one test
+— but **it is not a suite win, and predicting one from "chat-offline is 12s of
+a 12s phase" was wrong.** The next real win is per-job setup across 33 jobs,
+not any single test. Measure the span against the sum before splitting anything
+else: when they differ by 2x, the tail is not the problem.
 
 ## What it cost to get there
 
@@ -375,8 +460,8 @@ one server it is routine, so it must be fixed FIRST.
 **`CAOS_STUB_HOST` breaks.** `run-test.sh` sets it to `127.0.0.1` because
 "siblings share this container's netns, so localhost is the stub's address".
 With a shared stack, A's runnerd launches workers into A's netns, not the test's,
-so every stub-server test (chat-offline, llm-step, caos-tools, merge-harness,
-llm-call) loses its stub. The test container has its own `caos-net` address, so
+so every stub-server test (chat-offline, chat-talk, chat-tools, llm-step,
+caos-tools, merge-harness, llm-call, max-tokens) loses its stub. The test container has its own `caos-net` address, so
 the fix is for the stub to bind `0.0.0.0` and `CAOS_STUB_HOST` to be that
 address — but it is not free, and it will present as a mystery failure if it is
 not done up front.

@@ -25,8 +25,18 @@ for _ in 1 2 3 4 5; do
   port=$((20000 + RANDOM % 20000))
   "$stub_bin" "0.0.0.0:$port" "$PWD/stub" 2>stub/log &
   stub_pid=$!
-  sleep 0.5
-  kill -0 "$stub_pid" 2>/dev/null && break
+  # Wait for the LISTENER, not for a fixed interval: a flat `sleep 0.5` here
+  # was half a second of a test whose whole body is a few seconds, and the stub
+  # binds in a few ms. Probing the port also tells the two failures apart — a
+  # dead process (retry on another port) against one still coming up.
+  ready=0
+  for _ in {1..400}; do
+    if ! kill -0 "$stub_pid" 2>/dev/null; then break; fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=1; break; fi
+    sleep 0.005
+  done
+  if [ "$ready" = 1 ]; then break; fi
+  kill "$stub_pid" 2>/dev/null || true
   stub_pid=""
 done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"

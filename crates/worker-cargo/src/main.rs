@@ -156,6 +156,10 @@ fn flat(cmd: &str) -> Result<(), String> {
         ws
     };
 
+    // Read BEFORE cargo runs: stage_binaries tells this build's executables
+    // from the bake's by mtime, and the reference point has to predate the
+    // link it is meant to catch.
+    let started = std::time::SystemTime::now();
     let out = run_cargo(&argv, &ws)?;
     let exit = exit_code(&out.status);
 
@@ -164,7 +168,7 @@ fn flat(cmd: &str) -> Result<(), String> {
     fs::write(res.join("stdout"), tail(&out.stdout)).map_err(|e| format!("writing stdout: {e}"))?;
     fs::write(res.join("stderr"), tail(&out.stderr)).map_err(|e| format!("writing stderr: {e}"))?;
     if cmd == "build" && exit == 0 {
-        stage_binaries(target.as_deref(), &profile, &res)?;
+        stage_binaries(target.as_deref(), &profile, started, &res)?;
     }
     caos(["put", path(&res), "/cas/out"])
 }
@@ -235,11 +239,25 @@ pub(crate) fn run_cargo(argv: &[&str], ws: &str) -> Result<std::process::Output,
     cmd.output().map_err(|e| format!("running cargo: {e}"))
 }
 
-/// Stage the build's executables into `res/bin/<name>` — what a
+/// Stage the executables THIS build linked into `res/bin/<name>` — what a
 /// worker-producing caller (rustc) is after. Cargo places a workspace's final
 /// binaries directly in the profile dir (`target[/<triple>]/<debug|release>`);
 /// everything else there (deps/, build/, .fingerprint/, *.d) is intermediate.
-fn stage_binaries(target: Option<&str>, profile: &str, res: &Path) -> Result<(), String> {
+///
+/// The profile dir is the image's BAKED one, so it already holds the bake's own
+/// executables — every caos binary, ~39 MB of them. Staging the directory
+/// wholesale put all of that in every `--cmd=build` result: `std/llm-stub`'s
+/// was 45 MB to carry one 6 MB stub, fetched in full by each of the four llm
+/// tests. Select by mtime, exactly as the decomposed path's
+/// `stage_fresh_binaries` does and for the same reason — a path-set delta
+/// cannot see a relink over a baked dummy, but a binary linked by this job
+/// carries an mtime after the job started while baked ones sit at store epoch.
+fn stage_binaries(
+    target: Option<&str>,
+    profile: &str,
+    started: std::time::SystemTime,
+    res: &Path,
+) -> Result<(), String> {
     let mut dir = target_dir()?;
     if let Some(t) = target {
         dir = dir.join(t);
@@ -251,7 +269,8 @@ fn stage_binaries(target: Option<&str>, profile: &str, res: &Path) -> Result<(),
     let mut bins = Vec::new();
     for entry in entries(path(&dir))? {
         let meta = fs::metadata(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
-        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+        let fresh = meta.modified().map(|m| m >= started).unwrap_or(false);
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 && fresh {
             bins.push(entry);
         }
     }
