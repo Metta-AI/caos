@@ -700,6 +700,15 @@
                 docker load -i "$image"
                 docker tag "$name:latest" "$src_tag"
               fi
+              # ALWAYS re-point `:latest`, which is the tag `docker run` names.
+              # The sentinel says the image is PRESENT, never that `:latest`
+              # still points at it: any other load of this repo moves that tag —
+              # a second checkout, an older `caosd`, a `docker load` by hand —
+              # and then the skip above runs the WRONG image, silently. That is
+              # not hypothetical: it left a stack running a `serve` from before
+              # the core-seeder-runner existed, so every seeded key fell through
+              # to the generic runner and died pulling `seeded:latest`.
+              docker tag "$src_tag" "$name:latest"
             }
 
             die() { # <message>
