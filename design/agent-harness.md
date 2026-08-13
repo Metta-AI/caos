@@ -115,7 +115,12 @@ messages; a toolless turn as its message text), POSTs `/v1/messages`, then:
   tool_result `is_error`. No dispatcher worker — the step worker knows each
   tool's image. Parallel map-then execution of read-only tools is a later
   optimization.
-- Any other `stop_reason` (`max_tokens`, refusal, …) → the run errors with a
+- `stop_reason: max_tokens` (the response was truncated at the per-round
+  output cap) → the round is **continued**: the partial assistant content is
+  appended as a prefill and the model is asked to resume, its blocks
+  accumulating into the one round. Continuations are bounded; only if the
+  response never converges within the budget does the turn fail.
+- Any other `stop_reason` (refusal, …) → the run errors with a
   clear message; the turn fails (prototype behavior).
 
 Tool classes:

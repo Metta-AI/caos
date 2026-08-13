@@ -119,7 +119,7 @@ echo "== the stub saw exact replays and single tool_result messages ==" >&2
 grep -qF '"messages":[{"content":"create out.txt containing hi, then confirm","role":"user"}]' \
   stub/request-1.json || fail "round 1 messages wrong"
 grep -qF '"model":"test-model"' stub/request-1.json || fail "model not sent"
-grep -qF '"max_tokens":16000' stub/request-1.json || fail "max_tokens not sent"
+grep -qF '"max_tokens":64000' stub/request-1.json || fail "max_tokens not sent"
 grep -qF '"thinking":{"type":"adaptive"}' stub/request-1.json || fail "thinking not sent"
 grep -qF '"cache_control":{"type":"ephemeral"}' stub/request-1.json || fail "cache_control not sent"
 grep -qF '"name":"bash"' stub/request-1.json || fail "bash tool not registered"

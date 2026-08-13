@@ -56,6 +56,17 @@ const AGENT_AUTHOR: &str = "caos-agent";
 const STEP_DIR: &str = ".caos";
 const STEP_FILE: &str = "step.json";
 
+/// The per-round output-token cap sent to the API. A single response is
+/// unlikely to need this much; when one does, `stop_reason: "max_tokens"`
+/// truncates it and we continue (see `llm_round`).
+const MAX_TOKENS: u64 = 64000;
+
+/// How many times a single round may be continued after a `max_tokens`
+/// truncation before the turn gives up. Each continuation prefills the partial
+/// response and asks the model to resume, so the bound caps a pathological
+/// loop (a model that never stops) at `MAX_CONTINUATIONS + 1` API calls.
+const MAX_CONTINUATIONS: u32 = 8;
+
 fn main() -> std::process::ExitCode {
     run_worker("llm-step", run)
 }
@@ -449,7 +460,7 @@ fn llm_round(
 ) -> Result<(), String> {
     let body = json!({
         "model": cfg.model,
-        "max_tokens": 16000,
+        "max_tokens": MAX_TOKENS,
         // Constrains model choice: adaptive thinking needs a 4.6+ model
         // (haiku-4-5 rejects it with a 400). Deliberately unconditional —
         // sniffing per-model capabilities here would rot.
@@ -463,19 +474,51 @@ fn llm_round(
     // call is the one silent, slow part of a turn, so say what it's doing —
     // and, via the retry callback, why it's waiting.
     let status = |text: &str| progress::status(cfg.conversation.as_deref(), head_hash, text);
-    status(&format!("calling {}…", cfg.model));
-    let started = std::time::Instant::now();
-    let resp = post_messages(&cfg.base_url, &cfg.api_key, &body, &status)?;
-    status(&format!(
-        "{} answered in {:.1}s",
-        cfg.model,
-        started.elapsed().as_secs_f64()
-    ));
-    let stop = resp["stop_reason"].as_str().unwrap_or("").to_string();
-    let blocks = resp["content"]
-        .as_array()
-        .cloned()
-        .ok_or("API response has no content array")?;
+
+    // A single logical round can span several API calls. When a response ends
+    // with stop_reason "max_tokens" it was truncated mid-generation; rather
+    // than fail the turn, we append the partial assistant content as a prefill
+    // and ask the model to resume (the API concatenates trailing assistant
+    // messages), accumulating every round's blocks into one. Only end_turn and
+    // tool_use end the loop; exhausting the continuation budget falls through
+    // to the stop-reason match below, which still fails the turn.
+    let mut messages = messages;
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut stop;
+    let mut continuation = 0u32;
+    loop {
+        if continuation == 0 {
+            status(&format!("calling {}…", cfg.model));
+        } else {
+            status(&format!(
+                "{} hit the {MAX_TOKENS}-token cap; continuing ({continuation}/{MAX_CONTINUATIONS})…",
+                cfg.model
+            ));
+        }
+        let mut body = body.clone();
+        body["messages"] = Value::Array(messages.clone());
+        let started = std::time::Instant::now();
+        let resp = post_messages(&cfg.base_url, &cfg.api_key, &body, &status)?;
+        status(&format!(
+            "{} answered in {:.1}s",
+            cfg.model,
+            started.elapsed().as_secs_f64()
+        ));
+        stop = resp["stop_reason"].as_str().unwrap_or("").to_string();
+        let round_blocks = resp["content"]
+            .as_array()
+            .cloned()
+            .ok_or("API response has no content array")?;
+        blocks.extend(round_blocks.iter().cloned());
+        if stop == "max_tokens" && continuation < MAX_CONTINUATIONS {
+            // Prefill the next call with the partial content so the model
+            // picks up where it stopped.
+            messages.push(message("assistant", Value::Array(round_blocks)));
+            continuation += 1;
+            continue;
+        }
+        break;
+    }
     let tool_uses: Vec<Value> = blocks
         .iter()
         .filter(|b| b["type"] == "tool_use")
@@ -521,6 +564,10 @@ fn llm_round(
                 Vec::new(),
             )
         }
+        "max_tokens" => Err(format!(
+            "LLM round still hit stop_reason \"max_tokens\" after {MAX_CONTINUATIONS} \
+             continuation(s); the response would not converge and the turn fails here"
+        )),
         other => Err(format!(
             "LLM round ended with stop_reason {other:?} (only end_turn and tool_use \
              are handled; the turn fails here by design for now)"

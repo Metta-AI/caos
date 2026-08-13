@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
+# set, INSIDE a test stack — the suite's per-test job (tests/lib/run-test.sh).
+#
+# max_tokens continuation (design/agent-harness.md): when a round ends with
+# stop_reason "max_tokens" the harness does NOT fail the turn — it appends the
+# partial assistant content as a prefill and asks the model to resume,
+# accumulating every partial into the one logical round. This drives a scripted
+# stub through TWO truncations before an end_turn and asserts (a) the turn
+# advanced, (b) its message is the concatenation of all three partials, and
+# (c) each continuation request replayed the running prefill verbatim.
+set -euo pipefail
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
+mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
+  local tree=$1 msg=$2 parent=${3:-}
+  git -c user.email=test@caos -c user.name=caos \
+    commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg"
+}
+
+echo "== stage the worker binaries and fixtures ==" >&2
+cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
+cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
+stub_bin=$CAOS_BIN_DIR/llm-stub
+
+mkdir -p ws
+echo "hello" > ws/greeting.txt
+echo "You are a coding agent operating on a git workspace." > system.txt
+commit "workspace + worker binaries"
+
+base=$(mkcommit "HEAD:ws" "base")
+human1=$(mkcommit "HEAD:ws" "write me a long answer" "$base")
+
+echo "== script the stub: two truncations, then end_turn ==" >&2
+# response_text joins text blocks with a blank line, so the turn message is the
+# three partials joined by "\n\n".
+P1='[{"text":"Part one.","type":"text"}]'
+P2='[{"text":"Part two.","type":"text"}]'
+P3='[{"text":"Part three.","type":"text"}]'
+mkdir stub
+printf '{"content":%s,"stop_reason":"max_tokens"}' "$P1" > stub/response-1.json
+printf '{"content":%s,"stop_reason":"max_tokens"}' "$P2" > stub/response-2.json
+printf '{"content":%s,"stop_reason":"end_turn"}'   "$P3" > stub/response-3.json
+
+stub_pid=""
+for _ in 1 2 3 4 5; do
+  port=$((20000 + RANDOM % 20000))
+  "$stub_bin" "0.0.0.0:$port" "$PWD/stub" 2>stub/log &
+  stub_pid=$!
+  sleep 0.5
+  kill -0 "$stub_pid" 2>/dev/null && break
+  stub_pid=""
+done
+[ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
+trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
+
+echo "== curry the workers and run the turn ==" >&2
+conv="conv-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
+stub_host=${CAOS_STUB_HOST:-host.containers.internal}
+llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
+  --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
+  --model=test-model --base-url="http://$stub_host:$port" \
+  --conversation="$conv")
+
+"$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
+turn=$(git hash-object -t commit --stdin < turn.commit)
+git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
+
+echo "== the turn advanced and concatenated the three partials ==" >&2
+[ "$(git rev-parse "$turn^")" = "$human1" ] || fail "turn's first parent is not the human turn"
+git rev-parse -q --verify "$turn^2" >/dev/null && fail "a toolless turn should have one parent"
+[ "$(git show -s --format=%an "$turn")" = "caos-agent" ] || fail "turn author"
+want=$(printf 'Part one.\n\nPart two.\n\nPart three.')
+[ "$(git show -s --format=%B "$turn")" = "$want" ] \
+  || fail "turn message is not the concatenation of the three partials"
+[ "$(git rev-parse "$turn^{tree}")" = "$(git rev-parse "$human1^{tree}")" ] \
+  || fail "toolless turn changed the tree"
+echo "  ok: single-parent turn, message = the three partials joined" >&2
+
+echo "== each continuation replayed the running prefill verbatim ==" >&2
+grep -qF '"max_tokens":64000' stub/request-1.json || fail "max_tokens not sent"
+grep -qF '{"content":"write me a long answer","role":"user"}]' stub/request-1.json \
+  || fail "round 1 user message wrong"
+# Request 2 (first continuation) ends with round 1's partial prefilled.
+grep -qF "\"content\":$P1,\"role\":\"assistant\"}]" stub/request-2.json \
+  || fail "round-1 partial not prefilled as the trailing assistant message in request 2"
+# Request 3 (second continuation) carries BOTH prior partials as prefill.
+grep -qF "\"content\":$P1,\"role\":\"assistant\"}" stub/request-3.json \
+  || fail "round-1 partial missing from request 3"
+grep -qF "\"content\":$P2,\"role\":\"assistant\"}]" stub/request-3.json \
+  || fail "round-2 partial not the trailing assistant message in request 3"
+[ ! -f stub/request-4.json ] || fail "unexpected fourth request (turn should have ended)"
+echo "  ok: two continuations, each prefilling the accumulated response" >&2
+
+echo "== the progress ref advanced to the turn's step-free tip ==" >&2
+# A toolless turn mints no steps, so from-agent is never pushed; the turn
+# commit itself is the run's result and the ref the client advances.
+[ -s turn.commit ] || fail "no turn commit emitted"
+echo "  ok: turn commit emitted as the run result" >&2
+
+echo "max-tokens: ALL PASS" >&2
