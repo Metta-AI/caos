@@ -1615,9 +1615,9 @@ impl App {
     }
 
     fn start_turn(&mut self) {
-        if self.selected().is_busy() {
+        if self.selected().publishing {
             self.selected_mut()
-                .show_command_error("this conversation already has an operation running");
+                .show_command_error("finish publishing before sending another message");
             return;
         }
         let Some(raw) = self.selected_mut().composer.take_message() else {
@@ -4488,7 +4488,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_prompt_uses_the_command_panel_instead_of_a_chat_entry() {
+    fn active_turn_accepts_an_interjection() {
         let mut conversation = state("talk-1");
         conversation.running = true;
         conversation.composer.insert_str("another prompt");
@@ -4496,23 +4496,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
-        assert!(app.selected().transcript.is_empty());
-        assert_eq!(
-            app.selected().command_error.as_deref(),
-            Some("this conversation already has an operation running")
-        );
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Command error"));
-        assert!(rendered.contains("this conversation already has an operation running"));
+        assert_eq!(app.selected().transcript.len(), 1);
+        assert_eq!(app.selected().transcript[0].role, EntryRole::Human);
+        assert_eq!(app.selected().transcript[0].text, "another prompt");
+        assert!(app.selected().command_error.is_none());
     }
 
     #[test]
