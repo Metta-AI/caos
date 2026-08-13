@@ -810,8 +810,8 @@ const COMMANDS: [Command; 7] = [
     },
     Command {
         name: "/invite",
-        usage: "/invite <username>",
-        description: "add this conversation to another user's sidebar",
+        usage: "/invite <user>",
+        description: "add this conversation to another user's sidebar (case-sensitive)",
         action: CommandAction::Invite,
         takes_argument: true,
     },
@@ -1727,16 +1727,16 @@ impl App {
         }
     }
 
-    fn invite_selected(&mut self, username: &str) {
+    fn invite_selected(&mut self, user: &str) {
         let id = self.selected().id.clone();
         let title = self.selected().title.clone();
         match self
             .transport()
-            .and_then(|transport| invite_user_to_conversation(&transport, username, &id, &title))
+            .and_then(|transport| invite_user_to_conversation(&transport, user, &id, &title))
         {
-            Ok(()) => self
-                .selected_mut()
-                .push_info(format!("Invited {username} to this conversation.")),
+            Ok(()) => self.selected_mut().push_info(format!(
+                "Invited user {user}. Their TUI must use exactly `--username {user}`."
+            )),
             Err(error) => self.selected_mut().show_command_error(error),
         }
     }
@@ -3621,6 +3621,18 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
+        let header = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .take(100)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let selection_end = header
+            .find("copy-anywhere")
+            .map(|column| column + "copy-anywhere".len() - 1)
+            .unwrap() as u16;
         app.capture_screen(terminal.backend().buffer());
         let area = Rect::new(0, 0, 100, 30);
         let mouse = |kind, column| MouseEvent {
@@ -3635,10 +3647,16 @@ mod tests {
             MouseAction::Redraw
         );
         assert_eq!(
-            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20), area),
+            app.handle_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), selection_end),
+                area
+            ),
             MouseAction::Redraw
         );
-        let copied = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 20), area);
+        let copied = app.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), selection_end),
+            area,
+        );
 
         assert!(
             matches!(copied, MouseAction::Copy(ref text) if text.contains("caos") && text.contains("copy-anywhere"))
@@ -4229,6 +4247,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(header.contains("caos"));
+        assert!(header.contains("user tester"));
         assert!(header.contains("A concise title"));
         assert!(header.contains("head bbbbbbb"));
         assert!(!header.contains("idle"));
