@@ -8,7 +8,9 @@
 //! disappear after submit returns without owning unfinished conversation
 //! state.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -32,6 +34,120 @@ pub struct TurnOptions {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub username: Option<String>,
+}
+
+/// Structured progress retained for the full-screen TUI. Durable calls and
+/// results are reconstructed from the v2 event spine; phase/status entries are
+/// transient presentation hints.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TurnEvent {
+    PhaseStarted(TurnPhase),
+    PhaseComplete {
+        label: String,
+        elapsed_secs: f64,
+    },
+    Status(String),
+    AssistantText(String),
+    ToolCall {
+        step_commit: String,
+        tool_use_id: String,
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        step_commit: String,
+        tool_use_id: String,
+        is_error: bool,
+        content: String,
+    },
+    Completed(TurnOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnPhase {
+    System,
+    Model,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnOutcome {
+    pub conversation: String,
+    pub commit: String,
+    pub short_commit: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationRole {
+    Human,
+    Agent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub commit: String,
+    pub short_commit: String,
+    pub author: String,
+    pub role: ConversationRole,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationTurnEvents {
+    pub turn_commit: String,
+    pub events: Vec<TurnEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationReplay {
+    pub turns: Vec<ConversationTurn>,
+    pub turn_events: Vec<ConversationTurnEvents>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserConversationSummary {
+    pub id: String,
+    pub title: String,
+    pub head: String,
+    pub updated_unix: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserConversationStatus {
+    Active,
+    Archived,
+}
+
+impl UserConversationStatus {
+    fn ref_component(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceDiff {
+    pub base_commit: String,
+    pub head: String,
+    pub patch: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolDescription {
+    pub name: String,
+    pub docs: String,
+    pub image: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolSetDescription {
+    pub source: String,
+    pub tools: Vec<ToolDescription>,
+}
+
+fn short_hash(hash: &str) -> &str {
+    &hash[..hash.len().min(8)]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +304,7 @@ pub fn submit_message(
     id: &str,
     message: &str,
 ) -> Result<Option<String>, String> {
-    submit_message_inner(t, options, id, message, false)
+    submit_message_inner(t, options, id, message, false, None)
 }
 
 /// Submit the first message for `--new`, failing instead of joining a
@@ -199,7 +315,23 @@ pub fn submit_new_message(
     id: &str,
     message: &str,
 ) -> Result<Option<String>, String> {
-    submit_message_inner(t, options, id, message, true)
+    submit_message_inner(t, options, id, message, true, None)
+}
+
+/// TUI-only variant used by `/update-tree`: attach the submitted user event to
+/// an explicitly prepared workspace tree while keeping the same durable/CAS
+/// admission path as an ordinary message.
+pub fn submit_message_with_tree(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    tree: &str,
+) -> Result<Option<String>, String> {
+    validate_hash(tree, "submitted workspace tree")?;
+    t.git_capture(&["cat-file", "-e", &format!("{tree}^{{tree}}")], None)?;
+    t.ensure_pushed(tree)?;
+    submit_message_inner(t, options, id, message, false, Some(tree))
 }
 
 fn submit_message_inner(
@@ -208,6 +340,7 @@ fn submit_message_inner(
     id: &str,
     message: &str,
     require_absent: bool,
+    tree_override: Option<&str>,
 ) -> Result<Option<String>, String> {
     let refname = conversation_ref(id)?;
     if message.trim().is_empty() {
@@ -231,10 +364,13 @@ fn submit_message_inner(
             }
             None => resolve_base(t, options)?,
         };
-        let tree = t
-            .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
-            .trim()
-            .to_string();
+        let tree = match tree_override {
+            Some(tree) => tree.to_string(),
+            None => t
+                .git_capture(&["rev-parse", &format!("{parent}^{{tree}}")], None)?
+                .trim()
+                .to_string(),
+        };
         if observed.is_none()
             && t.git_capture(
                 &["rev-parse", "--verify", "--quiet", &format!("{tree}:.caos")],
@@ -380,6 +516,548 @@ pub fn resume_request(t: &GitTransport, request: &str) -> Result<(), String> {
     validate_hash(request, "request")?;
     let server = t.server_url()?;
     request_compute(&server, request, "").map(|_| ())
+}
+
+const USER_INDEX_PREFIX: &str = "refs/caos/users/";
+
+fn user_key(user: &str) -> Result<String, String> {
+    let user = user.trim();
+    if user.is_empty() || user.chars().any(char::is_control) {
+        return Err(
+            "conversation username must be nonempty and contain no control characters".into(),
+        );
+    }
+    Ok(format!(
+        "u-{}",
+        user.as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn user_conversation_ref(
+    user: &str,
+    status: UserConversationStatus,
+    id: &str,
+) -> Result<String, String> {
+    conversation_ref(id)?;
+    Ok(format!(
+        "{USER_INDEX_PREFIX}{}/conversations/{}/{}",
+        user_key(user)?,
+        status.ref_component(),
+        id
+    ))
+}
+
+fn conversation_title_ref(id: &str) -> Result<String, String> {
+    conversation_ref(id)?;
+    Ok(format!("{CONVERSATION_PREFIX}{id}/title"))
+}
+
+fn remote_refs(
+    t: &GitTransport,
+    patterns: impl IntoIterator<Item = String>,
+) -> Result<HashMap<String, String>, String> {
+    let mut args = vec![
+        "ls-remote".to_string(),
+        "--refs".to_string(),
+        CAOS_REMOTE.to_string(),
+    ];
+    args.extend(patterns);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = t.git_capture(&refs, None)?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let (hash, refname) = line.split_once('\t')?;
+            Some((refname.to_string(), hash.to_string()))
+        })
+        .collect())
+}
+
+/// Ensure a canonical v2 conversation is visible in one user's sidebar.
+/// Sidebar/title refs are presentation indexes only; the canonical head stays
+/// the sole conversation authority.
+pub fn publish_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+) -> Result<(), String> {
+    let head = conversation_head(t, id)?
+        .ok_or_else(|| format!("cannot publish conversation {id:?} before its first turn"))?;
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("conversation title must not be empty".to_string());
+    }
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    t.ensure_pushed(&title_hash)?;
+    let head_ref = conversation_ref(id)?;
+    let title_ref = conversation_title_ref(id)?;
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    t.git_capture(
+        &[
+            "push",
+            "--quiet",
+            "--atomic",
+            CAOS_REMOTE,
+            &format!("{head}:{head_ref}"),
+            &format!("+{title_hash}:{title_ref}"),
+            &format!("+{head}:{active_ref}"),
+        ],
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("publishing conversation {id:?}: {error}"))
+}
+
+pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("conversation title must not be empty".to_string());
+    }
+    let hash = t.put_object("blob", title.as_bytes())?.to_string();
+    t.ensure_pushed(&hash)?;
+    let title_ref = conversation_title_ref(id)?;
+    t.git_capture(
+        &[
+            "push",
+            "--quiet",
+            CAOS_REMOTE,
+            &format!("+{hash}:{title_ref}"),
+        ],
+        None,
+    )
+    .map(|_| ())
+}
+
+fn move_user_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    from: UserConversationStatus,
+    to: UserConversationStatus,
+) -> Result<(), String> {
+    let from_ref = user_conversation_ref(user, from, id)?;
+    let to_ref = user_conversation_ref(user, to, id)?;
+    let refs = remote_refs(t, [from_ref.clone(), to_ref.clone()])?;
+    match (refs.get(&from_ref), refs.get(&to_ref)) {
+        (None, Some(_)) => Ok(()),
+        (None, None) => Err(format!(
+            "conversation {id:?} is not {}",
+            from.ref_component()
+        )),
+        (Some(_), Some(_)) => Err(format!("conversation {id:?} is both active and archived")),
+        (Some(hash), None) => t
+            .git_capture(
+                &[
+                    "push",
+                    "--quiet",
+                    "--atomic",
+                    CAOS_REMOTE,
+                    &format!("{hash}:{to_ref}"),
+                    &format!(":{from_ref}"),
+                ],
+                None,
+            )
+            .map(|_| ()),
+    }
+}
+
+pub fn archive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+    move_user_conversation(
+        t,
+        user,
+        id,
+        UserConversationStatus::Active,
+        UserConversationStatus::Archived,
+    )
+}
+
+pub fn unarchive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+    move_user_conversation(
+        t,
+        user,
+        id,
+        UserConversationStatus::Archived,
+        UserConversationStatus::Active,
+    )
+}
+
+/// Add every canonical conversation not already classified by this user to
+/// their active sidebar. This is also how an already-open second TUI discovers
+/// a conversation created by the first.
+pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(), String> {
+    let key = user_key(user)?;
+    let prefix = format!("{USER_INDEX_PREFIX}{key}/conversations/");
+    let indexed = remote_refs(
+        t,
+        [format!("{prefix}active/*"), format!("{prefix}archived/*")],
+    )?;
+    let indexed_ids = indexed
+        .keys()
+        .filter_map(|refname| refname.rsplit('/').next().map(str::to_string))
+        .collect::<HashSet<_>>();
+    let title_refs = remote_refs(t, [format!("{CONVERSATION_PREFIX}*/title")])?;
+    for (id, head) in remote_conversations(t)? {
+        if indexed_ids.contains(&id) {
+            continue;
+        }
+        let active_ref = user_conversation_ref(user, UserConversationStatus::Active, &id)?;
+        let mut updates = vec![format!("{head}:{active_ref}")];
+        let title_ref = conversation_title_ref(&id)?;
+        if !title_refs.contains_key(&title_ref) {
+            let snapshot = conversation_snapshot(t, &id)?
+                .ok_or_else(|| format!("conversation {id:?} disappeared while indexing it"))?;
+            let title_hash = t.put_object("blob", snapshot.title.as_bytes())?.to_string();
+            t.ensure_pushed(&title_hash)?;
+            updates.push(format!("+{title_hash}:{title_ref}"));
+        }
+        let mut args = vec!["push", "--quiet", "--atomic", CAOS_REMOTE];
+        args.extend(updates.iter().map(String::as_str));
+        t.git_capture(&args, None)?;
+    }
+    Ok(())
+}
+
+pub fn list_user_conversations(
+    t: &GitTransport,
+    user: &str,
+    status: UserConversationStatus,
+) -> Result<Vec<UserConversationSummary>, String> {
+    let key = user_key(user)?;
+    let prefix = format!(
+        "{USER_INDEX_PREFIX}{key}/conversations/{}/",
+        status.ref_component()
+    );
+    let state = remote_refs(t, [format!("{prefix}*")])?;
+    let canonical = remote_conversations(t)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let titles = remote_refs(t, [format!("{CONVERSATION_PREFIX}*/title")])?;
+    let mut conversations = Vec::new();
+    for refname in state.keys() {
+        let Some(id) = refname.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(head) = canonical.get(id) else {
+            continue;
+        };
+        let title_ref = conversation_title_ref(id)?;
+        let title = if let Some(hash) = titles.get(&title_ref) {
+            let (kind, bytes) = t.get_object(hash)?;
+            if kind != "blob" {
+                return Err(format!("conversation title {hash} is a {kind}, not a blob"));
+            }
+            String::from_utf8(bytes)
+                .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?
+        } else {
+            id.to_string()
+        };
+        conversations.push(UserConversationSummary {
+            id: id.to_string(),
+            title,
+            head: head.clone(),
+            updated_unix: remote_commit_timestamp(t, head)?,
+        });
+    }
+    conversations.sort_by(|a, b| {
+        b.updated_unix
+            .cmp(&a.updated_unix)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    Ok(conversations)
+}
+
+pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let names = names.into_iter().collect::<HashSet<_>>();
+    for number in 1_u64.. {
+        let candidate = format!("{AUTO_NAME_PREFIX}{number}");
+        if !names.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("the integer conversation-name space is not finite")
+}
+
+fn durable_conversation_events(
+    t: &GitTransport,
+    id: &str,
+) -> Result<(Vec<StoredEvent>, String, String), String> {
+    let snapshot =
+        conversation_snapshot(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    let mut newest_first = Vec::new();
+    let mut current = snapshot.head.clone();
+    loop {
+        let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
+        let value = serde_json::from_str::<Value>(message.trim()).ok();
+        if value
+            .as_ref()
+            .and_then(|value| value.get("v"))
+            .and_then(Value::as_u64)
+            != Some(EVENT_VERSION)
+        {
+            newest_first.reverse();
+            return Ok((newest_first, current, snapshot.head));
+        }
+        newest_first.push(StoredEvent {
+            commit: current.clone(),
+            value: value.expect("checked above"),
+        });
+        current = t
+            .git_capture(&["rev-parse", &format!("{current}^1")], None)?
+            .trim()
+            .to_string();
+    }
+}
+
+fn value_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
+}
+
+fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
+    let mut events = Vec::new();
+    if let Some(calls) = event.value.get("calls").and_then(Value::as_array) {
+        for call in calls {
+            let id = call.get("id").and_then(Value::as_str).unwrap_or("tool");
+            let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let args = call.get("args").cloned().unwrap_or(Value::Null);
+            events.push(TurnEvent::ToolCall {
+                step_commit: event.commit.clone(),
+                tool_use_id: id.to_string(),
+                name: name.to_string(),
+                summary: format!("{name} {}", value_text(&args)),
+            });
+        }
+    }
+    if let Some(result) = event.value.get("result") {
+        events.push(TurnEvent::ToolResult {
+            step_commit: event.commit.clone(),
+            tool_use_id: result
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_string(),
+            is_error: result
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            content: result.get("content").map(value_text).unwrap_or_default(),
+        });
+    }
+    events
+}
+
+pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationReplay, String> {
+    let (events, _base, head) = durable_conversation_events(t, id)?;
+    let mut turns = Vec::new();
+    let mut activity = Vec::new();
+    for event in &events {
+        activity.extend(durable_turn_events(event));
+        let Some(content) = event.value.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let author = event
+            .value
+            .get("author")
+            .and_then(Value::as_str)
+            .unwrap_or("assistant");
+        let role = if matches!(author, "user" | "human") {
+            ConversationRole::Human
+        } else {
+            ConversationRole::Agent
+        };
+        let display_author = event
+            .value
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or(author)
+            .to_string();
+        turns.push(ConversationTurn {
+            commit: event.commit.clone(),
+            short_commit: short_hash(&event.commit).to_string(),
+            author: display_author,
+            role,
+            message: content.to_string(),
+        });
+    }
+    Ok(ConversationReplay {
+        turns,
+        turn_events: (!activity.is_empty())
+            .then_some(ConversationTurnEvents {
+                turn_commit: head,
+                events: activity,
+            })
+            .into_iter()
+            .collect(),
+    })
+}
+
+pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<WorkspaceDiff, String> {
+    let (_events, base_commit, head) = durable_conversation_events(t, id)?;
+    let patch = t.git_capture(
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            &base_commit,
+            &head,
+            "--",
+            ".",
+            ":(exclude).caos",
+        ],
+        None,
+    )?;
+    Ok(WorkspaceDiff {
+        base_commit,
+        head,
+        patch,
+    })
+}
+
+/// Run/admit one v2 turn while retaining the old TUI's progress callback.
+/// Durable transcript/activity is read by the TUI's remote poller; this method
+/// emits only transient phase and status hints, avoiding duplicate rows.
+pub fn run_chat_turn(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    human_tree: Option<&str>,
+    mut emit: impl FnMut(TurnEvent),
+) -> Result<TurnOutcome, String> {
+    emit(TurnEvent::PhaseStarted(TurnPhase::System));
+    emit(TurnEvent::Status("saving message".to_string()));
+    let submitted = match human_tree {
+        Some(tree) => submit_message_with_tree(t, options, id, message, tree)?,
+        None => submit_message(t, options, id, message)?,
+    };
+    let started = Instant::now();
+    let mut request_result = None;
+    if let Some(queued_head) = submitted {
+        let request = prepare_queued_request(t, options, id, &queued_head)?;
+        emit(TurnEvent::PhaseComplete {
+            label: "Prepared".to_string(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+        });
+        emit(TurnEvent::PhaseStarted(TurnPhase::Model));
+        emit(TurnEvent::Status("waiting for agent".to_string()));
+        let server = t.server_url()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = request_compute(&server, &request, "").map(|_| ());
+            let _ = tx.send(result);
+        });
+        request_result = Some(rx);
+    } else {
+        emit(TurnEvent::PhaseStarted(TurnPhase::Model));
+        emit(TurnEvent::Status("joined active turn".to_string()));
+    }
+
+    let mut last_head = String::new();
+    loop {
+        let snapshot = conversation_snapshot(t, id)?
+            .ok_or_else(|| format!("conversation {id:?} disappeared"))?;
+        if snapshot.head != last_head {
+            last_head = snapshot.head.clone();
+            emit(TurnEvent::Status(match snapshot.status.as_str() {
+                "queued" => "queued".to_string(),
+                "running" => "agent running".to_string(),
+                other => other.to_string(),
+            }));
+        }
+        match snapshot.status.as_str() {
+            "idle" => {
+                return Ok(TurnOutcome {
+                    conversation: id.to_string(),
+                    short_commit: short_hash(&snapshot.head).to_string(),
+                    commit: snapshot.head,
+                })
+            }
+            "failed" | "canceled" => {
+                return Err(format!("conversation request ended {}", snapshot.status))
+            }
+            _ => {}
+        }
+        if let Some(rx) = &request_result {
+            match rx.try_recv() {
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(())) => request_result = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("agent request watcher disconnected".to_string())
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+pub fn generate_conversation_title(
+    _t: &GitTransport,
+    _options: &TurnOptions,
+    first_message: &str,
+) -> Result<String, String> {
+    Ok(default_title(first_message))
+}
+
+pub fn describe_tool_set(
+    t: &GitTransport,
+    id: &str,
+    options: &TurnOptions,
+) -> Result<ToolSetDescription, String> {
+    let source = match conversation_snapshot(t, id)? {
+        Some(snapshot) => format!("{}:caos-tools", snapshot.head),
+        None => format!("{}:caos-tools", options.base.as_deref().unwrap_or("HEAD")),
+    };
+    let listing = match t.git_capture(&["ls-tree", &source], None) {
+        Ok(listing) => listing,
+        Err(_) => {
+            return Ok(ToolSetDescription {
+                source,
+                tools: Vec::new(),
+            })
+        }
+    };
+    let mut tools = Vec::new();
+    for line in listing.lines() {
+        let Some((metadata, filename)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(name) = filename.strip_suffix(".sh") else {
+            continue;
+        };
+        if ["bash", "grep", "read", "ls", "write", "edit"].contains(&name) {
+            continue;
+        }
+        let Some(hash) = metadata.split_whitespace().nth(2) else {
+            continue;
+        };
+        let script = t.git_capture(&["show", hash], None)?;
+        let docs = script
+            .lines()
+            .filter_map(|line| line.strip_prefix("#@doc").map(str::trim))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tools.push(ToolDescription {
+            name: name.to_string(),
+            docs: if docs.is_empty() {
+                format!("Project tool caos-tools/{filename}")
+            } else {
+                docs
+            },
+            image: "project".to_string(),
+        });
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ToolSetDescription { source, tools })
 }
 
 fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
