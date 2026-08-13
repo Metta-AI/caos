@@ -12,6 +12,8 @@
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result, optionally emitting this invocation to an open
 //!   trace stream.
+//! * `GET /run-async?req=<hash>` — ensure that same run is progressing on a
+//!   server-owned thread and return `request <hash>` without waiting for it.
 //! * `GET /trace/<id>/stream` — follow one live invocation as chunked NDJSON.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
@@ -199,6 +201,20 @@ fn main() {
     // git's own side only; the in-process gix writes are `storage`'s to sync.
     git(&["-C", &git_dir, "config", "core.fsync", "objects,reference"]);
     git(&["-C", &git_dir, "config", "core.fsyncMethod", "batch"]);
+    // Conversation history has one authoritative, append-only ref. Keep its
+    // previous values as a second recovery path if the tip is damaged despite
+    // the fsync policy above. `always` is required because these refs live
+    // outside refs/heads; the ordinary bare-repository default does not log
+    // them. Never expire the recovery trail behind an active conversation.
+    git(&["-C", &git_dir, "config", "core.logAllRefUpdates", "always"]);
+    git(&["-C", &git_dir, "config", "gc.reflogExpire", "never"]);
+    git(&[
+        "-C",
+        &git_dir,
+        "config",
+        "gc.reflogExpireUnreachable",
+        "never",
+    ]);
 
     // Clear what a previous crash left behind BEFORE opening the repo: gix
     // answers "is this object stored?" for a loose object with a path-exists
@@ -256,7 +272,7 @@ fn main() {
     for request in server.incoming_requests() {
         let config = Arc::clone(&config);
         std::thread::spawn(move || {
-            if let Err(err) = handle(&config, request) {
+            if let Err(err) = handle(config, request) {
                 // Only reachable if writing the response itself fails.
                 eprintln!("failed to send response: {err}");
             }
@@ -300,12 +316,12 @@ impl From<std::io::Error> for HttpError {
 }
 
 /// Dispatch a single request and send its response.
-fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
+fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     // Git smart-HTTP (the `caos` remote) is served by a separate CGI delegate that
     // sets its own status/headers, so it bypasses the `route` -> `from_data` path.
     let path = request.url().split('?').next().unwrap_or("").to_string();
     if git::is_git_path(&path) {
-        return git::serve(config, request);
+        return git::serve(&config, request);
     }
     // The WORLD guard (design/test-stack-image.md): a caos client built for
     // the other world must not drive this stack. The dangerous crossing is
@@ -355,7 +371,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
         }
     }
 
-    match route(config, &mut request) {
+    match route(&config, &mut request) {
         Ok(body) => request.respond(Response::from_data(body)),
         Err(err) => request.respond(
             Response::from_string(format!("{}\n", err.message))
@@ -367,7 +383,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
 /// Match the request to a handler and produce the response body. Serves the
 /// storage endpoints (`/object*`), compute (`/run`), and the runner protocol
 /// (`/runner/poll`, `/runner/result`).
-fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
+fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpError> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -385,6 +401,17 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
             compute::run(config, &query, &secrets_header)
+        }
+        Method::Get if path == "/run-async" => {
+            // Same ephemeral context as `/run`. The background thread owns the
+            // parsed copy after this request has returned.
+            let secrets_header = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(secrets::HEADER))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap_or_default();
+            compute::run_async(Arc::clone(config), query, secrets_header)
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),

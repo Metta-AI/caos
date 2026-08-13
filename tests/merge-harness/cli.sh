@@ -1,52 +1,40 @@
 #!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a test stack — the suite's per-test job (tests/lib/run-test.sh).
-#
-# The `merge` tool driven THROUGH the agent harness (SPEC "Merging and conflict
-# resolution"), with a scripted stub for the LLM (like tests/llm-step): a turn
-# whose one tool call is `merge --theirs=feature`. Asserts the whole stage-3
-# wiring — the ref snapshot resolves `feature`, the git-bearing worker runs, its
-# two-parent M becomes the workspace, and (the crux) `theirs` is REACHABLE from
-# the turn commit, so the merge is a real merge in the conversation DAG.
+# The merge tool through a v2 conversation. The canonical event head, rather
+# than the llm-step result object, must retain the real merge ancestry.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 gc() { git -c user.email=test@caos -c user.name=caos "$@"; }
-commit() { gc add -A && gc commit -qm "$1"; }
-mkcommit() { # <tree> <message> [parent...] -> a commit minted with plain git
-  local tree=$1 msg=$2; shift 2
-  local ps=(); for p in "$@"; do ps+=(-p "$p"); done
-  gc commit-tree "$tree" "${ps[@]}" -m "$msg"
+mkcommit() { # <tree> <message> [parent...] -> commit
+  local tree=$1 message=$2
+  shift 2
+  local parents=() parent
+  for parent in "$@"; do parents+=(-p "$parent"); done
+  gc commit-tree "$tree" "${parents[@]}" -m "$message"
 }
 
-echo "== stage bins and the workspace ==" >&2
-# The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
-# the executable is at bin/<name>. Copied out because materialized CAS content
-# is read-only and owner-only — exec straight from /cas is "Permission denied".
-"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
+echo "== workspace, feature, and scripted model ==" >&2
+"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry \
+  || fail "resolving llm-stub"
 stub_bin=/tmp/llm-stub-bin
 install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
 
-# base workspace: one file. The human turn is text-only, so `ours` == base.
-mkdir -p ws
+mkdir ws
 echo v1 > ws/f.txt
 echo "You are a coding agent." > system.txt
-commit "workspace + bins"
+git add -A
+gc commit -qm fixtures
 base_tree=$(git rev-parse HEAD:ws)
 base=$(mkcommit "$base_tree" base)
-human=$(mkcommit "$base_tree" "merge in the feature branch" "$base")
 
-# `feature`: shares base with the head and adds g.txt (a clean, non-conflicting
-# merge). Push its closure to the server so the merge worker can fetch it —
-# onto a content-addressed ref, exactly as the harness snapshot would.
-mkdir -p feat
+mkdir feat
 echo v1 > feat/f.txt
 echo hello > feat/g.txt
-gc add feat; gc commit -qm feat-scratch
+git add feat
+gc commit -qm feature-fixture
 feature=$(mkcommit "$(git rev-parse HEAD:feat)" feature "$base")
 git push --quiet caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
 
-echo "== script the stub: round 1 merges, round 2 ends ==" >&2
 R1='[{"id":"toolu_01","input":{"theirs":"feature"},"name":"merge","type":"tool_use"}]'
 mkdir stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
@@ -59,35 +47,65 @@ for _ in 1 2 3 4 5; do
   "$stub_bin" "0.0.0.0:$port" "$PWD/stub" 2>stub/log &
   stub_pid=$!
   sleep 0.5
-  kill -0 "$stub_pid" 2>/dev/null && break
+  if kill -0 "$stub_pid" 2>/dev/null; then break; fi
   stub_pid=""
 done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-echo "== curry the workers (merge-image + ref snapshot) and run the turn ==" >&2
+echo "== dispatch merge turn ==" >&2
+conv="merge-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+conversation_ref="refs/caos/conversations/$conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --api-key=test-key --system:@=system.txt \
   --merge-refs="feature $feature" \
-  --model=test-model --base-url="http://$stub_host:$port")
+  --model=test-model --base-url="http://$stub_host:$port" \
+  --conversation="$conv")
 
-"$CAOS_CLI" run "$llm" -- --head:commit="$human" > turn.commit
-turn=$(git hash-object -t commit --stdin < turn.commit)
-git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn" || fail "fetch turn"
+user=$(mkcommit "$base_tree" \
+  '{"author":"user","content":"merge in the feature branch","status":"queued","v":2}' \
+  "$base")
+request=$("$CAOS_CLI" curry "$llm" -- --head:commit="$user")
+running=$(mkcommit "$base_tree" \
+  "{\"request\":\"$request\",\"status\":\"running\",\"v\":2}" "$user")
+git push --quiet caos "$running:$conversation_ref" || fail "publishing request event"
+"$CAOS_CLI" run "$request" >/tmp/merge-result || fail "running merge turn"
 
-echo "== the turn merged the feature branch, and theirs is reachable ==" >&2
-[ "$(git rev-parse "$turn^")" = "$human" ] || fail "turn's first parent is not the human turn"
-# The crux: the merge's M (and thus `theirs`) hangs off the turn by parent
-# edges — a real merge in the DAG, not a detached snapshot.
-git merge-base --is-ancestor "$feature" "$turn" \
-  || fail "feature (theirs) is NOT reachable from the turn — the merge edge was lost"
+advertised=$(git ls-remote --refs caos "$conversation_ref") \
+  || fail "reading canonical conversation head"
+head=${advertised%%$'\t'*}
+[ -n "$head" ] || fail "canonical conversation head is absent"
+git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$head" \
+  || fail "fetching canonical conversation head"
 
-# The workspace advanced to the merged tree: the feature's clean add is present.
-[ "$(git show "$turn:g.txt")" = "hello" ] || fail "merged file g.txt missing from the turn tree"
-[ "$(git show "$turn:f.txt")" = "v1" ] || fail "f.txt wrong in the turn tree"
-# A clean merge leaves no conflict scaffolding, and .caos never leaks to a turn.
-git rev-parse -q --verify "$turn:.caos" >/dev/null && fail ".caos leaked into the turn tree"
-echo "  ok: feature reachable; g.txt merged in; no .caos in the turn tree" >&2
+echo "== event spine owns the merged workspace and ancestry ==" >&2
+git merge-base --is-ancestor "$feature" "$head" \
+  || fail "feature is not reachable from canonical conversation head"
+[ "$(git show "$head:g.txt")" = hello ] || fail "merged file g.txt missing"
+[ "$(git show "$head:f.txt")" = v1 ] || fail "f.txt changed"
+
+current=$head
+count=0
+while [ "$current" != "$base" ]; do
+  message=$(git show -s --format=%B "$current")
+  grep -Eq '"v"[[:space:]]*:[[:space:]]*2' <<<"$message" \
+    || fail "non-v2 commit on event spine: $current"
+  current=$(git rev-parse "$current^")
+  count=$((count + 1))
+done
+[ "$count" -ge 4 ] || fail "merge turn recorded too few events"
+
+events=$(git log --first-parent --format=%B "$base..$head")
+grep -Eq '"calls"[[:space:]]*:[[:space:]]*\[' <<<"$events" || fail "ordered call record is missing"
+grep -Eq '"result"[[:space:]]*:[[:space:]]*\{' <<<"$events" || fail "tool result record is missing"
+grep -qF '"id":"toolu_01"' <<<"$events" || fail "merge call was not recorded"
+grep -qF '"tool_use_id":"toolu_01"' <<<"$events" || fail "merge result was not recorded"
+grep -qF 'merged the feature branch' <<<"$events" || fail "assistant transcript missing"
+terminal=$(git show -s --format=%B "$head")
+grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' <<<"$terminal" \
+  || fail "turn did not become idle"
+grep -Eq '"request"[[:space:]]*:[[:space:]]*null' <<<"$terminal" \
+  || fail "turn did not clear its request"
 
 echo "merge-harness: ALL PASS" >&2

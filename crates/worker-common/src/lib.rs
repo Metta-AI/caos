@@ -213,6 +213,31 @@ pub fn run_then_catching(input: &str, run: &str, then: &str) -> Result<(), Strin
     run_then_inner(input, run, Some(then), true)
 }
 
+/// Tail-call an already-complete ArgTree request without adding or rebuilding
+/// any args. With `then`, the callback receives only `--result=<R>`; without
+/// one, the exact request's result is returned directly.
+pub fn run_request_then(request: &str, then: Option<&str>) -> Result<(), String> {
+    run_request_then_inner(request, then, false)
+}
+
+/// [`run_request_then`] with a failing request delivered to `then` as its sole
+/// `--error=<blob>` arg. The enclosing request remains uncached, matching
+/// [`run_then_catching`].
+pub fn run_request_then_catching(request: &str, then: &str) -> Result<(), String> {
+    run_request_then_inner(request, Some(then), true)
+}
+
+fn run_request_then_inner(request: &str, then: Option<&str>, catch: bool) -> Result<(), String> {
+    let mut argv: Vec<String> = vec!["run-request-then".into(), request.into(), "--".into()];
+    if let Some(then) = then {
+        argv.push(format!("--then={then}"));
+    }
+    if catch {
+        argv.push("--catch".into());
+    }
+    caos_argv(&str_refs(&argv))
+}
+
 fn run_then_inner(input: &str, run: &str, then: Option<&str>, catch: bool) -> Result<(), String> {
     let mut argv: Vec<String> = vec![
         "run-then".into(),
@@ -284,6 +309,12 @@ pub struct Commit {
 /// arg's own id, which becomes the `parent` of the commit minted from it.
 pub fn cas_hash(cas_path: &str) -> Result<String, String> {
     caos_capture(&["hash", cas_path])
+}
+
+/// Make `to` name the same blob/tree/commit result as `from`, preserving the
+/// kind without materializing its bytes. `to` must be a fresh CAS path.
+pub fn forward(from: &str, to: &str) -> Result<(), String> {
+    caos(["forward", from, to])
 }
 
 /// Fetch and parse the commit at a CAS path (e.g. a `--name:commit=` arg, which
