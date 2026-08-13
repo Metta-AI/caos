@@ -5,10 +5,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use caos::chat::{
     archive_user_conversation, conversation_head, conversation_replay, conversation_snapshot,
     conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
-    generate_conversation_title, list_user_conversations, publish_unindexed_conversations,
-    publish_user_conversation, run_chat_turn, set_conversation_title, unarchive_user_conversation,
-    ConversationRole, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    fork_conversation, generate_conversation_title, invite_user_to_conversation,
+    list_user_conversations, publish_user_conversation, run_chat_turn, set_conversation_title,
+    unarchive_user_conversation, ConversationRole, ToolSetDescription, TurnEvent, TurnOptions,
+    TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -749,6 +749,7 @@ impl Composer {
 enum CommandAction {
     From,
     Help,
+    Invite,
     Palette,
     Reference,
     Title,
@@ -764,7 +765,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 6] = [
+const COMMANDS: [Command; 7] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -806,6 +807,13 @@ const COMMANDS: [Command; 6] = [
         description: "show the copyable conversation ref and full head hash",
         action: CommandAction::Reference,
         takes_argument: false,
+    },
+    Command {
+        name: "/invite",
+        usage: "/invite <username>",
+        description: "add this conversation to another user's sidebar",
+        action: CommandAction::Invite,
+        takes_argument: true,
     },
 ];
 
@@ -1234,10 +1242,9 @@ impl App {
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        publish_unindexed_conversations(&transport, &args.user)?;
         let mut conversations =
             list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
-        if let Some(requested) = args.conversation.as_deref() {
+        if let Some(requested) = args.conversation.clone() {
             if conversations
                 .iter()
                 .all(|conversation| conversation.id != requested)
@@ -1251,7 +1258,17 @@ impl App {
                     .iter()
                     .any(|conversation| conversation.id == requested)
                 {
-                    unarchive_user_conversation(&transport, &args.user, requested)?;
+                    unarchive_user_conversation(&transport, &args.user, &requested)?;
+                    conversations = list_user_conversations(
+                        &transport,
+                        &args.user,
+                        UserConversationStatus::Active,
+                    )?;
+                } else if let Some(snapshot) = conversation_snapshot(&transport, &requested)? {
+                    if args.new_conversation {
+                        return Err(format!("conversation {requested:?} already exists"));
+                    }
+                    publish_user_conversation(&transport, &args.user, &requested, &snapshot.title)?;
                     conversations = list_user_conversations(
                         &transport,
                         &args.user,
@@ -1591,6 +1608,10 @@ impl App {
                     }
                     return;
                 }
+                CommandAction::Invite => {
+                    self.invite_selected(arguments);
+                    return;
+                }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
                     return;
@@ -1706,6 +1727,20 @@ impl App {
         }
     }
 
+    fn invite_selected(&mut self, username: &str) {
+        let id = self.selected().id.clone();
+        let title = self.selected().title.clone();
+        match self
+            .transport()
+            .and_then(|transport| invite_user_to_conversation(&transport, username, &id, &title))
+        {
+            Ok(()) => self
+                .selected_mut()
+                .push_info(format!("Invited {username} to this conversation.")),
+            Err(error) => self.selected_mut().show_command_error(error),
+        }
+    }
+
     pub(crate) fn drain_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.rx.try_recv() {
@@ -1775,9 +1810,6 @@ impl App {
         let Ok(transport) = self.transport() else {
             return false;
         };
-        if publish_unindexed_conversations(&transport, &self.user).is_err() {
-            return false;
-        }
         let Ok(summaries) =
             list_user_conversations(&transport, &self.user, UserConversationStatus::Active)
         else {
@@ -2467,6 +2499,7 @@ impl App {
                 return;
             }
         };
+        let fork_from = base.clone();
         let (options, base) = match new_conversation_options(
             self.selected().turn_options.clone(),
             base,
@@ -2479,10 +2512,20 @@ impl App {
             }
         };
         let status = format!("ready from {}; enter a prompt", short_hash(&base));
-        self.conversations.insert(
-            0,
-            ConversationState::new_virtual(id, title, options, status),
-        );
+        let mut state = ConversationState::new_virtual(id.clone(), title.clone(), options, status);
+        if let Some(from) = fork_from {
+            let fork = match fork_conversation(&transport, &self.user, &id, &title, &from) {
+                Ok(fork) => fork,
+                Err(error) => {
+                    self.selected_mut().show_command_error(error);
+                    return;
+                }
+            };
+            state.reload(&transport, &self.user);
+            state.remote_head = Some(fork);
+            state.status = format!("forked from {}", short_hash(&from));
+        }
+        self.conversations.insert(0, state);
         self.selected = 0;
         self.view = View::Chat;
         self.confirm_action = None;
@@ -3110,7 +3153,8 @@ mod tests {
                 "/title",
                 "/update-tree",
                 "/commands",
-                "/ref"
+                "/ref",
+                "/invite"
             ]
         );
 
@@ -3147,6 +3191,10 @@ mod tests {
         let (command, arguments) = parse_command("/ref").unwrap();
         assert_eq!(command.action, CommandAction::Reference);
         assert!(arguments.is_empty());
+
+        let (command, arguments) = parse_command("/invite Bob").unwrap();
+        assert_eq!(command.action, CommandAction::Invite);
+        assert_eq!(arguments, "Bob");
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
@@ -4657,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_poll_discovers_shared_conversations_and_names_the_other_user() {
+    fn remote_poll_discovers_invited_conversations_and_names_the_other_user() {
         let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let transport = GitTransport::discover(&repo).unwrap();
@@ -4666,6 +4714,7 @@ mod tests {
             ..TurnOptions::default()
         };
         caos::chat::submit_message(&transport, &options, "shared", "hello from Alice").unwrap();
+        invite_user_to_conversation(&transport, "Bob", "shared", "Shared chat").unwrap();
 
         let (mut app, _) = app_with(vec![state("local")]);
         app.repo_dir = repo.clone();
@@ -4707,6 +4756,44 @@ mod tests {
         assert_eq!(shown.role, EntryRole::Info);
         assert!(shown.text.contains("refs/caos/conversations/shared/head"));
         assert!(shown.text.contains(&head));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn from_materializes_history_and_invite_indexes_the_fork() {
+        let (repo, remote, _) = repo_with_default_branch("fork-and-invite", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = caos::chat::submit_message(
+            &transport,
+            &TurnOptions {
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "original",
+            "inherited message",
+        )
+        .unwrap()
+        .unwrap();
+
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source.clone()));
+
+        let fork_id = app.selected().id.clone();
+        assert_ne!(fork_id, "original");
+        assert_eq!(app.selected().transcript[0].text, "inherited message");
+        assert!(conversation_head(&transport, &fork_id).unwrap().is_some());
+        assert_eq!(app.selected().diff.as_ref().unwrap().base_commit, source);
+        assert!(app.selected().diff.as_ref().unwrap().patch.is_empty());
+
+        app.invite_selected("Bob");
+        let bob =
+            list_user_conversations(&transport, "Bob", UserConversationStatus::Active).unwrap();
+        assert!(bob.iter().any(|conversation| conversation.id == fork_id));
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();

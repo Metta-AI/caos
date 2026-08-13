@@ -612,6 +612,68 @@ pub fn publish_user_conversation(
     .map_err(|error| format!("publishing conversation {id:?}: {error}"))
 }
 
+/// Add an existing conversation to another user's active sidebar. The
+/// canonical conversation head is unchanged; this writes presentation refs
+/// only.
+pub fn invite_user_to_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+) -> Result<(), String> {
+    publish_user_conversation(t, user, id, title)
+}
+
+/// Materialize a fork before its first new message. Replay follows the marker's
+/// first parent, while workspace diffing treats `from` as the fork's base.
+pub fn fork_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+    from: &str,
+) -> Result<String, String> {
+    validate_hash(from, "fork source")?;
+    fetch_commit(t, from)?;
+    let source_message = t.git_capture(&["show", "-s", "--format=%B", from], None)?;
+    let source_event = serde_json::from_str::<Value>(source_message.trim())
+        .map_err(|_| format!("fork source {from} is not a conversation event"))?;
+    if source_event.get("v").and_then(Value::as_u64) != Some(EVENT_VERSION) {
+        return Err(format!(
+            "fork source {from} is not a version-{EVENT_VERSION} conversation event"
+        ));
+    }
+    let refname = conversation_ref(id)?;
+    if remote_ref(t, &refname)?.is_some() {
+        return Err(format!("conversation {id:?} already exists"));
+    }
+    let tree = t
+        .git_capture(&["rev-parse", &format!("{from}^{{tree}}")], None)?
+        .trim()
+        .to_string();
+    let username = resolve_username(t, Some(user))?;
+    let event = json!({
+        "v": EVENT_VERSION,
+        "author": "user",
+        "username": username,
+        "content": "",
+        "forked_from": from,
+        "title": title,
+        "status": "idle",
+        "request": Value::Null,
+    });
+    let fork = create_event_commit(t, &tree, from, &event)?;
+    t.ensure_pushed(&fork)?;
+    match push_head_cas(t, &refname, None, &fork)? {
+        true => {
+            let _ = update_local_cache(t, &refname, &fork);
+            publish_user_conversation(t, user, id, title)?;
+            Ok(fork)
+        }
+        false => Err(format!("conversation {id:?} was created concurrently")),
+    }
+}
+
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
     let title = title.trim();
     if title.is_empty() {
@@ -685,42 +747,6 @@ pub fn unarchive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Re
     )
 }
 
-/// Add every canonical conversation not already classified by this user to
-/// their active sidebar. This is also how an already-open second TUI discovers
-/// a conversation created by the first.
-pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(), String> {
-    let key = user_key(user)?;
-    let prefix = format!("{USER_INDEX_PREFIX}{key}/conversations/");
-    let indexed = remote_refs(
-        t,
-        [format!("{prefix}active/*"), format!("{prefix}archived/*")],
-    )?;
-    let indexed_ids = indexed
-        .keys()
-        .filter_map(|refname| refname.rsplit('/').next().map(str::to_string))
-        .collect::<HashSet<_>>();
-    let title_refs = remote_refs(t, [format!("{CONVERSATION_PREFIX}*/title")])?;
-    for (id, head) in remote_conversations(t)? {
-        if indexed_ids.contains(&id) {
-            continue;
-        }
-        let active_ref = user_conversation_ref(user, UserConversationStatus::Active, &id)?;
-        let mut updates = vec![format!("{head}:{active_ref}")];
-        let title_ref = conversation_title_ref(&id)?;
-        if !title_refs.contains_key(&title_ref) {
-            let snapshot = conversation_snapshot(t, &id)?
-                .ok_or_else(|| format!("conversation {id:?} disappeared while indexing it"))?;
-            let title_hash = t.put_object("blob", snapshot.title.as_bytes())?.to_string();
-            t.ensure_pushed(&title_hash)?;
-            updates.push(format!("+{title_hash}:{title_ref}"));
-        }
-        let mut args = vec!["push", "--quiet", "--atomic", CAOS_REMOTE];
-        args.extend(updates.iter().map(String::as_str));
-        t.git_capture(&args, None)?;
-    }
-    Ok(())
-}
-
 pub fn list_user_conversations(
     t: &GitTransport,
     user: &str,
@@ -789,6 +815,7 @@ fn durable_conversation_events(
         conversation_snapshot(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
     let mut newest_first = Vec::new();
     let mut current = snapshot.head.clone();
+    let mut fork_base = None;
     loop {
         let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
         let value = serde_json::from_str::<Value>(message.trim()).ok();
@@ -799,12 +826,20 @@ fn durable_conversation_events(
             != Some(EVENT_VERSION)
         {
             newest_first.reverse();
-            return Ok((newest_first, current, snapshot.head));
+            return Ok((newest_first, fork_base.unwrap_or(current), snapshot.head));
         }
-        newest_first.push(StoredEvent {
+        let event = StoredEvent {
             commit: current.clone(),
             value: value.expect("checked above"),
-        });
+        };
+        if fork_base.is_none() {
+            fork_base = event
+                .value
+                .get("forked_from")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        newest_first.push(event);
         current = t
             .git_capture(&["rev-parse", &format!("{current}^1")], None)?
             .trim()
