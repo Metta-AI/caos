@@ -19,15 +19,18 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
     commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg"
 }
 
-echo "== stage the worker binaries and fixtures ==" >&2
-cp "$CAOS_BIN_DIR/worker-bash-tool" bash-tool-bin
-cp "$CAOS_BIN_DIR/worker-llm-step" llm-step-bin
-stub_bin=$CAOS_BIN_DIR/llm-stub
+echo "== stage the stub and fixtures ==" >&2
+# The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
+# the executable is at bin/<name>. Copied out because materialized CAS content
+# is read-only and owner-only — exec straight from /cas is "Permission denied".
+"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
+stub_bin=/tmp/llm-stub-bin
+install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
 
 mkdir -p ws
 echo "hello" > ws/greeting.txt
 echo "You are a coding agent operating on a git workspace." > system.txt
-commit "workspace + worker binaries"
+commit "workspace + fixtures"
 
 base=$(mkcommit "HEAD:ws" "base")
 human1=$(mkcommit "HEAD:ws" "write me a long answer" "$base")
@@ -55,12 +58,15 @@ done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-echo "== curry the workers and run the turn ==" >&2
+echo "== curry llm-step and run the turn ==" >&2
 conv="conv-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-bash_tool=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=bash-tool-bin)
+# Workers reach the stub as host.containers.internal from the outer engine's
+# container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-llm=$("$CAOS_CLI" curry /cas/std/runner -- --worker1:@=llm-step-bin \
-  --api-key=test-key --system:@=system.txt --bash-image="$bash_tool" \
+# NO TOOL IMAGES: llm-step's `.caos-expr` binds its own (std/llm-step/DEPS), so
+# a caller says what the turn is, never which shell the agent greps with.
+llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
+  --api-key=test-key --system:@=system.txt \
   --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")
 
