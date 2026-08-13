@@ -1,36 +1,16 @@
 //! caos-worker-llm-step: the agent-harness driver (see design/agent-harness.md).
 //!
-//! One invocation is one position in the step loop:
-//!
-//! * **Start** (`--head:commit=`, no `--result`): rebuild the conversation's
-//!   API transcript from the commit chain, POST `/v1/messages`, and either
-//!   mint the turn commit (no tool calls) or mint a step commit and launch the
-//!   first tool call as a run-then sub-run, currying ourselves — with the step
-//!   commit, the remaining pending calls, and the collected results — into
-//!   `then`.
-//! * **Callback** (`--result` present, from run-then): fold the tool's result
-//!   into a `tool_result` block; if calls are still pending, launch the next
-//!   one the same way; otherwise send all the results back in one user message
-//!   (the next LLM round) and continue as above.
+//! The canonical conversation event spine is the loop state. A start or a
+//! run-then callback rereads it, performs the next missing action, and records
+//! that action's result before continuing.
 //!
 //! Tool calls are driven serially through one queue (`drive`): the inline file
 //! tools (read/ls/write/edit — `tools.rs`) execute in-process, advancing the
-//! workspace with no sub-run; only `bash` exits into a run-then sub-run.
-//!
-//! Curried configuration: `api-key`, `system` (the system prompt), `bash-image`
-//! (the sub-run tool's image), and optionally `model` (default
-//! `claude-opus-4-8`), `base-url` (default `https://api.anthropic.com`;
-//! overridable so tests can point it at a stub), and `conversation` (a name;
-//! when present, each minted step pushes `refs/caos/conversations/<name>/from-agent`
-//! and each API attempt updates `refs/caos/conversations/<name>/status` — see
-//! `progress.rs`). Continuation state, curried by ourselves: `step` (the
-//! current step commit), `pending` / `results` (JSON arrays of the remaining
-//! `tool_use` blocks and the collected `tool_result` blocks), and
-//! `current_id` (the in-flight call's `tool_use` id).
-//!
-//! Commit structure and the `.caos/step.json` format are documented in
-//! design/agent-harness.md; the constants below are the load-bearing bits.
+//! workspace with no sub-run; compute tools exit into serial run-then sub-runs.
+//! Continuations carry only the stable run/round/call identity and observed
+//! head; pending queues and results are always reconstructed from the ref.
 
+mod async_work;
 mod githist;
 mod progress;
 mod tools;
@@ -38,23 +18,16 @@ mod tools;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use llm_client::{post_messages, DEFAULT_BASE_URL, DEFAULT_MODEL};
 use serde_json::{json, Value};
 use worker_common::{
-    arg, caos, caos_curry, caos_recurry, cas_hash, entries, file_name, link, own_args_tree, path,
-    read_arg, read_arg_opt, read_commit, run_then_catching, run_worker, scratch, write_commit_as,
-    Arg, Commit,
+    arg, caos, caos_curry, caos_recurry, cas_hash, forward, link, own_args_tree, path, read_arg,
+    read_arg_opt, read_commit, run_then_catching, run_worker, scratch, write_commit_as, Arg,
 };
 
-/// Author name on step and turn commits — and how the conversation walk tells
-/// an agent turn from the base commit below it.
 const AGENT_AUTHOR: &str = "caos-agent";
-
-/// The reserved top-level workspace entry holding a step's transcript.
 const STEP_DIR: &str = ".caos";
-const STEP_FILE: &str = "step.json";
 
 /// The per-round output-token cap sent to the API. A single response is
 /// unlikely to need this much; when one does, `stop_reason: "max_tokens"`
@@ -86,6 +59,7 @@ struct Config {
     /// The git-bearing merge worker (std/merge). The `merge` tool is registered
     /// only when present.
     merge_image: Option<String>,
+    run_and_update_ref_image: Option<String>,
     /// The turn-start ref snapshot: `name <hash>` lines the `merge` tool
     /// resolves `--theirs` against (SPEC "Resolving `--theirs`"). Absent = the
     /// tool takes only a bare hash.
@@ -117,6 +91,7 @@ impl Config {
             grep_image: image_arg("grep-image")?,
             tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
+            run_and_update_ref_image: image_arg("run-and-update-ref-image")?,
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -131,50 +106,71 @@ impl Config {
 /// start of a turn.
 fn run() -> Result<(), String> {
     let cfg = Config::read()?;
-    if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
+    let outcome = if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
         callback(&cfg)
     } else {
         start(&cfg)
+    };
+    if let Err(error) = &outcome {
+        if let Err(record_error) = record_failure(&cfg, error) {
+            eprintln!("llm-step: additionally failed to record failure: {record_error}");
+        }
     }
+    outcome
 }
 
-/// Start of a turn: `head` is the human-turn commit to answer.
 fn start(cfg: &Config) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let run = own_args_tree()?;
     let head_hash = cas_hash(&arg("head"))?;
-    // First signal of the turn: everything before it is client/dispatch, the
-    // stretch from here to `calling <model>…` is transcript/workspace prep.
-    progress::status(
-        cfg.conversation.as_deref(),
-        &head_hash,
-        "preparing the turn…",
-    );
-    let head = read_commit(&arg("head"))?;
-    let prior = prior_messages(&head)?;
-
-    // The workspace this turn starts from: the head commit's tree.
-    let ws = fresh("ws");
-    caos(["get-hash", &head.tree, &ws])?;
-    // `.caos` is reserved. At conversation start (no prior agent turns) the
-    // base tree must not already carry one.
-    if prior.is_empty() && Path::new(&ws).join(STEP_DIR).exists() {
+    let log = ensure_request_running(conversation, &run, &head_hash)?;
+    if let Some(terminal) = terminal_for_run(&log, &run)? {
+        readmit_pending_async(cfg, &log)?;
+        return finish_from_terminal(terminal);
+    }
+    let request = active_request(&log)?;
+    if request != run {
+        return Err(format!(
+            "conversation's active request is {request}, but this worker is {run}"
+        ));
+    }
+    let (ws, _) = canonical_workspace(&log)?;
+    if log.events.len() <= 2 && Path::new(&ws).join(STEP_DIR).exists() {
         return Err(format!(
             "the conversation's base tree already contains the reserved {STEP_DIR:?} entry"
         ));
     }
+    resume_run(cfg, &run, &head_hash, log)
+}
 
-    let mut messages = prior;
-    messages.push(user_text(&head.message));
-    // The workspace commit threaded through the turn (SPEC "Tools thread a
-    // commit"): starts as the head commit itself, advances as tools mutate.
-    llm_round(
-        cfg,
-        messages,
-        &ws,
-        &arg("head"),
-        &head_hash,
-        &head_hash,
-        &[],
-    )
+/// Make the exact request visible on the canonical event spine before doing
+/// any model work. The client has already published `head`, the queued user
+/// event used to construct this request; the worker owns the transition to
+/// running. A user event may win the ref race while we do this, so each retry
+/// revalidates the same queued anchor and appends after the new tip.
+fn ensure_request_running(
+    conversation: &str,
+    run: &str,
+    head: &str,
+) -> Result<progress::ConversationLog, String> {
+    validate_run_hash(run)?;
+    validate_run_hash(head)?;
+    for _ in 0..32 {
+        let log = progress::conversation_log(conversation)?;
+        match request_start_disposition(&log, run, head)? {
+            RequestStart::Running => return Ok(log),
+            RequestStart::Claim { expected, tree } => {
+                let event = json!({"v": 2, "request": run, "status": "running"});
+                match progress::append_event_at_head(conversation, &expected, &event, &tree)? {
+                    progress::ConditionalAppend::Appended(_) => {
+                        return progress::conversation_log(conversation)
+                    }
+                    progress::ConditionalAppend::HeadChanged(_) => continue,
+                }
+            }
+        }
+    }
+    Err("conversation kept changing while starting request".to_string())
 }
 
 /// Callback from run-then: `result` is the sub-run tool's result, `in` the
@@ -182,14 +178,25 @@ fn start(cfg: &Config) -> Result<(), String> {
 /// the loop state rode our own curry. Establishes the workspace (`ws`) and the
 /// workspace commit (`wc`) the queue continues over.
 fn callback(cfg: &Config) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let log = progress::conversation_log(conversation)?;
     let head_hash = cas_hash(&arg("head"))?;
-    progress::status(
-        cfg.conversation.as_deref(),
-        &head_hash,
-        "folding the tool result in…",
-    );
-    let pending = parse_blocks(&read_arg("pending")?, "pending")?;
-    let mut results = parse_blocks(&read_arg("results")?, "results")?;
+    let run = read_arg("run")?;
+    let round = read_arg("round")?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid continuation round: {error}"))?;
+    let base_head = read_arg("base-head")?;
+    if let Some(terminal) = terminal_for_run(&log, &run)? {
+        readmit_pending_async(cfg, &log)?;
+        return finish_from_terminal(terminal);
+    }
+    let request = active_request(&log)?;
+    let expected_request = request_for_head(&log, &head_hash)?;
+    if request != expected_request || request != run {
+        return Err(format!(
+            "callback belongs to request {expected_request} ({run}), but conversation is running {request}"
+        ));
+    }
     let current_id = read_arg("current-id")?;
 
     // Fold the tool's outcome into a tool_result block the model will see,
@@ -205,7 +212,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
     // land here as a dead turn; now only the tool call is dead.
     if Path::new(&arg("error")).exists() {
         let text = read_arg("error")?;
-        results.push(json!({
+        let result = json!({
             "type": "tool_result",
             "tool_use_id": current_id,
             "is_error": true,
@@ -214,32 +221,37 @@ fn callback(cfg: &Config) -> Result<(), String> {
                  This is the tool itself failing, not a non-zero exit from your command.",
                 text.trim_end()
             )}],
-        }));
-        let ws = arg("ws");
-        caos(["get", &ws])?;
-        return drive(
+        });
+        append_tool_result(
             cfg,
-            ws,
-            arg("wc"),
+            &run,
+            round,
+            &base_head,
+            &result,
+            &cas_hash(&arg("ws"))?,
+            None,
+        )?;
+        return resume_run(
+            cfg,
+            &run,
             &head_hash,
-            &arg("step"),
-            &pending,
-            results,
+            progress::conversation_log(conversation)?,
         );
     }
 
-    let (ws, wc) = match current_tool.as_str() {
+    match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
-            results.push(tools::grep_result_block(
-                &current_id,
-                &arg("result"),
-                &scope,
-            )?);
-            let ws = arg("ws");
-            caos(["get", &ws])?;
-            // A grep is read-only: workspace and its commit are unchanged.
-            (ws, arg("wc"))
+            let result = tools::grep_result_block(&current_id, &arg("result"), &scope)?;
+            append_tool_result(
+                cfg,
+                &run,
+                round,
+                &base_head,
+                &result,
+                &cas_hash(&arg("ws"))?,
+                None,
+            )?;
         }
         // `merge` returns a COMMIT (its two-parent M): M becomes the workspace
         // commit, its tree the workspace, and the model hears about any
@@ -250,20 +262,34 @@ fn callback(cfg: &Config) -> Result<(), String> {
             let commit = read_commit(&m)?;
             let ws = fresh("ws");
             caos(["get-hash", &commit.tree, &ws])?;
-            results.push(merge_result_block(&current_id, &ws)?);
-            (ws, m)
+            let result = merge_result_block(&current_id, &ws)?;
+            append_tool_result(
+                cfg,
+                &run,
+                round,
+                &base_head,
+                &result,
+                &commit.tree,
+                Some(&cas_hash(&m)?),
+            )?;
         }
         // A tree tool's result (caos-tools/<name>.sh) is a VALUE — a report,
         // a bin tree, diagnostics — never a workspace: the pre-run workspace
         // and its commit rode our curry, exactly like grep.
         name if name != "bash" => {
-            results.push(tools::tree_tool_result_block(&current_id, &arg("result"))?);
-            let ws = arg("ws");
-            caos(["get", &ws])?;
-            (ws, arg("wc"))
+            let result = tools::tree_tool_result_block(&current_id, &arg("result"))?;
+            append_tool_result(
+                cfg,
+                &run,
+                round,
+                &base_head,
+                &result,
+                &cas_hash(&arg("ws"))?,
+                None,
+            )?;
         }
         _ => {
-            results.push(tool_result_block(&current_id)?);
+            let result = tool_result_block(&current_id)?;
             let ws = format!("{}/tree", arg("result"));
             if !Path::new(&ws).exists() {
                 return Err("bash result carries no `tree` entry".to_string());
@@ -271,11 +297,24 @@ fn callback(cfg: &Config) -> Result<(), String> {
             caos(["get", &ws])?;
             // bash may have mutated the tree — advance the workspace commit.
             let wc = advance_wc(&ws, &arg("wc"), "bash")?;
-            (ws, wc)
+            append_tool_result(
+                cfg,
+                &run,
+                round,
+                &base_head,
+                &result,
+                &cas_hash(&ws)?,
+                Some(&cas_hash(&wc)?),
+            )?;
         }
-    };
+    }
 
-    drive(cfg, ws, wc, &head_hash, &arg("step"), &pending, results)
+    resume_run(
+        cfg,
+        &run,
+        &head_hash,
+        progress::conversation_log(conversation)?,
+    )
 }
 
 /// Work through the call queue, threading the workspace `ws` AND its commit
@@ -289,34 +328,66 @@ fn drive(
     mut ws: String,
     mut wc: String,
     head_hash: &str,
-    step_path: &str,
     queue: &[Value],
-    mut results: Vec<Value>,
+    run: &str,
+    round: u64,
+    mut base_head: String,
 ) -> Result<(), String> {
     let mut queue = queue.to_vec();
     while let Some(call) = queue.first().cloned() {
         let name = call["name"].as_str().unwrap_or("");
+        if name == async_work::TOOL_NAME {
+            let image = cfg
+                .run_and_update_ref_image
+                .as_deref()
+                .ok_or("run_async was called without a run-and-update-ref image")?;
+            let queued = async_work::queue_call(
+                &call,
+                conversation(cfg)?,
+                image,
+                &ws,
+                |task, pending_ws| {
+                    record_async_pending(cfg, task, &base_head, pending_ws)
+                },
+            )?;
+            let _task_identity = (&queued.task, &queued.status, &queued.workspace);
+
+            // Pending publication or the background task may have advanced F.
+            // Fold this tree-neutral tool result over the actual canonical tip,
+            // never over the stale workspace used to construct pending.
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            (ws, _) = canonical_workspace(&log)?;
+            base_head = log.head;
+            append_tool_result(
+                cfg,
+                run,
+                round,
+                &base_head,
+                &queued.result,
+                &cas_hash(&ws)?,
+                None,
+            )?;
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            (ws, wc) = canonical_workspace(&log)?;
+            base_head = log.head;
+            queue.remove(0);
+            continue;
+        }
         if name == "bash" {
-            return launch(cfg, &call, &ws, &wc, step_path, &queue[1..], &results);
+            return launch(cfg, &call, &ws, &wc, run, round, &base_head);
         }
         if name == "merge" && cfg.merge_image.is_some() {
             match resolve_theirs(cfg, &call) {
                 Err(block) => {
-                    results.push(block);
+                    append_tool_result(cfg, run, round, &base_head, &block, &cas_hash(&ws)?, None)?;
+                    let log = progress::conversation_log(conversation(cfg)?)?;
+                    (ws, wc) = canonical_workspace(&log)?;
+                    base_head = log.head;
                     queue.remove(0);
                     continue;
                 }
                 Ok(theirs) => {
-                    return launch_merge(
-                        cfg,
-                        &call,
-                        &theirs,
-                        &ws,
-                        &wc,
-                        step_path,
-                        &queue[1..],
-                        &results,
-                    )
+                    return launch_merge(cfg, &call, &theirs, &ws, &wc, run, round, &base_head)
                 }
             }
         }
@@ -326,21 +397,16 @@ fn drive(
             // exits into the fold sub-run.
             match tools::grep_precheck(&call, &ws) {
                 Err(block) => {
-                    results.push(block);
+                    append_tool_result(cfg, run, round, &base_head, &block, &cas_hash(&ws)?, None)?;
+                    let log = progress::conversation_log(conversation(cfg)?)?;
+                    (ws, wc) = canonical_workspace(&log)?;
+                    base_head = log.head;
                     queue.remove(0);
                     continue;
                 }
                 Ok((scope, prefix)) => {
                     return launch_grep(
-                        cfg,
-                        &call,
-                        &scope,
-                        &prefix,
-                        &ws,
-                        &wc,
-                        step_path,
-                        &queue[1..],
-                        &results,
+                        cfg, &call, &scope, &prefix, &ws, &wc, run, round, &base_head,
                     )
                 }
             }
@@ -351,21 +417,16 @@ fn drive(
             let tool = githist::tool(name).expect("is_builtin implies tool");
             match tools::tree_tool_args(&call, &tool) {
                 Err(block) => {
-                    results.push(block);
+                    append_tool_result(cfg, run, round, &base_head, &block, &cas_hash(&ws)?, None)?;
+                    let log = progress::conversation_log(conversation(cfg)?)?;
+                    (ws, wc) = canonical_workspace(&log)?;
+                    base_head = log.head;
                     queue.remove(0);
                     continue;
                 }
                 Ok(bound) => {
                     return launch_githist(
-                        cfg,
-                        &call,
-                        name,
-                        &bound,
-                        &ws,
-                        &wc,
-                        step_path,
-                        &queue[1..],
-                        &results,
+                        cfg, &call, name, &bound, &ws, &wc, run, round, &base_head,
                     )
                 }
             }
@@ -379,23 +440,25 @@ fn drive(
                 // bad grep is — only a valid one exits into the sub-run.
                 match tools::tree_tool_args(&call, &tool) {
                     Err(block) => {
-                        results.push(block);
+                        append_tool_result(
+                            cfg,
+                            run,
+                            round,
+                            &base_head,
+                            &block,
+                            &cas_hash(&ws)?,
+                            None,
+                        )?;
+                        let log = progress::conversation_log(conversation(cfg)?)?;
+                        (ws, wc) = canonical_workspace(&log)?;
+                        base_head = log.head;
                         queue.remove(0);
                         continue;
                     }
                     Ok(bound) => {
                         return launch_tree_tool(
-                            cfg,
-                            &call,
-                            name,
-                            &script,
-                            &bound,
-                            tool.git,
-                            &ws,
-                            &wc,
-                            step_path,
-                            &queue[1..],
-                            &results,
+                            cfg, &call, name, &script, &bound, tool.git, &ws, &wc, run, round,
+                            &base_head,
                         )
                     }
                 }
@@ -408,27 +471,31 @@ fn drive(
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
-        results.push(block);
+        let mut extra_parent = None;
         if let Some(w) = new_ws {
             // An inline MUTATION: advance the workspace and mint its child
             // commit (a read returns None and leaves both untouched).
             wc = advance_wc(&w, &wc, name)?;
             ws = w;
+            extra_parent = Some(cas_hash(&wc)?);
         }
+        append_tool_result(
+            cfg,
+            run,
+            round,
+            &base_head,
+            &block,
+            &cas_hash(&ws)?,
+            extra_parent.as_deref(),
+        )?;
+        let log = progress::conversation_log(conversation(cfg)?)?;
+        (ws, wc) = canonical_workspace(&log)?;
+        base_head = log.head;
         queue.remove(0);
     }
 
-    // Queue drained: rebuild the transcript (prior turns + this turn's step
-    // chain), append the results, next round.
-    let step_hash = cas_hash(step_path)?;
-    let head = read_commit(&arg("head"))?;
-    let mut messages = prior_messages(&head)?;
-    messages.push(user_text(&head.message));
-    for step in step_chain(Some(&step_hash), head_hash)? {
-        messages.extend(step_messages(&step));
-    }
-    messages.push(message("user", Value::Array(results.clone())));
-    llm_round(cfg, messages, &ws, &wc, head_hash, &step_hash, &results)
+    let log = progress::conversation_log(conversation(cfg)?)?;
+    resume_run(cfg, run, head_hash, log)
 }
 
 /// Mint the child workspace commit after a mutation: `commit(new tree, parent
@@ -439,24 +506,25 @@ fn advance_wc(ws: &str, wc: &str, what: &str) -> Result<String, String> {
     let tree = cas_hash(ws)?;
     let parent = cas_hash(wc)?;
     let out = fresh("wc");
-    write_commit_as(&tree, &[&parent], what, agent_now(), &out)?;
+    // A retry of the same durable call must mint the same ancestry object; a
+    // wall-clock timestamp here used to make every recovered continuation a
+    // distinct request that could race its original.
+    write_commit_as(&tree, &[&parent], what, Some((AGENT_AUTHOR, 0)), &out)?;
     Ok(out)
 }
 
-/// One LLM API round over `messages`, with `ws` the workspace CAS path the
-/// round is over, `wc` its commit, `prev` the commit the next step chains onto
-/// (the previous step, or the human turn), and `sent_results` the tool_result
-/// blocks this round's request carried (recorded in the step commit's
-/// step.json).
+/// One LLM API round over `messages`. `prev` is the exact canonical head used
+/// to build the request; publication is conditional on that head so a response
+/// can never claim to have seen a concurrent interjection.
 #[allow(clippy::too_many_arguments)]
 fn llm_round(
     cfg: &Config,
     messages: Vec<Value>,
     ws: &str,
-    wc: &str,
     head_hash: &str,
     prev: &str,
-    sent_results: &[Value],
+    run: &str,
+    round: u64,
 ) -> Result<(), String> {
     let body = json!({
         "model": cfg.model,
@@ -470,11 +538,7 @@ fn llm_round(
         "tools": registry(cfg, ws)?,
         "messages": messages,
     });
-    // Bracket the API call with status-ref updates (progress::status): the
-    // call is the one silent, slow part of a turn, so say what it's doing —
-    // and, via the retry callback, why it's waiting.
-    let status = |text: &str| progress::status(cfg.conversation.as_deref(), head_hash, text);
-
+    let status = |text: &str| eprintln!("llm-step: {text}");
     // A single logical round can span several API calls. When a response ends
     // with stop_reason "max_tokens" it was truncated mid-generation; rather
     // than fail the turn, we append the partial assistant content as a prefill
@@ -528,41 +592,64 @@ fn llm_round(
     match stop.as_str() {
         "end_turn" => {
             let text = response_text(&blocks);
-            if prev == head_hash && sent_results.is_empty() {
-                // No tool calls anywhere in this turn: no steps — the turn
-                // commit's sole parent is the human turn, its tree unchanged.
-                let tree = cas_hash(ws)?;
-                write_commit_as(&tree, &[head_hash], &text, agent_now(), "/cas/out")?;
-            } else {
-                // The turn used tools: mint a final step (so this round's
-                // blocks and the last tool results stay tree-reachable), then
-                // the pure turn merge.
-                let (step_hash, _) = mint_step(cfg, ws, prev, wc, sent_results, &blocks)?;
-                let tree = cas_hash(ws)?;
-                write_commit_as(
-                    &tree,
-                    &[head_hash, &step_hash],
-                    &text,
-                    agent_now(),
-                    "/cas/out",
-                )?;
+            let tree = cas_hash(ws)?;
+            let conversation = conversation(cfg)?;
+            let event = json!({
+                "v": 2,
+                "run": run,
+                "round": round,
+                "author": "assistant",
+                "content": text,
+                "response": blocks,
+                "status": "idle",
+                "request": Value::Null,
+            });
+            match progress::append_event_at_head(conversation, prev, &event, &tree)? {
+                progress::ConditionalAppend::Appended(appended) => forward_commit(&appended.commit),
+                progress::ConditionalAppend::HeadChanged(_) => {
+                    let log = progress::conversation_log(conversation)?;
+                    resume_run(cfg, run, head_hash, log)
+                }
             }
-            Ok(())
         }
         "tool_use" => {
             if tool_uses.is_empty() {
                 return Err("stop_reason tool_use but no tool_use blocks".to_string());
             }
-            let (_, step_path) = mint_step(cfg, ws, prev, wc, sent_results, &blocks)?;
-            drive(
-                cfg,
-                ws.to_string(),
-                wc.to_string(),
-                head_hash,
-                &step_path,
-                &tool_uses,
-                Vec::new(),
-            )
+            let tree = cas_hash(ws)?;
+            let calls: Vec<Value> = tool_uses
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.get("id").cloned().unwrap_or(Value::Null),
+                        "name": call.get("name").cloned().unwrap_or(Value::Null),
+                        "args": call.get("input").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect();
+            let event = json!({
+                "v": 2,
+                "run": run,
+                "round": round,
+                "author": "assistant",
+                "content": response_text(&blocks),
+                "response": blocks,
+                "calls": calls,
+            });
+            match progress::append_event_at_head(conversation(cfg)?, prev, &event, &tree)? {
+                progress::ConditionalAppend::Appended(_) => resume_run(
+                    cfg,
+                    run,
+                    head_hash,
+                    progress::conversation_log(conversation(cfg)?)?,
+                ),
+                progress::ConditionalAppend::HeadChanged(_) => resume_run(
+                    cfg,
+                    run,
+                    head_hash,
+                    progress::conversation_log(conversation(cfg)?)?,
+                ),
+            }
         }
         "max_tokens" => Err(format!(
             "LLM round still hit stop_reason \"max_tokens\" after {MAX_CONTINUATIONS} \
@@ -575,79 +662,6 @@ fn llm_round(
     }
 }
 
-/// Mint a step commit: tree = the workspace plus `.caos/step.json` (this
-/// round's verbatim response blocks and the tool_results its request carried),
-/// FIRST parent = the previous step (or the human turn), SECOND parent = the
-/// workspace commit `wc` (unless it already equals the first parent — the
-/// turn's first round, before any tool ran). That second parent hangs the
-/// workspace-commit chain — and so any `merge`'s `M` and its `theirs` — off the
-/// transcript, reachable, without disturbing the first-parent spine or the
-/// transcript walk. Author `caos-agent` at wall-clock time. Pushes the progress
-/// ref (best-effort). Returns the commit's `(hash, cas-path)`.
-fn mint_step(
-    cfg: &Config,
-    ws: &str,
-    parent: &str,
-    wc: &str,
-    sent_results: &[Value],
-    blocks: &[Value],
-) -> Result<(String, String), String> {
-    let dir = scratch("steptree")?;
-    // Link every workspace entry EXCEPT `.caos` (rebuilt below): a mid-merge
-    // workspace carries `.caos/conflicts`, which must survive alongside the
-    // step.json we add — the two share the `.caos/` name, never a file.
-    let mut ws_caos: Option<String> = None;
-    for child in entries(ws)? {
-        if file_name(&child) == STEP_DIR {
-            ws_caos = Some(path(&child).to_string());
-            continue;
-        }
-        link(&child, dir.join(file_name(&child)))?;
-    }
-    let caos_dir = dir.join(STEP_DIR);
-    fs::create_dir(&caos_dir).map_err(|e| format!("creating {STEP_DIR}: {e}"))?;
-    if let Some(ws_caos) = ws_caos {
-        caos(["get", &ws_caos])?;
-        for child in entries(&ws_caos)? {
-            link(&child, caos_dir.join(file_name(&child)))?;
-        }
-    }
-    let step_json = json!({
-        "content": blocks,
-        "results": sent_results,
-        "v": 1,
-    });
-    fs::write(caos_dir.join(STEP_FILE), step_json.to_string())
-        .map_err(|e| format!("writing {STEP_FILE}: {e}"))?;
-    let tree_path = fresh("steptree");
-    caos(["put", path(&dir), &tree_path])?;
-    let tree_hash = cas_hash(&tree_path)?;
-
-    let text = response_text(blocks);
-    let message = if text.is_empty() {
-        format!(
-            "step: {} tool call(s)",
-            blocks.iter().filter(|b| b["type"] == "tool_use").count()
-        )
-    } else {
-        text
-    };
-    // The workspace commit as a second parent — omitted when it IS the first
-    // parent (the turn's opening round, wc still the head commit): git allows a
-    // duplicate parent but it is noise.
-    let wc_hash = cas_hash(wc)?;
-    let mut parents: Vec<&str> = vec![parent];
-    if wc_hash != parent {
-        parents.push(&wc_hash);
-    }
-    let commit_path = fresh("step");
-    let hash = write_commit_as(&tree_hash, &parents, &message, agent_now(), &commit_path)?;
-    if let Some(conversation) = &cfg.conversation {
-        progress::push(conversation, &hash);
-    }
-    Ok((hash, commit_path))
-}
-
 /// Launch one bash call as a run-then sub-run: `in` = `{tree, cmd, paths}`,
 /// `run` = the bash image, `then` = ourselves re-curried with the loop state.
 fn launch(
@@ -655,9 +669,9 @@ fn launch(
     call: &Value,
     ws: &str,
     wc: &str,
-    step_path: &str,
-    pending: &[Value],
-    results: &[Value],
+    run: &str,
+    round: u64,
+    base_head: &str,
 ) -> Result<(), String> {
     let name = call["name"].as_str().unwrap_or("");
     if name != "bash" {
@@ -689,9 +703,9 @@ fn launch(
 
     let me = self_curry(
         wc,
-        step_path,
-        pending,
-        results,
+        run,
+        round,
+        base_head,
         id,
         // `ws` rides even though a SUCCESSFUL bash callback takes the workspace
         // from `result/tree`: a CAUGHT failure has no result tree, and the queue
@@ -715,9 +729,9 @@ fn launch_merge(
     theirs: &str,
     ws: &str,
     wc: &str,
-    step_path: &str,
-    pending: &[Value],
-    results: &[Value],
+    run: &str,
+    round: u64,
+    base_head: &str,
 ) -> Result<(), String> {
     let id = call["id"]
         .as_str()
@@ -736,9 +750,9 @@ fn launch_merge(
     )?;
     let me = self_curry(
         wc,
-        step_path,
-        pending,
-        results,
+        run,
+        round,
+        base_head,
         id,
         // As in `launch`: the success path rebuilds the workspace from the
         // merge commit, but a caught failure continues from this `ws`.
@@ -760,9 +774,9 @@ fn launch_grep(
     scope_prefix: &str,
     ws: &str,
     wc: &str,
-    step_path: &str,
-    pending: &[Value],
-    results: &[Value],
+    run: &str,
+    round: u64,
+    base_head: &str,
 ) -> Result<(), String> {
     let id = call["id"]
         .as_str()
@@ -777,9 +791,9 @@ fn launch_grep(
     let curried = caos_curry(image, &[("pattern", Arg::Lit(pattern))])?;
     let me = self_curry(
         wc,
-        step_path,
-        pending,
-        results,
+        run,
+        round,
+        base_head,
         id,
         &[
             ("current-tool", Arg::Lit("grep")),
@@ -812,9 +826,9 @@ fn launch_tree_tool(
     git: bool,
     ws: &str,
     wc: &str,
-    step_path: &str,
-    pending: &[Value],
-    results: &[Value],
+    run: &str,
+    round: u64,
+    base_head: &str,
 ) -> Result<(), String> {
     let id = call["id"]
         .as_str()
@@ -841,9 +855,9 @@ fn launch_tree_tool(
     let curried = caos_curry(image, &kvs)?;
     let me = self_curry(
         wc,
-        step_path,
-        pending,
-        results,
+        run,
+        round,
+        base_head,
         id,
         &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
     )?;
@@ -863,9 +877,9 @@ fn launch_githist(
     bound: &[(String, String)],
     ws: &str,
     wc: &str,
-    step_path: &str,
-    pending: &[Value],
-    results: &[Value],
+    run: &str,
+    round: u64,
+    base_head: &str,
 ) -> Result<(), String> {
     let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
     let dir = scratch(&format!("githist-{name}"))?;
@@ -874,45 +888,43 @@ fn launch_githist(
     let script = fresh("githist-script");
     caos(["put", path(&file), &script])?;
     launch_tree_tool(
-        cfg, call, name, &script, bound, true, ws, wc, step_path, pending, results,
+        cfg, call, name, &script, bound, true, ws, wc, run, round, base_head,
     )
 }
 
-/// Rebuild ourselves as the `then` for the next round — the same ArgTree we're
-/// running as, with the loop state advanced. We carry our WHOLE current ArgTree
+/// Rebuild ourselves as the callback for one compute tool. We carry our WHOLE current ArgTree
 /// forward with [`own_args_tree`] (so the static config — `api-key`, `system`,
 /// `bash-image`, `head`, `worker1`, and the optional
 /// `model`/`base-url`/`conversation`/`grep-image`/`tools-image`/`merge-image`/`merge-refs`
 /// — rides along and a NEW config arg needs no edit here) and manage only the
 /// args this loop OWNS: unbind whichever are bound right now, then rebind the
-/// ones that continue. Commit-valued paths (`head`, `step`, `wc`) ride as
+/// ones that continue. Commit-valued paths (`head`, `wc`) ride as
 /// gitlinks. Contrast the old approach — rebuild from the bare base and re-list
 /// every arg — whose keep-list dropped a config arg the moment you forgot to add
 /// it; here a forgotten carry is impossible and a forgotten unbind is a loud
 /// rebind error, not a stale value.
 fn self_curry(
     wc: &str,
-    step_path: &str,
-    pending: &[Value],
-    results: &[Value],
+    run: &str,
+    round: u64,
+    base_head: &str,
     current_id: &str,
     extras: &[(&str, Arg)],
 ) -> Result<String, String> {
-    let pending_json = Value::Array(pending.to_vec()).to_string();
-    let results_json = Value::Array(results.to_vec()).to_string();
+    let round = round.to_string();
 
     // The loop/per-call args this function owns. Unbind whichever are bound in
     // the current invocation (so they neither double-bind nor persist), then
     // rebind the state below and the per-tool `extras`; `in`/`result` (run-then's
     // call args) are dropped — the server supplies fresh ones next call.
-    //   loop state (rebound below): step, wc, pending, results, current-id
+    //   loop state (rebound below): wc, run, round, base-head, current-id
     //   per-tool (rebound via `extras`): current-tool, ws, scope
     //   run-then's call args (dropped): in, result
     const MANAGED: &[&str] = &[
-        "step",
         "wc",
-        "pending",
-        "results",
+        "run",
+        "round",
+        "base-head",
         "current-id",
         "current-tool",
         "ws",
@@ -931,11 +943,11 @@ fn self_curry(
         .collect();
 
     let mut kvs: Vec<(&str, Arg)> = vec![
-        ("step", Arg::Path(step_path)),
         // The workspace commit the callback continues from (a gitlink).
         ("wc", Arg::Path(wc)),
-        ("pending", Arg::Lit(&pending_json)),
-        ("results", Arg::Lit(&results_json)),
+        ("run", Arg::Lit(run)),
+        ("round", Arg::Lit(&round)),
+        ("base-head", Arg::Lit(base_head)),
         ("current-id", Arg::Lit(current_id)),
     ];
     for (name, value) in extras {
@@ -954,109 +966,698 @@ fn self_curry(
 // Transcript reconstruction (see design/agent-harness.md, "Commit structure").
 // ---------------------------------------------------------------------------
 
-/// One step commit's `.caos/step.json` payload.
-struct StepJson {
-    /// The tool_result blocks this round's request carried (answers to the
-    /// previous step's calls; empty for a turn's first round).
-    results: Vec<Value>,
-    /// The round's response content blocks, verbatim.
-    content: Vec<Value>,
+fn conversation(cfg: &Config) -> Result<&str, String> {
+    cfg.conversation
+        .as_deref()
+        .ok_or_else(|| "llm-step requires --conversation in chat v2".to_string())
 }
 
-/// Messages for every completed turn strictly below `head` (oldest first) —
-/// everything up to, but not including, head's own user message.
-fn prior_messages(head: &Commit) -> Result<Vec<Value>, String> {
-    // Walk the first-parent spine newest-first: below a human turn sits either
-    // an agent turn merge (author caos-agent) or the conversation's base.
-    let mut groups: Vec<Vec<Value>> = Vec::new();
-    let mut parents = head.parents.clone();
-    while let Some(parent) = parents.first().cloned() {
-        let turn = fetch_commit(&parent)?;
-        if turn.author != AGENT_AUTHOR {
-            break; // the base commit — the conversation starts above it
+fn active_request(log: &progress::ConversationLog) -> Result<String, String> {
+    let mut status = None;
+    let mut request = None;
+    for event in &log.events {
+        if let Some(value) = event.value.get("status") {
+            status = value.as_str().map(str::to_string);
         }
-        let human_hash = turn
-            .parents
-            .first()
-            .ok_or_else(|| format!("agent turn {parent} has no parents"))?
-            .clone();
-        let human = fetch_commit(&human_hash)?;
-        let mut group = vec![user_text(&human.message)];
-        group.extend(turn_messages(&turn, &human_hash)?);
-        groups.push(group);
-        parents = human.parents;
-    }
-    groups.reverse();
-    Ok(groups.into_iter().flatten().collect())
-}
-
-/// Replay one completed agent turn: its steps' verbatim blocks — or, for a
-/// turn that used no tools (and so has no steps), just its message text.
-fn turn_messages(turn: &Commit, human_hash: &str) -> Result<Vec<Value>, String> {
-    let steps = step_chain(turn.parents.get(1).map(String::as_str), human_hash)?;
-    if steps.is_empty() {
-        return Ok(vec![message(
-            "assistant",
-            Value::String(turn.message.clone()),
-        )]);
-    }
-    Ok(steps.iter().flat_map(step_messages).collect())
-}
-
-/// A step's replayed messages: the tool_results its request carried (one user
-/// message), then its assistant blocks, byte-exact.
-fn step_messages(step: &StepJson) -> Vec<Value> {
-    let mut msgs = Vec::new();
-    if !step.results.is_empty() {
-        msgs.push(message("user", Value::Array(step.results.clone())));
-    }
-    msgs.push(message("assistant", Value::Array(step.content.clone())));
-    msgs
-}
-
-/// Walk a step chain from its tail commit back to `stop` (the human turn the
-/// chain hangs off), returning the steps' payloads oldest-first.
-fn step_chain(tail: Option<&str>, stop: &str) -> Result<Vec<StepJson>, String> {
-    let mut steps = Vec::new();
-    let mut cur = tail.map(str::to_string);
-    while let Some(hash) = cur {
-        if hash == stop {
-            break;
+        if let Some(value) = event.value.get("request") {
+            request = value.as_str().map(str::to_string);
         }
-        let commit = fetch_commit(&hash)?;
-        steps.push(read_step_json(&commit)?);
-        cur = commit.parents.first().cloned();
     }
-    steps.reverse();
-    Ok(steps)
+    if !matches!(status.as_deref(), Some("queued" | "running")) {
+        return Err(format!(
+            "conversation is not active (status {})",
+            status.as_deref().unwrap_or("unset")
+        ));
+    }
+    let request = request.ok_or_else(|| "active conversation has no request hash".to_string())?;
+    validate_run_hash(&request)?;
+    Ok(request)
 }
 
-/// Fetch a commit by hash (materializing it at a fresh CAS path) and parse it.
-fn fetch_commit(hash: &str) -> Result<Commit, String> {
-    let p = fresh("commit");
-    caos(["get-hash", hash, &p])?;
-    read_commit(&p)
+#[derive(Debug, PartialEq, Eq)]
+enum RequestStart {
+    Running,
+    Claim { expected: String, tree: String },
 }
 
-/// Read a step commit's `.caos/step.json`.
-fn read_step_json(step: &Commit) -> Result<StepJson, String> {
-    let tree = fresh("steptree-in");
-    caos(["get-hash", &step.tree, &tree])?;
-    let file = format!("{tree}/{STEP_DIR}/{STEP_FILE}");
-    caos(["get", &format!("{tree}/{STEP_DIR}")])?;
-    caos(["get", &file])?;
-    let text = fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("parsing {STEP_FILE}: {e}"))?;
-    let arr = |key: &str| -> Result<Vec<Value>, String> {
-        v[key]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| format!("{STEP_FILE} has no {key} array"))
-    };
-    Ok(StepJson {
-        results: arr("results")?,
-        content: arr("content")?,
+fn request_start_disposition(
+    log: &progress::ConversationLog,
+    run: &str,
+    head: &str,
+) -> Result<RequestStart, String> {
+    let position = log
+        .events
+        .iter()
+        .position(|event| event.commit == head)
+        .ok_or_else(|| format!("request head {head} is not on the conversation event spine"))?;
+
+    if let Some(recorded) = request_after_head(log, position)? {
+        if recorded != run {
+            return Err(format!(
+                "request head {head} already belongs to request {recorded}, not {run}"
+            ));
+        }
+        return Ok(RequestStart::Running);
+    }
+
+    if log.events[position]
+        .value
+        .get("status")
+        .and_then(Value::as_str)
+        != Some("queued")
+    {
+        return Err(format!("request head {head} is not a queued event"));
+    }
+    let latest_status = log.events[position..]
+        .iter()
+        .filter_map(|event| event.value.get("status"))
+        .last()
+        .and_then(Value::as_str);
+    if latest_status != Some("queued") {
+        return Err(format!(
+            "queued request head {head} is no longer current (status {})",
+            latest_status.unwrap_or("invalid")
+        ));
+    }
+    let tree = log
+        .events
+        .last()
+        .map(|event| event.tree.clone())
+        .ok_or("conversation has no events")?;
+    Ok(RequestStart::Claim {
+        expected: log.head.clone(),
+        tree,
     })
+}
+
+fn request_after_head(
+    log: &progress::ConversationLog,
+    position: usize,
+) -> Result<Option<String>, String> {
+    let request = log.events[position + 1..]
+        .iter()
+        .find_map(|event| event.value.get("request").and_then(Value::as_str))
+        .map(str::to_string);
+    if let Some(request) = &request {
+        validate_run_hash(request)?;
+    }
+    Ok(request)
+}
+
+fn request_for_head(log: &progress::ConversationLog, head: &str) -> Result<String, String> {
+    let position = log
+        .events
+        .iter()
+        .position(|event| event.commit == head)
+        .ok_or_else(|| format!("request head {head} is not on the conversation event spine"))?;
+    let request = request_after_head(log, position)?
+        .ok_or_else(|| format!("request head {head} is not followed by a request event"))?;
+    Ok(request)
+}
+
+fn validate_run_hash(run: &str) -> Result<(), String> {
+    if run.len() != 40 || !run.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("invalid conversation run hash {run:?}"));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RoundState {
+    round: u64,
+    calls: Vec<Value>,
+    pending: Vec<Value>,
+}
+
+fn event_run_round(event: &progress::ConversationEvent) -> Result<(&str, u64), String> {
+    let run = event
+        .value
+        .get("run")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("event {} has no string run", event.commit))?;
+    validate_run_hash(run)?;
+    let round = event
+        .value
+        .get("round")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("event {} has no integer round", event.commit))?;
+    Ok((run, round))
+}
+
+fn latest_round(log: &progress::ConversationLog, run: &str) -> Result<Option<RoundState>, String> {
+    let mut response_index = None;
+    let mut round = 0;
+    let mut calls = Vec::new();
+    for (index, event) in log.events.iter().enumerate() {
+        if event.value.get("response").is_none() {
+            continue;
+        }
+        let (event_run, event_round) = event_run_round(event)?;
+        if event_run != run {
+            continue;
+        }
+        if response_index.is_some() && event_round <= round {
+            return Err(format!(
+                "run {run} has non-increasing response round {event_round}"
+            ));
+        }
+        let response = event.value["response"]
+            .as_array()
+            .ok_or_else(|| format!("response event {} is not an array", event.commit))?;
+        calls = response
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .cloned()
+            .collect();
+        response_index = Some(index);
+        round = event_round;
+    }
+    let Some(response_index) = response_index else {
+        return Ok(None);
+    };
+
+    let mut answered = std::collections::HashSet::new();
+    for event in &log.events[response_index + 1..] {
+        let Some(result) = event.value.get("result") else {
+            continue;
+        };
+        let (event_run, event_round) = event_run_round(event)?;
+        if event_run != run || event_round != round {
+            continue;
+        }
+        let id = result
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("result event {} has no tool_use_id", event.commit))?;
+        if !answered.insert(id.to_string()) {
+            return Err(format!(
+                "run {run} round {round} has duplicate result for call {id}"
+            ));
+        }
+    }
+    let mut seen_calls = std::collections::HashSet::new();
+    for call in &calls {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("tool_use block has no string id")?;
+        if !seen_calls.insert(id) {
+            return Err(format!("run {run} round {round} repeats call id {id}"));
+        }
+    }
+    if let Some(unexpected) = answered.iter().find(|id| !seen_calls.contains(id.as_str())) {
+        return Err(format!(
+            "run {run} round {round} has a result for unknown call {unexpected}"
+        ));
+    }
+    let pending = calls
+        .iter()
+        .filter(|call| {
+            call.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !answered.contains(id))
+        })
+        .cloned()
+        .collect();
+    Ok(Some(RoundState {
+        round,
+        calls,
+        pending,
+    }))
+}
+
+fn terminal_for_run<'a>(
+    log: &'a progress::ConversationLog,
+    run: &str,
+) -> Result<Option<&'a progress::ConversationEvent>, String> {
+    for event in log.events.iter().rev() {
+        if event.value.get("run").and_then(Value::as_str) != Some(run) {
+            continue;
+        }
+        if matches!(
+            event.value.get("status").and_then(Value::as_str),
+            Some("idle" | "failed" | "canceled")
+        ) {
+            return Ok(Some(event));
+        }
+    }
+    Ok(None)
+}
+
+fn finish_from_terminal(event: &progress::ConversationEvent) -> Result<(), String> {
+    match event.value.get("status").and_then(Value::as_str) {
+        Some("idle") => forward_commit(&event.commit),
+        Some(status) => Err(event
+            .value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("conversation request ended {status}"))),
+        None => Err(format!("terminal event {} has no status", event.commit)),
+    }
+}
+
+fn forward_commit(hash: &str) -> Result<(), String> {
+    let source = fresh("terminal");
+    caos(["get-hash", hash, &source])?;
+    forward(&source, "/cas/out")
+}
+
+fn canonical_workspace(log: &progress::ConversationLog) -> Result<(String, String), String> {
+    let tree = log
+        .events
+        .last()
+        .map(|event| event.tree.as_str())
+        .ok_or("conversation has no events")?;
+    let ws = fresh("ws-canonical");
+    caos(["get-hash", tree, &ws])?;
+    let wc = fresh("wc-canonical");
+    caos(["get-hash", &log.head, &wc])?;
+    Ok((ws, wc))
+}
+
+const MAX_PENDING_APPEND_ATTEMPTS: usize = 32;
+
+struct ReloadedPending {
+    head: String,
+    /// None means Q already has a durable status at `head`.
+    workspace: Option<String>,
+}
+
+/// Retry a pending append after a ref race. `reload` must derive the proposal
+/// from the latest canonical tree; blindly retrying the original tree would
+/// discard a concurrent workspace change.
+fn retry_pending_append<A, R>(
+    initial_head: &str,
+    initial_workspace: &str,
+    mut append: A,
+    mut reload: R,
+) -> Result<String, String>
+where
+    A: FnMut(&str, &str) -> Result<progress::ConditionalAppend, String>,
+    R: FnMut() -> Result<ReloadedPending, String>,
+{
+    let mut head = initial_head.to_string();
+    let mut workspace = initial_workspace.to_string();
+    for _ in 0..MAX_PENDING_APPEND_ATTEMPTS {
+        match append(&head, &workspace)? {
+            progress::ConditionalAppend::Appended(appended) => return Ok(appended.commit),
+            progress::ConditionalAppend::HeadChanged(_) => {
+                let latest = reload()?;
+                head = latest.head;
+                let Some(rebuilt) = latest.workspace else {
+                    return Ok(head);
+                };
+                workspace = rebuilt;
+            }
+        }
+    }
+    Err(format!(
+        "conversation kept changing while recording async task pending after {MAX_PENDING_APPEND_ATTEMPTS} attempts"
+    ))
+}
+
+fn record_async_pending(
+    cfg: &Config,
+    task: &str,
+    observed_head: &str,
+    pending_workspace: &str,
+) -> Result<(), String> {
+    validate_run_hash(task)?;
+    let event = json!({"v": 2});
+    let conversation = conversation(cfg)?;
+    retry_pending_append(
+        observed_head,
+        pending_workspace,
+        |expected, workspace| {
+            progress::append_event_at_head_with_parent(
+                conversation,
+                expected,
+                &event,
+                &cas_hash(workspace)?,
+                None,
+            )
+        },
+        || {
+            let log = progress::conversation_log(conversation)?;
+            let (workspace, _) = canonical_workspace(&log)?;
+            Ok(ReloadedPending {
+                head: log.head,
+                workspace: async_work::ensure_pending_workspace(&workspace, task)?,
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// Re-admit every Q whose latest durable state is pending. Failures are
+/// intentionally warnings: the status remains on F and a later invocation
+/// retries the same exact Q. Validation inside `readmit_task` prevents a
+/// forged event from targeting any ref except this conversation's head.
+fn readmit_pending_async(
+    cfg: &Config,
+    log: &progress::ConversationLog,
+) -> Result<(), String> {
+    let (workspace, _) = canonical_workspace(log)?;
+    let tasks = async_work::tasks(&workspace)?
+        .into_iter()
+        .filter_map(|(task, status)| (status == "pending").then_some(task))
+        .collect::<Vec<_>>();
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let conversation = conversation(cfg)?;
+    for task in tasks {
+        if let Err(error) = async_work::readmit_task(&task, conversation) {
+            eprintln!("llm-step: could not re-admit pending async task {task}: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn resume_run(
+    cfg: &Config,
+    run: &str,
+    head_hash: &str,
+    log: progress::ConversationLog,
+) -> Result<(), String> {
+    readmit_pending_async(cfg, &log)?;
+    if let Some(terminal) = terminal_for_run(&log, run)? {
+        return finish_from_terminal(terminal);
+    }
+    let active = active_request(&log)?;
+    if active != run || request_for_head(&log, head_hash).as_deref() != Ok(run) {
+        return Err(format!(
+            "request {run} is stale; conversation is running {active}"
+        ));
+    }
+    let (ws, wc) = canonical_workspace(&log)?;
+    if let Some(state) = latest_round(&log, run)? {
+        if !state.pending.is_empty() {
+            let base_head = log.head.clone();
+            return drive(
+                cfg,
+                ws,
+                wc,
+                head_hash,
+                &state.pending,
+                run,
+                state.round,
+                base_head,
+            );
+        }
+        let messages = event_messages(&log, true)?;
+        let prev = log.head.clone();
+        let next_round = state
+            .round
+            .checked_add(1)
+            .ok_or_else(|| format!("run {run} exhausted its round counter"))?;
+        return llm_round(cfg, messages, &ws, head_hash, &prev, run, next_round);
+    }
+    let messages = event_messages(&log, true)?;
+    let prev = log.head.clone();
+    llm_round(cfg, messages, &ws, head_hash, &prev, run, 0)
+}
+
+/// Rebuild the Anthropic transcript from events. User interjections that land
+/// while a tool batch is outstanding are held until all of that response's
+/// results can be emitted together, in call order, immediately after the
+/// assistant tool-use message.
+fn event_messages(
+    log: &progress::ConversationLog,
+    include_async_status: bool,
+) -> Result<Vec<Value>, String> {
+    struct ToolBatch {
+        run: String,
+        round: u64,
+        ids: Vec<String>,
+        results: std::collections::HashMap<String, Value>,
+        deferred_users: Vec<Value>,
+    }
+
+    fn flush_batch(messages: &mut Vec<Value>, batch: &mut Option<ToolBatch>) -> Result<(), String> {
+        let Some(current) = batch.take() else {
+            return Ok(());
+        };
+        if current.results.len() != current.ids.len() {
+            *batch = Some(current);
+            return Ok(());
+        }
+        let results = current
+            .ids
+            .iter()
+            .map(|id| {
+                current
+                    .results
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("missing result for call {id}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.push(message("user", Value::Array(results)));
+        messages.extend(current.deferred_users);
+        Ok(())
+    }
+
+    let mut messages = Vec::new();
+    let mut batch: Option<ToolBatch> = None;
+    for event in &log.events {
+        if let Some(response) = event.value.get("response") {
+            if batch.is_some() {
+                flush_batch(&mut messages, &mut batch)?;
+                if batch.is_some() {
+                    return Err(format!(
+                        "response event {} arrived before the preceding tool batch completed",
+                        event.commit
+                    ));
+                }
+            }
+            let blocks = response.as_array().ok_or_else(|| {
+                format!(
+                    "conversation response event {} is not an array",
+                    event.commit
+                )
+            })?;
+            messages.push(message("assistant", Value::Array(blocks.clone())));
+            let ids = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .map(|call| {
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            format!("response event {} has a call without an id", event.commit)
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !ids.is_empty() {
+                let (run, round) = event_run_round(event)?;
+                batch = Some(ToolBatch {
+                    run: run.to_string(),
+                    round,
+                    ids,
+                    results: std::collections::HashMap::new(),
+                    deferred_users: Vec::new(),
+                });
+            }
+        }
+        if let Some(result) = event.value.get("result") {
+            let (run, round) = event_run_round(event)?;
+            let current = batch.as_mut().ok_or_else(|| {
+                format!(
+                    "result event {} has no preceding tool response",
+                    event.commit
+                )
+            })?;
+            if current.run != run || current.round != round {
+                return Err(format!(
+                    "result event {} belongs to {run}/{round}, expected {}/{}",
+                    event.commit, current.run, current.round
+                ));
+            }
+            let id = result
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("result event {} has no tool_use_id", event.commit))?;
+            if !current.ids.iter().any(|expected| expected == id) {
+                return Err(format!(
+                    "result event {} names unknown call {id}",
+                    event.commit
+                ));
+            }
+            if current
+                .results
+                .insert(id.to_string(), result.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "result event {} duplicates call {id}",
+                    event.commit
+                ));
+            }
+            flush_batch(&mut messages, &mut batch)?;
+        }
+        if event.value.get("author").and_then(Value::as_str) == Some("user") {
+            let content = event
+                .value
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("user event {} has no string content", event.commit))?;
+            let user = user_text(content);
+            if let Some(current) = batch.as_mut() {
+                current.deferred_users.push(user);
+            } else {
+                messages.push(user);
+            }
+        }
+    }
+    flush_batch(&mut messages, &mut batch)?;
+    if include_async_status {
+        let (workspace, _) = canonical_workspace(log)?;
+        for (task, status) in async_work::tasks(&workspace)? {
+            if matches!(status.as_str(), "complete" | "failed" | "canceled") {
+                messages.push(user_text(&format!(
+                    "Independent task {task} is {status}. Its result is addressed by that task hash."
+                )));
+            }
+        }
+    }
+    Ok(messages)
+}
+
+fn append_tool_result(
+    cfg: &Config,
+    run: &str,
+    round: u64,
+    base_head: &str,
+    result: &Value,
+    tree: &str,
+    extra_parent: Option<&str>,
+) -> Result<(), String> {
+    let call_id = result
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .ok_or("tool result block has no tool_use_id")?;
+    for _ in 0..32 {
+        let current = progress::conversation_log(conversation(cfg)?)?;
+        if let Some(existing) = current.events.iter().find(|event| {
+            event.value.get("run").and_then(Value::as_str) == Some(run)
+                && event.value.get("round").and_then(Value::as_u64) == Some(round)
+                && event
+                    .value
+                    .get("result")
+                    .and_then(|value| value.get("tool_use_id"))
+                    .and_then(Value::as_str)
+                    == Some(call_id)
+        }) {
+            if existing.value.get("result") != Some(result) {
+                return Err(format!(
+                    "call {call_id} in run {run} round {round} has conflicting results"
+                ));
+            }
+            return Ok(());
+        }
+        if terminal_for_run(&current, run)?.is_some()
+            || active_request(&current).as_deref() != Ok(run)
+        {
+            return Err(format!("result for stale request {run}, call {call_id}"));
+        }
+        let state = latest_round(&current, run)?
+            .ok_or_else(|| format!("result for run {run} before any model response"))?;
+        if state.round != round
+            || !state
+                .calls
+                .iter()
+                .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
+        {
+            return Err(format!(
+                "call {call_id} is not pending in run {run} round {round}"
+            ));
+        }
+        let base_tree = current
+            .events
+            .iter()
+            .find(|event| event.commit == base_head)
+            .map(|event| event.tree.as_str())
+            .ok_or_else(|| format!("tool base {base_head} is not on the event spine"))?;
+        let current_tree = current
+            .events
+            .last()
+            .map(|event| event.tree.as_str())
+            .ok_or("conversation has no events")?;
+        let merged_tree = progress::retry_tree(base_tree, tree, current_tree)?;
+        let event = json!({"v": 2, "run": run, "round": round, "result": result});
+        match progress::append_event_at_head_with_parent(
+            conversation(cfg)?,
+            &current.head,
+            &event,
+            &merged_tree,
+            extra_parent,
+        )? {
+            progress::ConditionalAppend::Appended(_) => return Ok(()),
+            progress::ConditionalAppend::HeadChanged(_) => continue,
+        }
+    }
+    Err(format!(
+        "conversation kept changing while recording call {call_id}"
+    ))
+}
+
+fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let run = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+    for _ in 0..32 {
+        let log = progress::conversation_log(conversation)?;
+        if terminal_for_run(&log, &run)?.is_some() {
+            return Ok(());
+        }
+        if active_request(&log).as_deref() != Ok(run.as_str()) {
+            return Ok(());
+        }
+        if let Some(state) = latest_round(&log, &run)? {
+            if let Some(call) = state.pending.first() {
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("pending tool call has no id")?;
+                let result = json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "is_error": true,
+                    "content": [{"type": "text", "text": format!(
+                        "the request stopped before this tool completed: {error}"
+                    )}],
+                });
+                let tree = log
+                    .events
+                    .last()
+                    .map(|event| event.tree.clone())
+                    .ok_or("conversation has no events")?;
+                append_tool_result(cfg, &run, state.round, &log.head, &result, &tree, None)?;
+                continue;
+            }
+        }
+        let tree = log
+            .events
+            .last()
+            .map(|event| event.tree.as_str())
+            .ok_or("conversation has no events")?;
+        let round = latest_round(&log, &run)?.map_or(0, |state| state.round);
+        let event = json!({
+            "v": 2,
+            "run": run,
+            "round": round,
+            "status": "failed",
+            "request": Value::Null,
+            "error": error,
+        });
+        match progress::append_event_at_head(conversation, &log.head, &event, tree)? {
+            progress::ConditionalAppend::Appended(_) => return Ok(()),
+            progress::ConditionalAppend::HeadChanged(_) => continue,
+        }
+    }
+    Err("conversation kept changing while recording request failure".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1669,9 @@ fn read_step_json(step: &Commit) -> Result<StepJson, String> {
 fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
+    if cfg.run_and_update_ref_image.is_some() {
+        tools.push(async_work::declaration());
+    }
     if cfg.grep_image.is_some() {
         tools.push(tools::grep_declaration());
     }
@@ -1287,24 +1891,6 @@ fn response_text(blocks: &[Value]) -> String {
         .join("\n\n")
 }
 
-/// Author `caos-agent` at wall-clock now — step/turn commits carry real
-/// timestamps, so a retried turn is a distinct commit.
-fn agent_now() -> Option<(&'static str, i64)> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    Some((AGENT_AUTHOR, now))
-}
-
-/// Parse a curried JSON array of blocks (`pending` / `results`).
-fn parse_blocks(text: &str, what: &str) -> Result<Vec<Value>, String> {
-    let v: Value = serde_json::from_str(text).map_err(|e| format!("parsing {what}: {e}"))?;
-    v.as_array()
-        .cloned()
-        .ok_or_else(|| format!("{what} is not a JSON array"))
-}
-
 /// A fresh, unique direct-child CAS path (CAS paths are single-assignment).
 fn fresh(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1315,6 +1901,218 @@ fn fresh(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log(values: Vec<Value>) -> progress::ConversationLog {
+        progress::ConversationLog {
+            head: "f".repeat(40),
+            events: values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| progress::ConversationEvent {
+                    commit: format!("{index:040x}"),
+                    tree: "a".repeat(40),
+                    value,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn canonical_log_tracks_pending_calls_by_run_and_round() {
+        let run = "b".repeat(40);
+        let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{"path":"a"}});
+        let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{"path":"b"}});
+        let history = log(vec![
+            json!({"v":2,"author":"user","content":"hello","status":"queued"}),
+            json!({"v":2,"request":run,"status":"running"}),
+            json!({"v":2,"run":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
+            json!({"v":2,"run":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+        ]);
+
+        assert_eq!(active_request(&history).unwrap(), run);
+        let state = latest_round(&history, &run).unwrap().unwrap();
+        assert_eq!(state.round, 0);
+        assert_eq!(state.pending, [call_b]);
+        // An incomplete tool batch is not sent back to Anthropic yet.
+        assert_eq!(
+            event_messages(&history, false).unwrap(),
+            [
+                json!({"role":"user","content":"hello"}),
+                json!({"role":"assistant","content":[call_a, state.calls[1].clone()]})
+            ]
+        );
+    }
+
+    #[test]
+    fn interjections_follow_a_complete_ordered_tool_result_batch() {
+        let run = "b".repeat(40);
+        let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{}});
+        let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{}});
+        let history = log(vec![
+            json!({"v":2,"author":"user","content":"start"}),
+            json!({"v":2,"run":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
+            json!({"v":2,"run":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"v":2,"author":"user","content":"also do this"}),
+            json!({"v":2,"run":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
+        ]);
+        assert_eq!(
+            event_messages(&history, false).unwrap(),
+            [
+                json!({"role":"user","content":"start"}),
+                json!({"role":"assistant","content":[call_a,call_b]}),
+                json!({"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"a","content":"one"},
+                    {"type":"tool_result","tool_use_id":"b","content":"two"}
+                ]}),
+                json!({"role":"user","content":"also do this"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn result_ids_are_scoped_to_their_round() {
+        let run = "b".repeat(40);
+        let call = json!({"type":"tool_use","id":"same","name":"read","input":{}});
+        let result = json!({"type":"tool_result","tool_use_id":"same","content":"ok"});
+        let history = log(vec![
+            json!({"v":2,"run":run,"round":0,"response":[call.clone()]}),
+            json!({"v":2,"run":run,"round":0,"result":result}),
+            json!({"v":2,"run":run,"round":1,"response":[call]}),
+        ]);
+        let state = latest_round(&history, &run).unwrap().unwrap();
+        assert_eq!(state.round, 1);
+        assert_eq!(state.pending.len(), 1);
+    }
+
+    #[test]
+    fn terminal_is_identified_by_run() {
+        let old = "a".repeat(40);
+        let current = "b".repeat(40);
+        let history = log(vec![
+            json!({"v":2,"run":old,"round":0,"status":"idle","request":null}),
+            json!({"v":2,"request":current,"status":"running"}),
+        ]);
+        assert!(terminal_for_run(&history, &old).unwrap().is_some());
+        assert!(terminal_for_run(&history, &current).unwrap().is_none());
+    }
+
+    #[test]
+    fn queued_start_claims_after_user_interjections() {
+        let run = "b".repeat(40);
+        let queued = format!("{:040x}", 0);
+        let history = log(vec![
+            json!({"v":2,"author":"user","content":"start","status":"queued"}),
+            json!({"v":2,"author":"user","content":"also this"}),
+        ]);
+        assert_eq!(
+            request_start_disposition(&history, &run, &queued).unwrap(),
+            RequestStart::Claim {
+                expected: "f".repeat(40),
+                tree: "a".repeat(40),
+            }
+        );
+    }
+
+    #[test]
+    fn recorded_start_is_idempotent_and_conflicting_start_is_rejected() {
+        let run = "b".repeat(40);
+        let other = "c".repeat(40);
+        let queued = format!("{:040x}", 0);
+        let history = log(vec![
+            json!({"v":2,"author":"user","content":"start","status":"queued"}),
+            json!({"v":2,"request":run,"status":"running"}),
+        ]);
+        assert_eq!(
+            request_start_disposition(&history, &run, &queued).unwrap(),
+            RequestStart::Running
+        );
+        let error = request_start_disposition(&history, &other, &queued).unwrap_err();
+        assert!(error.contains(&run), "{error}");
+    }
+
+    #[test]
+    fn queued_start_cannot_claim_after_state_moves_on() {
+        let run = "b".repeat(40);
+        let queued = format!("{:040x}", 0);
+        let history = log(vec![
+            json!({"v":2,"author":"user","content":"start","status":"queued"}),
+            json!({"v":2,"status":"failed"}),
+        ]);
+        let error = request_start_disposition(&history, &run, &queued).unwrap_err();
+        assert!(error.contains("no longer current"), "{error}");
+    }
+
+    #[test]
+    fn pending_append_rebuilds_after_a_head_race() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let mut reloads = 0;
+        let committed = retry_pending_append(
+            "head-0",
+            "workspace-0",
+            |head, workspace| {
+                attempts
+                    .borrow_mut()
+                    .push((head.to_string(), workspace.to_string()));
+                if head == "head-0" {
+                    Ok(progress::ConditionalAppend::HeadChanged(
+                        "head-1".to_string(),
+                    ))
+                } else {
+                    Ok(progress::ConditionalAppend::Appended(
+                        progress::AppendResult {
+                            commit: "pending-commit".to_string(),
+                            previous_head: head.to_string(),
+                            retries: 0,
+                        },
+                    ))
+                }
+            },
+            || {
+                reloads += 1;
+                Ok(ReloadedPending {
+                    head: "head-1".to_string(),
+                    workspace: Some("workspace-1-with-pending".to_string()),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(committed, "pending-commit");
+        assert_eq!(reloads, 1);
+        assert_eq!(
+            attempts.into_inner(),
+            [
+                ("head-0".to_string(), "workspace-0".to_string()),
+                (
+                    "head-1".to_string(),
+                    "workspace-1-with-pending".to_string()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_append_accepts_a_concurrent_durable_record() {
+        let mut attempts = 0;
+        let head = retry_pending_append(
+            "head-0",
+            "workspace-0",
+            |_, _| {
+                attempts += 1;
+                Ok(progress::ConditionalAppend::HeadChanged(
+                    "head-1".to_string(),
+                ))
+            },
+            || {
+                Ok(ReloadedPending {
+                    head: "head-1".to_string(),
+                    workspace: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(head, "head-1");
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn theirs_lookup() {

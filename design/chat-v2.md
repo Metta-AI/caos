@@ -1,6 +1,6 @@
 # Chat v2: minimal durable model
 
-**Status:** from-scratch proposal, not a migration plan.
+**Status:** from-scratch design, not a migration plan.
 
 ## Distilled
 
@@ -17,7 +17,8 @@ receive-pack push.
 
 An event commit has the previous event as first parent, the current workspace
 plus reserved `.caos` state as its tree, and a key/value message. `author` plus
-`content` adds a transcript message; for other keys, the newest value wins.
+`content` adds a transcript message; human messages keep `author: user` and add
+`username` for display. For other keys, the newest value wins.
 
 A CAS loser retries on the new head. Text-only events take its tree; workspace
 changes use a three-way merge. Clean Git merges may still require event-specific
@@ -26,6 +27,10 @@ logical checks.
 The client commits a queued user event, then starts the `llm-step` CAOS request.
 The request hash is the run identity. `llm-step` records every durable step on
 `F`; clients only follow the ref.
+
+Any number of clients may follow and append to `F`. Concurrent idle submits
+CAS-serialize: the winner starts the request and each loser retries as an
+interjection into that request. No client starts a competing run.
 
 ### Tool calls
 
@@ -148,14 +153,15 @@ If `head` moved to `C`, merge `C` and `U` instead. This is ordinary
 A new-turn event sets `status: queued`. That commit plus the fixed `llm-step`
 configuration determines an ArgTree request hash `R`; `R` is the run identity,
 so there is no separate run ID. An interjection only appends its message; the
-active run notices it.
+active run notices it at its next recovery boundary. Human events always use
+`author: user` for model semantics and carry a separate `username` for display.
 
 The client calls `/run?req=R`. CAOS already uses `R` as its cache and
 single-flight key, so concurrent or repeated calls are a generic CAOS concern,
 not chat state. Completed results are cached and normally pinned under `res/R`.
 
 CAOS does not yet durably queue in-flight resolution across a server restart.
-Chat v1 need not solve that: the queued user event and every completed remote
+Chat v2 need not solve that: the queued user event and every completed remote
 event remain on `head`, so reopening the chat can issue `R` again and
 `llm-step` can recover. A future durable CAOS work queue would make restart
 automatic without changing the conversation model.
@@ -177,7 +183,7 @@ commit is already in the server's object database, that push needs no objects:
 just the `(A -> B)` command and an empty pack.
 
 Thus `llm-step` itself updates the conversation ref. The current worker already
-does exactly this for progress refs with a small receive-pack client. Chat v1
+does exactly this for progress refs with a small receive-pack client. Chat v2
 can extend that code to `head`; tool workers do not update conversation refs.
 A rejected update is rebuilt and retried as above.
 
@@ -217,6 +223,7 @@ remains the complete ordered conversation.
 **Client**
 
 - fetch `head`, create the user's event locally, and CAS-push it;
+- label human events with its `username` while preserving `author: user`;
 - start `llm-step` when the submitted event needs a new run;
 - follow `head` and render its message map;
 - own drafts and UI state, but no remote execution state.

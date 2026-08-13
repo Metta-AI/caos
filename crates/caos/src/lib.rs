@@ -783,7 +783,7 @@ impl GitTransport {
     /// avoids the one shared worktree file otherwise touched by concurrent
     /// raw-object fetches; fetched objects still land in the shared object
     /// database.
-    fn fetch_object(&self, hash: &str) -> Result<(), String> {
+    pub(crate) fn fetch_object(&self, hash: &str) -> Result<(), String> {
         self.run_git(&[
             "-c",
             "fetch.negotiationAlgorithm=noop",
@@ -808,6 +808,7 @@ impl GitTransport {
     /// single-round *and* the pack stays minimal — without it, a turn fetch in
     /// a repo with real history re-downloads the whole workspace closure every
     /// turn (measured: ~10s of index-pack CPU per turn on a large repo).
+    #[cfg(test)]
     pub(crate) fn fetch_object_negotiated(&self, hash: &str, tip: &str) -> Result<(), String> {
         self.run_git(&[
             "-c",
@@ -1536,6 +1537,22 @@ pub fn cas_hash(path: &str) -> Result<(), String> {
     let target = validate_descendant(&cas, path)?;
     println!("{}", read_hash(&target)?);
     Ok(())
+}
+
+/// `forward <src-cas-path> <dst-cas-path>` — record the object already named
+/// by `src` at a fresh CAS path `dst`, preserving its result kind. This is the
+/// zero-copy pass-through a continuation callback needs when its own result is
+/// exactly the prior step's blob/tree/commit.
+pub fn forward(src: &str, dst: &str) -> Result<(), String> {
+    let cas = cas_dir();
+    let source = validate_descendant(&cas, src)?;
+    let target = validate_target(&cas, dst)?;
+    probe_xattr(&cas)?;
+    let kind = result_kind(&source)?;
+    match kind.as_str() {
+        "blob" | "tree" | "commit" => write_placeholder(&target, &kind, &read_hash(&source)?),
+        other => Err(format!("cannot forward a {other} result")),
+    }
 }
 
 /// Recursively store `path` via the transport, returning the git tree entry
@@ -2293,6 +2310,30 @@ fn prepare_request(
     assemble_arg_tree(t, image, call, store)
 }
 
+/// `prepare-request <image-or-arg-tree> -- [--name=value | --name:@=path ...]`
+/// — construct the exact flat runnable ArgTree and print its hash without
+/// executing it. This is the worker-side half: CAS paths use `/cas` semantics.
+///
+/// Unlike [`caos_curry`], the result is not a partial curry node. It is the same
+/// request `run_request` would send to `/run`, so it can be recorded durably
+/// and later handed unchanged to `run-async` or `run-request-then`.
+pub fn caos_prepare_request(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+    let cas = cas_dir();
+    let image = resolve_run_image(t, &cas, image)?;
+    println!("{}", prepare_request(t, &image, Some(&cas), kvs, &[])?);
+    Ok(())
+}
+
+/// User-facing [`caos_prepare_request`]. Host paths are ingested with the same
+/// semantics as [`cli_run`], and the flat request is pushed before its hash is
+/// printed so another process can immediately run it.
+pub fn cli_prepare_request(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
+    let image = resolve_cli_image(t, image)?;
+    let store = build_secret_store(t)?;
+    println!("{}", prepare_request(t, &image, None, kvs, &store)?);
+    Ok(())
+}
+
 /// Assemble a runnable ArgTree from a base `image` ref and the caller's already
 /// resolved `call` args, folding in the reserved `image`/`salt`/`std` entries,
 /// storing it, and getting it onto the server. Returns the ArgTree hash (the
@@ -2386,12 +2427,20 @@ fn assemble_arg_tree(
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
-    record_continuation(t, "map-then", input, kvs, &["map", "then"], &[], |given| {
-        if given.is_empty() {
-            return Err("`map-then` needs --map and/or --then".to_string());
-        }
-        Ok(())
-    })
+    record_continuation(
+        t,
+        "map-then",
+        ContinuationSubject::Input(input),
+        kvs,
+        &["map", "then"],
+        &[],
+        |given| {
+            if given.is_empty() {
+                return Err("`map-then` needs --map and/or --then".to_string());
+            }
+            Ok(())
+        },
+    )
 }
 
 /// `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
@@ -2415,7 +2464,7 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     record_continuation(
         t,
         "run-then",
-        input,
+        ContinuationSubject::Input(input),
         kvs,
         &["run", "then"],
         &["catch"],
@@ -2434,18 +2483,77 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     )
 }
 
-/// Shared body of [`caos_map_then`] / [`caos_run_then`]: record a continuation
-/// `{in, <images>}` over `input` as this worker's result at `/cas/out` (a
-/// `promise` placeholder the server resolves once the job is posted). `allowed`
-/// names the image-valued entries this verb accepts — the surface split is the
-/// client-side mutual exclusion of `map` and `run` — `markers` names its bare
-/// flags (recorded as one-byte blobs; the interpreter reads only their
-/// presence), and `check` validates the set actually given, before anything is
-/// sealed.
+/// `run-request-then <R> -- [--then=<image>] [--catch]` — record a promise
+/// that runs the already-complete ArgTree `R` unchanged. With `--then`, its
+/// result is passed as that callback's sole `--result` arg; without one, R's
+/// result is this request's result. `--catch` instead passes a failed R as the
+/// callback's sole `--error` arg and therefore requires `--then`.
+///
+/// `R` may be a 40-character tree hash already stored on the server or a tree
+/// path inside `/cas`. Unlike `run-then`, no `--in` is added and no new request
+/// is assembled around an image: R's hash is the request identity executed by
+/// the promise interpreter.
+pub fn caos_run_request_then(
+    t: &dyn Transport,
+    request: &str,
+    kvs: &[String],
+) -> Result<(), String> {
+    record_continuation(
+        t,
+        "run-request-then",
+        ContinuationSubject::Request(request),
+        kvs,
+        &["then"],
+        &["catch"],
+        |given| {
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`run-request-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+/// `run-async <Q>` — ask the server to own a top-level run of the already
+/// stored ArgTree `Q`, returning as soon as it has been admitted. The wire
+/// reply keeps the ordinary `"<kind> <hash>"` shape: `"request <Q>"` here,
+/// versus the eventual result returned by blocking `/run`.
+pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
+    if !is_hex_hash(arg_tree) {
+        return Err(format!(
+            "run-async needs a 40-character ArgTree hash, got {arg_tree:?}"
+        ));
+    }
+    t.ensure_pushed(arg_tree)?;
+    let url = format!(
+        "{}/run-async?req={arg_tree}",
+        t.server_url()?.trim_end_matches('/')
+    );
+    let (kind, returned) = request_compute_url(&url, "")?;
+    if kind != "request" || returned != arg_tree {
+        return Err(format!(
+            "server admitted the wrong async request: expected request {arg_tree}, got {kind} {returned}"
+        ));
+    }
+    println!("{kind} {returned}");
+    Ok(())
+}
+
+enum ContinuationSubject<'a> {
+    Input(&'a str),
+    Request(&'a str),
+}
+
+/// Shared continuation recorder. `subject` supplies either the ordinary `in`
+/// data entry or an exact `request` ArgTree; `allowed` names image-valued
+/// entries and `markers` names bare presence flags.
 fn record_continuation(
     t: &dyn Transport,
     verb: &str,
-    input: &str,
+    subject: ContinuationSubject<'_>,
     kvs: &[String],
     allowed: &[&'static str],
     markers: &[&'static str],
@@ -2464,16 +2572,49 @@ fn record_continuation(
         ));
     }
 
-    // `in` is the data node the continuation is over: an existing CAS path,
-    // referenced as a real tree entry (mode + recorded hash) so the server knows
-    // its shape without fetching anything.
-    let in_path = validate_descendant(&cas, input)?;
-    let (in_mode, in_oid) = cas_entry(&in_path)?;
-    let mut entries = vec![Entry {
-        mode: in_mode,
-        filename: b"in".to_vec().into(),
-        oid: in_oid,
-    }];
+    let subject = match subject {
+        // `in` is the data node the continuation is over: an existing CAS path,
+        // referenced as a real tree entry (mode + recorded hash).
+        ContinuationSubject::Input(input) => {
+            let path = validate_descendant(&cas, input)?;
+            let (mode, oid) = cas_entry(&path)?;
+            Entry {
+                mode,
+                filename: b"in".to_vec().into(),
+                oid,
+            }
+        }
+        // `request` is a complete ArgTree. Store it as a tree entry so the
+        // continuation names R directly rather than a blob that must be
+        // interpreted and rebuilt.
+        ContinuationSubject::Request(request) => {
+            let (mode, oid) = if Path::new(request).starts_with(&cas) {
+                let path = validate_descendant(&cas, request)?;
+                cas_entry(&path)?
+            } else {
+                if !is_hex_hash(request) {
+                    return Err(format!(
+                        "`run-request-then` needs a 40-character ArgTree hash or /cas tree path, got {request:?}"
+                    ));
+                }
+                let (kind, _) = t.get_object(request)?;
+                if kind != "tree" {
+                    return Err(format!("request {request} is a {kind}, not a tree"));
+                }
+                (EntryKind::Tree.into(), parse_oid(request)?)
+            };
+            if !mode.is_tree() {
+                return Err(format!("request {request:?} is not a tree"));
+            }
+            t.ensure_pushed(&oid.to_string())?;
+            Entry {
+                mode: EntryKind::Tree.into(),
+                filename: b"request".to_vec().into(),
+                oid,
+            }
+        }
+    };
+    let mut entries = vec![subject];
 
     let mut given: Vec<&str> = Vec::new();
     for kv in kvs {

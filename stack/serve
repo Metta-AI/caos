@@ -190,9 +190,19 @@ if [ "$CAOS_STACK_RUNNERD" = yes ]; then
     CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
     CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
     "$CAOS_STACK_BIN/runnerd"
-  sleep 1
-  grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" \
-    || fail "runnerd did not start"
+  ok=""
+  runnerd_pid=${pids[$((${#pids[@]} - 1))]}
+  for _ in $(seq 1 30); do
+    if grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" 2>/dev/null; then
+      ok=1
+      break
+    fi
+    if ! kill -0 "$runnerd_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  [ -n "$ok" ] || fail "runnerd did not start"
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -

@@ -17,5 +17,6 @@ BASH_TOOL=curry DEEP-DEPS/bash-tool --
 GREP=curry DEEP-DEPS/rgrep --
 TOOLS=curry DEEP-DEPS/bash --
 MERGE=curry DEEP-DEPS/merge --
+ASYNC_WORKER=curry DEEP-DEPS/run-and-update-ref --
 STEP=run DEEP-DEPS/rustc -- --src:@=. --dep0:@=DEEP-DEPS/llm-client
-curry $STEP -- --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE
+curry $STEP -- --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE --run-and-update-ref-image=$ASYNC_WORKER

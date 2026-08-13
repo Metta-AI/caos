@@ -12,6 +12,8 @@
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result, optionally emitting this invocation to an open
 //!   trace stream.
+//! * `GET /run-async?req=<hash>` — ensure that same run is progressing on a
+//!   server-owned thread and return `request <hash>` without waiting for it.
 //! * `GET /trace/<id>/stream` — follow one live invocation as chunked NDJSON.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
@@ -122,7 +124,10 @@ fn main() {
     // `git push`, `allowAnySHA1InWant` lets them fetch a result by bare hash.
     // `git init --bare` is idempotent, so this is a no-op once seeded.
     let git = |args: &[&str]| {
-        let _ = std::process::Command::new("git").args(args).status();
+        run_required_git(args).unwrap_or_else(|error| {
+            eprintln!("fatal: {error}");
+            std::process::exit(1);
+        });
     };
     if gix::open(&git_dir).is_err() {
         git(&["init", "-q", "--bare", &git_dir]);
@@ -199,6 +204,20 @@ fn main() {
     // git's own side only; the in-process gix writes are `storage`'s to sync.
     git(&["-C", &git_dir, "config", "core.fsync", "objects,reference"]);
     git(&["-C", &git_dir, "config", "core.fsyncMethod", "batch"]);
+    // Conversation history has one authoritative, append-only ref. Keep its
+    // previous values as a second recovery path if the tip is damaged despite
+    // the fsync policy above. `always` is required because these refs live
+    // outside refs/heads; the ordinary bare-repository default does not log
+    // them. Never expire the recovery trail behind an active conversation.
+    git(&["-C", &git_dir, "config", "core.logAllRefUpdates", "always"]);
+    git(&["-C", &git_dir, "config", "gc.reflogExpire", "never"]);
+    git(&[
+        "-C",
+        &git_dir,
+        "config",
+        "gc.reflogExpireUnreachable",
+        "never",
+    ]);
 
     // Clear what a previous crash left behind BEFORE opening the repo: gix
     // answers "is this object stored?" for a loose object with a path-exists
@@ -256,12 +275,42 @@ fn main() {
     for request in server.incoming_requests() {
         let config = Arc::clone(&config);
         std::thread::spawn(move || {
-            if let Err(err) = handle(&config, request) {
+            if let Err(err) = handle(config, request) {
                 // Only reachable if writing the response itself fails.
                 eprintln!("failed to send response: {err}");
             }
         });
     }
+}
+
+/// Run one of the Git commands that establishes the server's storage
+/// contract. Ignoring one of these failures lets the server start in a mode
+/// where pushes, object fetches, or crash recovery are silently unsafe.
+fn run_required_git(args: &[&str]) -> Result<(), String> {
+    let command = format!(
+        "git {}",
+        args.iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|error| format!("cannot run required command {command}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    Err(if detail.is_empty() {
+        format!("required command {command} exited with {}", output.status)
+    } else {
+        format!(
+            "required command {command} exited with {}: {detail}",
+            output.status
+        )
+    })
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -300,12 +349,12 @@ impl From<std::io::Error> for HttpError {
 }
 
 /// Dispatch a single request and send its response.
-fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
+fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     // Git smart-HTTP (the `caos` remote) is served by a separate CGI delegate that
     // sets its own status/headers, so it bypasses the `route` -> `from_data` path.
     let path = request.url().split('?').next().unwrap_or("").to_string();
     if git::is_git_path(&path) {
-        return git::serve(config, request);
+        return git::serve(&config, request);
     }
     // The WORLD guard (design/test-stack-image.md): a caos client built for
     // the other world must not drive this stack. The dangerous crossing is
@@ -355,7 +404,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
         }
     }
 
-    match route(config, &mut request) {
+    match route(&config, &mut request) {
         Ok(body) => request.respond(Response::from_data(body)),
         Err(err) => request.respond(
             Response::from_string(format!("{}\n", err.message))
@@ -367,7 +416,7 @@ fn handle(config: &Config, mut request: Request) -> std::io::Result<()> {
 /// Match the request to a handler and produce the response body. Serves the
 /// storage endpoints (`/object*`), compute (`/run`), and the runner protocol
 /// (`/runner/poll`, `/runner/result`).
-fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
+fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpError> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -385,6 +434,17 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
             compute::run(config, &query, &secrets_header)
+        }
+        Method::Get if path == "/run-async" => {
+            // Same ephemeral context as `/run`. The background thread owns the
+            // parsed copy after this request has returned.
+            let secrets_header = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(secrets::HEADER))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap_or_default();
+            compute::run_async(Arc::clone(config), query, secrets_header)
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
@@ -414,5 +474,29 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
             }
         }
         _ => Err(HttpError::new(404, "not found")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_required_git;
+
+    #[test]
+    fn required_git_command_reports_nonzero_status() {
+        let absent = std::env::temp_dir().join(format!(
+            "caos-required-git-test-{}-absent",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&absent).ok();
+        let error = run_required_git(&[
+            "-C",
+            absent.to_str().unwrap(),
+            "config",
+            "http.receivepack",
+            "true",
+        ])
+        .unwrap_err();
+        assert!(error.contains("required command git"), "{error}");
+        assert!(error.contains("exited with"), "{error}");
     }
 }

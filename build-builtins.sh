@@ -37,7 +37,9 @@ cd "$(dirname "$0")"
 PROJECT=$PWD
 
 names=("$@")
-[ ${#names[@]} -eq 0 ] && names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step deep-deps rustc llm-stub)
+if [ ${#names[@]} -eq 0 ]; then
+  names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step run-and-update-ref deep-deps rustc llm-stub)
+fi
 
 # Which entries have a HOST-BUILT nix image behind them. This is the whole
 # partition: everything else is a checked-in source directory this script
@@ -331,7 +333,9 @@ if [ -n "$runner_delta" ]; then
   # shellcheck disable=SC2086
   for p in $bin_paths; do
     for b in "${bin_names[@]}"; do
-      [ -x "$p/bin/worker-$b" ] && bin_path[$b]=$p
+      if [ -x "$p/bin/worker-$b" ]; then
+        bin_path[$b]=$p
+      fi
     done
   done
 fi
