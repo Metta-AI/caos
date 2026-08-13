@@ -15,6 +15,7 @@
 # test loudly rather than letting it borrow something ambient. An
 # unnecessary line only over-keys the test, so when in doubt, declare.
 ../../std/bash-tool bash-tool
+../../std/bash bash
 ../../std/llm-step llm-step
 ../../std/cargo cargo
 ../../std/flake-builder flake-builder

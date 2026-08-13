@@ -144,7 +144,12 @@ pub(crate) fn run(
     let result = result?;
     // Pin an external run's result so a client can fetch it by ref and it
     // survives gc; sub-runs set no ref (they'd flood the namespace).
-    pin_result(config, &arg_tree, &result);
+    // For a blocking caller this ref is convenient; for a disconnected caller
+    // it is the only durable way to discover the eventual result from Q.
+    // Therefore a run is not successful until publication succeeds. Repeating
+    // exact Q is safe: the compute result is cached, and the retry comes
+    // straight back here.
+    pin_result(config, &arg_tree, &result)?;
     Ok(format!("{result}\n").into_bytes())
 }
 
@@ -631,9 +636,10 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 
 // ---- Promise resolution ------------------------------------------------------
 
-/// Resolve a continuation — a tree `{in, map?, run?, then?, catch?}` where `in`
-/// is a real tree entry (the data node) and `map`/`run`/`then` are blobs naming
-/// images (see `design/map-then.md`). `map` and `run` are mutually exclusive
+/// Resolve a continuation — either `{in, map?|run?|then?, catch?}` or
+/// `{request, then?, catch?}`. `request` is a tree entry naming an already
+/// complete ArgTree, executed unchanged; `map`/`run`/`then` are blobs naming
+/// images. The three middle forms `map`/`run`/`request` are mutually exclusive
 /// (the client already refuses to record both; this is defense in depth). One
 /// resolution path covers both forms — a *middle step*, then `then`:
 ///
@@ -642,24 +648,22 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 ///    into a `children` tree under the original names;
 /// 2. if `run` is given: one sub-run, `run(--in=<in>)` — the single-valued
 ///    form. Its result R may be any kind (a commit as much as a blob/tree);
-/// 3. the result is `then(--in=<in>[, --children=<children> | --result=<R>])`
-///    if `then` is given (the extra arg only when a middle step ran), else the
-///    middle step's own result — the `children` tree, or R. With no middle
-///    step, `then(--in=<in>)` is a plain tail call.
+/// 3. if `request` is given: run exactly that ArgTree, adding no args;
+/// 4. `then` receives the available args: `--in` for the image forms, plus
+///    `--children`/`--result`; the exact-request form passes only `--result`.
 ///
 /// Every sub-run goes through [`run_work_request`], so promises nest arbitrarily (a map
 /// child, a `run`, or a `then` may itself promise) and each sub-run gets its
 /// own memoization and cycle detection (via `stack`).
 ///
-/// **`catch`** (a marker blob, `run` only) makes a FAILING `run` a value the
-/// `then` receives rather than an error that propagates: `then(--in=<in>,
-/// --error=<blob>)`, the blob holding the failure text, exactly where
-/// `--result` would have been. Without it a failed sub-run fails the whole
+/// **`catch`** (a marker blob, `run` or `request`) makes a failing middle step a
+/// value `then` receives as `--error=<blob>`, exactly where `--result` would
+/// have been. Without it a failed sub-run fails the whole
 /// request, which is the right default for a pipeline — but wrong for a driver
 /// that must survive its callee, the agent loop being the case that forced it
-/// (`design/agent-harness.md`, "Tool failures are values"). Scoped to `run`
-/// deliberately: a caught `map` would have to say WHICH child failed and what
-/// the surviving siblings' results mean, and nothing needs that yet.
+/// (`design/agent-harness.md`, "Tool failures are values"). A caught `map`
+/// would have to say WHICH child failed and what the surviving siblings'
+/// results mean, so catch remains single-valued (`run` or `request`).
 ///
 /// The bool in the return says a catch fired. It rides out to [`run_dispatch`]
 /// so the enclosing request is NOT memoized: sub-run failures are uncached by
@@ -678,6 +682,7 @@ fn resolve_promise(
     use gix::objs::tree::EntryKind;
 
     let mut input: Option<gix::objs::tree::Entry> = None;
+    let mut request: Option<String> = None;
     let (mut map, mut run, mut then) = (None, None, None);
     let mut catch = false;
     for entry in fetch_tree(config, cont)
@@ -685,6 +690,13 @@ fn resolve_promise(
     {
         match entry.name.as_str() {
             "in" => input = Some(named_entry("in", entry.mode, entry.oid)),
+            "request" if entry.mode.is_tree() => request = Some(entry.oid.to_string()),
+            "request" => {
+                return Err(HttpError::new(
+                    500,
+                    format!("continuation {cont} has a non-tree 'request' entry"),
+                ))
+            }
             "map" => map = Some(blob_string(config, &entry.oid.to_string())?),
             "run" => run = Some(blob_string(config, &entry.oid.to_string())?),
             "then" => then = Some(blob_string(config, &entry.oid.to_string())?),
@@ -698,46 +710,21 @@ fn resolve_promise(
             }
         }
     }
-    let input =
-        input.ok_or_else(|| HttpError::new(500, format!("continuation {cont} missing 'in'")))?;
-    if map.is_some() && run.is_some() {
-        return Err(HttpError::new(
-            500,
-            format!("continuation {cont} has both 'map' and 'run' (they are mutually exclusive)"),
-        ));
-    }
-    if map.is_none() && run.is_none() && then.is_none() {
-        return Err(HttpError::new(
-            500,
-            format!("continuation {cont} has none of 'map', 'run', or 'then'"),
-        ));
-    }
-    // Both checked here rather than client-side only: a continuation is a tree
-    // any worker can hand us, so the interpreter states its own contract.
-    if catch && run.is_none() {
-        return Err(HttpError::new(
-            500,
-            format!("continuation {cont} has 'catch' without 'run' (catch covers the run step)"),
-        ));
-    }
-    if catch && then.is_none() {
-        return Err(HttpError::new(
-            500,
-            format!(
-                "continuation {cont} has 'catch' without 'then' (nothing would receive the error)"
-            ),
-        ));
-    }
-
-    // Set when `catch` turns a failed `run` into an `--error` arg; rides out to
-    // [`run_dispatch`], which then skips memoizing this request.
-    let mut caught = false;
+    validate_continuation_shape(
+        cont,
+        input.is_some(),
+        map.is_some(),
+        run.is_some(),
+        request.is_some(),
+        then.is_some(),
+        catch,
+    )?;
 
     // The middle step, if any: `map` fans out over `in`'s children and yields a
-    // `children` tree; `run` is one sub-run yielding a `result` entry. Either
-    // way we get (the extra arg `then` receives, the result when there is no
-    // `then`).
-    let mid: Option<(gix::objs::tree::Entry, String)> = if let Some(img) = &map {
+    // `children` tree; `run` builds one request from its image + `in`; `request`
+    // runs an already-complete ArgTree unchanged.
+    let mid: Option<(gix::objs::tree::Entry, String, bool)> = if let Some(img) = &map {
+        let input = input.as_ref().expect("validated input");
         // Map the children in parallel — one thread per child, each a full
         // [`run_work_request`] (so a child may itself promise). Concurrency is bounded by
         // the runner pool, not the thread count; threads are cheap and mostly
@@ -787,49 +774,58 @@ fn resolve_promise(
         Some((
             named_entry("children", EntryKind::Tree.into(), children_tree),
             format!("tree {children_tree}"),
+            false,
         ))
     } else if let Some(img) = &run {
+        let input = input.as_ref().expect("validated input");
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_work_request`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        match run_image(
+        Some(continuation_result(
             config,
-            img,
-            vec![input.clone()],
-            salt,
-            stack,
-            trace_id,
-            secrets,
-        ) {
-            Ok(result) => Some((result_entry("result", &result)?, result)),
-            // `catch`: the failure becomes `--error`, a blob of the message the
-            // caller would otherwise have seen as a 500. `then` is required
-            // alongside `catch` (checked above), so the unused second element
-            // of the pair never reaches a caller.
-            Err(e) if catch => {
-                let text = e.message().to_string();
-                eprintln!("caught sub-run failure in continuation {cont}: {text}");
-                caught = true;
-                let oid = store_git_blob(config, text.as_bytes())
-                    .map_err(|e| HttpError::new(500, format!("storing error blob: {e}")))?;
-                Some((
-                    named_entry("error", EntryKind::Blob.into(), oid),
-                    format!("blob {oid}"),
-                ))
-            }
-            Err(e) => return Err(e),
-        }
+            cont,
+            run_image(
+                config,
+                img,
+                vec![input.clone()],
+                salt,
+                stack,
+                trace_id,
+                secrets,
+            ),
+            catch,
+        )?)
+    } else if let Some(arg_tree) = &request {
+        Some(continuation_result(
+            config,
+            cont,
+            run_work_request(
+                config,
+                &WorkRequest {
+                    arg_tree,
+                    stack,
+                    trace_id,
+                    secrets,
+                },
+            ),
+            catch,
+        )?)
     } else {
         None
     };
 
+    let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught);
+
     match (then, mid) {
-        // `then` combines: it gets the original `in`, plus the middle step's
-        // contribution when one ran — (`--in`, `--children`) after a map,
-        // (`--in`, `--result`) after a run, (`--in`, `--error`) after a caught
-        // run, bare `--in` for a plain tail call.
+        // `then` combines: it gets the original `in` when this is an image
+        // continuation, plus the middle step's contribution when one ran. An
+        // exact-request continuation has no `in`, so it passes only `result`
+        // or `error`.
         (Some(img), mid) => {
-            let mut args = vec![input];
-            if let Some((extra, _)) = mid {
+            let mut args = Vec::new();
+            if let Some(input) = input {
+                args.push(input);
+            }
+            if let Some((extra, _, _)) = mid {
                 args.push(extra);
             }
             Ok((
@@ -838,12 +834,99 @@ fn resolve_promise(
             ))
         }
         // No `then`: the middle step's own result is the request's result.
-        (None, Some((_, result))) => Ok((result, caught)),
+        (None, Some((_, result, _))) => Ok((result, caught)),
         // Unreachable — the presence check above requires some step.
         (None, None) => Err(HttpError::new(
             500,
             format!("continuation {cont} has no step to run"),
         )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_continuation_shape(
+    cont: &str,
+    has_input: bool,
+    has_map: bool,
+    has_run: bool,
+    has_request: bool,
+    has_then: bool,
+    catch: bool,
+) -> Result<(), HttpError> {
+    let middle_count = usize::from(has_map) + usize::from(has_run) + usize::from(has_request);
+    if middle_count > 1 {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has more than one of 'map', 'run', and 'request' (they are mutually exclusive)"
+            ),
+        ));
+    }
+    if has_request && has_input {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has both 'request' and 'in'"),
+        ));
+    }
+    if !has_request && !has_input {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} missing 'in'"),
+        ));
+    }
+    if middle_count == 0 && !has_then {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has none of 'map', 'run', 'request', or 'then'"),
+        ));
+    }
+    // Both checked here rather than client-side only: a continuation is a tree
+    // any worker can hand us, so the interpreter states its own contract.
+    if catch && !has_run && !has_request {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has 'catch' without 'run' or 'request' (catch covers one exact step)"
+            ),
+        ));
+    }
+    if catch && !has_then {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has 'catch' without 'then' (nothing would receive the error)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Turn one single-valued middle step into the callback entry/result pair,
+/// optionally representing a failure as an `error` blob. Shared by rebuilt
+/// `run` requests and exact `request` continuations so catch semantics cannot
+/// drift between them.
+fn continuation_result(
+    config: &Config,
+    cont: &str,
+    result: Result<String, HttpError>,
+    catch: bool,
+) -> Result<(gix::objs::tree::Entry, String, bool), HttpError> {
+    use gix::objs::tree::EntryKind;
+
+    match result {
+        Ok(result) => Ok((result_entry("result", &result)?, result, false)),
+        Err(error) if catch => {
+            let text = error.message().to_string();
+            eprintln!("caught sub-run failure in continuation {cont}: {text}");
+            let oid = store_git_blob(config, text.as_bytes())
+                .map_err(|e| HttpError::new(500, format!("storing error blob: {e}")))?;
+            Ok((
+                named_entry("error", EntryKind::Blob.into(), oid),
+                format!("blob {oid}"),
+                true,
+            ))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1084,23 +1167,46 @@ fn result_hash(result: &str) -> &str {
 }
 
 /// Pin `refs/caos/res/<argTreeHash>` at the result so a client can fetch it by
-/// ref and it survives gc. Best-effort: a failure just means the result isn't
-/// ref-pinned (it's still cached and reachable by hash). `result` is
-/// `"<type> <hash>"`.
-fn pin_result(config: &Config, arg_tree: &str, result: &str) {
+/// ref and it survives gc. This is part of top-level run success, particularly
+/// when the HTTP caller disconnected before the eventual result.
+fn pin_result(config: &Config, arg_tree: &str, result: &str) -> Result<(), HttpError> {
     let hash = result_hash(result);
     if hash.is_empty() {
-        return;
+        return Err(HttpError::new(
+            500,
+            format!("cannot pin malformed result {result:?}"),
+        ));
     }
     let refname = format!("refs/caos/res/{arg_tree}");
-    match Command::new("git")
-        .args(["-C", &config.git_dir, "update-ref", &refname, hash])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("warning: git update-ref {refname} exited with {status}"),
-        Err(e) => eprintln!("warning: pinning {refname}: {e}"),
+    pin_result_in(&config.git_dir, &refname, hash)
+}
+
+fn pin_result_in(git_dir: &str, refname: &str, hash: &str) -> Result<(), HttpError> {
+    const ATTEMPTS: usize = 8;
+    let mut last_error = String::new();
+    for attempt in 0..ATTEMPTS {
+        match Command::new("git")
+            .args(["-C", git_dir, "update-ref", refname, hash])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                last_error = format!(
+                    "git update-ref exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(error) => last_error = format!("running git update-ref: {error}"),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
+    Err(HttpError::new(
+        500,
+        format!("pinning {refname} after {ATTEMPTS} attempts: {last_error}"),
+    ))
 }
 
 /// Resolve the `image` parameter to a reference the host docker daemon can run.
@@ -1654,20 +1760,34 @@ fn push_blob(config: &Config, digest: &str, data: &[u8]) -> Result<(), String> {
 
 /// Upload a manifest to the registry, addressed by its digest.
 fn push_manifest(config: &Config, digest: &str, data: &[u8]) -> Result<(), String> {
+    const ATTEMPTS: usize = 8;
     let base = config.registry_push_url.trim_end_matches('/');
     let url = format!("{base}/v2/{REGISTRY_REPO}/manifests/{digest}");
-    let response = minreq::put(&url)
-        .with_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-        .with_body(data.to_vec())
-        .send()
-        .map_err(|e| format!("PUT {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "uploading manifest {digest}: {} {}",
-            response.status_code, response.reason_phrase
-        ));
+    for attempt in 0..ATTEMPTS {
+        let response = minreq::put(&url)
+            .with_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .with_body(data.to_vec())
+            .send()
+            .map_err(|e| format!("PUT {url}: {e}"))?;
+        if (200..300).contains(&response.status_code) {
+            return Ok(());
+        }
+        // Concurrent conversion of one cold image can race in distribution:
+        // one request observes the shared layer while its content link is
+        // still becoming visible, and the manifest PUT briefly reports
+        // `manifest blob unknown` (400). The manifest is content-addressed, so
+        // retrying this one response is idempotent. Other client errors are
+        // permanent; server errors remain loud instead of being hidden here.
+        if response.status_code != 400 || attempt + 1 == ATTEMPTS {
+            return Err(format!(
+                "uploading manifest {digest}: {} {}",
+                response.status_code, response.reason_phrase
+            ));
+        }
+        let delay_ms = 25_u64 << attempt.min(6);
+        std::thread::sleep(Duration::from_millis(delay_ms));
     }
-    Ok(())
+    unreachable!("manifest upload loop either succeeds or returns its last error")
 }
 
 /// Hex sha256 of `data`.
@@ -1998,5 +2118,125 @@ mod single_flight_tests {
             second_outcome
         );
         drop(second_guard);
+    }
+}
+
+#[cfg(test)]
+mod continuation_shape_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    fn shape(
+        has_input: bool,
+        has_map: bool,
+        has_run: bool,
+        has_request: bool,
+        has_then: bool,
+        catch: bool,
+    ) -> Result<(), HttpError> {
+        validate_continuation_shape(
+            "test-continuation",
+            has_input,
+            has_map,
+            has_run,
+            has_request,
+            has_then,
+            catch,
+        )
+    }
+
+    #[test]
+    fn exact_request_is_exclusive_with_input_map_and_run() {
+        for (input, map, run) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let error = shape(input, map, run, true, false, false).unwrap_err();
+            assert!(
+                error.message().contains("mutually exclusive")
+                    || error.message().contains("both 'request' and 'in'"),
+                "{}",
+                error.message()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_request_allows_a_result_callback_or_plain_tail_call() {
+        assert!(shape(false, false, false, true, false, false).is_ok());
+        assert!(shape(false, false, false, true, true, false).is_ok());
+    }
+
+    #[test]
+    fn exact_request_catch_requires_a_callback() {
+        let error = shape(false, false, false, true, false, true).unwrap_err();
+        assert!(error.message().contains("without 'then'"));
+        assert!(shape(false, false, false, true, true, true).is_ok());
+    }
+
+    #[test]
+    fn result_pin_retries_a_transient_ref_lock() {
+        let git_dir = std::env::temp_dir().join(format!(
+            "caos-pin-result-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let init = Command::new("git")
+            .args(["init", "--bare", git_dir.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let mut hash_object = Command::new("git")
+            .args([
+                "-C",
+                git_dir.to_str().unwrap(),
+                "hash-object",
+                "-w",
+                "--stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hash_object
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"result")
+            .unwrap();
+        let object = hash_object.wait_with_output().unwrap();
+        assert!(object.status.success());
+        let hash = String::from_utf8(object.stdout).unwrap().trim().to_string();
+
+        let refname = "refs/caos/res/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let lock = git_dir.join(format!("{refname}.lock"));
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"held").unwrap();
+        let unlock = std::thread::spawn({
+            let lock = lock.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(25));
+                std::fs::remove_file(lock).unwrap();
+            }
+        });
+
+        if let Err(error) = pin_result_in(git_dir.to_str().unwrap(), refname, &hash) {
+            panic!("{}", error.message());
+        }
+        unlock.join().unwrap();
+        let pinned = Command::new("git")
+            .args(["-C", git_dir.to_str().unwrap(), "rev-parse", refname])
+            .output()
+            .unwrap();
+        assert!(pinned.status.success());
+        assert_eq!(String::from_utf8(pinned.stdout).unwrap().trim(), hash);
+        std::fs::remove_dir_all(git_dir).unwrap();
     }
 }
