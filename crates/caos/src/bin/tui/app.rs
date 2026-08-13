@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use caos::chat::{
-    archive_user_conversation, conversation_replay, conversation_snapshot,
+    archive_user_conversation, conversation_head, conversation_replay, conversation_snapshot,
     conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
     generate_conversation_title, list_user_conversations, publish_unindexed_conversations,
     publish_user_conversation, run_chat_turn, set_conversation_title, unarchive_user_conversation,
@@ -750,6 +750,7 @@ enum CommandAction {
     From,
     Help,
     Palette,
+    Reference,
     Title,
     UpdateTree,
 }
@@ -763,7 +764,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 5] = [
+const COMMANDS: [Command; 6] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -797,6 +798,13 @@ const COMMANDS: [Command; 5] = [
         usage: "/commands",
         description: "open the searchable command palette",
         action: CommandAction::Palette,
+        takes_argument: false,
+    },
+    Command {
+        name: "/ref",
+        usage: "/ref",
+        description: "show the copyable conversation ref and full head hash",
+        action: CommandAction::Reference,
         takes_argument: false,
     },
 ];
@@ -1575,6 +1583,14 @@ impl App {
                     }
                     return;
                 }
+                CommandAction::Reference => {
+                    if arguments.is_empty() {
+                        self.show_selected_ref();
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
+                    return;
+                }
                 CommandAction::From => {
                     self.start_from_hash(arguments);
                     return;
@@ -1672,6 +1688,22 @@ impl App {
                 });
             }
         });
+    }
+
+    fn show_selected_ref(&mut self) {
+        let id = self.selected().id.clone();
+        match self
+            .transport()
+            .and_then(|transport| conversation_head(&transport, &id))
+        {
+            Ok(Some(head)) => self.selected_mut().push_info(format!(
+                "Conversation ref: refs/caos/conversations/{id}/head\nHead commit: {head}"
+            )),
+            Ok(None) => self
+                .selected_mut()
+                .show_command_error("this conversation has no remote ref until its first message"),
+            Err(error) => self.selected_mut().show_command_error(error),
+        }
     }
 
     pub(crate) fn drain_messages(&mut self) -> bool {
@@ -3072,7 +3104,14 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/help", "/title", "/update-tree", "/commands"]
+            [
+                "/from",
+                "/help",
+                "/title",
+                "/update-tree",
+                "/commands",
+                "/ref"
+            ]
         );
 
         assert!(composer.select_command(2));
@@ -3104,6 +3143,10 @@ mod tests {
         let (command, arguments) = parse_command("/from\nabc123").unwrap();
         assert_eq!(command.action, CommandAction::From);
         assert_eq!(arguments, "abc123");
+
+        let (command, arguments) = parse_command("/ref").unwrap();
+        assert_eq!(command.action, CommandAction::Reference);
+        assert!(arguments.is_empty());
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
@@ -4641,6 +4684,29 @@ mod tests {
         ));
         assert_eq!(shared.transcript[0].text, "hello from Alice");
         assert!(!app.poll_remote());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn ref_command_shows_a_copyable_canonical_ref_and_full_head() {
+        let (repo, remote, _) = repo_with_default_branch("show-ref", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let head =
+            caos::chat::submit_message(&transport, &TurnOptions::default(), "shared", "hello")
+                .unwrap()
+                .unwrap();
+
+        let (mut app, _) = app_with(vec![state("shared")]);
+        app.repo_dir = repo.clone();
+        app.show_selected_ref();
+
+        let shown = app.selected().transcript.last().unwrap();
+        assert_eq!(shown.role, EntryRole::Info);
+        assert!(shown.text.contains("refs/caos/conversations/shared/head"));
+        assert!(shown.text.contains(&head));
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
