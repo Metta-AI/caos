@@ -144,7 +144,9 @@ deepener)
   # core-seeder-runner answers it with the host's image — no evaluator in the
   # worker, no blocking run, no world crossing. If the sentinel ever changes,
   # this forms a key nothing answers and the job fails loudly on the pending
-  # timeout; it cannot quietly deepen with the wrong thing.
+  # timeout; it cannot quietly deepen with the wrong thing. As with ordinary
+  # expression evaluation, `--in:@=.` excludes the expression file itself, so
+  # project that entry before forming the manual sentinel request.
   caos get /cas/args/in/std
   caos get /cas/args/in/std/deep-deps
 
@@ -162,7 +164,12 @@ deepener)
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
   deepen=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the deepen stage"
-  caos run-then /cas/args/in/std/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
+  DD=/tmp/deep-deps-in
+  rm -rf "$DD"; mkdir -p "$DD"
+  find /cas/args/in/std/deep-deps -mindepth 1 -maxdepth 1 ! -name .caos-expr -print0 \
+    | while IFS= read -r -d '' e; do ln -s "$e" "$DD/$(basename "$e")"; done
+  caos put "$DD" /cas/deep-deps-in
+  caos run-then /cas/deep-deps-in -- --run=docker://seeded-deep-deps --then="$deepen"
   ;;
 
 deepen)

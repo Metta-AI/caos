@@ -1,7 +1,7 @@
 # llm-step's dependencies (format `<path> <name>`, path relative to this dir):
 # the rustc worker factory that compiles it, the llm-client code crate it links,
 # and THE TOOLS IT DRIVES — bash-tool, rgrep, bash (the tree-tool shell) and
-# merge. rustc DEPENDS on the runner pool itself and curries the built binary
+# merge and run-and-update-ref. rustc DEPENDS on the runner pool itself and curries the built binary
 # onto it, so no tool names a runner. LOCAL deps (mounted under DEEP-DEPS/ by
 # deepening) rather than /std, so std has no ambient self-reference.
 #
@@ -15,3 +15,4 @@
 ../rgrep rgrep
 ../bash bash
 ../merge merge
+../run-and-update-ref run-and-update-ref

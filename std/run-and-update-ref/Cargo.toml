@@ -1,0 +1,18 @@
+[package]
+name = "run-and-update-ref"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+worker-common = { path = "worker-common" }
+minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

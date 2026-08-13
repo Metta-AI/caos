@@ -119,7 +119,10 @@ reduce)
   # Do not name the entry as the image instead: that hands the SERVER a raw
   # flake tree to build — flake-builder building flake-builder. And a worker
   # cannot evaluate the `.caos-expr` itself, because that blocks on a run. The
-  # entry is in the tree we were handed, at `in/std/flake-builder`.
+  # entry is in the tree we were handed, at `in/std/flake-builder`. Expression
+  # evaluation removes `.caos-expr` before binding `--in`; reproduce that small
+  # projection here rather than accidentally asking runnerd to pull the
+  # sentinel as a real image.
   #
   # Each run ends a stage, so resolving it ends this one; `build-env` runs it.
   env=$(caos curry /cas/args/image -- \
@@ -127,7 +130,12 @@ reduce)
     "--reduced:@=/cas/reduced" "--src:@=/cas/src") \
     || fail "currying the build-env stage"
 
-  caos run-then /cas/args/in/std/flake-builder -- --run=docker://seeded --then="$env"
+  FB=/tmp/flake-builder-in
+  rm -rf "$FB"; mkdir -p "$FB"
+  find /cas/args/in/std/flake-builder -mindepth 1 -maxdepth 1 ! -name .caos-expr -print0 \
+    | while IFS= read -r -d '' e; do ln -s "$e" "$FB/$(basename "$e")"; done
+  caos put "$FB" /cas/flake-builder-in
+  caos run-then /cas/flake-builder-in -- --run=docker://seeded --then="$env"
   ;;
 
 build-env)

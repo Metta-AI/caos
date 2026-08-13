@@ -1,0 +1,3 @@
+# The rustc worker factory compiles this source and curries the result onto the
+# runner pool. rustc brings its own runner/cargo/worker-common dependencies.
+../rustc rustc
