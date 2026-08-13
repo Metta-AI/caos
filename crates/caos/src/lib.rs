@@ -6,8 +6,8 @@
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
 //!   It talks to the server over HTTP (`/object`) and runs the container
 //!   `runner` (jobs arrive by long-poll; see `design/runner-protocol.md`). It
-//!   never triggers compute — its `map-then` records a map-then continuation
-//!   the server resolves after the worker's job finishes.
+//!   normally records continuations for the server to resolve after the job;
+//!   `run-async` is the one command that directly dispatches `/run`.
 //! * **`caos-cli`** — the user-facing client. It uses the server as a `caos` git
 //!   remote, building objects in the local working repo and exchanging them with
 //!   the server by negotiated push/fetch.
@@ -27,6 +27,7 @@
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -2520,6 +2521,25 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     )
 }
 
+/// Start an already-stored ArgTree through the ordinary `/run` endpoint without
+/// waiting for its result. The server handles each HTTP request on its own
+/// thread, so closing our side after sending the request does not cancel it.
+pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
+    if !is_hex_hash(arg_tree) {
+        return Err(format!(
+            "run-async needs a 40-character ArgTree hash, got {arg_tree:?}"
+        ));
+    }
+    t.ensure_pushed(arg_tree)?;
+    let url = format!(
+        "{}/run?req={arg_tree}",
+        t.server_url()?.trim_end_matches('/')
+    );
+    dispatch_compute_url(&url)?;
+    println!("request {arg_tree}");
+    Ok(())
+}
+
 /// Shared continuation recorder. `allowed` names image-valued entries and
 /// `markers` names bare presence flags.
 fn record_continuation(
@@ -3482,6 +3502,66 @@ fn request_compute_traced(
         base.trim_end_matches('/')
     );
     request_compute_url(&url, secrets)
+}
+
+/// Send a plain-HTTP compute request and deliberately do not read its response.
+/// This is the small worker-side primitive behind `caos run-async`: `/run`
+/// already outlives a disconnected caller, while the conversation's durable
+/// `pending` entry makes a dispatch that dies before reaching the server safe to
+/// retry. Waiting for response headers here would wait for the run itself.
+fn dispatch_compute_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("run-async only supports plain HTTP server URLs: {url}"))?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return Err(format!("run-async server URL has no host: {url}"));
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| format!("invalid IPv6 server URL: {url}"))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = match suffix.strip_prefix(':') {
+            Some(port) => port
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port in server URL: {url}"))?,
+            None if suffix.is_empty() => 80,
+            None => return Err(format!("invalid server URL: {url}")),
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (
+                host,
+                port.parse::<u16>()
+                    .map_err(|_| format!("invalid port in server URL: {url}"))?,
+            ),
+            _ => (authority, 80),
+        }
+    };
+
+    let mut stream = TcpStream::connect((host, port))
+        .map_err(|error| format!("connecting to {authority}: {error}"))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\n{}: {}\r\nConnection: close\r\n\r\n",
+        caos_world::WORLD_HEADER,
+        caos_world::WORLD,
+    )
+    .map_err(|error| format!("sending GET {url}: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("sending GET {url}: {error}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| format!("finishing GET {url}: {error}"))?;
+    Ok(())
 }
 
 /// Issue the compute `GET /run`, carrying the ephemeral secrets store in the
