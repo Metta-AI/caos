@@ -7,7 +7,8 @@
 //! to observability warnings.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -35,6 +36,13 @@ struct RemoteCommit {
     parents: Vec<String>,
     message: String,
 }
+
+type CommitCache = Mutex<HashMap<(String, String), RemoteCommit>>;
+
+// One llm-step process owns one turn. Conversation commits are immutable, so
+// retaining each parsed commit for that process bounds repeat spine reads to
+// newly appended events instead of another HTTP GET for the entire history.
+static COMMIT_CACHE: OnceLock<CommitCache> = OnceLock::new();
 
 /// One version-2 event on the canonical first-parent conversation spine.
 #[derive(Debug, Clone)]
@@ -641,10 +649,34 @@ fn store_object(base: &str, kind: &str, content: &[u8]) -> Result<String, String
 }
 
 fn fetch_commit(base: &str, hash: &str) -> Result<RemoteCommit, String> {
+    let cache = COMMIT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    fetch_commit_cached(cache, base, hash, || fetch_object(base, hash))
+}
+
+fn fetch_commit_cached(
+    cache: &CommitCache,
+    base: &str,
+    hash: &str,
+    fetch: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<RemoteCommit, String> {
     validate_hash(hash, "commit")?;
-    let serialized = fetch_object(base, hash)?;
-    parse_serialized_commit(&serialized)
-        .map_err(|e| format!("object {hash}: invalid commit object: {e}"))
+    let key = (base.trim_end_matches('/').to_string(), hash.to_string());
+    if let Some(commit) = cache
+        .lock()
+        .map_err(|_| "conversation commit cache lock is poisoned".to_string())?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(commit);
+    }
+    let serialized = fetch()?;
+    let commit = parse_serialized_commit(&serialized)
+        .map_err(|e| format!("object {hash}: invalid commit object: {e}"))?;
+    cache
+        .lock()
+        .map_err(|_| "conversation commit cache lock is poisoned".to_string())?
+        .insert(key, commit.clone());
+    Ok(commit)
 }
 
 fn fetch_object(base: &str, hash: &str) -> Result<Vec<u8>, String> {
@@ -1041,6 +1073,38 @@ mod tests {
         object.extend_from_slice(content.as_bytes());
         let parsed = parse_serialized_commit(&object).unwrap();
         assert_eq!(parsed.tree, A);
+    }
+
+    #[test]
+    fn fetched_commit_cache_reuses_immutable_spine_objects_per_server() {
+        let content = format!(
+            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"v\":2}}\n"
+        );
+        let mut object = format!("commit {}\0", content.len()).into_bytes();
+        object.extend_from_slice(content.as_bytes());
+        let cache = Mutex::new(HashMap::new());
+        let fetches = std::cell::Cell::new(0);
+        let fetch = || {
+            fetches.set(fetches.get() + 1);
+            Ok(object.clone())
+        };
+
+        assert_eq!(
+            fetch_commit_cached(&cache, "http://server", C, fetch)
+                .unwrap()
+                .tree,
+            A
+        );
+        assert_eq!(
+            fetch_commit_cached(&cache, "http://server/", C, fetch)
+                .unwrap()
+                .tree,
+            A
+        );
+        assert_eq!(fetches.get(), 1, "the same commit was fetched twice");
+
+        fetch_commit_cached(&cache, "http://other-server", C, fetch).unwrap();
+        assert_eq!(fetches.get(), 2, "cache entries leaked across servers");
     }
 
     #[test]

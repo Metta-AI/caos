@@ -18,6 +18,7 @@
 //! broken ref, we restore its newest readable reflog value when one exists.
 //! This rule is deliberately generic: the server does not interpret ref names.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -76,12 +77,16 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
     let mut paths = Vec::new();
     collect_files(&Path::new(git_dir).join("refs"), &mut paths);
     let mut removed = 0;
+    // Conversation, user-index, and result refs commonly share most of their
+    // workspace closure. Validate each reachable object once per startup, not
+    // once per ref; failed subtrees are deliberately not memoized.
+    let mut memo = IntegrityMemo::default();
     for path in paths {
         let name = ref_name(git_dir, &path);
-        let Some(reason) = breakage(repo, &path) else {
+        let Some(reason) = breakage(repo, &path, &mut memo) else {
             continue;
         };
-        if recover_ref(repo, git_dir, &name, &path) {
+        if recover_ref(repo, git_dir, &name, &path, &mut memo) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -96,7 +101,13 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
 }
 
 /// Replace a broken ref with its newest readable reflog value.
-fn recover_ref(repo: &gix::Repository, git_dir: &str, name: &str, path: &Path) -> bool {
+fn recover_ref(
+    repo: &gix::Repository,
+    git_dir: &str,
+    name: &str,
+    path: &Path,
+    memo: &mut IntegrityMemo,
+) -> bool {
     let log = Path::new(git_dir).join("logs").join(name);
     let Ok(contents) = std::fs::read_to_string(&log) else {
         return false;
@@ -110,7 +121,7 @@ fn recover_ref(repo: &gix::Repository, git_dir: &str, name: &str, path: &Path) -
             let Ok(id) = gix::ObjectId::from_hex(candidate.as_bytes()) else {
                 continue;
             };
-            if intact_ref_target(repo, id).is_err() {
+            if intact_ref_target(repo, id, memo).is_err() {
                 continue;
             }
             match replace_ref_file(path, candidate) {
@@ -134,61 +145,107 @@ enum ClosureKind {
     Blob,
 }
 
+#[derive(Default)]
+struct IntegrityMemo {
+    targets: HashSet<gix::ObjectId>,
+    closure: HashSet<(gix::ObjectId, ClosureKind)>,
+}
+
 /// Validate a ref target. Commit targets include their workspace tree, but not
 /// their parents: this lets recovery roll back past one damaged append without
 /// making the server understand what the ref represents.
-fn intact_ref_target(repo: &gix::Repository, id: gix::ObjectId) -> Result<(), String> {
+fn intact_ref_target(
+    repo: &gix::Repository,
+    id: gix::ObjectId,
+    memo: &mut IntegrityMemo,
+) -> Result<(), String> {
+    if memo.targets.contains(&id) {
+        return Ok(());
+    }
     let object = repo
         .find_object(id)
         .map_err(|error| format!("object {id} is unreadable: {error}"))?;
     if object.kind != gix::object::Kind::Commit {
+        memo.targets.insert(id);
         return Ok(());
     }
     let commit = gix::objs::CommitRef::from_bytes(&object.data, gix::hash::Kind::Sha1)
         .map_err(|error| format!("commit {id} is malformed: {error}"))?;
-    intact_tree(repo, commit.tree())
+    intact_tree(repo, commit.tree(), &mut memo.closure)?;
+    memo.targets.insert(id);
+    Ok(())
 }
 
-fn intact_tree(repo: &gix::Repository, root: gix::ObjectId) -> Result<(), String> {
+fn intact_tree(
+    repo: &gix::Repository,
+    root: gix::ObjectId,
+    checked: &mut HashSet<(gix::ObjectId, ClosureKind)>,
+) -> Result<(), String> {
     use gix::objs::tree::EntryKind;
-    use std::collections::HashSet;
 
-    let mut pending = vec![(root, ClosureKind::Tree)];
-    let mut checked = HashSet::new();
-    while let Some((id, expected)) = pending.pop() {
-        if !checked.insert((id, expected)) {
-            continue;
-        }
-        let object = repo
-            .find_object(id)
-            .map_err(|error| format!("reachable object {id} is unreadable: {error}"))?;
-        match expected {
-            ClosureKind::Blob if object.kind != gix::object::Kind::Blob => {
-                return Err(format!(
-                    "reachable object {id} is a {}, not a blob",
-                    object.kind
-                ));
+    enum Visit {
+        Check(gix::ObjectId, ClosureKind),
+        Complete(gix::ObjectId, ClosureKind),
+    }
+
+    let mut pending = vec![Visit::Check(root, ClosureKind::Tree)];
+    while let Some(visit) = pending.pop() {
+        match visit {
+            Visit::Complete(id, expected) => {
+                checked.insert((id, expected));
             }
-            ClosureKind::Tree if object.kind != gix::object::Kind::Tree => {
-                return Err(format!(
-                    "reachable object {id} is a {}, not a tree",
-                    object.kind
-                ));
-            }
-            ClosureKind::Blob => {}
-            ClosureKind::Tree => {
-                let tree = gix::objs::TreeRef::from_bytes(&object.data, gix::hash::Kind::Sha1)
-                    .map_err(|error| format!("reachable tree {id} is malformed: {error}"))?;
-                for entry in tree.entries {
-                    let expected = match entry.mode.kind() {
-                        EntryKind::Tree => Some(ClosureKind::Tree),
-                        EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                            Some(ClosureKind::Blob)
-                        }
-                        EntryKind::Commit => None,
-                    };
-                    if let Some(expected) = expected {
-                        pending.push((entry.oid.to_owned(), expected));
+            Visit::Check(id, expected) => {
+                if checked.contains(&(id, expected)) {
+                    continue;
+                }
+                let object = repo
+                    .find_object(id)
+                    .map_err(|error| format!("reachable object {id} is unreadable: {error}"))?;
+                match expected {
+                    ClosureKind::Blob if object.kind != gix::object::Kind::Blob => {
+                        return Err(format!(
+                            "reachable object {id} is a {}, not a blob",
+                            object.kind
+                        ));
+                    }
+                    ClosureKind::Tree if object.kind != gix::object::Kind::Tree => {
+                        return Err(format!(
+                            "reachable object {id} is a {}, not a tree",
+                            object.kind
+                        ));
+                    }
+                    ClosureKind::Blob => {
+                        checked.insert((id, expected));
+                    }
+                    ClosureKind::Tree => {
+                        let tree =
+                            gix::objs::TreeRef::from_bytes(&object.data, gix::hash::Kind::Sha1)
+                                .map_err(|error| {
+                                    format!("reachable tree {id} is malformed: {error}")
+                                })?;
+                        let entries = tree
+                            .entries
+                            .into_iter()
+                            .filter_map(|entry| {
+                                let expected = match entry.mode.kind() {
+                                    EntryKind::Tree => Some(ClosureKind::Tree),
+                                    EntryKind::Blob
+                                    | EntryKind::BlobExecutable
+                                    | EntryKind::Link => Some(ClosureKind::Blob),
+                                    EntryKind::Commit => None,
+                                }?;
+                                Some((entry.oid.to_owned(), expected))
+                            })
+                            .collect::<Vec<_>>();
+                        // Mark a tree reusable only after every descendant has
+                        // passed. Caching it before descent would let a second
+                        // ref skip over a corrupt child after the first failed.
+                        pending.push(Visit::Complete(id, expected));
+                        pending.extend(
+                            entries
+                                .into_iter()
+                                .map(|(id, expected)| Visit::Check(id, expected)),
+                        );
                     }
                 }
             }
@@ -227,7 +284,7 @@ fn replace_ref_file(path: &Path, hash: &str) -> std::io::Result<()> {
 /// Why `path` is not a usable ref, or `None` if it is fine (or if we could not
 /// read it — an unreadable ref file is not evidence of a lost object, so it
 /// keeps the benefit of the doubt).
-fn breakage(repo: &gix::Repository, path: &Path) -> Option<String> {
+fn breakage(repo: &gix::Repository, path: &Path, memo: &mut IntegrityMemo) -> Option<String> {
     let content = match std::fs::read(path) {
         Ok(content) => content,
         Err(err) => {
@@ -248,7 +305,7 @@ fn breakage(repo: &gix::Repository, path: &Path) -> Option<String> {
     let Ok(id) = gix::ObjectId::from_hex(text.as_bytes()) else {
         return Some(format!("unparsable content {text:?}"));
     };
-    intact_ref_target(repo, id).err()
+    intact_ref_target(repo, id, memo).err()
 }
 
 /// Every regular file under `dir`, recursively.
@@ -414,6 +471,27 @@ mod tests {
         let good = plant_ref(&dir, "refs/caos/empty", &format!("{empty}\n"));
         assert_eq!(drop_broken_refs(&repo, &git_dir), 0);
         assert!(good.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn integrity_memo_reuses_a_workspace_closure_across_ref_targets() {
+        let (repo, dir) = temp_repo();
+        let repo = repo.to_thread_local();
+        let first = empty_commit(&dir, "first");
+        let second = empty_commit(&dir, "second");
+        let first = gix::ObjectId::from_hex(first.as_bytes()).unwrap();
+        let second = gix::ObjectId::from_hex(second.as_bytes()).unwrap();
+        let mut memo = IntegrityMemo::default();
+
+        intact_ref_target(&repo, first, &mut memo).unwrap();
+        let closure_objects = memo.closure.len();
+        assert!(closure_objects > 0);
+        intact_ref_target(&repo, second, &mut memo).unwrap();
+
+        assert_eq!(memo.targets.len(), 2);
+        assert_eq!(memo.closure.len(), closure_objects);
 
         std::fs::remove_dir_all(&dir).ok();
     }

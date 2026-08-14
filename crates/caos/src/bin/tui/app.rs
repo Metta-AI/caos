@@ -4778,7 +4778,7 @@ mod tests {
                 "push",
                 "-q",
                 "caos",
-                &format!("{admitted}:refs/caos/conversations/shared/head"),
+                &format!("{admitted}:refs/caos/v2/conversations/shared/head"),
             ],
         );
 

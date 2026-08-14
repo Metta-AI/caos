@@ -223,7 +223,11 @@ fn main() {
     git(&["-C", &git_dir, "config", "core.fsyncMethod", "batch"]);
     // Keep previous values as a generic recovery path if a ref tip is damaged
     // despite the fsync policy above. `always` includes refs outside
-    // refs/heads. Ordinary Git expiry bounds these logs.
+    // refs/heads. Automatic GC is disabled above, so these logs do not expire
+    // by themselves; design/chat-v2.md records bounded retention/pruning as
+    // follow-up work. Until that policy exists, retain recovery history rather
+    // than inventing an expiry window that can silently remove the only sound
+    // value for a damaged ref.
     git(&["-C", &git_dir, "config", "core.logAllRefUpdates", "always"]);
 
     // Clear what a previous crash left behind BEFORE opening the repo: gix

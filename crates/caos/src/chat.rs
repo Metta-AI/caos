@@ -196,19 +196,23 @@ pub fn pick_conversation(
         return Ok((id.to_string(), !exists));
     }
 
-    let mut conversations = remote_conversations(t)?;
+    let conversations = remote_conversations(t)?;
     if !new && !conversations.is_empty() {
         // Read only each tip object so the choice is based on commit time rather
         // than lexicographic ref order. Fetching a tip through Git would also
         // fetch its entire workspace/history closure, which is especially
         // costly when opening a shared remote with many conversations.
         let mut dated = Vec::with_capacity(conversations.len());
-        for (id, hash) in conversations.drain(..) {
-            let timestamp = remote_commit_timestamp(t, &hash)?;
-            dated.push((timestamp, id));
+        for (id, hash) in &conversations {
+            match remote_commit_timestamp(t, &hash) {
+                Ok(timestamp) => dated.push((timestamp, id.clone())),
+                Err(error) => warn_skipped_conversation(id, &error),
+            }
         }
         dated.sort_by(|a, b| b.cmp(a));
-        return Ok((dated[0].1.clone(), false));
+        if let Some((_, id)) = dated.first() {
+            return Ok((id.clone(), false));
+        }
     }
 
     let used: std::collections::HashSet<String> =
@@ -332,7 +336,22 @@ pub fn submit_message_with_tree(
 ) -> Result<Option<String>, String> {
     validate_hash(proposal, "submitted workspace commit")?;
     t.git_capture(&["cat-file", "-e", &format!("{proposal}^{{commit}}")], None)?;
+    reject_reserved_caos(t, proposal, "submitted workspace")?;
     submit_message_inner(t, options, id, message, false, Some(proposal))
+}
+
+fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), String> {
+    if t.git_capture(
+        &["rev-parse", "--verify", "--quiet", &format!("{root}:.caos")],
+        None,
+    )
+    .is_ok()
+    {
+        return Err(format!(
+            "the {what} contains top-level .caos state; choose a clean workspace"
+        ));
+    }
+    Ok(())
 }
 
 fn submit_message_inner(
@@ -383,7 +402,7 @@ where
         }
         let parent = match observed.as_deref() {
             Some(head) => {
-                fetch_commit(t, head)?;
+                fetch_conversation_commit(t, &refname, head)?;
                 head.to_string()
             }
             None => resolve_base(t, options)?,
@@ -400,16 +419,8 @@ where
             },
         };
         let tree = workspace.tree().to_string();
-        if observed.is_none()
-            && t.git_capture(
-                &["rev-parse", "--verify", "--quiet", &format!("{tree}:.caos")],
-                None,
-            )
-            .is_ok()
-        {
-            return Err(
-                "the base tree contains top-level .caos state; choose a clean base".to_string(),
-            );
+        if observed.is_none() {
+            reject_reserved_caos(t, &tree, "base tree")?;
         }
 
         let mut user_event = json!({
@@ -969,12 +980,28 @@ pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(
         if indexed_ids.contains(&id) {
             continue;
         }
+        if let Err(error) = remote_commit_timestamp(t, &head) {
+            warn_skipped_conversation(&id, &error);
+            continue;
+        }
         let active_ref = user_conversation_ref(user, UserConversationStatus::Active, &id)?;
         let mut updates = vec![format!("{head}:{active_ref}")];
         let title_ref = conversation_title_ref(&id)?;
         if !title_refs.contains_key(&title_ref) {
-            let snapshot = conversation_snapshot(t, &id)?
-                .ok_or_else(|| format!("conversation {id:?} disappeared while indexing it"))?;
+            let snapshot = match conversation_snapshot(t, &id) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    warn_skipped_conversation(
+                        &id,
+                        "it disappeared while its user index was being prepared",
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    warn_skipped_conversation(&id, &error);
+                    continue;
+                }
+            };
             let title_hash = t.put_object("blob", snapshot.title.as_bytes())?.to_string();
             t.ensure_pushed(&title_hash)?;
             updates.push(format!("+{title_hash}:{title_ref}"));
@@ -1009,23 +1036,30 @@ pub fn list_user_conversations(
         let Some(head) = canonical.get(id) else {
             continue;
         };
-        let title_ref = conversation_title_ref(id)?;
-        let title = if let Some(hash) = titles.get(&title_ref) {
-            let (kind, bytes) = t.get_object(hash)?;
-            if kind != "blob" {
-                return Err(format!("conversation title {hash} is a {kind}, not a blob"));
-            }
-            String::from_utf8(bytes)
-                .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?
-        } else {
-            id.to_string()
-        };
-        conversations.push(UserConversationSummary {
-            id: id.to_string(),
-            title,
-            head: head.clone(),
-            updated_unix: remote_commit_timestamp(t, head)?,
-        });
+        let summary = (|| {
+            let updated_unix = remote_commit_timestamp(t, head)?;
+            let title_ref = conversation_title_ref(id)?;
+            let title = if let Some(hash) = titles.get(&title_ref) {
+                let (kind, bytes) = t.get_object(hash)?;
+                if kind != "blob" {
+                    return Err(format!("conversation title {hash} is a {kind}, not a blob"));
+                }
+                String::from_utf8(bytes)
+                    .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?
+            } else {
+                id.to_string()
+            };
+            Ok(UserConversationSummary {
+                id: id.to_string(),
+                title,
+                head: head.clone(),
+                updated_unix,
+            })
+        })();
+        match summary {
+            Ok(summary) => conversations.push(summary),
+            Err(error) => warn_skipped_conversation(id, &error),
+        }
     }
     conversations.sort_by(|a, b| {
         b.updated_unix
@@ -1084,6 +1118,20 @@ fn value_text(value: &Value) -> String {
         .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
 }
 
+fn tool_result_text(value: &Value) -> String {
+    if let Some(blocks) = value.as_array() {
+        let text = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        if !text.is_empty() {
+            return text.join("\n");
+        }
+    }
+    value_text(value)
+}
+
 fn tool_call_summary(name: &str, args: &Value) -> String {
     match name {
         "bash" => format!(
@@ -1136,7 +1184,10 @@ fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            content: result.get("content").map(value_text).unwrap_or_default(),
+            content: result
+                .get("content")
+                .map(tool_result_text)
+                .unwrap_or_default(),
         });
     }
     events
@@ -1607,17 +1658,27 @@ fn remote_conversations(t: &GitTransport) -> Result<Vec<(String, String)>, Strin
         let Some((hash, refname)) = line.split_once('\t') else {
             continue;
         };
-        validate_hash(hash, "remote conversation head")?;
+        if let Err(error) = validate_hash(hash, "remote conversation head") {
+            warn_skipped_conversation(refname, &error);
+            continue;
+        }
         let Some(id) = refname
             .strip_prefix(CONVERSATION_PREFIX)
             .and_then(|rest| rest.strip_suffix(HEAD_SUFFIX))
         else {
             continue;
         };
-        conversation_ref(id)?;
+        if let Err(error) = conversation_ref(id) {
+            warn_skipped_conversation(id, &error);
+            continue;
+        }
         conversations.push((id.to_string(), hash.to_string()));
     }
     Ok(conversations)
+}
+
+fn warn_skipped_conversation(id: &str, error: &str) {
+    eprintln!("warning: skipping malformed conversation {id:?}: {error}");
 }
 
 fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> {
@@ -1640,13 +1701,20 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
         let (headers, message) = text.split_once("\n\n").ok_or_else(|| {
             format!("conversation history commit {current} has no message separator")
         })?;
-        let event = serde_json::from_str::<Value>(message.trim()).ok();
-        if event
-            .as_ref()
-            .and_then(|event| event.get("author"))
-            .and_then(Value::as_str)
-            == Some("user")
-        {
+        let event = match serde_json::from_str::<Value>(message.trim()) {
+            Ok(event)
+                if event.is_object()
+                    && event.get("v").and_then(Value::as_u64) == Some(EVENT_VERSION) =>
+            {
+                event
+            }
+            _ => {
+                return Err(format!(
+                    "conversation history commit {current} is not a version-{EVENT_VERSION} event"
+                ))
+            }
+        };
+        if event.get("author").and_then(Value::as_str) == Some("user") {
             let line = headers
                 .lines()
                 .find(|line| line.starts_with("committer "))
@@ -1679,12 +1747,16 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
 
 fn fetch_commit(t: &GitTransport, hash: &str) -> Result<(), String> {
     validate_hash(hash, "commit")?;
-    if t.git_capture(&["cat-file", "-e", &format!("{hash}^{{commit}}")], None)
-        .is_ok()
-    {
+    if commit_closure_is_local(t, hash) {
         return Ok(());
     }
-    t.fetch_object(hash)
+    t.fetch_object(hash)?;
+    if !commit_closure_is_local(t, hash) {
+        return Err(format!(
+            "fetched commit {hash} from {CAOS_REMOTE}, but its reachable closure is incomplete"
+        ));
+    }
+    Ok(())
 }
 
 fn fetch_commit_after(
@@ -1693,38 +1765,37 @@ fn fetch_commit_after(
     known_server_tip: Option<&str>,
 ) -> Result<(), String> {
     validate_hash(hash, "commit")?;
-    if t.git_capture(&["cat-file", "-e", &format!("{hash}^{{commit}}")], None)
-        .is_ok()
-    {
+    if commit_closure_is_local(t, hash) {
         return Ok(());
     }
     if let Some(tip) = known_server_tip {
         validate_hash(tip, "negotiation tip")?;
-        if t.git_capture(&["cat-file", "-e", &format!("{tip}^{{commit}}")], None)
-            .is_ok()
-        {
-            return t
-                .git_capture(
-                    &[
-                        "-c",
-                        "fetch.negotiationAlgorithm=default",
-                        "fetch",
-                        "--quiet",
-                        "--no-write-fetch-head",
-                        "--negotiation-tip",
-                        tip,
-                        CAOS_REMOTE,
-                        hash,
-                    ],
-                    None,
-                )
-                .map(|_| ())
-                .map_err(|error| {
-                    format!("fetching {hash} from {CAOS_REMOTE} after {tip}: {error}")
-                });
+        if commit_closure_is_local(t, tip) {
+            t.git_capture(
+                &[
+                    "-c",
+                    "fetch.negotiationAlgorithm=default",
+                    "fetch",
+                    "--quiet",
+                    "--no-write-fetch-head",
+                    "--negotiation-tip",
+                    tip,
+                    CAOS_REMOTE,
+                    hash,
+                ],
+                None,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("fetching {hash} from {CAOS_REMOTE} after {tip}: {error}"))?;
+            if commit_closure_is_local(t, hash) {
+                return Ok(());
+            }
+            return Err(format!(
+                "fetched commit {hash} from {CAOS_REMOTE} after {tip}, but its reachable closure is incomplete"
+            ));
         }
     }
-    t.fetch_object(hash)
+    fetch_commit(t, hash)
 }
 
 fn fetch_conversation_commit(t: &GitTransport, refname: &str, hash: &str) -> Result<(), String> {
@@ -1733,42 +1804,54 @@ fn fetch_conversation_commit(t: &GitTransport, refname: &str, hash: &str) -> Res
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| validate_hash(value, "cached conversation head").is_ok());
-    // A tip-only HTTP read (used while choosing the newest conversation) puts
-    // raw commits in the local ODB without their trees. A private cache ref is
-    // our marker that a closure fetch completed, but still verify the tip tree
-    // before trusting it in case an older client wrote that ref prematurely.
-    if cached.as_deref() == Some(hash) && commit_tree_is_local(t, hash) {
+    // Exact HTTP reads can leave any proper subset of the closure in the local
+    // ODB. Verify connectivity rather than trusting the tip commit, its root
+    // tree, or an older client's cache ref in isolation.
+    if commit_closure_is_local(t, hash) {
         return Ok(());
     }
-    if let Some(tip) = cached.as_deref() {
-        if commit_tree_is_local(t, tip) {
-            return t
-                .git_capture(
-                    &[
-                        "-c",
-                        "fetch.negotiationAlgorithm=default",
-                        "fetch",
-                        "--quiet",
-                        "--no-write-fetch-head",
-                        "--negotiation-tip",
-                        tip,
-                        CAOS_REMOTE,
-                        hash,
-                    ],
-                    None,
-                )
-                .map(|_| ())
-                .map_err(|error| {
-                    format!("fetching {hash} from {CAOS_REMOTE} after {tip}: {error}")
-                });
-        }
+    let fetched = match cached.as_deref() {
+        Some(tip) if commit_closure_is_local(t, tip) => t
+            .git_capture(
+                &[
+                    "-c",
+                    "fetch.negotiationAlgorithm=default",
+                    "fetch",
+                    "--quiet",
+                    "--no-write-fetch-head",
+                    "--negotiation-tip",
+                    tip,
+                    CAOS_REMOTE,
+                    hash,
+                ],
+                None,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("fetching {hash} from {CAOS_REMOTE} after {tip}: {error}")),
+        _ => fetch_commit(t, hash),
+    };
+    fetched?;
+    if !commit_closure_is_local(t, hash) {
+        return Err(format!(
+            "fetched conversation commit {hash}, but its reachable closure is incomplete"
+        ));
     }
-    t.fetch_object(hash)
+    Ok(())
 }
 
-fn commit_tree_is_local(t: &GitTransport, hash: &str) -> bool {
-    t.git_capture(&["cat-file", "-e", &format!("{hash}^{{tree}}")], None)
-        .is_ok()
+fn commit_closure_is_local(t: &GitTransport, hash: &str) -> bool {
+    t.git_capture(
+        &[
+            "rev-list",
+            "--objects",
+            "--missing=error",
+            "--quiet",
+            hash,
+            "--",
+        ],
+        None,
+    )
+    .is_ok()
 }
 
 fn first_parent_contains(t: &GitTransport, tip: &str, ancestor: &str) -> Result<bool, String> {
@@ -2000,7 +2083,8 @@ fn run_line_client(
     let require_absent = parsed.new && fresh;
 
     if let Some(message) = parsed.message {
-        run_line_turn(t, &parsed.options, &id, &message, require_absent)?;
+        run_line_turn(t, &parsed.options, &id, &message, require_absent)
+            .map_err(|failure| failure.error)?;
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
@@ -2008,7 +2092,8 @@ fn run_line_client(
         std::io::stdin()
             .read_to_string(&mut message)
             .map_err(|error| format!("reading message: {error}"))?;
-        return run_line_turn(t, &parsed.options, &id, &message, require_absent);
+        return run_line_turn(t, &parsed.options, &id, &message, require_absent)
+            .map_err(|failure| failure.error);
     }
 
     let mut line = String::new();
@@ -2027,8 +2112,53 @@ fn run_line_client(
             return Ok(());
         }
         if !line.trim().is_empty() {
-            run_line_turn(t, &parsed.options, &id, &line, require_absent)?;
-            require_absent = false;
+            let result = run_line_turn(t, &parsed.options, &id, &line, require_absent);
+            if let Some(error) = finish_interactive_line(&mut require_absent, result) {
+                eprintln!("talk: {error}");
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LineTurnFailure {
+    error: String,
+    admitted: bool,
+}
+
+impl LineTurnFailure {
+    fn before_admission(error: String) -> Self {
+        Self {
+            error,
+            admitted: false,
+        }
+    }
+
+    fn after_admission(error: String) -> Self {
+        Self {
+            error,
+            admitted: true,
+        }
+    }
+}
+
+/// Interactive talk reports a failed line and keeps reading. Once a submit was
+/// durably admitted, `--new` has done its job even if waiting for the worker
+/// failed; a preparation failure leaves the absence guard armed for the retry.
+fn finish_interactive_line(
+    require_absent: &mut bool,
+    result: Result<(), LineTurnFailure>,
+) -> Option<String> {
+    match result {
+        Ok(()) => {
+            *require_absent = false;
+            None
+        }
+        Err(failure) => {
+            if failure.admitted {
+                *require_absent = false;
+            }
+            Some(failure.error)
         }
     }
 }
@@ -2039,56 +2169,61 @@ fn run_line_turn(
     id: &str,
     message: &str,
     require_absent: bool,
-) -> Result<(), String> {
-    let before_snapshot = conversation_snapshot(t, id)?;
+) -> Result<(), LineTurnFailure> {
+    let before_snapshot =
+        conversation_snapshot(t, id).map_err(LineTurnFailure::before_admission)?;
     let before = before_snapshot
         .as_ref()
         .map(|snapshot| snapshot.messages.len())
         .unwrap_or_default();
     let before_head = before_snapshot.map(|snapshot| snapshot.head);
     let submitted = if require_absent {
-        submit_new_message(t, options, id, message)?
+        submit_new_message(t, options, id, message)
     } else {
-        submit_message(t, options, id, message)?
-    };
-    let request = match submitted {
-        Some(request) => Some(request),
-        None => conversation_snapshot(t, id)?
-            .filter(|snapshot| request_is_active(&snapshot.status))
-            .map(|snapshot| {
-                snapshot.request.ok_or_else(|| {
-                    format!("active conversation {id:?} has no durably recorded request")
-                })
-            })
-            .transpose()?,
-    };
-    if let Some(request) = request {
-        resume_request(t, &request)?;
+        submit_message(t, options, id, message)
     }
-    let snapshot = conversation_snapshot(t, id)?
-        .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;
-    let (events, _, _) = durable_conversation_events(t, id)?;
-    let mut current_turn = before_head.is_none();
-    for event in events {
-        if before_head.as_deref() == Some(event.commit.as_str()) {
-            current_turn = true;
-            continue;
+    .map_err(LineTurnFailure::before_admission)?;
+    (|| {
+        let request = match submitted {
+            Some(request) => Some(request),
+            None => conversation_snapshot(t, id)?
+                .filter(|snapshot| request_is_active(&snapshot.status))
+                .map(|snapshot| {
+                    snapshot.request.ok_or_else(|| {
+                        format!("active conversation {id:?} has no durably recorded request")
+                    })
+                })
+                .transpose()?,
+        };
+        if let Some(request) = request {
+            resume_request(t, &request)?;
         }
-        if !current_turn {
-            continue;
-        }
-        for event in durable_turn_events(&event) {
-            if let TurnEvent::ToolCall { summary, .. } = event {
-                println!("{summary}");
+        let snapshot = conversation_snapshot(t, id)?
+            .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;
+        let (events, _, _) = durable_conversation_events(t, id)?;
+        let mut current_turn = before_head.is_none();
+        for event in events {
+            if before_head.as_deref() == Some(event.commit.as_str()) {
+                current_turn = true;
+                continue;
+            }
+            if !current_turn {
+                continue;
+            }
+            for event in durable_turn_events(&event) {
+                if let TurnEvent::ToolCall { summary, .. } = event {
+                    println!("{summary}");
+                }
             }
         }
-    }
-    for message in snapshot.messages.iter().skip(before) {
-        if message.author == "assistant" || message.author == "agent" {
-            println!("{}", message.content);
+        for message in snapshot.messages.iter().skip(before) {
+            if message.author == "assistant" || message.author == "agent" {
+                println!("{}", message.content);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })()
+    .map_err(LineTurnFailure::after_admission)
 }
 
 fn print_snapshot(snapshot: &ConversationSnapshot, output: &mut impl Write) -> Result<(), String> {
@@ -2121,6 +2256,21 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn test_git_bytes(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
 
     fn configure_test_repo(repo: &std::path::Path, username: &str) {
@@ -2197,6 +2347,58 @@ mod tests {
         assert!(request_is_active("running"));
         assert!(!request_is_active("idle"));
         assert!(!request_is_active("failed"));
+    }
+
+    #[test]
+    fn interactive_talk_reports_failures_and_preserves_new_admission_state() {
+        let mut require_absent = true;
+        let error = finish_interactive_line(
+            &mut require_absent,
+            Err(LineTurnFailure::before_admission(
+                "prepare failed".to_string(),
+            )),
+        );
+        assert_eq!(error.as_deref(), Some("prepare failed"));
+        assert!(
+            require_absent,
+            "a pre-admission failure must remain retryable"
+        );
+
+        let error = finish_interactive_line(
+            &mut require_absent,
+            Err(LineTurnFailure::after_admission(
+                "worker failed".to_string(),
+            )),
+        );
+        assert_eq!(error.as_deref(), Some("worker failed"));
+        assert!(
+            !require_absent,
+            "a durably admitted first line must disarm --new even when waiting fails"
+        );
+
+        let mut require_absent = true;
+        assert_eq!(finish_interactive_line(&mut require_absent, Ok(())), None);
+        assert!(!require_absent);
+    }
+
+    #[test]
+    fn mixed_tool_result_blocks_render_text_instead_of_json() {
+        let events = durable_turn_events(&event(json!({
+            "v": 2,
+            "result": {
+                "tool_use_id": "toolu_1",
+                "content": [
+                    {"type": "text", "text": "first line"},
+                    {"type": "image", "source": {"type": "base64", "data": "abc"}},
+                    {"type": "text", "text": "second line"}
+                ]
+            }
+        })));
+        let [TurnEvent::ToolResult { content, .. }] = events.as_slice() else {
+            panic!("expected one replayed tool result");
+        };
+        assert_eq!(content, "first line\nsecond line");
+        assert!(!content.contains("\\\"type\\\""));
     }
 
     #[test]
@@ -2417,6 +2619,257 @@ mod tests {
         assert!(error.contains("version-2 event"));
 
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn malformed_indexed_conversation_does_not_hide_valid_conversations() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caos-chat-v2-malformed-listing-{}-{unique}",
+            std::process::id()
+        ));
+        let remote = root.join("remote.git");
+        let repo = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "Alice");
+        test_git(
+            &repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        test_git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+        let transport = GitTransport::discover(&repo).unwrap();
+        let base = test_git(&repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let good = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({"v":2,"author":"user","username":"Alice","content":"valid"}),
+        )
+        .unwrap();
+        let malformed = test_git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "not an event"],
+        );
+        let good_ref = conversation_ref("good").unwrap();
+        let broken_ref = conversation_ref("broken").unwrap();
+        let good_index =
+            user_conversation_ref("Alice", UserConversationStatus::Active, "good").unwrap();
+        let broken_index =
+            user_conversation_ref("Alice", UserConversationStatus::Active, "broken").unwrap();
+        for (hash, refname) in [
+            (&good, &good_ref),
+            (&malformed, &broken_ref),
+            (&good, &good_index),
+            (&malformed, &broken_index),
+        ] {
+            test_git(
+                &repo,
+                &["push", "--quiet", CAOS_REMOTE, &format!("{hash}:{refname}")],
+            );
+        }
+
+        let listed =
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert_eq!(
+            pick_conversation(&transport, None, false).unwrap().0,
+            "good"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn submit_fetches_a_full_closure_when_only_the_raw_tip_is_local() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caos-chat-v2-tip-only-submit-{}-{unique}",
+            std::process::id()
+        ));
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let client = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+        std::fs::create_dir_all(&seed).unwrap();
+        test_git(&seed, &["init", "--quiet"]);
+        configure_test_repo(&seed, "seed");
+        test_git(
+            &seed,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        std::fs::write(seed.join("workspace"), "base\n").unwrap();
+        test_git(&seed, &["add", "workspace"]);
+        test_git(&seed, &["commit", "--quiet", "-m", "base"]);
+        let seed_transport = GitTransport::discover(&seed).unwrap();
+        let base = test_git(&seed, &["rev-parse", "HEAD"]);
+        let tree = test_git(&seed, &["rev-parse", "HEAD^{tree}"]);
+        let user = create_event_commit(
+            &seed_transport,
+            &tree,
+            &base,
+            &json!({"v":2,"author":"user","username":"seed","content":"start"}),
+        )
+        .unwrap();
+        let request = "b".repeat(40);
+        let admitted = create_event_commit(
+            &seed_transport,
+            &tree,
+            &user,
+            &json!({"v":2,"status":"queued","request":request,"request_head":user}),
+        )
+        .unwrap();
+        let refname = conversation_ref("shared").unwrap();
+        test_git(
+            &seed,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{admitted}:{refname}"),
+            ],
+        );
+
+        std::fs::create_dir_all(&client).unwrap();
+        test_git(&client, &["init", "--quiet"]);
+        configure_test_repo(&client, "Alice");
+        test_git(
+            &client,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        let client_transport = GitTransport::discover(&client).unwrap();
+        let raw_tip = test_git_bytes(&seed, &["cat-file", "commit", &admitted]);
+        assert_eq!(
+            client_transport
+                .put_object("commit", &raw_tip)
+                .unwrap()
+                .to_string(),
+            admitted
+        );
+        assert!(!commit_closure_is_local(&client_transport, &admitted));
+
+        let result = submit_message_inner_with(
+            &client_transport,
+            &TurnOptions {
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "follow up",
+            false,
+            None,
+            |_, _, _, _| Err("active request was unexpectedly prepared again".to_string()),
+        )
+        .unwrap();
+        assert_eq!(result.as_deref(), Some(request.as_str()));
+        assert!(commit_closure_is_local(&client_transport, &admitted));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_conversation_rejects_reserved_caos_in_workspace_proposal() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caos-chat-v2-reserved-proposal-{}-{unique}",
+            std::process::id()
+        ));
+        let remote = root.join("remote.git");
+        let repo = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "Alice");
+        test_git(
+            &repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        test_git(&repo, &["commit", "--quiet", "-m", "base"]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let base = test_git(&repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let user = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({"v":2,"author":"user","username":"Alice","content":"start"}),
+        )
+        .unwrap();
+        let request = "c".repeat(40);
+        let admitted = create_event_commit(
+            &transport,
+            &tree,
+            &user,
+            &json!({"v":2,"status":"queued","request":request,"request_head":user}),
+        )
+        .unwrap();
+        let refname = conversation_ref("shared").unwrap();
+        test_git(
+            &repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{admitted}:{refname}"),
+            ],
+        );
+
+        std::fs::create_dir_all(repo.join(".caos")).unwrap();
+        std::fs::write(repo.join(".caos/conflicts"), "reserved\n").unwrap();
+        test_git(&repo, &["add", ".caos/conflicts"]);
+        let proposal_tree = test_git(&repo, &["write-tree"]);
+        let proposal = test_git(
+            &repo,
+            &[
+                "commit-tree",
+                &proposal_tree,
+                "-p",
+                &admitted,
+                "-m",
+                "workspace proposal",
+            ],
+        );
+        let error = submit_message_with_tree(
+            &transport,
+            &TurnOptions::default(),
+            "shared",
+            "apply this",
+            &proposal,
+        )
+        .unwrap_err();
+        assert!(error.contains("submitted workspace"), "{error}");
+        assert!(error.contains(".caos"), "{error}");
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(admitted.as_str())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
