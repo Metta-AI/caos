@@ -5566,7 +5566,7 @@ mod tests {
     fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/conversations/talk-1/from-user:caos-tools".to_string(),
+            source: "refs/caos/conversations/talk-1/head:caos-tools".to_string(),
             tools: vec![caos::chat::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),
@@ -5596,7 +5596,7 @@ mod tests {
             .collect();
         assert!(rendered.contains("Always available"));
         assert!(rendered.contains("read, ls, write, edit"));
-        assert!(rendered.contains("talk-1/from-user:caos-tools"));
+        assert!(rendered.contains("talk-1/head:caos-tools"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("Build everything the tree defines."));
         assert!(rendered.contains("[docker://caos-std-bash]"));
