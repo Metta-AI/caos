@@ -11,7 +11,7 @@
 //!   * `--in` a file — a leaf: it counts as 1.
 //!
 //! The result, a blob holding the count, is left at `/cas/out`. It reaches its
-//! own image at `/cas/args/image` — the request's reserved `image` entry — so
+//! own image at `/cas/args/base` — the request's reserved `base` entry — so
 //! recursion needs no std lookup. `own_image` is the *unwrapped base*, though,
 //! so when this worker ships as a runner-pool `curry(runner, bin)` the
 //! recursion must rebind `bin` (the rgrep worker documents the same); with the
