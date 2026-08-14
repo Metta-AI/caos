@@ -278,7 +278,7 @@ pub(super) fn reference_copy_at(
     row: u16,
 ) -> Option<String> {
     let state = app.selected();
-    if state.command_error.is_some() || state.publish_prompt {
+    if state.command_error.is_some() || state.publish_prompt || app.palette.is_some() {
         return None;
     }
     let reference = state.reference_notice.as_ref()?;

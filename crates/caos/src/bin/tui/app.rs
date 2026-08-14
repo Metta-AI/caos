@@ -5,14 +5,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_head, conversation_ref, conversation_replay,
-    conversation_snapshot, conversation_workspace_diff, describe_tool_set,
+    archive_user_conversation, conversation_head, conversation_ref, conversation_reference,
+    conversation_replay, conversation_snapshot, conversation_workspace_diff, describe_tool_set,
     first_available_conversation_name, generate_conversation_title, list_user_conversations,
     publish_unindexed_conversations, publish_user_conversation, resume_request, run_chat_turn,
     set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationReplay,
-    ConversationRole,
-    ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    ConversationRole, ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions,
+    TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -914,6 +913,8 @@ struct ConversationState {
     status: String,
     command_error: Option<String>,
     reference_notice: Option<ReferenceNotice>,
+    reference_loading: bool,
+    reference_generation: u64,
     publish_prompt: bool,
     running: bool,
     local_turn: bool,
@@ -950,6 +951,8 @@ impl ConversationState {
             status,
             command_error: None,
             reference_notice: None,
+            reference_loading: false,
+            reference_generation: 0,
             publish_prompt: false,
             running: false,
             local_turn: false,
@@ -974,6 +977,13 @@ impl ConversationState {
     }
 
     fn apply_load(&mut self, load: LoadedConversation, current_user: &str) {
+        if self
+            .reference_notice
+            .as_ref()
+            .is_some_and(|notice| notice.head != load.snapshot.head)
+        {
+            self.reference_notice = None;
+        }
         let preserve_local_lifecycle = self.running
             && self.local_turn
             && matches!(load.snapshot.status.as_str(), "queued" | "running")
@@ -1072,6 +1082,7 @@ impl ConversationState {
                 return Some(snapshot);
             }
             Ok(None) => {
+                self.reference_notice = None;
                 self.transcript = self
                     .pending_submissions
                     .iter()
@@ -1243,6 +1254,8 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
+        } else if self.reference_loading {
+            self.status.clone()
         } else if self.publishing {
             self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
@@ -1322,6 +1335,12 @@ enum UiMessage {
         conversation: String,
         request: String,
         result: Result<(), String>,
+    },
+    ReferenceLoaded {
+        conversation: String,
+        generation: u64,
+        observed_head: Option<String>,
+        result: Result<(String, Option<String>), String>,
     },
     RemotePolled {
         result: Result<Vec<RemotePollEntry>, String>,
@@ -1711,6 +1730,9 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if self.palette.is_some() || self.confirm_action.is_some() {
+            return MouseAction::Ignored;
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(value) = ui::reference_copy_at(self, area, mouse.column, mouse.row) {
                 self.selecting_transcript = false;
@@ -1881,6 +1903,12 @@ impl App {
         let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
+        let state = self.selected_mut();
+        state.reference_notice = None;
+        state.reference_loading = false;
+        if state.status == "loading conversation reference" {
+            state.status.clear();
+        }
         // Resolve the prompt into the turn's message and, for `/update-tree`,
         // the tree the human commit should carry. `/from`, `/help`, and
         // `/title` are not turns and return here; everything else falls
@@ -2082,33 +2110,34 @@ impl App {
     }
 
     fn show_selected_ref(&mut self) {
-        let id = self.selected().id.clone();
-        let refname = match conversation_ref(&id) {
-            Ok(refname) => refname,
-            Err(error) => {
-                self.selected_mut().reference_notice = None;
-                self.selected_mut().show_command_error(error);
-                return;
-            }
-        };
-        match self
-            .transport()
-            .and_then(|transport| conversation_head(&transport, &id))
-        {
-            Ok(Some(head)) => {
-                self.selected_mut().reference_notice = Some(ReferenceNotice { refname, head });
-            }
-            Ok(None) => {
-                self.selected_mut().reference_notice = None;
-                self.selected_mut().show_command_error(
-                    "this conversation has no remote ref until its first message",
-                );
-            }
-            Err(error) => {
-                self.selected_mut().reference_notice = None;
-                self.selected_mut().show_command_error(error);
-            }
+        self.start_reference_lookup(self.selected);
+    }
+
+    fn start_reference_lookup(&mut self, index: usize) {
+        let state = &mut self.conversations[index];
+        if state.reference_loading {
+            return;
         }
+        state.reference_loading = true;
+        state.reference_generation = state.reference_generation.wrapping_add(1);
+        state.reference_notice = None;
+        state.command_error = None;
+        state.status = "loading conversation reference".to_string();
+        let conversation = state.id.clone();
+        let generation = state.reference_generation;
+        let observed_head = state.remote_head.clone();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir)
+                .and_then(|transport| conversation_reference(&transport, &conversation));
+            let _ = tx.send(UiMessage::ReferenceLoaded {
+                conversation,
+                generation,
+                observed_head,
+                result,
+            });
+        });
     }
 
     pub(crate) fn drain_messages(&mut self) -> bool {
@@ -2248,6 +2277,56 @@ impl App {
                             state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
                             state.status = format!("recovery retry pending: {error}");
                         }
+                    }
+                }
+                UiMessage::ReferenceLoaded {
+                    conversation,
+                    generation,
+                    observed_head,
+                    result,
+                } => {
+                    let Some(index) = self.conversation_index(&conversation) else {
+                        continue;
+                    };
+                    if !self.conversations[index].reference_loading
+                        || self.conversations[index].reference_generation != generation
+                    {
+                        continue;
+                    }
+                    let retry = {
+                        let state = &mut self.conversations[index];
+                        state.reference_loading = false;
+                        if state.status == "loading conversation reference" {
+                            state.status.clear();
+                        }
+                        match result {
+                            Ok((_refname, Some(head)))
+                                if state.remote_head != observed_head
+                                    && state.remote_head.as_deref() != Some(head.as_str()) =>
+                            {
+                                true
+                            }
+                            Ok((refname, Some(head))) => {
+                                state.reference_notice = Some(ReferenceNotice { refname, head });
+                                false
+                            }
+                            Ok((_refname, None)) if state.remote_head != observed_head => true,
+                            Ok((_refname, None)) => {
+                                state.reference_notice = None;
+                                state.show_command_error(
+                                    "this conversation has no remote ref until its first message",
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                state.reference_notice = None;
+                                state.show_command_error(error);
+                                false
+                            }
+                        }
+                    };
+                    if retry {
+                        self.start_reference_lookup(index);
                     }
                 }
                 UiMessage::RemotePolled { result } => {
@@ -2571,6 +2650,17 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return;
+        }
+        if key.code == KeyCode::Esc
+            && (self.selected().reference_notice.is_some() || self.selected().reference_loading)
+        {
+            let state = self.selected_mut();
+            state.reference_notice = None;
+            state.reference_loading = false;
+            if state.status == "loading conversation reference" {
+                state.status.clear();
             }
             return;
         }
@@ -3532,6 +3622,18 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for pending submission {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_reference_lookup(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.selected().reference_loading {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for conversation reference"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -5699,6 +5801,8 @@ mod tests {
         let (mut app, _) = app_with(vec![state(id)]);
         app.repo_dir = repo.clone();
         app.show_selected_ref();
+        assert!(app.selected().reference_loading);
+        wait_for_reference_lookup(&mut app);
 
         let refname = conversation_ref(id).unwrap();
         assert!(app.selected().transcript.is_empty());
@@ -5712,8 +5816,8 @@ mod tests {
 
         // A coherent reload must not erase this presentation-only result.
         let transport = GitTransport::discover(&repo).unwrap();
-        let load = conversation_load(&transport, id).unwrap().unwrap();
-        app.selected_mut().apply_load(load, "Alice");
+        let load = load_conversation(&transport, id).unwrap().unwrap();
+        app.selected_mut().apply_load(load.clone(), "Alice");
         assert_eq!(
             app.selected().reference_notice,
             Some(ReferenceNotice {
@@ -5744,6 +5848,21 @@ mod tests {
             copy_rows.iter().map(|(_, value)| value).collect::<Vec<_>>(),
             vec![&refname, &head]
         );
+        app.palette = Some(CommandPalette::default());
+        assert!(ui::reference_copy_at(&app, area, 27, copy_rows[0].0).is_none());
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 27,
+                    row: copy_rows[0].0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            ),
+            MouseAction::Ignored
+        );
+        app.palette = None;
         for (row, expected) in copy_rows {
             assert_eq!(
                 app.handle_mouse(
@@ -5758,6 +5877,17 @@ mod tests {
                 MouseAction::Copy(expected)
             );
         }
+
+        let mut advanced = load;
+        advanced.snapshot.head = "b".repeat(40);
+        advanced.workspace_diff.head = advanced.snapshot.head.clone();
+        app.selected_mut().apply_load(advanced, "Alice");
+        assert!(app.selected().reference_notice.is_none());
+
+        app.selected_mut().reference_notice = Some(ReferenceNotice { refname, head });
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().reference_notice.is_none());
+        assert_eq!(app.focus, Focus::Conversation);
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
