@@ -762,12 +762,7 @@ mod tests {
     /// a matching poll is never a verdict.
     #[test]
     fn a_matching_seeder_is_not_a_verdict() {
-        let job = args(&[
-            ("base", "sent"),
-            ("in", "aaa"),
-            ("std", "s"),
-            ("salt", "x"),
-        ]);
+        let job = args(&[("base", "sent"), ("in", "aaa"), ("std", "s"), ("salt", "x")]);
         let seeder = args(&[("base", "sent"), ("in", "aaa")]);
         assert!(disagreeing_seeder(&job, [&seeder].into_iter()).is_none());
     }

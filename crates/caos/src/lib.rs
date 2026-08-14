@@ -2987,6 +2987,16 @@ fn unwrap_curry(
 /// remaining entries as bound args. This is the shape the server materializes at
 /// `/cas/args` (hence what `own_args_tree` names); `None` for a curry node, a
 /// plain image, or any tree without a `base` entry.
+///
+/// `base` ALONE DOES NOT SAY "args tree": a git-docker image tree carries its
+/// own `base` — the `docker://` ref its `layer<NN>`s are a delta over (SPEC,
+/// "Git-tree image"). Reading one as an args tree peels it into its own base and
+/// scatters `config.json`/`layer<NN>` into the caller's args, so the run goes to
+/// the raw registry ref instead of the converted image, and `run-tool test` dies
+/// at `lookup caos-registry ... no such host` — the SERVER's name for the
+/// registry, which the host daemon cannot resolve. `config.json` is the
+/// discriminator: the converter requires it on every image tree, and it can
+/// never be an arg name (arg names are `[a-z][a-z0-9-]*` — no dot).
 fn args_tree_node(
     t: &dyn Transport,
     hash: &str,
@@ -3000,6 +3010,9 @@ fn args_tree_node(
         .any(|e| entry_name(e) == CURRY_MARKER.as_bytes())
     {
         return Ok(None); // a curry node — handled by `curry_node`
+    }
+    if entries.iter().any(|e| entry_name(e) == b"config.json") {
+        return Ok(None); // a git-docker image tree, whose `base` is its own
     }
     let Some(image) = entries.iter().find(|e| entry_name(e) == b"base") else {
         return Ok(None); // no reserved `base` entry — not an args tree
