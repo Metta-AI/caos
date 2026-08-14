@@ -40,14 +40,18 @@ the expected old hash to the new hash. Raw Git pushes remain available for
 multi-ref presentation updates, with a server-owned hook enforcing the same
 append rule for conversation heads.
 
-An event commit has the previous event as first parent, the current workspace
-plus reserved `.caos` state as its tree, and a JSON message whose exact stable
-discriminator is `"kind": "caos-chat-event"`. There is no numeric event-format
-version. A missing or unknown `kind` is not interpreted as a legacy event.
-`author` plus `content` adds a transcript message; human messages use
-`author: user` and one case-sensitive `username` for both attribution and
-sidebar membership. For other scalar keys, the newest value wins; keyed
-collections such as async tasks fold independently by their own identity.
+Each non-initial event commit has the previous event as first parent. An
+ordinary conversation's initial event first-parents the resolved workspace
+base; a materialized fork's initial marker first-parents the selected source
+event. Its tree is the current workspace plus reserved `.caos` state, and its
+JSON message uses the exact stable discriminator `"kind":
+"caos-chat-event"`. There is no numeric event-format version. A missing or
+unknown `kind` is not interpreted as a legacy event. `author` plus `content`
+adds a transcript message; human messages use `author: user` and one
+case-sensitive `username` for attribution and display. Clients separately use
+that same resolved identity when they write sidebar membership refs. For other
+scalar keys, the newest value wins; keyed collections such as async tasks fold
+independently by their own identity.
 
 A CAS loser retries on the new head. Text-only events take its tree; workspace
 changes use a three-way merge. Clean Git merges may still require event-specific
@@ -66,7 +70,37 @@ Any number of clients may follow the same conversation. The TUI exposes one
 user identity, rather than separate `user` and `username` concepts, and uses it
 whenever it appends or indexes a conversation. Sidebar refs encode the UTF-8
 bytes of that identity as lowercase hexadecimal prefixed with `u-`; the event
-keeps the original case-sensitive display value.
+keeps the original case-sensitive display value. Usernames are limited to 126
+UTF-8 bytes so the encoded directory component remains filesystem-safe. The
+conversation ID is independently encoded as lowercase UTF-8 hexadecimal
+prefixed with `c-` and limited to 124 UTF-8 bytes, so the encoded terminal
+component plus Git's `.lock` suffix fits the filesystem component limit. An ID
+therefore remains one reversible component even when its canonical ref contains
+`/`.
+
+An explicit `--username` wins. Otherwise clients use the normalized `$USER`
+(trim surrounding whitespace, preserve case and internal spaces, reject control
+and invisible Unicode formatting characters). A line client may fall back to
+Git `user.name`, then `user`, when `$USER` is absent; the TUI instead requires
+`--username` in that environment. `$USER` intentionally remains ahead of Git
+configuration. Until a persisted identity exists, an environment with a shared
+or generic value such as `root` or `ubuntu` must pass a personal `--username`
+explicitly to avoid merging multiple people's attribution and membership. The
+fallback is only a convenience, not a second identity source.
+
+Membership refs use ref-safe keys, not the display values literally. The user
+key is `u-<lowercase hex of the normalized username's UTF-8 bytes>`; for
+example, `Alice Smith` is `u-416c69636520536d697468`. The conversation key is
+`c-<lowercase hex of the conversation ID's UTF-8 bytes>`; for example,
+`project/talk-1` is
+`c-70726f6a6563742f74616c6b2d31`. Encoding the whole ID prevents the Git ref
+file/directory collision that raw IDs `project` and `project/talk-1` would
+otherwise create in one membership namespace.
+
+For a given user and conversation, active and archived membership are mutually
+exclusive. Invitations preserve an existing archived choice instead of
+silently unarchiving it; archive and unarchive move membership with leases on
+both refs in one atomic push.
 
 ### Tool calls
 
@@ -124,6 +158,7 @@ Nothing merges the child workspace into the parent—applying files is explicit.
 - [ ] `/ref`
 - [ ] `/invite`
 - [ ] durable `/from` forks
+- [ ] detached-task follower after foreground exit
 - [ ] child conversations and subagents
 - [ ] detached-work execution-context propagation
 - [ ] plain-commit and mid-tool-batch fork contract
@@ -154,12 +189,25 @@ For a human identity `U`, its ref-safe key is `u-` followed by the lowercase
 hexadecimal encoding of U's UTF-8 bytes. This is reversible and collision-free,
 preserves spaces and case, and prevents a username from introducing ref path
 components. For example, `Ada Lovelace` becomes
-`u-416461204c6f76656c616365`. Active and archived membership refs are:
+`u-416461204c6f76656c616365`. A conversation ID is encoded independently as a
+single `c-` plus lowercase UTF-8 hexadecimal component. For example,
+`project/talk-1` becomes `c-70726f6a6563742f74616c6b2d31`. Active and archived
+membership refs are:
 
 ```text
-refs/caos/users/<user-key>/conversations/active/<id>
-refs/caos/users/<user-key>/conversations/archived/<id>
+refs/caos/users/<user-key>/conversations/active/<conversation-key>
+refs/caos/users/<user-key>/conversations/archived/<conversation-key>
 ```
+
+The reader accepts only this keyed membership layout and decodes the component
+back to the exact conversation ID. It does not read or migrate raw-ID
+membership refs; the destructive cutover above removes them.
+
+The server keeps reflogs for crash repair while automatic Git GC is disabled.
+Those reflogs do not expire on their own. A bounded retention/pruning policy is
+follow-up work and must preserve a documented recovery window; until then,
+unbounded reflog growth is an accepted operational cost rather than something
+ordinary Git maintenance is assumed to handle.
 
 The client appends user events; the remote `llm-step` appends everything it
 does. Neither resets the ref.
@@ -186,10 +234,14 @@ server enforces this first-parent append rule for conversation-head refs and
 rejects deletion or history replacement. Administrative repair can still use a
 local `git update-ref`, outside the network protocol.
 
-Creation uses the same protocol with an explicit expected-absent value. The
-initial event has no first parent, and the server creates `F` only if `F` does
-not exist. A retry after an ambiguous transport failure first reads `F`: an
-observed value equal to the proposed initial commit means the first attempt
+Creation uses the same append protocol with an explicit expected-absent value
+for canonical `F`. That expected value describes the ref, not the commit's
+parentage: an ordinary initial event first-parents the resolved workspace base,
+while a materialized fork marker first-parents its selected source event. The
+atomic first publication separately creates the title and active membership
+under create-only presentation-ref leases while proving archived membership
+absent. A retry after an ambiguous transport failure first reads `F`: an
+observed value equal to the proposed creation tip means the first attempt
 succeeded; any other value is a collision and must not be adopted as the new
 conversation. Child-conversation creation follows the same create-only rule,
 so replaying its recorded creation can recover idempotently without attaching
@@ -313,7 +365,9 @@ bypass append enforcement. A rejected update is rebuilt and retried as above.
 
 An event commit has:
 
-- first parent = previous event;
+- first parent = previous event; an ordinary initial event instead uses the
+  resolved workspace base, while an initial fork marker uses its selected
+  source event;
 - tree = workspace after the event;
 - message = one JSON object, schematically:
 
@@ -366,7 +420,9 @@ ordered conversation.
 - fetch `head`, create the user's event and request locally, upload the closed
   request graph, then CAS-admit both the message and request record;
 - use one case-sensitive user identity for message attribution and sidebar
-  membership, and use its `u-<lowercase UTF-8 hex>` key only in ref paths;
+  membership, use its `u-<lowercase UTF-8 hex>` key only in ref paths, and use
+  one reversible `c-<lowercase UTF-8 hex>` component for each membership's
+  conversation ID;
 - submit or resubmit the one admitted `llm-step` request;
 - follow `head` and render its message map;
 - own drafts and UI state, but no remote execution state.
@@ -552,8 +608,12 @@ operation.
   commits. Unify those entry points only after defining the empty-transcript
   semantics for a plain commit. The same contract must identify safe turn
   boundaries: a fork in the middle of a recorded tool-call batch inherits an
-  incomplete protocol prefix and cannot yet be promised to resume. These are
-  known limitations, not part of the initial implementation in this stack.
+  incomplete protocol prefix and cannot yet be promised to resume. It must also
+  define whether keyed async task state is inherited, reset, or translated. In
+  particular, an inherited pending Q still names the source conversation ref,
+  so the fork cannot safely redispatch it against the fork ref; inherited
+  terminal notices have a different, read-only meaning. These are known
+  limitations, not part of the initial implementation in this stack.
 - Exact reads and appends remove repository-wide discovery from the chat event
   path, and short-lived request refs are swept. Result refs still appear in
   receive-pack advertisements because request commits may refer to result

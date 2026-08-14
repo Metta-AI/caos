@@ -290,10 +290,18 @@ Two verbs and a full-screen client over one turn engine (implemented —
   own crate. It consumes structured `TurnEvent`s from the same engine,
   reconstructs durable history from server-indexed conversation refs, and
   presents independent virtual conversations in a left sidebar. A stable
-  conversation ID addresses `refs/caos/conversations/<id>/from-user`; its mutable
+  conversation ID addresses `refs/caos/conversations/<id>/head`; its mutable
   title lives at the sibling `title` ref. Per-user active and archived membership
-  lives under `refs/caos/users/<user>/conversations/{active,archived}/`, with
-  `--user` defaulting to `$USER`. `Ctrl+W` atomically archives for that user
+  lives under `refs/caos/users/<user-key>/conversations/{active,archived}/`,
+  where `<user-key>` is `u-` plus lowercase hex of the normalized username's
+  UTF-8 bytes and each final `<conversation-key>` is `c-` plus lowercase hex of
+  the conversation ID's UTF-8 bytes. Usernames are limited to 126 UTF-8 bytes;
+  conversation IDs are limited to 124, leaving room for the encoded terminal
+  component's Git `.lock` suffix. Keeping the ID in one reversible component
+  avoids Git ref file/directory collisions for IDs containing `/`.
+  `--username` defaults to `$USER`; shared container accounts such as `root`
+  must pass a personal value until persisted identity is implemented.
+  `Ctrl+W` atomically archives for that user
   without changing HEAD or another user's state; `--list-archived` and
   `--unarchive` recover old conversations. Every conversation retains its own
   transcript, prompt, activity, diff, and running worker thread, so turns can
