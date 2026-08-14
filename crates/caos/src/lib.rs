@@ -2524,17 +2524,14 @@ fn record_continuation(
         if given.contains(&name) {
             return Err(format!("--{name} given twice"));
         }
-        // Literal or path form, the value names an image; resolve_run_image
-        // handles all the shapes (a /cas path, a bare hash, docker://).
-        let image = match value {
-            ArgValue::Literal(v) => v,
-            ArgValue::Path(p) => p,
-            // A tree hash is a valid image ref (a git image or curry node),
-            // so the typed form degenerates to the literal one here.
-            ArgValue::Tree(v) => v,
-            ArgValue::Commit(_) => {
+        // Literal, path or tree-hash all name an image ref (a /cas path, a bare
+        // hash, docker://, or a git image / curry node); resolve_run_image
+        // handles the shapes. A commit is not an image.
+        let image = match ty {
+            ArgType::Commit => {
                 return Err(format!("--{name} names an image, not a commit"));
             }
+            _ => value,
         };
         let resolved = resolve_run_image(t, &cas, image)?;
         entries.push(Entry {
