@@ -75,6 +75,22 @@ Every script here runs with it, and two constructs quietly break under it.
   (`:@@=`'s `--depth 1` fetch does); do NOT add it where the alternate's tips are
   legitimately part of the history you are completing.
 
+- **An unsalted `run-tool test` does not prove a push works.** `ensure_pushed`
+  pushes `<argtree>:refs/caos/req/<argtree>`, so re-running with an unchanged
+  tree pushes a hash the server already has at that ref: git sends nothing,
+  traverses nothing, and any defect in packing the request is invisible. Only a
+  NEW ArgTree builds a real pack — which is why the primary gate is
+  `CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool test` (SPEC.md) and
+  why a green unsalted suite once sat next to a hard-failing salted one for a
+  whole session. Run the salted form before believing a push-path change.
+- **The test harness hides object-availability bugs.** Each per-test client repo
+  gets an ALTERNATE object store (`tests/lib/run-test.sh` → `/tmp/seed-git`)
+  holding what that test declared, so a client that could not otherwise read its
+  base image's closure reads it anyway. A test that is ABOUT what the client
+  holds must `rm .git/objects/info/alternates` first — see `tests/push-closure`,
+  which needs a rustc-built worker (whose base is reached by unwrapping a curry,
+  and so is covered by no advertised ref) to reproduce at all.
+
 # Caches and defaults, when a suite fans out
 
 Both of these presented as "the tests are slow", cost a long time to find, and

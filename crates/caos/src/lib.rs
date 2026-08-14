@@ -586,8 +586,7 @@ impl Transport for GitTransport {
         // re-push of the same content is a no-op), and it persists as the
         // negotiation base for the next push, so an edited tree ships only its
         // delta. The push carries the whole object graph reachable from `hash`.
-        let refspec = format!("{hash}:refs/caos/req/{hash}");
-        let push = || self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec]);
+        let push = || self.push_req_ref(hash);
 
         // RETRIED, for the create race between clients pushing the same object.
         // They all read an advertisement without the ref, so they all plan a
@@ -611,10 +610,23 @@ impl Transport for GitTransport {
         // varies by version: a few extra pushes on the failure path are cheaper
         // than a fragile string test, and a genuine failure just fails N times.
         let mut last = String::new();
+        let mut probed = false;
         for attempt in 0..4 {
             match push() {
                 Ok(_) => return Ok(()),
                 Err(e) => last = e,
+            }
+            // A graph we cannot READ is not the create race, and no retry will
+            // fix it — see `hand_over_graph`. Decided by asking git to walk the
+            // graph rather than by matching its wording, for the same reason the
+            // retry above is unconditional: the message varies by version.
+            // Probed once, and only after a failure, so a healthy push pays
+            // nothing.
+            if !probed {
+                probed = true;
+                if !self.graph_readable(hash) {
+                    return self.hand_over_graph(hash);
+                }
             }
             // Widening pause: the thing we are waiting for is another client's
             // ref update landing, which is brief but not instant.
@@ -885,6 +897,116 @@ impl GitTransport {
 }
 
 impl GitTransport {
+    /// Push `hash` under its content-addressed request ref. The single network
+    /// step of [`Transport::ensure_pushed`], split out so the fallback below can
+    /// reuse it per-child.
+    fn push_req_ref(&self, hash: &str) -> Result<(), String> {
+        let refspec = format!("{hash}:refs/caos/req/{hash}");
+        self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
+    }
+
+    /// Can git walk everything reachable from `hash` in THIS repo?
+    ///
+    /// `--quiet` so a large tree costs a walk and not a printed listing. Used
+    /// only after a push has already failed, to tell an unreadable graph apart
+    /// from a transient failure without pattern-matching git's error text.
+    fn graph_readable(&self, hash: &str) -> bool {
+        self.git_capture(&["rev-list", "--objects", "--quiet", hash], None)
+            .is_ok()
+    }
+
+    /// Read `hash` from the LOCAL object store only — `None` if we don't have
+    /// it. Deliberately unlike [`Transport::get_object`], which falls back to
+    /// the server: here the whole question is what we hold.
+    fn read_local(&self, hash: &str) -> Result<Option<(String, Vec<u8>)>, String> {
+        let oid = parse_oid(hash)?;
+        if let Ok(object) = self.repo.find_object(oid) {
+            return Ok(Some((object.kind.to_string(), object.data.clone())));
+        }
+        // Re-open for packs written after this handle was cached (a fetch), the
+        // same hazard `get_object` guards against.
+        if let Ok(repo) = gix::open(&self.git_dir) {
+            if let Ok(object) = repo.find_object(oid) {
+                return Ok(Some((object.kind.to_string(), object.data.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get the graph rooted at `hash` onto the server when `git push` CANNOT,
+    /// because the client references objects it does not hold.
+    ///
+    /// That state is ordinary, not corruption: an ArgTree names its base image
+    /// as a real tree entry, but the client only ever fetched that image's ROOT
+    /// (one object, per `get_object`'s laziness) — every interior object exists
+    /// solely on the server. git will not use the remote's copy as a boundary
+    /// (it drops negative tips it lacks), so it tries to pack what it cannot
+    /// read and dies. It only bites when no advertised ref reaches the image:
+    /// a flake-built image is pinned as a run result and so is covered, while a
+    /// curry's base is a BLOB naming the hash, leaving the unwrapped runner-pool
+    /// image reachable from nothing.
+    ///
+    /// The invariant that makes this sound — and makes FETCHING the missing
+    /// objects the wrong fix — is that **the client learns an oid in exactly two
+    /// ways**: it computed it (so it holds the object) or the server handed it
+    /// back (so the server holds it). There is no third source. So an object we
+    /// cannot read is one the server already has, and nothing needs to move;
+    /// downloading it merely to upload nothing would tax every cold clone.
+    ///
+    /// Per child: push it whole when its graph is readable — one negotiated,
+    /// delta-compressed push, which is what the git transport is for and what
+    /// carries the big ingested trees — else recurse. Then hand over this one
+    /// object's bytes, which `POST /object` stores with no connectivity check
+    /// (the same endpoint a worker's `caos` uses).
+    fn hand_over_graph(&self, hash: &str) -> Result<(), String> {
+        let Some((kind, content)) = self.read_local(hash)? else {
+            return Ok(()); // not ours to send: it came from the server
+        };
+        if kind == "tree" {
+            let tree = gix::objs::TreeRef::from_bytes(&content, self.repo.object_hash())
+                .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+            for entry in tree.entries {
+                // Gitlinks are not reachability-traversed, so a commit arg's
+                // closure never rode in this push anyway (`resolve_commit_arg`
+                // ships it separately).
+                if entry.mode.is_commit() {
+                    continue;
+                }
+                let child = entry.oid.to_string();
+                if self.graph_readable(&child) {
+                    // `ensure_pushed`, not the raw push: a child ref is subject
+                    // to the same create race as any other, and skipping its
+                    // retry turned a concurrent suite into "cannot lock ref …:
+                    // reference already exists".
+                    self.ensure_pushed(&child)?;
+                } else {
+                    self.hand_over_graph(&child)?;
+                }
+            }
+        }
+        self.post_object_http(&kind, &content)
+    }
+
+    /// Hand the server ONE object's bytes over the HTTP object API, in the
+    /// `<type> <size>\0<content>` framing `HttpTransport::put_object` uses.
+    fn post_object_http(&self, kind: &str, content: &[u8]) -> Result<(), String> {
+        let mut body = format!("{kind} {}\0", content.len()).into_bytes();
+        body.extend_from_slice(content);
+        let url = format!("{}/object/", self.server_url()?.trim_end_matches('/'));
+        let response = minreq::post(&url)
+            .with_body(body)
+            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+            .send()
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(format!(
+                "POST {url}: server returned {} {}",
+                response.status_code, response.reason_phrase
+            ));
+        }
+        Ok(())
+    }
+
     /// Does the local repo already hold `rev` as a COMMIT?
     ///
     /// A SUBPROCESS on purpose, rather than the cached `self.repo`: a `git fetch`

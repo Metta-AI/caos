@@ -1,0 +1,12 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). deep-deps mounts each of these RECURSIVELY
+# DEEPENED at DEEP-DEPS/<name> (design/caos-expr.md).
+#
+# `rgrep` on purpose, not `bash`: rgrep is a rustc-built worker, so it
+# resolves to curry(runner, worker1=<binary>) and its unwrapped base is
+# the RUNNER POOL IMAGE — which is exactly the shape this test is about
+# (see cli.sh). A flake-built image like bash's is pinned as a run
+# result and so cannot exhibit it.
+../../std/rgrep rgrep
+../../std/runner runner
+../../std/rustc rustc
