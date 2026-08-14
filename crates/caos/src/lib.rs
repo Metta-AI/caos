@@ -2981,12 +2981,12 @@ fn unwrap_curry(
     Ok((image, bound))
 }
 
-/// If `hash` names a flat **args tree** — a tree carrying the reserved `image`
-/// entry but no [`CURRY_MARKER`] — return its base image ref (from the `image`
+/// If `hash` names a flat **args tree** — a tree carrying the reserved `base`
+/// entry but no [`CURRY_MARKER`] — return its base image ref (from the `base`
 /// entry: a git image's tree oid, or a `docker://` blob's contents) and its
 /// remaining entries as bound args. This is the shape the server materializes at
 /// `/cas/args` (hence what `own_args_tree` names); `None` for a curry node, a
-/// plain image, or any tree without an `image` entry.
+/// plain image, or any tree without a `base` entry.
 fn args_tree_node(
     t: &dyn Transport,
     hash: &str,
@@ -3001,8 +3001,8 @@ fn args_tree_node(
     {
         return Ok(None); // a curry node — handled by `curry_node`
     }
-    let Some(image) = entries.iter().find(|e| entry_name(e) == b"image") else {
-        return Ok(None); // no reserved `image` entry — not an args tree
+    let Some(image) = entries.iter().find(|e| entry_name(e) == b"base") else {
+        return Ok(None); // no reserved `base` entry — not an args tree
     };
     // A git image rides embedded (the entry IS its tree, so the ref is the oid);
     // a `docker://` ref rides as a blob naming the registry ref.
@@ -3013,7 +3013,7 @@ fn args_tree_node(
     };
     let bound = entries
         .into_iter()
-        .filter(|e| entry_name(e) != b"image")
+        .filter(|e| entry_name(e) != b"base")
         .collect();
     Ok(Some((base_ref, bound)))
 }
