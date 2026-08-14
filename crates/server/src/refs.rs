@@ -291,7 +291,11 @@ fn validate_ref(git_dir: &str, refname: &str) -> Result<(), HttpError> {
 }
 
 fn validate_hash(hash: &str, what: &str) -> Result<(), HttpError> {
-    if hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if hash.len() == 40
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
         Ok(())
     } else {
         Err(HttpError::new(400, format!("invalid {what} {hash:?}")))
@@ -539,6 +543,14 @@ mod tests {
         let request = |expected: Option<&str>, new: &str| {
             serde_json::json!({"ref": refname, "expected": expected, "new": new}).to_string()
         };
+
+        let uppercase = "A".repeat(40);
+        let error = append(&config, &request(None, &uppercase)).err().unwrap();
+        assert_eq!(error.status(), 400);
+        let error = append(&config, &request(Some(&uppercase), &a))
+            .err()
+            .unwrap();
+        assert_eq!(error.status(), 400);
 
         if let Err(error) = append(&config, &request(None, &a)) {
             panic!("{}: {}", error.status(), error.message());
