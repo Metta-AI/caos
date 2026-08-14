@@ -282,14 +282,15 @@ fn conversation_snapshot_at(
             commit: current.clone(),
             value,
         });
-        let parent = t.git_capture(
-            &["rev-parse", "--verify", "--quiet", &format!("{current}^")],
-            None,
-        );
-        match parent {
-            Ok(parent) => current = parent.trim().to_string(),
-            Err(_) => break,
-        }
+        let parent = t
+            .git_capture(
+                &["rev-parse", "--verify", "--quiet", &format!("{current}^")],
+                None,
+            )
+            .map_err(|_| format!("conversation event {current} has no first parent"))?;
+        let parent = parent.trim();
+        validate_hash(parent, "conversation event parent")?;
+        current = parent.to_string();
     }
     newest_first.reverse();
     fold_events(id, head, &newest_first)
@@ -2859,6 +2860,35 @@ mod tests {
         let error = conversation_snapshot_at(&transport, "broken", &malformed).unwrap_err();
         assert!(error.contains("conversation head"));
         assert!(error.contains("caos-chat-event"));
+
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn parentless_chat_event_is_not_a_valid_conversation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "caos-chat-parentless-event-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "test");
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        let tree = test_git(&repo, &["write-tree"]);
+        let message = serde_json::to_string(
+            &json!({"kind": EVENT_KIND, "author": "user", "content": "orphan"}),
+        )
+        .unwrap();
+        let root_event = test_git(&repo, &["commit-tree", &tree, "-m", &message]);
+
+        let transport = GitTransport::discover(&repo).unwrap();
+        let error = conversation_snapshot_at(&transport, "broken", &root_event).unwrap_err();
+        assert!(error.contains("has no first parent"), "{error}");
 
         std::fs::remove_dir_all(repo).unwrap();
     }
