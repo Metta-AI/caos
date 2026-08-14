@@ -244,10 +244,10 @@ fn disagreeing_seeder<'a>(
     entries: &ArgTree,
     polls: impl Iterator<Item = &'a ArgTree>,
 ) -> Option<String> {
-    let image = entries.get("image")?;
+    let image = entries.get("base")?;
     let mut closest: Option<Vec<String>> = None;
     for required in polls {
-        if required.get("image") != Some(image) {
+        if required.get("base") != Some(image) {
             continue;
         }
         // A matching poll would have been claimed by `offer_job`; if one is
