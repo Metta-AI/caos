@@ -2232,7 +2232,8 @@ fn resolve_commit_arg(
 /// The **type tag** of a `--name[:type]=value` argument — the operator's
 /// explicit choice of how the value is read (never sniffed from the value's
 /// shape, so a value may start with anything, no escaping). Bare `=` is a
-/// literal; `:@=` a path; `:commit=` a commit; `:tree=` a tree hash.
+/// literal; `:@=` a path; `:commit=` a commit; `:hash=` an object by oid;
+/// `:docker=` a docker ref.
 ///
 /// This is the ONE arg-type vocabulary, shared by the CLI/worker arg builder
 /// ([`build_arg_entries`]), the map-then image args, and the `.caos-expr`
