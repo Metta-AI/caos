@@ -170,17 +170,40 @@ mechanical mapping.)
 
 ## Implementation stages
 
-1. **Unify the parser.** One `ArgType` enum + shared `parse_kv`, used by both
-   `lib.rs` and `eval.rs`. No new behavior; closes the drift (and finally lets
-   `.caos-expr` express `commit`/`hash`). Safe, prerequisite.
-2. **`--base` rename + grammar collapse.** Reserved entry `image` → `base`;
-   `run`/`curry`/worker-self-ref/server reads; delete shape-sniffing in
-   `resolve_expr_base` / `run_request` / `resolve_run_image`; drop the CLI
-   positional and the `.caos-expr` positional + `--`. Type the map-then image
-   positions.
-3. **New types.** `:docker=`, `:hash=` (generalize `:tree=`), and `:@@=` ref
-   parse (`Ref { url, rev, dir }` + validation: mandatory `rev` for remote,
-   reject `ref=`-without-`rev`).
+1. **Unify the parser.** ✅ **DONE.** One `ArgType` enum + shared `parse_arg`,
+   used by both `lib.rs` and `eval.rs`. Closed the drift (and gives `.caos-expr`
+   the same type vocabulary; it still *resolves* only literals/paths — the rest
+   parse and error "not yet supported", wired in stage 3).
+2. **`--base` rename + grammar collapse.** Split into two checkpoints:
+   - **2A — internal `image` → `base` rename.** ✅ **DONE (33/33).** Reserved
+     ArgTree entry `image` → `base` everywhere it's written/read: client
+     assembly (`base_arg_entry`, secret-hash inserts, `args_tree_node`), server
+     unpack + sub-request build, runner match + `disagreeing_seeder`, worker
+     runner (`/cas/args/base`, poll `required.base`), `worker-common::own_image`,
+     `RESERVED_ARGS`, the self-recursion scripts (`std/flake-builder/worker`,
+     `caos-tools/{build,test}.sh`), the seed records (`build-builtins.sh`), and
+     docs. Re-keys every cached result and the seed — needed one
+     `nix build && caosd up`, exactly like the socket-grant merge.
+
+     **GOTCHA (found the hard way): `base` collides with the git-docker image
+     tree.** An image tree already carries a `base` entry — the `docker://` ref
+     its `layer<NN>`s delta over (SPEC "Git-tree image"). So `args_tree_node`'s
+     "has a `base` entry ⇒ args tree" peeled every image tree, scattering
+     `config.json`/`layer<NN>` into the args and sending the run to the raw
+     server-side registry name (`lookup caos-registry … no such host`). Fixed by
+     making `args_tree_node` return `None` for a tree carrying `config.json` (the
+     converter requires it; a `.`-name can't be an arg). **Checkpoint B must keep
+     this apart anywhere it inspects entries by the `base` name.** (One stale
+     redis seed-result had to be dropped by hand, since seed keys are stable.)
+   - **2B — grammar collapse (next).** Drop the CLI positional `<image>` and the
+     `.caos-expr` positional image + `--`; `run`/`curry` take `--base` as an
+     ordinary typed arg. Delete the shape-sniffing in `resolve_expr_base` /
+     `run_request` / `resolve_run_image`. Type the map-then image positions
+     (`--map`/`--run`/`--then`). Pulls the `:docker=`/`:hash=` types forward
+     (below), since a base must be expressible without sniffing.
+3. **New types.** `:docker=`, `:hash=` (generalize `:tree=`) — pulled into 2B —
+   and `:@@=` ref parse (`Ref { url, rev, dir }` + validation: mandatory `rev`
+   for remote, reject `ref=`-without-`rev`); `:@@=` resolution stays here.
 4. **Locator fetch.** Client-side `git fetch --depth 1 <url> <rev>` → peel →
    descend `dir` → ingest → oid; local refs via the existing git-tracked ingest.
 5. **Migrate std + bootstrap.** `docker://seeded-*` → `--base:docker=`;
