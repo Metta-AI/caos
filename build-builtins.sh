@@ -483,13 +483,13 @@ add_seed_record() { # <name> <required-json> <result-tree>
 }
 
 if [ -n "$fb_delta" ] && [ -n "${hash_of[flake-builder]:-}" ]; then
-  # flake-builder: `run docker://seeded -- --in:@=.`. The `image` a caller forms
-  # for a `docker://` ref is a BLOB naming it (image_arg_entry stores the bytes),
-  # so required `image` is that blob's oid; `in` is the (deepened, but DEPS-free
+  # flake-builder: `run docker://seeded -- --in:@=.`. The `base` a caller forms
+  # for a `docker://` ref is a BLOB naming it (base_arg_entry stores the bytes),
+  # so required `base` is that blob's oid; `in` is the (deepened, but DEPS-free
   # so identity) flake-builder source entry.
   seeded_blob=$(printf 'docker://seeded' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record flake-builder \
-    "$(printf '{"image":"%s","in":"%s"}' "$seeded_blob" "${in_of[flake-builder]}")" "$fb_delta"
+    "$(printf '{"base":"%s","in":"%s"}' "$seeded_blob" "${in_of[flake-builder]}")" "$fb_delta"
 fi
 
 if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; then
@@ -497,7 +497,7 @@ if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; 
   # the flake-builder image (fb_delta), so the caller's arg-tree `image` is that
   # tree oid and `in` is the deepened cargo entry — both known here.
   add_seed_record cargo \
-    "$(printf '{"image":"%s","in":"%s"}' "$fb_delta" "${in_of[cargo]}")" "$cargo_delta"
+    "$(printf '{"base":"%s","in":"%s"}' "$fb_delta" "${in_of[cargo]}")" "$cargo_delta"
 fi
 
 # rustc/deep-deps: SEEDED core. Their `.caos-expr` is a distinct sentinel
@@ -513,7 +513,7 @@ if [ -n "$runner_delta" ] && [ -n "${bin_path[deep-deps]:-}" ] && [ -n "${hash_o
   bts "curried deep-deps"
   dd_blob=$(printf 'docker://seeded-deep-deps' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record deep-deps \
-    "$(printf '{"image":"%s","in":"%s"}' "$dd_blob" "${in_of[deep-deps]}")" "$dd_curry"
+    "$(printf '{"base":"%s","in":"%s"}' "$dd_blob" "${in_of[deep-deps]}")" "$dd_curry"
 fi
 
 if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}" ] && [ -n "${hash_of[rustc]:-}" ]; then
@@ -538,7 +538,7 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   bts "curried rustc"
   rustc_blob=$(printf 'docker://seeded-rustc' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record rustc \
-    "$(printf '{"image":"%s","in":"%s"}' "$rustc_blob" "${in_of[rustc]}")" "$rustc_curry"
+    "$(printf '{"base":"%s","in":"%s"}' "$rustc_blob" "${in_of[rustc]}")" "$rustc_curry"
 fi
 
 # runner: the pooled interpreter, a self-contained nix closure with no source to
@@ -549,7 +549,7 @@ fi
 if [ -n "$runner_delta" ] && [ -n "${hash_of[runner]:-}" ]; then
   runner_blob=$(printf 'docker://seeded-runner' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record runner \
-    "$(printf '{"image":"%s","in":"%s"}' "$runner_blob" "${in_of[runner]}")" "$runner_delta"
+    "$(printf '{"base":"%s","in":"%s"}' "$runner_blob" "${in_of[runner]}")" "$runner_delta"
 fi
 
 if [ -n "$seed_entries" ]; then
