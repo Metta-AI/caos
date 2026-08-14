@@ -2084,49 +2084,49 @@ fn build_arg_entries(
 
     let mut entries = Vec::new();
     for kv in kvs {
-        let (name, value) = parse_kv(kv)?;
+        let (name, ty, value) = parse_arg(kv)?;
 
-        let (mode, oid) = match value {
+        let (mode, oid) = match ty {
             // `--name=value` — store the literal verbatim as a blob.
-            ArgValue::Literal(v) => (
+            ArgType::Literal => (
                 EntryKind::Blob.into(),
-                post_object(t, "blob", v.as_bytes())?,
+                post_object(t, "blob", value.as_bytes())?,
             ),
             // `--name:@=path` under the CAS — reference whatever it was made from.
-            ArgValue::Path(p) if cas.is_some_and(|c| Path::new(p).starts_with(c)) => {
+            ArgType::Path if cas.is_some_and(|c| Path::new(value).starts_with(c)) => {
                 let cas = cas.expect("checked is_some_and above");
-                let canon = Path::new(p)
+                let canon = Path::new(value)
                     .canonicalize()
-                    .map_err(|e| format!("{p}: {e}"))?;
+                    .map_err(|e| format!("{value}: {e}"))?;
                 let cas_real = cas
                     .canonicalize()
                     .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
                 if !canon.starts_with(&cas_real) {
-                    return Err(format!("{p} resolves outside {}", cas.display()));
+                    return Err(format!("{value} resolves outside {}", cas.display()));
                 }
                 cas_entry(&canon)?
             }
             // `--name:@=path` elsewhere — ingest a host path (git transport only;
             // the worker has no host filesystem, so it errors clearly).
-            ArgValue::Path(p) => t.ingest_path(p)?.ok_or_else(|| {
-                format!("`{name}`: {p:?} is a host path, but this client only reads /cas paths")
+            ArgType::Path => t.ingest_path(value)?.ok_or_else(|| {
+                format!("`{name}`: {value:?} is a host path, but this client only reads /cas paths")
             })?,
             // `--name:commit=value` — a commit, unpeeled, as a gitlink entry.
-            ArgValue::Commit(v) => (
+            ArgType::Commit => (
                 EntryKind::Commit.into(),
-                resolve_commit_arg(t, cas, v).map_err(|e| format!("`{name}`: {e}"))?,
+                resolve_commit_arg(t, cas, value).map_err(|e| format!("`{name}`: {e}"))?,
             ),
             // `--name:tree=hash` — a tree the server already holds (an earlier
             // result), referenced by hash. Verified server-side to be a tree so
             // a typo fails here, not as a bad materialization in the worker.
-            ArgValue::Tree(v) => {
+            ArgType::Tree => {
                 let (kind, _) = t
-                    .get_object(v)
-                    .map_err(|e| format!("`{name}`: tree {v}: {e}"))?;
+                    .get_object(value)
+                    .map_err(|e| format!("`{name}`: tree {value}: {e}"))?;
                 if kind != "tree" {
-                    return Err(format!("`{name}`: {v} is a {kind}, not a tree"));
+                    return Err(format!("`{name}`: {value} is a {kind}, not a tree"));
                 }
-                (EntryKind::Tree.into(), parse_oid(v)?)
+                (EntryKind::Tree.into(), parse_oid(value)?)
             }
         };
 
