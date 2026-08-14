@@ -121,11 +121,12 @@ publishes a deterministic fallback atomically with `F`. A generated title may
 replace only the exact fallback it was based on; any manual or foreign rename
 wins the compare-and-swap race.
 
-Followers poll the exact head away from the input/render thread and perform a
-full coherent load only when that head changes. At most one refresh is in
-flight. A result is applied only if its observed head is still relevant, and a
-pending local submission remains visible until its durable commit is observed;
-stale network results cannot roll back newer conversation or draft state.
+Followers refresh sidebar membership, conversation heads, and titles away from
+the input/render thread, then perform a full coherent load only for a changed
+selected head. At most one refresh is in flight. A result is applied only if its
+observed head is still relevant, and a pending local submission remains visible
+until its durable commit is observed; stale network results cannot roll back
+newer conversation or draft state.
 
 ### Tool calls
 
@@ -486,8 +487,10 @@ warned about and ignored while later valid task events remain usable. This
 defensive folding is not a compatibility reader: a commit without the exact
 event kind is not accepted as conversation history.
 
-Tool calls and results are events keyed by call ID, not another waterfall
-property. The UI derives current activity from calls without results.
+Tool calls and results are events keyed by `(request, round, call ID)`, not
+another waterfall property. The UI derives current activity from composite call
+identities without results; a provider may reuse a bare call ID in another
+round.
 
 Commits without `content` record internal progress. Only recovery-worthy
 progress belongs here; token-level streaming may remain ephemeral.
@@ -507,8 +510,9 @@ ordered conversation.
   one reversible `c-<lowercase UTF-8 hex>` component for each membership's
   conversation ID;
 - submit or resubmit the one admitted `llm-step` request;
-- poll the exact `head` away from the UI thread, load all projections from one
-  coherent spine read only when it changes, and reject stale load results;
+- refresh sidebar discovery away from the UI thread, load all projections from
+  one coherent spine read only when the selected head changes, and reject stale
+  load results;
 - own drafts and UI state, but no remote execution state.
 
 **`llm-step`**
@@ -556,7 +560,8 @@ ordered conversation.
 
 The canonical head is the only remote execution state, but a responsive client
 also has local optimistic state. Each follower permits one remote refresh at a
-time. It first performs an exact head read; an unchanged hash is cheap, while a
+time. The current refresh lists that user's membership refs plus conversation
+heads and titles; an unchanged selected hash avoids the full load, while a
 changed hash triggers one coherent load that derives snapshot, transcript, and
 workspace diff from the same validated first-parent walk. The UI applies that
 load only if its conversation and observed-head generation are still current.
@@ -726,6 +731,10 @@ result-consumption operation.
   tool-selection, and finish paths still perform synchronous Git or network
   work on the TUI thread. Move those remaining operations behind the same
   asynchronous, generation-checked boundary.
+- Background discovery still performs broad membership, conversation-head, and
+  title ref queries on each poll. Make the open conversation's unchanged case
+  an exact-head read and move sidebar discovery to a separate incremental or
+  less frequent path.
 - Startup ref repair validates each conversation tip and its workspace tree but
   does not yet validate the complete event-parent spine. If an earlier event
   object is lost while a newer tip survives, startup therefore leaves a ref
