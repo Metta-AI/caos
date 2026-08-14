@@ -263,31 +263,18 @@ fn run_work_request_inner(
     // errors cleanly. An owner guard clears and broadcasts if its thread
     // unwinds; a waiter never promotes itself merely because a valid run is
     // slow, since duplicate execution may repeat external side effects.
-    let owner = match join_flight(arg_tree, stack) {
-        Flight::Owner(owner) => Some(owner),
-        Flight::Unsafe => {
-            eprintln!(
-                "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
-            );
-            None
-        }
-        Flight::Waiter(rx, guard) => {
-            let outcome = rx.recv();
-            drop(guard);
-            match outcome {
-                Ok(outcome) => {
-                    eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
-                    return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
+    let owner =
+        match claim_flight_after_miss(arg_tree, stack, || cache_get(&config.redis_addr, &key)) {
+            FlightDisposition::Run(owner) => owner,
+            FlightDisposition::Complete { outcome, cache_hit } => {
+                if cache_hit {
+                    if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
+                        config.trace.cache(trace_id, span_id, true);
+                    }
                 }
-                Err(_) => {
-                    return Err(HttpError::new(
-                        500,
-                        format!("single-flight owner for {arg_tree} ended without an outcome"),
-                    ))
-                }
+                return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
             }
-        }
-    };
+        };
     let outcome = run_dispatch(config, request, &image, &salt, &key, traced_arg_entries);
     if let Some(owner) = owner {
         owner.finish(&outcome);
@@ -450,6 +437,88 @@ enum Flight {
     Waiter(mpsc::Receiver<Outcome>, ParkGuard),
     /// Someone is, but parking would deadlock: run independently.
     Unsafe,
+}
+
+enum FlightDisposition {
+    /// This arrival must execute. `Some` owns the canonical flight; `None` is
+    /// the independent duplicate required to expose a cross-thread cycle.
+    Run(Option<FlightOwner>),
+    /// A live owner or the post-claim cache re-read supplied the outcome.
+    Complete { outcome: Outcome, cache_hit: bool },
+}
+
+/// Join the flight after an initial cache miss, then re-read the cache if this
+/// arrival will execute. A miss can be descheduled before it reaches the flight
+/// table; the previous owner may finish, cache, and remove its entry meanwhile.
+/// The new owner must therefore check again while its ownership excludes any
+/// other ordinary in-process executor. Unsafe cycle-breaking duplicates also
+/// re-read before repeating possibly effectful work.
+fn claim_flight_after_miss(
+    arg_tree: &str,
+    stack: &[String],
+    reread_cache: impl FnOnce() -> Result<Option<String>, String>,
+) -> FlightDisposition {
+    match join_flight(arg_tree, stack) {
+        Flight::Owner(owner) => match reread_cache() {
+            Ok(Some(result)) => {
+                eprintln!("cache hit after single-flight claim: arg_tree={arg_tree} -> {result}");
+                let outcome = Ok(result);
+                owner.finish(&outcome);
+                FlightDisposition::Complete {
+                    outcome,
+                    cache_hit: true,
+                }
+            }
+            Ok(None) => FlightDisposition::Run(Some(owner)),
+            Err(error) => {
+                eprintln!(
+                    "cache lookup after single-flight claim failed ({error}); running worker: arg_tree={arg_tree}"
+                );
+                FlightDisposition::Run(Some(owner))
+            }
+        },
+        Flight::Unsafe => match reread_cache() {
+            Ok(Some(result)) => {
+                eprintln!("cache hit before cycle-breaking run: arg_tree={arg_tree} -> {result}");
+                FlightDisposition::Complete {
+                    outcome: Ok(result),
+                    cache_hit: true,
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
+                );
+                FlightDisposition::Run(None)
+            }
+            Err(error) => {
+                eprintln!(
+                    "cache lookup before cycle-breaking run failed ({error}); running independently: arg_tree={arg_tree}"
+                );
+                FlightDisposition::Run(None)
+            }
+        },
+        Flight::Waiter(rx, guard) => {
+            let outcome = rx.recv();
+            drop(guard);
+            match outcome {
+                Ok(outcome) => {
+                    eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
+                    FlightDisposition::Complete {
+                        outcome,
+                        cache_hit: false,
+                    }
+                }
+                Err(_) => FlightDisposition::Complete {
+                    outcome: Err((
+                        500,
+                        format!("single-flight owner for {arg_tree} ended without an outcome"),
+                    )),
+                    cache_hit: false,
+                },
+            }
+        }
+    }
 }
 
 /// The unique owner of one in-process flight. Normal completion explicitly
@@ -1769,6 +1838,56 @@ mod single_flight_tests {
         owner.finish(&outcome);
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
         drop(guard);
+    }
+
+    #[test]
+    fn a_stale_cache_miss_rereads_after_becoming_owner() {
+        let request = "9".repeat(40);
+        let first_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+
+        // This arrival observes a miss while the first owner is live, then is
+        // descheduled until that owner has cached and left the flight table.
+        let mut cached = None;
+        assert!(cached.is_none());
+        let cached_result = format!("blob {}", "8".repeat(40));
+        cached = Some(cached_result.clone());
+        first_owner.finish(&Ok(cached_result.clone()));
+
+        let mut reread_saw_new_owner = false;
+        let disposition = claim_flight_after_miss(&request, &[], || {
+            // The re-read happens only after this stale arrival has claimed a
+            // new flight, so another arrival must observe it as a waiter.
+            match join_flight(&request, &[]) {
+                Flight::Waiter(rx, guard) => {
+                    reread_saw_new_owner = true;
+                    drop(rx);
+                    drop(guard);
+                }
+                _ => panic!("cache re-read ran before flight ownership"),
+            }
+            Ok(cached.clone())
+        });
+
+        assert!(reread_saw_new_owner);
+        match disposition {
+            FlightDisposition::Complete { outcome, cache_hit } => {
+                assert!(cache_hit);
+                assert_eq!(outcome, Ok(cached_result));
+            }
+            FlightDisposition::Run(owner) => {
+                drop(owner);
+                panic!("stale cache miss dispatched duplicate work");
+            }
+        }
+
+        let replacement = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("cache-filled flight was not released"),
+        };
+        drop(replacement);
     }
 
     #[test]
