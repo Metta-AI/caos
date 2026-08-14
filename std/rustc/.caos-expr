@@ -8,4 +8,4 @@
 # — and seeds it under this expression's arg-tree key. Nothing is staged into
 # the checked-in entry: a consumer fetching this tree gets a resolvable
 # expression, and the binary rides in the seed, not here.
-run docker://seeded-rustc -- --in:@=.
+run --base:docker=seeded-rustc --in:@=.

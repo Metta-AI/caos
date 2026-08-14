@@ -5,4 +5,4 @@
 # /std, so std carries no ambient self-reference. No runner is named: rustc
 # DEPENDS on the pool and curries the built binary onto it itself, so the result
 # is curry(runner, worker1=<the compiled binary>) — a ready-to-run worker.
-run DEEP-DEPS/rustc -- --src:@=.
+run --base:@=DEEP-DEPS/rustc --src:@=.

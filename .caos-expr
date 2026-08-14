@@ -21,4 +21,4 @@
 # That is why `std/runner` exists as a seeded `{.caos-expr}` sentinel rather
 # than a name published straight from a host-built delta, and why the test
 # fixture binary moved to `std/llm-stub` instead of riding in a build output.
-run std/deep-deps -- --in:@=.
+run --base:@=std/deep-deps --in:@=.

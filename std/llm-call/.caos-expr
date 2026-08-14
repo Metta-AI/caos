@@ -4,4 +4,4 @@
 # hands it the llm-client code crate, spliced at `llm-client/`. Deps are named by
 # LOCAL deep-deps mounts (declared in DEPS), never ambient /std. No runner is
 # named: rustc DEPENDS on the pool and curries the built binary onto it itself.
-run DEEP-DEPS/rustc -- --src:@=. --dep0:@=DEEP-DEPS/llm-client
+run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client
