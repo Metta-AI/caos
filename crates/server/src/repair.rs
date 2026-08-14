@@ -152,11 +152,14 @@ enum ClosureKind {
 enum IntegrityDepth {
     TargetOnly,
     WorkspaceClosure,
+    ConversationHead,
 }
 
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/") || refname.starts_with("refs/caos/res/") {
         IntegrityDepth::TargetOnly
+    } else if refname.starts_with("refs/caos/conversations/") && refname.ends_with("/head") {
+        IntegrityDepth::ConversationHead
     } else {
         IntegrityDepth::WorkspaceClosure
     }
@@ -187,7 +190,17 @@ fn intact_ref_target(
     let object = repo
         .find_object(id)
         .map_err(|error| format!("object {id} is unreadable: {error}"))?;
-    if depth == IntegrityDepth::TargetOnly || object.kind != gix::object::Kind::Commit {
+    if depth == IntegrityDepth::TargetOnly {
+        memo.targets.insert((id, depth));
+        return Ok(());
+    }
+    if object.kind != gix::object::Kind::Commit {
+        if depth == IntegrityDepth::ConversationHead {
+            return Err(format!(
+                "conversation head object {id} is a {}, not a commit",
+                object.kind
+            ));
+        }
         memo.targets.insert((id, depth));
         return Ok(());
     }
@@ -610,6 +623,49 @@ mod tests {
 
         assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
         assert!(!head.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn conversation_head_requires_a_commit_while_title_accepts_a_blob() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let repo = repo.to_thread_local();
+        let intact = empty_commit(&dir, "intact event");
+        let blob = repo
+            .write_blob(b"Readable title")
+            .unwrap()
+            .detach()
+            .to_string();
+        let head = plant_ref(
+            &dir,
+            "refs/caos/conversations/chat/head",
+            &format!("{blob}\n"),
+        );
+        let title = plant_ref(
+            &dir,
+            "refs/caos/conversations/chat/title",
+            &format!("{blob}\n"),
+        );
+        plant_ref(
+            &dir,
+            "logs/refs/caos/conversations/chat/head",
+            &format!(
+                "0000000000000000000000000000000000000000 {intact} caos <caos@caos> 0 +0000\tcreated\n\
+                 {intact} {blob} caos <caos@caos> 1 +0000\tinvalid update\n"
+            ),
+        );
+
+        assert_eq!(drop_broken_refs(&repo, &git_dir), 0);
+        assert_eq!(
+            std::fs::read_to_string(&head).unwrap(),
+            format!("{intact}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&title).unwrap(),
+            format!("{blob}\n")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
