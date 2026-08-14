@@ -489,10 +489,10 @@ warned about and ignored while later valid task events remain usable. This
 defensive folding is not a compatibility reader: a commit without the exact
 event kind is not accepted as conversation history.
 
-Tool calls and results are events keyed by `(request, round, call ID)`, not
-another waterfall property. The UI derives current activity from composite call
-identities without results; a provider may reuse a bare call ID in another
-round.
+Tool calls and results carry the composite identity
+`(request, round, tool_use_id)`. A model call ID is only round-local and may
+recur in later rounds or requests. The UI derives current activity from
+composite call identities that do not yet have results.
 
 Commits without `content` record internal progress. Only recovery-worthy
 progress belongs here; token-level streaming may remain ephemeral.
