@@ -94,7 +94,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   doesn't match the seed record NOTHING happens — no container, no log line —
   and the eventual `no runner for arg_tree …` blames capacity, the one thing
   that isn't wrong. The server now proves this instead: a parked poll whose
-  `required["image"]` equals the job's `image` IS that sentinel's seeder, so a
+  `required["base"]` equals the job's `base` IS that sentinel's seeder, so a
   disagreement is permanent, and after `CAOS_SEEDED_GRACE_SECS` (45s) the 503
   names the differing args. **Read that message rather than re-deriving it** —
   it prints both oids, and the fix is always one of the two sides being stale.
