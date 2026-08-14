@@ -89,7 +89,7 @@ pub fn queue_request<S>(
 where
     S: FnOnce(&str) -> Result<String, String>,
 {
-    if let Err(error) = validate_hash(subrequest, "async subrequest") {
+    if let Err(error) = validate_subrequest(subrequest) {
         return Ok(error_block(call_id, &error));
     }
     progress::validate_conversation_ref(target_ref)?;
@@ -239,7 +239,7 @@ pub(crate) fn readmit_task(task: &str, conversation: &str) -> Result<(), String>
         return Err(format!("async task {task} is not an ArgTree"));
     }
     let subreq = read_literal_arg(&request, task, "subreq")?;
-    validate_hash(&subreq, "async subrequest")?;
+    validate_subrequest(&subreq)?;
     let recorded_target = read_literal_arg(&request, task, "target-ref")?;
     if recorded_target != target_ref {
         return Err(format!(
@@ -269,6 +269,10 @@ fn validate_status(status: &str) -> Result<(), String> {
     } else {
         Err(format!("invalid async status {status:?}"))
     }
+}
+
+fn validate_subrequest(subrequest: &str) -> Result<(), String> {
+    validate_hash(subrequest, "async subrequest")
 }
 
 fn dispatch(task: &str) -> Result<(), String> {
@@ -389,6 +393,23 @@ mod tests {
         .unwrap();
         assert_eq!(result["tool_use_id"], "call-2");
         assert_eq!(result["is_error"], true);
+
+        let uppercase = json!({
+            "type": "tool_use",
+            "id": "call-3",
+            "name": TOOL_NAME,
+            "input": {"request": "A".repeat(40)}
+        });
+        let result = queue_call(&uppercase, "chat", "unused", |_| {
+            panic!("uppercase request must not record pending")
+        })
+        .unwrap();
+        assert_eq!(result["tool_use_id"], "call-3");
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("lowercase"));
     }
 
     #[test]

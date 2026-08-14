@@ -29,7 +29,7 @@ pub fn validate_target_ref(refname: &str) -> Result<(), String> {
         ));
     };
     if conversation.is_empty()
-        || conversation.len() > 512
+        || conversation.len() > 124
         || conversation.starts_with('/')
         || conversation.ends_with('/')
         || conversation.contains("//")
@@ -42,7 +42,7 @@ pub fn validate_target_ref(refname: &str) -> Result<(), String> {
         || conversation.split('/').any(|component| {
             component.is_empty()
                 || component == "."
-                || component == "head"
+                || matches!(component, "head" | "title")
                 || component.starts_with('.')
                 || component.ends_with(".lock")
         })
@@ -367,8 +367,14 @@ fn read_ref(base: &str, refname: &str) -> Result<Option<String>, String> {
 }
 
 pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid {what} hash {hash:?}"));
+    if hash.len() != 40
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
+        ));
     }
     Ok(())
 }
@@ -378,11 +384,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durable_hashes_are_canonical_lowercase() {
+        assert!(validate_hash(&"a".repeat(40), "test hash").is_ok());
+        assert!(validate_hash(&"A".repeat(40), "test hash")
+            .unwrap_err()
+            .contains("lowercase"));
+    }
+
+    #[test]
     fn target_ref_is_only_a_conversation_head() {
         assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_ok());
         assert!(validate_target_ref("refs/heads/main").is_err());
         assert!(validate_target_ref("refs/caos/conversations/chat-1/status").is_err());
         assert!(validate_target_ref("refs/caos/conversations/a/head/b/head").is_err());
+        assert!(validate_target_ref("refs/caos/conversations/a/title/b/head").is_err());
+        assert!(validate_target_ref(&format!(
+            "refs/caos/conversations/{}/head",
+            "a".repeat(124)
+        ))
+        .is_ok());
+        assert!(validate_target_ref(&format!(
+            "refs/caos/conversations/{}/head",
+            "a".repeat(125)
+        ))
+        .is_err());
         assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_err());
     }
 

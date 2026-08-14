@@ -2004,9 +2004,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conversation_run_hashes_are_canonical_lowercase() {
-        assert!(validate_run_hash(&"a".repeat(40)).is_ok());
-        assert!(validate_run_hash(&"A".repeat(40))
+    fn durable_hashes_are_canonical_lowercase() {
+        assert!(validate_hash(&"a".repeat(40), "test hash").is_ok());
+        assert!(validate_hash(&"A".repeat(40), "test hash")
             .unwrap_err()
             .contains("lowercase"));
     }
