@@ -2062,7 +2062,7 @@ fn scratch_dir() -> Result<PathBuf, String> {
 /// The per-arg tree entries that make up an args tree — `run`/`curry` merge call
 /// args with a curry node's bound args, then `post_tree` the result.
 ///
-/// Each `--name[:type]=value` becomes a tree entry `name` (see [`parse_kv`]):
+/// Each `--name[:type]=value` becomes a tree entry `name` (see [`parse_arg`]):
 /// * `--name=value` — a literal, stored verbatim as a blob;
 /// * `--name:@=path` inside the CAS — references the object that path was
 ///   materialized from (its recorded hash). Only when `cas` is `Some` (the
