@@ -574,6 +574,10 @@ fn llm_round(
         .filter(|b| b["type"] == "tool_use")
         .cloned()
         .collect();
+    // Prove the response shape is replayable before either terminal arm can
+    // publish it. In particular, an `end_turn` carrying tool calls would leave
+    // a permanently incomplete batch on the append-only conversation spine.
+    let durable_calls = validated_tool_calls(&stop, &tool_uses)?;
 
     match stop.as_str() {
         "end_turn" => {
@@ -604,11 +608,7 @@ fn llm_round(
             }
         }
         "tool_use" => {
-            // Validate the identifiers before publishing any part of this
-            // response. `latest_round` and transcript replay rely on IDs to
-            // pair results; persisting a malformed batch would make even the
-            // normal failure recorder unable to read the new head.
-            let calls = durable_tool_calls(&tool_uses)?;
+            let calls = durable_calls.ok_or("validated tool_use response has no calls")?;
             let tree = cas_hash(ws)?;
             let event = json!({
                 "kind": "caos-chat-event",
@@ -2028,6 +2028,23 @@ fn response_text(blocks: &[Value]) -> String {
         .join("\n\n")
 }
 
+/// Validate the relationship between a response's stop reason and tool blocks
+/// before the response is recorded. Only `tool_use` may carry calls; an
+/// `end_turn` with calls would be replayed as a batch that can never receive
+/// results.
+fn validated_tool_calls(
+    stop_reason: &str,
+    tool_uses: &[Value],
+) -> Result<Option<Vec<Value>>, String> {
+    match stop_reason {
+        "tool_use" => durable_tool_calls(tool_uses).map(Some),
+        "end_turn" if !tool_uses.is_empty() => {
+            Err("stop_reason end_turn but response contains tool_use blocks".to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Build the durable call projection only after proving the response can be
 /// folded again. IDs are scoped to this response's request/round, so reuse by
 /// a later round is valid; duplicates inside one response are not.
@@ -2137,6 +2154,19 @@ mod tests {
         assert!(durable_tool_calls(&[valid.clone(), valid])
             .unwrap_err()
             .contains("repeats tool_use id"));
+    }
+
+    #[test]
+    fn terminal_response_rejects_tool_calls_before_recording() {
+        let call = json!({"type":"tool_use","id":"call","name":"read","input":{}});
+        assert!(validated_tool_calls("end_turn", &[]).unwrap().is_none());
+        assert!(validated_tool_calls("end_turn", &[call.clone()])
+            .unwrap_err()
+            .contains("end_turn"));
+        assert_eq!(
+            validated_tool_calls("tool_use", &[call]).unwrap().unwrap()[0]["id"],
+            "call"
+        );
     }
 
     #[test]
