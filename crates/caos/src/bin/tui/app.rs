@@ -3598,7 +3598,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos::chat::conversation_ref;
+    use caos::chat::{conversation_ref, ConversationReplay};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
