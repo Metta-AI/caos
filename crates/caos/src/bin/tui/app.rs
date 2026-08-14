@@ -612,6 +612,20 @@ impl Composer {
         Some(message)
     }
 
+    /// Put a failed submission back in the draft without replacing anything
+    /// the user typed while the request was in flight.
+    fn restore_message(&mut self, message: &str) {
+        if self.expanded_text().trim() == message.trim() {
+            return;
+        }
+        self.selection_anchor = None;
+        self.cursor = self.text.len();
+        if !self.text.is_empty() {
+            self.insert_str("\n\n");
+        }
+        self.insert_str(message);
+    }
+
     fn clear(&mut self) -> bool {
         if self.text.is_empty() && self.pending_pastes.is_empty() {
             return false;
@@ -946,7 +960,10 @@ impl ConversationState {
         let preserve_local_lifecycle = self.running
             && self.local_turn
             && matches!(load.snapshot.status.as_str(), "queued" | "running")
-            && self.active_request == load.snapshot.request;
+            && self
+                .active_request
+                .as_ref()
+                .is_none_or(|request| load.snapshot.request.as_ref() == Some(request));
         let local_lifecycle = preserve_local_lifecycle.then(|| {
             (
                 self.activities.clone(),
@@ -1155,11 +1172,37 @@ impl ConversationState {
         {
             pending.commit = Some(commit);
         }
+        let durable_is_visible = self
+            .pending_submissions
+            .iter()
+            .find(|pending| pending.id == id)
+            .and_then(|pending| pending.commit.as_deref())
+            .is_some_and(|commit| {
+                self.transcript
+                    .iter()
+                    .any(|entry| entry.commit.as_deref() == Some(commit))
+            });
+        if durable_is_visible {
+            self.discard_pending_submission(id);
+        }
     }
 
     fn discard_pending_submission(&mut self, id: u64) {
         self.pending_submissions.retain(|pending| pending.id != id);
         self.transcript.retain(|entry| entry.pending_id != Some(id));
+    }
+
+    fn restore_pending_submission(&mut self, id: u64) {
+        let Some(pending) = self
+            .pending_submissions
+            .iter()
+            .find(|pending| pending.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.discard_pending_submission(id);
+        self.composer.restore_message(&pending.text);
     }
 
     fn follow_tail(&mut self) {
@@ -1228,16 +1271,21 @@ enum UiMessage {
     },
     Failed {
         conversation: String,
+        pending_id: u64,
         error: String,
     },
     Completed {
         conversation: String,
         outcome: TurnOutcome,
     },
-    InterjectionSubmitted {
+    SubmissionCommitted {
         conversation: String,
         pending_id: u64,
         commit: String,
+    },
+    InterjectionRefreshed {
+        conversation: String,
+        observed_head: Option<String>,
         load: Result<Box<LoadedConversation>, String>,
     },
     InterjectionFailed {
@@ -1490,9 +1538,6 @@ impl App {
             .collect();
         for state in &mut states {
             state.reload(&transport, &args.user);
-            if let Some(snapshot) = conversation_snapshot(&transport, &state.id)? {
-                state.apply_snapshot(&snapshot);
-            }
         }
         let selected_id = if states.iter().any(|state| state.id == selected_name) {
             selected_name.clone()
@@ -1858,24 +1903,20 @@ impl App {
         };
         let should_generate_title =
             !interjecting && self.selected().automatic_title && !self.selected().generating_title;
+        let observed_head = self.selected().remote_head.clone();
         let pending_id = if interjecting {
             let state = self.selected_mut();
             let pending_id = state.queue_pending_submission(message.clone());
             state.follow_tail();
             state.transcript_selection = None;
-            Some(pending_id)
+            pending_id
         } else {
             let state = self.selected_mut();
             state.apply_automatic_title(&message);
             if should_generate_title {
                 state.generating_title = true;
             }
-            state.transcript.push(TranscriptEntry {
-                role: EntryRole::Human,
-                commit: None,
-                text: message.clone(),
-                pending_id: None,
-            });
+            let pending_id = state.queue_pending_submission(message.clone());
             state.activities.clear();
             state.activity_selection = None;
             state.activity_detail_scroll = 0;
@@ -1886,7 +1927,7 @@ impl App {
             state.status = "starting turn".to_string();
             state.follow_tail();
             state.transcript_selection = None;
-            None
+            pending_id
         };
 
         let tx = self.tx.clone();
@@ -1909,7 +1950,7 @@ impl App {
                 });
             });
         }
-        if let Some(pending_id) = pending_id {
+        if interjecting {
             std::thread::spawn(move || {
                 let transport = match GitTransport::discover(repo_dir) {
                     Ok(transport) => transport,
@@ -1930,6 +1971,11 @@ impl App {
                     human_tree.as_deref(),
                 ) {
                     Ok(commit) => {
+                        let _ = tx.send(UiMessage::SubmissionCommitted {
+                            conversation: conversation.clone(),
+                            pending_id,
+                            commit,
+                        });
                         let load = load_conversation(&transport, &conversation)
                             .and_then(|load| {
                                 load.ok_or_else(|| {
@@ -1939,10 +1985,9 @@ impl App {
                                 })
                             })
                             .map(Box::new);
-                        let _ = tx.send(UiMessage::InterjectionSubmitted {
+                        let _ = tx.send(UiMessage::InterjectionRefreshed {
                             conversation,
-                            pending_id,
-                            commit,
+                            observed_head,
                             load,
                         });
                     }
@@ -1965,6 +2010,13 @@ impl App {
                     &conversation,
                     &message,
                     human_tree.as_deref(),
+                    |commit| {
+                        let _ = tx.send(UiMessage::SubmissionCommitted {
+                            conversation: conversation.clone(),
+                            pending_id,
+                            commit: commit.to_string(),
+                        });
+                    },
                     |event| {
                         if matches!(event, TurnEvent::Completed(_)) {
                             return;
@@ -1984,6 +2036,7 @@ impl App {
             if let Err(error) = result {
                 let _ = tx.send(UiMessage::Failed {
                     conversation,
+                    pending_id,
                     error,
                 });
             }
@@ -2005,29 +2058,34 @@ impl App {
                 }
                 UiMessage::Failed {
                     conversation,
+                    pending_id,
                     error,
                 } => {
-                    let refresh = self.transport().and_then(|transport| {
-                        let snapshot = conversation_snapshot(&transport, &conversation)?;
-                        Ok((transport, snapshot))
-                    });
+                    let transport = self.transport();
                     let user = self.user.clone();
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.local_turn = false;
-                        if let Ok((transport, snapshot)) = refresh {
-                            state.reload(&transport, &user);
-                            if let Some(snapshot) = snapshot {
-                                state.apply_snapshot(&snapshot);
-                            } else {
-                                state.running = false;
-                            }
-                        } else {
+                        let refreshed = transport
+                            .as_ref()
+                            .ok()
+                            .and_then(|transport| state.reload(transport, &user));
+                        if refreshed.is_none() {
                             state.running = false;
+                            state.active_request = None;
                         }
-                        state.status = "turn failed".to_string();
-                        state.sidebar_attention = Some("Failed — open for details".to_string());
-                        state.push_error(error);
+                        state.restore_pending_submission(pending_id);
+                        if state.running {
+                            state.sidebar_attention =
+                                Some("Local follower failed — turn still active".to_string());
+                            state.show_command_error_preserving_status(format!(
+                                "following turn failed: {error}"
+                            ));
+                        } else {
+                            state.sidebar_attention = Some("Failed — open for details".to_string());
+                            state.push_error(error);
+                            state.status = "turn failed".to_string();
+                        }
                     }
                 }
                 UiMessage::Completed {
@@ -2038,16 +2096,26 @@ impl App {
                         self.finish_turn(index, outcome);
                     }
                 }
-                UiMessage::InterjectionSubmitted {
+                UiMessage::SubmissionCommitted {
                     conversation,
                     pending_id,
                     commit,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.conversations[index].mark_pending_submission(pending_id, commit);
+                    }
+                }
+                UiMessage::InterjectionRefreshed {
+                    conversation,
+                    observed_head,
                     load,
                 } => {
                     let user = self.user.clone();
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
-                        state.mark_pending_submission(pending_id, commit);
+                        if state.remote_head != observed_head {
+                            continue;
+                        }
                         match load {
                             Ok(load) => state.apply_load(*load, &user),
                             Err(error) => {
@@ -2066,7 +2134,7 @@ impl App {
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
-                        state.discard_pending_submission(pending_id);
+                        state.restore_pending_submission(pending_id);
                         state.show_command_error_preserving_status(format!(
                             "sending message failed: {error}"
                         ));
@@ -2130,9 +2198,9 @@ impl App {
     /// input/render loop. At most one refresh may be in flight; its versioned
     /// result is applied from `drain_messages` only if the local state has not
     /// advanced in the meantime.
-    pub(crate) fn poll_remote(&mut self) -> bool {
+    pub(crate) fn poll_remote(&mut self) {
         if self.remote_polling {
-            return false;
+            return;
         }
         self.remote_polling = true;
         let observed: HashMap<_, _> = self
@@ -2171,16 +2239,6 @@ impl App {
                                             )
                                         })
                                     })
-                                    .and_then(|load| {
-                                        if load.snapshot.head == summary.head {
-                                            Ok(load)
-                                        } else {
-                                            Err(format!(
-                                                "conversation {:?} changed during refresh",
-                                                summary.id
-                                            ))
-                                        }
-                                    })
                                     .map(Box::new)
                             });
                         RemotePollEntry {
@@ -2194,7 +2252,6 @@ impl App {
             });
             let _ = tx.send(UiMessage::RemotePolled { result });
         });
-        false
     }
 
     fn apply_remote_poll(&mut self, entries: Vec<RemotePollEntry>) -> bool {
@@ -4996,6 +5053,130 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn first_durable_load_preserves_a_locally_started_turn() {
+        let head = "a".repeat(40);
+        let request = "b".repeat(40);
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.local_turn = true;
+        conversation.status = "running a tool".to_string();
+        conversation.turn_phase = TurnPhase::Model;
+        conversation.activities.push(activity(1));
+        assert!(conversation.active_request.is_none());
+
+        conversation.apply_load(
+            LoadedConversation {
+                snapshot: ConversationSnapshot {
+                    id: "talk-1".to_string(),
+                    head: head.clone(),
+                    title: "talk-1".to_string(),
+                    status: "queued".to_string(),
+                    request: Some(request.clone()),
+                    request_head: Some("c".repeat(40)),
+                    messages: Vec::new(),
+                },
+                replay: ConversationReplay {
+                    turns: Vec::new(),
+                    turn_events: Vec::new(),
+                },
+                workspace_diff: WorkspaceDiff {
+                    base_commit: "d".repeat(40),
+                    head: head.clone(),
+                    patch: String::new(),
+                },
+            },
+            "tester",
+        );
+
+        assert_eq!(conversation.status, "running a tool");
+        assert_eq!(conversation.turn_phase, TurnPhase::Model);
+        assert_eq!(conversation.activities, vec![activity(1)]);
+        assert_eq!(
+            conversation.active_request.as_deref(),
+            Some(request.as_str())
+        );
+        assert_eq!(conversation.remote_head.as_deref(), Some(head.as_str()));
+    }
+
+    #[test]
+    fn learning_a_commit_retires_an_already_visible_optimistic_row() {
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("hello".to_string());
+        let commit = "a".repeat(40);
+        conversation.transcript.insert(
+            0,
+            TranscriptEntry {
+                role: EntryRole::Human,
+                commit: Some(commit.clone()),
+                text: "hello".to_string(),
+                pending_id: None,
+            },
+        );
+
+        conversation.mark_pending_submission(pending_id, commit);
+
+        assert!(conversation.pending_submissions.is_empty());
+        assert_eq!(conversation.transcript.len(), 1);
+        assert!(conversation.transcript[0].pending_id.is_none());
+    }
+
+    #[test]
+    fn failed_submission_restores_text_without_replacing_a_newer_draft() {
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("failed message".to_string());
+        conversation.composer.insert_str("newer draft");
+
+        conversation.restore_pending_submission(pending_id);
+
+        assert!(conversation.pending_submissions.is_empty());
+        assert!(conversation.transcript.is_empty());
+        assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
+    }
+
+    #[test]
+    fn stale_interjection_refresh_cannot_roll_back_a_newer_head() {
+        let old_head = "a".repeat(40);
+        let new_head = "b".repeat(40);
+        let mut conversation = state("talk-1");
+        conversation.remote_head = Some(new_head.clone());
+        conversation.status = "completed bbbbbbbb".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+        tx.send(UiMessage::InterjectionRefreshed {
+            conversation: "talk-1".to_string(),
+            observed_head: Some(old_head.clone()),
+            load: Ok(Box::new(LoadedConversation {
+                snapshot: ConversationSnapshot {
+                    id: "talk-1".to_string(),
+                    head: old_head.clone(),
+                    title: "talk-1".to_string(),
+                    status: "queued".to_string(),
+                    request: Some("c".repeat(40)),
+                    request_head: Some("d".repeat(40)),
+                    messages: Vec::new(),
+                },
+                replay: ConversationReplay {
+                    turns: Vec::new(),
+                    turn_events: Vec::new(),
+                },
+                workspace_diff: WorkspaceDiff {
+                    base_commit: "e".repeat(40),
+                    head: old_head,
+                    patch: String::new(),
+                },
+            })),
+        })
+        .unwrap();
+
+        assert!(app.drain_messages());
+        assert_eq!(
+            app.selected().remote_head.as_deref(),
+            Some(new_head.as_str())
+        );
+        assert_eq!(app.selected().status, "completed bbbbbbbb");
+        assert!(!app.selected().running);
     }
 
     #[test]

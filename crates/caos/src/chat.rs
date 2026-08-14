@@ -412,6 +412,28 @@ fn submit_message_inner(
     )
 }
 
+fn submit_message_detailed(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    require_absent: bool,
+    proposal: Option<&str>,
+) -> Result<SubmittedMessage, String> {
+    submit_message_inner_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        SubmitMessagePolicy {
+            require_absent,
+            proposal,
+            admit_when_idle: true,
+        },
+        prepare_queued_request,
+    )
+}
+
 fn submit_message_inner_with<F>(
     t: &GitTransport,
     options: &TurnOptions,
@@ -505,6 +527,13 @@ where
 
         if let WorkspaceProposal::Conflict(conflict) = &workspace {
             let error = conflict.message();
+            // An interjection never owns the active request's lifecycle. In
+            // particular, a rejected workspace proposal must not append a
+            // conversation-level `failed` event that makes the request's real
+            // owner stop following an otherwise healthy turn.
+            if !admit_when_idle {
+                return Err(error);
+            }
             user_event["status"] = Value::String("failed".to_string());
             user_event["error"] = Value::String(error.clone());
             user_event["workspace_conflict"] = conflict.value();
@@ -1429,17 +1458,24 @@ pub fn run_chat_turn(
     id: &str,
     message: &str,
     human_tree: Option<&str>,
+    mut on_submitted: impl FnMut(&str),
     mut emit: impl FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
     emit(TurnEvent::Status("saving message".to_string()));
     let submitted = match human_tree {
-        Some(tree) => submit_message_with_tree(t, options, id, message, tree)?,
-        None => submit_message(t, options, id, message)?,
+        Some(tree) => {
+            validate_hash(tree, "submitted workspace commit")?;
+            t.git_capture(&["cat-file", "-e", &format!("{tree}^{{commit}}")], None)?;
+            reject_reserved_caos(t, tree, "submitted workspace")?;
+            submit_message_detailed(t, options, id, message, false, Some(tree))?
+        }
+        None => submit_message_detailed(t, options, id, message, false, None)?,
     };
+    on_submitted(&submitted.commit);
     let started = Instant::now();
     let mut request_result = None;
-    let request = match submitted {
+    let request = match submitted.request {
         Some(request) => Some(request),
         None => conversation_snapshot(t, id)?
             .filter(|snapshot| request_is_active(&snapshot.status))
@@ -3417,6 +3453,32 @@ mod tests {
                 &format!("{current}:{refname}"),
             ],
         );
+
+        let interjection_error = submit_interjection(
+            &transport,
+            &TurnOptions {
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "apply my workspace while the turn runs",
+            Some(&proposal),
+        )
+        .unwrap_err();
+        assert!(
+            interjection_error.contains("conflicts"),
+            "{interjection_error}"
+        );
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(current.as_str()),
+            "a rejected interjection must not change the active turn"
+        );
+        let snapshot = conversation_snapshot(&transport, "shared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status, "queued");
+        assert_eq!(snapshot.request.as_deref(), Some(request.as_str()));
 
         let error = submit_message_with_tree(
             &transport,
