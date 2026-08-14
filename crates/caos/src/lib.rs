@@ -3396,7 +3396,7 @@ fn resolve_reader_client(
         );
     }
     // The image entry wins over any like-named bound arg, mirroring assembly.
-    entries.insert("image".to_string(), base);
+    entries.insert("base".to_string(), base);
     Ok(entries)
 }
 
