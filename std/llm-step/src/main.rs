@@ -124,12 +124,12 @@ fn start(cfg: &Config) -> Result<(), String> {
     let run = own_args_tree()?;
     let head_hash = cas_hash(&arg("head"))?;
     let log = ensure_request_running(conversation, &run, &head_hash)?;
+    if let Some(terminal) = terminal_for_run(&log, &run)? {
+        return finish_from_terminal(cfg, &log, terminal);
+    }
     // One recovery dispatch at turn entry is enough. Normal tool callbacks do
     // not repeat it and park another single-flight waiter for every tool call.
     reconcile_async_tasks(cfg, &log)?;
-    if let Some(terminal) = terminal_for_run(&log, &run)? {
-        return finish_from_terminal(terminal);
-    }
     let request = active_request(&log)?;
     if request != run {
         return Err(format!(
@@ -189,8 +189,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
         .map_err(|error| format!("invalid continuation round: {error}"))?;
     let base_head = read_arg("base-head")?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
-        reconcile_async_tasks(cfg, &log)?;
-        return finish_from_terminal(terminal);
+        return finish_from_terminal(cfg, &log, terminal);
     }
     let request = active_request(&log)?;
     let expected_request = request_for_head(&log, &head_hash)?;
@@ -1235,9 +1234,19 @@ fn terminal_for_run<'a>(
     Ok(None)
 }
 
-fn finish_from_terminal(event: &progress::ConversationEvent) -> Result<(), String> {
+/// An idle foreground terminal event is the successful worker's final recovery
+/// point. Failed terminals return their error here and are reconciled by
+/// `record_failure`, which also owns failures appended by this invocation.
+fn finish_from_terminal(
+    cfg: &Config,
+    log: &progress::ConversationLog,
+    event: &progress::ConversationEvent,
+) -> Result<(), String> {
     match event.value.get("status").and_then(Value::as_str) {
-        Some("idle") => forward_commit(&event.commit),
+        Some("idle") => {
+            reconcile_async_tasks(cfg, log)?;
+            forward_commit(&event.commit)
+        }
         Some(status) => Err(event
             .value
             .get("error")
@@ -1380,7 +1389,7 @@ fn resume_run(
     log: progress::ConversationLog,
 ) -> Result<(), String> {
     if let Some(terminal) = terminal_for_run(&log, run)? {
-        return finish_from_terminal(terminal);
+        return finish_from_terminal(cfg, &log, terminal);
     }
     let active = active_request(&log)?;
     if active != run || request_for_head(&log, head_hash).as_deref() != Ok(run) {
@@ -1706,18 +1715,32 @@ fn append_tool_result(
     ))
 }
 
-fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
-    let conversation = conversation(cfg)?;
-    let run = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+fn record_failure_with<L, P, A, R>(
+    run: &str,
+    error: &str,
+    mut load: L,
+    mut append_pending: P,
+    mut append_terminal: A,
+    mut reconcile: R,
+) -> Result<(), String>
+where
+    L: FnMut() -> Result<progress::ConversationLog, String>,
+    P: FnMut(u64, &str, &Value, &str) -> Result<(), String>,
+    A: FnMut(&str, &Value, &str) -> Result<progress::ConditionalAppend, String>,
+    R: FnMut(&progress::ConversationLog) -> Result<(), String>,
+{
     for _ in 0..32 {
-        let log = progress::conversation_log(conversation)?;
-        if terminal_for_run(&log, &run)?.is_some() {
+        let log = load()?;
+        if terminal_for_run(&log, run)?.is_some() {
+            // A retry can arrive after the foreground failure became durable
+            // but before its terminal-boundary recovery ran.
+            reconcile(&log)?;
             return Ok(());
         }
-        if active_request(&log).as_deref() != Ok(run.as_str()) {
+        if active_request(&log).as_deref() != Ok(run) {
             return Ok(());
         }
-        if let Some(state) = latest_round(&log, &run)? {
+        if let Some(state) = latest_round(&log, run)? {
             if let Some(call) = state.pending.first() {
                 let id = call
                     .get("id")
@@ -1736,7 +1759,7 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
                     .last()
                     .map(|event| event.tree.clone())
                     .ok_or("conversation has no events")?;
-                append_tool_result(cfg, &run, state.round, &log.head, &result, &tree, None)?;
+                append_pending(state.round, &log.head, &result, &tree)?;
                 continue;
             }
         }
@@ -1745,7 +1768,7 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
             .last()
             .map(|event| event.tree.as_str())
             .ok_or("conversation has no events")?;
-        let round = latest_round(&log, &run)?.map_or(0, |state| state.round);
+        let round = latest_round(&log, run)?.map_or(0, |state| state.round);
         let event = json!({
             "kind": "caos-chat-event",
             "request": run,
@@ -1753,12 +1776,33 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
             "status": "failed",
             "error": error,
         });
-        match progress::append_event_at_head(conversation, &log.head, &event, tree)? {
-            progress::ConditionalAppend::Appended(_) => return Ok(()),
+        match append_terminal(&log.head, &event, tree)? {
+            progress::ConditionalAppend::Appended(_) => {
+                // This failure is the worker's final safe boundary. Reload so
+                // tasks appended concurrently with the failure are included.
+                let terminal = load()?;
+                reconcile(&terminal)?;
+                return Ok(());
+            }
             progress::ConditionalAppend::HeadChanged(_) => continue,
         }
     }
     Err("conversation kept changing while recording request failure".to_string())
+}
+
+fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let run = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+    record_failure_with(
+        &run,
+        error,
+        || progress::conversation_log(conversation),
+        |round, base_head, result, tree| {
+            append_tool_result(cfg, &run, round, base_head, result, tree, None)
+        },
+        |head, event, tree| progress::append_event_at_head(conversation, head, event, tree),
+        |log| reconcile_async_tasks(cfg, log),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2150,6 +2194,87 @@ mod tests {
         ]);
         assert!(terminal_for_run(&history, &old).unwrap().is_some());
         assert!(terminal_for_run(&history, &current).unwrap().is_none());
+    }
+
+    #[test]
+    fn preexisting_failed_terminal_reconciles_before_failure_recording_returns() {
+        let run = "b".repeat(40);
+        let task = "c".repeat(40);
+        let history = log(vec![
+            json!({"kind":"caos-chat-event","request":run,"status":"running"}),
+            json!({"kind":"caos-chat-event","async":{"task":task,"status":"pending"}}),
+            json!({"kind":"caos-chat-event","request":run,"round":0,"status":"failed","error":"boom"}),
+        ]);
+        let reconciliations = std::cell::Cell::new(0);
+
+        record_failure_with(
+            &run,
+            "boom",
+            || Ok(history.clone()),
+            |_, _, _, _| panic!("a terminal request cannot have a pending foreground call"),
+            |_, _, _| panic!("an existing terminal must not be appended again"),
+            |terminal| {
+                reconciliations.set(reconciliations.get() + 1);
+                let tasks = async_work::tasks(terminal.events.iter().map(|event| &event.value));
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].task, task);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reconciliations.get(), 1);
+    }
+
+    #[test]
+    fn newly_appended_failed_terminal_reloads_then_reconciles() {
+        let run = "b".repeat(40);
+        let task = "c".repeat(40);
+        let running = log(vec![
+            json!({"kind":"caos-chat-event","request":run,"status":"running"}),
+            json!({"kind":"caos-chat-event","async":{"task":task,"status":"pending"}}),
+        ]);
+        let terminal = log(vec![
+            json!({"kind":"caos-chat-event","request":run,"status":"running"}),
+            json!({"kind":"caos-chat-event","async":{"task":task,"status":"pending"}}),
+            json!({"kind":"caos-chat-event","request":run,"round":0,"status":"failed","error":"boom"}),
+        ]);
+        let mut loads = std::collections::VecDeque::from([running, terminal]);
+        let appends = std::cell::Cell::new(0);
+        let reconciliations = std::cell::Cell::new(0);
+
+        record_failure_with(
+            &run,
+            "boom",
+            || loads.pop_front().ok_or("unexpected extra load".to_string()),
+            |_, _, _, _| panic!("the request has no pending foreground call"),
+            |head, event, tree| {
+                appends.set(appends.get() + 1);
+                assert_eq!(head, "f".repeat(40));
+                assert_eq!(tree, "a".repeat(40));
+                assert_eq!(event["status"], "failed");
+                Ok(progress::ConditionalAppend::Appended(
+                    progress::AppendResult {
+                        commit: "d".repeat(40),
+                        previous_head: head.to_string(),
+                        retries: 0,
+                    },
+                ))
+            },
+            |reloaded| {
+                reconciliations.set(reconciliations.get() + 1);
+                assert!(terminal_for_run(reloaded, &run)?.is_some());
+                let tasks = async_work::tasks(reloaded.events.iter().map(|event| &event.value));
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].task, task);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(loads.is_empty());
+        assert_eq!(appends.get(), 1);
+        assert_eq!(reconciliations.get(), 1);
     }
 
     #[test]
