@@ -186,28 +186,28 @@ mod tests {
 
     #[test]
     fn subset_needs_every_pinned_entry() {
-        let job = map(&[("image", "aa"), ("std", "bb"), ("worker1", "cc")]);
-        assert!(is_subset(&map(&[("image", "aa")]), &job));
-        assert!(is_subset(&map(&[("image", "aa"), ("worker1", "cc")]), &job));
+        let job = map(&[("base", "aa"), ("std", "bb"), ("worker1", "cc")]);
+        assert!(is_subset(&map(&[("base", "aa")]), &job));
+        assert!(is_subset(&map(&[("base", "aa"), ("worker1", "cc")]), &job));
         // Disagreeing pin, and a pin the job lacks, both fail.
-        assert!(!is_subset(&map(&[("image", "zz")]), &job));
-        assert!(!is_subset(&map(&[("image", "aa"), ("marker", "x")]), &job));
+        assert!(!is_subset(&map(&[("base", "zz")]), &job));
+        assert!(!is_subset(&map(&[("base", "aa"), ("marker", "x")]), &job));
     }
 
     #[test]
     fn grant_requires_the_matching_secret_hash() {
         let grants = parse_header(
             r#"[{"name":"tok","value":"s3cr3t","entropy":"E","readers":[
-                 {"image":"aa"},
-                 {"image":"bb","repo":"cc"}
+                 {"base":"aa"},
+                 {"base":"bb","repo":"cc"}
                ]}]"#,
         );
         // A worker that matches a reader but carries NO secret-hash is refused
         // (it wasn't produced by eval with this store).
-        assert!(grant(&grants, &map(&[("image", "aa")])).is_empty());
+        assert!(grant(&grants, &map(&[("base", "aa")])).is_empty());
         // With the matching secret-hash present, the value is injected. The
         // entry is the blob-oid of the digest (how it rides in a real tree).
-        let mut job = map(&[("image", "aa"), ("salt", "z")]);
+        let mut job = map(&[("base", "aa"), ("salt", "z")]);
         let digest = secret_hash(&grants, &job).unwrap();
         job.insert(
             caos_world::SECRET_HASH_ARG.to_string(),
@@ -218,14 +218,14 @@ mod tests {
             vec![("tok".to_string(), "s3cr3t".to_string())]
         );
         // A wrong secret-hash is refused.
-        let mut forged = map(&[("image", "aa")]);
+        let mut forged = map(&[("base", "aa")]);
         forged.insert(
             caos_world::SECRET_HASH_ARG.to_string(),
             "deadbeef".to_string(),
         );
         assert!(grant(&grants, &forged).is_empty());
         // A worker matching NO reader gets nothing (and needs no hash).
-        assert!(grant(&grants, &map(&[("image", "xx")])).is_empty());
+        assert!(grant(&grants, &map(&[("base", "xx")])).is_empty());
     }
 
     #[test]
@@ -241,22 +241,22 @@ mod tests {
     #[test]
     fn secret_hash_isolates_and_is_stable() {
         let grants = parse_header(
-            r#"[{"name":"tok","value":"v","entropy":"E1","readers":[{"image":"aa"}]}]"#,
+            r#"[{"name":"tok","value":"v","entropy":"E1","readers":[{"base":"aa"}]}]"#,
         );
-        let job = map(&[("image", "aa"), ("salt", "z")]);
+        let job = map(&[("base", "aa"), ("salt", "z")]);
         let h = secret_hash(&grants, &job).expect("a matching grant hashes");
         // Stable across calls (a real cache key).
         assert_eq!(Some(h.clone()), secret_hash(&grants, &job));
         // No matching grant → None, so a secret-free run stays globally shared.
-        assert!(secret_hash(&grants, &map(&[("image", "zz")])).is_none());
+        assert!(secret_hash(&grants, &map(&[("base", "zz")])).is_none());
         // Rotating the entropy re-namespaces the cache; rotating only the value
         // (same entropy) does not.
         let rotated_entropy = parse_header(
-            r#"[{"name":"tok","value":"v","entropy":"E2","readers":[{"image":"aa"}]}]"#,
+            r#"[{"name":"tok","value":"v","entropy":"E2","readers":[{"base":"aa"}]}]"#,
         );
         assert_ne!(Some(h.clone()), secret_hash(&rotated_entropy, &job));
         let rotated_value = parse_header(
-            r#"[{"name":"tok","value":"DIFFERENT","entropy":"E1","readers":[{"image":"aa"}]}]"#,
+            r#"[{"name":"tok","value":"DIFFERENT","entropy":"E1","readers":[{"base":"aa"}]}]"#,
         );
         assert_eq!(Some(h), secret_hash(&rotated_value, &job));
     }
