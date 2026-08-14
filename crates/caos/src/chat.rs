@@ -2014,12 +2014,9 @@ fn fold_events(
         waterfall_string(value, "status", &mut status)?;
         waterfall_string(value, "request", &mut request)?;
         waterfall_string(value, "request_head", &mut request_head)?;
-        match value.get("status").and_then(Value::as_str) {
-            Some("idle" | "failed") => {
-                request = None;
-                request_head = None;
-            }
-            _ => {}
+        if let Some("idle" | "failed") = value.get("status").and_then(Value::as_str) {
+            request = None;
+            request_head = None;
         }
     }
     if let Some(request) = request.as_deref() {
