@@ -597,25 +597,27 @@ where
 
         if let WorkspaceProposal::Conflict(conflict) = &workspace {
             let error = conflict.message();
-            // An interjection never owns the active request's lifecycle. In
-            // particular, a rejected workspace proposal must not append a
-            // conversation-level `failed` event that makes the request's real
-            // owner stop following an otherwise healthy turn.
+            // A conflicting proposal never owns an already-active request's
+            // lifecycle. This check is based on the current durable state, not
+            // on how the submit started: an idle submit can lose its CAS to a
+            // new admission and become an interjection on retry. Appending a
+            // conversation-level `failed` event in that case would terminate
+            // the winner's otherwise healthy turn.
+            if let Some(head) = observed.as_deref() {
+                let snapshot = conversation_snapshot_at(t, id, head)?;
+                if request_is_active(&snapshot.status) {
+                    snapshot.request.ok_or_else(|| {
+                        format!("active conversation {id:?} has no durably recorded request")
+                    })?;
+                    return Err(error);
+                }
+            }
             if !admit_when_idle {
                 return Err(error);
             }
             user_event["status"] = Value::String("failed".to_string());
             user_event["error"] = Value::String(error.clone());
             user_event["workspace_conflict"] = conflict.value();
-            if let Some(head) = observed.as_deref() {
-                let snapshot = conversation_snapshot_at(t, id, head)?;
-                if request_is_active(&snapshot.status) {
-                    let request = snapshot.request.ok_or_else(|| {
-                        format!("active conversation {id:?} has no durably recorded request")
-                    })?;
-                    user_event["request"] = Value::String(request);
-                }
-            }
             let event = create_event_commit_with_parents(
                 t,
                 &parent_tree,
@@ -3701,6 +3703,103 @@ mod tests {
     }
 
     #[test]
+    fn idle_workspace_submit_cannot_fail_a_concurrently_admitted_request() {
+        let (root, repo, transport, base) =
+            conversation_index_fixture("idle-workspace-admission-race");
+        let base_tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+
+        std::fs::write(repo.join("workspace"), "winner\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        let winner_tree = test_git(&repo, &["write-tree"]);
+        let winner_user = create_event_commit(
+            &transport,
+            &winner_tree,
+            &base,
+            &json!({
+                "kind": EVENT_KIND,
+                "author": "user",
+                "username": "Bob",
+                "content": "winning turn"
+            }),
+        )
+        .unwrap();
+        let winner_request = "b".repeat(40);
+        let winner_admission = create_event_commit(
+            &transport,
+            &winner_tree,
+            &winner_user,
+            &json!({
+                "kind": EVENT_KIND,
+                "status": "queued",
+                "request": winner_request,
+                "request_head": winner_user
+            }),
+        )
+        .unwrap();
+
+        std::fs::write(repo.join("workspace"), "proposal\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        let proposal_tree = test_git(&repo, &["write-tree"]);
+        let proposal = test_git(
+            &repo,
+            &[
+                "commit-tree",
+                &proposal_tree,
+                "-p",
+                &base,
+                "-m",
+                "losing workspace proposal",
+            ],
+        );
+
+        let refname = conversation_ref("shared").unwrap();
+        let published_winner = std::cell::Cell::new(false);
+        let error = submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "apply my workspace",
+            false,
+            Some(&proposal),
+            |t, _, _, _| {
+                assert!(!published_winner.replace(true));
+                t.git_capture(
+                    &[
+                        "push",
+                        "--quiet",
+                        CAOS_REMOTE,
+                        &format!("{winner_admission}:{refname}"),
+                    ],
+                    None,
+                )?;
+                Ok("a".repeat(40))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("conflicts"), "{error}");
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(winner_admission.as_str()),
+            "the losing proposal terminated the winner's request"
+        );
+        let snapshot = conversation_snapshot(&transport, "shared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status, "queued");
+        assert_eq!(snapshot.request.as_deref(), Some(winner_request.as_str()));
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].content, "winning turn");
+        assert_ne!(winner_tree, base_tree);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn invalid_username_metadata_fails_loudly() {
         let error = fold_events(
             "one",
@@ -4243,6 +4342,18 @@ mod tests {
         assert_eq!(snapshot.status, "queued");
         assert_eq!(snapshot.request.as_deref(), Some(request.as_str()));
 
+        let idle = create_event_commit(
+            &transport,
+            &current_tree,
+            &current,
+            &json!({"kind": EVENT_KIND, "request": request, "status": "idle"}),
+        )
+        .unwrap();
+        test_git(
+            &repo,
+            &["push", "--quiet", CAOS_REMOTE, &format!("{idle}:{refname}")],
+        );
+
         let error = submit_message_with_tree(
             &transport,
             &TurnOptions {
@@ -4258,10 +4369,7 @@ mod tests {
         assert!(error.contains("recorded at"), "{error}");
 
         let tip = remote_ref(&transport, &refname).unwrap().unwrap();
-        assert_eq!(
-            test_git(&repo, &["rev-parse", &format!("{tip}^1")]),
-            current
-        );
+        assert_eq!(test_git(&repo, &["rev-parse", &format!("{tip}^1")]), idle);
         assert_eq!(
             test_git(&repo, &["rev-parse", &format!("{tip}^2")]),
             proposal
@@ -4273,7 +4381,7 @@ mod tests {
         let event: Value =
             serde_json::from_str(&test_git(&repo, &["show", "-s", "--format=%B", &tip])).unwrap();
         assert_eq!(event["status"], "failed");
-        assert_eq!(event["request"], request);
+        assert!(event.get("request").is_none());
         assert_eq!(event["workspace_conflict"]["proposal"], proposal);
         assert_eq!(event["workspace_conflict"]["paths"], json!(["shared.txt"]));
 
