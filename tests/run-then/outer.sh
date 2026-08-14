@@ -5,4 +5,4 @@
 # before the driver's `then` sees it as --result.
 set -euo pipefail
 caos get /cas/args/inner-img
-caos run-then /cas/args/in -- --run="$(cat /cas/args/inner-img)"
+caos run-then /cas/args/in --run:hash="$(cat /cas/args/inner-img)"

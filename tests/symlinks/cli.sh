@@ -8,4 +8,4 @@
 # script just launches it.
 set -euo pipefail
 
-"$CAOS_CLI" run DEEP-DEPS/bash -- --worker1:@=test/check.sh --test:@=test
+"$CAOS_CLI" run --base:@=DEEP-DEPS/bash --worker1:@=test/check.sh --test:@=test

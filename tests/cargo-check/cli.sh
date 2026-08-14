@@ -24,7 +24,7 @@ tgt="$(uname -m)-unknown-linux-musl"
 
 echo "== cargo test: a passing package ==" >&2
 t0=$(ms)
-"$CAOS_CLI" run DEEP-DEPS/cargo r1 -- --tree:@=test/mini --cmd=test "--target=$tgt"
+"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=test/mini --cmd=test "--target=$tgt"
 t1=$(ms)
 [ "$(cat r1/exit)" = "0" ] || fail "test: exit $(cat r1/exit); stderr: $(cat r1/stderr)"
 grep -q "test result: ok. 1 passed" r1/stdout \
@@ -32,14 +32,14 @@ grep -q "test result: ok. 1 passed" r1/stdout \
 echo "  ok: tests ran and passed ($((t1 - t0))ms)" >&2
 
 echo "== cargo check: a compile error is a value, not a run error ==" >&2
-"$CAOS_CLI" run DEEP-DEPS/cargo r2 -- --tree:@=test/broken --cmd=check "--target=$tgt"
+"$CAOS_CLI" run r2 --base:@=DEEP-DEPS/cargo --tree:@=test/broken --cmd=check "--target=$tgt"
 [ "$(cat r2/exit)" != "0" ] || fail "broken check exited 0"
 grep -q "mismatched types" r2/stderr || fail "no diagnostics: $(cat r2/stderr)"
 echo "  ok: diagnostics surfaced, exit $(cat r2/exit)" >&2
 
 echo "== identical tree: the cached value comes back ==" >&2
 t2=$(ms)
-"$CAOS_CLI" run DEEP-DEPS/cargo r3 -- --tree:@=test/mini --cmd=test "--target=$tgt"
+"$CAOS_CLI" run r3 --base:@=DEEP-DEPS/cargo --tree:@=test/mini --cmd=test "--target=$tgt"
 t3=$(ms)
 cmp -s r1/exit r3/exit && cmp -s r1/stdout r3/stdout \
   || fail "re-run of an identical tree differed"

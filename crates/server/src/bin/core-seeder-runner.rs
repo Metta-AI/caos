@@ -34,7 +34,7 @@
 //! cargo's expr runs std/flake-builder). That is only needed once we convert
 //! a core item whose `.caos-expr` names another *core std* item as its
 //! builder/image. `flake-builder` names the `docker://seeded` sentinel, which
-//! `resolve_expr_image` passes straight through with **no dispatch**, so
+//! `resolve_expr_base` passes straight through with **no dispatch**, so
 //! forming its key runs nothing and this runner just answers a static set of
 //! records. The live answerer arrives with the first item that runs another
 //! (cargo → flake-builder).

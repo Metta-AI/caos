@@ -336,11 +336,11 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos-cli run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path …]` (the
+`caos-cli run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — the **ArgTree** — including the
-   `<image>` under a reserved `base` entry and (when set) the cache-busting
+   `--base` image under the reserved `base` entry and (when set) the cache-busting
    salt under a reserved `salt` entry (see
    [arguments](#arguments-literals-and-paths));
 2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —
@@ -362,14 +362,14 @@ Pass `--trace=<file>` to write Chrome Trace Events as JSONL. `--trace` and
 `--trace-id=<id>` optionally overrides the generated invocation id.
 
 ```sh
-caos-cli run --trace=trace.jsonl <image> <result-path> -- --input=value
-caos-cli run --trace <image> <result-path> -- --input=value
+caos-cli run --trace=trace.jsonl <result-path> --base:<type>=<image> --input=value
+caos-cli run --trace <result-path> --base:<type>=<image> --input=value
 ```
 
 Traces are live-only and discarded when the run ends. Trace ids do not affect
 request or cache identity.
 
-The worker-side `caos map-then <in> -- [--map=<image>] [--then=<image>]` is a
+The worker-side `caos map-then <in> [--map:<type>=<image>] [--then:<type>=<image>]` is a
 different thing entirely: a **tail call**. It records the continuation
 `{in, map?, then?}` as the worker's own result at `/cas/out` (a `promise`
 placeholder) and fetches and runs nothing; the worker exits and the server
@@ -386,12 +386,18 @@ any depth) fails the requests above it the same way, up to the top-level
 `caos-cli run`, which exits non-zero with the message. (The run-cycle error is
 one such case.)
 
-`<image>` (and a `--map`/`--then` value) is a **git image by default**: a bare
-git hash (e.g. an `import-image` output or a `caos curry` ref), or — on
-`caos-cli` — a path to a directory, which is INGESTED and then EVALUATED: a
-tree carrying a `.caos-expr` resolves to what that expression builds, and one
-without it to itself. Inside a worker an image can be any `/cas` path, resolved
-to the hash recorded on it. An **ordinary docker image** is written `docker://<ref>`.
+**An image is named by an operator, never by shape.** `--base` (and a
+`--map`/`--run`/`--then` value) takes the same type tags as any other argument —
+there is no positional image anywhere, and nothing sniffs a bare token:
+
+- `:hash=<oid>` — an object the server holds: a git image, or a `caos curry` ref
+  or `import-image` output;
+- `:@=<path>` — on `caos-cli` a host DIRECTORY, which is INGESTED and then
+  EVALUATED (a tree carrying a `.caos-expr` resolves to what that expression
+  builds, one without it to itself); inside a worker any `/cas` path, resolved to
+  the hash recorded on it;
+- `:docker=<ref>` — an **ordinary docker image**, stored as the blob
+  `docker://<ref>`.
 
 ### Arguments: literals and paths
 
@@ -441,12 +447,13 @@ filesystem (only `/cas`), so a non-`/cas` path there is an error.
 - `put <src-path> <cas-path>` (`caos`) — store an outside path into the CAS and
   record it at a `/cas` path. Files become blobs, directories trees; a symlink
   into the CAS reuses the recorded hash.
-- `curry <image> -- [--name=value | --name:@=path …]` (both clients) — bind some
+- `curry [--unbind=<name> …] --base:<type>=<image> [--name=value | --name:@=path …]`
+  (both clients) — bind some
   args to an image, printing a ref to the curried image. It's a small
   content-addressed tree (`base`, `args`, a `.caos-curry` marker); `run`/`curry`
   expand it — the CLI for its own calls, the server when a curried `map`/`then`
   runs (call args win, and the base is folded into the args tree as its
-  `image` entry) — so a request only ever carries a plain args tree. Currying
+  `base` entry) — so a request only ever carries a plain args tree. Currying
   flattens, so it's canonical. On `caos-cli`, path args are host paths to
   ingest.
 - `runner --job=<json>` (`caos`) — the container runner; see below.

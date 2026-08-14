@@ -65,7 +65,7 @@ suite)
   done
   caos put /tmp/build-ws /cas/build-ws
 
-  build=$(caos curry /cas/args/base -- \
+  build=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/in/caos-tools/build.sh") || fail "currying the build tool"
 
   # `deepener` reads the workspace as /cas/args/in: run-then hands its `then` the
@@ -84,8 +84,8 @@ suite)
   # to tests/lib/run-test.sh.
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
 
-  deepener=$(caos curry /cas/args/base -- "${fwd[@]}") || fail "currying the deepener stage"
-  caos run-then /cas/args/in -- --run="$build" --then="$deepener"
+  deepener=$(caos curry --base:@=/cas/args/base "${fwd[@]}") || fail "currying the deepener stage"
+  caos run-then /cas/args/in --run:hash="$build" --then:hash="$deepener"
   ;;
 
 deepener)
@@ -98,7 +98,7 @@ deepener)
   caos get /cas/args/result
   # The seed records (design/caos-expr.md, Phase 3), when the build carried them.
   # A whole-tree placeholder — every wrapper gets the same one, so the inner
-  # core-seeder-runner answers flake-builder's `run docker://seeded`.
+  # core-seeder-runner answers flake-builder's `run --base:docker=seeded`.
   if [ -e /cas/args/result/seed ]; then caos get /cas/args/result/seed; fi
   caos get /cas/args/in
   caos get /cas/args/in/tests
@@ -111,7 +111,7 @@ deepener)
   #
   # NOTHING IS ASSEMBLED HERE. The tree deepened is the WORKSPACE ITSELF
   # (`/cas/args/in`), whose root `.caos-expr` IS this transform
-  # (`run std/deep-deps -- --in:@=.`), so a `DEPS` path resolves against the real
+  # (`run --base:@=std/deep-deps --in:@=.`), so a `DEPS` path resolves against the real
   # repo: `tests/rgrep/DEPS` says `../../std/rgrep` and means it. Do not rebuild
   # a look-alike tree out of build outputs — the paths would only be repo-shaped
   # by coincidence, and a tree can deepen itself only when everything it
@@ -127,7 +127,7 @@ deepener)
   # Two things stand in the way of just naming the entry as an image, and both
   # are load-bearing rules rather than accidents:
   #
-  #   - A WORKER CANNOT EVALUATE. `resolve_run_image` reads a /cas path as the
+  #   - A WORKER CANNOT EVALUATE. `resolve_cas_image` reads a /cas path as the
   #     object it was made from, so the sentinel entry arrives as its own
   #     one-file tree ("image tree has no config.json"). Evaluation is a CLIENT
   #     capability, and it must stay one: `eval_path` on a `run` BLOCKS on the
@@ -138,7 +138,7 @@ deepener)
   #     "caos world mismatch"). This stage runs in the host world, so it needs
   #     the HOST's deep-deps.
   #
-  # Both dissolve the same way: `run docker://seeded-deep-deps -- --in:@=.` IS
+  # Both dissolve the same way: `run --base:docker=seeded-deep-deps --in:@=.` IS
   # `run-then` over the std entry with the sentinel as `--run`. That forms
   # precisely the arg-tree key the entry's expression forms, so the host's own
   # core-seeder-runner answers it with the host's image — no evaluator in the
@@ -179,8 +179,8 @@ deepener)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
-  deepen=$(caos curry /cas/args/base -- "${fwd[@]}") || fail "currying the deepen stage"
-  caos run-then /cas/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
+  deepen=$(caos curry --base:@=/cas/args/base "${fwd[@]}") || fail "currying the deepen stage"
+  caos run-then /cas/deep-deps --run:docker=seeded-deep-deps --then:hash="$deepen"
   ;;
 
 deepen)
@@ -193,8 +193,8 @@ deepen)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
-  fanout=$(caos curry /cas/args/base -- "${fwd[@]}") || fail "currying the fan-out stage"
-  caos run-then /cas/args/ws -- --run=/cas/args/result --then="$fanout"
+  fanout=$(caos curry --base:@=/cas/args/base "${fwd[@]}") || fail "currying the fan-out stage"
+  caos run-then /cas/args/ws --run:@=/cas/args/result --then:hash="$fanout"
   ;;
 
 fanout)
@@ -214,7 +214,7 @@ fanout)
 
   # The per-test map worker is curried HERE, where the image is a genuine
   # tree. Passing the image itself as a curried arg to a later stage
-  # does not work: `caos curry /cas/args/<argname>` curries over the arg NODE,
+  # does not work: `caos curry --base:@=/cas/args/<argname>` curries over the arg NODE,
   # so the resulting worker inherits this job's own bindings (observed: a map
   # job whose args were `image in worker1`, running as uid 1000 because the
   # image's root grant was not in play either).
@@ -224,7 +224,7 @@ fanout)
   # client aimed at the inner server, so it can neither fetch this file's args
   # nor reach the outer stack (test-stack/worker materializes its args before
   # flipping the env).
-  map=$(caos curry /cas/args/build/image -- \
+  map=$(caos curry --base:@=/cas/args/build/image \
     "--worker1:@=/cas/args/ws/tests/lib/run-test.sh") || fail "currying the per-test runner"
 
   # The test selection: every tests/<name> with a cli.sh — or just the names in
@@ -373,11 +373,11 @@ fanout)
   #
   # A timestamp in args means the summariser never caches. That is the point: it
   # is one cheap container, and it only runs at all when this stage does.
-  then_img=$(caos curry /cas/args/base -- \
+  then_img=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
     "--build-time:@=/cas/args/build/time" "--start-time=$(date +%s)") \
     || fail "currying the summarize stage"
-  caos map-then /cas/sel -- --map="$map" --then="$then_img"
+  caos map-then /cas/sel --map:hash="$map" --then:hash="$then_img"
   ;;
 
 summarize)

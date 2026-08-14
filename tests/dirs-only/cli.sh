@@ -22,13 +22,13 @@ commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -q
 echo "== build the fixture worker from its source ==" >&2
 # No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
 # the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry DEEP-DEPS/rustc --)
-"$CAOS_CLI" run "$builder" img -- --src:@=test/worker.rs
+builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
+"$CAOS_CLI" run img --base:hash="$builder" --src:@=test/worker.rs
 commit "built dirs-only"
 worker=$(git rev-parse HEAD:img)
 
 echo "== dirs-only keeps directories, drops files ==" >&2
-"$CAOS_CLI" run "$worker" filtered -- --in:@=test/tree
+"$CAOS_CLI" run filtered --base:hash="$worker" --in:@=test/tree
 ls -la filtered >&2
 
 [ -d filtered/dirA ] || fail "dirA (a directory) was dropped"

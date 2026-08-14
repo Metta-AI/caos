@@ -35,7 +35,7 @@ commit "salted sources"
 # builder compiles src and curries the result into this runner.
 # No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
 # the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry DEEP-DEPS/rustc --)
+builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
 
 # The builder's result is a worker image (a curry node over the runner). The CLI
 # checks results out as files, so re-ingest the checkout through git to get the
@@ -45,16 +45,16 @@ tree_hash() { # <dir> -> the git tree hash of its committed contents
 }
 
 echo "build greeter.rs -> runnable worker -> run" >&2
-t0=$(ms); "$CAOS_CLI" run "$builder" img -- --src:@=g1.rs; t1=$(ms)
+t0=$(ms); "$CAOS_CLI" run img --base:hash="$builder" --src:@=g1.rs; t1=$(ms)
 commit "built image 1"
-"$CAOS_CLI" run "$(tree_hash img)" a --; t2=$(ms)
+"$CAOS_CLI" run a --base:hash="$(tree_hash img)"; t2=$(ms)
 grep -q "source-built worker" a/greeting \
   || fail "built worker did not produce the expected output"
 
 echo "edit source -> a distinct worker" >&2
-t3=$(ms); "$CAOS_CLI" run "$builder" img2 -- --src:@=g2.rs; t4=$(ms)
+t3=$(ms); "$CAOS_CLI" run img2 --base:hash="$builder" --src:@=g2.rs; t4=$(ms)
 commit "built image 2"
-"$CAOS_CLI" run "$(tree_hash img2)" c --; t5=$(ms)
+"$CAOS_CLI" run c --base:hash="$(tree_hash img2)"; t5=$(ms)
 grep -q "different greeting" c/greeting \
   || fail "edited worker did not produce the new output"
 grep -q "different greeting" a/greeting \

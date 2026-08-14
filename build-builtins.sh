@@ -437,7 +437,7 @@ bts "hand-deepened ${#names[@]} entries"
 # What a caller's `--in:@=.` actually resolves to: the entry MINUS its own
 # `.caos-expr`. eval-path hands an expression its directory excluding the
 # directive (crates/caos/src/eval.rs `strip_caos_expr`), so every seeded item —
-# each of whose expressions is `run <builder> -- --in:@=.` — forms an `in` that
+# each of whose expressions is `run --base:<t>=<builder> --in:@=.` — forms an `in` that
 # is the stripped tree. Strip here too or the seeder registers a key no caller
 # ever forms, and the job falls through to the generic runner and dies on a
 # sentinel image.
@@ -483,7 +483,7 @@ add_seed_record() { # <name> <required-json> <result-tree>
 }
 
 if [ -n "$fb_delta" ] && [ -n "${hash_of[flake-builder]:-}" ]; then
-  # flake-builder: `run docker://seeded -- --in:@=.`. The `base` a caller forms
+  # flake-builder: `run --base:docker=seeded --in:@=.`. The `base` a caller forms
   # for a `docker://` ref is a BLOB naming it (base_arg_entry stores the bytes),
   # so required `base` is that blob's oid; `in` is the (deepened, but DEPS-free
   # so identity) flake-builder source entry.
@@ -493,7 +493,7 @@ if [ -n "$fb_delta" ] && [ -n "${hash_of[flake-builder]:-}" ]; then
 fi
 
 if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; then
-  # cargo: `run DEEP-DEPS/flake-builder -- --in:@=.`. Resolving the mount yields
+  # cargo: `run --base:@=DEEP-DEPS/flake-builder --in:@=.`. Resolving the mount yields
   # the flake-builder image (fb_delta), so the caller's arg-tree `image` is that
   # tree oid and `in` is the deepened cargo entry — both known here.
   add_seed_record cargo \
@@ -501,7 +501,7 @@ if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; 
 fi
 
 # rustc/deep-deps: SEEDED core. Their `.caos-expr` is a distinct sentinel
-# (`run docker://seeded-{rustc,deep-deps} -- --in:@=.`), so the caller's key is
+# (`run --base:docker=seeded-{rustc,deep-deps} --in:@=.`), so the caller's key is
 # `{ image: <blob of that sentinel>, in: <the {.caos-expr} entry> }`. The RESULT
 # is the hand-built curry over the runner pool: a binary bound onto the runner,
 # which is what the entry would have resolved to if it could build itself.
@@ -509,7 +509,8 @@ if [ -n "$runner_delta" ] && [ -n "${bin_path[deep-deps]:-}" ] && [ -n "${hash_o
   install -m 755 "${bin_path[deep-deps]}/bin/worker-deep-deps" "$CLIENT/seed-deep-deps"
   git -C "$CLIENT" add seed-deep-deps
   bts "staged deep-deps seed inputs"
-  dd_curry=$(cd "$CLIENT" && "$caos" curry "$runner_delta" -- "--worker1:@=seed-deep-deps")
+  dd_curry=$(cd "$CLIENT" && "$caos" curry \
+    "--base:hash=$runner_delta" "--worker1:@=seed-deep-deps")
   bts "curried deep-deps"
   dd_blob=$(printf 'docker://seeded-deep-deps' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record deep-deps \
@@ -532,7 +533,8 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   # literal like `--cargo`, because that is what a seed result can bind — when
   # rustc stops being seeded its expression binds DEEP-DEPS/runner instead.
   bts "staged rustc seed inputs"
-  rustc_curry=$(cd "$CLIENT" && "$caos" curry "$runner_delta" -- \
+  rustc_curry=$(cd "$CLIENT" && "$caos" curry \
+    "--base:hash=$runner_delta" \
     "--worker1:@=seed-rustc" "--cargo=$cargo_delta" "--runner=$runner_delta" \
     "--worker-common:@=seed-rustc-wc")
   bts "curried rustc"

@@ -33,7 +33,7 @@ echo "== cargo test of the workspace, per-crate, in caos workers ==" >&2
 # `|| ok=0`, not a bare call: under `set -e` a failed run would kill the
 # script before the diagnostics below ever print.
 ok=1
-"$CAOS_CLI" run DEEP-DEPS/cargo r1 -- --tree:@=ws --cmd=test --mode=all \
+"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=ws --cmd=test --mode=all \
   "--target=$tgt" >/tmp/r1.log 2>&1 || ok=0
 cat /tmp/r1.log >&2
 if [ "$ok" = 0 ] || [ ! -e r1/exit ] || [ "$(cat r1/exit)" != "0" ]; then

@@ -15,9 +15,9 @@ traps have already been sprung.
 | 1 | Unify the two arg parsers into one `ArgType` + `parse_arg` | ✅ done, merged |
 | 2A | Rename the reserved ArgTree entry `image` → `base` (wire/disk/seed) | ✅ done (33/33), merged |
 | 2B | `.caos-expr` grammar collapse: `run`/`curry` take `--base`, no positional/`--`; add `:docker=`/`:hash=`; migrate all `.caos-expr` | ✅ done (33/33), **no redeploy needed** |
-| **2C** | **CLI + worker `caos` grammar collapse: drop the positional image everywhere; type the map-then positions; delete the last sniffers** | **← NEXT, not started** |
-| 3 | `:@@=` remote git-ref *parse* (`Ref{url,rev,dir}` + validation) | not started |
-| 4 | `:@@=` *resolution* (client-side fetch → oid) | not started |
+| 3 | `:@@=` remote git-ref *parse* (`GitRef{url,rev,dir}` + validation) | ✅ done (33/33), **no redeploy needed** |
+| 2C | CLI + worker `caos` grammar collapse: drop the positional image (and the `--`) everywhere; type the map-then positions; delete the last sniffers | ✅ done (33/33), **needed a redeploy** |
+| **4** | **`:@@=` *resolution* (client-side fetch → oid): the `parse_arg` arm, `ArgType::Remote`, and the fetch/descend/ingest behind it** | **← NEXT, not started** |
 | 6 | Docs + tests (SPEC, README, a remote-ref test) | ongoing |
 
 The end goal past stage 4: a consumer repo pins caos with one
@@ -107,8 +107,10 @@ Notes:
   grammar. Local refs *can* be `:@@=path:./x`, but you'd rarely bother.
 - **`:docker=` / "stop sniffing" is a parse-time change only.** `:docker=alpine`
   still *stores* the blob `docker://alpine`, so the downstream
-  `docker://`-prefix checks (`resolve_run_image`, the server's re-derivation)
-  are untouched. What dies is guessing a bare token's type by shape.
+  `docker://`-prefix checks — `resolve_cas_image` reading a CAS file's content,
+  `base_arg_entry`, the server's re-derivation — are untouched. What dies is
+  guessing a bare token's type by shape. Resolving a ref caos itself RECORDED is
+  not sniffing; guessing at a token a user typed is.
 - **`:hash=` generalizes the existing `:tree=`** to a blob or tree by oid (verify
   it exists). `:commit=` stays separate (the *unpeeled* form).
 
@@ -172,49 +174,112 @@ the outer stack kept answering. What changed:
   the first pass — those write `.caos-expr` at test time in old grammar and the
   new evaluator rejects them: `argument must look like --name=value, got: bash`).
 
-Deliberately left untouched (isolated, hence low-risk): the CLI/worker sniffers
-`resolve_run_image`/`resolve_cli_image`, so `caos-cli run <dir>` and
-`caos curry <img>` still use positional grammar. That is stage 2C.
+Deliberately left untouched at the time (isolated, hence low-risk): the
+CLI/worker sniffers `resolve_run_image`/`resolve_cli_image`, so
+`caos-cli run <dir>` and `caos curry <img>` still used positional grammar.
+That was stage 2C, now done.
 
-## Stage 2C: CLI + worker `caos` grammar collapse — ← NEXT
+## Stage 3: the `:@@=` locator parser — ✅ DONE
 
-The other half of "no special arg": drop the positional image on the CLI and in
-the worker `caos` subcommands, type the map-then image positions, delete the last
-sniffers. **This one DOES touch the tool scripts and test `cli.sh`, so it re-keys
-nothing but changes the grammar those scripts use — expect a redeploy** (they run
-on the outer stack), unlike 2B.
+Pure string logic, so it landed and was verified **in-session** (33/33) with **no
+redeploy** and no stack fixture: `GitRef { url, rev: Option, dir: Option }` plus
+`parse_git_ref` in `lib.rs`, with a `git_ref_tests` module covering each rule.
+The validation *is* the feature — it is what makes a URL behave like content:
 
-Pointers (verified this session):
+- a git scheme (`git+https://`, `git+ssh://`, `git+file://`, `github:`) **must**
+  carry `rev=<40-hex>`; no rev is an error, and a short rev is an error;
+- a `ref=` (branch/tag) is **rejected outright**, even alongside a `rev=` —
+  mutable input never enters a cache key, and refusing the ambiguous both-form
+  keeps there from being a "which won?" question;
+- `path:` is a plain local directory: **no** rev (hashed live, like `:@=`);
+- unknown scheme, unknown query key, a non-`key=value` query part and a repeated
+  `rev=`/`dir=` are all errors — the grammar is closed, so a typo can't be
+  silently ignored into a wrong-but-plausible fetch.
 
-- **CLI `run`/`curry`:** argv parsing in `crates/caos/src/bin/caos-cli.rs`
-  (`Some("run")` ~L43 matches `[image, output?, "--", kvs…]`; `Some("curry")`
-  ~L109 passes `arg_tree` positional). Drop the positional; pull `--base` from
-  kvs. Keep the CLI `--` separating the optional `output` (a host result path,
-  NOT an arg) from the args. `cli_run`/`run_request`/`prepare_request`
-  (`lib.rs` ~L2302/2328) currently take `image: &str` — feed it from the parsed
-  `--base` instead. **CLI `:@=` base** = a host dir → `resolve_cli_image`
-  (ingest+eval); make it path-only (docker/hash now arrive as their own types).
-- **Worker `caos`:** `crates/caos/src/bin/caos.rs` — `curry` (drop positional
-  base → `--base`), `run-then`/`map-then` (keep the positional `<in>` data node;
-  type `--map`/`--run`/`--then`). The map-then image-arg parser is in `lib.rs`
-  (~L2560 region, matches `ArgType`, calls `resolve_run_image`). `resolve_run_image`
-  (`lib.rs` ~L2723) is the worker/CLI sniffer: split its `docker://`/hex branches
-  out to the `:docker=`/`:hash=` types, leaving it to resolve only a `:@=`
-  `/cas` path (whose *content* may still be a `docker://` blob — that's resolving
-  a recorded object, not sniffing a token, and stays).
-- **Tool scripts + fixtures to migrate with 2C** (they use worker/CLI grammar):
-  `std/flake-builder/worker` (`caos run-then … --run=… --then=…`, `caos curry
-  /cas/args/base …`), `caos-tools/build.sh` + `test.sh` (`--run=docker://seeded`
-  → `--run:docker=seeded`; `--run=/cas/args/result` → `--run:@=…`; `--map/--then`
-  `$var` holding a hash → `:hash=`; `caos curry /cas/args/base …`), and the many
-  `tests/*/cli.sh` doing `caos-cli run DEEP-DEPS/x …` / `curry DEEP-DEPS/x --`.
-- **Server:** `crates/server/src/compute.rs` sub-request builder (~L734)
-  `image.len()==40 && hex → tree entry, else blob`. **Keep** — that re-derives
-  the entry from a stored ref (the server's `base_arg_entry`), not user-value
-  sniffing.
-- **Open detail:** whether `map-then`/`run-then` keep the `--` before their typed
-  image flags (the `<in>` stays positional regardless). Note in
-  `design/map-then.md`.
+`GitRef`/`parse_git_ref` carry `#[allow(dead_code)]`: nothing *reads* the fields
+until stage 4 wires resolution in, and `unit-clippy` runs `--all-targets -D
+warnings`, so a helper exercised only by `#[cfg(test)]` still trips `dead_code`
+in the non-test lib build. **Drop the allows in stage 4**, when the resolver
+reads them.
+
+Not yet done here (deliberately, they are stage 4): `parse_arg` does **not** yet
+accept `:@@=` — the key split is `key.split_once(':')`, so the arm is a
+one-liner (`Some((name, "@@"))`) whenever the resolver behind it exists.
+
+## Stage 2C: CLI + worker `caos` grammar collapse — ✅ DONE
+
+The other half of "no special arg": the positional image is gone from the CLI and
+from the worker `caos` subcommands, the `map-then` image positions are typed, and
+the last sniffers are deleted. Verified **33/33 after a redeploy** (`nix build
+.#caosd && ./result-caosd/bin/caosd up`), which this stage genuinely needed —
+`caos-tools/*.sh` and `std/flake-builder/worker` run on the deployed stack, so
+their grammar and the deployed `caos` binary have to move together. It re-keys
+nothing: the arg trees are byte-identical, so every seed record held (bootstrap's
+own `caos-cli curry --base:hash=…` is the proof — the stack came up clean).
+
+### The final grammar
+
+```
+caos-cli run [--trace…] [output] --base:<t>=<image> [--k=v …]
+caos-cli curry [--unbind=<n> …] --base:<t>=<arg tree> [--k=v …]
+caos     curry [--unbind=<n> …] --base:<t>=<arg tree> [--k=v …]
+caos     map-then <in> [--map:<t>=<img>] [--then:<t>=<img>]
+caos     run-then <in>  --run:<t>=<img> [--then:<t>=<img>] [--catch]
+```
+
+**There is no `--` anywhere** — this was the one open question, and collapsing it
+is what makes the grammar one rule instead of four. What keeps a verb's own
+operands apart from the args it binds is that their NAMES are reserved (`base`,
+`unbind`), exactly as 2B did it for `.caos-expr`; a `--` separating regions was
+the last remnant of positional thinking. Consequences worth knowing:
+
+- `--unbind` may now sit anywhere among the binds, and an arg literally named
+  `unbind` cannot be bound (it is reserved, like `base`).
+- The CLI's `[output]` stays positional — it is a HOST path, not an arg — and is
+  identified as "the token that isn't a `--flag`". Sound because every argument
+  in the grammar is `--name[:type]=value`.
+- `<in>` on `map-then`/`run-then` stays positional too: it is the DATA the
+  continuation is over, not an image.
+
+### What changed
+
+- **`split_base_arg`** (`lib.rs`) pulls the reserved `--base` out of any verb's kv
+  list (exactly one required), and **`resolve_base`** resolves a typed image ref —
+  the single function every image position now goes through: `--base` on both
+  clients, and `--map`/`--run`/`--then` in `record_continuation`.
+- **The sniffers are gone.** `resolve_run_image` split into `resolve_cas_image`
+  (worker, `:@=` only) and `resolve_cli_image` (CLI, `:@=` only — a host dir to
+  ingest+evaluate, now an ERROR if it isn't a directory). Its `docker://`-prefix
+  and hex-hash branches became the `:docker=`/`:hash=` types. What *stays* is
+  reading a CAS file's CONTENT for a `docker://` ref: the path was typed `:@=` by
+  the operator and what's found there is an object caos recorded — resolving a
+  stored ref, not guessing at a token. Same reason the server's re-derivation
+  (`compute.rs` sub-request builder) and `base_arg_entry` are untouched.
+- **`worker_common::Arg`** gained `Hash` and `Docker` (and `#[derive(Clone,
+  Copy)]`), and `caos_curry`/`caos_recurry`/`map_then`/`run_then`/
+  `run_then_catching` now take `Arg` for every image instead of `&str`. This is
+  where the change earned its keep: each Rust worker had to *say* what it was
+  holding, and the answers were all already knowable — `own_image()` is a
+  `/cas` PATH, `own_args_tree()`/`caos_curry`'s output are HASHES, and an image
+  read out of an arg (`llm-step`'s `image_arg`, `worker-rustc`'s
+  `read_arg("runner")`) is a hash literal. `tests/file-count/worker.rs` was the
+  one place the two kinds were genuinely mixed behind one `String`
+  (`recur_arg_tree` returned a curry hash OR the bare image path); it is now
+  typed at each branch, which is strictly clearer than what it replaced.
+
+### Migrated in lockstep
+
+`build-builtins.sh` (both seed curries), `std/flake-builder/worker`,
+`caos-tools/build.sh` + `test.sh`, ~85 `tests/*/cli.sh` sites, the
+`tests/run-then/*.sh` worker fixtures, `tests/{commit,file-count}`'s Rust worker
+fixtures, `examples/consumer`, README/SPEC/`design/{map-then,caos-expr,
+flake-images,cargo-workers}.md`, plus every stale in-code comment naming the old
+forms.
+
+**One migration trap worth repeating:** a mechanical `run "$x" … --` →
+`--base:hash="$x"` sweep is wrong wherever `$x` holds a PATH. `tests/bash-tool`
+sets `tool=DEEP-DEPS/bash-tool` and went red with `:hash= wants an object hash`.
+The sweep can't know; check what each variable actually holds.
 
 ### ⚠️ The trap that already bit us (2A) — still relevant
 

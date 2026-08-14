@@ -49,7 +49,7 @@ runner image, one warm pool, per-worker cost of one small blob.
 
 > **Superseded by `caos-expr.md` (2026-08).** The server no longer detects
 > flakes: `resolve_flake_image` and its by-name builder lookup are DELETED.
-> A flake directory carries a `.caos-expr` (`run DEEP-DEPS/flake-builder --
+> A flake directory carries a `.caos-expr` (`run --base:@=DEEP-DEPS/flake-builder
 > --in:@=.`) and the CLIENT evaluates it, so what reaches the server is
 > already an image. The stage machinery below is still what
 > `std/flake-builder/worker` does; only the entry point changed.

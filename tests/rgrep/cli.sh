@@ -16,7 +16,7 @@ ms() { date +%s%3N; } # epoch milliseconds
 
 echo "== whole-tree grep: sparse result, matches only ==" >&2
 t0=$(ms)
-"$CAOS_CLI" run DEEP-DEPS/rgrep out -- --pattern='need.e' --in:@=test/tree
+"$CAOS_CLI" run out --base:@=DEEP-DEPS/rgrep --pattern='need.e' --in:@=test/tree
 t1=$(ms)
 [ "$(cat out/a.txt)" = '1:alpha needle one
 3:needle again' ] || fail "a.txt matches wrong: $(cat out/a.txt)"
@@ -33,19 +33,19 @@ echo "  ok: matches only, binaries skipped, empty subtrees absent" >&2
 
 echo "== the same grep again: served from cache ==" >&2
 t2=$(ms)
-"$CAOS_CLI" run DEEP-DEPS/rgrep out2 -- --pattern='need.e' --in:@=test/tree
+"$CAOS_CLI" run out2 --base:@=DEEP-DEPS/rgrep --pattern='need.e' --in:@=test/tree
 t3=$(ms)
 diff -r out out2 || fail "cached result differs from the cold one"
 echo "  ok: identical result" >&2
 
 echo "== file-scoped grep: the match blob itself ==" >&2
-got=$("$CAOS_CLI" run DEEP-DEPS/rgrep -- --pattern=needle --in:@=test/tree/a.txt)
+got=$("$CAOS_CLI" run --base:@=DEEP-DEPS/rgrep --pattern=needle --in:@=test/tree/a.txt)
 [ "$got" = '1:alpha needle one
 3:needle again' ] || fail "file-scoped matches wrong: $got"
 echo "  ok: blob of linenum:line matches" >&2
 
 echo "== no matches anywhere: the empty tree ==" >&2
-"$CAOS_CLI" run DEEP-DEPS/rgrep out3 -- --pattern=absent-string --in:@=test/tree
+"$CAOS_CLI" run out3 --base:@=DEEP-DEPS/rgrep --pattern=absent-string --in:@=test/tree
 [ -d out3 ] || fail "no-match result did not check out as a directory"
 [ -z "$(find out3 -type f)" ] || fail "no-match result is not empty: $(find out3 -type f)"
 echo "  ok: empty tree" >&2

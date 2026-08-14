@@ -112,7 +112,7 @@ reduce)
   caos put "$S" /cas/src
 
   # THE FLAKE-BUILDER IMAGE, resolved the way its own `.caos-expr` resolves it:
-  # `run docker://seeded -- --in:@=.` IS a run-then over the entry with the
+  # `run --base:docker=seeded --in:@=.` IS a run-then over the entry with the
   # sentinel as `--run`, which forms exactly the key the core-seeder-runner
   # registered — so it answers with the pre-built image, no container.
   #
@@ -139,12 +139,12 @@ reduce)
   caos put "$F" /cas/flake-builder
 
   # Each run ends a stage, so resolving it ends this one; `build-env` runs it.
-  env=$(caos curry /cas/args/base -- \
+  env=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=build-env \
     "--reduced:@=/cas/reduced" "--src:@=/cas/src") \
     || fail "currying the build-env stage"
 
-  caos run-then /cas/flake-builder -- --run=docker://seeded --then="$env"
+  caos run-then /cas/flake-builder --run:docker=seeded --then:hash="$env"
   ;;
 
 build-env)
@@ -153,11 +153,11 @@ build-env)
   # through as a curried arg so `make` can reach it: run-then passes only --in
   # and --result.
   caos get /cas/args/result
-  launch=$(caos curry /cas/args/base -- \
+  launch=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=launch "--src:@=/cas/args/src") \
     || fail "currying the launch stage"
 
-  caos run-then /cas/args/reduced -- --run=/cas/args/result --then="$launch"
+  caos run-then /cas/args/reduced --run:@=/cas/args/result --then:hash="$launch"
   ;;
 
 launch)
@@ -174,14 +174,14 @@ launch)
   # `docker://<ref>` blob and convert_git_image has no git-tree-base case —
   # chaining caos images by hash is exactly the extension we discussed and do
   # not have yet.
-  make=$(caos curry "$image" -- \
+  make=$(caos curry "--base:hash=$image" \
     "--worker1:@=/cas/args/worker1" --stage=make \
     "--src:@=/cas/args/src" "--builder:@=/cas/args/result") \
     || fail "currying the make stage onto the builder image"
 
   # --in is immaterial to `make` (everything it needs is curried in), but
   # run-then requires one; the reduced tree is already in hand.
-  caos run-then /cas/args/in -- --run="$make"
+  caos run-then /cas/args/in --run:hash="$make"
   ;;
 
 make)
@@ -339,7 +339,7 @@ make)
     bash "$wsroot/build-builtins.sh" >&2 || fail "bootstrapping the seeded core"
 
   # The seed records (design/caos-expr.md, Phase 3), if bootstrap published any:
-  # flake-builder resolves via `run docker://seeded`, answered by the inner
+  # flake-builder resolves via `run --base:docker=seeded`, answered by the inner
   # core-seeder-runner from these. Optional so a std without seeded core still
   # builds.
   SEED=$(git -C "$state/git" rev-parse refs/caos/seed 2>/dev/null || true)

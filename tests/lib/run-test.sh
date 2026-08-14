@@ -165,7 +165,7 @@ cp -r "$TEST" ./test
 # names its `DEPS` file used, and the same vocabulary any consumer uses.
 #
 # They have to be IN the repo (not just in the wrapper) because the CLI ingests
-# git-tracked paths: `caos-cli run DEEP-DEPS/rgrep` resolves by INGESTING that
+# git-tracked paths: `caos-cli run --base:@=DEEP-DEPS/rgrep` resolves by INGESTING that
 # directory and then EVALUATING its `.caos-expr`. A dependency the repo does not
 # hold is one the CLI cannot name, which is the point — the test's DEPS is the
 # whole of what it can reach.

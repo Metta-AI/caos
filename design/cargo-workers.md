@@ -296,7 +296,7 @@ a worker currying its *own image* from `/cas/args/base` (file-count,
 deep-deps, rgrep self-recursion) resolved the path to its recorded git hash —
 but when the image rides as a `docker://` **blob** (the nested passthrough
 case), that hash is the blob's oid, which no engine can run. Fix in
-`resolve_run_image`: a CAS *file* whose content is a `docker://` ref resolves
+`resolve_cas_image`: a CAS *file* whose content is a `docker://` ref resolves
 to the ref itself. Outer stacks never hit this (images there are git trees,
 where the oid *is* the image) — nesting is what makes the blob case real.
 

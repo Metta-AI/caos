@@ -67,12 +67,12 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry the workers (merge-image + ref snapshot) and run the turn ==" >&2
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
+llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
   --api-key=test-key --system:@=system.txt \
   --merge-refs="feature $feature" \
   --model=test-model --base-url="http://$stub_host:$port")
 
-"$CAOS_CLI" run "$llm" -- --head:commit="$human" > turn.commit
+"$CAOS_CLI" run --base:hash="$llm" --head:commit="$human" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn" || fail "fetch turn"
 

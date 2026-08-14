@@ -202,10 +202,17 @@ pub const SALT_ENV: &str = "CAOS_SALT";
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
 
+/// The reserved ArgTree entry naming the worker an ArgTree runs — and, since
+/// there is no positional image anywhere in the grammar, the arg name every verb
+/// reads its base out of: `run`/`curry`/`map-then` all take
+/// `--base:<type>=<image>` like any other typed arg (design/flake-inputs.md).
+/// Reserved: it is merged last, so it wins over a like-named user arg.
+pub const BASE_ARG: &str = "base";
+
 /// Marker entry naming a curry node: a CAS tree that pairs a `base` image ref
 /// with an `args` subtree of bound arguments. `run`/`curry` expand it client-side
 /// (merging the bound args under the call's args, then folding the base in as the
-/// args' `image` entry) so the server only ever sees an ordinary args tree. The
+/// args' [`BASE_ARG`] entry) so the server only ever sees an ordinary args tree. The
 /// marker lets it be told apart from a
 /// git-docker image tree, which it otherwise resembles. See `unwrap_curry`.
 pub const CURRY_MARKER: &str = ".caos-curry";
@@ -2314,6 +2321,79 @@ pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
     Ok((name, ty, value))
 }
 
+/// Pull the reserved `--base:<type>=<image>` out of a verb's arg list, returning
+/// its type and value plus everything else, in order. There is no positional
+/// image in any surface — CLI, worker or `.caos-expr` — so the worker an ArgTree
+/// runs is named exactly like every other argument, by an operator that says how
+/// to read it (design/flake-inputs.md). Exactly one `--base` is required: a verb
+/// with none has nothing to run, and two is a typo worth failing on rather than
+/// silently taking the last.
+///
+/// Every kv is parsed here (not just `base`), so a malformed argument anywhere in
+/// the list is reported before we resolve or ingest anything.
+pub(crate) fn split_base_arg<'a>(
+    verb: &str,
+    kvs: &'a [String],
+) -> Result<(ArgType, &'a str, Vec<String>), String> {
+    let mut base: Option<(ArgType, &str)> = None;
+    let mut rest = Vec::new();
+    for kv in kvs {
+        let (name, ty, value) = parse_arg(kv)?;
+        if name == BASE_ARG {
+            if base.replace((ty, value)).is_some() {
+                return Err(format!("`{verb}` given --{BASE_ARG} twice"));
+            }
+        } else {
+            rest.push(kv.clone());
+        }
+    }
+    let (ty, value) = base.ok_or_else(|| {
+        format!("`{verb}` needs a --{BASE_ARG}:<type>=<image> arg (:@= a path, :docker= a registry ref, or :hash= an object)")
+    })?;
+    Ok((ty, value, rest))
+}
+
+/// Resolve a typed image ref — a `--base`, or a `map-then`'s `--map`/`--run`/
+/// `--then` — into what the server runs: a git hash, or a `docker://<ref>`.
+/// The TYPE decides how the value is read, never the value's shape; this is the
+/// function that replaced the CLI/worker sniffers (design/flake-inputs.md, 2C).
+///
+/// `cas` says which world we're in, and is the only difference between the two
+/// clients: `Some(dir)` is a worker, where a path names a materialized `/cas`
+/// node; `None` is the CLI, where a path is a host directory to ingest (and
+/// evaluate — see [`resolve_cli_image`]).
+fn resolve_base(
+    t: &dyn Transport,
+    cas: Option<&Path>,
+    ty: ArgType,
+    value: &str,
+) -> Result<String, String> {
+    match ty {
+        // `:docker=<ref>` — a registry image, carried as the `docker://` ref the
+        // server and `base_arg_entry` expect. The scheme is added here, so the
+        // value a caller writes is the plain ref.
+        ArgType::Docker => Ok(format!("{DOCKER_SCHEME}{value}")),
+        // `:hash=<oid>` — a git image or a curry node already in the store (e.g.
+        // what `caos curry` printed). Location-independent, so it survives being
+        // passed through an arg into a worker, which a `/cas` path would not.
+        ArgType::Hash => {
+            if !is_hex_hash(value) {
+                return Err(format!(":hash= wants an object hash, got {value:?}"));
+            }
+            Ok(value.to_string())
+        }
+        // `:@=<path>` — a `/cas` node in a worker, a host directory on the CLI.
+        ArgType::Path => match cas {
+            Some(cas) => resolve_cas_image(t, cas, value),
+            None => resolve_cli_image(t, value),
+        },
+        ArgType::Literal => Err(format!(
+            "an image needs a type: use --name:@=path, --name:docker=ref or --name:hash=oid, got {value:?}"
+        )),
+        ArgType::Commit => Err("a commit is not an image".to_string()),
+    }
+}
+
 /// A parsed `:@@=` locator — a git tree named by WHERE to fetch it, pinned by a
 /// content hash (design/flake-inputs.md). The syntax is nix's flake-reference
 /// grammar, borrowed as a STRING FORMAT only (no nix ever runs): a scheme + an
@@ -2531,6 +2611,11 @@ mod git_ref_tests {
         assert!(parse_git_ref(&v).unwrap_err().contains("rev given twice"));
     }
 }
+
+/// Resolve curry layers, build the args tree, bundle + push the request, and run
+/// it — the CLI's blocking run (the worker never triggers compute; its sub-runs
+/// are continuations the server resolves). Returns the server's
+/// `(kind, result-hash)`. `cas` is `None` here: every path arg is a host path to
 /// ingest.
 fn run_request(
     t: &dyn Transport,
@@ -2652,15 +2737,16 @@ fn assemble_arg_tree(
     Ok(arg_tree.to_string())
 }
 
-/// `map-then <in> -- [--map=<image>] [--then=<image>]` — the *worker* form: record a
-/// continuation `{in, map?, then?}` as this worker's result at
+/// `map-then <in> [--map:<type>=<image>] [--then:<type>=<image>]` — the
+/// *worker* form: record a continuation `{in, map?, then?}` as this worker's result at
 /// `/cas/out`, fetching and running nothing. The worker then exits, and the
 /// *server* resolves the continuation — `map` over each child of `in` in
 /// parallel, then `then(--in, --children)` — with no worker slot held (see
 /// `design/map-then.md`). So `caos map-then` is a tail call: it produces `/cas/out`
 /// itself and must be the worker's final act. At least one of `--map`/`--then`
-/// is required; each names an image (a `/cas` path, resolved to the hash
-/// recorded on it, or a git/curry hash or `docker://` ref, passed through).
+/// is required; each names an ArgTree, TYPED like a `--base` — `:@=` a `/cas`
+/// path, `:docker=` a registry ref, `:hash=` an object already in the store —
+/// and resolved through the same path a `--base` takes (`resolve_base`).
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
@@ -2672,7 +2758,7 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     })
 }
 
-/// `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
+/// `run-then <in> --run:<type>=<image> [--then:<type>=<image>] [--catch]` — the
 /// single-valued [`caos_map_then`]: record a continuation `{in, run, then?,
 /// catch?}` as this worker's result at `/cas/out` and exit. The server runs
 /// `run(--in=<in>)` once, yielding R; with `--then` the request's result is
@@ -2793,16 +2879,11 @@ fn record_continuation(
         if given.contains(&name) {
             return Err(format!("--{name} given twice"));
         }
-        // Literal, path or tree-hash all name an image ref (a /cas path, a bare
-        // hash, docker://, or a git image / curry node); resolve_run_image
-        // handles the shapes. A commit is not an image.
-        let image = match ty {
-            ArgType::Commit => {
-                return Err(format!("--{name} names an image, not a commit"));
-            }
-            _ => value,
-        };
-        let resolved = resolve_run_image(t, &cas, image)?;
+        // Each of these flags names an ArgTree to run, typed exactly like a
+        // `--base`: `:@=` a `/cas` path, `:docker=` a registry ref, `:hash=` an
+        // object already in the store (typically what `caos curry` printed).
+        let resolved =
+            resolve_base(t, Some(&cas), ty, value).map_err(|e| format!("--{name}: {e}"))?;
         entries.push(Entry {
             mode: EntryKind::Blob.into(),
             filename: name.as_bytes().to_vec().into(),
@@ -2816,7 +2897,7 @@ fn record_continuation(
     write_placeholder(&out, "promise", &continuation.to_string())
 }
 
-/// `run <image | dir> [output] -- [--name=value | --name:@=path ...]`
+/// `run [output] --base:<type>=<image> [--name=value | --name:@=path ...]`
 /// — the *CLI* form. `<output>`, if given, is any path on the host; the whole
 /// result tree is checked out there in full as ordinary rw files. If `<output>`
 /// is omitted and the result is a file, its bytes are written to stdout — with a
@@ -2828,11 +2909,11 @@ fn record_continuation(
 /// `<output>` as such; fetch the real object by hash (`git fetch caos <hash>`)
 /// when you want the commit itself. There
 /// is no `/cas` here: path-valued args are host paths the transport ingests, and
-/// `<image>` is a `docker://` ref, a bare hash, or a host DIRECTORY — evaluated
-/// if it carries a `.caos-expr` (see [`resolve_cli_image`]).
+/// the worker is the reserved [`BASE_ARG`] — `--base:@=<host dir>` (ingested, and
+/// evaluated if it carries a `.caos-expr`; see [`resolve_cli_image`]),
+/// `--base:docker=<ref>`, or `--base:hash=<oid>`.
 pub fn cli_run(
     t: &dyn Transport,
-    image: &str,
     output: Option<&str>,
     trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
@@ -2840,12 +2921,13 @@ pub fn cli_run(
     if trace.as_ref().is_some_and(|(id, _)| !valid_trace_id(id)) {
         return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
     }
-    let image = resolve_cli_image(t, image)?;
+    let (bty, bval, kvs) = split_base_arg("run", kvs)?;
+    let image = resolve_base(t, None, bty, bval)?;
     // Build the ephemeral secrets store from the caller's `.caos-secrets`
     // (design/secrets.md), resolving each reader here — where eval-path is
     // available — so the server never evals. Empty when there's no store.
     let store = build_secret_store(t)?;
-    let (kind, result) = run_request(t, &image, None, trace, kvs, &store)?;
+    let (kind, result) = run_request(t, &image, None, trace, &kvs, &store)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -2949,57 +3031,50 @@ pub fn resolve_ref(name: &str) -> Result<String, String> {
     Ok(tree.to_string())
 }
 
-/// Resolve an image argument of `caos map-then`/`caos curry` into what the server
-/// expects. A git image is given as a path inside the CAS, which resolves to the
-/// git hash recorded on it; a `docker://<ref>` value is an ordinary docker image
-/// and passes through unchanged. Anything else is rejected.
-fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<String, String> {
-    if image.starts_with(DOCKER_SCHEME) {
-        return Ok(image.to_string());
+/// Resolve a worker-side `:@=` image path — a node under the CAS — to what the
+/// server expects: the git hash recorded on it, or, for a node whose *content*
+/// is a `docker://` ref, that ref.
+///
+/// Reading the content is not sniffing a caller's token: the path was typed
+/// `:@=` by the operator, and what's found there is an object caos itself
+/// recorded, exactly as [`base_arg_entry`] re-derives an entry from a stored
+/// ref. A path outside the CAS is rejected — a worker has no host filesystem.
+fn resolve_cas_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<String, String> {
+    if !Path::new(image).starts_with(cas) {
+        return Err(format!(
+            "an image path must be under {} (a worker has no host filesystem), got: {image}",
+            cas.display()
+        ));
     }
-    // A bare git hash — a git image or a curry node already in the store, e.g. a
-    // ref produced by `caos curry`. Location-independent, so it survives being
-    // passed through args into a worker (a CAS path would not). Sent as-is.
-    if is_hex_hash(image) {
-        return Ok(image.to_string());
+    let canon = Path::new(image)
+        .canonicalize()
+        .map_err(|e| format!("{image}: {e}"))?;
+    let cas_real = cas
+        .canonicalize()
+        .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
+    if !canon.starts_with(&cas_real) {
+        return Err(format!("{image} resolves outside {}", cas.display()));
     }
-    // A path inside the CAS: reference whatever git object it was made from.
-    if Path::new(image).starts_with(cas) {
-        let canon = Path::new(image)
-            .canonicalize()
-            .map_err(|e| format!("{image}: {e}"))?;
-        let cas_real = cas
-            .canonicalize()
-            .map_err(|e| format!("CAS directory {}: {e}", cas.display()))?;
-        if !canon.starts_with(&cas_real) {
-            return Err(format!("{image} resolves outside {}", cas.display()));
-        }
-        // A `docker://` image has no git object, so it rides as a *blob naming
-        // the ref* (see `read_request`); a file holding such a ref resolves
-        // to the ref itself — its recorded blob hash names an object no engine
-        // could run. Fetch the blob rather than reading the file: a CAS entry
-        // is a content-less placeholder until someone `get`s it.
-        if canon.is_file() {
-            let hash = read_hash(&canon)?;
-            if let Ok(content) = fetch_blob_string(t, &hash) {
-                if content.starts_with(DOCKER_SCHEME) {
-                    return Ok(content);
-                }
+    // A `docker://` image has no git object, so it rides as a *blob naming
+    // the ref* (see `read_request`); a file holding such a ref resolves
+    // to the ref itself — its recorded blob hash names an object no engine
+    // could run. Fetch the blob rather than reading the file: a CAS entry
+    // is a content-less placeholder until someone `get`s it.
+    if canon.is_file() {
+        let hash = read_hash(&canon)?;
+        if let Ok(content) = fetch_blob_string(t, &hash) {
+            if content.starts_with(DOCKER_SCHEME) {
+                return Ok(content);
             }
-            return Ok(hash);
         }
-        return read_hash(&canon);
+        return Ok(hash);
     }
-    Err(format!(
-        "image must be a path under {} (a git image), a git hash, or \
-         {DOCKER_SCHEME}<ref>, got: {image}",
-        cas.display()
-    ))
+    read_hash(&canon)
 }
 
-/// Resolve a `caos-cli run` image argument to something the server can run: a
-/// DIRECTORY is ingested (and evaluated, if it is evaluable), and every other
-/// form (`docker://…`, a bare hash) is left untouched.
+/// Resolve a CLI-side `:@=` image path — a host DIRECTORY — by ingesting it and
+/// evaluating it, which is the only image form the CLI reads off the filesystem
+/// (`:docker=` and `:hash=` name things that need no host at all).
 ///
 /// A directory is the only name a caller needs, because a tree says how it is
 /// built. There is deliberately no name-to-image lookup here: the CLI resolves
@@ -3007,35 +3082,38 @@ fn resolve_run_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// which is what makes a caller's dependencies its own declared edges rather
 /// than whatever an ambient library happens to hold.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    // A directory is an image tree to ingest: ingest it exactly like a
-    // `--name:@=path` arg (git-tracked paths only) and hand the server its tree
-    // hash. A flake dir is NOT special-cased here or on the server — it carries
-    // a `.caos-expr` naming its builder, and the evaluation below turns it into
-    // an image, so what the server receives is already one (design/caos-expr.md).
-    if Path::new(image).is_dir() {
-        let (_, oid) = t
-            .ingest_path(image)?
-            .ok_or_else(|| format!("this transport cannot ingest the image dir {image}"))?;
-        // ...unless the directory is EVALUABLE. A tree carrying a `.caos-expr`
-        // says how it is built, so resolving it means evaluating it — the same
-        // rule `resolve_expr_image` applies to a path named inside an
-        // expression. This is what lets a caller name a dependency by its
-        // deep-deps mount (`run DEEP-DEPS/rgrep`) — a path it holds, not a name
-        // it looks up; a tree with no `.caos-expr` (a plain flake dir, a
-        // git-docker image) evaluates to itself and nothing changes.
-        return eval::eval_tree(t, &oid.to_string());
+    // Ingest the directory exactly like a `--name:@=path` arg (git-tracked paths
+    // only) and hand the server its tree hash. A flake dir is NOT special-cased
+    // here or on the server — it carries a `.caos-expr` naming its builder, and
+    // the evaluation below turns it into an image, so what the server receives is
+    // already one (design/caos-expr.md).
+    if !Path::new(image).is_dir() {
+        return Err(format!(
+            "`:@=` names a directory to ingest; {image:?} is not one \
+             (a registry image is --base:docker=<ref>, an object --base:hash=<oid>)"
+        ));
     }
-    Ok(image.to_string())
+    let (_, oid) = t
+        .ingest_path(image)?
+        .ok_or_else(|| format!("this transport cannot ingest the image dir {image}"))?;
+    // A tree carrying a `.caos-expr` says how it is built, so resolving it means
+    // evaluating it — the same rule `resolve_expr_base` applies to a path named
+    // inside an expression. This is what lets a caller name a dependency by its
+    // deep-deps mount (`--base:@=DEEP-DEPS/rgrep`) — a path it holds, not a name
+    // it looks up; a tree with no `.caos-expr` (a plain flake dir, a git-docker
+    // image) evaluates to itself and nothing changes.
+    eval::eval_tree(t, &oid.to_string())
 }
 
-/// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — bind arguments
-/// to `<arg tree>`, printing a ref (a git hash) to the new arg tree that includes
+/// `curry [--unbind=<name> …] --base:<type>=<arg tree> [--name=value ...]` —
+/// bind arguments to the `--base` arg tree, printing a ref (a git hash) to the new
+/// arg tree that includes
 /// the new args. The ref can be `run` — which supplies the rest of the args —
 /// or `curry`'d again, exactly like any other arg tree; the binding is partial
 /// application, not a rebuilt container image. This is the *worker* form: path
 /// args resolve against `/cas`. (The CLI's is [`cli_curry`].)
 ///
-/// Currying is an ArgTree → ArgTree operation. `arg_tree` may be given in any of
+/// Currying is an ArgTree → ArgTree operation. The `--base` may be given in any of
 /// its equivalent forms — a curry node, a flat args tree (e.g. `own_args_tree`),
 /// or a bare image (the *simplest* ArgTree, image and nothing else) — because
 /// `unwrap_curry` normalizes whichever it is into the `(base image, bound
@@ -3049,22 +3127,24 @@ pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, Strin
 /// (`curry (curry img a) b` == `curry img a b`) — and STRICT: rebinding an
 /// already-bound name is refused, not overridden, unless it is first `--unbind`ed
 /// (see `curry_object`).
-pub fn caos_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<(), String> {
+pub fn caos_curry(t: &dyn Transport, rest: &[String]) -> Result<(), String> {
     let cas = cas_dir();
-    let (unbind, kvs) = split_curry_args(rest)?;
-    let arg_tree = resolve_run_image(t, &cas, arg_tree)?;
-    println!("{}", curry_object(t, &arg_tree, Some(&cas), &unbind, kvs)?);
+    let (unbind, kvs) = split_curry_args(rest);
+    let (bty, bval, kvs) = split_base_arg("curry", &kvs)?;
+    let arg_tree = resolve_base(t, Some(&cas), bty, bval)?;
+    println!("{}", curry_object(t, &arg_tree, Some(&cas), &unbind, &kvs)?);
     Ok(())
 }
 
-/// `curry <arg tree> [--unbind=<name> …] -- [--name=value ...]` — the *CLI* form
-/// of [`caos_curry`]: `<arg tree>` may be a directory to ingest and evaluate,
-/// path args are host paths to ingest, and the curried
+/// `curry [--unbind=<name> …] --base:<type>=<arg tree> [--name=value ...]` —
+/// the *CLI* form of [`caos_curry`]: a `--base:@=` is a host directory to ingest
+/// and evaluate, path args are host paths to ingest, and the curried
 /// arg tree is pushed so a later `run` can use the printed ref directly.
-pub fn cli_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<(), String> {
-    let (unbind, kvs) = split_curry_args(rest)?;
-    let arg_tree = resolve_cli_image(t, arg_tree)?;
-    let curried = curry_object(t, &arg_tree, None, &unbind, kvs)?;
+pub fn cli_curry(t: &dyn Transport, rest: &[String]) -> Result<(), String> {
+    let (unbind, kvs) = split_curry_args(rest);
+    let (bty, bval, kvs) = split_base_arg("curry", &kvs)?;
+    let arg_tree = resolve_base(t, None, bty, bval)?;
+    let curried = curry_object(t, &arg_tree, None, &unbind, &kvs)?;
     t.ensure_pushed(&curried.to_string())?;
     if is_hex_hash(&arg_tree) {
         t.ensure_pushed(&arg_tree)?;
@@ -3073,27 +3153,25 @@ pub fn cli_curry(t: &dyn Transport, arg_tree: &str, rest: &[String]) -> Result<(
     Ok(())
 }
 
-/// Split a `curry`'s tail — `[--unbind=<name> …] -- [--name=value …]` — into the
-/// unbind names (before `--`) and the bind kvs (after it). The `--` is required,
-/// so the two regions never blur; only `--unbind=<name>` is accepted before it,
-/// which cannot collide with a bound arg (a different region entirely).
-fn split_curry_args(rest: &[String]) -> Result<(Vec<&str>, &[String]), String> {
-    let sep = rest
-        .iter()
-        .position(|a| a == "--")
-        .ok_or("curry needs `--` before its args (e.g. `curry <arg tree> -- --k=v`)")?;
-    let (flags, kvs) = (&rest[..sep], &rest[sep + 1..]);
-    let unbind = flags
-        .iter()
-        .map(|f| {
-            f.strip_prefix("--unbind=").ok_or_else(|| {
-                format!(
-                    "curry: unexpected {f:?} before `--`; only --unbind=<name> is allowed there"
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((unbind, kvs))
+/// Split a `curry`'s args — `[--unbind=<name> …] --base:<type>=<arg tree>
+/// [--name=value …]` — into the unbind names and everything else.
+///
+/// There is no `--` separator anywhere in the grammar: what keeps the verb's own
+/// operands apart from the args it binds is that their NAMES are reserved.
+/// `unbind` is one (repeatable), [`BASE_ARG`] the other, so neither can be bound
+/// as an ordinary arg — the same rule, applied uniformly, that lets `run` take
+/// its worker as `--base` instead of a positional (design/flake-inputs.md).
+/// Order is therefore free: an `--unbind=` may sit anywhere among the binds.
+fn split_curry_args(rest: &[String]) -> (Vec<&str>, Vec<String>) {
+    let mut unbind = Vec::new();
+    let mut kvs = Vec::new();
+    for a in rest {
+        match a.strip_prefix("--unbind=") {
+            Some(name) => unbind.push(name),
+            None => kvs.push(a.clone()),
+        }
+    }
+    (unbind, kvs)
 }
 
 /// Build (and store) a curry node from the ArgTree `arg_tree` plus `unbind`/`kvs`:

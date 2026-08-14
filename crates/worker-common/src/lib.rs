@@ -81,6 +81,8 @@ pub fn secret(name: &str) -> Result<String, String> {
 ///
 /// Reaching for this to rebuild your whole ArgTree by hand? Prefer
 /// [`own_args_tree`] + [`caos_recurry`], which carry every other arg forward.
+///
+/// It is a `/cas` PATH, so it is curried as `Arg::Path(&own_image())`.
 pub fn own_image() -> String {
     arg("base")
 }
@@ -92,6 +94,8 @@ pub fn own_image() -> String {
 /// re-listing its config arg by arg (miss one and it silently vanishes next
 /// round). Its per-call args (`in`, `result`, `children`, …) ride along too, so
 /// `unbind` any that shouldn't persist into the next call.
+///
+/// It is a git HASH, so it is curried as `Arg::Hash(&own_args_tree()?)`.
 pub fn own_args_tree() -> Result<String, String> {
     cas_hash(ARGS)
 }
@@ -114,46 +118,65 @@ pub fn caos<const N: usize>(args: [&str; N]) -> Result<(), String> {
     caos_argv(&args)
 }
 
-/// An argument value for `caos curry`. The two kinds serialize with different
-/// operators — `--name=value` for a literal, `--name:@=value` for a path — so
-/// the distinction is explicit, never sniffed from the value.
+/// An argument value for `caos curry`/`map-then`/`run-then`. Each kind
+/// serializes with its own operator — `--name=v`, `--name:@=v`, `--name:hash=v`,
+/// `--name:docker=v` — so the type is always the caller's explicit choice, never
+/// sniffed from the value's shape. This mirrors caos' one arg-type vocabulary
+/// (`caos::ArgType`); an image is named with the same operators as any other
+/// argument, because it IS one (the reserved `base`).
+#[derive(Clone, Copy)]
 pub enum Arg<'a> {
-    /// A literal string (e.g. a mode, or an arg-tree ref to bind).
+    /// A literal string (e.g. a mode, or a flag value).
     Lit(&'a str),
     /// A `/cas` path to reference (or, off-worker, a host path to ingest).
     Path(&'a str),
+    /// An object already in the store, by git hash — what [`caos_curry`] prints,
+    /// or an image ref a caller was handed as a literal. Location-independent,
+    /// so unlike a `/cas` path it survives being passed on to another worker.
+    Hash(&'a str),
+    /// A registry image, by docker ref (stored as the blob `docker://<ref>`).
+    Docker(&'a str),
 }
 
-/// `caos curry <arg tree> -- …` — bind the given named arguments to `arg_tree`,
-/// returning a ref to the resulting curried ArgTree. Currying is strict: it
-/// refuses to rebind an already-bound name — use [`caos_recurry`] to release
+impl Arg<'_> {
+    /// This argument as the `--name[:type]=value` token `caos` parses.
+    fn token(&self, name: &str) -> String {
+        match self {
+            Arg::Lit(s) => format!("--{name}={s}"),
+            Arg::Path(s) => format!("--{name}:@={s}"),
+            Arg::Hash(s) => format!("--{name}:hash={s}"),
+            Arg::Docker(s) => format!("--{name}:docker={s}"),
+        }
+    }
+}
+
+/// `caos curry --base:<type>=<arg tree> …` — bind the given named arguments to
+/// `base`, returning a ref to the resulting curried ArgTree. Currying is strict:
+/// it refuses to rebind an already-bound name — use [`caos_recurry`] to release
 /// one first.
-pub fn caos_curry(arg_tree: &str, args: &[(&str, Arg)]) -> Result<String, String> {
-    caos_recurry(arg_tree, &[], args)
+pub fn caos_curry(base: Arg, args: &[(&str, Arg)]) -> Result<String, String> {
+    caos_recurry(base, &[], args)
 }
 
-/// `caos curry <arg tree> --unbind=… -- …` — carry `arg_tree` forward, dropping
-/// each name in `unbind` so it can be rebound, then binding `args`; returns a ref
-/// to the new ArgTree. This is the self-recurry primitive: pair it with
-/// [`own_args_tree`] to change a few args and keep every other one untouched, e.g.
-/// `caos_recurry(&own_args_tree()?, &["step"], &[("step", Arg::Path(&next))])`.
-pub fn caos_recurry(
-    arg_tree: &str,
-    unbind: &[&str],
-    args: &[(&str, Arg)],
-) -> Result<String, String> {
-    let mut argv = vec!["curry".to_string(), arg_tree.to_string()];
+/// `caos curry --unbind=… --base:<type>=<arg tree> …` — carry `base` forward,
+/// dropping each name in `unbind` so it can be rebound, then binding `args`;
+/// returns a ref to the new ArgTree. This is the self-recurry primitive: pair it
+/// with [`own_args_tree`] to change a few args and keep every other one untouched,
+/// e.g. `caos_recurry(Arg::Hash(&own_args_tree()?), &["step"],
+/// &[("step", Arg::Path(&next))])`.
+pub fn caos_recurry(base: Arg, unbind: &[&str], args: &[(&str, Arg)]) -> Result<String, String> {
+    let mut argv = vec!["curry".to_string()];
     argv.extend(unbind.iter().map(|name| format!("--unbind={name}")));
-    argv.push("--".to_string());
-    argv.extend(args.iter().map(|(k, v)| match v {
-        Arg::Lit(s) => format!("--{k}={s}"),
-        Arg::Path(s) => format!("--{k}:@={s}"),
-    }));
+    // The ArgTree being curried onto is the reserved `base` arg — typed like any
+    // other, so there is no positional image (and no `--`) anywhere in the
+    // grammar; `base` and `unbind` are reserved NAMES instead.
+    argv.push(base.token("base"));
+    argv.extend(args.iter().map(|(k, v)| v.token(k)));
     caos_capture(&str_refs(&argv))
 }
 
 /// Map-then: record a continuation over `input` (a CAS path) as this worker's
-/// result at `/cas/out` — `caos map-then <input> -- --map=<map> --then=<then>`. The
+/// result at `/cas/out` — `caos map-then <input> --map:<t>=<map> --then:<t>=<then>`. The
 /// *server* resolves it after this worker exits: `map` runs over each child of
 /// `input` in parallel, the results are assembled into a `children` tree under
 /// the original names, and `then(--in=<input>, --children=<children>)` produces
@@ -161,33 +184,34 @@ pub fn caos_recurry(
 /// `design/map-then.md`). A blob `input` has no children (a leaf), so `then`
 /// gets an empty `children` tree. With no `then`, the children tree itself is
 /// the result; with no `map`, `then(--in=<input>)` is a plain tail call.
-/// `map`/`then` are arg-tree refs (a `/cas` path, a git/curry hash, or
-/// `docker://…`), usually curried with whatever else they need.
+/// `map`/`then` are arg-tree refs, TYPED by the caller ([`Arg`]) rather than
+/// sniffed: `Arg::Path` a `/cas` node, `Arg::Hash` a git/curry hash,
+/// `Arg::Docker` a registry ref — usually curried with whatever else they need.
 ///
 /// This is a worker's *final act*: it produces `/cas/out`, so call it once, in
 /// tail position.
-pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<(), String> {
+pub fn map_then(input: &str, map: Option<Arg>, then: Option<Arg>) -> Result<(), String> {
     if map.is_none() && then.is_none() {
         return Err("map_then needs a map or a then arg tree".to_string());
     }
-    let mut argv: Vec<String> = vec!["map-then".into(), input.into(), "--".into()];
+    let mut argv: Vec<String> = vec!["map-then".into(), input.into()];
     if let Some(map) = map {
-        argv.push(format!("--map={map}"));
+        argv.push(map.token("map"));
     }
     if let Some(then) = then {
-        argv.push(format!("--then={then}"));
+        argv.push(then.token("then"));
     }
     caos_argv(&str_refs(&argv))
 }
 
 /// Run-then: the single-valued [`map_then`] — record a continuation over
 /// `input` (a CAS path) as this worker's result at `/cas/out`: `caos run-then
-/// <input> -- --run=<run> [--then=<then>]`. The *server* resolves it after this
+/// <input> --run:<t>=<run> [--then:<t>=<then>]`. The *server* resolves it after this
 /// worker exits: one sub-run `run(--in=<input>)` yields R, then
 /// `then(--in=<input>, --result=<R>)` produces the final result — or R itself
 /// with no `then`, a plain tail call to `run`. R may itself be a promise; the
-/// server collapses it fully before `then` sees it. `run`/`then` are arg-tree refs
-/// exactly as in [`map_then`], usually curried with whatever else they need
+/// server collapses it fully before `then` sees it. `run`/`then` are typed
+/// arg-tree refs exactly as in [`map_then`], usually curried with whatever else they need
 /// (e.g. a worker currying its own state into `then` to be called back with the
 /// sub-run's result).
 ///
@@ -196,7 +220,7 @@ pub fn map_then(input: &str, map: Option<&str>, then: Option<&str>) -> Result<()
 ///
 /// [`run_then_catching`] is the same call with a failing `run` turned into a
 /// value for `then` instead of an error that propagates.
-pub fn run_then(input: &str, run: &str, then: Option<&str>) -> Result<(), String> {
+pub fn run_then(input: &str, run: Arg, then: Option<Arg>) -> Result<(), String> {
     run_then_inner(input, run, then, false)
 }
 
@@ -209,19 +233,14 @@ pub fn run_then(input: &str, run: &str, then: Option<&str>) -> Result<(), String
 /// For drivers that must outlive their callees. The agent loop is the case this
 /// exists for: a tool that dies has to come back to the model as an `is_error`
 /// tool_result it can read and react to, not take the whole turn down with it.
-pub fn run_then_catching(input: &str, run: &str, then: &str) -> Result<(), String> {
+pub fn run_then_catching(input: &str, run: Arg, then: Arg) -> Result<(), String> {
     run_then_inner(input, run, Some(then), true)
 }
 
-fn run_then_inner(input: &str, run: &str, then: Option<&str>, catch: bool) -> Result<(), String> {
-    let mut argv: Vec<String> = vec![
-        "run-then".into(),
-        input.into(),
-        "--".into(),
-        format!("--run={run}"),
-    ];
+fn run_then_inner(input: &str, run: Arg, then: Option<Arg>, catch: bool) -> Result<(), String> {
+    let mut argv: Vec<String> = vec!["run-then".into(), input.into(), run.token("run")];
     if let Some(then) = then {
-        argv.push(format!("--then={then}"));
+        argv.push(then.token("then"));
     }
     if catch {
         argv.push("--catch".into());

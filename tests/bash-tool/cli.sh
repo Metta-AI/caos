@@ -40,7 +40,7 @@ base=$(git rev-parse HEAD)
 tool=DEEP-DEPS/bash-tool
 
 echo "== targeted read: declared path only; workspace round-trips by hash ==" >&2
-"$CAOS_CLI" run "$tool" r1 -- --tree:@=ws --cmd='cat a/one.txt' --paths='a/one.txt'
+"$CAOS_CLI" run r1 --base:@="$tool" --tree:@=ws --cmd='cat a/one.txt' --paths='a/one.txt'
 [ "$(cat r1/exit)" = "0" ] || fail "read: exit $(cat r1/exit)"
 [ "$(cat r1/stdout)" = "one" ] || fail "read: stdout $(cat r1/stdout)"
 [ "$(snap r1/tree)" = "$(git rev-parse "$base:ws")" ] \
@@ -48,7 +48,7 @@ echo "== targeted read: declared path only; workspace round-trips by hash ==" >&
 echo "  ok: read its file; tree unchanged (identical hash)" >&2
 
 echo "== undeclared touch: EACCES + structured retry hint ==" >&2
-"$CAOS_CLI" run "$tool" r2 -- --tree:@=ws --cmd='cat a/b/two.txt' --paths='top.txt'
+"$CAOS_CLI" run r2 --base:@="$tool" --tree:@=ws --cmd='cat a/b/two.txt' --paths='top.txt'
 [ "$(cat r2/exit)" != "0" ] || fail "undeclared read did not fail"
 grep -qi "permission denied" r2/stderr || fail "no EACCES in stderr: $(cat r2/stderr)"
 [ -f r2/denied ] || fail "no denied hint in the result"
@@ -56,7 +56,7 @@ grep -q "a/b/two.txt" r2/denied || fail "hint misses the path: $(cat r2/denied)"
 echo "  ok: EACCES surfaced, denied names a/b/two.txt" >&2
 
 echo "== writes staged back; untouched placeholder subtree intact by hash ==" >&2
-"$CAOS_CLI" run "$tool" r3 -- --tree:@=ws \
+"$CAOS_CLI" run r3 --base:@="$tool" --tree:@=ws \
   --cmd='echo hi > new.txt && echo edited >> a/one.txt' --paths='a/one.txt'
 [ "$(cat r3/exit)" = "0" ] || fail "write: exit $(cat r3/exit)"
 [ "$(cat r3/tree/new.txt)" = "hi" ] || fail "created file missing/wrong"
@@ -67,14 +67,14 @@ echo "== writes staged back; untouched placeholder subtree intact by hash ==" >&
 echo "  ok: new.txt + edit staged, a/b round-tripped" >&2
 
 echo "== a failing command is a value, not a run error ==" >&2
-"$CAOS_CLI" run "$tool" r4 -- --tree:@=ws --cmd='echo oops >&2; exit 7'
+"$CAOS_CLI" run r4 --base:@="$tool" --tree:@=ws --cmd='echo oops >&2; exit 7'
 [ "$(cat r4/exit)" = "7" ] || fail "exit code not surfaced: $(cat r4/exit)"
 grep -q "oops" r4/stderr || fail "stderr not captured"
 [ "$(snap r4/tree)" = "$(git rev-parse "$base:ws")" ] || fail "failed run mangled the tree"
 echo "  ok: exit 7 + stderr returned as a value" >&2
 
 echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
-"$CAOS_CLI" run "$tool" r5 -- --tree:@=ws --cmd='./run.sh' --paths='run.sh'
+"$CAOS_CLI" run r5 --base:@="$tool" --tree:@=ws --cmd='./run.sh' --paths='run.sh'
 [ "$(cat r5/exit)" = "0" ] || fail "exec run: exit $(cat r5/exit)"
 [ "$(cat r5/stdout)" = "hi" ] || fail "declared file was not executable: $(cat r5/stdout)"
 [ "$(snap r5/tree)" = "$(git rev-parse "$base:ws")" ] \

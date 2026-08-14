@@ -43,7 +43,7 @@ echo "== the tested client still works against its own stack ==" >&2
 # The positive case, through the real client rather than curl: if the guard
 # rejected same-world traffic, this would fail.
 echo hello > file.txt
-"$CAOS_CLI" run DEEP-DEPS/bash out -- --worker1:@=test/worker.sh >/dev/null
+"$CAOS_CLI" run out --base:@=DEEP-DEPS/bash --worker1:@=test/worker.sh >/dev/null
 [ "$(cat out)" = "world-guard ok" ] || fail "same-world job did not run: $(cat out)"
 echo "  ok: same-world job ran" >&2
 

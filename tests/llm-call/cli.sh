@@ -44,12 +44,12 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 call=$(
-  "$CAOS_CLI" curry DEEP-DEPS/llm-call -- \
+  "$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-call \
     --api-key=test-key --base-url="http://$stub_host:$port"
 )
 messages='[{"role":"user","content":"Name the sidebar task"}]'
 result=$(
-  "$CAOS_CLI" run "$call" -- \
+  "$CAOS_CLI" run --base:hash="$call" \
     --system='Return only a concise title.' \
     --messages="$messages" \
     --model=test-model \

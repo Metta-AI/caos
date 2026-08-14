@@ -61,7 +61,7 @@ use super::{
 /// same declaration, the same transform and the same mount names a worker sees.
 ///
 /// Evaluating is not optional. A std entry's expression names its own
-/// dependencies by mount (`run DEEP-DEPS/rustc -- …`), and those exist only in
+/// dependencies by mount (`run --base:@=DEEP-DEPS/rustc …`), and those exist only in
 /// the DEEPENED tree — so resolving the raw `std/llm-step` directory out of the
 /// worktree cannot work, whatever the path is spelled.
 pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String, String> {
@@ -80,9 +80,9 @@ pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String
 /// Evaluate a tree's own root `.caos-expr` to the object it builds; a tree
 /// carrying none evaluates to itself.
 ///
-/// This is the rule [`resolve_expr_image`] applies to a path named *inside* an
+/// This is the rule [`resolve_expr_base`] applies to a path named *inside* an
 /// expression, lifted to the CLI boundary — so a caller reaches a dependency by
-/// its deep-deps mount (`run DEEP-DEPS/rgrep`) exactly as an expression does,
+/// its deep-deps mount (`run --base:@=DEEP-DEPS/rgrep`) exactly as an expression does,
 /// rather than by any name looked up outside the tree it was handed.
 pub(crate) fn eval_tree(t: &dyn Transport, tree: &str) -> Result<String, String> {
     // As in [`eval_workspace_dep`]: the result is an image that the caller's own
@@ -284,7 +284,7 @@ fn eval_value(
     eval_command(t, input_tree, line, env, store)
 }
 
-/// Evaluate a single `run <image> -- …` or `curry <image> -- …` command against
+/// Evaluate a single `run --base:<t>=<image> …` or `curry --base:<t>=<image> …` command against
 /// `input_tree`, returning the result's `(kind, oid)`. A `curry` yields the
 /// curried ArgTree (a tree); a `run` triggers compute and yields its result.
 fn eval_command(
@@ -308,7 +308,7 @@ fn eval_command(
     let mut arg_toks: Vec<&str> = Vec::new();
     for &tok in &tokens[1..] {
         let (name, ty, value) = crate::parse_arg(tok)?;
-        if name == "base" {
+        if name == crate::BASE_ARG {
             if base.replace((ty, value)).is_some() {
                 return Err(format!("eval-path: `{verb}` given --base twice"));
             }

@@ -32,7 +32,7 @@ commit "caos workspace snapshot"
 
 echo "== cargo check of the caos workspace, in a caos worker ==" >&2
 t0=$(ms)
-"$CAOS_CLI" run DEEP-DEPS/cargo r1 -- --tree:@=ws --cmd=check "--target=$tgt"
+"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=ws --cmd=check "--target=$tgt"
 t1=$(ms)
 [ "$(cat r1/exit)" = "0" ] || fail "self-check failed: $(tail -c 2000 r1/stderr)"
 took=$((t1 - t0))
@@ -57,7 +57,7 @@ export CAOS_SALT
 
 echo "== per-crate (mode=all): cold, then a one-crate edit ==" >&2
 t2=$(ms)
-"$CAOS_CLI" run --trace=cold.trace DEEP-DEPS/cargo r2 -- \
+"$CAOS_CLI" run --trace=cold.trace r2 --base:@=DEEP-DEPS/cargo \
   --tree:@=ws --cmd=check --mode=all "--target=$tgt"
 t3=$(ms)
 [ "$(cat r2/exit)" = "0" ] || fail "mode=all check failed: $(tail -c 2000 r2/stderr)"
@@ -93,7 +93,7 @@ echo "  ok: per-crate check clean (${cold}ms cold, ${cold_hits} cache hits)" >&2
 echo "// tripwire edit" >> ws/crates/worker-runner/src/main.rs
 commit "edit one crate"
 t4=$(ms)
-"$CAOS_CLI" run --trace=edit.trace DEEP-DEPS/cargo r3 -- \
+"$CAOS_CLI" run --trace=edit.trace r3 --base:@=DEEP-DEPS/cargo \
   --tree:@=ws --cmd=check --mode=all "--target=$tgt"
 t5=$(ms)
 [ "$(cat r3/exit)" = "0" ] || fail "edited mode=all check failed: $(tail -c 2000 r3/stderr)"

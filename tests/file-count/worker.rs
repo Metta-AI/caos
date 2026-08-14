@@ -42,26 +42,22 @@ fn run() -> Result<(), String> {
         // A tree with no counted children yet: recurse. Tail call — the
         // continuation is this worker's result.
         eprintln!("file-count: recursing over the tree's children");
-        let me = recur_arg_tree()?;
-        return map_then(&arg("in"), Some(&me), Some(&me));
+        // The two branches of `recur_arg_tree` are DIFFERENT KINDS of ref — a
+        // curry's hash vs our own image's `/cas` path — so each is typed at the
+        // point it is known, rather than handed on as a bare string for
+        // `map-then` to guess at.
+        let bin = arg("worker1");
+        if Path::new(&bin).exists() {
+            let me = caos_curry(Arg::Path(&own_image()), &[("worker1", Arg::Path(&bin))])?;
+            return map_then(&arg("in"), Some(Arg::Hash(&me)), Some(Arg::Hash(&me)));
+        }
+        let me = own_image();
+        return map_then(&arg("in"), Some(Arg::Path(&me)), Some(Arg::Path(&me)));
     };
 
     let out = scratch("file-count")?.join("count");
     fs::write(&out, format!("{total}\n")).map_err(|e| format!("writing count: {e}"))?;
     caos(["put", path(&out), "/cas/out"])
-}
-
-/// The ArgTree to recurse with: our own (unwrapped) image, rebinding the
-/// runner-pool `bin` when we ship as a curry so children re-exec this binary.
-/// A no-op when there's no `bin` (a baked image already carries `/worker`).
-fn recur_arg_tree() -> Result<String, String> {
-    let me = own_image();
-    let bin = arg("worker1");
-    if Path::new(&bin).exists() {
-        caos_curry(&me, &[("worker1", Arg::Path(&bin))])
-    } else {
-        Ok(me)
-    }
 }
 
 /// Sum the counts in the `--children` tree (one numeric blob per child; an

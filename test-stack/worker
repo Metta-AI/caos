@@ -294,7 +294,7 @@ INNER=http://127.0.0.1
 # Named by the image it runs (see the header). `addr` holds its address; `lock`
 # is held only while someone is starting one.
 # THE ENGINE'S IMAGE ID, asked of the engine. Every tree-derived name was
-# unstable, and each in the same way: `caos hash <path>` and `caos curry <path>`
+# unstable, and each in the same way: `caos hash <path>` and `caos curry --base:@=<path>`
 # both INGEST materialized content, which is not the object it came from —
 # materializing drops what a git tree can hold and a filesystem cannot. Tried in
 # turn and all three ping-ponged between two values on an unchanged tree, so

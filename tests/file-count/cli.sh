@@ -21,18 +21,18 @@ commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -q
 echo "== build the fixture worker from its source ==" >&2
 # No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
 # the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry DEEP-DEPS/rustc --)
-"$CAOS_CLI" run "$builder" img -- --src:@=test/worker.rs
+builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
+"$CAOS_CLI" run img --base:hash="$builder" --src:@=test/worker.rs
 commit "built file-count"
 worker=$(git rev-parse HEAD:img)
 
 echo "== a whole tree totals its leaf files ==" >&2
-t0=$(ms); n=$("$CAOS_CLI" run "$worker" -- --in:@=test/tree); t1=$(ms)
+t0=$(ms); n=$("$CAOS_CLI" run --base:hash="$worker" --in:@=test/tree); t1=$(ms)
 [ "$n" = "5" ] || fail "expected 5 leaf files, got: $n"
 echo "  ok: tree -> 5" >&2
 
 echo "== a single file counts as 1 ==" >&2
-t2=$(ms); n=$("$CAOS_CLI" run "$worker" -- --in:@=test/tree/a.txt); t3=$(ms)
+t2=$(ms); n=$("$CAOS_CLI" run --base:hash="$worker" --in:@=test/tree/a.txt); t3=$(ms)
 [ "$n" = "1" ] || fail "expected 1, got: $n"
 echo "  ok: file -> 1" >&2
 

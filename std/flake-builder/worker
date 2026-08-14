@@ -50,9 +50,9 @@ orchestrate)
   # the image THIS run already resolved to — the flake-builder delta — so the
   # self-reference is a plain image ref (design/caos-expr.md: a worker reaches
   # its own image at /cas/args/base to call itself).
-  build=$(caos curry /cas/args/base -- --stage=build) || fail "currying build"
-  stack=$(caos curry /cas/args/base -- --stage=stack) || fail "currying stack"
-  caos run-then /cas/args/in -- --run="$build" --then="$stack"
+  build=$(caos curry --base:@=/cas/args/base --stage=build) || fail "currying build"
+  stack=$(caos curry --base:@=/cas/args/base --stage=stack) || fail "currying stack"
+  caos run-then /cas/args/in --run:hash="$build" --then:hash="$stack"
   ;;
 
 build)

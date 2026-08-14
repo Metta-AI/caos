@@ -35,7 +35,14 @@ that records a *map-then continuation* as the worker's own result, and the
 worker exits. The server resolves the continuation *after* the container is
 gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 
-- **`caos map-then <in> -- [--map=<img>] [--then=<img>]`** (worker form) writes
+**Grammar note (flake-inputs 2C).** `<in>` stays positional — it is the DATA the
+continuation is over, not an image — and every image position is a typed arg
+(`:@=` a `/cas` path, `:docker=` a registry ref, `:hash=` an object in the
+store), resolved by the same `resolve_base` a `--base` goes through. There is no
+`--` separator: nothing needs separating once the verb's own operands are
+reserved NAMES rather than a region.
+
+- **`caos map-then <in> [--map:<t>=<img>] [--then:<t>=<img>]`** (worker form) writes
   `/cas/out` as a **promise placeholder** naming a continuation object;
   `entrypoint` reports `promise <hash>` instead of `blob/tree <hash>`.
 - The **continuation** is a content-addressed tree `{in, map?, run?, then?,
@@ -71,12 +78,12 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 
 ## Run-then: the single-valued form
 
-`caos run-then <in> -- --run=<img> [--then=<img>]` (helper:
+`caos run-then <in> --run:<t>=<img> [--then:<t>=<img>]` (helper:
 `worker_common::run_then`) is map-then over a single value instead of a node's
 children: the server runs `run(--in=<in>)` once and threads its result R into
 `then(--in=<in>, --result=<R>)` — symmetric with map-then's
 `--in`/`--children` pair. With no `then`, the request's result is R itself, so
-`run-then --run=X` is a plain tail call to X (just as map-then with no map is a
+`run-then --run:<t>=X` is a plain tail call to X (just as map-then with no map is a
 plain tail call to `then`); both degenerate forms are the same resolution path,
 not parallel mechanisms.
 
@@ -93,7 +100,7 @@ worker slot), and the server resolves all promises before answering.
 
 ## Catch: a failing `run` as a value
 
-`caos run-then <in> -- --run=<img> --then=<img> --catch` (helper:
+`caos run-then <in> --run:<t>=<img> --then:<t>=<img> --catch` (helper:
 `worker_common::run_then_catching`) records a `catch` marker alongside the rest.
 When the `run` sub-run **fails**, the server does not fail the request: it
 stores the failure text as a blob and calls `then(--in=<in>, --error=<blob>)` —

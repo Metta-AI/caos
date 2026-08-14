@@ -698,7 +698,7 @@ fn launch(
         // has to continue from the workspace as it stood before the call.
         &[("current-tool", Arg::Lit("bash")), ("ws", Arg::Path(ws))],
     )?;
-    run_then_catching(&in_path, &cfg.bash_image, &me)
+    run_then_catching(&in_path, Arg::Hash(&cfg.bash_image), Arg::Hash(&me))
 }
 
 /// Launch a `merge` call as a run-then sub-run of the git-bearing merge worker
@@ -731,7 +731,7 @@ fn launch_merge(
     let theirs_path = fresh("theirs");
     caos(["get-hash", theirs, &theirs_path])?;
     let curried = caos_curry(
-        image,
+        Arg::Hash(image),
         &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
     )?;
     let me = self_curry(
@@ -744,7 +744,7 @@ fn launch_merge(
         // merge commit, but a caught failure continues from this `ws`.
         &[("current-tool", Arg::Lit("merge")), ("ws", Arg::Path(ws))],
     )?;
-    run_then_catching(ws, &curried, &me)
+    run_then_catching(ws, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
 /// Launch a grep as a run-then sub-run of the rgrep fold worker: the input is
@@ -774,7 +774,7 @@ fn launch_grep(
         .grep_image
         .as_ref()
         .ok_or("launch_grep without a grep_image (drive guards this)")?;
-    let curried = caos_curry(image, &[("pattern", Arg::Lit(pattern))])?;
+    let curried = caos_curry(Arg::Hash(image), &[("pattern", Arg::Lit(pattern))])?;
     let me = self_curry(
         wc,
         step_path,
@@ -787,7 +787,7 @@ fn launch_grep(
             ("scope", Arg::Lit(scope_prefix)),
         ],
     )?;
-    run_then_catching(scope, &curried, &me)
+    run_then_catching(scope, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
 /// Launch a tree tool (`caos-tools/<name>.sh`, already resolved in the current
@@ -838,7 +838,7 @@ fn launch_tree_tool(
             kvs.push(("refs", Arg::Lit(refs)));
         }
     }
-    let curried = caos_curry(image, &kvs)?;
+    let curried = caos_curry(Arg::Hash(image), &kvs)?;
     let me = self_curry(
         wc,
         step_path,
@@ -847,7 +847,7 @@ fn launch_tree_tool(
         id,
         &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
     )?;
-    run_then_catching(ws, &curried, &me)
+    run_then_catching(ws, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
 /// Launch a built-in history tool (`log`/`show`/`diff`): assemble its embedded
@@ -939,15 +939,9 @@ fn self_curry(
         ("current-id", Arg::Lit(current_id)),
     ];
     for (name, value) in extras {
-        kvs.push((
-            name,
-            match value {
-                Arg::Lit(s) => Arg::Lit(s),
-                Arg::Path(s) => Arg::Path(s),
-            },
-        ));
+        kvs.push((name, *value));
     }
-    caos_recurry(&own_args_tree()?, &unbind, &kvs)
+    caos_recurry(Arg::Hash(&own_args_tree()?), &unbind, &kvs)
 }
 
 // ---------------------------------------------------------------------------

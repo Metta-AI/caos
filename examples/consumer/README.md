@@ -34,10 +34,10 @@ git remote add caos http://localhost:9090
 #    their deep-deps mount path, e.g. ./inputs/caos/std/bash-tool.)
 export CAOS_CAS_DIR=/tmp/cas
 git add hello.rs && git commit -m "my worker"
-builder=$(caos-cli curry ./inputs/caos/std/rustc --)
-caos-cli run "$builder" img -- --src:@=hello.rs
+builder=$(caos-cli curry --base:@=./inputs/caos/std/rustc)
+caos-cli run img --base:hash="$builder" --src:@=hello.rs
 git add img && git commit -m "built worker"
-caos-cli run "$(git rev-parse HEAD:img)" "$CAOS_CAS_DIR/out" -- --greeting=hi
+caos-cli run "$CAOS_CAS_DIR/out" --base:hash="$(git rev-parse HEAD:img)" --greeting=hi
 ```
 
 ## Updating the stdlib

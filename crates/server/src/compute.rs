@@ -999,7 +999,7 @@ fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
     // resolved BY NAME out of an ambient library, which is the one thing the
     // server must not have — it holds an arg tree, not a project tree, so it
     // cannot resolve a dependency by descent the way a client can. A flake
-    // directory says `run DEEP-DEPS/flake-builder -- --in:@=.` and the CLIENT
+    // directory says `run --base:@=DEEP-DEPS/flake-builder --in:@=.` and the CLIENT
     // evaluates it, so what arrives here is already an image (design/caos-expr.md).
     convert_git_image(config, image)
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))

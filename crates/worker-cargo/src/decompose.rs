@@ -109,7 +109,11 @@ pub fn all(cmd: &str) -> Result<(), String> {
     let mut then_kvs = vec![("mode", Arg::Lit("combine")), ("cmd", Arg::Lit(cmd))];
     then_kvs.extend(flag_extras(&flags));
     let then = self_curry(&then_kvs)?;
-    map_then("/cas/members", Some(&map), Some(&then))
+    map_then(
+        "/cas/members",
+        Some(Arg::Hash(&map)),
+        Some(Arg::Hash(&then)),
+    )
 }
 
 /// The optional cross/profile flags (`--target`, `--profile`), threaded
@@ -160,7 +164,7 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
 
     if member.deps.is_empty() {
         // No workspace deps: a plain tail call into the job (no children).
-        return map_then(&arg("in"), None, Some(&job));
+        return map_then(&arg("in"), None, Some(Arg::Hash(&job)));
     }
     // Recurse on each direct dep with ourselves; deps always build as
     // artifacts (cmd=dep) regardless of what the top asked for.
@@ -177,7 +181,7 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
     ];
     dep_kvs.extend(flag_extras(&flags));
     let map = self_curry(&dep_kvs)?;
-    map_then("/cas/deps", Some(&map), Some(&job))
+    map_then("/cas/deps", Some(Arg::Hash(&map)), Some(Arg::Hash(&job)))
 }
 
 /// Prune the workspace to what `member`'s build reads: root manifest +
@@ -614,15 +618,9 @@ fn self_curry(extras: &[(&str, Arg)]) -> Result<String, String> {
         kvs.push(("worker1", Arg::Path(&bin)));
     }
     for (name, value) in extras {
-        kvs.push((
-            name,
-            match value {
-                Arg::Lit(s) => Arg::Lit(s),
-                Arg::Path(s) => Arg::Path(s),
-            },
-        ));
+        kvs.push((name, *value));
     }
-    caos_curry(&own_image(), &kvs)
+    caos_curry(Arg::Path(&own_image()), &kvs)
 }
 
 /// Fetch and read a blob at a CAS path.

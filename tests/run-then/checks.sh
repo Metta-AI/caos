@@ -9,19 +9,19 @@ set -euo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 img=$(printf 'd%.0s' {1..40})   # any well-formed image ref; never run
 
-if caos run-then /cas/args/in -- --map="$img" --run="$img" 2>/tmp/err; then
+if caos run-then /cas/args/in --map:hash="$img" --run:hash="$img" 2>/tmp/err; then
   fail "run-then accepted --map"
 fi
 grep -q 'takes only --run and --then' /tmp/err \
   || fail "wrong error for run-then --map: $(cat /tmp/err)"
 
-if caos run-then /cas/args/in -- --then="$img" 2>/tmp/err; then
+if caos run-then /cas/args/in --then:hash="$img" 2>/tmp/err; then
   fail "run-then accepted a missing --run"
 fi
 grep -q 'needs --run' /tmp/err \
   || fail "wrong error for run-then without --run: $(cat /tmp/err)"
 
-if caos map-then /cas/args/in -- --run="$img" 2>/tmp/err; then
+if caos map-then /cas/args/in --run:hash="$img" 2>/tmp/err; then
   fail "map-then accepted --run"
 fi
 grep -q 'takes only --map and --then' /tmp/err \
@@ -29,7 +29,7 @@ grep -q 'takes only --map and --then' /tmp/err \
 
 # --catch has nowhere to deliver the error without a --then, so the flag is
 # refused rather than silently degrading to "the failure propagates anyway".
-if caos run-then /cas/args/in -- --run="$img" --catch 2>/tmp/err; then
+if caos run-then /cas/args/in --run:hash="$img" --catch 2>/tmp/err; then
   fail "run-then accepted --catch without --then"
 fi
 grep -q 'needs --then' /tmp/err \
@@ -39,7 +39,7 @@ grep -q 'needs --then' /tmp/err \
 # form, where "the step failed" has one unambiguous meaning. (`--catch=1`, not
 # the bare flag: map-then declares no markers, so the flag never reaches the
 # allowed-name check — it fails earlier, on parse_arg wanting a `=value`.)
-if caos map-then /cas/args/in -- --map="$img" --catch=1 2>/tmp/err; then
+if caos map-then /cas/args/in --map:hash="$img" --catch=1 2>/tmp/err; then
   fail "map-then accepted --catch"
 fi
 grep -q 'takes only --map and --then' /tmp/err \

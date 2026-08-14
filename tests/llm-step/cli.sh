@@ -89,12 +89,12 @@ conv="conv-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
+llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
   --api-key=test-key --system:@=system.txt \
   --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")
 
-"$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
+"$CAOS_CLI" run --base:hash="$llm" --head:commit="$human1" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
 
@@ -160,7 +160,7 @@ echo "  ok: refs/caos/conversations/$conv/from-agent = step3" >&2
 
 echo "== a second turn replays the first from the commit chain ==" >&2
 human2=$(mkcommit "$turn^{tree}" "and now?" "$turn")
-"$CAOS_CLI" run "$llm" -- --head:commit="$human2" > turn2.commit
+"$CAOS_CLI" run --base:hash="$llm" --head:commit="$human2" > turn2.commit
 turn2=$(git hash-object -t commit --stdin < turn2.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn2"
 [ "$(git rev-parse "$turn2^")" = "$human2" ] || fail "turn2's parent is not human2"

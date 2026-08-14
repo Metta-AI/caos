@@ -11,7 +11,7 @@
 # whole-tree transform, published as the std entry std/deep-deps. That
 # entry is itself a HAND-DEEPENED source entry (design/caos-expr.md, Phase 3):
 # `{.caos-expr, worker, DEEP-DEPS/runner}`, the deepened form of a checked-in
-# `{.caos-expr, DEPS, worker}` whose `.caos-expr` is `curry DEEP-DEPS/runner --
+# `{.caos-expr, DEPS, worker}` whose `.caos-expr` is `curry --base:@=DEEP-DEPS/runner
 # --worker1:@=worker` — so deep-deps names its own runner base by a LOCAL
 # deep-deps mount rather than ambient `/std/runner`, and resolving the entry
 # evaluates that expression to the same curry node bootstrap published. We check
@@ -37,7 +37,7 @@ build_fixture() { # <root-dir>
 }
 
 deepen() { # <in-dir> <out-dir>
-  "$CAOS_CLI" run DEEP-DEPS/deep-deps "$2" -- --in:@="$1"
+  "$CAOS_CLI" run "$2" --base:@=DEEP-DEPS/deep-deps --in:@="$1"
 }
 
 build_fixture tree

@@ -38,7 +38,7 @@ fn start() -> Result<(), String> {
     caos(["put", path(&input), "/cas/toolin"])?;
 
     let tool = caos_curry(
-        &read_arg("bash")?,
+        Arg::Hash(&read_arg("bash")?),
         &[("worker1", Arg::Path(&arg("tool-script")))],
     )?;
     // A source-built worker is curry(runner, bin), unwrapped into args by the
@@ -46,13 +46,13 @@ fn start() -> Result<(), String> {
     // (content-addressed, hence identical), plus the head commit to remember.
     // The head is a commit-valued CAS path, so it rides the curry as a gitlink.
     let me = caos_curry(
-        &arg("base"),
+        Arg::Path(&arg("base")),
         &[
             ("worker1", Arg::Path(&arg("worker1"))),
             ("head", Arg::Path(&arg("head"))),
         ],
     )?;
-    run_then("/cas/toolin", &tool, Some(&me))
+    run_then("/cas/toolin", Arg::Hash(&tool), Some(Arg::Hash(&me)))
 }
 
 /// Then position: `--result` is the tool's output; `--head` rode through the

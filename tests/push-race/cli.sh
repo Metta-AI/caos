@@ -56,7 +56,7 @@ for i in $(seq 1 "$N"); do
   # reported as "aborted" (a harness bug) instead of FAIL (the thing under test
   # is wrong). Verified by reverting the fix: it aborted.
   (
-    if "$CAOS_CLI" curry docker://caos-push-race-not-pulled -- --probe:@=probe \
+    if "$CAOS_CLI" curry --base:docker=caos-push-race-not-pulled --probe:@=probe \
          > "/tmp/curry.$i.out" 2> "/tmp/curry.$i.err"
     then echo 0 > "/tmp/curry.$i.rc"
     else echo $? > "/tmp/curry.$i.rc"

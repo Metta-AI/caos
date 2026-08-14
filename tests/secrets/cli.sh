@@ -125,14 +125,14 @@ reader=mytool
 EOF
 
 echo "== a granted secret is injected; a non-matching one is not ==" >&2
-out=$("$CAOS_CLI" run DEEP-DEPS/bash got -- --worker1:@=check.sh) || fail "run failed: $out"
+out=$("$CAOS_CLI" run got --base:@=DEEP-DEPS/bash --worker1:@=check.sh) || fail "run failed: $out"
 verdict=$(cat got/verdict)
 [ "$verdict" = "token-ok deploy-absent" ] \
   || fail "verdict: $verdict (expected 'token-ok deploy-absent')"
 echo "  ok: /secret/token granted, the differently-scoped /secret/deploytok denied" >&2
 
 echo "== a worker that leaks a secret into its output is refused ==" >&2
-if "$CAOS_CLI" run DEEP-DEPS/bash leaked -- --worker1:@=leak.sh >/dev/null 2>leak.err; then
+if "$CAOS_CLI" run leaked --base:@=DEEP-DEPS/bash --worker1:@=leak.sh >/dev/null 2>leak.err; then
   fail "run leaking the secret should have failed"
 fi
 grep -qi "secret" leak.err || fail "leak error should mention a secret: $(cat leak.err)"
@@ -140,7 +140,7 @@ if grep -q "SEKRET-abc-123" leak.err; then fail "the error must NOT echo the sec
 echo "  ok: leaking the value fails the run, without echoing it" >&2
 
 echo "== a secret printed to the log is masked ==" >&2
-if "$CAOS_CLI" run DEEP-DEPS/bash shouted -- --worker1:@=shout.sh >/dev/null 2>shout.err; then
+if "$CAOS_CLI" run shouted --base:@=DEEP-DEPS/bash --worker1:@=shout.sh >/dev/null 2>shout.err; then
   fail "the shouting worker should have failed"
 fi
 if grep -q "SEKRET-abc-123" shout.err; then
@@ -152,7 +152,7 @@ echo "  ok: the printed secret is masked" >&2
 
 echo "== a grant can name a repo-local tool by path ==" >&2
 tool=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed: $tool"
-out=$("$CAOS_CLI" run "${tool##* }" tgot --) || fail "run mytool failed: $out"
+out=$("$CAOS_CLI" run tgot --base:hash="${tool##* }") || fail "run mytool failed: $out"
 verdict=$(cat tgot/verdict)
 [ "$verdict" = "deploytok-ok" ] \
   || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"

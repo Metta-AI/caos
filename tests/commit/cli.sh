@@ -19,8 +19,8 @@ commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -q
 echo "== build the commit worker from source ==" >&2
 # No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
 # the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry DEEP-DEPS/rustc --)
-"$CAOS_CLI" run "$builder" img -- --src:@=test/commit-worker.rs
+builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
+"$CAOS_CLI" run img --base:hash="$builder" --src:@=test/commit-worker.rs
 commit "built worker image"
 worker=$(git rev-parse HEAD:img)
 
@@ -32,8 +32,8 @@ head_tree=$(git rev-parse 'HEAD^{tree}')
 echo "== HEAD as a :commit= arg -> worker -> child commit on stdout ==" >&2
 # --bash: the worker curries its tool onto the bash image, and a worker cannot
 # evaluate a `.caos-expr` — so we resolve it here and bind the hash.
-bash_img=$("$CAOS_CLI" curry DEEP-DEPS/bash --)
-"$CAOS_CLI" run "$worker" -- --head:commit=HEAD --tool-script:@=test/tool.sh \
+bash_img=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash)
+"$CAOS_CLI" run --base:hash="$worker" --head:commit=HEAD --tool-script:@=test/tool.sh \
   --bash="$bash_img" \
   > child.commit
 grep -q "^tree $head_tree\$" child.commit \

@@ -37,9 +37,12 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
-        // `run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [...]`.
-        // The trace id is invocation metadata; everything after `--` is a
-        // computation argument and therefore part of the ArgTree (the cache key).
+        // `run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [...]`.
+        // The trace id is invocation metadata, and `[output]` is a host path to
+        // check the result out to — the run's only positional, and the only
+        // token that isn't a `--flag`. Every `--name[:type]=value` after it is a
+        // computation argument and therefore part of the ArgTree (the cache
+        // key), including the reserved `--base`, which names the worker to run.
         Some("run") => {
             let mut trace_id = None;
             let mut trace_path = None;
@@ -62,12 +65,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 index += 1;
             }
-            let (image, output, kvs) = match &args[index..] {
-                [image, sep, kvs @ ..] if sep == "--" => (image, None, kvs),
-                [image, output, sep, kvs @ ..] if sep == "--" => {
-                    (image, Some(output.as_str()), kvs)
-                }
-                _ => return Err(usage(args)),
+            let (output, kvs) = match &args[index..] {
+                [] => return Err(usage(args)),
+                [output, kvs @ ..] if !output.starts_with("--") => (Some(output.as_str()), kvs),
+                kvs => (None, kvs),
             };
             if trace_path == Some("") {
                 return Err("--trace needs a file path or '-' for stdout".to_string());
@@ -92,7 +93,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 None => None,
             };
             let transport = transport()?;
-            let run = |trace| caos::cli_run(&transport, image, output, trace, kvs);
+            let run = |trace| caos::cli_run(&transport, output, trace, kvs);
             match trace_output.as_mut() {
                 Some(writer) => run(Some((
                     trace_id.expect("trace output always has an id"),
@@ -101,15 +102,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 None => run(None),
             }
         }
-        // `curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]` —
-        // bind args to an ArgTree (a bare image, a curry node, or a flat args
-        // tree), printing a ref to the curried ArgTree (run it like any other).
-        // Path args are host paths to ingest;
+        // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
+        // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
+        // args tree), printing a ref to the curried ArgTree (run it like any
+        // other). Path args are host paths to ingest;
         // `--unbind` releases a bound arg so it can be rebound.
-        Some("curry") => match &args[2..] {
-            [arg_tree, rest @ ..] => caos::cli_curry(&transport()?, arg_tree, rest),
-            _ => Err(usage(args)),
-        },
+        Some("curry") => caos::cli_curry(&transport()?, &args[2..]),
         // `import-image [--base docker://<ref>] <docker-archive>` — store a
         // docker-archive image into caos and print the git hash of the resulting
         // git-docker image. With `--base`, the archive's layers are stored as a
@@ -193,8 +191,9 @@ fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
         "usage:\n  \
-         {prog} run [--trace[=<file|->]] [--trace-id=<id>] <image> [output] -- [--name=value | --name:@=path ...]\n  \
-         {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
+         {prog} run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [--name=value | --name:@=path ...]\n  \
+         {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
+         (an image is --base:@=<dir>, --base:docker=<ref> or --base:hash=<oid>)\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [options]\n  \
          {prog} tui [--new | --from <commit>] [options]\n  \

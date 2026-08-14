@@ -12,13 +12,13 @@ Examples:
 - Each expression is evaluated in the tree returned by the parent expression. Most expressions will evaluate to a tree with a similar shape to the original. But this is not required. A valid path is one where each segment after an expression is valid in the result of that expression. This can't be determined statically
 - A `.caos-expr` is a sequence of lines. Blank lines and `#` comments are ignored. Any line but the last binds a variable; the last line is the file's value:
   ```
-    run   <image> -- [--name=value | --name:@=path | --name:commit=rev]
-    curry <image> -- [--name=value | --name:@=path]
+    run   --base:<type>=<image> [--name=value | --name:@=path | --name:commit=rev]
+    curry --base:<type>=<image> [--name=value | --name:@=path]
     # bind a variable (uppercase name), then use it with $NAME:
-    FOO=run <cargo-ref> -- --src:@=src
-    curry <runner-ref> -- --worker1=$FOO
+    FOO=run --base:@=<cargo-path> --src:@=src
+    curry --base:hash=<runner-oid> --worker1=$FOO
   ```
-  Variable names are `[A-Z][A-Z0-9_]*`; the verbs are lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`. A `$NAME` in an image position is the object that variable produced; `--k=$NAME` binds that object by reference (at its own kind); `--k=value` is a literal blob. (This replaces an earlier `$( ... )` command-substitution sketch — the variable form is easier to write, read and parse.)
+  Variable names are `[A-Z][A-Z0-9_]*`; the verbs are lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`. `--base=$NAME` names the object that variable produced; `--k=$NAME` binds that object by reference (at its own kind); `--k=value` is a literal blob. (This replaces an earlier `$( ... )` command-substitution sketch — the variable form is easier to write, read and parse.)
 - A `run` expression evaluates to the run's result; a `curry` expression to the curried ArgTree. In practice we dig into `run` results, not through `curry`.
 
 - Arguments are parsed as with a normal curry/run-then command, except that paths are relative to the directory containing the `.caos-expr` file. A path names a directory in the tree; there is no ambient `/std/...`
@@ -83,7 +83,7 @@ Status so far (landed, suite green):
   `eval-path` walker over the std tree (`eval::eval_std_entry`): a std-root
   `.caos-expr` is applied first, then the named entry's own — so a std entry can
   be a direct image OR source + a `.caos-expr`, resolved uniformly.
-- `std/bash`, `std/merge`: source + `.caos-expr` (`run /std/flake-builder -- --in:@=.`).
+- `std/bash`, `std/merge`: source + `.caos-expr` (`run --base:@=/std/flake-builder --in:@=.`).
 - `/std/rustc` gained a **directory interface** (`--src:@=<project dir>` using the
   tool's own `Cargo.toml`) and builds at the cargo image's default profile
   (dev + musl) so a tool's crates.io deps are **reused from the seeded
@@ -136,7 +136,7 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
   and a full arg-tree match beats `runnerd`'s empty `required`. Works even when
   no generic runner exists — the bootstrap situation.
 - **Dependency-ordered with a live answerer.** Because a core item's expr names
-  its *real* builder (e.g. cargo's is `run /std/flake-builder -- --in:@=.`),
+  its *real* builder (e.g. cargo's is `run --base:@=/std/flake-builder --in:@=.`),
   *forming* cargo's key dispatches `flake-builder`'s build — which must already
   be answered. So the seeder cannot compute all keys independently up front: one
   thread polls-and-answers from the current seed map while the main thread
@@ -147,7 +147,7 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
 
 1. **`flake-builder`'s self-reference** (resolution-time, in-process, before any
    dispatch the seeder could answer). Fix: `flake-builder`'s `.caos-expr` names
-   its image as the sentinel `docker://seeded` — `run docker://seeded -- --in:@=.`.
+   its image as the sentinel `docker://seeded` — `run --base:docker=seeded --in:@=.`.
    A `docker://` ref passes straight through `resolve_expr_image` (needs a small
    addition — that resolver doesn't yet handle `docker://`; `resolve_run_image`
    already does), so evaluation never re-enters `/std/flake-builder`. The formed
@@ -199,13 +199,13 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
 - **flake-builder converted**: its std entry is now a **source tree** (with the
   `.caos-expr`); its hand-built delta is the seed **result**. Two resolution
   paths reach it and both go through the seeder:
-  - *client eval* (`resolve_std_image` → eval `run docker://seeded` → dispatch →
+  - *client eval* (`resolve_std_image` → eval `run --base:docker=seeded` → dispatch →
     seeder), for `/std/bash`, `/std/merge`, `eval-path`, etc.;
   - *server `resolve_flake_image`* (`crates/server/src/compute.rs`), which
     `worker-common`'s `std_image("bash")` reaches by handing the server a raw
     bash flake tree. `resolve_flake_image` now resolves the *builder* image via
     `flake_builder_image`: a delta std entry is used directly (old form), a
-    source entry is resolved by forming `run docker://seeded -- --in:@=<source>`
+    source entry is resolved by forming `run --base:docker=seeded -- --in:@=<source>`
     and dispatching it (the seeder answers). This is the one place the server
     had to change — it can't eval a `.caos-expr`, so it forms the single
     flake-builder key it knows.
@@ -233,7 +233,7 @@ Whole suite green (28/28) with flake-builder resolved through the seeder.
   that carries its own curry `.caos-expr`, converging on the byte-identical
   arg-tree as the direct form).
 - **`std/deep-deps` converted to a hand-deepened source entry.** Its checked-in
-  form is `{.caos-expr = "curry DEEP-DEPS/runner -- --worker1:@=worker", DEPS =
+  form is `{.caos-expr = "curry --base:@=DEEP-DEPS/runner --worker1:@=worker", DEPS =
   "../runner runner"}`; `build-builtins.sh` publishes it **hand-deepened** —
   `{.caos-expr, worker, DEEP-DEPS/runner}` with the compiled worker staged and
   the `../runner` dep mounted as the runner delta — so it names its runner base
@@ -244,7 +244,7 @@ Whole suite green (28/28) with flake-builder resolved through the seeder.
 
 **The key realization (yours):** the hard part isn't runtime or currying — it's
 **computing the seed key**. Bootstrap forms each item's key by running the real
-evaluator (so the key matches the caller's), and a `run DEEP-DEPS/<worker>` in an
+evaluator (so the key matches the caller's), and a `run --base:@=DEEP-DEPS/<worker>` in an
 expr forces resolving that worker *to an image*, which for a seeded worker means
 it must already be seeded. So key computation is necessarily **interleaved with
 seeding, in dependency order** — the live answerer — for `run` items. `curry`
@@ -265,7 +265,7 @@ rescan already converges on a static, complete record set.
 ### Landed: cargo (a seeded `run` item)
 
 - `std/cargo` is now a hand-deepened source entry
-  (`.caos-expr = "run DEEP-DEPS/flake-builder -- --in:@=."`,
+  (`.caos-expr = "run --base:@=DEEP-DEPS/flake-builder --in:@=."`,
   `DEPS = "../flake-builder flake-builder"`). `build-builtins.sh` still
   hand-builds the cargo image delta; that delta is the seed **result**, keyed on
   `{ image: <flake-builder delta>, in: <deepened cargo entry> }`. Resolving
@@ -280,10 +280,10 @@ Every compiled worker that rode `curry(runner, worker1=<binary>)` is now a
 **hand-deepened source entry** `{.caos-expr, worker, DEEP-DEPS/…}`, assembled
 uniformly (`assemble_pool_worker` in `build-builtins.sh`):
 
-- `bash-tool`, `llm-call`, `llm-step`, `deep-deps`: `curry DEEP-DEPS/runner --
+- `bash-tool`, `llm-call`, `llm-step`, `deep-deps`: `curry --base:@=DEEP-DEPS/runner
   --worker1:@=worker` (DEPS `../runner runner`). Pure curry, hash-preserving —
   resolving each yields the byte-identical node it used to publish directly.
-- `rustc`: `CARGO=curry DEEP-DEPS/cargo --` then `curry DEEP-DEPS/runner --
+- `rustc`: `CARGO=curry --base:@=DEEP-DEPS/cargo` then `curry --base:@=DEEP-DEPS/runner
   --worker1:@=worker --cargo=$CARGO --worker-common:@=worker-common` (DEPS
   `../runner runner`, `../cargo cargo`). The `CARGO` variable resolves the
   `DEEP-DEPS/cargo` mount to the cargo image (a mount is an image only in image
@@ -360,8 +360,8 @@ meantime, *this* project reaches std through deep-deps (`DEEP-DEPS/x`).
 ### Finale (remaining)
 
 - **`rustc` + `deep-deps` seeded** ✓; **`stage_worker` deleted.** Each checked-in
-  entry is now a `{.caos-expr}` sentinel (`run docker://seeded-rustc` /
-  `run docker://seeded-deep-deps` — distinct sentinels so their keys don't
+  entry is now a `{.caos-expr}` sentinel (`run --base:docker=seeded-rustc` /
+  `run --base:docker=seeded-deep-deps` — distinct sentinels so their keys don't
   collide); bootstrap hand-builds the curry (`curry(runner, worker1=<binary>[,
   cargo, worker-common]`) as the SEED RESULT and seeds it under the sentinel's
   key. No binary is injected into the checked-in tree, so a consumer fetching it
@@ -378,7 +378,7 @@ meantime, *this* project reaches std through deep-deps (`DEEP-DEPS/x`).
 This is the step the whole phase was for: **the checked-in tree is now
 self-resolving, and std resolves by descent.**
 
-- **`std/.caos-expr`** (new): `run deep-deps -- --in:@=.`. Every
+- **`std/.caos-expr`** (new): `run --base:@=deep-deps --in:@=.`. Every
   `/cas/std/<name>` resolution (`resolve_std_image` → `eval_std_entry` →
   `eval_path`) applies it before descending to the entry, so an entry's
   `DEEP-DEPS/<dep>` mounts are computed by the real `deep-deps` worker instead of
@@ -430,7 +430,7 @@ founding note), so the harness now runs the real worker instead:
   the build's own seed record can't stand in: that image is built from the tree
   under test, a `test`-world binary the outer `host` server refuses to serve
   ("caos world mismatch", measured). Both dissolve at once, because
-  `run docker://seeded-deep-deps -- --in:@=.` IS `run-then` over the std entry
+  `run --base:docker=seeded-deep-deps --in:@=.` IS `run-then` over the std entry
   with the sentinel as `--run` — it forms exactly the key the expression forms,
   so the host's own seeder answers it. No evaluator in the worker, no blocking
   run, no world crossing. That is why `test.sh` now has a `deepen` stage between
@@ -467,7 +467,7 @@ and the widening was the mechanism asking to be replaced.
 
 ### Landed: the repo deepens ITSELF (root `.caos-expr`)
 
-The tree now carries `/.caos-expr` = `run std/deep-deps -- --in:@=.` — the
+The tree now carries `/.caos-expr` = `run --base:@=std/deep-deps --in:@=.` — the
 top-level expression this design always called for ("Most repos will have a
 top-level `.caos-expr` that invokes `std/deep-deps` on the tree"). The suite no
 longer assembles a look-alike tree out of build outputs and invoke the transform
@@ -480,7 +480,7 @@ Two things had to land first, and both were real, not incidental:
   host-built delta, so `std/runner` was a NAME WITH NO DIRECTORY — and
   `std/rustc/DEPS` says `../runner`. A tree cannot deepen itself while a declared
   dependency is not in it. It is a `{.caos-expr}` sentinel now
-  (`run docker://seeded-runner`), seeded exactly like flake-builder, which also
+  (`run --base:docker=seeded-runner`), seeded exactly like flake-builder, which also
   completes the rule that every std entry has an expression: the ones that cannot
   be built that way are seeded, not exempted. (This reverses the earlier "runner
   stays raw / not a std entry" note.)
@@ -506,7 +506,7 @@ it turned on:
   writes the same lines pointing at `./flake-inputs/caos/std/...`; the
   declaration moves, the code does not, because relative paths are stable under
   mounting. Evaluating is not optional — a std entry's expression names its deps
-  by mount (`run DEEP-DEPS/rustc`), which exist only in the DEEPENED tree, so
+  by mount (`run --base:@=DEEP-DEPS/rustc`), which exist only in the DEEPENED tree, so
   resolving the raw directory could never work.
 - **`std` is not an arg.** It rode in every arg tree (so every cache key) and was
   materialized at `/cas/std` in every container. No worker reads it; the client
@@ -514,7 +514,7 @@ it turned on:
 - **The server has no std at all.** Its one semantic use was looking up
   `flake-builder` BY NAME when handed a raw flake tree. That is deleted:
   `.caos-expr` replaced implicit flake detection, so a flake directory says
-  `run DEEP-DEPS/flake-builder -- --in:@=.` and the CLIENT evaluates it. Verified
+  `run --base:@=DEEP-DEPS/flake-builder --in:@=.` and the CLIENT evaluates it. Verified
   unreachable before removal — the branch was replaced with an error and the
   suite ran without any job hitting it.
 - **llm-step declares its own tools.** bash-tool, rgrep, bash and merge are

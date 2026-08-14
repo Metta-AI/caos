@@ -111,9 +111,9 @@ fn run() -> Result<(), String> {
         map_kvs.push(("worker1", Arg::Path(&bin)));
         then_kvs.push(("worker1", Arg::Path(&bin)));
     }
-    let map = caos_curry(&me, &map_kvs)?;
-    let then = caos_curry(&me, &then_kvs)?;
-    map_then(subdirs_cas, Some(&map), Some(&then))
+    let map = caos_curry(Arg::Path(&me), &map_kvs)?;
+    let then = caos_curry(Arg::Path(&me), &then_kvs)?;
+    map_then(subdirs_cas, Some(Arg::Hash(&map)), Some(Arg::Hash(&then)))
 }
 
 /// The `then` position: one sparse tree from the local match files (`--own`)

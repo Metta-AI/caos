@@ -133,7 +133,7 @@ fn start() -> Result<(), String> {
     // (musl, dev) precompiled the dependency graph at — so the tool's deps are
     // reused from the seeded target/ rather than recompiled. musl still links
     // static regardless of profile, so the binary runs on any base.
-    let build = caos_curry(&cargo, &[("cmd", Arg::Lit("build"))])?;
+    let build = caos_curry(Arg::Hash(&cargo), &[("cmd", Arg::Lit("build"))])?;
     // Ourselves, in the `finish` position: rebuild our own curry (the runner
     // image with our bin re-bound) plus what finish needs. `cargo` and
     // `worker-common` deliberately don't ride — finish's cache key is just
@@ -144,8 +144,8 @@ fn start() -> Result<(), String> {
     if Path::new(&bin).exists() {
         kvs.insert(0, ("worker1", Arg::Path(&bin)));
     }
-    let me = caos_curry(&own_image(), &kvs)?;
-    run_then("/cas/proj", &build, Some(&me))
+    let me = caos_curry(Arg::Path(&own_image()), &kvs)?;
+    run_then("/cas/proj", Arg::Hash(&build), Some(Arg::Hash(&me)))
 }
 
 /// The compile came back: a failing build errors the run (diagnostics in the
@@ -168,9 +168,12 @@ fn finish() -> Result<(), String> {
         return Err("cargo result carries no bin/worker".to_string());
     }
     // `read_arg`, not `arg`: the runner rides as a hash LITERAL (like `cargo`),
-    // and `resolve_run_image` takes a bare hash — so this curries onto the
-    // runner image itself, not onto the blob that names it.
-    let curried = caos_curry(&read_arg("runner")?, &[("worker1", Arg::Path(&bin))])?;
+    // so `Arg::Hash` curries onto the runner IMAGE itself — `Arg::Path` would
+    // curry onto the blob that merely names it.
+    let curried = caos_curry(
+        Arg::Hash(&read_arg("runner")?),
+        &[("worker1", Arg::Path(&bin))],
+    )?;
     caos(["get-hash", &curried, "/cas/out"])
 }
 

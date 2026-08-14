@@ -73,31 +73,29 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(path), None) => caos::cas_hash(path),
             _ => Err(usage(args)),
         },
-        // `map-then <in> -- [--map=<image>] [--then=<image>]` — record a map-then
+        // `map-then <in> [--map:<type>=<image>] [--then:<type>=<image>]` —
+        // record a map-then
         // continuation over the CAS path `<in>` as this worker's result at
         // /cas/out (a tail call; the server resolves it after the worker exits).
         Some("map-then") => match &args[2..] {
-            [input, sep, kvs @ ..] if sep == "--" => caos::caos_map_then(&http()?, input, kvs),
+            [input, kvs @ ..] => caos::caos_map_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
-        // `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
+        // `run-then <in> --run:<type>=<image> [--then:<type>=<image>] [--catch]` — the
         // single-valued map-then: the server runs `run(--in=<in>)` once, then
         // (optionally) `then(--in=<in>, --result=<R>)`. The same tail-call
         // contract. With `--catch`, a failing `run` reaches `then` as
         // `--error=<blob>` instead of failing the whole request.
         Some("run-then") => match &args[2..] {
-            [input, sep, kvs @ ..] if sep == "--" => caos::caos_run_then(&http()?, input, kvs),
+            [input, kvs @ ..] => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
-        // `curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]` —
-        // bind args to an ArgTree (a bare image, a curry node, or a flat args
-        // tree like `own_args_tree`), printing a ref to the resulting curried
+        // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
+        // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
+        // args tree like `own_args_tree`), printing a ref to the resulting curried
         // ArgTree (run/curry it like any other). `--unbind` releases a bound arg
         // so it can be rebound.
-        Some("curry") => match &args[2..] {
-            [arg_tree, rest @ ..] => caos::caos_curry(&http()?, arg_tree, rest),
-            _ => Err(usage(args)),
-        },
+        Some("curry") => caos::caos_curry(&http()?, &args[2..]),
         // `runner --job=<json>` — run the handed-in job, then poll for more; see
         // `runner()`.
         Some("runner") => match &args[2..] {
@@ -454,9 +452,10 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} put-commit <src-file> <cas-path>\n  \
          {prog} hash <cas-path>\n  \
-         {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
-         {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>] [--catch]\n  \
-         {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
+         {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n  \
+         {prog} run-then <in-cas-path> --run:<type>=<image> [--then:<type>=<image>] [--catch]\n  \
+         {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
+         (an image is :@=<cas path>, :docker=<ref> or :hash=<oid>)\n  \
          {prog} runner --job=<json>"
     )
 }
