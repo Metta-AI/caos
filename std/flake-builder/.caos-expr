@@ -1,8 +1,9 @@
 # std/flake-builder's image (design/caos-expr.md, Phase 3 — "Breaking the
 # cycles"). flake-builder cannot be built by flake-builder, so its image is the
-# sentinel `docker://seeded`: `resolve_expr_image` passes a `docker://` ref
-# straight through (no dispatch, no re-entry into std/flake-builder), and the
-# formed arg-tree is `{ image: docker://seeded, in: <this tree>, salt }`.
+# sentinel `--base:docker=seeded`: `resolve_expr_base` turns a `:docker=` ref
+# into the blob `docker://seeded` with no dispatch (no re-entry into
+# std/flake-builder), and the formed arg-tree is
+# `{ base: docker://seeded, in: <this tree>, salt }`.
 # Nothing ever pulls `docker://seeded`: the core-seeder-runner registered that
 # exact key answers it with the pre-built flake-builder image (bootstrap's
 # hand-built delta). If the seeder is absent the job hits the generic runner and
