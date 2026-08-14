@@ -2325,6 +2325,11 @@ pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
 /// cache key. A `path:` names a plain local directory instead (hashed live, like
 /// `:@=`), so it carries no rev. Resolution itself is a later stage; this only
 /// parses and validates.
+///
+/// NOTE: constructed and validated here (unit-tested below); the RESOLUTION that
+/// reads these fields — fetch `url`@`rev`, descend `dir` — lands in the next
+/// stage (design/flake-inputs.md, `:@@=` stage 4), hence `allow(dead_code)`.
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct GitRef {
     /// The fetch URL — everything before `?`: `git+https://…`, `git+ssh://…`,
@@ -2337,6 +2342,7 @@ pub(crate) struct GitRef {
     pub dir: Option<String>,
 }
 
+#[allow(dead_code)]
 impl GitRef {
     /// A `path:` locator names a plain local directory — no git fetch, no rev —
     /// resolved by ingesting the tree, like a `:@=` path.
@@ -2349,7 +2355,8 @@ impl GitRef {
 /// content-addressing invariant: a git fetch MUST pin a commit (`rev=<40-hex>`),
 /// a mutable `ref=` (branch/tag) is rejected, and a `path:` takes no rev. The
 /// scheme chooses the meaning — never sniffed from the value's shape. Resolution
-/// is a separate step; this is pure string logic (unit-tested).
+/// is a separate step (stage 4); this is pure string logic (unit-tested).
+#[allow(dead_code)]
 pub(crate) fn parse_git_ref(value: &str) -> Result<GitRef, String> {
     let (url, query) = value.split_once('?').unwrap_or((value, ""));
     if url.is_empty() {
