@@ -102,7 +102,7 @@ echo "== through eval-path: a top-level .caos-expr invokes deep-deps ==" >&2
 # copied in — which is what a DEPS mount would have produced.
 build_fixture evtree
 cp -r DEEP-DEPS/deep-deps evtree/deep-deps
-printf 'run deep-deps -- --in:@=.\n' > evtree/.caos-expr
+printf 'run --base:@=deep-deps --in:@=.\n' > evtree/.caos-expr
 commit "evtree with .caos-expr"
 out=$("$CAOS_CLI" eval-path evtree/app/DEEP-DEPS/foo) || fail "eval-path failed"
 kind=${out%% *}; hash=${out##* }
