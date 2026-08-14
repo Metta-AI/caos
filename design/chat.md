@@ -530,6 +530,16 @@ operation.
 
 ## Deferred work
 
+- A detached task can still be `pending` after the foreground `llm-step` has
+  appended its terminal event and exited. At that point no worker process owns
+  redispatch if the original admission was lost. Add a durable follower at the
+  client/server boundary: on open, reconnect, and each newly observed canonical
+  head, fold pending tasks, verify that Q names this conversation's canonical
+  target ref, and reissue each `(head, Q)` at most once until newer durable state
+  appears. Do not keep `llm-step` alive recursively as a waiter; that consumes a
+  worker and still provides no durable ownership after process loss. Until the
+  follower exists, only a later `llm-step` invocation supplies another recovery
+  boundary; merely leaving the conversation open does not.
 - Conversation refresh and worker recovery can still rebuild the first-parent
   event spine, and some changed-head paths derive more than one projection from
   that history. Across a long sequence of appends or polls, those repeated
