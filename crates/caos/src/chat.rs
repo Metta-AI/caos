@@ -372,9 +372,11 @@ pub fn submit_interjection(
         options,
         id,
         message,
-        false,
-        proposal,
-        false,
+        SubmitMessagePolicy {
+            require_absent: false,
+            proposal,
+            admit_when_idle: false,
+        },
         prepare_queued_request,
     )
     .map(|submitted| submitted.commit)
@@ -383,6 +385,12 @@ pub fn submit_interjection(
 struct SubmittedMessage {
     commit: String,
     request: Option<String>,
+}
+
+struct SubmitMessagePolicy<'a> {
+    require_absent: bool,
+    proposal: Option<&'a str>,
+    admit_when_idle: bool,
 }
 
 fn submit_message_inner(
@@ -421,9 +429,11 @@ where
         options,
         id,
         message,
-        require_absent,
-        proposal,
-        true,
+        SubmitMessagePolicy {
+            require_absent,
+            proposal,
+            admit_when_idle: true,
+        },
         prepare,
     )
     .map(|submitted| submitted.request)
@@ -434,14 +444,17 @@ fn submit_message_inner_detailed_with<F>(
     options: &TurnOptions,
     id: &str,
     message: &str,
-    require_absent: bool,
-    proposal: Option<&str>,
-    admit_when_idle: bool,
+    policy: SubmitMessagePolicy<'_>,
     prepare: F,
 ) -> Result<SubmittedMessage, String>
 where
     F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
 {
+    let SubmitMessagePolicy {
+        require_absent,
+        proposal,
+        admit_when_idle,
+    } = policy;
     let refname = conversation_ref(id)?;
     if message.trim().is_empty() {
         return Err("empty message".to_string());
