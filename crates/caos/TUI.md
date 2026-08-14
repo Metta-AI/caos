@@ -42,7 +42,9 @@ caos tui --list-archived  list archived conversation IDs and titles
 caos tui --unarchive ID   restore one conversation to the active list
 ```
 
-`--username` defaults to `$USER`. Active and archived membership is stored on the
+`--username` defaults to `$USER`. If `$USER` is a shared container account such
+as `root` or `ubuntu`, pass a personal `--username`; persisted identity is future
+work. Active and archived membership is stored on the
 CAOS server under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
 not in local TUI state. `<user-key>` is `u-` plus lowercase hex of the
 normalized username's UTF-8 bytes; usernames are limited to 126 UTF-8 bytes.

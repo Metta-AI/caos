@@ -15,7 +15,17 @@ pub(crate) struct Args {
 
 impl Args {
     pub(crate) fn parse(raw: &[String]) -> Result<Self, String> {
-        Self::parse_with_default_user(raw, std::env::var("USER").ok())
+        let default_user = match std::env::var("USER") {
+            Ok(user) => Some(user),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) if raw.iter().any(|arg| arg == "--username") => {
+                None
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("$USER is not valid UTF-8; pass --username explicitly".to_string())
+            }
+        };
+        Self::parse_with_default_user(raw, default_user)
     }
 
     /// `default_user` is only consulted when `--username` is absent, so an
@@ -49,12 +59,19 @@ impl Args {
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }
         }
-        let user = user_flag
-            .or(default_user)
-            .ok_or_else(|| "--username is required when $USER is not set".to_string())?;
-        parsed.user = normalized_username(&user).ok_or_else(|| {
-            "--username must be nonempty and contain no control characters".to_string()
-        })?;
+        parsed.user = match user_flag {
+            Some(user) => normalized_username(&user).ok_or_else(|| {
+                "--username must be nonempty and contain no control or invisible formatting characters"
+                    .to_string()
+            })?,
+            None => {
+                let user = default_user
+                    .ok_or_else(|| "--username is required when $USER is not set".to_string())?;
+                normalized_username(&user).ok_or_else(|| {
+                    "$USER is not a usable identity; pass --username explicitly".to_string()
+                })?
+            }
+        };
         if parsed.turn.system.is_some() && parsed.turn.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
         }
@@ -137,6 +154,16 @@ mod tests {
             Some("alice".to_string()),
         )
         .is_err());
+        assert!(Args::parse_with_default_user(
+            &["--username".to_string(), "ali\u{200b}ce".to_string()],
+            Some("alice".to_string()),
+        )
+        .is_err());
+
+        let ambient_error = Args::parse_with_default_user(&[], Some(" \t ".to_string()))
+            .expect_err("an unusable ambient identity was accepted");
+        assert!(ambient_error.contains("$USER"), "{ambient_error}");
+        assert!(ambient_error.contains("--username"), "{ambient_error}");
     }
 
     #[test]

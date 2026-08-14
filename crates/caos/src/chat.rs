@@ -823,7 +823,8 @@ pub fn prepare_queued_request(
 pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<String, String> {
     if let Some(explicit) = explicit {
         return normalized_username(explicit).ok_or_else(|| {
-            "--username must be 1-126 UTF-8 bytes and contain no control characters".into()
+            "--username must be 1-126 UTF-8 bytes and contain no control or invisible formatting characters"
+                .into()
         });
     }
     if let Some(user) = std::env::var_os("USER") {
@@ -847,8 +848,43 @@ pub fn normalized_username(username: &str) -> Option<String> {
     let username = username.trim();
     (!username.is_empty()
         && username.len() <= MAX_USERNAME_BYTES
-        && !username.chars().any(char::is_control))
+        && !username.chars().any(unsafe_username_character))
     .then(|| username.to_string())
+}
+
+fn unsafe_username_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            // Unicode format controls, bidi controls, joiners, and selectors
+            // can make distinct identities render identically or affect the
+            // surrounding terminal row. Keep identity comparison byte-exact,
+            // but refuse those invisible presentation modifiers at the gate.
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{13455}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+                 | '\u{e0100}'..='\u{e01ef}'
+        )
 }
 
 fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<String, String> {
@@ -919,7 +955,7 @@ const USER_INDEX_PREFIX: &str = "refs/caos/users/";
 
 fn user_key(user: &str) -> Result<String, String> {
     let user = normalized_username(user).ok_or_else(|| {
-        "conversation username must be 1-126 UTF-8 bytes and contain no control characters"
+        "conversation username must be 1-126 UTF-8 bytes and contain no control or invisible formatting characters"
             .to_string()
     })?;
     Ok(utf8_ref_key("u-", &user))
@@ -3546,6 +3582,15 @@ mod tests {
         assert!(normalized_username("Alice\nBob").is_none());
         assert!(normalized_username(&"a".repeat(MAX_USERNAME_BYTES)).is_some());
         assert!(normalized_username(&"a".repeat(MAX_USERNAME_BYTES + 1)).is_none());
+        assert!(normalized_username("Alice\u{202e}Bob").is_none());
+        assert!(normalized_username("Ali\u{200b}ce").is_none());
+        assert!(normalized_username("Ali\u{200d}ce").is_none());
+        assert!(normalized_username("Alice\u{fe0f}").is_none());
+        assert_eq!(
+            user_key("  Alice Smith  ").as_deref(),
+            Ok("u-416c69636520536d697468")
+        );
+        assert!(user_key("Ali\u{200b}ce").is_err());
     }
 
     #[test]
