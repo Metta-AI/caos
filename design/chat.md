@@ -603,6 +603,14 @@ operation.
   suffix and folded projections by canonical head, reusing an ancestor entry
   when the append-only/CAS invariant proves it safe. This is a performance
   follow-up; the current remote ref remains authoritative.
+- Startup ref repair validates each conversation tip and its workspace tree but
+  does not yet validate the complete event-parent spine. If an earlier event
+  object is lost while a newer tip survives, startup therefore leaves a ref
+  whose replay will fail instead of rolling it back through the reflog. Add a
+  chat-aware repair walk that validates recognized event commits along the
+  first-parent spine, stops after validating the first ordinary workspace base,
+  and shares work across refs. A generic recursive parent walk is not suitable:
+  it would turn startup repair into a scan of unrelated repository history.
 - `/from` materializes conversation event commits, while startup `--from` and
   the earlier virtual flow have also accepted ordinary workspace
   commits. Unify those entry points only after defining the empty-transcript
