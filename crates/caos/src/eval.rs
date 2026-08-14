@@ -48,7 +48,7 @@ use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use super::{
     assemble_arg_tree, build_secret_store, curry_from_entries, entry_name, fetch_tree_entries,
     is_hex_hash, mark_arg_tree, parse_oid, post_object, post_tree, request_compute,
-    secret_store_header, ClientSecret, Transport,
+    secret_store_header, ClientSecret, Transport, DOCKER_SCHEME,
 };
 
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
