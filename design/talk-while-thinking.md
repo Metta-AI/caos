@@ -1,5 +1,10 @@
 # Talk while thinking — spec
 
+> **Historical context only.** The authoritative interjection and append model
+> is [`chat.md`](chat.md). The four-ref layout and migrations below describe the
+> superseded prototype and must not be implemented as a compatibility reader;
+> development repositories use the destructive cutover in `chat.md`.
+
 Steer and cancel a running turn. Extends `agent-harness.md`; terms from there
 (turn, step, human commit `H`, turn merge `M`, `caos-agent`).
 

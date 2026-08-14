@@ -1,5 +1,11 @@
 # Agent harness: conversations as commit chains — design note
 
+> **Historical context only.** The authoritative chat design is
+> [`chat.md`](chat.md). The schemas and ref layouts described below document
+> the superseded prototype; the current design does not read or migrate them.
+> Development repositories are destructively wiped at the cutover described in
+> `chat.md`.
+
 **Status:** steps 1–5 implemented — run-then + first-class commits, the
 bounded bash tool (`crates/worker-bash-tool`), the stateless llm-call worker
 (`crates/worker-llm-call`), the llm-step driver (`crates/worker-llm-step`), and the chat client (`caos-cli chat`,

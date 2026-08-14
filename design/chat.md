@@ -1,13 +1,32 @@
-# Chat v2: minimal durable model
+# Chat: minimal durable model
 
-**Status:** tracked below.
+**Status:** target design; implementation is tracked below.
+
+This is a destructive replacement of the earlier chat formats. It deliberately
+uses the existing unversioned ref namespace and has no compatibility reader or
+migration path. Before switching a development repository to this format,
+delete every old ref below both `refs/caos/conversations/` and
+`refs/caos/users/` in the client and server repositories. Old commits may be
+garbage-collected after their reflogs and any other refs stop retaining them.
+
+For example, from each repository that stores chat refs:
+
+```sh
+git for-each-ref --format='delete %(refname)' \
+  refs/caos/conversations/ refs/caos/users/ |
+  git update-ref --stdin
+```
+
+Do not run an old and a new chat binary against the same repository. A rollout
+means stopping the old binaries, wiping those ref subtrees, and then starting
+only the new binaries.
 
 ## Distilled
 
-A conversation is one append-only, versioned ref:
+A conversation is one append-only ref:
 
 ```text
-F = refs/caos/v2/conversations/<id>/head
+F = refs/caos/conversations/<id>/head
 ```
 
 Auxiliary refs hold the title and per-user sidebar membership. They never take
@@ -22,10 +41,13 @@ multi-ref presentation updates, with a server-owned hook enforcing the same
 append rule for conversation heads.
 
 An event commit has the previous event as first parent, the current workspace
-plus reserved `.caos` state as its tree, and a key/value message. `author` plus
-`content` adds a transcript message; human messages use `author: user` and one
-case-sensitive `username` for both attribution and sidebar membership. For
-other keys, the newest value wins.
+plus reserved `.caos` state as its tree, and a JSON message whose exact stable
+discriminator is `"kind": "caos-chat-event"`. There is no numeric event-format
+version. A missing or unknown `kind` is not interpreted as a legacy event.
+`author` plus `content` adds a transcript message; human messages use
+`author: user` and one case-sensitive `username` for both attribution and
+sidebar membership. For other scalar keys, the newest value wins; keyed
+collections such as async tasks fold independently by their own identity.
 
 A CAS loser retries on the new head. Text-only events take its tree; workspace
 changes use a three-way merge. Clean Git merges may still require event-specific
@@ -42,7 +64,9 @@ inventing another run.
 
 Any number of clients may follow the same conversation. The TUI exposes one
 user identity, rather than separate `user` and `username` concepts, and uses it
-whenever it appends or indexes a conversation.
+whenever it appends or indexes a conversation. Sidebar refs encode the UTF-8
+bytes of that identity as lowercase hexadecimal prefixed with `u-`; the event
+keeps the original case-sensitive display value.
 
 ### Tool calls
 
@@ -60,13 +84,20 @@ Q = std/run-and-update-ref { subreq: R, target-ref: F }
 task ID = hash(Q)
 ```
 
-`llm-step` commits `{async: {task: Q, status: pending}}`, calls the generic
-nonblocking `/bin/caos run-async Q`, returns `Q` to the model, and continues.
+If Q has no recorded state, `llm-step` commits
+`{"kind":"caos-chat-event","async":{"task":"<Q>","status":"pending"}}`,
+calls the generic nonblocking
+`/bin/caos run-async Q`, returns `Q` to the model, and continues. Repeating the
+same tool request folds the existing state for Q and does not append another
+`pending` event after Q has reached a terminal state.
 
-`Q` uses ordinary `run-then` to run `R`. Its finish stage CAS-appends a commit
-with the same tree and that task's status set to `complete` or `failed`, then
-returns `R`'s result unchanged. The conversation stores neither `R` nor its
-output: both are available through `Q`.
+`Q` uses `run-request-then R`, preserving R's exact request identity. Its
+finish stage CAS-appends a commit with the same tree and that task's status set
+to `complete` or `failed`, then returns `R`'s result unchanged. The conversation
+stores neither `R` nor its output. Recovery checks the exact
+`refs/caos/res/Q` ref and reissues Q whenever the task's folded state is
+terminal but that result is not yet addressable. Reading the completed result
+follows `refs/caos/res/Q`; it never reruns Q as a substitute for a read.
 
 ### Subagents
 
@@ -96,23 +127,39 @@ Nothing merges the child workspace into the parent—applying files is explicit.
 - [ ] child conversations and subagents
 - [ ] detached-work execution-context propagation
 - [ ] plain-commit and mid-tool-batch fork contract
-- [ ] result-ref retention and large-installation ref scaling
+- [ ] head-keyed folded projection/event cache for long conversations
+- [ ] result-ref and server-reflog retention, pruning, and large-installation
+  ref scaling
 
 ## Model
 
 A conversation is one append-only ref:
 
 ```text
-refs/caos/v2/conversations/<id>/head -> latest event commit
+refs/caos/conversations/<id>/head -> latest event commit
 ```
 
 Small title and per-user membership refs support the sidebar. They do not take
-part in the conversation append protocol.
+part in the conversation append protocol. The title lives at
+`refs/caos/conversations/<id>/title`.
 
-All refs in this design live below `refs/caos/v2/`. The namespace is part of
-the storage format: older clients must not discover or mutate v2 conversations,
-and future incompatible formats receive a new namespace rather than guessing a
-commit's schema from its contents.
+Conversation refs live below `refs/caos/conversations/`; sidebar membership
+refs live below `refs/caos/users/`. There is no version component in either
+path. Compatibility comes from a coordinated destructive development cutover,
+not from readers guessing which historical format an unversioned ref contains.
+The new reader accepts only commits marked `"kind": "caos-chat-event"` and does
+not parse, migrate, rename, or republish an older conversation layout.
+
+For a human identity `U`, its ref-safe key is `u-` followed by the lowercase
+hexadecimal encoding of U's UTF-8 bytes. This is reversible and collision-free,
+preserves spaces and case, and prevents a username from introducing ref path
+components. For example, `Ada Lovelace` becomes
+`u-416461204c6f76656c616365`. Active and archived membership refs are:
+
+```text
+refs/caos/users/<user-key>/conversations/active/<id>
+refs/caos/users/<user-key>/conversations/archived/<id>
+```
 
 The client appends user events; the remote `llm-step` appends everything it
 does. Neither resets the ref.
@@ -138,6 +185,15 @@ The remote ref is authoritative. A client's local ref is only a cache. The
 server enforces this first-parent append rule for conversation-head refs and
 rejects deletion or history replacement. Administrative repair can still use a
 local `git update-ref`, outside the network protocol.
+
+Creation uses the same protocol with an explicit expected-absent value. The
+initial event has no first parent, and the server creates `F` only if `F` does
+not exist. A retry after an ambiguous transport failure first reads `F`: an
+observed value equal to the proposed initial commit means the first attempt
+succeeded; any other value is a collision and must not be adopted as the new
+conversation. Child-conversation creation follows the same create-only rule,
+so replaying its recorded creation can recover idempotently without attaching
+the child request to somebody else's existing history.
 
 ### Losing the compare-and-swap
 
@@ -203,17 +259,32 @@ with `request: R` and CAS-pushes `A -> C`. Although the update crosses two
 commits, observers can see neither one without the other. Once claimed, later
 events carry the same `request`; `status` says whether it is active or terminal.
 
+An admission CAS retry rebuilds the whole admission candidate. After rereading
+the new head, the client creates a new user event `B'`, derives a new
+`llm-step` request `R'` from `B'`, uploads the complete graph for `R'`, and
+creates its matching admission event `C'`. It must not graft stale `R` onto a
+rebased message: the request hash commits to the exact queued head from which
+the worker will resume.
+
 If another client wins that CAS, the loser rereads the new state. When a run is
 now active it appends its message as an interjection and returns the already
 recorded request, so it also reissues the only valid run instead of creating a
 second claimant. A client that reloads any admitted `queued` or `running`
 request does the same. The active run notices interjections at safe boundaries.
 
+The terminal boundary is also a safe interjection boundary. Before appending a
+terminal event, `llm-step` compare-and-swaps the head it last examined. If an
+interjection won that race, it must not replay the terminal event on top of the
+new input. It rereads and folds the new head, resumes the active request with
+the interjection included, and attempts termination only after the resulting
+model/tool work reaches another terminal boundary.
+
 The client calls `/run?req=R`. CAOS uses `R` as its cache and single-flight key:
 concurrent or repeated calls join the same owner for as long as that owner is
 alive. Waiting callers never time out and begin duplicate execution. Completed
-results are cached and normally pinned under `res/R`. Reissuing a completed
-asynchronous task is a cache hit and must not append a new `pending` state.
+results are cached and normally pinned under `refs/caos/res/R`. Reissuing a
+completed asynchronous task is a cache hit and must not append a new `pending`
+state.
 
 CAOS does not yet durably queue in-flight resolution across a server restart.
 The admitted request and every completed remote event remain on `head`, so any
@@ -244,21 +315,39 @@ An event commit has:
 
 - first parent = previous event;
 - tree = workspace after the event;
-- message = a map, schematically:
+- message = one JSON object, schematically:
 
-```text
-author: assistant
-content: I fixed the race.
-title: Preserve work across disconnects
-status: idle
+```json
+{
+  "kind": "caos-chat-event",
+  "author": "assistant",
+  "content": "I fixed the race.",
+  "title": "Preserve work across disconnects",
+  "status": "idle"
+}
 ```
 
+Every event must have the exact string discriminator
+`"kind": "caos-chat-event"`. Numeric event versions such as `"v": 2` are not
+part of the format. A reader rejects a missing or unknown kind instead of
+treating it as an older chat event. Additive fields may be ignored by readers
+that do not project them; a truly incompatible event family needs a different
+descriptive kind and an explicit reader decision, not a numeric counter.
+
 If `content` exists, `author` is required and the pair adds one transcript
-message. Every other key is conversation state: scan the first-parent history
-oldest-to-newest and the latest specified value wins. A null value clears a
-key. Thus status, model, request hash, and future run properties need no sidecar
-state or new commit types. The initial title may be a fallback in the first
-event; its mutable value is presentation state outside the turn protocol.
+message. Scalar conversation state is folded by scanning the first-parent
+history oldest-to-newest; the latest specified value wins and null clears a
+key. Keyed collections are folded by their own identity: in particular, each
+`async.task` has an independent latest status, so an event for Q2 cannot erase
+Q1's state. Thus status, model, request hash, and future run properties need no
+sidecar state or new commit types. The initial title may be a fallback in the
+first event; its mutable value is presentation state outside the turn protocol.
+
+Malformed payloads inside a recognized event are isolated to the projection
+they affect where that is safe. For example, an invalid `async` payload is
+warned about and ignored while later valid task events remain usable. This
+defensive folding is not a compatibility reader: a commit without the exact
+event kind is not accepted as conversation history.
 
 Tool calls and results are events keyed by call ID, not another waterfall
 property. The UI derives current activity from calls without results.
@@ -277,7 +366,7 @@ ordered conversation.
 - fetch `head`, create the user's event and request locally, upload the closed
   request graph, then CAS-admit both the message and request record;
 - use one case-sensitive user identity for message attribution and sidebar
-  membership;
+  membership, and use its `u-<lowercase UTF-8 hex>` key only in ref paths;
 - submit or resubmit the one admitted `llm-step` request;
 - follow `head` and render its message map;
 - own drafts and UI state, but no remote execution state.
@@ -290,8 +379,9 @@ ordered conversation.
 - reconstruct all continuation state from history plus ordinary work results;
 - notice user commits added while it runs and include them at the next safe
   boundary;
-- reconcile recorded `pending` independent tasks at start and safe boundaries
-  by reissuing their stable request hashes;
+- fold independent-work status separately per task at start and safe
+  boundaries; reissue pending tasks, and reissue terminal tasks only while
+  their exact result ref is absent;
 - normally CAS-update only the named conversation's `head`; when explicitly
   creating a subagent, create that child's initial head as part of the recorded
   parent operation.
@@ -299,8 +389,8 @@ ordered conversation.
 **CAOS server**
 
 - remain ignorant of conversation event semantics;
-- enforce append-only first-parent updates for the versioned conversation-head
-  namespace;
+- enforce append-only first-parent updates for the conversation-head namespace,
+  including expected-absent creation;
 - provide exact-ref reads and CAS appends so per-event updates do not download a
   repository-wide advertisement;
 - keep request and result refs out of broad fetch advertisements, reject client
@@ -350,7 +440,12 @@ command and one std worker:
 No new server endpoint is needed. The server already owns a `/run` request
 after receiving it and continues when the HTTP client disconnects. A failed or
 lost dispatch remains `pending` on the conversation and is sent again during
-recovery.
+recovery. `GET /run?req=Q` is an execution/admission operation, not a result
+read: it may run Q when no cached owner or result exists. Consumers retrieve a
+terminal result only by resolving and reading the exact
+`refs/caos/res/Q` ref, which is side-effect-free. This distinction matters for
+caught failures, which may be intentionally uncached and would otherwise be
+executed again merely to inspect their payload.
 
 Detached work currently receives only the context encoded in its ArgTree.
 Before independent tools or subagents can promise parity with an attached turn,
@@ -367,14 +462,26 @@ task ID = hash(Q)
 ```
 
 `Q` contains `R` and `F`, so the conversation need not copy them elsewhere.
+Async state is not one flat newest-value-wins field. Fold the chronological
+event stream into a map keyed by Q; the newest valid status for each Q wins
+independently. Valid statuses are `pending`, `complete`, and `failed`. A
+malformed async payload is warned about and ignored rather than preventing
+later valid events from being folded.
+
 The dispatch protocol is:
 
-1. `llm-step` appends a tree-neutral
-   `{async: {task: Q, status: pending}}` event.
-2. It calls `caos run-async Q`, immediately returns `{task: Q, status:
-   pending}` for the model's tool call, and continues the primary conversation.
-3. In the background, `run-and-update-ref` emits an ordinary `run-then` with
-   `run = R` and a finish stage as `then`.
+1. `llm-step` folds Q's state. Only when Q has no recorded status does it
+   append a tree-neutral
+   `{"kind":"caos-chat-event","async":{"task":"<Q>","status":"pending"}}`
+   event; a repeated request for an existing Q returns the folded state without
+   resetting it.
+2. When the folded state needs dispatch, it calls `caos run-async Q` without
+   waiting. The initial call immediately returns `{task: Q, status: pending}`
+   for the model's tool call and continues the primary conversation; a repeated
+   tool request returns Q's existing folded status.
+3. In the background, `run-and-update-ref` emits `run-request-then R` with a
+   finish stage as `then`, preserving R's exact request identity rather than
+   synthesizing another request around its arguments.
 4. On success, finish reads the latest `F` tip `P`, creates a single-parent,
    tree-neutral `complete` event for Q, and CAS-pushes `P -> J`. A lost CAS
    rereads `F` and retries.
@@ -383,10 +490,24 @@ The dispatch protocol is:
 
 Status events do not touch the workspace, so completion has no file merge.
 Duplicate starts identify the same `Q`; CAOS joins, cache-hits, or reruns it as
-usual. A subsequent `llm-step` notices the completion event and obtains the
-result through `Q` (`GET /run?req=Q` or `res/Q`).
+usual. The failure continuation similarly writes `failed`.
 
-The failure continuation similarly writes `failed`.
+At startup and safe boundaries, recovery handles every folded task, not merely
+the last async event:
+
+- a `pending` Q is reissued;
+- a `complete` or `failed` Q with an addressable `refs/caos/res/Q` is converged
+  and is not reissued;
+- a terminal Q without that exact result ref is reissued, closing the crash
+  window in which finish appended the terminal event but the server had not yet
+  pinned Q's returned result.
+
+Appending the same terminal outcome again is idempotent. A retry of an
+uncached caught failure may instead succeed; in that case finish appends a
+newer `complete` event for Q, so the per-task fold agrees with the result the
+server will pin. A later `llm-step` synthesizes one notice at the durable
+terminal event's position and reads the payload through `refs/caos/res/Q`; it
+neither appends that notice again nor uses `/run` as a read API.
 
 ## Subagents
 
@@ -399,17 +520,25 @@ A subagent uses the same protocol with a child-conversation request as `R`:
 3. The parent immediately receives task ID `Q` and continues. Meanwhile the
    child advances its own conversation ref normally.
 4. When the child run returns, `Q` marks the parent task `complete` and passes
-   through the child's result. The parent can query `Q` or inspect the child
-   conversation; no child workspace is merged into the parent.
+   through the child's result. The parent can read `refs/caos/res/Q` or inspect
+   the child conversation; no child workspace is merged into the parent.
 
-Multiple children may run concurrently. A `wait(Q)` waits for or retrieves
-Q's ordinary result. Applying files from that result is a separate explicit
+Multiple children may run concurrently. A `wait(Q)` may reissue Q while
+pending, but retrieves an addressable result through the exact
+`refs/caos/res/Q` ref. Applying files from that result is a separate explicit
 operation.
 
-## Deferred compatibility and scaling work
+## Deferred work
 
-- `/from` currently materializes v2 conversation event commits, while startup
-  `--from` and the earlier virtual flow have also accepted ordinary workspace
+- Conversation refresh and worker recovery can still rebuild the first-parent
+  event spine, and some changed-head paths derive more than one projection from
+  that history. Across a long sequence of appends or polls, those repeated
+  O(n) walks create an O(n²) cumulative ceiling. Cache the validated event
+  suffix and folded projections by canonical head, reusing an ancestor entry
+  when the append-only/CAS invariant proves it safe. This is a performance
+  follow-up; the current remote ref remains authoritative.
+- `/from` materializes conversation event commits, while startup `--from` and
+  the earlier virtual flow have also accepted ordinary workspace
   commits. Unify those entry points only after defining the empty-transcript
   semantics for a plain commit. The same contract must identify safe turn
   boundaries: a fork in the middle of a recorded tool-call batch inherits an
@@ -422,8 +551,10 @@ operation.
   repack those absent objects locally. A later protocol should provide a compact
   negotiation anchor (or make clients hydrate every referenced closure), then
   hide and eventually sweep old result refs without breaking cached request
-  lookup. Conversation, title, and membership refs may also need sharding once
-  their aggregate advertisement becomes material.
+  lookup. Server reflogs used for crash repair also remain unbounded while
+  automatic Git GC is disabled; define a bounded pruning policy that preserves
+  a documented recovery window. Conversation, title, and membership refs may
+  also need sharding once their aggregate advertisement becomes material.
 
 ## Invariants
 
