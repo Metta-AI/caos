@@ -2098,9 +2098,9 @@ mod tests {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
         let mut events = vec![
-            json!({"v":2,"author":"user","content":"start"}),
-            json!({"v":2,"request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
-            json!({"v":2,"async":{"task":task,"status":"complete"}}),
+            json!({"kind":"caos-chat-event","author":"user","content":"start"}),
+            json!({"kind":"caos-chat-event","request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
+            json!({"kind":"caos-chat-event","async":{"task":task,"status":"complete"}}),
         ];
         let before_response = event_messages(&log(events.clone()), true).unwrap();
         assert!(before_response.iter().any(|message| {
@@ -2110,7 +2110,7 @@ mod tests {
         }));
 
         events.push(json!({
-            "v":2,
+            "kind":"caos-chat-event",
             "request":run,
             "round":1,
             "response":[{"type":"text","text":"observed"}]

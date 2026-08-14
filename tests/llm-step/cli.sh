@@ -285,7 +285,7 @@ grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" stub/request-
 echo "== model-issued independent work ==" >&2
 tree2=$(git rev-parse "$head2^{tree}")
 user3=$(mkcommit "$tree2" \
-  '{"author":"user","content":"queue the independent request","status":"queued","v":2}' \
+  '{"author":"user","content":"queue the independent request","kind":"caos-chat-event","status":"queued"}' \
   "$head2")
 request3=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user3")
 [ "${#request3}" -eq 40 ] && [[ "$request3" =~ ^[0-9a-f]+$ ]] \
@@ -366,7 +366,7 @@ done
 
 tree3=$(git rev-parse "$completion_head^{tree}")
 user4=$(mkcommit "$tree3" \
-  '{"author":"user","content":"what completed?","status":"queued","v":2}' \
+  '{"author":"user","content":"what completed?","kind":"caos-chat-event","status":"queued"}' \
   "$completion_head")
 request4=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user4")
 git push --quiet caos "$user4:$conversation_ref" \
