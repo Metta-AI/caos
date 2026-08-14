@@ -219,20 +219,23 @@ pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
         };
         let parent = commit.parents.first().cloned();
         newest_first.push(ConversationEvent {
-            commit: current,
+            commit: current.clone(),
             tree: commit.tree,
             value,
         });
-        let Some(parent) = parent else {
-            break;
-        };
-        current = parent;
+        current = required_event_parent(parent.as_deref(), &current)?;
     }
     newest_first.reverse();
     Ok(ConversationLog {
         head,
         events: newest_first,
     })
+}
+
+fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
+    parent
+        .map(str::to_string)
+        .ok_or_else(|| format!("conversation event {event} has no first parent"))
 }
 
 fn conversation_ref(conversation: &str) -> Result<String, String> {
@@ -245,7 +248,7 @@ fn conversation_ref(conversation: &str) -> Result<String, String> {
 /// component: allowing `a/head/b` would make its ref collide with conversation
 /// `a`'s ref-as-file, while `title` collides with its title ref.
 fn validate_conversation(conversation: &str) -> Result<(), String> {
-    if conversation.is_empty() || conversation.len() > 512 {
+    if conversation.is_empty() || conversation.len() > 124 {
         return Err(format!("invalid conversation name {conversation:?}"));
     }
     if conversation.starts_with('/')
@@ -274,8 +277,14 @@ fn validate_conversation(conversation: &str) -> Result<(), String> {
 }
 
 fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid {what} hash {hash:?}"));
+    if hash.len() != 40
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
+        ));
     }
     Ok(())
 }
@@ -862,11 +871,20 @@ mod tests {
     const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     #[test]
+    fn recognized_root_event_is_rejected() {
+        assert!(required_event_parent(None, A)
+            .unwrap_err()
+            .contains("no first parent"));
+    }
+
+    #[test]
     fn validates_conversation_ids_and_reserves_ref_channel_components() {
         assert_eq!(
             conversation_ref("project/talk-1").unwrap(),
             "refs/caos/conversations/project/talk-1/head"
         );
+        assert!(conversation_ref(&"a".repeat(124)).is_ok());
+        assert!(conversation_ref(&"a".repeat(125)).is_err());
         for invalid in [
             "", "bad name", "a//b", "a/../b", ".hidden", "a.lock", "head", "a/head/b",
             "title", "a/title/b", "a~b", "a@{b",
@@ -876,6 +894,10 @@ mod tests {
                 "accepted invalid id {invalid:?}"
             );
         }
+        assert!(validate_hash(&"a".repeat(40), "test hash").is_ok());
+        assert!(validate_hash(&"A".repeat(40), "test hash")
+            .unwrap_err()
+            .contains("lowercase"));
     }
 
     #[derive(Default)]

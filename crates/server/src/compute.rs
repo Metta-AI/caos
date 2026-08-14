@@ -114,14 +114,7 @@ pub(crate) fn run(
     query: &str,
     secrets_header: &str,
 ) -> Result<Vec<u8>, HttpError> {
-    let arg_tree = query_param(query, "req")
-        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
-    if arg_tree.is_empty() || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(HttpError::new(
-            400,
-            format!("invalid arg-tree hash: {arg_tree:?}"),
-        ));
-    }
+    let arg_tree = parse_arg_tree(query)?;
     let trace_id = query_param(query, "trace");
     if let Some(id) = &trace_id {
         if !crate::trace::valid_id(id) {
@@ -151,6 +144,23 @@ pub(crate) fn run(
     // survives gc; sub-runs set no ref (they'd flood the namespace).
     pin_result(config, &arg_tree, &result);
     Ok(format!("{result}\n").into_bytes())
+}
+
+/// Parse and validate the request identity.
+fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
+    let arg_tree = query_param(query, "req")
+        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
+    if arg_tree.len() != 40
+        || !arg_tree
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(HttpError::new(
+            400,
+            format!("invalid arg-tree hash: {arg_tree:?}"),
+        ));
+    }
+    Ok(arg_tree)
 }
 
 /// Run WorkRequest `request` (its ArgTree, with `request.stack` the chain of
@@ -1705,6 +1715,18 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod single_flight_tests {
     use super::*;
+
+    #[test]
+    fn external_run_identity_is_canonical_lowercase() {
+        assert_eq!(
+            parse_arg_tree(&format!("req={}", "a".repeat(40)))
+                .ok()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let error = parse_arg_tree(&format!("req={}", "A".repeat(40))).unwrap_err();
+        assert_eq!(error.status(), 400);
+    }
 
     #[test]
     fn waiter_receives_the_owners_outcome() {

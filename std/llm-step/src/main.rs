@@ -1062,8 +1062,14 @@ fn request_for_head(log: &progress::ConversationLog, head: &str) -> Result<Strin
 }
 
 fn validate_run_hash(run: &str) -> Result<(), String> {
-    if run.len() != 40 || !run.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("invalid conversation run hash {run:?}"));
+    if run.len() != 40
+        || !run
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "conversation run must be a lowercase 40-character hexadecimal hash, got {run:?}"
+        ));
     }
     Ok(())
 }
@@ -1821,6 +1827,14 @@ fn fresh(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_run_hashes_are_canonical_lowercase() {
+        assert!(validate_run_hash(&"a".repeat(40)).is_ok());
+        assert!(validate_run_hash(&"A".repeat(40))
+            .unwrap_err()
+            .contains("lowercase"));
+    }
 
     fn log(values: Vec<Value>) -> progress::ConversationLog {
         progress::ConversationLog {
