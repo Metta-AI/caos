@@ -325,7 +325,7 @@ fn next_job(
 ) -> Result<Option<RunnerJob>, String> {
     let ttl_ms = caos::env_u32(RUNNER_TTL_ENV).unwrap_or(DEFAULT_RUNNER_TTL_MS);
     let body = serde_json::json!({
-        "required": { "image": image_oid },
+        "required": { "base": image_oid },
         // Our parent is a generic runner (runnerd) — it polls with no required
         // args once we die, so a job we can't serve can evict us toward it.
         "lineage": [ {} ],
