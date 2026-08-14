@@ -254,8 +254,11 @@ Results, converted images, and built layers are cached in Redis
 (`caos:result:<argTreeHash>`, `caos:image:<git-hash>`, `caos:layer:<tree-hash>`).
 A hit on the result key skips the container entirely (logged `cache hit …` vs
 `cache miss …`). Redis is best-effort: if it's unreachable the server logs and
-runs uncached. There are no locks yet, so two identical cold-cache requests may
-both run.
+runs uncached. Cold misses are single-flighted in the server: identical
+requests join one live owner, and image conversion and layer publication use
+the same per-key pattern. A request runs independently only when the waits-for
+graph proves that joining would form a cycle. Losing an owner fails and wakes
+its waiters so a later arrival can become the new owner.
 
 ### Git images
 
