@@ -184,14 +184,14 @@ context (an ancestor stack for cycle detection and an optional trace id) that is
 NOT part of the cache key. The ArgTree is itself a content-addressed git object,
 whose hash, `argTreeHash`, *is* the cache key and the rendezvous id — with
 nothing keyed alongside it. The worker image rides *inside* the ArgTree, under a
-reserved `image` entry — as do the standard library `std` (a reserved `std`
+reserved `base` entry — as do the standard library `std` (a reserved `std`
 entry naming the std tree) and the cache-busting `salt` (a reserved `salt`
 entry) — so a computation is identified entirely by its args (an executor can
 match on the worker alongside the rest, and a worker, seeing its args at
 `/cas/args`, can read its own image to call itself). `GET /run?req=<argTreeHash>`
 (`req` is the query param's historical name; its value is the ArgTree hash):
 
-1. **read** the ArgTree, whose `image` entry is the worker ref, `std` entry
+1. **read** the ArgTree, whose `base` entry is the worker ref, `std` entry
    names the standard library, and `salt` entry is the cache-buster;
 2. **cache** lookup in Redis keyed on `argTreeHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
@@ -239,7 +239,7 @@ exclusive) — as the worker's own result at
    plain tail call.
 
 Recursion ties the knot through `map`: a worker curries *its own image* — read
-straight from `/cas/args/image`, the request's reserved entry — as the mapper,
+straight from `/cas/args/base`, the request's reserved entry — as the mapper,
 so each child gets the same treatment, with no std lookup and for any git
 image (a rustc-built worker as much as a builtin) — and each child may itself
 promise. Because a worker either computes a value or *describes* the remaining
@@ -340,7 +340,7 @@ setuid `caos`.
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — the **ArgTree** — including the
-   `<image>` under a reserved `image` entry and (when set) the cache-busting
+   `<image>` under a reserved `base` entry and (when set) the cache-busting
    salt under a reserved `salt` entry (see
    [arguments](#arguments-literals-and-paths));
 2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —

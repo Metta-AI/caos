@@ -5,7 +5,7 @@
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
 //! hash *is* the cache key with nothing keyed alongside it: the worker image, the
 //! standard library `std`, and the cache-busting `salt` all ride inside it under
-//! reserved `image`/`std`/`salt` entries. `/run?req=<argTreeHash>`
+//! reserved `base`/`std`/`salt` entries. `/run?req=<argTreeHash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
 //! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
 //! the registry) → dispatch through the runner rendezvous ([`crate::runner`]:
@@ -178,7 +178,7 @@ fn run_work_request_inner(
         trace_id,
         secrets: _,
     } = *request;
-    // Unpack the ArgTree's two reserved entries: the worker `image` (an embedded
+    // Unpack the ArgTree's two reserved entries: the worker `base` (an embedded
     // tree for a git image, a ref blob for `docker://`) and the cache-busting
     // `salt`. Both are part of the ArgTree — hence part of the cache key —
     // threaded into the worker and inherited by any promise sub-runs this request
@@ -712,7 +712,7 @@ fn resolve_promise(
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
 /// any curry layers and build the ArgTree — worker image folded in under its
-/// reserved `image` entry, salt under `salt`, std under `std` — whose hash IS the
+/// reserved `base` entry, salt under `salt`, std under `std` — whose hash IS the
 /// request, built server-side byte-identically to what a client would build, so
 /// the ArgTree hash (and cache key) is the same no matter who assembles it — and
 /// send it through [`run_work_request`]. Returns `"<type> <hash>"`.
@@ -731,17 +731,17 @@ fn run_image(
     let (image, bound) = unwrap_curry(config, image_ref)?;
     let store_err = |e: String| HttpError::new(500, format!("building sub-request: {e}"));
 
-    // The worker image rides *in* the ArgTree under the reserved `image` entry
+    // The worker image rides *in* the ArgTree under the reserved `base` entry
     // (embedded as the image's own tree for a git image, a ref blob for
     // `docker://`) — the same shape the client builds, merged last so the
     // reserved name wins over any like-named user arg.
     let image_entry = if image.len() == 40 && image.bytes().all(|b| b.is_ascii_hexdigit()) {
         let oid = gix::ObjectId::from_hex(image.as_bytes())
             .map_err(|e| HttpError::new(500, format!("invalid image hash: {e}")))?;
-        named_entry("image", EntryKind::Tree.into(), oid)
+        named_entry("base", EntryKind::Tree.into(), oid)
     } else {
         named_entry(
-            "image",
+            "base",
             EntryKind::Blob.into(),
             store_git_blob(config, image.as_bytes()).map_err(store_err)?,
         )
@@ -900,8 +900,8 @@ fn args_entries(
 }
 
 /// Unpack an ArgTree into the reserved entries the server needs: the image ref
-/// (its `image` entry), the std-tree hash (its `std` entry, empty if none), and
-/// the salt (its `salt` entry, empty if none). `image`/`std`/`salt` are all
+/// (its `base` entry), the std-tree hash (its `std` entry, empty if none), and
+/// the salt (its `salt` entry, empty if none). `base`/`std`/`salt` are all
 /// entries of this one tree, so the ArgTree's hash *is* the cache key with
 /// nothing keyed alongside it — the ArgTree hash itself is the request identity,
 /// so it is not returned here.
@@ -916,7 +916,7 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
             // is a tree, its oid the image hash — the image travels inside the
             // ArgTree graph); a `docker://` image has no git object, so it rides
             // as a blob naming the registry ref.
-            "image" => {
+            "base" => {
                 image = Some(if entry.mode.is_tree() {
                     entry.oid.to_string()
                 } else {
@@ -928,7 +928,7 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
             _ => {}
         }
     }
-    let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'image'"))?;
+    let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'base'"))?;
     Ok((image, salt))
 }
 

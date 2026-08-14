@@ -213,7 +213,7 @@ fn run_runner_job(
     // off the placeholder cas_setup just materialized (every entry is tagged
     // with its hash).
     if image_oid.is_none() {
-        *image_oid = caos::read_hash(&cas.join("args").join("image")).ok();
+        *image_oid = caos::read_hash(&cas.join("args").join("base")).ok();
     }
     let envs = [(caos::SALT_ENV, salt.as_str())];
     // Drop the granted secrets at `/secret/<name>` just before the worker runs
@@ -267,7 +267,7 @@ fn remove_secrets() {
 }
 
 /// Unpack an ArgTree: its hash (returned back for `/cas/args`) and the salt
-/// (its reserved `salt` entry, empty if absent). `image`/`salt` are entries of
+/// (its reserved `salt` entry, empty if absent). `base`/`salt` are entries of
 /// this one tree, per SPEC's ArgTree.
 fn read_arg_tree(t: &dyn Transport, arg_tree: &str) -> Result<(String, String), String> {
     let (kind, content) = t.get_object(arg_tree)?;
@@ -325,7 +325,7 @@ fn next_job(
 ) -> Result<Option<RunnerJob>, String> {
     let ttl_ms = caos::env_u32(RUNNER_TTL_ENV).unwrap_or(DEFAULT_RUNNER_TTL_MS);
     let body = serde_json::json!({
-        "required": { "image": image_oid },
+        "required": { "base": image_oid },
         // Our parent is a generic runner (runnerd) — it polls with no required
         // args once we die, so a job we can't serve can evict us toward it.
         "lineage": [ {} ],

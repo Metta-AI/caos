@@ -276,7 +276,7 @@ Marker lines in the script's header comment:
 - `#@arg <name> <description>` — a REQUIRED parameter
 - `#@arg [<name>] <description>` — an OPTIONAL parameter
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `image`, `std` and `salt`
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `std` and `salt`
 are refused: the interpreter binds those itself and currying SHALL fail on a
 rebind. A malformed `#@arg` line is skipped with a message, never silently
 turned into an arg the model cannot use.

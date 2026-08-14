@@ -2338,8 +2338,8 @@ fn prepare_request(
     assemble_arg_tree(t, image, call, store)
 }
 
-/// Assemble a runnable ArgTree from a base `image` ref and the caller's already
-/// resolved `call` args, folding in the reserved `image`/`salt`/`std` entries,
+/// Assemble a runnable ArgTree from a base image ref and the caller's already
+/// resolved `call` args, folding in the reserved `base`/`salt`/`std` entries,
 /// storing it, and getting it onto the server. Returns the ArgTree hash (the
 /// request id and cache key). Shared by [`prepare_request`] (which resolves
 /// `call` from kvs) and the `.caos-expr` evaluator (which resolves `call`
@@ -2355,24 +2355,24 @@ fn assemble_arg_tree(
     // only ever sees a plain args tree.
     let (image, bound) = unwrap_curry(t, image)?;
 
-    // The worker (image) rides *in* the args tree under the reserved `image`
+    // The worker (image) rides *in* the args tree under the reserved `base`
     // entry, rather than as a sibling of `args` in the request. So a computation
     // is identified entirely by its args (an executor can match on the worker
     // alongside the rest), and a worker — which sees its args at `/cas/args` —
-    // reaches its own image at `/cas/args/image` to call itself. Merged last so
+    // reaches its own image at `/cas/args/base` to call itself. Merged last so
     // the reserved name wins over any like-named user arg.
     //
     // A git-docker image *is* a git tree, so we reference it by that tree (the
     // entry's oid is the image tree): the image then travels inside the request's
-    // own object graph — no separate push — and materializes at `/cas/args/image`
+    // own object graph — no separate push — and materializes at `/cas/args/base`
     // as a real directory whose recorded hash is the image, so recursion can pass
     // that path straight to `caos run`. A `docker://` ref has no git object to
     // embed, so it rides as a blob naming the registry ref.
-    let image_entry = image_arg_entry(t, &image)?;
+    let image_entry = base_arg_entry(t, &image)?;
     let mut arg_entries = merge_entries(merge_entries(bound, call), vec![image_entry]);
 
     // The cache-busting salt (empty by default) rides *in* the args tree under the
-    // reserved `salt` entry, exactly like `image` — per SPEC an ArgTree is a git
+    // reserved `salt` entry, exactly like `base` — per SPEC an ArgTree is a git
     // tree of named args including `salt`, so the salt belongs there rather than
     // as a sibling of `args` in the request. Since the args tree is the cache key,
     // a salted run is simply a different args tree; it needs no keying of its own.
@@ -2648,13 +2648,13 @@ pub fn cli_run(
     checkout(t, &target, &result, root)
 }
 
-/// The reserved `image` entry for an args tree, carrying the worker image `image`
+/// The reserved `base` entry for an args tree, carrying the worker image `image`
 /// (a resolved ref: `docker://…` or a git-image hash). A git-docker image *is* a
 /// git tree, so it rides embedded — the entry references that tree directly, so
 /// the image travels inside the request's object graph and materializes as a real
-/// directory at `/cas/args/image`. A `docker://` ref has no git object to embed,
+/// directory at `/cas/args/base`. A `docker://` ref has no git object to embed,
 /// so it rides as a blob naming the registry ref.
-fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::Entry, String> {
+fn base_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::Entry, String> {
     use gix::objs::tree::{Entry, EntryKind};
     let (mode, oid) = if is_hex_hash(image) {
         (EntryKind::Tree, parse_oid(image)?)
@@ -2663,13 +2663,13 @@ fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::En
     };
     Ok(Entry {
         mode: mode.into(),
-        filename: b"image".to_vec().into(),
+        filename: b"base".to_vec().into(),
         oid,
     })
 }
 
 /// Build the args tree's reserved `salt` entry: the cache-busting salt as a plain
-/// blob. The counterpart of [`image_arg_entry`] for the other
+/// blob. The counterpart of [`base_arg_entry`] for the other
 /// reserved ArgTree member; merged in only when the salt is non-empty.
 fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entry, String> {
     use gix::objs::tree::{Entry, EntryKind};
@@ -2981,12 +2981,12 @@ fn unwrap_curry(
     Ok((image, bound))
 }
 
-/// If `hash` names a flat **args tree** — a tree carrying the reserved `image`
-/// entry but no [`CURRY_MARKER`] — return its base image ref (from the `image`
+/// If `hash` names a flat **args tree** — a tree carrying the reserved `base`
+/// entry but no [`CURRY_MARKER`] — return its base image ref (from the `base`
 /// entry: a git image's tree oid, or a `docker://` blob's contents) and its
 /// remaining entries as bound args. This is the shape the server materializes at
 /// `/cas/args` (hence what `own_args_tree` names); `None` for a curry node, a
-/// plain image, or any tree without an `image` entry.
+/// plain image, or any tree without a `base` entry.
 fn args_tree_node(
     t: &dyn Transport,
     hash: &str,
@@ -3001,8 +3001,8 @@ fn args_tree_node(
     {
         return Ok(None); // a curry node — handled by `curry_node`
     }
-    let Some(image) = entries.iter().find(|e| entry_name(e) == b"image") else {
-        return Ok(None); // no reserved `image` entry — not an args tree
+    let Some(image) = entries.iter().find(|e| entry_name(e) == b"base") else {
+        return Ok(None); // no reserved `base` entry — not an args tree
     };
     // A git image rides embedded (the entry IS its tree, so the ref is the oid);
     // a `docker://` ref rides as a blob naming the registry ref.
@@ -3013,7 +3013,7 @@ fn args_tree_node(
     };
     let bound = entries
         .into_iter()
-        .filter(|e| entry_name(e) != b"image")
+        .filter(|e| entry_name(e) != b"base")
         .collect();
     Ok(Some((base_ref, bound)))
 }
@@ -3282,7 +3282,7 @@ pub(crate) fn mark_arg_tree(
         return Ok(oid.to_string());
     }
     let (image_ref, bound) = unwrap_curry(t, oid)?;
-    let image_entry = image_arg_entry(t, &image_ref)?;
+    let image_entry = base_arg_entry(t, &image_ref)?;
     let mut base: std::collections::BTreeMap<String, String> = bound
         .iter()
         .map(|e| {
@@ -3292,7 +3292,7 @@ pub(crate) fn mark_arg_tree(
             )
         })
         .collect();
-    base.insert("image".to_string(), image_entry.oid.to_string());
+    base.insert("base".to_string(), image_entry.oid.to_string());
     let Some(digest) = client_secret_hash(store, &base)? else {
         return Ok(oid.to_string());
     };
@@ -3396,7 +3396,7 @@ fn resolve_reader_client(
         );
     }
     // The image entry wins over any like-named bound arg, mirroring assembly.
-    entries.insert("image".to_string(), base);
+    entries.insert("base".to_string(), base);
     Ok(entries)
 }
 

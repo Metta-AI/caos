@@ -49,7 +49,7 @@ closes "anyone can poll jobs containing curried creds").
 
 ```json
 {
-  "required": { "image": "<oid>" },   // {} for a generic runner
+  "required": { "base": "<oid>" },   // {} for a generic runner
   "lineage":  [ {} ],                 // ancestors' required sets, outermost first
   "ttl_ms": 2000
 }
@@ -78,7 +78,7 @@ The job payload is the rendezvous ids plus only what the runner can't derive:
 ```
 
 No `args`/`std`/`salt`: those are exactly the entries of the `req` tree, which
-IS the ArgTree (`image`, `std` and `salt` are all reserved entries of it), which
+IS the ArgTree (`base`, `std` and `salt` are all reserved entries of it), which
 the runner unpacks itself (one tree fetch, plus the `std` ref blob) — `req`
 has to travel anyway for the result post, and sending only it means the
 payload can't disagree with the request. `image_ref` is genuinely
@@ -143,7 +143,7 @@ Details:
   timeout produces `no runner for arg_tree …`, which blames capacity. But a
   seeded job's `image` arg is the blob of the sentinel string itself, and the
   seed record carries that same blob in its `required`, so **a parked poll
-  whose `required["image"]` equals the job's `image` is that sentinel's seeder
+  whose `required["base"]` equals the job's `base` is that sentinel's seeder
   and nobody else's**. If it is parked and does not match, the two sides
   disagree about the rest of the key and waiting cannot fix it. After
   `CAOS_SEEDED_GRACE_SECS` (45s — enough to clear the seeder's own 20s poll

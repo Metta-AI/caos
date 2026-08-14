@@ -65,7 +65,7 @@ suite)
   done
   caos put /tmp/build-ws /cas/build-ws
 
-  build=$(caos curry /cas/args/image -- \
+  build=$(caos curry /cas/args/base -- \
     "--worker1:@=/cas/args/in/caos-tools/build.sh") || fail "currying the build tool"
 
   # `deepener` reads the workspace as /cas/args/in: run-then hands its `then` the
@@ -84,7 +84,7 @@ suite)
   # to tests/lib/run-test.sh.
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
 
-  deepener=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the deepener stage"
+  deepener=$(caos curry /cas/args/base -- "${fwd[@]}") || fail "currying the deepener stage"
   caos run-then /cas/args/in -- --run="$build" --then="$deepener"
   ;;
 
@@ -179,7 +179,7 @@ deepener)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
-  deepen=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the deepen stage"
+  deepen=$(caos curry /cas/args/base -- "${fwd[@]}") || fail "currying the deepen stage"
   caos run-then /cas/deep-deps -- --run=docker://seeded-deep-deps --then="$deepen"
   ;;
 
@@ -193,7 +193,7 @@ deepen)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
-  fanout=$(caos curry /cas/args/image -- "${fwd[@]}") || fail "currying the fan-out stage"
+  fanout=$(caos curry /cas/args/base -- "${fwd[@]}") || fail "currying the fan-out stage"
   caos run-then /cas/args/ws -- --run=/cas/args/result --then="$fanout"
   ;;
 
@@ -373,7 +373,7 @@ fanout)
   #
   # A timestamp in args means the summariser never caches. That is the point: it
   # is one cheap container, and it only runs at all when this stage does.
-  then_img=$(caos curry /cas/args/image -- \
+  then_img=$(caos curry /cas/args/base -- \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
     "--build-time:@=/cas/args/build/time" "--start-time=$(date +%s)") \
     || fail "currying the summarize stage"

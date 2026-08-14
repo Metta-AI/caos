@@ -292,7 +292,7 @@ architecture, from the restart discussion:
   the identical jobs, so their runs share cache hits.
 
 Folding the bin-worker tests through the socket surfaced a real client bug:
-a worker currying its *own image* from `/cas/args/image` (file-count,
+a worker currying its *own image* from `/cas/args/base` (file-count,
 deep-deps, rgrep self-recursion) resolved the path to its recorded git hash —
 but when the image rides as a `docker://` **blob** (the nested passthrough
 case), that hash is the blob's oid, which no engine can run. Fix in
