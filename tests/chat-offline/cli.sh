@@ -88,7 +88,8 @@ if [ -z "$stub_pid" ]; then
 fi
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-conv="chat-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+test_id=$(printf '%s' "${CAOS_SALT:-$(date +%s%N)}" | tr -cd '0-9a-zA-Z')
+conv="chat-$test_id"
 ref="refs/caos/conversations/$conv/head"
 queued_conv="queued-$conv"
 queued_ref="refs/caos/conversations/$queued_conv/head"
@@ -243,7 +244,7 @@ grep -qF "assistant: $T1_TEXT" log.out || fail "log misses first assistant event
 grep -qF "tester: and now?" log.out || fail "log misses second user event"
 grep -qF "assistant: $T2_TEXT" log.out || fail "log misses recovered assistant event"
 
-fresh="chat-fresh-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+fresh="chat-fresh-$test_id"
 "$CAOS_CLI" talk --new -c "$fresh" "fresh start" "${opts[@]}" >talk.out 2>talk.err
 grep -qF "$T3_TEXT" talk.out || fail "fresh conversation response is missing"
 auto_ref="refs/caos/conversations/$fresh/head"
