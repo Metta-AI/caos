@@ -3032,6 +3032,33 @@ mod tests {
     }
 
     #[test]
+    fn indexed_conversation_ids_preserve_slashes() {
+        let (root, _repo, transport, base) = conversation_index_fixture("slash-id");
+        let request = "e".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "project/talk-1",
+            "Nested conversation",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+
+        let listed =
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "project/talk-1");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hash_validation_is_exact() {
         assert!(validate_hash(&"a".repeat(40), "test").is_ok());
         assert!(validate_hash(&"a".repeat(39), "test").is_err());
