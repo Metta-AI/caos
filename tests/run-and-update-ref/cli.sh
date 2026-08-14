@@ -54,8 +54,8 @@ printf 'workspace survives\n' > workspace.txt
 commit "conversation base"
 base=$(git rev-parse HEAD)
 suffix=${base:0:12}
-success_ref="refs/caos/v2/conversations/run-update-success-$suffix/head"
-failure_ref="refs/caos/v2/conversations/run-update-failure-$suffix/head"
+success_ref="refs/caos/conversations/run-update-success-$suffix/head"
+failure_ref="refs/caos/conversations/run-update-failure-$suffix/head"
 git push -q caos "HEAD:$success_ref" "HEAD:$failure_ref"
 
 worker=$("$CAOS_CLI" curry DEEP-DEPS/run-and-update-ref --)

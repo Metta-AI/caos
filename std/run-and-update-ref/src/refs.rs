@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 const MAX_CAS_ATTEMPTS: usize = 32;
+const EVENT_KIND: &str = "caos-chat-event";
 
 enum PushResult {
     Updated,
@@ -17,7 +18,7 @@ enum PushResult {
 }
 
 pub fn validate_target_ref(refname: &str) -> Result<(), String> {
-    let Some(rest) = refname.strip_prefix("refs/caos/v2/conversations/") else {
+    let Some(rest) = refname.strip_prefix("refs/caos/conversations/") else {
         return Err(format!(
             "target-ref is not a conversation head: {refname:?}"
         ));
@@ -76,7 +77,7 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
             return Ok(());
         }
 
-        let message = json!({"v": 2, "async": {"task": task, "status": status}});
+        let message = json!({"kind": EVENT_KIND, "async": {"task": task, "status": status}});
         let message = serde_json::to_string(&message)
             .map_err(|error| format!("serializing async status event: {error}"))?;
         let commit = store_commit(&base, &remote.tree, &head, &message)?;
@@ -184,7 +185,7 @@ fn task_status(
     while let Some(hash) = current {
         let commit = fetch_commit_cached(base, &hash, cache)?;
         let event = match serde_json::from_str::<Value>(commit.message.trim()) {
-            Ok(event) if event.get("v").and_then(Value::as_u64) == Some(2) => event,
+            Ok(event) if event.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) => event,
             _ => return Ok(None),
         };
         if let Some(status) = event_task_status(&event, task) {
@@ -378,11 +379,11 @@ mod tests {
 
     #[test]
     fn target_ref_is_only_a_conversation_head() {
-        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_ok());
+        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_ok());
         assert!(validate_target_ref("refs/heads/main").is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/status").is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/a/head/b/head").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_err());
+        assert!(validate_target_ref("refs/caos/conversations/chat-1/status").is_err());
+        assert!(validate_target_ref("refs/caos/conversations/a/head/b/head").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_err());
     }
 
     #[test]
@@ -390,14 +391,14 @@ mod tests {
         let task = "a".repeat(40);
         assert_eq!(
             event_task_status(
-                &json!({"v": 2, "async": {"task": "oops", "status": "complete"}}),
+                &json!({"kind": EVENT_KIND, "async": {"task": "oops", "status": "complete"}}),
                 &task
             ),
             None
         );
         assert_eq!(
             event_task_status(
-                &json!({"v": 2, "async": {"task": task, "status": "failed"}}),
+                &json!({"kind": EVENT_KIND, "async": {"task": task, "status": "failed"}}),
                 &task
             )
             .as_deref(),

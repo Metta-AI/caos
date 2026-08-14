@@ -343,9 +343,9 @@ mod tests {
     fn task_status_is_folded_from_events() {
         let task = "a".repeat(40);
         let events = [
-            json!({"v": 2, "async": {"task": task, "status": "pending"}}),
-            json!({"v": 2, "content": "unrelated"}),
-            json!({"v": 2, "async": {"task": task, "status": "complete"}}),
+            json!({"kind": "caos-chat-event", "async": {"task": task, "status": "pending"}}),
+            json!({"kind": "caos-chat-event", "content": "unrelated"}),
+            json!({"kind": "caos-chat-event", "async": {"task": task, "status": "complete"}}),
         ];
         assert_eq!(
             task_status(events.iter(), &task).unwrap().as_deref(),
@@ -357,9 +357,9 @@ mod tests {
     fn malformed_async_events_are_skipped_without_losing_valid_state() {
         let task = "a".repeat(40);
         let events = [
-            json!({"v": 2, "async": {"task": task, "status": "pending"}}),
-            json!({"v": 2, "async": {"task": "oops", "status": "pending"}}),
-            json!({"v": 2, "async": {"task": task, "status": "future"}}),
+            json!({"kind": "caos-chat-event", "async": {"task": task, "status": "pending"}}),
+            json!({"kind": "caos-chat-event", "async": {"task": "oops", "status": "pending"}}),
+            json!({"kind": "caos-chat-event", "async": {"task": task, "status": "future"}}),
         ];
         assert_eq!(
             task_status(events.iter(), &task).unwrap().as_deref(),

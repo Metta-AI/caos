@@ -1317,7 +1317,7 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
         .last()
         .map(|event| event.tree.clone())
         .ok_or("conversation has no events")?;
-    let event = json!({"v": 2, "async": {"task": task, "status": "pending"}});
+    let event = json!({"kind": "caos-chat-event", "async": {"task": task, "status": "pending"}});
     let mut observed_status = None;
     retry_pending_append(
         &log.head,
