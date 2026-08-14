@@ -148,11 +148,12 @@ dev, `caosd up` creates a dedicated bare repo for it under `CAOS_DATA` (see
 
 It serves requests **concurrently — one thread per request** — so a worker can
 fetch objects while its own `/run` is in flight, and several top-level runs can
-proceed at once. Workers never call back into `/run`: a worker that needs
-sub-computations records a **map-then continuation** as its result and finishes
-its job, and the server resolves it (see [compute](#compute)) — so no worker
-ever waits on another worker and nothing can deadlock. Capacity lives
-runner-side: the set of hanging `/runner/poll`s *is* the pool.
+proceed at once. Ordinary dependent sub-computations use a **map-then
+continuation**: the worker records the continuation as its result and finishes
+its job before the server resolves it (see [compute](#compute)). `run-async` is
+the deliberate exception: it starts a detached `/run` request from a worker and
+returns the request hash immediately, without waiting for that subrequest.
+Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 
 | Request | Behaviour |
 |---|---|
