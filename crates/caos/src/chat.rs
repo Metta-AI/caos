@@ -3221,6 +3221,21 @@ mod tests {
             Some(admitted.as_str())
         );
 
+        let error = submit_interjection(
+            &transport,
+            &TurnOptions::default(),
+            "shared",
+            "apply this while the turn runs",
+            Some(&proposal),
+        )
+        .unwrap_err();
+        assert!(error.contains("submitted workspace"), "{error}");
+        assert!(error.contains(".caos"), "{error}");
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(admitted.as_str())
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
