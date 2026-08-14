@@ -2552,10 +2552,10 @@ pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
     if !tree
         .entries
         .iter()
-        .any(|entry| entry.filename.to_vec().as_slice() == b"image")
+        .any(|entry| entry.filename.to_vec().as_slice() == b"base")
     {
         return Err(format!(
-            "run-async needs a runnable ArgTree, but {arg_tree} has no 'image' entry"
+            "run-async needs a runnable ArgTree, but {arg_tree} has no 'base' entry"
         ));
     }
     t.ensure_pushed(arg_tree)?;
@@ -3812,7 +3812,7 @@ mod git_transport_tests {
         };
         assert!(caos_run_async(&curry_or_plain_tree, &request)
             .unwrap_err()
-            .contains("has no 'image' entry"));
+            .contains("has no 'base' entry"));
 
         let uppercase = request.to_ascii_uppercase();
         assert!(caos_run_async(&missing, &uppercase)
