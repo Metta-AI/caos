@@ -20,6 +20,7 @@ use super::{curry_object, prepare_request, request_compute, GitTransport, Transp
 const CONVERSATION_PREFIX: &str = "refs/caos/conversations/";
 const HEAD_SUFFIX: &str = "/head";
 const EVENT_KIND: &str = "caos-chat-event";
+const MAX_CONVERSATION_ID_BYTES: usize = 124;
 const MAX_APPEND_ATTEMPTS: usize = 32;
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const AUTO_NAME_PREFIX: &str = "talk-";
@@ -1681,7 +1682,11 @@ fn push_head_cas_git(
 }
 
 fn conversation_ref(id: &str) -> Result<String, String> {
-    if id.is_empty() || id.split('/').any(|part| matches!(part, "head" | "title")) {
+    if id.is_empty()
+        || id.len() > MAX_CONVERSATION_ID_BYTES
+        || id.ends_with('.')
+        || id.split('/').any(|part| matches!(part, "head" | "title"))
+    {
         return Err(format!("invalid conversation id {id:?}"));
     }
     let refname = format!("{CONVERSATION_PREFIX}{id}{HEAD_SUFFIX}");
@@ -1954,7 +1959,11 @@ fn update_local_cache(t: &GitTransport, refname: &str, hash: &str) -> Result<(),
 }
 
 fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if hash.len() != 40
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
         return Err(format!("invalid {what} hash {hash:?}"));
     }
     Ok(())
@@ -2477,6 +2486,9 @@ mod tests {
             conversation_ref("project/talk-1").unwrap(),
             "refs/caos/conversations/project/talk-1/head"
         );
+        assert!(conversation_ref(&"a".repeat(MAX_CONVERSATION_ID_BYTES)).is_ok());
+        assert!(conversation_ref(&"a".repeat(MAX_CONVERSATION_ID_BYTES + 1)).is_err());
+        assert!(conversation_ref("ends-with-dot.").is_err());
     }
 
     #[test]
@@ -2505,6 +2517,7 @@ mod tests {
     fn hash_validation_is_exact() {
         assert!(validate_hash(&"a".repeat(40), "test").is_ok());
         assert!(validate_hash(&"a".repeat(39), "test").is_err());
+        assert!(validate_hash(&"A".repeat(40), "test").is_err());
         assert!(validate_hash(&"z".repeat(40), "test").is_err());
     }
 
