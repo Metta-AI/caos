@@ -3471,7 +3471,7 @@ mod tests {
         let base = git_output(repo, &["rev-parse", "HEAD"]);
         let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
         let event = serde_json::to_string(&serde_json::json!({
-            "v": 2,
+            "kind": "caos-chat-event",
             "author": "user",
             "username": username,
             "content": message,
