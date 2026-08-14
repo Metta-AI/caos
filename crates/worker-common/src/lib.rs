@@ -15,7 +15,7 @@
 //! What a worker curries and calls is an *ArgTree*, not an image (SPEC, "Work"):
 //! currying takes an ArgTree and args and returns a new ArgTree, and its in-code
 //! form is a curry node (`{base, args, .caos-curry}`). An image is just one arg
-//! (the reserved `image`), so the *simplest* ArgTree is a bare image — which is
+//! (the reserved `base`), so the *simplest* ArgTree is a bare image — which is
 //! exactly what `own_image` hands you: an image ref, the value under
 //! that one arg. `caos curry` binds args onto such a ref to build a richer
 //! ArgTree; the `map`/`then`/`run` operands are ArgTree refs (a bare image, or a
