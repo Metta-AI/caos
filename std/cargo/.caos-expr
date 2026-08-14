@@ -7,7 +7,7 @@
 # This is a `run` of a seeded worker, so its key can't be a pure assembly:
 # resolving DEEP-DEPS/flake-builder evaluates flake-builder's own `.caos-expr`
 # to its (seeded) image. bootstrap hand-builds the cargo image delta and seeds
-# it under the arg-tree key this expression forms — `{ image: <flake-builder
+# it under the arg-tree key this expression forms — `{ base: <flake-builder
 # delta>, in: <this deepened tree> }` — so resolving this entry returns that
 # delta without the flake-builder worker ever running (design/caos-expr.md, the
 # hand-assembled seed keys).
