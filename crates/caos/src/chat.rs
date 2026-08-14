@@ -1865,6 +1865,11 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
                 ))
             }
         };
+        let parent = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("parent "))
+            .ok_or_else(|| format!("conversation event {current} has no first parent"))?;
+        validate_hash(parent, "conversation event parent")?;
         if event.get("author").and_then(Value::as_str) == Some("user") {
             let line = headers
                 .lines()
@@ -1880,15 +1885,6 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
                     format!("conversation event {current} has an invalid timestamp: {error}")
                 });
         }
-        let Some(parent) = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("parent "))
-        else {
-            return Err(format!(
-                "conversation tip {hash} has no caos-chat-event user event ancestor"
-            ));
-        };
-        validate_hash(parent, "conversation event parent")?;
         current = parent.to_string();
     }
     Err(format!(
@@ -2889,6 +2885,8 @@ mod tests {
         let transport = GitTransport::discover(&repo).unwrap();
         let error = conversation_snapshot_at(&transport, "broken", &root_event).unwrap_err();
         assert!(error.contains("has no first parent"), "{error}");
+        let error = remote_commit_timestamp(&transport, &root_event).unwrap_err();
+        assert!(error.contains("has no first parent"), "{error}");
 
         std::fs::remove_dir_all(repo).unwrap();
     }
@@ -2932,17 +2930,27 @@ mod tests {
             &repo,
             &["commit-tree", &tree, "-p", &base, "-m", "not an event"],
         );
+        let parentless_message = serde_json::to_string(
+            &json!({"kind": EVENT_KIND, "author": "user", "content": "orphan"}),
+        )
+        .unwrap();
+        let parentless = test_git(&repo, &["commit-tree", &tree, "-m", &parentless_message]);
         let good_ref = conversation_ref("good").unwrap();
         let broken_ref = conversation_ref("broken").unwrap();
+        let parentless_ref = conversation_ref("z-parentless").unwrap();
         let good_index =
             user_conversation_ref("Alice", UserConversationStatus::Active, "good").unwrap();
         let broken_index =
             user_conversation_ref("Alice", UserConversationStatus::Active, "broken").unwrap();
+        let parentless_index =
+            user_conversation_ref("Alice", UserConversationStatus::Active, "z-parentless").unwrap();
         for (hash, refname) in [
             (&good, &good_ref),
             (&malformed, &broken_ref),
+            (&parentless, &parentless_ref),
             (&good, &good_index),
             (&malformed, &broken_index),
+            (&parentless, &parentless_index),
         ] {
             test_git(
                 &repo,
