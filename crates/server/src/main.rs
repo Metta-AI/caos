@@ -694,7 +694,7 @@ mod tests {
         for refname in [
             "refs/caos/req/request",
             "refs/caos/res/result",
-            "refs/caos/users/u-1/conversations/active/c-74657374",
+            "refs/caos/v2/users/u-1/conversations/active/c-74657374",
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
@@ -726,7 +726,7 @@ mod tests {
         ]);
         assert!(!upload.contains("refs/caos/req/"));
         assert!(!upload.contains("refs/caos/res/"));
-        assert!(upload.contains("refs/caos/users/"));
+        assert!(upload.contains("refs/caos/v2/users/"));
 
         let receive = git(&[
             "receive-pack",
@@ -736,7 +736,7 @@ mod tests {
         ]);
         assert!(receive.contains("refs/caos/req/"));
         assert!(receive.contains("refs/caos/res/"));
-        assert!(receive.contains("refs/caos/users/"));
+        assert!(receive.contains("refs/caos/v2/users/"));
 
         let config = super::Config {
             registry_push_url: String::new(),

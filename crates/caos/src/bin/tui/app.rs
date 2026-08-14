@@ -3550,7 +3550,7 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map_err(|error| format!("reading the clock: {error}"))?
         .as_nanos();
     let descriptor = format!(
-        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
+        "caos conversation v2\ncreator {user}\ncreated {created}\nprocess {}\n",
         std::process::id()
     );
     t.put_object("blob", descriptor.as_bytes())
@@ -3701,7 +3701,7 @@ mod tests {
                 "push",
                 "-q",
                 "caos",
-                &format!("{head}:refs/caos/conversations/{id}/head"),
+                &format!("{head}:refs/caos/v2/conversations/{id}/head"),
             ],
         );
     }
@@ -3710,7 +3710,7 @@ mod tests {
         let base = git_output(repo, &["rev-parse", "HEAD"]);
         let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
         let event = serde_json::to_string(&serde_json::json!({
-            "kind": "caos-chat-event",
+            "v": 2,
             "author": "user",
             "username": username,
             "content": message,
@@ -3731,7 +3731,7 @@ mod tests {
         let base = git_output(repo, &["rev-parse", "HEAD"]);
         let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
         let user_event = serde_json::to_string(&serde_json::json!({
-            "kind": "caos-chat-event",
+            "v": 2,
             "author": "user",
             "username": username,
             "content": message,
@@ -3743,7 +3743,7 @@ mod tests {
         );
         let request = "b".repeat(40);
         let admission = serde_json::to_string(&serde_json::json!({
-            "kind": "caos-chat-event",
+            "v": 2,
             "status": "queued",
             "request": request,
             "request_head": user,
@@ -6620,7 +6620,7 @@ mod tests {
     fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/conversations/talk-1/head:caos-tools".to_string(),
+            source: "refs/caos/v2/conversations/talk-1/head:caos-tools".to_string(),
             tools: vec![caos::chat::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),

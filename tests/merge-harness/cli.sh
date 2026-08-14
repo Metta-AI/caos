@@ -59,7 +59,7 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== dispatch merge turn ==" >&2
 conv="merge-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-conversation_ref="refs/caos/conversations/$conv/head"
+conversation_ref="refs/caos/v2/conversations/$conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --api-key=test-key --system:@=system.txt \
@@ -68,13 +68,13 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --conversation="$conv")
 
 user=$(mkcommit "$base_tree" \
-  '{"author":"user","content":"merge in the feature branch","kind":"caos-chat-event"}' \
+  '{"author":"user","content":"merge in the feature branch","v":2}' \
   "$base")
 request=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user")
 [ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
   || fail "prepared request is not exact Q: $request"
 admitted=$(mkcommit "$base_tree" \
-  "{\"kind\":\"caos-chat-event\",\"request\":\"$request\",\"request_head\":\"$user\",\"status\":\"queued\"}" "$user")
+  "{\"v\":2,\"request\":\"$request\",\"request_head\":\"$user\",\"status\":\"queued\"}" "$user")
 git push --quiet caos "$admitted:$conversation_ref" || fail "publishing request admission"
 "$CAOS_CLI" run "$request" -- >/tmp/merge-result || fail "running merge turn"
 [ -n "$(remote_exact_ref "refs/caos/res/$request")" ] \
@@ -97,7 +97,7 @@ current=$head
 count=0
 while [ "$current" != "$base" ]; do
   message=$(git show -s --format=%B "$current")
-  grep -Eq '"kind"[[:space:]]*:[[:space:]]*"caos-chat-event"' <<<"$message" \
+  grep -Eq '"v"[[:space:]]*:[[:space:]]*2([,}])' <<<"$message" \
     || fail "non-chat commit on event spine: $current"
   current=$(git rev-parse "$current^")
   count=$((count + 1))

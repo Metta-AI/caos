@@ -3,7 +3,7 @@
 //! The worker image has no `git`, so this module uses the server's object API
 //! and exact-ref compare-and-append endpoint. Event objects are stored before
 //! the ref moves. A successful return therefore means the event is reachable
-//! from `refs/caos/conversations/<id>/head`; failures are never downgraded
+//! from `refs/caos/v2/conversations/<id>/head`; failures are never downgraded
 //! to observability warnings.
 
 use std::cmp::Ordering;
@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 
-const EVENT_KIND: &str = "caos-chat-event";
+const EVENT_VERSION: u64 = 2;
 use crate::validate_hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,9 +187,9 @@ fn append_event_at_head_inner(
 }
 
 fn validate_event(event: &Value) -> Result<(), String> {
-    if !event.is_object() || event.get("kind").and_then(Value::as_str) != Some(EVENT_KIND) {
+    if !event.is_object() || event.get("v").and_then(Value::as_u64) != Some(EVENT_VERSION) {
         return Err(format!(
-            "conversation event must be a JSON object with kind {EVENT_KIND:?}"
+            "conversation event must be a JSON object with numeric version {EVENT_VERSION}"
         ));
     }
     Ok(())
@@ -211,12 +211,16 @@ pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
         let value = match serde_json::from_str::<Value>(commit.message.trim()) {
             Ok(value)
                 if value.is_object()
-                    && value.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) =>
+                    && value.get("v").and_then(Value::as_u64) == Some(EVENT_VERSION) =>
             {
                 value
             }
             _ if !newest_first.is_empty() => break,
-            _ => return Err(format!("conversation head {head} is not a {EVENT_KIND} event")),
+            _ => {
+                return Err(format!(
+                    "conversation head {head} is not a version-{EVENT_VERSION} event"
+                ))
+            }
         };
         let parent = commit.parents.first().cloned();
         newest_first.push(ConversationEvent {
@@ -241,14 +245,14 @@ fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, St
 
 pub(crate) fn conversation_ref(conversation: &str) -> Result<String, String> {
     validate_conversation(conversation)?;
-    Ok(format!("refs/caos/conversations/{conversation}/head"))
+    Ok(format!("refs/caos/v2/conversations/{conversation}/head"))
 }
 
 /// Validate an already-formed canonical conversation head ref with the same
 /// grammar used when this crate constructs one from a conversation id.
 pub(crate) fn validate_conversation_ref(refname: &str) -> Result<(), String> {
     let Some(conversation) = refname
-        .strip_prefix("refs/caos/conversations/")
+        .strip_prefix("refs/caos/v2/conversations/")
         .and_then(|rest| rest.strip_suffix("/head"))
     else {
         return Err(format!("invalid target conversation ref {refname:?}"));
@@ -911,7 +915,7 @@ mod tests {
     fn validates_conversation_ids_and_reserves_ref_channel_components() {
         assert_eq!(
             conversation_ref("project/talk-1").unwrap(),
-            "refs/caos/conversations/project/talk-1/head"
+            "refs/caos/v2/conversations/project/talk-1/head"
         );
         assert!(conversation_ref(&"a".repeat(124)).is_ok());
         assert!(conversation_ref(&"a".repeat(125)).is_err());
@@ -929,14 +933,14 @@ mod tests {
             .unwrap_err()
             .contains("lowercase"));
         assert!(
-            validate_conversation_ref("refs/caos/conversations/project/talk-1/head").is_ok()
+            validate_conversation_ref("refs/caos/v2/conversations/project/talk-1/head").is_ok()
         );
         assert!(
-            validate_conversation_ref("refs/caos/conversations/project/head/talk-1/head")
+            validate_conversation_ref("refs/caos/v2/conversations/project/head/talk-1/head")
                 .is_err()
         );
         assert!(validate_conversation_ref(
-            "refs/caos/v2/conversations/project/talk-1/head"
+            "refs/caos/conversations/project/talk-1/head"
         )
         .is_err());
     }
@@ -1140,10 +1144,12 @@ mod tests {
     }
 
     #[test]
-    fn only_stably_discriminated_objects_are_events() {
-        assert!(validate_event(&serde_json::json!({"kind": "caos-chat-event"})).is_ok());
+    fn only_numeric_version_two_objects_are_events() {
+        assert!(validate_event(&serde_json::json!({"v": 2})).is_ok());
+        assert!(validate_event(&serde_json::json!({"kind": "caos-chat-event"})).is_err());
         assert!(validate_event(&serde_json::json!({"kind": "other"})).is_err());
-        assert!(validate_event(&serde_json::json!({"v": 2})).is_err());
+        assert!(validate_event(&serde_json::json!({"v": 1})).is_err());
+        assert!(validate_event(&serde_json::json!({"v": "2"})).is_err());
         assert!(validate_event(&serde_json::json!({"status": "idle"})).is_err());
         assert!(validate_event(&serde_json::json!([])).is_err());
     }
@@ -1162,7 +1168,7 @@ mod tests {
     #[test]
     fn fetched_commit_cache_reuses_immutable_spine_objects_per_server() {
         let content = format!(
-            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"kind\":\"caos-chat-event\"}}\n"
+            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"v\":2}}\n"
         );
         let mut object = format!("commit {}\0", content.len()).into_bytes();
         object.extend_from_slice(content.as_bytes());

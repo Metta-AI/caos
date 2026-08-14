@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 const MAX_CAS_ATTEMPTS: usize = 32;
-const EVENT_KIND: &str = "caos-chat-event";
+const EVENT_VERSION: u64 = 2;
 
 enum PushResult {
     Updated,
@@ -18,7 +18,7 @@ enum PushResult {
 }
 
 pub fn validate_target_ref(refname: &str) -> Result<(), String> {
-    let Some(rest) = refname.strip_prefix("refs/caos/conversations/") else {
+    let Some(rest) = refname.strip_prefix("refs/caos/v2/conversations/") else {
         return Err(format!(
             "target-ref is not a conversation head: {refname:?}"
         ));
@@ -77,7 +77,7 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
             return Ok(());
         }
 
-        let message = json!({"kind": EVENT_KIND, "async": {"task": task, "status": status}});
+        let message = json!({"v": EVENT_VERSION, "async": {"task": task, "status": status}});
         let message = serde_json::to_string(&message)
             .map_err(|error| format!("serializing async status event: {error}"))?;
         let commit = store_commit(&base, &remote.tree, &head, &message)?;
@@ -182,12 +182,13 @@ fn task_status(
     cache: &mut HashMap<String, RemoteCommit>,
 ) -> Result<Option<String>, String> {
     let mut current = Some(head.to_string());
+    let mut canonical_head = true;
     while let Some(hash) = current {
         let commit = fetch_commit_cached(base, &hash, cache)?;
-        let event = match serde_json::from_str::<Value>(commit.message.trim()) {
-            Ok(event) if event.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) => event,
-            _ => return Ok(None),
+        let Some(event) = parse_spine_event(&commit.message, &hash, canonical_head)? else {
+            return Ok(None);
         };
+        canonical_head = false;
         let parent = required_event_parent(commit.parent.as_deref(), &hash)?;
         if let Some(status) = event_task_status(&event, task) {
             return Ok(Some(status));
@@ -195,6 +196,22 @@ fn task_status(
         current = Some(parent);
     }
     Ok(None)
+}
+
+fn parse_spine_event(
+    message: &str,
+    commit: &str,
+    canonical_head: bool,
+) -> Result<Option<Value>, String> {
+    match serde_json::from_str::<Value>(message.trim()) {
+        Ok(event) if event.get("v").and_then(Value::as_u64) == Some(EVENT_VERSION) => {
+            Ok(Some(event))
+        }
+        _ if canonical_head => Err(format!(
+            "conversation head {commit} is not a version-{EVENT_VERSION} event"
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
@@ -407,23 +424,42 @@ mod tests {
     }
 
     #[test]
+    fn canonical_head_requires_exact_numeric_v2() {
+        let head = "a".repeat(40);
+        assert!(parse_spine_event(r#"{"v":2}"#, &head, true)
+            .unwrap()
+            .is_some());
+        for legacy in [
+            r#"{"kind":"caos-chat-event"}"#,
+            r#"{"v":1}"#,
+            r#"{"v":"2"}"#,
+            r#"{}"#,
+        ] {
+            assert!(parse_spine_event(legacy, &head, true)
+                .unwrap_err()
+                .contains("version-2"));
+            assert_eq!(parse_spine_event(legacy, &head, false), Ok(None));
+        }
+    }
+
+    #[test]
     fn target_ref_is_only_a_conversation_head() {
-        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_ok());
+        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_ok());
         assert!(validate_target_ref("refs/heads/main").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/chat-1/status").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/a/head/b/head").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/a/title/b/head").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/status").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/a/head/b/head").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/a/title/b/head").is_err());
         assert!(validate_target_ref(&format!(
-            "refs/caos/conversations/{}/head",
+            "refs/caos/v2/conversations/{}/head",
             "a".repeat(124)
         ))
         .is_ok());
         assert!(validate_target_ref(&format!(
-            "refs/caos/conversations/{}/head",
+            "refs/caos/v2/conversations/{}/head",
             "a".repeat(125)
         ))
         .is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_err());
+        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_err());
     }
 
     #[test]
@@ -431,14 +467,14 @@ mod tests {
         let task = "a".repeat(40);
         assert_eq!(
             event_task_status(
-                &json!({"kind": EVENT_KIND, "async": {"task": "oops", "status": "complete"}}),
+                &json!({"v": EVENT_VERSION, "async": {"task": "oops", "status": "complete"}}),
                 &task
             ),
             None
         );
         assert_eq!(
             event_task_status(
-                &json!({"kind": EVENT_KIND, "async": {"task": task, "status": "failed"}}),
+                &json!({"v": EVENT_VERSION, "async": {"task": task, "status": "failed"}}),
                 &task
             )
             .as_deref(),

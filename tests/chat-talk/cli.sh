@@ -110,7 +110,7 @@ stage "seed a two-turn conversation for talk to continue"
 sed 's/^/  seed1| /' seed1.out >&2
 "$CAOS_CLI" chat "$conv" -m "and now?" "${opts[@]}" > seed2.out
 sed 's/^/  seed2| /' seed2.out >&2
-ref="refs/caos/conversations/$conv/head"
+ref="refs/caos/v2/conversations/$conv/head"
 turn2=$(remote_tip "$ref") || fail "seed conversation not created"
 git fetch -q caos "$turn2"
 echo "  ok: $conv has two turns" >&2
@@ -139,8 +139,8 @@ stage "talk --new starts a named conversation"
 sed 's/^/  talk2| /' talk2.out >&2
 grep -qF "[conversation $fresh — new]" talk2.err \
   || fail "talk --new did not announce $fresh: $(cat talk2.err)"
-remote_tip "refs/caos/conversations/$fresh/head" >/dev/null \
-  || fail "talk --new did not create refs/caos/conversations/$fresh/head"
+remote_tip "refs/caos/v2/conversations/$fresh/head" >/dev/null \
+  || fail "talk --new did not create refs/caos/v2/conversations/$fresh/head"
 grep -qF "$T4_TEXT" talk2.out || fail "talk --new's response text not printed"
 grep -qF '{"content":"and now?","role":"user"}' stub/request-4.json \
   && fail "old conversation replayed into the new one"

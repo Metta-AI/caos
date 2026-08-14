@@ -1,7 +1,7 @@
 //! Chat: one append-only ref containing every durable conversation event.
 //!
 //! The only authoritative pointer is
-//! `refs/caos/conversations/<id>/head`. An idle submit prepares the exact
+//! `refs/caos/v2/conversations/<id>/head`. An idle submit prepares the exact
 //! request from a user event, then publishes that event and its queued admission
 //! child with one compare-and-swap push. A submit during an active run appends
 //! an interjection and returns the already-admitted request for reconciliation.
@@ -17,9 +17,9 @@ use serde_json::{json, Value};
 
 use super::{curry_object, prepare_request, request_compute, GitTransport, Transport, CAOS_REMOTE};
 
-const CONVERSATION_PREFIX: &str = "refs/caos/conversations/";
+const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
 const HEAD_SUFFIX: &str = "/head";
-const EVENT_KIND: &str = "caos-chat-event";
+const EVENT_VERSION: u64 = 2;
 const MAX_CONVERSATION_ID_BYTES: usize = 124;
 const MAX_APPEND_ATTEMPTS: usize = 32;
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -335,7 +335,7 @@ fn durable_conversation_from_local(
             _ if !newest_first.is_empty() => break,
             _ => {
                 return Err(format!(
-                    "conversation head {head} is not a {EVENT_KIND} event"
+                    "conversation head {head} is not a version-{EVENT_VERSION} event"
                 ))
             }
         };
@@ -590,7 +590,7 @@ where
         }
 
         let mut user_event = json!({
-            "kind": EVENT_KIND,
+            "v": EVENT_VERSION,
             "author": "user",
             "username": username,
             "content": message,
@@ -698,7 +698,7 @@ where
         // cycle; publishing the admission tip makes both visible in one CAS.
         let request = prepare(t, options, id, &user)?;
         let admission = json!({
-            "kind": EVENT_KIND,
+            "v": EVENT_VERSION,
             "status": "queued",
             "request": request.clone(),
             "request_head": user,
@@ -1068,7 +1068,7 @@ pub fn reconcile_active_request(t: &GitTransport, id: &str) -> Result<Option<Str
     Ok(Some(request))
 }
 
-const USER_INDEX_PREFIX: &str = "refs/caos/users/";
+const USER_INDEX_PREFIX: &str = "refs/caos/v2/users/";
 
 fn user_key(user: &str) -> Result<String, String> {
     let user = normalized_username(user).ok_or_else(|| {
@@ -1318,7 +1318,7 @@ pub fn fork_conversation(
         .trim()
         .to_string();
     let event = json!({
-        "kind": EVENT_KIND,
+        "v": EVENT_VERSION,
         "forked_from": from,
         "title": title,
         "status": "idle",
@@ -2124,7 +2124,7 @@ fn create_event_commit_with_parents(
     }
     if !is_conversation_event(event) {
         return Err(format!(
-            "conversation event must be a JSON object with kind {EVENT_KIND:?}"
+            "conversation event must be a JSON object with numeric version {EVENT_VERSION}"
         ));
     }
     let message = serde_json::to_string(event)
@@ -2453,7 +2453,7 @@ fn try_push_new_conversation(
 /// Find a structurally identical event on the observed first-parent history.
 /// Git commit IDs include author/committer timestamps, so two clients can build
 /// the same logical fork marker with different IDs even though its tree,
-/// parents, and kind-tagged event are identical.
+/// parents, and version-tagged event are identical.
 fn equivalent_event_ancestor(
     t: &GitTransport,
     id: &str,
@@ -2465,7 +2465,7 @@ fn equivalent_event_ancestor(
         .map_err(|_| format!("new conversation head {candidate} is not a conversation event"))?;
     if !is_conversation_event(&candidate_event) {
         return Err(format!(
-            "new conversation head {candidate} is not a {EVENT_KIND} event"
+            "new conversation head {candidate} is not a version-{EVENT_VERSION} event"
         ));
     }
     let candidate_tree = t
@@ -2618,7 +2618,7 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
             Ok(event) if is_conversation_event(&event) => event,
             _ => {
                 return Err(format!(
-                    "conversation history commit {current} is not a {EVENT_KIND} event"
+                    "conversation history commit {current} is not a version-{EVENT_VERSION} event"
                 ))
             }
         };
@@ -2794,7 +2794,7 @@ fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
 }
 
 fn is_conversation_event(value: &Value) -> bool {
-    value.is_object() && value.get("kind").and_then(Value::as_str) == Some(EVENT_KIND)
+    value.is_object() && value.get("v").and_then(Value::as_u64) == Some(EVENT_VERSION)
 }
 
 fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
@@ -3273,7 +3273,7 @@ mod tests {
             &tree,
             &base,
             &json!({
-                "kind": EVENT_KIND,
+                "v": EVENT_VERSION,
                 "author": "user",
                 "username": "Source",
                 "content": "inherited message",
@@ -3323,11 +3323,11 @@ mod tests {
             "one",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[
-                event_at(user, json!({"kind": EVENT_KIND, "author": "user", "username": "Alice", "content": "hello", "title": "First"})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": user, "status": "queued"})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "", "calls": [{"name": "bash"}]})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "done", "status": "idle"})),
+                event_at(user, json!({"v": EVENT_VERSION, "author": "user", "username": "Alice", "content": "hello", "title": "First"})),
+                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": user, "status": "queued"})),
+                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"})),
+                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "", "calls": [{"name": "bash"}]})),
+                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "done", "status": "idle"})),
             ],
         )
         .unwrap();
@@ -3347,8 +3347,8 @@ mod tests {
             "fallback",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[
-                event(json!({"kind": "caos-chat-event", "title": "old", "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})),
-                event(json!({"kind": "caos-chat-event", "title": null, "request": null})),
+                event(json!({"v": 2, "title": "old", "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})),
+                event(json!({"v": 2, "title": null, "request": null})),
             ],
         )
         .unwrap();
@@ -3407,10 +3407,13 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_is_stable_and_required() {
-        assert!(is_conversation_event(&json!({"kind": EVENT_KIND})));
+    fn event_version_is_numeric_exact_and_required() {
+        assert!(is_conversation_event(&json!({"v": EVENT_VERSION})));
+        assert!(!is_conversation_event(&json!({"kind": "caos-chat-event"})));
         assert!(!is_conversation_event(&json!({"kind": "other"})));
-        assert!(!is_conversation_event(&json!({"v": 2})));
+        assert!(!is_conversation_event(&json!({"v": 1})));
+        assert!(!is_conversation_event(&json!({"v": 3})));
+        assert!(!is_conversation_event(&json!({"v": "2"})));
         assert!(!is_conversation_event(&json!({})));
     }
 
@@ -3421,7 +3424,7 @@ mod tests {
         }
         assert_eq!(
             conversation_ref("project/talk-1").unwrap(),
-            "refs/caos/conversations/project/talk-1/head"
+            "refs/caos/v2/conversations/project/talk-1/head"
         );
         assert!(conversation_ref(&"a".repeat(MAX_CONVERSATION_ID_BYTES)).is_ok());
         assert!(conversation_ref(&"a".repeat(MAX_CONVERSATION_ID_BYTES + 1)).is_err());
@@ -3430,8 +3433,8 @@ mod tests {
 
     #[test]
     fn membership_keys_preserve_slashes_without_ref_collisions() {
-        let active = "refs/caos/users/u-41/conversations/active/";
-        let archived = "refs/caos/users/u-41/conversations/archived/";
+        let active = "refs/caos/v2/users/u-41/conversations/active/";
+        let archived = "refs/caos/v2/users/u-41/conversations/archived/";
         assert_eq!(conversation_key("project").unwrap(), "c-70726f6a656374");
         let nested = conversation_key("project/talk-1").unwrap();
         assert_eq!(nested, "c-70726f6a6563742f74616c6b2d31");
@@ -3527,7 +3530,7 @@ mod tests {
     #[test]
     fn mixed_tool_result_blocks_render_text_instead_of_json() {
         let events = durable_turn_events(&event(json!({
-            "kind": "caos-chat-event",
+            "v": 2,
             "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "round": 2,
             "result": {
@@ -3556,19 +3559,19 @@ mod tests {
             &[
                 event_at(
                     queued,
-                    json!({"kind": EVENT_KIND, "author": "user", "content": "start"}),
+                    json!({"v": EVENT_VERSION, "author": "user", "content": "start"}),
                 ),
                 event_at(
                     admitted,
-                    json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": queued, "status": "queued"}),
+                    json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": queued, "status": "queued"}),
                 ),
                 event_at(
                     "3333333333333333333333333333333333333333",
-                    json!({"kind": EVENT_KIND, "author": "user", "content": "also this"}),
+                    json!({"v": EVENT_VERSION, "author": "user", "content": "also this"}),
                 ),
                 event_at(
                     "4444444444444444444444444444444444444444",
-                    json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"}),
+                    json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"}),
                 ),
             ],
         )
@@ -3589,10 +3592,10 @@ mod tests {
             "one",
             "2222222222222222222222222222222222222222",
             &[
-                event_at(user, json!({"kind": "caos-chat-event","author":"user","content":"start"})),
+                event_at(user, json!({"v": 2,"author":"user","content":"start"})),
                 event_at(
                     "2222222222222222222222222222222222222222",
-                    json!({"kind": "caos-chat-event","request":request,"request_head":user,"status":"queued"}),
+                    json!({"v": 2,"request":request,"request_head":user,"status":"queued"}),
                 ),
             ],
         )
@@ -3741,7 +3744,7 @@ mod tests {
             &winner_tree,
             &base,
             &json!({
-                "kind": EVENT_KIND,
+                "v": EVENT_VERSION,
                 "author": "user",
                 "username": "Bob",
                 "content": "winning turn"
@@ -3754,7 +3757,7 @@ mod tests {
             &winner_tree,
             &winner_user,
             &json!({
-                "kind": EVENT_KIND,
+                "v": EVENT_VERSION,
                 "status": "queued",
                 "request": winner_request,
                 "request_head": winner_user
@@ -3830,7 +3833,7 @@ mod tests {
             "one",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[event(
-                json!({"kind": "caos-chat-event", "author": "user", "username": 7, "content": "hello"}),
+                json!({"v": 2, "author": "user", "username": 7, "content": "hello"}),
             )],
         )
         .unwrap_err();
@@ -3863,7 +3866,7 @@ mod tests {
         let transport = GitTransport::discover(&repo).unwrap();
         let error = conversation_snapshot_at(&transport, "broken", &malformed).unwrap_err();
         assert!(error.contains("conversation head"));
-        assert!(error.contains("caos-chat-event"));
+        assert!(error.contains("version-2"));
 
         std::fs::remove_dir_all(repo).unwrap();
     }
@@ -3885,7 +3888,7 @@ mod tests {
         test_git(&repo, &["add", "workspace"]);
         let tree = test_git(&repo, &["write-tree"]);
         let message = serde_json::to_string(
-            &json!({"kind": EVENT_KIND, "author": "user", "content": "orphan"}),
+            &json!({"v": EVENT_VERSION, "author": "user", "content": "orphan"}),
         )
         .unwrap();
         let root_event = test_git(&repo, &["commit-tree", &tree, "-m", &message]);
@@ -3931,7 +3934,7 @@ mod tests {
             &transport,
             &tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","username":"Alice","content":"valid"}),
+            &json!({"v": 2,"author":"user","username":"Alice","content":"valid"}),
         )
         .unwrap();
         let malformed = test_git(
@@ -3939,7 +3942,7 @@ mod tests {
             &["commit-tree", &tree, "-p", &base, "-m", "not an event"],
         );
         let parentless_message = serde_json::to_string(
-            &json!({"kind": EVENT_KIND, "author": "user", "content": "orphan"}),
+            &json!({"v": EVENT_VERSION, "author": "user", "content": "orphan"}),
         )
         .unwrap();
         let parentless = test_git(&repo, &["commit-tree", &tree, "-m", &parentless_message]);
@@ -3984,6 +3987,93 @@ mod tests {
     }
 
     #[test]
+    fn v2_chat_ignores_and_preserves_unversioned_refs() {
+        let (root, repo, transport, base) = conversation_index_fixture("v2-isolation");
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let legacy = test_git(
+            &repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                r#"{"kind":"caos-chat-event","author":"user","content":"old"}"#,
+            ],
+        );
+        let legacy_head = "refs/caos/conversations/shared/head";
+        let legacy_membership = format!(
+            "refs/caos/users/{}/conversations/active/{}",
+            user_key("Alice Smith").unwrap(),
+            conversation_key("shared").unwrap()
+        );
+        test_git(
+            &repo,
+            &[
+                "push",
+                "--quiet",
+                "--atomic",
+                CAOS_REMOTE,
+                &format!("{legacy}:{legacy_head}"),
+                &format!("{legacy}:{legacy_membership}"),
+            ],
+        );
+
+        assert!(remote_conversations(&transport).unwrap().is_empty());
+        assert!(
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Active,)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            pick_conversation(&transport, None, false).unwrap(),
+            ("talk-1".to_string(), true)
+        );
+
+        let request = "c".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice Smith".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "new v2 conversation",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote_ref(&transport, legacy_head).unwrap().as_deref(),
+            Some(legacy.as_str())
+        );
+        assert_eq!(
+            remote_ref(&transport, &legacy_membership)
+                .unwrap()
+                .as_deref(),
+            Some(legacy.as_str())
+        );
+        assert!(remote_ref(&transport, &conversation_ref("shared").unwrap())
+            .unwrap()
+            .is_some());
+        let listed =
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Active)
+                .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn submit_fetches_a_full_closure_when_only_the_raw_tip_is_local() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4015,7 +4105,7 @@ mod tests {
             &seed_transport,
             &tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","username":"seed","content":"start"}),
+            &json!({"v": 2,"author":"user","username":"seed","content":"start"}),
         )
         .unwrap();
         let request = "b".repeat(40);
@@ -4023,7 +4113,7 @@ mod tests {
             &seed_transport,
             &tree,
             &user,
-            &json!({"kind": "caos-chat-event","status":"queued","request":request,"request_head":user}),
+            &json!({"v": 2,"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
         let refname = conversation_ref("shared").unwrap();
@@ -4105,7 +4195,7 @@ mod tests {
             &transport,
             &tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","username":"Alice","content":"start"}),
+            &json!({"v": 2,"author":"user","username":"Alice","content":"start"}),
         )
         .unwrap();
         let request = "c".repeat(40);
@@ -4113,7 +4203,7 @@ mod tests {
             &transport,
             &tree,
             &user,
-            &json!({"kind": "caos-chat-event","status":"queued","request":request,"request_head":user}),
+            &json!({"v": 2,"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
         let refname = conversation_ref("shared").unwrap();
@@ -4293,7 +4383,7 @@ mod tests {
             &transport,
             &base_tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            &json!({"v": 2,"author":"user","content":"start"}),
         )
         .unwrap();
         let request = "b".repeat(40);
@@ -4301,7 +4391,7 @@ mod tests {
             &transport,
             &base_tree,
             &user,
-            &json!({"kind": "caos-chat-event","status":"queued","request":request,"request_head":user}),
+            &json!({"v": 2,"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
 
@@ -4312,7 +4402,7 @@ mod tests {
             &transport,
             &current_tree,
             &admitted,
-            &json!({"kind": "caos-chat-event","author":"user","username":"Bob","content":"concurrent"}),
+            &json!({"v": 2,"author":"user","username":"Bob","content":"concurrent"}),
         )
         .unwrap();
 
@@ -4371,7 +4461,7 @@ mod tests {
             &transport,
             &current_tree,
             &current,
-            &json!({"kind": EVENT_KIND, "request": request, "status": "idle"}),
+            &json!({"v": EVENT_VERSION, "request": request, "status": "idle"}),
         )
         .unwrap();
         test_git(
@@ -4594,7 +4684,7 @@ mod tests {
 
         let tree = test_git(&source_repo, &["rev-parse", &format!("{source}^{{tree}}")]);
         let event = serde_json::to_string(&json!({
-            "kind": EVENT_KIND,
+            "v": EVENT_VERSION,
             "forked_from": source,
             "title": "talk-3",
             "status": "idle",
@@ -4655,7 +4745,7 @@ mod tests {
             &tree,
             &source,
             &json!({
-                "kind": EVENT_KIND,
+                "v": EVENT_VERSION,
                 "forked_from": format!("--output={}", output.display()),
                 "status": "idle"
             }),
@@ -4680,7 +4770,7 @@ mod tests {
             &transport,
             &tree,
             &source,
-            &json!({"kind": EVENT_KIND, "forked_from": base, "status": "idle"}),
+            &json!({"v": EVENT_VERSION, "forked_from": base, "status": "idle"}),
         )
         .unwrap();
         let mismatch_ref = conversation_ref("mismatch").unwrap();
@@ -4706,7 +4796,7 @@ mod tests {
         let base = test_git(&source_repo, &["rev-parse", "HEAD"]);
         let tree = test_git(&source_repo, &["rev-parse", "HEAD^{tree}"]);
         let message = serde_json::to_string(&json!({
-            "kind": EVENT_KIND,
+            "v": EVENT_VERSION,
             "author": "user",
             "username": "Source",
             "content": "old source",
@@ -5049,7 +5139,7 @@ mod tests {
             &tree,
             &base,
             &json!({
-                "kind": "caos-chat-event",
+                "v": 2,
                 "author": "user",
                 "username": "seed",
                 "content": "start"
@@ -5062,7 +5152,7 @@ mod tests {
             &tree,
             &first,
             &json!({
-                "kind": "caos-chat-event",
+                "v": 2,
                 "status": "queued",
                 "request": request,
                 "request_head": first,
@@ -5095,7 +5185,7 @@ mod tests {
 
         // The canonical push must remain successful even when another local
         // process holds the expendable cache ref's lock.
-        let alice_cache = alice.join(".git/refs/caos/conversations/shared");
+        let alice_cache = alice.join(".git/refs/caos/v2/conversations/shared");
         std::fs::create_dir_all(&alice_cache).unwrap();
         std::fs::write(alice_cache.join("head.lock"), "held by another TUI\n").unwrap();
 

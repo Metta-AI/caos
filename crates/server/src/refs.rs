@@ -31,7 +31,7 @@ while IFS=' ' read -r old new refname; do
       echo "caos: refusing client update to server-owned ref $refname" >&2
       exit 1
       ;;
-    refs/caos/conversations/*/head) ;;
+    refs/caos/v2/conversations/*/head) ;;
     *) continue ;;
   esac
 
@@ -524,7 +524,7 @@ mod tests {
         );
         let broken = write_object(&dir, "commit", &body);
         let request = serde_json::json!({
-            "ref": "refs/caos/conversations/broken/head",
+            "ref": "refs/caos/v2/conversations/broken/head",
             "expected": null,
             "new": broken,
         })
@@ -539,7 +539,7 @@ mod tests {
     fn append_endpoint_is_atomic_batched_and_idempotent() {
         let (dir, a, b, c, d) = repo();
         let config = config(&dir);
-        let refname = "refs/caos/conversations/test/head";
+        let refname = "refs/caos/v2/conversations/test/head";
         let request = |expected: Option<&str>, new: &str| {
             serde_json::json!({"ref": refname, "expected": expected, "new": new}).to_string()
         };
@@ -596,7 +596,7 @@ mod tests {
         let (dir, a, b, c, _d) = repo();
         install_hook(&dir).unwrap();
         install_hook(&dir).unwrap();
-        let refname = "refs/caos/conversations/test/head";
+        let refname = "refs/caos/v2/conversations/test/head";
         let push = |source: &str, force: bool| {
             let mut command = Command::new("git");
             command.args(["-C", &dir, "push", "--quiet"]);
@@ -642,6 +642,29 @@ mod tests {
         std::fs::write(&hook, [0xff, 0xfe]).unwrap();
         let error = install_hook(&dir).unwrap_err();
         assert!(error.contains("unmanaged pre-receive hook"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_hook_upgrade_moves_append_protection_to_v2_only() {
+        if bash_in_path().is_err() {
+            return;
+        }
+        let (dir, _a, _b, _c, _d) = repo();
+        let hook = Path::new(&dir).join("hooks/pre-receive");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n{HOOK_MARKER}\ncase refs/caos/conversations/test/head in\n  refs/caos/conversations/*/head) ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+
+        install_hook(&dir).unwrap();
+
+        let installed = std::fs::read_to_string(&hook).unwrap();
+        assert!(installed.contains("refs/caos/v2/conversations/*/head"));
+        assert!(!installed.contains("refs/caos/conversations/*/head"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
