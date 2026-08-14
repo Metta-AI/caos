@@ -10,4 +10,4 @@
 # binary at `<mount>/bin/llm-stub`. No `--target`: `--cmd=build` defaults to
 # musl-static (worker_common::MUSL_TARGET), which a `.caos-expr` could not
 # compute for itself.
-run DEEP-DEPS/cargo -- --cmd=build --tree:@=.
+run --base:@=DEEP-DEPS/cargo --cmd=build --tree:@=.

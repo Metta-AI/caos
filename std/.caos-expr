@@ -18,4 +18,4 @@
 # keys: a seeded item's `in` is its DEEPENED entry, i.e. what this expression
 # produces. So the hand-deepen and this worker must agree BYTE FOR BYTE or the
 # seeder's key misses — see `deepen_entry` there.
-run deep-deps -- --in:@=.
+run --base:@=deep-deps --in:@=.

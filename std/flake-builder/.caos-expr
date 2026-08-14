@@ -8,4 +8,4 @@
 # hand-built delta). If the seeder is absent the job hits the generic runner and
 # fails loudly on a bogus image — an honest "bootstrap broken" signal, never a
 # silent wrong answer.
-run docker://seeded -- --in:@=.
+run --base:docker=seeded --in:@=.
