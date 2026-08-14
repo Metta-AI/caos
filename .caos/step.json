@@ -1,0 +1,1 @@
+{"content":[{"text":"I'll merge `origin/main` into the workspace.","type":"text"},{"caller":{"type":"direct"},"id":"toolu_0181S9NLZ4XDods7Dxhh8Sxe","input":{"theirs":"origin/main"},"name":"merge","type":"tool_use"}],"results":[],"v":1}
