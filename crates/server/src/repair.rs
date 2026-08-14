@@ -169,10 +169,12 @@ struct IntegrityMemo {
 }
 
 /// Validate a ref target. Durable conversation/index refs include a commit's
-/// workspace tree, but not its parents: this lets recovery roll back past one
-/// damaged append. Content-addressed request/result refs only need their named
-/// object to be readable; traversing every request workspace would turn startup
-/// repair into a scan of unrelated immutable history.
+/// workspace tree, but not its parents. This keeps generic startup repair from
+/// scanning unrelated ordinary history, but it also means a surviving tip with
+/// a missing earlier event is not detected here; chat-aware spine repair is
+/// tracked in the chat design. Content-addressed request/result refs only need
+/// their named object to be readable; traversing every request workspace would
+/// turn startup repair into a scan of unrelated immutable history.
 fn intact_ref_target(
     repo: &gix::Repository,
     id: gix::ObjectId,
