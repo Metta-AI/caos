@@ -2522,7 +2522,7 @@ fn record_continuation(
 
     let mut given: Vec<&str> = Vec::new();
     for kv in kvs {
-        // Markers are bare flags, matched BEFORE parse_kv — which requires a
+        // Markers are bare flags, matched BEFORE parse_arg — which requires a
         // `=value` and would reject them. Presence is the whole signal, so the
         // recorded blob's content is arbitrary; the interpreter never reads it.
         if let Some(&name) = markers.iter().find(|&&m| kv.strip_prefix("--") == Some(m)) {
