@@ -125,7 +125,7 @@ fn start(cfg: &Config) -> Result<(), String> {
     let head_hash = cas_hash(&arg("head"))?;
     let log = ensure_request_running(conversation, &run, &head_hash)?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
-        readmit_pending_async(cfg, &log)?;
+        reconcile_async_tasks(cfg, &log)?;
         return finish_from_terminal(terminal);
     }
     let request = active_request(&log)?;
@@ -187,7 +187,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
         .map_err(|error| format!("invalid continuation round: {error}"))?;
     let base_head = read_arg("base-head")?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
-        readmit_pending_async(cfg, &log)?;
+        reconcile_async_tasks(cfg, &log)?;
         return finish_from_terminal(terminal);
     }
     let request = active_request(&log)?;
@@ -1089,13 +1089,17 @@ fn request_for_head(log: &progress::ConversationLog, head: &str) -> Result<Strin
 }
 
 fn validate_run_hash(run: &str) -> Result<(), String> {
-    if run.len() != 40
-        || !run
+    validate_hash(run, "conversation run")
+}
+
+pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
+    if hash.len() != 40
+        || !hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(format!(
-            "conversation run must be a lowercase 40-character hexadecimal hash, got {run:?}"
+            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
         ));
     }
     Ok(())
@@ -1310,9 +1314,7 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
     retry_pending_append(
         &log.head,
         &tree,
-        |head, workspace| {
-            progress::append_event_at_head(conversation, head, &event, workspace)
-        },
+        |head, workspace| progress::append_event_at_head(conversation, head, &event, workspace),
         || {
             let log = progress::conversation_log(conversation)?;
             let status =
@@ -1338,22 +1340,40 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
     Ok(observed_status.unwrap_or_else(|| "pending".to_string()))
 }
 
-/// Re-admit every Q whose latest durable state is pending. Failures are
-/// intentionally warnings: the status remains on F and a later invocation
-/// retries the same exact Q. Validation inside `readmit_task` prevents a
-/// forged event from targeting any ref except this conversation's head.
-fn readmit_pending_async(cfg: &Config, log: &progress::ConversationLog) -> Result<(), String> {
-    let tasks = async_work::tasks(log.events.iter().map(|event| &event.value))?
-        .into_iter()
-        .filter_map(|(task, status)| (status == "pending").then_some(task))
-        .collect::<Vec<_>>();
+/// Re-admit pending Qs and terminal Qs whose exact result ref is still absent.
+/// The latter closes the crash window between recording `complete`/`failed`
+/// and the server pinning `refs/caos/res/Q`. Failures are warnings: the durable
+/// state remains on F and a later invocation retries the same Q. Validation
+/// inside `readmit_task` prevents a forged event from targeting another ref.
+fn reconcile_async_tasks(cfg: &Config, log: &progress::ConversationLog) -> Result<(), String> {
+    let tasks = async_work::tasks(log.events.iter().map(|event| &event.value));
     if tasks.is_empty() {
         return Ok(());
     }
     let conversation = conversation(cfg)?;
-    for task in tasks {
-        if let Err(error) = async_work::readmit_task(&task, conversation) {
-            eprintln!("llm-step: could not re-admit pending async task {task}: {error}");
+    for state in tasks {
+        let result_is_addressable = if state.status == "pending" {
+            false
+        } else {
+            match progress::result_ref(&state.task) {
+                Ok(result) => result.is_some(),
+                Err(error) => {
+                    eprintln!(
+                        "llm-step: could not read result ref for async task {}: {error}",
+                        state.task
+                    );
+                    continue;
+                }
+            }
+        };
+        if !async_work::status_needs_dispatch(&state.status, result_is_addressable) {
+            continue;
+        }
+        if let Err(error) = async_work::readmit_task(&state.task, conversation) {
+            eprintln!(
+                "llm-step: could not re-admit async task {} ({}): {error}",
+                state.task, state.status
+            );
         }
     }
     Ok(())
@@ -1365,7 +1385,7 @@ fn resume_run(
     head_hash: &str,
     log: progress::ConversationLog,
 ) -> Result<(), String> {
-    readmit_pending_async(cfg, &log)?;
+    reconcile_async_tasks(cfg, &log)?;
     if let Some(terminal) = terminal_for_run(&log, run)? {
         return finish_from_terminal(terminal);
     }
@@ -1538,10 +1558,16 @@ fn event_messages(
     }
     flush_batch(&mut messages, &mut batch)?;
     if include_async_status {
-        for (task, status) in async_work::tasks(log.events.iter().map(|event| &event.value))? {
-            if matches!(status.as_str(), "complete" | "failed") {
+        let latest_response = log
+            .events
+            .iter()
+            .rposition(|event| event.value.get("response").is_some());
+        for state in async_work::tasks(log.events.iter().map(|event| &event.value)) {
+            let unseen = latest_response.map_or(true, |index| state.event_index > index);
+            if unseen && matches!(state.status.as_str(), "complete" | "failed") {
                 messages.push(user_text(&format!(
-                    "Independent task {task} is {status}. Its result is addressed by that task hash."
+                    "Independent task {} is {}. Its result is addressed by that task hash.",
+                    state.task, state.status
                 )));
             }
         }
@@ -1965,7 +1991,7 @@ fn response_text(blocks: &[Value]) -> String {
 }
 
 /// A fresh, unique direct-child CAS path (CAS paths are single-assignment).
-fn fresh(prefix: &str) -> String {
+pub(crate) fn fresh(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("/cas/{prefix}-{n}")
@@ -2063,6 +2089,36 @@ mod tests {
         let state = latest_round(&history, &run).unwrap().unwrap();
         assert_eq!(state.round, 1);
         assert_eq!(state.pending.len(), 1);
+    }
+
+    #[test]
+    fn terminal_async_notice_is_only_emitted_before_the_next_response() {
+        let run = "b".repeat(40);
+        let task = "c".repeat(40);
+        let mut events = vec![
+            json!({"v":2,"author":"user","content":"start"}),
+            json!({"v":2,"request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
+            json!({"v":2,"async":{"task":task,"status":"complete"}}),
+        ];
+        let before_response = event_messages(&log(events.clone()), true).unwrap();
+        assert!(before_response.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Independent task"))
+        }));
+
+        events.push(json!({
+            "v":2,
+            "request":run,
+            "round":1,
+            "response":[{"type":"text","text":"observed"}]
+        }));
+        let after_response = event_messages(&log(events), true).unwrap();
+        assert!(!after_response.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Independent task"))
+        }));
     }
 
     #[test]

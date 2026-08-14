@@ -36,7 +36,7 @@ fn run() -> Result<(), String> {
 
 fn start() -> Result<(), String> {
     let request = read_arg("subreq")?;
-    validate_hash(&request, "subreq")?;
+    refs::validate_hash(&request, "subreq")?;
     let target_ref = read_arg("target-ref")?;
     refs::validate_target_ref(&target_ref)?;
 
@@ -70,13 +70,6 @@ fn finish(status: &str) -> Result<(), String> {
     let target_ref = read_arg("target-ref")?;
     refs::validate_target_ref(&target_ref)?;
     let task = read_arg("task")?;
-    validate_hash(&task, "task")?;
+    refs::validate_hash(&task, "task")?;
     refs::append_status(&target_ref, &task, status)
-}
-
-fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid {what} hash {hash:?}"));
-    }
-    Ok(())
 }

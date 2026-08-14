@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::Value;
 
 const EVENT_KIND: &str = "caos-chat-event";
+use crate::validate_hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendResult {
@@ -272,19 +273,6 @@ fn validate_conversation(conversation: &str) -> Result<(), String> {
         {
             return Err(format!("invalid conversation name {conversation:?}"));
         }
-    }
-    Ok(())
-}
-
-fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(format!(
-            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
-        ));
     }
     Ok(())
 }
@@ -860,6 +848,14 @@ fn read_ref(base: &str, refname: &str) -> Result<Option<String>, String> {
         .trim();
     validate_hash(hash, "remote ref")?;
     Ok(Some(hash.to_string()))
+}
+
+/// Read the exact result ref for a top-level request. Independent-work
+/// reconciliation uses absence as proof that a terminal status has not yet
+/// converged to an addressable result and must be dispatched again.
+pub(crate) fn result_ref(task: &str) -> Result<Option<String>, String> {
+    validate_hash(task, "async task")?;
+    read_ref(&server_base()?, &format!("refs/caos/res/{task}"))
 }
 
 #[cfg(test)]

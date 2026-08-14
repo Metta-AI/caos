@@ -14,7 +14,9 @@
 
 Since extended with the **single-valued form**, `caos run-then` (the
 continuation gained a `run` entry, mutually exclusive with `map`; see
-[Run-then](#run-then-the-single-valued-form)).
+[Run-then](#run-then-the-single-valued-form)), and the **exact-request form**,
+`caos run-request-then` (see
+[Run-request-then](#run-request-then-the-exact-request-form)).
 
 ## Problem
 
@@ -38,16 +40,16 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 - **`caos map-then <in> -- [--map=<img>] [--then=<img>]`** (worker form) writes
   `/cas/out` as a **promise placeholder** naming a continuation object;
   `entrypoint` reports `promise <hash>` instead of `blob/tree <hash>`.
-- The **continuation** is a content-addressed tree `{in, map?, run?, then?,
-  catch?}`: `in` is a real tree entry (the data node, mode + oid);
-  `map`/`run`/`then` are blobs naming images (resolved to hashes / `docker://`
-  refs client-side, so the server never sees `/cas` paths); `catch` is a marker
-  blob whose presence is the whole signal (see
-  [Catch](#catch-a-failing-run-as-a-value)). `map` and `run` are **mutually
-  exclusive** — the worker CLI's two verbs (`map-then` takes only
-  `--map`/`--then`, `run-then` only `--run`/`--then`/`--catch`) enforce that
-  client-side, and the server rejects a continuation carrying both as defense
-  in depth.
+- The **continuation** is one of two content-addressed shapes:
+  `{in, map?|run?|then?, catch?}` or `{request, then?, catch?}`. `in` is a real
+  tree entry (the data node, mode + oid); `request` is a real tree entry naming
+  one complete ArgTree; `map`/`run`/`then` are blobs naming images (resolved to
+  hashes / `docker://` refs client-side, so the server never sees `/cas` paths);
+  `catch` is a marker blob whose presence is the whole signal (see
+  [Catch](#catch-a-failing-single-valued-step-as-a-value)). `map`, `run`, and
+  `request` are **mutually exclusive**, and `request` excludes `in`. The worker
+  CLI verbs enforce those shapes client-side and the server re-checks them as
+  defense in depth.
 - The **server**, on a `promise` result, resolves it — one path, a *middle
   step* then `then`:
   1. if `map` is given and `in` is a tree: run `map` with `--in=<child>` for
@@ -56,12 +58,14 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
      names;
   2. if `run` is given: **one** sub-run, `run(--in=<in>)`, yielding R — the
      single-valued form (see below);
-  3. if `then` is given: the request's result is `then(--in=<in>
-     [, --children=<children> | --result=<R>])` — the extra arg only when a
-     middle step ran;
-  4. with no `then`, the middle step's own result is the request's result —
-     the `children` tree after a `map`, R after a `run`. With no middle step,
-     `then(--in=<in>)` is a plain tail call.
+  3. if `request` is given: execute that exact ArgTree unchanged, yielding R —
+     the exact-request form (see below);
+  4. if `then` is given: the request's result is `then(--in=<in>
+     [, --children=<children> | --result=<R>])` for the `in` shape. For the
+     exact-request shape it is `then(--result=<R>)`, with no synthesized `in`;
+  5. with no `then`, the middle step's own result is the request's result —
+     the `children` tree after a `map`, R after a `run` or exact `request`. With
+     no middle step, `then(--in=<in>)` is a plain tail call.
 
   Every sub-run goes through the same internal pipeline (cache → cycle check →
   dispatch → promise resolution), so promises nest arbitrarily: a `map` child,
@@ -91,7 +95,23 @@ first-class commits) as much as a blob or tree.
 `caos-cli run` is **unchanged**: it still blocks at the top level (it holds no
 worker slot), and the server resolves all promises before answering.
 
-## Catch: a failing `run` as a value
+## Run-request-then: the exact-request form
+
+`caos run-request-then <R> -- [--then=<img>] [--catch]` (helpers
+`worker_common::run_request_then` and `run_request_then_catching`) records
+`{request: R, then?, catch?}`. `R` is already a complete ArgTree: the server
+executes that exact request identity without adding an `in` argument or
+reassembling it around an image. With no `then`, R's result is returned
+unchanged. With `then`, the callback receives only `--result=<R-result>`; it
+does not receive `--in`.
+
+The shape is intentionally exclusive: `request` cannot coexist with `in`,
+`map`, or `run`. `catch` requires `then`; when R fails, the callback receives
+only `--error=<blob>` instead of `--result`. This is the durable-work primitive:
+the exact recorded request can be reissued after recovery without reconstructing
+its arguments.
+
+## Catch: a failing single-valued step as a value
 
 `caos run-then <in> -- --run=<img> --then=<img> --catch` (helper:
 `worker_common::run_then_catching`) records a `catch` marker alongside the rest.
@@ -112,9 +132,10 @@ tool results, and the model's in-turn work.
 Two constraints, both enforced client-side and re-checked by the interpreter:
 
 - **`catch` needs `then`.** An error with no recipient is just an error.
-- **`catch` is `run`-only.** A caught `map` would have to say *which* child
-  failed and what the surviving siblings' results mean; nothing needs that yet,
-  and guessing the shape now would be the wrong guess.
+- **`catch` is single-valued.** It applies to `run` or exact `request`. A caught
+  `map` would have to say *which* child failed and what the surviving siblings'
+  results mean; nothing needs that yet, and guessing the shape now would be the
+  wrong guess.
 
 A request whose resolution caught a failure is **not memoized**. Sub-run
 failures are deliberately uncached (`cargo-workers.md`); folding one into a

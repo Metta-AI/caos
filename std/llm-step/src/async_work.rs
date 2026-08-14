@@ -13,17 +13,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::{json, Value};
 use worker_common::{caos, path, prepare_request, Arg};
+
+use crate::{fresh, progress, validate_hash};
 
 pub const TOOL_NAME: &str = "run_async";
 
 pub fn declaration() -> Value {
     json!({
         "name": TOOL_NAME,
-        "description": "Start an already-constructed CAOS request in the background. The request must be a complete 40-character ArgTree hash. Returns a task hash immediately; that same hash names the eventual CAOS result. Use this only for work that can proceed independently of the current response.",
+        "description": "Start an already-constructed CAOS request in the background. The request must be a complete 40-character ArgTree hash already stored in CAOS. Returns a task hash immediately; that same hash names the eventual CAOS result. Use this only for independent work whose complete context is in the request: detached work does not inherit secrets, credentials, model settings, or other ambient execution context.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -57,11 +58,16 @@ where
     if call.get("name").and_then(Value::as_str) != Some(TOOL_NAME) {
         return Err(format!("async queue received a non-{TOOL_NAME} tool call"));
     }
-    let request = call
+    let Some(request) = call
         .get("input")
         .and_then(|input| input.get("request"))
         .and_then(Value::as_str)
-        .ok_or("run_async call has no string `request`")?;
+    else {
+        return Ok(error_block(
+            id,
+            "run_async needs a string `request` containing a complete CAOS ArgTree hash",
+        ));
+    };
     queue_request(
         id,
         request,
@@ -83,8 +89,13 @@ pub fn queue_request<S>(
 where
     S: FnOnce(&str) -> Result<String, String>,
 {
-    validate_hash(subrequest, "async subrequest")?;
+    if let Err(error) = validate_hash(subrequest, "async subrequest") {
+        return Ok(error_block(call_id, &error));
+    }
     validate_target_ref(target_ref)?;
+    if let Some(error) = request_tree_error(subrequest)? {
+        return Ok(error_block(call_id, &error));
+    }
 
     let task = prepare_request(
         run_and_update_ref_image,
@@ -98,11 +109,50 @@ where
     let status = ensure_status(&task)?;
     validate_status(&status)?;
 
-    if let Some(error) = dispatch_error(&task, &status, dispatch) {
-        eprintln!("llm-step: {error}; task remains pending and will be re-admitted");
+    let result_is_addressable = if status == "pending" {
+        false
+    } else {
+        progress::result_ref(&task)?.is_some()
+    };
+    if let Some(error) = dispatch_error(
+        &task,
+        status_needs_dispatch(&status, result_is_addressable),
+        dispatch,
+    ) {
+        eprintln!("llm-step: {error}; the durable task state will cause a later recovery to retry");
     }
 
     Ok(result_block(call_id, &task, &status))
+}
+
+/// Check the model-supplied hash before publishing `pending`. A missing object
+/// or a non-tree object is user input and becomes an `is_error` result. Failure
+/// to launch the client or any server error other than not-found is
+/// infrastructure failure and remains fatal to the turn.
+fn request_tree_error(request: &str) -> Result<Option<String>, String> {
+    let target = fresh("async-subrequest");
+    let output = Command::new("caos")
+        .args(["get-hash", request, &target])
+        .output()
+        .map_err(|error| format!("validating async subrequest {request}: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if detail.contains("server returned 404") {
+            return Ok(Some(format!(
+                "async request {request} is not stored in CAOS"
+            )));
+        }
+        return Err(format!(
+            "validating async subrequest {request} failed ({}): {detail}",
+            output.status
+        ));
+    }
+    if !Path::new(&target).is_dir() {
+        return Ok(Some(format!(
+            "async request {request} is not an ArgTree (its object is not a tree)"
+        )));
+    }
+    Ok(None)
 }
 
 fn result_block(call_id: &str, task: &str, status: &str) -> Value {
@@ -114,29 +164,64 @@ fn result_block(call_id: &str, task: &str, status: &str) -> Value {
     })
 }
 
+fn error_block(call_id: &str, error: &str) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "is_error": true,
+        "content": [{"type": "text", "text": error}],
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskState {
+    pub task: String,
+    pub status: String,
+    pub event_index: usize,
+}
+
 /// Fold the latest status for each task from chronological conversation event
-/// values. Task state is conversation metadata, not workspace content.
-pub(crate) fn tasks<'a>(
-    events: impl IntoIterator<Item = &'a Value>,
-) -> Result<Vec<(String, String)>, String> {
+/// values. Task state is conversation metadata, not workspace content. A
+/// malformed or future-version state cannot be allowed to brick the append-only
+/// conversation, so it is ignored with a warning; writers remain strict.
+pub(crate) fn tasks<'a>(events: impl IntoIterator<Item = &'a Value>) -> Vec<TaskState> {
     let mut tasks = BTreeMap::new();
-    for event in events {
+    for (event_index, event) in events.into_iter().enumerate() {
         let Some(state) = event.get("async") else {
             continue;
         };
-        let task = state
-            .get("task")
-            .and_then(Value::as_str)
-            .ok_or("conversation async event has no string task")?;
-        let status = state
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or("conversation async event has no string status")?;
-        validate_hash(task, "async task")?;
-        validate_status(status)?;
-        tasks.insert(task.to_string(), status.to_string());
+        let parsed = (|| {
+            let task = state
+                .get("task")
+                .and_then(Value::as_str)
+                .ok_or("conversation async event has no string task")?;
+            let status = state
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or("conversation async event has no string status")?;
+            validate_hash(task, "async task")?;
+            validate_status(status)?;
+            Ok::<_, String>((task, status))
+        })();
+        let (task, status) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!(
+                    "llm-step: ignoring malformed async event at index {event_index}: {error}"
+                );
+                continue;
+            }
+        };
+        tasks.insert(
+            task.to_string(),
+            TaskState {
+                task: task.to_string(),
+                status: status.to_string(),
+                event_index,
+            },
+        );
     }
-    Ok(tasks.into_iter().collect())
+    tasks.into_values().collect()
 }
 
 pub(crate) fn task_status<'a>(
@@ -144,9 +229,9 @@ pub(crate) fn task_status<'a>(
     task: &str,
 ) -> Result<Option<String>, String> {
     validate_hash(task, "async task")?;
-    Ok(tasks(events)?
+    Ok(tasks(events)
         .into_iter()
-        .find_map(|(found, status)| (found == task).then_some(status)))
+        .find_map(|state| (state.task == task).then_some(state.status)))
 }
 
 /// Re-admit Q only after verifying that its recorded target is this
@@ -223,13 +308,6 @@ fn validate_target_ref(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("invalid {what} hash {hash:?}"));
-    }
-    Ok(())
-}
-
 fn validate_status(status: &str) -> Result<(), String> {
     if matches!(status, "pending" | "complete" | "failed") {
         Ok(())
@@ -262,22 +340,15 @@ fn dispatch(task: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch_error<F>(task: &str, status: &str, dispatch: F) -> Option<String>
+pub(crate) fn status_needs_dispatch(status: &str, result_is_addressable: bool) -> bool {
+    status == "pending" || (matches!(status, "complete" | "failed") && !result_is_addressable)
+}
+
+fn dispatch_error<F>(task: &str, needed: bool, dispatch: F) -> Option<String>
 where
     F: FnOnce(&str) -> Result<(), String>,
 {
-    (status == "pending")
-        .then(|| dispatch(task).err())
-        .flatten()
-}
-
-fn fresh(prefix: &str) -> String {
-    format!("/cas/{prefix}-{}", counter())
-}
-
-fn counter() -> u32 {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    needed.then(|| dispatch(task).err()).flatten()
 }
 
 #[cfg(test)]
@@ -313,12 +384,60 @@ mod tests {
     }
 
     #[test]
-    fn only_pending_tasks_are_dispatched() {
+    fn malformed_async_events_are_skipped_without_losing_valid_state() {
         let task = "a".repeat(40);
-        assert!(dispatch_error(&task, "complete", |_| Err("called".into())).is_none());
+        let events = [
+            json!({"v": 2, "async": {"task": task, "status": "pending"}}),
+            json!({"v": 2, "async": {"task": "oops", "status": "pending"}}),
+            json!({"v": 2, "async": {"task": task, "status": "future"}}),
+        ];
         assert_eq!(
-            dispatch_error(&task, "pending", |_| Err("temporarily unavailable".into())).as_deref(),
+            task_status(events.iter(), &task).unwrap().as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn malformed_model_arguments_are_tool_errors() {
+        let missing = json!({"type": "tool_use", "id": "call-1", "name": TOOL_NAME, "input": {}});
+        let result = queue_call(&missing, "chat", "unused", |_| {
+            panic!("malformed call must not record pending")
+        })
+        .unwrap();
+        assert_eq!(result["tool_use_id"], "call-1");
+        assert_eq!(result["is_error"], true);
+
+        let malformed = json!({
+            "type": "tool_use",
+            "id": "call-2",
+            "name": TOOL_NAME,
+            "input": {"request": "not-a-hash"}
+        });
+        let result = queue_call(&malformed, "chat", "unused", |_| {
+            panic!("malformed call must not record pending")
+        })
+        .unwrap();
+        assert_eq!(result["tool_use_id"], "call-2");
+        assert_eq!(result["is_error"], true);
+    }
+
+    #[test]
+    fn pending_and_terminal_without_a_result_are_dispatched() {
+        let task = "a".repeat(40);
+        assert!(
+            dispatch_error(&task, status_needs_dispatch("complete", true), |_| {
+                Err("called".into())
+            })
+            .is_none()
+        );
+        assert_eq!(
+            dispatch_error(&task, status_needs_dispatch("pending", false), |_| Err(
+                "temporarily unavailable".into()
+            ))
+            .as_deref(),
             Some("temporarily unavailable")
         );
+        assert!(status_needs_dispatch("failed", false));
+        assert!(!status_needs_dispatch("failed", true));
     }
 }

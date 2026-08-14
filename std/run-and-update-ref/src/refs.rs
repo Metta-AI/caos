@@ -148,26 +148,42 @@ fn task_status(base: &str, head: &str, task: &str) -> Result<Option<String>, Str
             Ok(event) if event.get("v").and_then(Value::as_u64) == Some(2) => event,
             _ => return Ok(None),
         };
-        if let Some(state) = event.get("async") {
-            let found = state
-                .get("task")
-                .and_then(Value::as_str)
-                .ok_or("conversation async event has no string task")?;
-            let status = state
-                .get("status")
-                .and_then(Value::as_str)
-                .ok_or("conversation async event has no string status")?;
-            validate_hash(found, "async task")?;
-            if !matches!(status, "pending" | "complete" | "failed") {
-                return Err(format!("invalid async status {status:?}"));
-            }
-            if found == task {
-                return Ok(Some(status.to_string()));
-            }
+        if let Some(status) = event_task_status(&event, task) {
+            return Ok(Some(status));
         }
         current = commit.parent;
     }
     Ok(None)
+}
+
+/// Read one event defensively. Conversation history is append-only, so a
+/// malformed or future async payload must not prevent a valid finish event
+/// from being appended after it.
+fn event_task_status(event: &Value, wanted: &str) -> Option<String> {
+    let state = event.get("async")?;
+    let parsed = (|| {
+        let task = state
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or("conversation async event has no string task")?;
+        let status = state
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or("conversation async event has no string status")?;
+        validate_hash(task, "async task")?;
+        if !matches!(status, "pending" | "complete" | "failed") {
+            return Err(format!("invalid async status {status:?}"));
+        }
+        Ok::<_, String>((task, status))
+    })();
+    match parsed {
+        Ok((task, status)) if task == wanted => Some(status.to_string()),
+        Ok(_) => None,
+        Err(error) => {
+            eprintln!("run-and-update-ref: ignoring malformed async event: {error}");
+            None
+        }
+    }
 }
 
 fn store_commit(base: &str, tree: &str, parent: &str, message: &str) -> Result<String, String> {
@@ -310,7 +326,7 @@ fn read_ref(base: &str, refname: &str) -> Result<Option<String>, String> {
     Ok(Some(hash.to_string()))
 }
 
-fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
+pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
     if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("invalid {what} hash {hash:?}"));
     }
@@ -328,5 +344,25 @@ mod tests {
         assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/status").is_err());
         assert!(validate_target_ref("refs/caos/v2/conversations/a/head/b/head").is_err());
         assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_err());
+    }
+
+    #[test]
+    fn malformed_async_state_is_not_a_terminal_verdict() {
+        let task = "a".repeat(40);
+        assert_eq!(
+            event_task_status(
+                &json!({"v": 2, "async": {"task": "oops", "status": "complete"}}),
+                &task
+            ),
+            None
+        );
+        assert_eq!(
+            event_task_status(
+                &json!({"v": 2, "async": {"task": task, "status": "failed"}}),
+                &task
+            )
+            .as_deref(),
+            Some("failed")
+        );
     }
 }
