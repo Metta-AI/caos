@@ -2866,10 +2866,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "caos-chat-v2-{label}-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("caos-chat-{label}-{}-{unique}", std::process::id()));
         let remote = root.join("remote.git");
         let repo = root.join("client");
         std::fs::create_dir_all(&remote).unwrap();
