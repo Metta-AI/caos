@@ -4401,6 +4401,7 @@ mod tests {
         );
 
         let first = fork_conversation(&transport, "Alice", "same-fork", "talk-3", &source).unwrap();
+        set_conversation_title(&transport, "same-fork", "Renamed elsewhere").unwrap();
         let duplicate =
             fork_conversation(&transport, "Bob", "same-fork", "talk-3", &source).unwrap();
         assert_eq!(duplicate, first);
@@ -4417,6 +4418,13 @@ mod tests {
         .unwrap()
         .as_deref()
         .is_some_and(|head| head == first));
+        let renamed = remote_ref(&transport, &conversation_title_ref("same-fork").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            transport.get_object(&renamed).unwrap().1,
+            b"Renamed elsewhere"
+        );
 
         let occupied_active =
             user_conversation_ref("Charlie", UserConversationStatus::Active, "same-fork").unwrap();

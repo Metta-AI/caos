@@ -2467,7 +2467,9 @@ impl App {
                 if state.remote_title.as_deref() != Some(entry.summary.title.as_str()) {
                     let first_automatic_publication = state.generating_title
                         && state.automatic_title
-                        && entry.observed_title.is_none();
+                        && entry.observed_title.is_none()
+                        && state.automatic_title_fallback.as_deref()
+                            == Some(entry.summary.title.as_str());
                     state.remote_title = Some(entry.summary.title.clone());
                     if !first_automatic_publication {
                         state.title = entry.summary.title.clone();
@@ -2637,7 +2639,7 @@ impl App {
     fn finish_fork(
         &mut self,
         conversation: &str,
-        origin: &str,
+        _origin: &str,
         source: &str,
         result: Result<(String, Box<ConversationLoad>), String>,
     ) {
@@ -2655,54 +2657,34 @@ impl App {
                 state.status = format!("forked from {}", short_hash(source));
             }
             Err(error) => {
-                if self.conversations.len() == 1 {
-                    // The origin may have been closed while the fork was in
-                    // flight. Never leave the failed fork placeholder usable:
-                    // its base was deliberately cleared so a later submit
-                    // cannot create a marker-less imitation of the fork.
-                    let state = &self.conversations[index];
-                    let id = state.id.clone();
-                    let title = state.title.clone();
-                    let composer = state.composer.clone();
-                    match new_conversation_options(state.turn_options.clone(), None, &self.repo_dir)
-                    {
-                        Ok((options, base)) => {
-                            let mut replacement = ConversationState::new_virtual(
-                                id,
-                                title,
-                                options,
-                                format!("ready from {}; enter a prompt", short_hash(&base)),
-                            );
-                            replacement.composer = composer;
-                            replacement.show_command_error(format!(
-                                "creating conversation fork failed: {error}; opened a new conversation instead"
-                            ));
-                            self.conversations[index] = replacement;
-                        }
-                        Err(fallback_error) => {
-                            // Keeping `forking` set makes this placeholder
-                            // non-submittable until the user opens another
-                            // conversation or fixes the repository state.
-                            self.conversations[index].show_command_error(format!(
-                                "creating conversation fork failed: {error}; creating a safe replacement also failed: {fallback_error}"
-                            ));
-                        }
+                // Never discard text typed while the fork was in flight. Turn
+                // the placeholder into an ordinary new conversation in place,
+                // independent of how many other tabs happen to be open.
+                let state = &self.conversations[index];
+                let id = state.id.clone();
+                let title = state.title.clone();
+                let composer = state.composer.clone();
+                match new_conversation_options(state.turn_options.clone(), None, &self.repo_dir) {
+                    Ok((options, base)) => {
+                        let mut replacement = ConversationState::new_virtual(
+                            id,
+                            title,
+                            options,
+                            format!("ready from {}; enter a prompt", short_hash(&base)),
+                        );
+                        replacement.composer = composer;
+                        replacement.show_command_error(format!(
+                            "creating conversation fork failed: {error}; opened a new conversation instead"
+                        ));
+                        self.conversations[index] = replacement;
                     }
-                    return;
-                }
-                let selected_fork = self.selected == index;
-                self.conversations.remove(index);
-                if self.selected > index {
-                    self.selected -= 1;
-                }
-                if selected_fork {
-                    self.selected = self
-                        .conversation_index(origin)
-                        .unwrap_or_else(|| self.selected.min(self.conversations.len() - 1));
-                }
-                if let Some(origin) = self.conversation_index(origin) {
-                    self.conversations[origin]
-                        .show_command_error(format!("creating conversation fork failed: {error}"));
+                    Err(fallback_error) => {
+                        // Keeping `forking` set makes this placeholder
+                        // non-submittable until the user fixes repository state.
+                        self.conversations[index].show_command_error(format!(
+                            "creating conversation fork failed: {error}; creating a safe replacement also failed: {fallback_error}"
+                        ));
+                    }
                 }
             }
         }
@@ -3434,7 +3416,9 @@ impl App {
             state.remote_title = Some(title.to_string());
         }
         state.automatic_title = false;
-        state.automatic_title_fallback = None;
+        if published {
+            state.automatic_title_fallback = None;
+        }
         state.status = format!("renamed conversation to {title:?}");
     }
 
@@ -4108,7 +4092,7 @@ mod tests {
             TurnOptions::default(),
             "ready".to_string(),
         );
-        conversation.title = "local fallback".to_string();
+        conversation.apply_automatic_title("published fallback");
         conversation.generating_title = true;
         let (mut app, _) = app_with(vec![conversation]);
 
@@ -4124,13 +4108,41 @@ mod tests {
             load: None,
         }]));
 
-        assert_eq!(app.selected().title, "local fallback");
+        assert_eq!(app.selected().title, "published fallback");
         assert_eq!(
             app.selected().remote_title.as_deref(),
             Some("published fallback")
         );
         assert!(app.selected().automatic_title);
         assert!(app.selected().generating_title);
+    }
+
+    #[test]
+    fn first_observed_foreign_title_cancels_automatic_generation() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("published fallback");
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "internal-id".to_string(),
+                title: "manual rename".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: None,
+            observed_title: None,
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "manual rename");
+        assert!(!app.selected().automatic_title);
     }
 
     #[test]
@@ -4205,6 +4217,42 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn generated_title_uses_fallback_when_remote_title_is_not_cached() {
+        let (repo, remote, _) = repo_with_default_branch("unknown-remote-title", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        publish_user_conversation(&transport, "tester", "new-talk", "fallback prompt").unwrap();
+
+        let mut conversation = ConversationState::new_virtual(
+            "new-talk".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("fallback prompt");
+        conversation.generating_title = true;
+        conversation.apply_load(
+            conversation_load(&transport, "new-talk").unwrap().unwrap(),
+            "tester",
+        );
+        assert!(conversation.current_hash().is_some());
+        assert!(conversation.remote_title.is_none());
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+
+        app.finish_title_generation(0, Ok("Generated title".to_string()));
+
+        assert_eq!(app.selected().title, "Generated title");
+        let listed =
+            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed[0].title, "Generated title");
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
@@ -6292,6 +6340,36 @@ mod tests {
     }
 
     #[test]
+    fn failed_fork_preserves_its_draft_with_other_conversations_open() {
+        let (repo, remote, tip) = repo_with_default_branch("multi-fork-failure", "main");
+        let mut fork = state("forked");
+        fork.forking = true;
+        fork.composer.insert_str("preserve this draft");
+        let (mut app, _) = app_with(vec![state("origin"), fork]);
+        app.repo_dir = repo.clone();
+        app.selected = 1;
+
+        app.finish_fork(
+            "forked",
+            "origin",
+            &"a".repeat(40),
+            Err("remote rejected the fork".to_string()),
+        );
+
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().id, "forked");
+        assert!(!app.selected().forking);
+        assert_eq!(
+            app.selected().turn_options.base.as_deref(),
+            Some(tip.as_str())
+        );
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
     fn from_materializes_inherited_history_immediately() {
         let (repo, remote, _) = repo_with_default_branch("durable-fork", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
@@ -6405,8 +6483,9 @@ mod tests {
             .unwrap()
             .contains("fork"));
 
-        assert!(!wait_for_fork(&mut app, &pending_id));
-        assert_eq!(app.selected().id, "origin");
+        assert!(wait_for_fork(&mut app, &pending_id));
+        assert_eq!(app.selected().id, pending_id);
+        assert_eq!(app.selected().composer.text, "must not submit");
         assert!(app
             .selected()
             .command_error
