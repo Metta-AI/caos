@@ -52,12 +52,16 @@ pub enum TurnEvent {
     AssistantText(String),
     ToolCall {
         step_commit: String,
+        request: String,
+        round: u64,
         tool_use_id: String,
         name: String,
         summary: String,
     },
     ToolResult {
         step_commit: String,
+        request: String,
+        round: u64,
         tool_use_id: String,
         is_error: bool,
         content: String,
@@ -1651,15 +1655,31 @@ fn tool_call_summary(name: &str, args: &Value) -> String {
     }
 }
 
+fn durable_tool_scope(event: &StoredEvent) -> (String, u64) {
+    match (
+        event.value.get("request").and_then(Value::as_str),
+        event.value.get("round").and_then(Value::as_u64),
+    ) {
+        (Some(request), Some(round)) => (request.to_string(), round),
+        // Malformed records were historically rendered best-effort. Keep that
+        // behavior without letting two such records share a bare tool id: an
+        // event-local scope cannot accidentally complete another event's call.
+        _ => (event.commit.clone(), 0),
+    }
+}
+
 fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
     let mut events = Vec::new();
     if let Some(calls) = event.value.get("calls").and_then(Value::as_array) {
+        let (request, round) = durable_tool_scope(event);
         for call in calls {
             let id = call.get("id").and_then(Value::as_str).unwrap_or("tool");
             let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
             let args = call.get("args").cloned().unwrap_or(Value::Null);
             events.push(TurnEvent::ToolCall {
                 step_commit: event.commit.clone(),
+                request: request.clone(),
+                round,
                 tool_use_id: id.to_string(),
                 name: name.to_string(),
                 summary: tool_call_summary(name, &args),
@@ -1667,13 +1687,16 @@ fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
         }
     }
     if let Some(result) = event.value.get("result") {
+        let (request, round) = durable_tool_scope(event);
+        let tool_use_id = result
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
         events.push(TurnEvent::ToolResult {
             step_commit: event.commit.clone(),
-            tool_use_id: result
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string(),
+            request,
+            round,
+            tool_use_id: tool_use_id.to_string(),
             is_error: result
                 .get("is_error")
                 .and_then(Value::as_bool)
@@ -3505,6 +3528,8 @@ mod tests {
     fn mixed_tool_result_blocks_render_text_instead_of_json() {
         let events = durable_turn_events(&event(json!({
             "kind": "caos-chat-event",
+            "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "round": 2,
             "result": {
                 "tool_use_id": "toolu_1",
                 "content": [

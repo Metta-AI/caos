@@ -167,6 +167,8 @@ enum ActivityState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Activity {
+    request: String,
+    round: u64,
     id: String,
     step_commit: String,
     name: String,
@@ -176,6 +178,10 @@ struct Activity {
 }
 
 impl Activity {
+    fn answers(&self, request: &str, round: u64, tool_use_id: &str) -> bool {
+        self.request == request && self.round == round && self.id == tool_use_id
+    }
+
     fn running_verb(&self) -> &'static str {
         match self.name.as_str() {
             "bash" => "Running",
@@ -206,10 +212,14 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
         match event {
             TurnEvent::ToolCall {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 name,
                 summary,
             } => activities.push(Activity {
+                request: request.clone(),
+                round: *round,
                 id: tool_use_id.clone(),
                 step_commit: step_commit.clone(),
                 name: name.clone(),
@@ -219,13 +229,15 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
             }),
             TurnEvent::ToolResult {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 is_error,
                 content,
             } => {
                 if let Some(activity) = activities
                     .iter_mut()
-                    .find(|activity| activity.id == *tool_use_id)
+                    .find(|activity| activity.answers(request, *round, tool_use_id))
                 {
                     activity.state = if *is_error {
                         ActivityState::Failed
@@ -235,6 +247,8 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
                     activity.detail = content.clone();
                 } else {
                     activities.push(Activity {
+                        request: request.clone(),
+                        round: *round,
                         id: tool_use_id.clone(),
                         step_commit: step_commit.clone(),
                         name: "result".to_string(),
@@ -2533,11 +2547,15 @@ impl App {
             }
             TurnEvent::ToolCall {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 name,
                 summary,
             } => {
                 state.push_activity(Activity {
+                    request,
+                    round,
                     id: tool_use_id,
                     step_commit,
                     name,
@@ -2548,6 +2566,8 @@ impl App {
             }
             TurnEvent::ToolResult {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 is_error,
                 content,
@@ -2555,7 +2575,7 @@ impl App {
                 if let Some(activity) = state
                     .activities
                     .iter_mut()
-                    .find(|activity| activity.id == tool_use_id)
+                    .find(|activity| activity.answers(&request, round, &tool_use_id))
                 {
                     activity.state = if is_error {
                         ActivityState::Failed
@@ -2565,6 +2585,8 @@ impl App {
                     activity.detail = content;
                 } else {
                     state.push_activity(Activity {
+                        request,
+                        round,
                         id: tool_use_id.clone(),
                         step_commit,
                         name: "result".to_string(),
@@ -3775,6 +3797,8 @@ mod tests {
 
     fn activity(number: usize) -> Activity {
         Activity {
+            request: "a".repeat(40),
+            round: number as u64,
             id: format!("tool-{number}"),
             step_commit: format!("{number:040x}"),
             name: "bash".to_string(),
@@ -4961,15 +4985,20 @@ mod tests {
 
     #[test]
     fn replayed_activity_restores_tool_results() {
+        let request = "a".repeat(40);
         let activities = replayed_activities(&[
             TurnEvent::ToolCall {
                 step_commit: "1".repeat(40),
+                request: request.clone(),
+                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 name: "read".to_string(),
                 summary: "read README.md".to_string(),
             },
             TurnEvent::ToolResult {
                 step_commit: "2".repeat(40),
+                request,
+                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 is_error: false,
                 content: "README contents".to_string(),
@@ -4983,6 +5012,71 @@ mod tests {
     }
 
     #[test]
+    fn replayed_activity_scopes_reused_ids_by_request_and_round() {
+        let request_a = "a".repeat(40);
+        let request_b = "b".repeat(40);
+        let events = [
+            TurnEvent::ToolCall {
+                step_commit: "1".repeat(40),
+                request: request_a.clone(),
+                round: 0,
+                tool_use_id: "reused".to_string(),
+                name: "read".to_string(),
+                summary: "first call".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "2".repeat(40),
+                request: request_a.clone(),
+                round: 0,
+                tool_use_id: "reused".to_string(),
+                is_error: false,
+                content: "first result".to_string(),
+            },
+            TurnEvent::ToolCall {
+                step_commit: "3".repeat(40),
+                request: request_a.clone(),
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                name: "read".to_string(),
+                summary: "second call".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "4".repeat(40),
+                request: request_a,
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                is_error: true,
+                content: "second result".to_string(),
+            },
+            TurnEvent::ToolCall {
+                step_commit: "5".repeat(40),
+                request: request_b.clone(),
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                name: "read".to_string(),
+                summary: "third call".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "6".repeat(40),
+                request: request_b,
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                is_error: false,
+                content: "third result".to_string(),
+            },
+        ];
+
+        let activities = replayed_activities(&events);
+        assert_eq!(activities.len(), 3);
+        assert_eq!(activities[0].state, ActivityState::Succeeded);
+        assert_eq!(activities[0].detail, "first result");
+        assert_eq!(activities[1].state, ActivityState::Failed);
+        assert_eq!(activities[1].detail, "second result");
+        assert_eq!(activities[2].state, ActivityState::Succeeded);
+        assert_eq!(activities[2].detail, "third result");
+    }
+
+    #[test]
     fn new_activity_follows_only_a_selection_at_the_tail() {
         let mut conversation = state("talk-1");
         conversation.activities = vec![activity(1), activity(2)];
@@ -4993,6 +5087,8 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "3".repeat(40),
+                request: "a".repeat(40),
+                round: 0,
                 tool_use_id: "tool-3".to_string(),
                 name: "bash".to_string(),
                 summary: "third".to_string(),
@@ -5005,6 +5101,8 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "4".repeat(40),
+                request: "a".repeat(40),
+                round: 0,
                 tool_use_id: "tool-4".to_string(),
                 name: "bash".to_string(),
                 summary: "fourth".to_string(),
@@ -5265,6 +5363,8 @@ mod tests {
             },
         ];
         selected.activities = vec![Activity {
+            request: "a".repeat(40),
+            round: 0,
             id: "tool-1".to_string(),
             step_commit: "c".repeat(40),
             name: "bash".to_string(),
