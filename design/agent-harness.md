@@ -271,6 +271,8 @@ conversation content). Same best-effort contract as the progress ref.
 
 ## Client
 
+### Current surface inventory
+
 Two verbs and a full-screen client over one turn engine (implemented —
 `crates/caos/src/chat.rs`, tested end-to-end against the stub in
 `tests/chat-offline` for `chat`, `tests/chat-talk` for `talk`, and
@@ -327,6 +329,11 @@ Two verbs and a full-screen client over one turn engine (implemented —
   opening, running, switching, or publishing conversations never mutates the
   checkout. Progress remains one completed API round at a time, and a running
   turn is not cancellable until the server/runner protocol grows cancellation.
+
+### Superseded protocol detail
+
+The remainder of this section describes the historical protocol named in the
+document banner, not the current chat implementation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>/from-user` (in

@@ -444,7 +444,10 @@ ordered conversation.
 
 **CAOS server**
 
-- remain ignorant of conversation event semantics;
+- remain ignorant of conversation event semantics during compute and ref-update
+  admission; startup crash repair is the narrow planned exception, using only
+  the stable event discriminator to bound a first-parent integrity walk at the
+  ordinary workspace base;
 - enforce append-only first-parent updates for the conversation-head namespace,
   including expected-absent creation;
 - provide exact-ref reads and CAS appends so per-event updates do not download a
