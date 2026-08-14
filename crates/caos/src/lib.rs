@@ -2648,13 +2648,13 @@ pub fn cli_run(
     checkout(t, &target, &result, root)
 }
 
-/// The reserved `image` entry for an args tree, carrying the worker image `image`
+/// The reserved `base` entry for an args tree, carrying the worker image `image`
 /// (a resolved ref: `docker://…` or a git-image hash). A git-docker image *is* a
 /// git tree, so it rides embedded — the entry references that tree directly, so
 /// the image travels inside the request's object graph and materializes as a real
-/// directory at `/cas/args/image`. A `docker://` ref has no git object to embed,
+/// directory at `/cas/args/base`. A `docker://` ref has no git object to embed,
 /// so it rides as a blob naming the registry ref.
-fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::Entry, String> {
+fn base_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::Entry, String> {
     use gix::objs::tree::{Entry, EntryKind};
     let (mode, oid) = if is_hex_hash(image) {
         (EntryKind::Tree, parse_oid(image)?)
@@ -2663,13 +2663,13 @@ fn image_arg_entry(t: &dyn Transport, image: &str) -> Result<gix::objs::tree::En
     };
     Ok(Entry {
         mode: mode.into(),
-        filename: b"image".to_vec().into(),
+        filename: b"base".to_vec().into(),
         oid,
     })
 }
 
 /// Build the args tree's reserved `salt` entry: the cache-busting salt as a plain
-/// blob. The counterpart of [`image_arg_entry`] for the other
+/// blob. The counterpart of [`base_arg_entry`] for the other
 /// reserved ArgTree member; merged in only when the salt is non-empty.
 fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entry, String> {
     use gix::objs::tree::{Entry, EntryKind};
