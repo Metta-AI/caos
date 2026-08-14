@@ -213,7 +213,7 @@ fn run_runner_job(
     // off the placeholder cas_setup just materialized (every entry is tagged
     // with its hash).
     if image_oid.is_none() {
-        *image_oid = caos::read_hash(&cas.join("args").join("image")).ok();
+        *image_oid = caos::read_hash(&cas.join("args").join("base")).ok();
     }
     let envs = [(caos::SALT_ENV, salt.as_str())];
     // Drop the granted secrets at `/secret/<name>` just before the worker runs
