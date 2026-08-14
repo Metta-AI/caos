@@ -46,7 +46,8 @@
 //!   `CAOS_SEED_REF`    the seed ref (default `refs/caos/seed`)
 //!   `CAOS_RUNNER_TOKEN` bearer token, if the server requires one
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The seed ref, unless `CAOS_SEED_REF` overrides it.
@@ -54,7 +55,16 @@ const DEFAULT_SEED_REF: &str = "refs/caos/seed";
 
 /// How long each poll hangs before re-polling (a reconnect cadence; a seeder
 /// never idles out).
-const POLL_TTL: Duration = Duration::from_secs(60);
+///
+/// This is also HOW STALE A PARKED POLL CAN BE. A poll carries the `required`
+/// its record had when it parked, so a republish that changes a record's key
+/// keeps being advertised under the OLD key until the poll turns over. The
+/// server treats a parked-but-disagreeing seeder as a permanent mismatch once
+/// `CAOS_SEEDED_GRACE_SECS` has passed (server/runner.rs `seeded_verdict`), so
+/// this bound plus `RESCAN` is what that grace has to clear. Kept short — five
+/// records re-polling every 20s is 15 requests a minute, and it buys both a
+/// tighter grace and a faster pickup of a republished record.
+const POLL_TTL: Duration = Duration::from_secs(20);
 
 /// Backoff after a failed poll or a git read (server or repo not ready).
 const RETRY: Duration = Duration::from_secs(2);
@@ -78,6 +88,13 @@ struct Record {
     required: serde_json::Map<String, serde_json::Value>,
     result: String,
 }
+
+/// The records currently on disk, by NAME — the whole of this runner's state.
+///
+/// Replaced wholesale on every rescan, never added to. The ref IS the complete
+/// list, so anything not in it has been withdrawn, and a name that is still
+/// there means "answer with THIS result now" regardless of what it said before.
+type Records = Arc<Mutex<HashMap<String, Record>>>;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -104,27 +121,60 @@ fn main() {
         config.server_url, config.seed_ref, config.git_dir
     );
 
-    // Which records already have a poll thread. A record's key is its whole
-    // content (name + required + result): a republished record with the same
-    // key needs no new thread, and one whose key changed gets a fresh thread —
-    // the stale one keeps polling harmlessly (its now-absent required matches no
-    // current job, and if one did match it is answered correctly by
-    // construction). Re-publishes are rare (a tree change), so the leak is
-    // bounded; a cancellable long-poll is future work.
-    let mut running: HashSet<String> = HashSet::new();
+    // ONE THREAD PER NAME, and the disk REPLACES its state on every rescan.
+    //
+    // Threads used to be keyed on a record's whole CONTENT — name, required and
+    // result — on the reasoning that a stale one "keeps polling harmlessly (its
+    // now-absent required matches no current job)". That is false whenever a
+    // record is republished with the same `required` and a different `result`,
+    // which is the ordinary case: `caosd up` re-runs build-builtins, and a
+    // rebuilt host binary changes the flake-builder delta while its arg-tree
+    // key stays exactly the same. Both threads then match every job and race,
+    // so the answer alternates between the current image and a stale one.
+    //
+    // Observed after several `caosd up`s: TWO live answerers for flake-builder
+    // and runner, THREE for cargo and rustc, handing out different results by
+    // coin flip. Downstream that alternated the builder image, so the test
+    // stack image changed run to run, and the suite started a fresh stack and
+    // recompiled every std tool about half the time (35s against 67-85s).
+    //
+    // So: the ref is the complete list, a rescan replaces the map, and a
+    // thread reads the CURRENT record for its name every time round — carrying
+    // no snapshot of its own to go stale. A name that disappears leaves its
+    // thread idling rather than answering.
+    let records: Records = Arc::new(Mutex::new(HashMap::new()));
+    let mut threads: HashSet<String> = HashSet::new();
     loop {
         match read_records(&config) {
-            Ok(records) => {
-                for rec in records {
-                    let key = record_key(&rec);
-                    if running.insert(key) {
+            Ok(list) => {
+                let names: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
+                {
+                    let mut current = records.lock().expect("seed records");
+                    for rec in list {
+                        match current.get(&rec.name) {
+                            Some(prev) if prev.result == rec.result => {}
+                            Some(prev) => eprintln!(
+                                "core-seeder-runner: {} now answers {} (was {})",
+                                rec.name, rec.result, prev.result
+                            ),
+                            None => eprintln!(
+                                "core-seeder-runner: answering {} -> {}",
+                                rec.name, rec.result
+                            ),
+                        }
+                        current.insert(rec.name.clone(), rec);
+                    }
+                    // Whatever the ref no longer names is withdrawn.
+                    current.retain(|name, _| names.iter().any(|n| n == name));
+                }
+                for name in names {
+                    if threads.insert(name.clone()) {
                         let server = config.server_url.clone();
                         let token = config.token.clone();
-                        eprintln!(
-                            "core-seeder-runner: answering {} -> {}",
-                            rec.name, rec.result
-                        );
-                        std::thread::spawn(move || poll_loop(&server, token.as_deref(), &rec));
+                        let records = Arc::clone(&records);
+                        std::thread::spawn(move || {
+                            poll_loop(&server, token.as_deref(), &name, &records)
+                        });
                     }
                 }
             }
@@ -134,30 +184,46 @@ fn main() {
     }
 }
 
-/// A stable per-record key: identical records collapse to one thread, changed
-/// ones get a new one.
-fn record_key(rec: &Record) -> String {
-    format!(
-        "{}\0{}\0{}",
-        rec.name,
-        serde_json::Value::Object(rec.required.clone()),
-        rec.result
-    )
-}
-
-/// One record's poll thread: claim a matching job, post its pre-built result,
-/// repeat. Never exits — a seeder is standing capacity.
-fn poll_loop(server: &str, token: Option<&str>, rec: &Record) {
+/// One NAME's poll thread: claim a matching job, post whatever that name
+/// currently answers with, repeat. Never exits — a seeder is standing capacity,
+/// and a name that is withdrawn may come back on the next publish.
+///
+/// The record is re-read from the shared map on every iteration AND again after
+/// a job is claimed, because a publish can land while this poll is parked. That
+/// is the whole point: the thread holds no result of its own to serve stale.
+fn poll_loop(server: &str, token: Option<&str>, name: &str, records: &Records) {
     loop {
-        match poll(server, token, rec) {
+        let rec = records.lock().expect("seed records").get(name).cloned();
+        let Some(rec) = rec else {
+            // Withdrawn: idle rather than answer for something the ref no
+            // longer lists. It costs one sleep to come back if it returns.
+            std::thread::sleep(RESCAN);
+            continue;
+        };
+        match poll(server, token, &rec) {
             Ok(Some((req, nonce))) => {
-                if let Err(e) = post_result(server, token, &req, &nonce, &rec.result) {
-                    eprintln!("core-seeder-runner: {}: posting result: {e}", rec.name);
+                let current = records
+                    .lock()
+                    .expect("seed records")
+                    .get(name)
+                    .map(|r| r.result.clone());
+                match current {
+                    Some(result) => {
+                        if let Err(e) = post_result(server, token, &req, &nonce, &result) {
+                            eprintln!("core-seeder-runner: {name}: posting result: {e}");
+                        }
+                    }
+                    // Withdrawn while we were parked. Answering with the result
+                    // we polled on would serve exactly the staleness this
+                    // rewrite removes, so leave the job for another answerer.
+                    None => eprintln!(
+                        "core-seeder-runner: {name}: withdrawn while parked; not answering {req}"
+                    ),
                 }
             }
             Ok(None) => {} // idle or evicted: re-poll
             Err(e) => {
-                eprintln!("core-seeder-runner: {}: poll failed: {e}", rec.name);
+                eprintln!("core-seeder-runner: {name}: poll failed: {e}");
                 std::thread::sleep(RETRY);
             }
         }

@@ -135,9 +135,13 @@ else
   redis_args+=(--save '')
 fi
 start redis redis-server "${redis_args[@]}"
-for _ in $(seq 1 20); do
+# Polled tightly, not politely. Every wait in this file is on the critical path
+# of a bring-up, and a bring-up is on the critical path of a cold test stack
+# (design/faster-tests.md) — redis answers in tens of milliseconds, so a 0.5s
+# step spends most of its time asleep after the thing it waits for is ready.
+for _ in $(seq 1 200); do
   redis-cli -p "$CAOS_STACK_REDIS_PORT" ping >/dev/null 2>&1 && break
-  sleep 0.5
+  sleep 0.05
 done
 redis-cli -p "$CAOS_STACK_REDIS_PORT" ping >/dev/null 2>&1 \
   || fail "redis never came up"
@@ -172,9 +176,17 @@ start server env \
   CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
   "$CAOS_STACK_BIN/server"
 ok=""
-for _ in $(seq 1 30); do
+# `git ls-remote`, NOT curl: this script also runs in the seed placement,
+# whose image is the BUILDER, and that flake has no curl — a curl probe here is
+# exit 127 on every attempt, so the loop runs out and every seed stack dies with
+# "server never came up". (The registry probe above may use curl only because
+# it sits behind CAOS_STACK_REGISTRY=yes, which is the host placement alone.)
+# The 0.1s step is still worth having, for the same reason as redis above: the
+# server answers in well under a second, and a 1s step meant a bring-up usually
+# paid most of a second for nothing.
+for _ in $(seq 1 300); do
   if git ls-remote "$SERVER_URL" >/dev/null 2>&1; then ok=1; break; fi
-  sleep 1
+  sleep 0.1
 done
 [ -n "$ok" ] || fail "server never came up"
 
@@ -190,9 +202,17 @@ if [ "$CAOS_STACK_RUNNERD" = yes ]; then
     CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
     CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
     "$CAOS_STACK_BIN/runnerd"
-  sleep 1
-  grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" \
-    || fail "runnerd did not start"
+  # WAIT FOR THE LINE, do not sleep for it. This was an unconditional `sleep 1`
+  # followed by one grep, so every stack that dispatches jobs paid a full second
+  # whether or not runnerd was already up — and it still failed spuriously if
+  # runnerd happened to be slower than the sleep.
+  ok=""
+  for _ in $(seq 1 300); do
+    if grep -q "slots, server" "$CAOS_STACK_LOGS/runnerd.log" 2>/dev/null; then ok=1; break; fi
+    kill -0 "${pids[-1]}" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ -n "$ok" ] || fail "runnerd did not start"
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -

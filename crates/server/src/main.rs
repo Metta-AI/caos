@@ -247,6 +247,8 @@ fn main() {
         config.git_dir, config.registry_push_url, config.registry_pull_host, config.redis_addr,
     );
 
+    spawn_request_ref_pruner(config.git_dir.clone());
+
     // One thread per request, not a serial loop: a worker fetches its inputs
     // from `/object` while its own `/run` request is still being served, a
     // runner's poll parks for its whole TTL, and several top-level runs may be
@@ -415,4 +417,80 @@ fn route(config: &Config, request: &mut Request) -> Result<Vec<u8>, HttpError> {
         }
         _ => Err(HttpError::new(404, "not found")),
     }
+}
+
+/// How often stale request refs are swept, and how long one is kept.
+const REQ_REF_SWEEP: std::time::Duration = std::time::Duration::from_secs(120);
+const REQ_REF_KEEP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Sweep old `refs/caos/req/<hash>` refs in the background.
+///
+/// EVERY PUSHED OBJECT LEAVES ONE (`ensure_pushed`), so they accumulate without
+/// bound — a single suite run adds about 1300 — and every push and fetch after
+/// that pays for them, because git advertises the whole ref list on each
+/// connection. Measured on this repo: 2560 refs is a 251 KB advertisement and a
+/// 258ms push of one small object; at 1231 refs the same push is 181ms. That is
+/// roughly 58ms per thousand refs, on every one of the hundreds of pushes a
+/// suite makes, and it gets worse every run.
+///
+/// Safe to delete, on two independent grounds. Nothing READS them: the name is
+/// written by `ensure_pushed` and never looked up (a result is fetched by hash,
+/// or by the `refs/caos/res/<argTree>` the server pins). And they anchor
+/// nothing: GC is off here precisely because almost every object is unreachable
+/// from any ref, so these are not what keeps objects alive.
+///
+/// AGE, not a flush. Their one job is to be a negotiation base for the NEXT
+/// push from the same client, seconds later, so that an edited tree ships only
+/// its delta. Deleting a fresh one would make that client re-send a closure it
+/// already sent, which is the cost this is trying to avoid.
+fn spawn_request_ref_pruner(git_dir: String) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(REQ_REF_SWEEP);
+        let dir = std::path::Path::new(&git_dir).join("refs/caos/req");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // No directory yet (nothing pushed) is the ordinary case, not news.
+            Err(_) => continue,
+        };
+        let mut stale = String::new();
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().map(|age| age > REQ_REF_KEEP).unwrap_or(false))
+                .unwrap_or(false);
+            if !old {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                stale.push_str(&format!("delete refs/caos/req/{name}\n"));
+                count += 1;
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        // Through git rather than by unlinking: it takes the same locks the
+        // push path does, and it copes with a ref that has been packed since.
+        let mut child = match std::process::Command::new("git")
+            .args(["-C", &git_dir, "update-ref", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("caos-server: pruning request refs: {e}");
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(stale.as_bytes());
+        }
+        match child.wait() {
+            Ok(_) => eprintln!("caos-server: pruned {count} stale request ref(s)"),
+            Err(e) => eprintln!("caos-server: pruning request refs: {e}"),
+        }
+    });
 }
