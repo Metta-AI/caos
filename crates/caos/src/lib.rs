@@ -655,9 +655,17 @@ impl Transport for GitTransport {
     fn fetch_git_ref(&self, url: &str, rev: &str) -> Result<Option<()>, String> {
         // ALREADY HAVE IT? A rev is a full commit sha, so local presence is
         // authoritative — the bytes cannot have changed under the name. This is
-        // the whole memo: pinning by content means a second evaluation of the
-        // same locator costs nothing, and a lockfile-pinned consumer never
-        // touches the network twice.
+        // the whole memo: re-evaluating the same locator costs nothing and
+        // touches no network.
+        //
+        // Two honest limits. (1) It tests the COMMIT, and the fetch below pulls
+        // that commit's whole tree, so a hit we ourselves put there is complete
+        // — but a commit already present for some OTHER reason (a partial or
+        // filtered clone) can have a missing tree, and that surfaces as a
+        // missing-object error while descending, not as a re-fetch. (2) The
+        // objects are unreferenced by design (see `--no-tags` below), so a
+        // `git gc` may prune them and the next resolve pays the fetch again;
+        // that is a cache miss, never a wrong answer.
         if self.have_commit(rev) {
             return Ok(Some(()));
         }

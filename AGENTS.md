@@ -68,8 +68,9 @@ Every script here runs with it, and two constructs quietly break under it.
   repo an alternate holding a deliberate SUBSET (`tests/lib/run-test.sh` →
   `/tmp/seed-git/objects`, "exactly what this test declared"), so any fetch there
   dies with `missing blob object <x>` naming an object with nothing to do with
-  the fetch — and blames the fetch. It cost a session on `tests/remote-ref`,
-  where the same command was green on the host and red in the suite. Add `-c
+  the fetch — and blames the fetch. It cost a session on `tests/remote-ref`: the
+  identical `git fetch` succeeds in any ordinary repo and fails in the harness's
+  client repo, so the difference is the alternate, not the command. Add `-c
   core.alternateRefsCommand=true` when the fetched closure stands alone
   (`:@@=`'s `--depth 1` fetch does); do NOT add it where the alternate's tips are
   legitimately part of the history you are completing.

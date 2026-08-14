@@ -184,8 +184,9 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
 alternate holds a deliberate SUBSET then fails with `missing blob object <x>`
 naming an object that has nothing to do with the fetch, blamed on the fetch.
 The test harness creates exactly that shape (`tests/lib/run-test.sh` points the
-client at `/tmp/seed-git/objects`, "exactly what this test declared"), so the
-first green-on-the-host run of `tests/remote-ref` failed in the suite.
+client at `/tmp/seed-git/objects`, "exactly what this test declared"), so
+`tests/remote-ref` failed the first time it ran — on a fetch that succeeds in
+any ordinary repo. The difference is the alternate, not the command.
 
 Fixed with `-c core.alternateRefsCommand=true` (a command that prints nothing)
 on **this fetch only**. Alternate tips are an EXCLUSION set, so dropping them
