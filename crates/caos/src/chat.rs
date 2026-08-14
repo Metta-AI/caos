@@ -204,7 +204,7 @@ pub fn pick_conversation(
         // costly when opening a shared remote with many conversations.
         let mut dated = Vec::with_capacity(conversations.len());
         for (id, hash) in &conversations {
-            match remote_commit_timestamp(t, &hash) {
+            match remote_commit_timestamp(t, hash) {
                 Ok(timestamp) => dated.push((timestamp, id.clone())),
                 Err(error) => warn_skipped_conversation(id, &error),
             }
