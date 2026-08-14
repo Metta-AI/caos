@@ -351,6 +351,40 @@ fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), 
     Ok(())
 }
 
+/// Persist a message without taking ownership of the surrounding turn
+/// lifecycle. Rich clients use this while another owner is already following
+/// the active request; the returned commit is the durable user event that lets
+/// the client retire its optimistic row after a coherent reload.
+pub fn submit_interjection(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    proposal: Option<&str>,
+) -> Result<String, String> {
+    if let Some(proposal) = proposal {
+        validate_hash(proposal, "submitted workspace commit")?;
+        t.git_capture(&["cat-file", "-e", &format!("{proposal}^{{commit}}")], None)?;
+        reject_reserved_caos(t, proposal, "submitted workspace")?;
+    }
+    submit_message_inner_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        false,
+        proposal,
+        false,
+        prepare_queued_request,
+    )
+    .map(|submitted| submitted.commit)
+}
+
+struct SubmittedMessage {
+    commit: String,
+    request: Option<String>,
+}
+
 fn submit_message_inner(
     t: &GitTransport,
     options: &TurnOptions,
@@ -379,6 +413,32 @@ fn submit_message_inner_with<F>(
     proposal: Option<&str>,
     prepare: F,
 ) -> Result<Option<String>, String>
+where
+    F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
+{
+    submit_message_inner_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        require_absent,
+        proposal,
+        true,
+        prepare,
+    )
+    .map(|submitted| submitted.request)
+}
+
+fn submit_message_inner_detailed_with<F>(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    require_absent: bool,
+    proposal: Option<&str>,
+    admit_when_idle: bool,
+    prepare: F,
+) -> Result<SubmittedMessage, String>
 where
     F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
 {
@@ -477,11 +537,20 @@ where
                         // ref is merely a cache and may be locked by another TUI
                         // in the same checkout.
                         let _ = update_local_cache(t, &refname, &user);
-                        return Ok(Some(request));
+                        return Ok(SubmittedMessage {
+                            commit: user,
+                            request: Some(request),
+                        });
                     }
                     false => continue,
                 }
             }
+        }
+
+        if !admit_when_idle {
+            return Err(format!(
+                "conversation {id:?} is no longer active; submit again to start a new turn"
+            ));
         }
 
         let user = create_event_commit_with_parents(
@@ -507,7 +576,10 @@ where
                 // The user event and exact request become durable together.
                 // Compute is launched only after this boundary.
                 let _ = update_local_cache(t, &refname, &admitted);
-                return Ok(Some(request));
+                return Ok(SubmittedMessage {
+                    commit: user,
+                    request: Some(request),
+                });
             }
             false => continue,
         }

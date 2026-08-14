@@ -1,16 +1,17 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_replay, conversation_snapshot,
+    archive_user_conversation, conversation_head, conversation_replay, conversation_snapshot,
     conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
     generate_conversation_title, list_user_conversations, publish_unindexed_conversations,
     publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    unarchive_user_conversation, ConversationRole, ConversationSnapshot, ToolSetDescription,
-    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
-    UserConversationSummary, WorkspaceDiff,
+    submit_interjection, unarchive_user_conversation, ConversationReplay, ConversationRole,
+    ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
+    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -105,6 +106,53 @@ struct TranscriptEntry {
     role: EntryRole,
     commit: Option<String>,
     text: String,
+    pending_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSubmission {
+    id: u64,
+    text: String,
+    commit: Option<String>,
+}
+
+#[derive(Clone)]
+struct LoadedConversation {
+    snapshot: ConversationSnapshot,
+    replay: ConversationReplay,
+    workspace_diff: WorkspaceDiff,
+}
+
+struct RemotePollEntry {
+    summary: UserConversationSummary,
+    observed_head: Option<String>,
+    observed_title: String,
+    load: Option<Result<Box<LoadedConversation>, String>>,
+}
+
+fn load_conversation(
+    transport: &GitTransport,
+    id: &str,
+) -> Result<Option<LoadedConversation>, String> {
+    for _attempt in 0..3 {
+        let Some(snapshot) = conversation_snapshot(transport, id)? else {
+            return Ok(None);
+        };
+        let replay = conversation_replay(transport, id)?;
+        let workspace_diff = conversation_workspace_diff(transport, id)?;
+        if workspace_diff.head == snapshot.head
+            && conversation_head(transport, id)?.as_deref() == Some(snapshot.head.as_str())
+        {
+            return Ok(Some(LoadedConversation {
+                snapshot,
+                replay,
+                workspace_diff,
+            }));
+        }
+    }
+    Err(format!(
+        "conversation {id:?} kept changing while it was being refreshed"
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -828,6 +876,8 @@ struct ConversationState {
     generating_title: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
+    pending_submissions: Vec<PendingSubmission>,
+    next_pending_submission: u64,
     activities: Vec<Activity>,
     diff: Option<WorkspaceDiff>,
     tool_set: Option<Result<ToolSetDescription, String>>,
@@ -861,6 +911,8 @@ impl ConversationState {
             generating_title: false,
             turn_options,
             transcript: Vec::new(),
+            pending_submissions: Vec::new(),
+            next_pending_submission: 0,
             activities: Vec::new(),
             diff: None,
             tool_set: None,
@@ -890,49 +942,124 @@ impl ConversationState {
         state
     }
 
-    fn reload(&mut self, transport: &GitTransport, current_user: &str) {
-        match conversation_replay(transport, &self.id) {
-            Ok(replay) => {
-                self.activities = replay
-                    .turn_events
-                    .last()
-                    .map(|turn| replayed_activities(&turn.events))
-                    .unwrap_or_default();
-                self.activity_selection = self.activities.len().checked_sub(1);
-                self.activity_detail_scroll = 0;
-                self.transcript = replay
-                    .turns
-                    .into_iter()
-                    .map(|turn| TranscriptEntry {
-                        role: match turn.role {
-                            ConversationRole::Human if turn.author != current_user => {
-                                EntryRole::Peer(turn.author)
-                            }
-                            ConversationRole::Human => EntryRole::Human,
-                            ConversationRole::Agent => EntryRole::Agent,
-                        },
-                        commit: Some(turn.commit),
-                        text: turn.message,
+    fn apply_load(&mut self, load: LoadedConversation, current_user: &str) {
+        let preserve_local_lifecycle = self.running
+            && self.local_turn
+            && matches!(load.snapshot.status.as_str(), "queued" | "running")
+            && self.active_request == load.snapshot.request;
+        let local_lifecycle = preserve_local_lifecycle.then(|| {
+            (
+                self.activities.clone(),
+                self.activity_selection,
+                self.activity_detail_scroll,
+                self.status.clone(),
+                self.turn_phase,
+                self.reconciling_request.clone(),
+                self.reconcile_after,
+            )
+        });
+        self.apply_snapshot(&load.snapshot);
+        self.activities = load
+            .replay
+            .turn_events
+            .last()
+            .map(|turn| replayed_activities(&turn.events))
+            .unwrap_or_default();
+        self.activity_selection = self.activities.len().checked_sub(1);
+        self.activity_detail_scroll = 0;
+        let mut transcript: Vec<_> = load
+            .replay
+            .turns
+            .into_iter()
+            .map(|turn| TranscriptEntry {
+                role: match turn.role {
+                    ConversationRole::Human if turn.author != current_user => {
+                        EntryRole::Peer(turn.author)
+                    }
+                    ConversationRole::Human => EntryRole::Human,
+                    ConversationRole::Agent => EntryRole::Agent,
+                },
+                commit: Some(turn.commit),
+                text: turn.message,
+                pending_id: None,
+            })
+            .collect();
+        self.pending_submissions.retain(|pending| {
+            pending.commit.as_ref().is_none_or(|commit| {
+                !transcript
+                    .iter()
+                    .any(|entry| entry.commit.as_deref() == Some(commit))
+            })
+        });
+        transcript.extend(
+            self.pending_submissions
+                .iter()
+                .map(|pending| TranscriptEntry {
+                    role: EntryRole::Human,
+                    commit: None,
+                    text: pending.text.clone(),
+                    pending_id: Some(pending.id),
+                }),
+        );
+        self.transcript = transcript;
+        self.diff = Some(load.workspace_diff);
+        self.remote_head = Some(load.snapshot.head);
+        self.transcript_selection = None;
+        if let Some((
+            activities,
+            activity_selection,
+            activity_detail_scroll,
+            status,
+            turn_phase,
+            reconciling_request,
+            reconcile_after,
+        )) = local_lifecycle
+        {
+            self.activities = activities;
+            self.activity_selection = activity_selection;
+            self.activity_detail_scroll = activity_detail_scroll;
+            self.status = status;
+            self.turn_phase = turn_phase;
+            self.local_turn = true;
+            self.reconciling_request = reconciling_request;
+            self.reconcile_after = reconcile_after;
+        }
+    }
+
+    fn reload(
+        &mut self,
+        transport: &GitTransport,
+        current_user: &str,
+    ) -> Option<ConversationSnapshot> {
+        match load_conversation(transport, &self.id) {
+            Ok(Some(load)) => {
+                let snapshot = load.snapshot.clone();
+                self.apply_load(load, current_user);
+                return Some(snapshot);
+            }
+            Ok(None) => {
+                self.transcript = self
+                    .pending_submissions
+                    .iter()
+                    .map(|pending| TranscriptEntry {
+                        role: EntryRole::Human,
+                        commit: None,
+                        text: pending.text.clone(),
+                        pending_id: Some(pending.id),
                     })
                     .collect();
-                match conversation_workspace_diff(transport, &self.id) {
-                    Ok(diff) => self.diff = Some(diff),
-                    Err(error) => {
-                        self.diff = None;
-                        self.push_error(format!("loading workspace changes failed: {error}"));
-                    }
-                }
-            }
-            Err(error) => {
-                self.transcript.clear();
                 self.activities.clear();
                 self.activity_selection = None;
                 self.activity_detail_scroll = 0;
                 self.diff = None;
+                self.remote_head = None;
+            }
+            Err(error) => {
                 self.push_error(format!("loading conversation failed: {error}"));
             }
         }
         self.transcript_selection = None;
+        None
     }
 
     fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
@@ -969,6 +1096,7 @@ impl ConversationState {
             role: EntryRole::Notice,
             commit: None,
             text: error.into(),
+            pending_id: None,
         });
         self.transcript_selection = None;
     }
@@ -980,6 +1108,7 @@ impl ConversationState {
             role: EntryRole::Info,
             commit: None,
             text: message.into(),
+            pending_id: None,
         });
         self.transcript_selection = None;
     }
@@ -990,10 +1119,47 @@ impl ConversationState {
         self.transcript_selection = None;
     }
 
+    fn show_command_error_preserving_status(&mut self, error: impl Into<String>) {
+        self.command_error = Some(error.into());
+        self.transcript_selection = None;
+    }
+
     fn note_transcript_append(&mut self) {
         if self.scroll.offset.is_some() {
             self.unread_below = true;
         }
+    }
+
+    fn queue_pending_submission(&mut self, text: String) -> u64 {
+        let id = self.next_pending_submission;
+        self.next_pending_submission = self.next_pending_submission.wrapping_add(1);
+        self.pending_submissions.push(PendingSubmission {
+            id,
+            text: text.clone(),
+            commit: None,
+        });
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text,
+            pending_id: Some(id),
+        });
+        id
+    }
+
+    fn mark_pending_submission(&mut self, id: u64, commit: String) {
+        if let Some(pending) = self
+            .pending_submissions
+            .iter_mut()
+            .find(|pending| pending.id == id)
+        {
+            pending.commit = Some(commit);
+        }
+    }
+
+    fn discard_pending_submission(&mut self, id: u64) {
+        self.pending_submissions.retain(|pending| pending.id != id);
+        self.transcript.retain(|entry| entry.pending_id != Some(id));
     }
 
     fn follow_tail(&mut self) {
@@ -1068,6 +1234,17 @@ enum UiMessage {
         conversation: String,
         outcome: TurnOutcome,
     },
+    InterjectionSubmitted {
+        conversation: String,
+        pending_id: u64,
+        commit: String,
+        load: Result<Box<LoadedConversation>, String>,
+    },
+    InterjectionFailed {
+        conversation: String,
+        pending_id: u64,
+        error: String,
+    },
     TitleGenerated {
         conversation: String,
         result: Result<String, String>,
@@ -1080,6 +1257,9 @@ enum UiMessage {
         conversation: String,
         request: String,
         result: Result<(), String>,
+    },
+    RemotePolled {
+        result: Result<Vec<RemotePollEntry>, String>,
     },
 }
 
@@ -1238,6 +1418,7 @@ pub(crate) struct App {
     copied_chars: Option<usize>,
     animation_frame: usize,
     enhanced_keyboard: bool,
+    remote_polling: bool,
     view: View,
     focus: Focus,
     tx: Sender<UiMessage>,
@@ -1353,6 +1534,7 @@ impl App {
             copied_chars: None,
             animation_frame: 0,
             enhanced_keyboard: false,
+            remote_polling: false,
             view: View::Chat,
             focus: Focus::Conversation,
             tx,
@@ -1620,6 +1802,7 @@ impl App {
                 .show_command_error("finish publishing before sending another message");
             return;
         }
+        let interjecting = self.selected().running;
         let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
@@ -1674,8 +1857,14 @@ impl App {
             raw
         };
         let should_generate_title =
-            self.selected().automatic_title && !self.selected().generating_title;
-        {
+            !interjecting && self.selected().automatic_title && !self.selected().generating_title;
+        let pending_id = if interjecting {
+            let state = self.selected_mut();
+            let pending_id = state.queue_pending_submission(message.clone());
+            state.follow_tail();
+            state.transcript_selection = None;
+            Some(pending_id)
+        } else {
             let state = self.selected_mut();
             state.apply_automatic_title(&message);
             if should_generate_title {
@@ -1685,6 +1874,7 @@ impl App {
                 role: EntryRole::Human,
                 commit: None,
                 text: message.clone(),
+                pending_id: None,
             });
             state.activities.clear();
             state.activity_selection = None;
@@ -1696,7 +1886,8 @@ impl App {
             state.status = "starting turn".to_string();
             state.follow_tail();
             state.transcript_selection = None;
-        }
+            None
+        };
 
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
@@ -1717,6 +1908,54 @@ impl App {
                     result,
                 });
             });
+        }
+        if let Some(pending_id) = pending_id {
+            std::thread::spawn(move || {
+                let transport = match GitTransport::discover(repo_dir) {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        let _ = tx.send(UiMessage::InterjectionFailed {
+                            conversation,
+                            pending_id,
+                            error,
+                        });
+                        return;
+                    }
+                };
+                match submit_interjection(
+                    &transport,
+                    &options,
+                    &conversation,
+                    &message,
+                    human_tree.as_deref(),
+                ) {
+                    Ok(commit) => {
+                        let load = load_conversation(&transport, &conversation)
+                            .and_then(|load| {
+                                load.ok_or_else(|| {
+                                    format!(
+                                        "conversation {conversation:?} disappeared after submit"
+                                    )
+                                })
+                            })
+                            .map(Box::new);
+                        let _ = tx.send(UiMessage::InterjectionSubmitted {
+                            conversation,
+                            pending_id,
+                            commit,
+                            load,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(UiMessage::InterjectionFailed {
+                            conversation,
+                            pending_id,
+                            error,
+                        });
+                    }
+                }
+            });
+            return;
         }
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
@@ -1799,6 +2038,40 @@ impl App {
                         self.finish_turn(index, outcome);
                     }
                 }
+                UiMessage::InterjectionSubmitted {
+                    conversation,
+                    pending_id,
+                    commit,
+                    load,
+                } => {
+                    let user = self.user.clone();
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.mark_pending_submission(pending_id, commit);
+                        match load {
+                            Ok(load) => state.apply_load(*load, &user),
+                            Err(error) => {
+                                state.remote_head = None;
+                                state.show_command_error_preserving_status(format!(
+                                    "message saved, but refreshing it failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                UiMessage::InterjectionFailed {
+                    conversation,
+                    pending_id,
+                    error,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.discard_pending_submission(pending_id);
+                        state.show_command_error_preserving_status(format!(
+                            "sending message failed: {error}"
+                        ));
+                    }
+                }
                 UiMessage::TitleGenerated {
                     conversation,
                     result,
@@ -1841,62 +2114,126 @@ impl App {
                         }
                     }
                 }
+                UiMessage::RemotePolled { result } => {
+                    self.remote_polling = false;
+                    if let Ok(entries) = result {
+                        changed |= self.apply_remote_poll(entries);
+                    }
+                }
             }
         }
         changed |= self.reconcile_active_requests();
         changed
     }
 
-    /// Follow canonical remote refs so other TUI clients and detached workers
-    /// become visible without any process-local notification channel.
+    /// Schedule a canonical-ref refresh so network and Git work never block the
+    /// input/render loop. At most one refresh may be in flight; its versioned
+    /// result is applied from `drain_messages` only if the local state has not
+    /// advanced in the meantime.
     pub(crate) fn poll_remote(&mut self) -> bool {
-        let Ok(transport) = self.transport() else {
-            return false;
-        };
-        if publish_unindexed_conversations(&transport, &self.user).is_err() {
+        if self.remote_polling {
             return false;
         }
-        let Ok(summaries) =
-            list_user_conversations(&transport, &self.user, UserConversationStatus::Active)
-        else {
-            return false;
-        };
+        self.remote_polling = true;
+        let observed: HashMap<_, _> = self
+            .conversations
+            .iter()
+            .map(|state| {
+                (
+                    state.id.clone(),
+                    (state.remote_head.clone(), state.title.clone()),
+                )
+            })
+            .collect();
+        let repo_dir = self.repo_dir.clone();
+        let user = self.user.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                publish_unindexed_conversations(&transport, &user)?;
+                let summaries =
+                    list_user_conversations(&transport, &user, UserConversationStatus::Active)?;
+                Ok(summaries
+                    .into_iter()
+                    .map(|summary| {
+                        let (observed_head, observed_title) = observed
+                            .get(&summary.id)
+                            .cloned()
+                            .unwrap_or((None, summary.title.clone()));
+                        let load =
+                            (observed_head.as_deref() != Some(summary.head.as_str())).then(|| {
+                                load_conversation(&transport, &summary.id)
+                                    .and_then(|load| {
+                                        load.ok_or_else(|| {
+                                            format!(
+                                                "conversation {:?} disappeared during refresh",
+                                                summary.id
+                                            )
+                                        })
+                                    })
+                                    .and_then(|load| {
+                                        if load.snapshot.head == summary.head {
+                                            Ok(load)
+                                        } else {
+                                            Err(format!(
+                                                "conversation {:?} changed during refresh",
+                                                summary.id
+                                            ))
+                                        }
+                                    })
+                                    .map(Box::new)
+                            });
+                        RemotePollEntry {
+                            summary,
+                            observed_head,
+                            observed_title,
+                            load,
+                        }
+                    })
+                    .collect())
+            });
+            let _ = tx.send(UiMessage::RemotePolled { result });
+        });
+        false
+    }
+
+    fn apply_remote_poll(&mut self, entries: Vec<RemotePollEntry>) -> bool {
         let mut changed = false;
-        for summary in summaries {
-            if let Some(index) = self.conversation_index(&summary.id) {
+        for entry in entries {
+            if let Some(index) = self.conversation_index(&entry.summary.id) {
                 let state = &mut self.conversations[index];
-                if state.title != summary.title {
-                    state.title = summary.title.clone();
+                if state.remote_head != entry.observed_head || state.title != entry.observed_title {
+                    continue;
+                }
+                if state.title != entry.summary.title {
+                    state.title = entry.summary.title.clone();
                     state.automatic_title = false;
                     changed = true;
                 }
-                if state.remote_head.as_deref() == Some(&summary.head) {
-                    continue;
+                if let Some(load) = entry.load {
+                    match load {
+                        Ok(load) => state.apply_load(*load, &self.user),
+                        Err(error) => {
+                            state.remote_head = None;
+                            state.push_error(format!("loading conversation failed: {error}"));
+                        }
+                    }
+                    changed = true;
                 }
-                state.reload(&transport, &self.user);
-                state.remote_head = Some(summary.head.clone());
-                if let Ok(Some(snapshot)) = conversation_snapshot(&transport, &summary.id) {
-                    state.apply_snapshot(&snapshot);
-                }
-                changed = true;
-            } else {
+            } else if let Some(Ok(load)) = entry.load {
                 let mut state = ConversationState::new(
-                    summary.id.clone(),
-                    summary.title,
+                    entry.summary.id.clone(),
+                    entry.summary.title,
                     self.selected().turn_options.clone(),
                     "shared conversation".to_string(),
                 );
-                state.reload(&transport, &self.user);
-                state.remote_head = Some(summary.head);
-                if let Ok(Some(snapshot)) = conversation_snapshot(&transport, &summary.id) {
-                    state.apply_snapshot(&snapshot);
-                }
+                state.apply_load(*load, &self.user);
                 self.conversations.insert(0, state);
                 self.selected += 1;
                 changed = true;
             }
         }
-        changed | self.reconcile_active_requests()
+        changed
     }
 
     fn conversation_index(&self, id: &str) -> Option<usize> {
@@ -1923,6 +2260,7 @@ impl App {
                     role: EntryRole::Agent,
                     commit: None,
                     text,
+                    pending_id: None,
                 });
                 state.transcript_selection = None;
             }
@@ -2902,6 +3240,50 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    fn push_test_conversation(repo: &Path, id: &str, head: &str) {
+        git_ok(
+            repo,
+            &[
+                "push",
+                "-q",
+                "caos",
+                &format!("{head}:refs/caos/v2/conversations/{id}/head"),
+            ],
+        );
+    }
+
+    fn seed_queued_conversation(
+        repo: &Path,
+        id: &str,
+        username: &str,
+        message: &str,
+    ) -> (String, String) {
+        let base = git_output(repo, &["rev-parse", "HEAD"]);
+        let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
+        let user_event = serde_json::to_string(&serde_json::json!({
+            "v": 2,
+            "author": "user",
+            "username": username,
+            "content": message,
+        }))
+        .unwrap();
+        let user = git_output(
+            repo,
+            &["commit-tree", &tree, "-p", &base, "-m", &user_event],
+        );
+        let request = "b".repeat(40);
+        let admission = serde_json::to_string(&serde_json::json!({
+            "v": 2,
+            "status": "queued",
+            "request": request,
+            "request_head": user,
+        }))
+        .unwrap();
+        let head = git_output(repo, &["commit-tree", &tree, "-p", &user, "-m", &admission]);
+        push_test_conversation(repo, id, &head);
+        (head, request)
+    }
+
     fn repo_with_default_branch(name: &str, branch: &str) -> (PathBuf, PathBuf, String) {
         let dir = throwaway_repo(name);
         git_ok(&dir, &["config", "user.name", "CAOS test"]);
@@ -2973,6 +3355,7 @@ mod tests {
                 copied_chars: None,
                 animation_frame: 0,
                 enhanced_keyboard: false,
+                remote_polling: false,
                 view: View::Chat,
                 focus: Focus::Conversation,
                 tx: tx.clone(),
@@ -2981,6 +3364,36 @@ mod tests {
             },
             tx,
         )
+    }
+
+    fn wait_for_remote_poll(app: &mut App) {
+        app.poll_remote();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.remote_polling {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for remote poll"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_pending_submission(app: &mut App, id: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .selected()
+            .pending_submissions
+            .iter()
+            .any(|pending| pending.id == id)
+        {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for pending submission {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn rendered_main_pane(terminal: &Terminal<TestBackend>) -> Vec<String> {
@@ -3759,6 +4172,7 @@ mod tests {
                 .map(|line| format!("existing line {line}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            pending_id: None,
         });
         let (mut app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
@@ -3942,6 +4356,7 @@ mod tests {
                 .map(|line| format!("line {line:02}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            pending_id: None,
         });
         let (mut app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
@@ -4045,6 +4460,7 @@ mod tests {
             role: EntryRole::Human,
             commit: None,
             text: "hello".to_string(),
+            pending_id: None,
         });
         let (mut app, _) = app_with(vec![selected]);
         let area = Rect::new(0, 0, 100, 30);
@@ -4098,11 +4514,13 @@ mod tests {
                 role: EntryRole::Human,
                 commit: Some("a".repeat(40)),
                 text: "Please run the tests".to_string(),
+                pending_id: None,
             },
             TranscriptEntry {
                 role: EntryRole::Agent,
                 commit: Some("b".repeat(40)),
                 text: "Running them now.".to_string(),
+                pending_id: None,
             },
         ];
         selected.activities = vec![Activity {
@@ -4244,6 +4662,7 @@ mod tests {
             role: EntryRole::Agent,
             commit: Some("b".repeat(40)),
             text: "done".to_string(),
+            pending_id: None,
         });
         let (app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
@@ -4318,6 +4737,7 @@ mod tests {
             role: EntryRole::Agent,
             commit: None,
             text: "plain **bold** and _italic_".to_string(),
+            pending_id: None,
         });
         let (app, _) = app_with(vec![selected]);
         let backend = TestBackend::new(100, 30);
@@ -4489,17 +4909,144 @@ mod tests {
 
     #[test]
     fn active_turn_accepts_an_interjection() {
+        let (repo, remote, _) = repo_with_default_branch("active-interjection", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let (head, request) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let mut conversation = state("talk-1");
         conversation.running = true;
+        conversation.local_turn = true;
+        conversation.remote_head = Some(head);
+        conversation.active_request = Some(request);
+        conversation.status = "running a tool".to_string();
+        conversation.turn_phase = TurnPhase::Model;
+        conversation.activities.push(activity(1));
+        conversation.activity_selection = Some(0);
         conversation.composer.insert_str("another prompt");
         let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
         assert_eq!(app.selected().transcript.len(), 1);
         assert_eq!(app.selected().transcript[0].role, EntryRole::Human);
         assert_eq!(app.selected().transcript[0].text, "another prompt");
+        assert_eq!(app.selected().pending_submissions.len(), 1);
+        assert_eq!(app.selected().status, "running a tool");
+        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
+        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().running);
+        assert!(app.selected().local_turn);
         assert!(app.selected().command_error.is_none());
+
+        wait_for_pending_submission(&mut app, 0);
+        assert_eq!(app.selected().status, "running a tool");
+        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
+        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().running);
+        assert!(app.selected().local_turn);
+        assert!(app.selected().command_error.is_none());
+        assert_eq!(
+            app.selected()
+                .transcript
+                .iter()
+                .filter(|entry| entry.text == "another prompt")
+                .count(),
+            1
+        );
+        assert!(app
+            .selected()
+            .transcript
+            .iter()
+            .find(|entry| entry.text == "another prompt")
+            .unwrap()
+            .commit
+            .is_some());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn pending_interjection_survives_a_stale_reload_until_its_commit_is_visible() {
+        let (repo, remote, _) = repo_with_default_branch("pending-interjection", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = load_conversation(&transport, "talk-1").unwrap().unwrap();
+        let durable_commit = load.replay.turns[0].commit.clone();
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("another prompt".to_string());
+
+        conversation.apply_load(load.clone(), "Alice");
+        assert_eq!(conversation.pending_submissions.len(), 1);
+        assert_eq!(
+            conversation.transcript.last().unwrap().text,
+            "another prompt"
+        );
+        assert_eq!(
+            conversation.transcript.last().unwrap().pending_id,
+            Some(pending_id)
+        );
+
+        conversation.mark_pending_submission(pending_id, durable_commit);
+        conversation.apply_load(load, "Alice");
+        assert!(conversation.pending_submissions.is_empty());
+        assert_eq!(conversation.transcript.len(), 1);
+        assert!(conversation.transcript[0].pending_id.is_none());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn stale_remote_poll_result_does_not_overwrite_newer_local_state() {
+        let mut conversation = state("local title");
+        conversation.id = "shared".to_string();
+        conversation.remote_head = Some("b".repeat(40));
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(!app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "shared".to_string(),
+                title: "stale title".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: Some("a".repeat(40)),
+            observed_title: "old local title".to_string(),
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "local title");
+        assert_eq!(
+            app.selected().remote_head.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn publishing_gate_keeps_the_draft_and_shows_the_command_error_panel() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "publishing".to_string();
+        conversation.composer.insert_str("do not send yet");
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert!(app.selected().publishing);
+        assert_eq!(app.selected().composer.text, "do not send yet");
+        assert!(app.selected().transcript.is_empty());
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("finish publishing before sending another message")
+        );
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(rendered_main_pane(&terminal)
+            .join("\n")
+            .contains("finish publishing before sending another message"));
     }
 
     #[test]
@@ -4773,7 +5320,7 @@ mod tests {
         let (mut app, _) = app_with(vec![state("local")]);
         app.repo_dir = repo.clone();
         app.user = "Bob".to_string();
-        assert!(app.poll_remote());
+        wait_for_remote_poll(&mut app);
 
         let shared = app
             .conversations
@@ -4786,7 +5333,7 @@ mod tests {
             EntryRole::Peer(author) if author == "Alice"
         ));
         assert_eq!(shared.transcript[0].text, "hello from Alice");
-        assert!(!app.poll_remote());
+        wait_for_remote_poll(&mut app);
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
