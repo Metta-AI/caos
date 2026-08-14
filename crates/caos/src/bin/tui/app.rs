@@ -5,13 +5,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_head, conversation_reference, conversation_replay,
-    conversation_snapshot, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, generate_conversation_title, invite_user_to_conversation,
-    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
-    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationReplay,
-    ConversationRole, ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions,
-    TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    archive_user_conversation, compare_and_set_conversation_title, conversation_head,
+    conversation_reference, conversation_replay, conversation_snapshot,
+    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
+    generate_conversation_title, invite_user_to_conversation, list_user_conversations,
+    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
+    submit_interjection, unarchive_user_conversation, ConversationReplay, ConversationRole,
+    ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
+    TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -909,6 +910,7 @@ struct ConversationState {
     sidebar_attention: Option<String>,
     automatic_title: bool,
     automatic_title_fallback_applied: bool,
+    automatic_title_fallback: Option<String>,
     generating_title: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
@@ -947,6 +949,7 @@ impl ConversationState {
             sidebar_attention: None,
             automatic_title: false,
             automatic_title_fallback_applied: false,
+            automatic_title_fallback: None,
             generating_title: false,
             turn_options,
             transcript: Vec::new(),
@@ -1247,8 +1250,12 @@ impl ConversationState {
     }
 
     fn apply_automatic_title(&mut self, prompt: &str) {
-        if self.automatic_title && !self.automatic_title_fallback_applied {
-            self.title = automatic_title(prompt);
+        if !self.automatic_title_fallback_applied {
+            let fallback = automatic_title(prompt);
+            if self.automatic_title {
+                self.title = fallback.clone();
+            }
+            self.automatic_title_fallback = Some(fallback);
             self.automatic_title_fallback_applied = true;
         }
     }
@@ -1532,6 +1539,16 @@ impl App {
             list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
         let mut relist = false;
         if let Some(requested) = args.conversation.clone() {
+            if args.new_conversation
+                && (conversations
+                    .iter()
+                    .any(|conversation| conversation.id == requested)
+                    || conversation_snapshot(&transport, &requested)?.is_some())
+            {
+                return Err(format!(
+                    "--new: conversation {requested:?} already exists; omit --new to continue it"
+                ));
+            }
             if conversations
                 .iter()
                 .all(|conversation| conversation.id != requested)
@@ -1548,9 +1565,6 @@ impl App {
                     unarchive_user_conversation(&transport, &args.user, &requested)?;
                     relist = true;
                 } else if conversation_snapshot(&transport, &requested)?.is_some() {
-                    if args.new_conversation {
-                        return Err(format!("conversation {requested:?} already exists"));
-                    }
                     invite_user_to_conversation(&transport, &args.user, &requested)?;
                     relist = true;
                 }
@@ -1560,7 +1574,7 @@ impl App {
             conversations =
                 list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
         }
-        let selected_name = choose_conversation(
+        let choice = choose_conversation(
             args.conversation.as_deref(),
             args.new_conversation,
             &conversations,
@@ -1587,24 +1601,24 @@ impl App {
         for state in &mut states {
             state.reload(&transport, &args.user);
         }
-        let selected_id = if states.iter().any(|state| state.id == selected_name) {
-            selected_name.clone()
-        } else {
-            let id = if args.conversation.is_some() {
-                selected_name.clone()
-            } else {
-                fresh_conversation_id(&transport, &args.user)?
-            };
-            states.insert(
-                0,
-                ConversationState::new_virtual(
-                    id.clone(),
-                    selected_name.clone(),
-                    new_conversation_options(args.turn.clone(), args.turn.base, &repo_dir)?.0,
-                    initial_status,
-                ),
-            );
-            id
+        let selected_id = match choice {
+            ConversationChoice::Existing(id) => id,
+            ConversationChoice::New { id, title } => {
+                let id = match id {
+                    Some(id) => id,
+                    None => fresh_conversation_id(&transport, &args.user)?,
+                };
+                states.insert(
+                    0,
+                    ConversationState::new_virtual(
+                        id.clone(),
+                        title,
+                        new_conversation_options(args.turn.clone(), args.turn.base, &repo_dir)?.0,
+                        initial_status,
+                    ),
+                );
+                id
+            }
         };
         let selected = states
             .iter()
@@ -2162,8 +2176,14 @@ impl App {
             .transport()
             .and_then(|transport| invite_user_to_conversation(&transport, user, &id))
         {
-            Ok(()) => self.selected_mut().push_info(format!(
+            Ok(InviteOutcome::Created) => self.selected_mut().push_info(format!(
                 "Invited username {user:?}. They must select that exact case-sensitive identity."
+            )),
+            Ok(InviteOutcome::AlreadyActive) => self.selected_mut().push_info(format!(
+                "Username {user:?} already has this conversation active."
+            )),
+            Ok(InviteOutcome::Archived) => self.selected_mut().push_info(format!(
+                "Username {user:?} has archived this conversation; their choice was preserved."
             )),
             Err(error) => self.selected_mut().show_command_error(error),
         }
@@ -2562,6 +2582,20 @@ impl App {
             Ok(transport) => {
                 match publish_user_conversation(&transport, &user, &state.id, &state.title) {
                     Ok(()) => {
+                        if let Some(fallback) = state.automatic_title_fallback.clone() {
+                            if !state.automatic_title
+                                && state.title != fallback
+                                && compare_and_set_conversation_title(
+                                    &transport,
+                                    &state.id,
+                                    &fallback,
+                                    &state.title,
+                                )
+                                .unwrap_or(false)
+                            {
+                                state.automatic_title_fallback = None;
+                            }
+                        }
                         state.reload(&transport, &user);
                         state.remote_head = Some(outcome.commit);
                     }
@@ -2593,12 +2627,18 @@ impl App {
             Err(_) => return,
         };
         if state.current_hash().is_some() {
+            let Some(expected) = state.automatic_title_fallback.as_deref() else {
+                return;
+            };
             let Ok(transport) = transport else {
                 return;
             };
-            if set_conversation_title(&transport, &state.id, &title).is_err() {
+            if !compare_and_set_conversation_title(&transport, &state.id, expected, &title)
+                .unwrap_or(false)
+            {
                 return;
             }
+            state.automatic_title_fallback = None;
         }
         state.title = title;
     }
@@ -3378,11 +3418,17 @@ fn new_conversation_options(
     Ok((options, base))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConversationChoice {
+    Existing(String),
+    New { id: Option<String>, title: String },
+}
+
 fn choose_conversation(
     requested: Option<&str>,
     new: bool,
     conversations: &[UserConversationSummary],
-) -> Result<String, String> {
+) -> Result<ConversationChoice, String> {
     if let Some(requested) = requested {
         if new
             && conversations
@@ -3393,18 +3439,30 @@ fn choose_conversation(
                 "--new: conversation {requested:?} already exists; omit --new to continue it"
             ));
         }
-        return Ok(requested.to_string());
+        if conversations
+            .iter()
+            .any(|conversation| conversation.id == requested)
+        {
+            return Ok(ConversationChoice::Existing(requested.to_string()));
+        }
+        return Ok(ConversationChoice::New {
+            id: Some(requested.to_string()),
+            title: requested.to_string(),
+        });
     }
     if !new {
         if let Some(latest) = conversations.first() {
-            return Ok(latest.id.clone());
+            return Ok(ConversationChoice::Existing(latest.id.clone()));
         }
     }
-    Ok(first_available_conversation_name(
-        conversations
-            .iter()
-            .map(|conversation| conversation.title.as_str()),
-    ))
+    Ok(ConversationChoice::New {
+        id: None,
+        title: first_available_conversation_name(
+            conversations
+                .iter()
+                .map(|conversation| conversation.title.as_str()),
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -4297,16 +4355,22 @@ mod tests {
         let conversations = vec![summary("recent"), summary("talk-1")];
         assert_eq!(
             choose_conversation(None, false, &conversations).unwrap(),
-            "recent"
+            ConversationChoice::Existing("recent".to_string())
         );
         assert_eq!(
             choose_conversation(None, true, &conversations).unwrap(),
-            "talk-2"
+            ConversationChoice::New {
+                id: None,
+                title: "talk-2".to_string(),
+            }
         );
         assert!(choose_conversation(Some("recent"), true, &conversations).is_err());
         assert_eq!(
             choose_conversation(Some("named"), false, &conversations).unwrap(),
-            "named"
+            ConversationChoice::New {
+                id: Some("named".to_string()),
+                title: "named".to_string(),
+            }
         );
         assert_eq!(
             first_available_conversation_name(
@@ -4316,6 +4380,23 @@ mod tests {
                     .chain(std::iter::once("talk-2")),
             ),
             "talk-3"
+        );
+    }
+
+    #[test]
+    fn new_conversation_titles_never_reopen_a_matching_id() {
+        let conversations = vec![UserConversationSummary {
+            id: "talk-1".to_string(),
+            title: "A generated title".to_string(),
+            head: "a".repeat(40),
+            updated_unix: 1,
+        }];
+        assert_eq!(
+            choose_conversation(None, true, &conversations).unwrap(),
+            ConversationChoice::New {
+                id: None,
+                title: "talk-1".to_string(),
+            }
         );
     }
 
