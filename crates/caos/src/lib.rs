@@ -2484,7 +2484,9 @@ mod git_ref_tests {
     #[test]
     fn a_git_fetch_must_pin_a_commit() {
         // no rev at all
-        assert!(parse_git_ref("git+https://h/r").unwrap_err().contains("must pin a commit"));
+        assert!(parse_git_ref("git+https://h/r")
+            .unwrap_err()
+            .contains("must pin a commit"));
         assert!(parse_git_ref("git+https://h/r?dir=x")
             .unwrap_err()
             .contains("must pin a commit"));
