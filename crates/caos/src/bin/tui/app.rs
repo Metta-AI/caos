@@ -5,14 +5,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, compare_and_set_conversation_title, conversation_head,
-    conversation_load, conversation_load_at, conversation_reference, conversation_snapshot,
-    describe_tool_set, first_available_conversation_name, fork_conversation,
-    generate_conversation_title, invite_user_to_conversation, list_user_conversations,
-    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
-    ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
-    TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    archive_user_conversation, compare_and_set_conversation_title, conversation_load,
+    conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
+    first_available_conversation_name, fork_conversation, generate_conversation_title,
+    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
+    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
+    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
+    InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
+    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -3598,7 +3598,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos::chat::{conversation_ref, ConversationReplay};
+    use caos::chat::{conversation_head, conversation_ref, ConversationReplay};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
