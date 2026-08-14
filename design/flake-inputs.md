@@ -150,110 +150,80 @@ value; the `:`-type split runs on the **key** only, so `://` is untouched; and
 
 ---
 
-## Stage 2B: `--base` full collapse (next up) — detailed
+## Stage 2B: `.caos-expr` grammar collapse — ✅ DONE
 
-"The thing we run" becomes an **ordinary typed arg** named `base`, parsed by the
-same `parse_arg` as everything else. It stays **reserved by meaning** (server and
-runner read the `base` slot to know what to run — 2A already made that so), but
-**not by syntax** — no bespoke positional/`--` codepath survives.
+The `.caos-expr` surface no longer has a positional image or a `--`. A `run`/
+`curry` is `verb --base:<type>=<image> [--k…]`; the reserved `--base` names the
+worker, typed like any arg. Landed **without a redeploy** — the collapse produces
+byte-identical arg trees (same `base`+args entries), so every seed key held and
+the outer stack kept answering. What changed:
 
-### The one semantic subtlety
+- **`parse_arg`/`ArgType`** (`lib.rs`): `:tree=`→`:hash=` (generalized to a tree
+  *or* blob by oid) and new `:docker=` (stores blob `docker://<ref>`). Wired in
+  `build_arg_entries` (CLI/worker args) and the evaluator.
+- **Evaluator** (`eval.rs`): `eval_command` scans tokens for `--base` (no
+  positional, no `--`); `resolve_expr_image` → `resolve_expr_base`, dispatched on
+  the explicit `ArgType` (docker/hash/path/`$VAR`) — **no sniffing here anymore**.
+  `resolve_expr_args` handles `:docker=`/`:hash=`. Module grammar doc updated.
+- **Migrated every `.caos-expr`**: all 14 committed (`run <IMG> -- …` →
+  `run --base:@=<path>|:docker=<sentinel> …`, incl. the multi-line `llm-step`
+  curry/variable form), **plus the runtime-generated fixtures** in
+  `tests/{eval-path,secrets,deep-deps}/cli.sh` (this was the one thing missed on
+  the first pass — those write `.caos-expr` at test time in old grammar and the
+  new evaluator rejects them: `argument must look like --name=value, got: bash`).
 
-A base's value needs **image resolution**, not plain arg resolution: a
-`:@=DEEP-DEPS/flake-builder` base must resolve *through that subtree's
-`.caos-expr` to the image it builds* (today's `resolve_expr_image`), whereas a
-plain data arg's `:@=` references the tree. In practice these converge for the
-directory case (an evaluable dir evaluates; a plain dir is identity), and the
-docker/hash/var shapes move to explicit types. Recommended shape:
+Deliberately left untouched (isolated, hence low-risk): the CLI/worker sniffers
+`resolve_run_image`/`resolve_cli_image`, so `caos-cli run <dir>` and
+`caos curry <img>` still use positional grammar. That is stage 2C.
 
-- Keep resolving the **base to a ref *string*** (so `assemble_arg_tree(image:
-  &str, …)` / `base_arg_entry` are unchanged), by dispatching on the base arg's
-  `ArgType`:
-  - `:@=path` → look up path, eval-path → hash string (today's
-    `resolve_expr_image` path branch, kept — just reached via the typed arg
-    instead of the positional token).
-  - `:docker=X` → `"docker://X"`.
-  - `:hash=X` → `X` (validate).
-  - `$VAR` → the variable's oid string.
-  - `:@@=ref` → stage 4 (fetch → hash string).
-- Resolve the **remaining args** with `resolve_expr_args` as today.
-- `assemble_arg_tree` / `curry_from_entries` fold the base string into the
-  reserved `base` entry (unchanged from 2A).
+## Stage 2C: CLI + worker `caos` grammar collapse — ← NEXT
 
-### Front-end sites to change (pointers)
+The other half of "no special arg": drop the positional image on the CLI and in
+the worker `caos` subcommands, type the map-then image positions, delete the last
+sniffers. **This one DOES touch the tool scripts and test `cli.sh`, so it re-keys
+nothing but changes the grammar those scripts use — expect a redeploy** (they run
+on the outer stack), unlike 2B.
 
-- **`.caos-expr` evaluator:** `crates/caos/src/eval.rs`
-  - `eval_command` (~L283): currently requires `--` at token position 2 and
-    treats `tokens[1]` as the image. New: no positional; scan the arg tokens for
-    the one whose name is `base`, resolve it as the base (above), resolve the
-    rest as args. Update the module grammar doc block at the top (~L12–21) and
-    the per-fn docs.
-  - `resolve_expr_image` (~L328, the `$`/`docker://`/hex/path sniffer):
-    becomes the base-string resolver dispatched on `ArgType` (see above). Delete
-    the shape-sniffing branches; each shape now arrives as an explicit type.
-- **CLI `run`/`curry`:** `crates/caos/src/lib.rs`
-  - `run_request` (~L2302), `prepare_request` (~L2328): drop the positional
-    `image: &str`; pull `--base` out of the kvs. `<output>` (a host result path,
-    NOT an arg) stays. Argv parsing lives in `crates/caos/src/bin/caos-cli.rs`.
-  - `resolve_run_image` (worker/CLI image sniffer): the `--map`/`--run`/`--then`
-    and worker-`caos curry` image args route through it. Type them; delete the
-    sniffing. This is the map-then image-position parser touched in stage 1
-    (lib.rs ~L2490 region).
-- **Worker `caos` subcommands:** `crates/caos/src/bin/caos.rs` — `caos curry`,
-  `caos run-then`, `caos map-then`. `curry` collapses like the others. **Open
-  detail:** `map-then`/`run-then` take a *positional `<in>`* (the data node,
-  single-assignment at `/cas/out`) that is NOT a base — decide whether `<in>`
-  stays positional (likely yes; only `--map`/`--run`/`--then` get typed) and
-  whether the `--` separator stays for it. Note in `design/map-then.md`.
-- **Server:** `crates/server/src/compute.rs` sub-request builder (~L734) has
-  `image.len()==40 && hex → tree entry, else blob`. **Keep it** — that is
-  re-deriving the entry representation from a stored ref (the server's
-  `base_arg_entry`), NOT user-value sniffing. Claude confirmed the server's
-  `unwrap_curry` only peels `CURRY_MARKER`, so it was never confused by `base`.
+Pointers (verified this session):
 
-### `.caos-expr` migration (all 14 files) — uniform rewrite
+- **CLI `run`/`curry`:** argv parsing in `crates/caos/src/bin/caos-cli.rs`
+  (`Some("run")` ~L43 matches `[image, output?, "--", kvs…]`; `Some("curry")`
+  ~L109 passes `arg_tree` positional). Drop the positional; pull `--base` from
+  kvs. Keep the CLI `--` separating the optional `output` (a host result path,
+  NOT an arg) from the args. `cli_run`/`run_request`/`prepare_request`
+  (`lib.rs` ~L2302/2328) currently take `image: &str` — feed it from the parsed
+  `--base` instead. **CLI `:@=` base** = a host dir → `resolve_cli_image`
+  (ingest+eval); make it path-only (docker/hash now arrive as their own types).
+- **Worker `caos`:** `crates/caos/src/bin/caos.rs` — `curry` (drop positional
+  base → `--base`), `run-then`/`map-then` (keep the positional `<in>` data node;
+  type `--map`/`--run`/`--then`). The map-then image-arg parser is in `lib.rs`
+  (~L2560 region, matches `ArgType`, calls `resolve_run_image`). `resolve_run_image`
+  (`lib.rs` ~L2723) is the worker/CLI sniffer: split its `docker://`/hex branches
+  out to the `:docker=`/`:hash=` types, leaving it to resolve only a `:@=`
+  `/cas` path (whose *content* may still be a `docker://` blob — that's resolving
+  a recorded object, not sniffing a token, and stays).
+- **Tool scripts + fixtures to migrate with 2C** (they use worker/CLI grammar):
+  `std/flake-builder/worker` (`caos run-then … --run=… --then=…`, `caos curry
+  /cas/args/base …`), `caos-tools/build.sh` + `test.sh` (`--run=docker://seeded`
+  → `--run:docker=seeded`; `--run=/cas/args/result` → `--run:@=…`; `--map/--then`
+  `$var` holding a hash → `:hash=`; `caos curry /cas/args/base …`), and the many
+  `tests/*/cli.sh` doing `caos-cli run DEEP-DEPS/x …` / `curry DEEP-DEPS/x --`.
+- **Server:** `crates/server/src/compute.rs` sub-request builder (~L734)
+  `image.len()==40 && hex → tree entry, else blob`. **Keep** — that re-derives
+  the entry from a stored ref (the server's `base_arg_entry`), not user-value
+  sniffing.
+- **Open detail:** whether `map-then`/`run-then` keep the `--` before their typed
+  image flags (the `<in>` stays positional regardless). Note in
+  `design/map-then.md`.
 
-Every current expr is `run <IMG> -- --in:@=.` (or a `curry <IMG> -- …`). Rewrite
-to `run --base:<TYPE>=<IMG> --in:@=.`:
-
-| `<IMG>` today | becomes |
-|---|---|
-| `docker://seeded-X` (sentinels: flake-builder=`seeded`, and `seeded-{rustc,deep-deps,runner}`) | `--base:docker=seeded-X` |
-| a path (`std/deep-deps`, `deep-deps`, `DEEP-DEPS/flake-builder`, …) | `--base:@=<path>` |
-
-Files: `./.caos-expr`, `./std/.caos-expr`, and `std/*/.caos-expr` for
-`bash bash-tool cargo deep-deps flake-builder llm-call llm-step llm-stub merge
-rgrep runner rustc`. (rustc/deep-deps/runner/flake-builder are the docker
-sentinels; the rest are paths.)
-
-### Tool scripts + bootstrap to migrate
-
-- `std/flake-builder/worker`: `caos run-then /cas/args/in -- --run="$build" --then="$stack"`
-  → typed image args. Self-recursion `caos curry /cas/args/base -- …` →
-  `caos curry --base:@=/cas/args/base …` (worker-side `:@=` is a `/cas` path).
-- `caos-tools/build.sh`, `caos-tools/test.sh`: several `caos run-then … --run=…`
-  / `caos map-then … --map=… --then=…` (e.g. `--run=docker://seeded` →
-  `--run:docker=seeded`; `--run=/cas/args/result` → `--run:@=/cas/args/result`;
-  `--map="$var"`/`--then="$var"` where the var holds a hash → `:hash=`) and the
-  `caos curry /cas/args/base -- …` self-recursions.
-- `build-builtins.sh`: the seed `required` maps already emit `{"base":…,"in":…}`
-  (2A). The `docker://seeded*` blobs it hashes (`printf 'docker://seeded…'`) stay
-  as-is — they are the stored representation `:docker=` also produces, so the
-  formed key still matches. **Only the `.caos-expr` tokens change**, not the seed
-  bytes. Verify key-match holds after migration (a mismatch shows up as a seeded
-  item falling through to the generic runner and dying on the sentinel image).
-
-### ⚠️ The trap that already bit us (2A) — keep it in mind for 2B
+### ⚠️ The trap that already bit us (2A) — still relevant
 
 **`base` collides with the git-docker image tree.** An image tree carries a
 `base` entry of its own — the `docker://` ref its `layer<NN>`s delta over (SPEC,
 "Git-tree image"). 2A's `args_tree_node` used "has a `base` entry ⇒ args tree"
-and so peeled *every image tree*, scattering `config.json`/`layer<NN>` into the
-args and sending runs to the raw server-side registry name
-(`lookup caos-registry … no such host`). Fixed by making `args_tree_node` return
-`None` for a tree carrying `config.json` (the converter requires it; a `.`-name
-can't be an arg). **Anywhere 2B inspects tree entries by the `base` name must
-keep image-trees vs args-trees apart the same way.**
+and peeled *every image tree* (fixed by returning `None` for a tree carrying
+`config.json`). **Anywhere later stages inspect tree entries by the `base` name
+must keep image-trees vs args-trees apart the same way.**
 
 ---
 
