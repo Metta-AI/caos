@@ -271,12 +271,17 @@ parentage: an ordinary initial event first-parents the resolved workspace base,
 while a materialized fork marker first-parents its selected source event. The
 atomic first publication separately creates the title and active membership
 under create-only presentation-ref leases while proving archived membership
-absent. A retry after an ambiguous transport failure first reads `F`: an
-observed value equal to the proposed creation tip means the first attempt
-succeeded; any other value is a collision and must not be adopted as the new
-conversation. A future child-conversation protocol must use the same
-create-only rule so replaying a recorded creation cannot attach a child request
-to somebody else's existing history.
+absent. A retry after an ambiguous transport failure first reads `F`. For
+ordinary message creation, an observed tip equal to the proposal—or a descendant
+that contains it on the first-parent spine—proves the first attempt succeeded;
+any unrelated value is a collision and must not be adopted. Materialized forks
+have one narrow additional recovery case: two structurally equivalent markers
+can differ only because their commit timestamps produced different object IDs.
+The loser may adopt the equivalent marker already on the canonical spine and
+create only its missing membership under the active/archived absence leases; it
+does not rewrite the canonical head or title. A future child-conversation
+protocol must use an equally explicit create-only identity rule so replaying a
+recorded creation cannot attach a child request to somebody else's history.
 
 ### Losing the compare-and-swap
 
@@ -307,13 +312,16 @@ does not imply a logically valid event: the first parent records the observed
 canonical head, while consumers recheck request, round, and call identities
 before appending.
 
-When the trees conflict, do not make conflict markers the canonical workspace
-and do not discard the losing proposal. Append a terminal conflict event whose
-first parent is the current head and whose second parent is the proposed
-workspace commit. Its tree remains the clean current tree, while its structured
-payload records the base, current and proposed commits and the conflicting
-paths. This keeps both workspace versions reachable and records the conflict
-for later resolution.
+When an idle submission that owns the foreground lifecycle finds a tree
+conflict, do not make conflict markers the canonical workspace and do not
+discard the losing proposal. Append a terminal conflict event whose first
+parent is the current head and whose second parent is the proposed workspace
+commit. Its tree remains the clean current tree, while its structured payload
+records the base, current and proposed commits and the conflicting paths. This
+keeps both workspace versions reachable and records the conflict for later
+resolution. A conflicting proposal against an already-active request is an
+interjection failure instead: reject it without moving `F` or changing that
+request's status, and let the rich client restore the draft and show the error.
 
 ### User path
 
