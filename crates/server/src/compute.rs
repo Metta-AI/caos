@@ -900,8 +900,8 @@ fn args_entries(
 }
 
 /// Unpack an ArgTree into the reserved entries the server needs: the image ref
-/// (its `image` entry), the std-tree hash (its `std` entry, empty if none), and
-/// the salt (its `salt` entry, empty if none). `image`/`std`/`salt` are all
+/// (its `base` entry), the std-tree hash (its `std` entry, empty if none), and
+/// the salt (its `salt` entry, empty if none). `base`/`std`/`salt` are all
 /// entries of this one tree, so the ArgTree's hash *is* the cache key with
 /// nothing keyed alongside it — the ArgTree hash itself is the request identity,
 /// so it is not returned here.
@@ -916,7 +916,7 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
             // is a tree, its oid the image hash — the image travels inside the
             // ArgTree graph); a `docker://` image has no git object, so it rides
             // as a blob naming the registry ref.
-            "image" => {
+            "base" => {
                 image = Some(if entry.mode.is_tree() {
                     entry.oid.to_string()
                 } else {
@@ -928,7 +928,7 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
             _ => {}
         }
     }
-    let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'image'"))?;
+    let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'base'"))?;
     Ok((image, salt))
 }
 
