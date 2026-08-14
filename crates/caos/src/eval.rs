@@ -386,26 +386,18 @@ fn resolve_expr_args(
 ) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for &tok in toks {
-        let body = tok
-            .strip_prefix("--")
-            .ok_or_else(|| format!("eval-path: expected --name=value, got {tok:?}"))?;
-        let (key, value) = body
-            .split_once('=')
-            .ok_or_else(|| format!("eval-path: expected --name[:@]=value, got {tok:?}"))?;
-        let (name, is_path) = match key.split_once(':') {
-            None => (key, false),
-            Some((n, "@")) => (n, true),
-            Some((_, ty)) => {
+        let (name, ty, value) = crate::parse_arg(tok)?;
+        // The evaluator resolves literals, paths and `$VAR` object references.
+        // Commit / tree-hash args share the same `parse_arg` vocabulary (so the
+        // type names and their errors are defined once) but aren't wired into
+        // eval resolution yet — that lands with the new locator types (stage 3).
+        match ty {
+            crate::ArgType::Literal | crate::ArgType::Path => {}
+            _ => {
                 return Err(format!(
-                    "eval-path: unknown arg type {ty:?} in {tok:?} \
-                     (use --name=value or --name:@=path)"
+                    "eval-path: arg type not yet supported in .caos-expr: {tok:?}"
                 ))
             }
-        };
-        if name.is_empty() || name.contains('/') {
-            return Err(format!(
-                "eval-path: arg name must be a single path component, got {name:?}"
-            ));
         }
 
         let (mode, oid) = if let Some(var) = value.strip_prefix('$') {
@@ -413,7 +405,7 @@ fn resolve_expr_args(
                 .get(var)
                 .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
             (mode_of_kind(kind), parse_oid(oid)?)
-        } else if is_path {
+        } else if matches!(ty, crate::ArgType::Path) {
             resolve_expr_path(t, input_tree, value, store)?
         } else {
             (
