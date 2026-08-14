@@ -14,11 +14,11 @@ traps have already been sprung.
 |---|---|---|
 | 1 | Unify the two arg parsers into one `ArgType` + `parse_arg` | ✅ done, merged |
 | 2A | Rename the reserved ArgTree entry `image` → `base` (wire/disk/seed) | ✅ done (33/33), merged |
-| **2B** | **Grammar collapse: `run`/`curry` take `--base`; drop positional image + `--`; type map-then positions; add `:docker=`/`:hash=`** | **← NEXT, not started** |
+| 2B | `.caos-expr` grammar collapse: `run`/`curry` take `--base`, no positional/`--`; add `:docker=`/`:hash=`; migrate all `.caos-expr` | ✅ done (33/33), **no redeploy needed** |
+| **2C** | **CLI + worker `caos` grammar collapse: drop the positional image everywhere; type the map-then positions; delete the last sniffers** | **← NEXT, not started** |
 | 3 | `:@@=` remote git-ref *parse* (`Ref{url,rev,dir}` + validation) | not started |
 | 4 | `:@@=` *resolution* (client-side fetch → oid) | not started |
-| 5 | Migrate every `.caos-expr` + `build-builtins.sh` to the new grammar | folded into 2B |
-| 6 | Docs + tests (SPEC, README, `tests/eval-path`, a remote-ref test) | ongoing |
+| 6 | Docs + tests (SPEC, README, a remote-ref test) | ongoing |
 
 The end goal past stage 4: a consumer repo pins caos with one
 `--base:@@=git+https://…caos?rev=<sha>` locator, grafts it in at
