@@ -124,8 +124,10 @@ fn start(cfg: &Config) -> Result<(), String> {
     let run = own_args_tree()?;
     let head_hash = cas_hash(&arg("head"))?;
     let log = ensure_request_running(conversation, &run, &head_hash)?;
+    // One recovery dispatch at turn entry is enough. Normal tool callbacks do
+    // not repeat it and park another single-flight waiter for every tool call.
+    reconcile_async_tasks(cfg, &log)?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
-        reconcile_async_tasks(cfg, &log)?;
         return finish_from_terminal(terminal);
     }
     let request = active_request(&log)?;
@@ -589,7 +591,13 @@ fn llm_round(
                 "status": "idle",
             });
             match progress::append_event_at_head(conversation, prev, &event, &tree)? {
-                progress::ConditionalAppend::Appended(appended) => forward_commit(&appended.commit),
+                progress::ConditionalAppend::Appended(appended) => {
+                    // A single post-turn recovery point closes dispatch loss
+                    // before this llm-step process exits. Later recovery is
+                    // owned by a fresh turn/follower, not by tool callbacks.
+                    reconcile_async_tasks(cfg, &progress::conversation_log(conversation)?)?;
+                    forward_commit(&appended.commit)
+                }
                 progress::ConditionalAppend::HeadChanged(_) => {
                     let log = progress::conversation_log(conversation)?;
                     resume_run(cfg, run, head_hash, log)
@@ -1352,21 +1360,7 @@ fn reconcile_async_tasks(cfg: &Config, log: &progress::ConversationLog) -> Resul
     }
     let conversation = conversation(cfg)?;
     for state in tasks {
-        let result_is_addressable = if state.status == "pending" {
-            false
-        } else {
-            match progress::result_ref(&state.task) {
-                Ok(result) => result.is_some(),
-                Err(error) => {
-                    eprintln!(
-                        "llm-step: could not read result ref for async task {}: {error}",
-                        state.task
-                    );
-                    continue;
-                }
-            }
-        };
-        if !async_work::status_needs_dispatch(&state.status, result_is_addressable) {
+        if !async_work::task_needs_dispatch(&state.task, &state.status) {
             continue;
         }
         if let Err(error) = async_work::readmit_task(&state.task, conversation) {
@@ -1385,7 +1379,6 @@ fn resume_run(
     head_hash: &str,
     log: progress::ConversationLog,
 ) -> Result<(), String> {
-    reconcile_async_tasks(cfg, &log)?;
     if let Some(terminal) = terminal_for_run(&log, run)? {
         return finish_from_terminal(terminal);
     }

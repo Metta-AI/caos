@@ -71,7 +71,7 @@ where
     queue_request(
         id,
         request,
-        &conversation_ref(conversation)?,
+        &progress::conversation_ref(conversation)?,
         run_and_update_ref_image,
         ensure_status,
     )
@@ -92,7 +92,7 @@ where
     if let Err(error) = validate_hash(subrequest, "async subrequest") {
         return Ok(error_block(call_id, &error));
     }
-    validate_target_ref(target_ref)?;
+    progress::validate_conversation_ref(target_ref)?;
     if let Some(error) = request_tree_error(subrequest)? {
         return Ok(error_block(call_id, &error));
     }
@@ -109,16 +109,8 @@ where
     let status = ensure_status(&task)?;
     validate_status(&status)?;
 
-    let result_is_addressable = if status == "pending" {
-        false
-    } else {
-        progress::result_ref(&task)?.is_some()
-    };
-    if let Some(error) = dispatch_error(
-        &task,
-        status_needs_dispatch(&status, result_is_addressable),
-        dispatch,
-    ) {
+    let should_dispatch = task_needs_dispatch(&task, &status);
+    if let Some(error) = dispatch_error(&task, should_dispatch, dispatch) {
         eprintln!("llm-step: {error}; the durable task state will cause a later recovery to retry");
     }
 
@@ -130,6 +122,11 @@ where
 /// to launch the client or any server error other than not-found is
 /// infrastructure failure and remains fatal to the turn.
 fn request_tree_error(request: &str) -> Result<Option<String>, String> {
+    if !progress::object_exists(request)? {
+        return Ok(Some(format!(
+            "async request {request} is not stored in CAOS"
+        )));
+    }
     let target = fresh("async-subrequest");
     let output = Command::new("caos")
         .args(["get-hash", request, &target])
@@ -137,11 +134,6 @@ fn request_tree_error(request: &str) -> Result<Option<String>, String> {
         .map_err(|error| format!("validating async subrequest {request}: {error}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if detail.contains("server returned 404") {
-            return Ok(Some(format!(
-                "async request {request} is not stored in CAOS"
-            )));
-        }
         return Err(format!(
             "validating async subrequest {request} failed ({}): {detail}",
             output.status
@@ -239,7 +231,7 @@ pub(crate) fn task_status<'a>(
 /// recovery dispatches Q itself rather than rebuilding it.
 pub(crate) fn readmit_task(task: &str, conversation: &str) -> Result<(), String> {
     validate_hash(task, "async task")?;
-    let target_ref = conversation_ref(conversation)?;
+    let target_ref = progress::conversation_ref(conversation)?;
     let request = fresh("async-request");
     caos(["get-hash", task, &request])?;
     caos(["get", &request])?;
@@ -269,43 +261,6 @@ fn read_literal_arg(request: &str, task: &str, name: &str) -> Result<String, Str
     fs::read_to_string(&argument)
         .map(|value| value.trim().to_string())
         .map_err(|error| format!("reading async task {task} {name}: {error}"))
-}
-
-fn conversation_ref(conversation: &str) -> Result<String, String> {
-    let target = format!("refs/caos/v2/conversations/{conversation}/head");
-    validate_target_ref(&target)?;
-    Ok(target)
-}
-
-fn validate_target_ref(target: &str) -> Result<(), String> {
-    let Some(conversation) = target
-        .strip_prefix("refs/caos/v2/conversations/")
-        .and_then(|rest| rest.strip_suffix("/head"))
-    else {
-        return Err(format!("invalid target conversation ref {target:?}"));
-    };
-    if conversation.is_empty()
-        || conversation.len() > 512
-        || conversation.starts_with('/')
-        || conversation.ends_with('/')
-        || conversation.contains("//")
-        || conversation.contains("..")
-        || conversation.contains("@{")
-        || conversation.ends_with('.')
-        || conversation.bytes().any(|b| {
-            b <= b' ' || b == 0x7f || matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-        })
-        || conversation.split('/').any(|component| {
-            component.is_empty()
-                || component == "."
-                || component == "head"
-                || component.starts_with('.')
-                || component.ends_with(".lock")
-        })
-    {
-        return Err(format!("invalid target conversation ref {target:?}"));
-    }
-    Ok(())
 }
 
 fn validate_status(status: &str) -> Result<(), String> {
@@ -342,6 +297,21 @@ fn dispatch(task: &str) -> Result<(), String> {
 
 pub(crate) fn status_needs_dispatch(status: &str, result_is_addressable: bool) -> bool {
     status == "pending" || (matches!(status, "complete" | "failed") && !result_is_addressable)
+}
+
+/// A result-ref probe is only a recovery hint. If it is temporarily unreadable,
+/// leave the durable task state alone and let a later recovery point retry.
+pub(crate) fn task_needs_dispatch(task: &str, status: &str) -> bool {
+    if status == "pending" {
+        return true;
+    }
+    match progress::result_ref(task) {
+        Ok(result) => status_needs_dispatch(status, result.is_some()),
+        Err(error) => {
+            eprintln!("llm-step: could not read result ref for async task {task}: {error}");
+            false
+        }
+    }
 }
 
 fn dispatch_error<F>(task: &str, needed: bool, dispatch: F) -> Option<String>

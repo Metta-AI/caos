@@ -5,6 +5,8 @@
 //! binary. Status appends are tree-neutral, so a CAS loser simply retries from
 //! the latest head with that head's tree.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -56,17 +58,21 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
         return Err(format!("invalid async status {status:?}"));
     }
     let base = server_base()?;
+    let mut commits = HashMap::new();
 
     for _ in 0..MAX_CAS_ATTEMPTS {
         let head = read_ref(&base, refname)?
             .ok_or_else(|| format!("target conversation ref {refname} does not exist"))?;
-        let remote = fetch_commit(&base, &head)?;
+        let remote = fetch_commit_cached(&base, &head, &mut commits)?;
         // A retry after a caught failure can legitimately succeed: caught
         // failures are not cached, so rerunning the same Q may produce the
         // other terminal outcome. Only the same outcome is idempotent. A
         // different one must become the latest durable state so F agrees with
         // the result this execution of Q will return and pin.
-        if terminal_status_is_current(task_status(&base, &head, task)?.as_deref(), status) {
+        if terminal_status_is_current(
+            task_status(&base, &head, task, &mut commits)?.as_deref(),
+            status,
+        ) {
             return Ok(());
         }
 
@@ -111,6 +117,7 @@ fn terminal_status_is_current(current: Option<&str>, next: &str) -> bool {
     current == Some(next)
 }
 
+#[derive(Clone)]
 struct RemoteCommit {
     tree: String,
     parent: Option<String>,
@@ -146,10 +153,36 @@ fn fetch_commit(base: &str, hash: &str) -> Result<RemoteCommit, String> {
     })
 }
 
-fn task_status(base: &str, head: &str, task: &str) -> Result<Option<String>, String> {
+fn fetch_commit_cached(
+    base: &str,
+    hash: &str,
+    cache: &mut HashMap<String, RemoteCommit>,
+) -> Result<RemoteCommit, String> {
+    cached_commit(cache, hash, || fetch_commit(base, hash))
+}
+
+fn cached_commit(
+    cache: &mut HashMap<String, RemoteCommit>,
+    hash: &str,
+    fetch: impl FnOnce() -> Result<RemoteCommit, String>,
+) -> Result<RemoteCommit, String> {
+    if let Some(commit) = cache.get(hash) {
+        return Ok(commit.clone());
+    }
+    let commit = fetch()?;
+    cache.insert(hash.to_string(), commit.clone());
+    Ok(commit)
+}
+
+fn task_status(
+    base: &str,
+    head: &str,
+    task: &str,
+    cache: &mut HashMap<String, RemoteCommit>,
+) -> Result<Option<String>, String> {
     let mut current = Some(head.to_string());
     while let Some(hash) = current {
-        let commit = fetch_commit(base, &hash)?;
+        let commit = fetch_commit_cached(base, &hash, cache)?;
         let event = match serde_json::from_str::<Value>(commit.message.trim()) {
             Ok(event) if event.get("v").and_then(Value::as_u64) == Some(2) => event,
             _ => return Ok(None),
@@ -380,5 +413,30 @@ mod tests {
         assert!(!terminal_status_is_current(Some("complete"), "failed"));
         assert!(!terminal_status_is_current(Some("pending"), "complete"));
         assert!(!terminal_status_is_current(None, "failed"));
+    }
+
+    #[test]
+    fn immutable_commit_cache_reuses_spine_entries_across_retries() {
+        let hash = "a".repeat(40);
+        let fetches = std::cell::Cell::new(0);
+        let mut cache = HashMap::new();
+        let mut fetch = || {
+            fetches.set(fetches.get() + 1);
+            Ok(RemoteCommit {
+                tree: "b".repeat(40),
+                parent: None,
+                message: "{}".to_string(),
+            })
+        };
+
+        assert_eq!(
+            cached_commit(&mut cache, &hash, &mut fetch).unwrap().tree,
+            "b".repeat(40)
+        );
+        assert_eq!(
+            cached_commit(&mut cache, &hash, &mut fetch).unwrap().tree,
+            "b".repeat(40)
+        );
+        assert_eq!(fetches.get(), 1);
     }
 }
