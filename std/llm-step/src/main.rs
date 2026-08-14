@@ -604,20 +604,12 @@ fn llm_round(
             }
         }
         "tool_use" => {
-            if tool_uses.is_empty() {
-                return Err("stop_reason tool_use but no tool_use blocks".to_string());
-            }
+            // Validate the identifiers before publishing any part of this
+            // response. `latest_round` and transcript replay rely on IDs to
+            // pair results; persisting a malformed batch would make even the
+            // normal failure recorder unable to read the new head.
+            let calls = durable_tool_calls(&tool_uses)?;
             let tree = cas_hash(ws)?;
-            let calls: Vec<Value> = tool_uses
-                .iter()
-                .map(|call| {
-                    json!({
-                        "id": call.get("id").cloned().unwrap_or(Value::Null),
-                        "name": call.get("name").cloned().unwrap_or(Value::Null),
-                        "args": call.get("input").cloned().unwrap_or(Value::Null),
-                    })
-                })
-                .collect();
             let event = json!({
                 "kind": "caos-chat-event",
                 "request": run,
@@ -2036,6 +2028,34 @@ fn response_text(blocks: &[Value]) -> String {
         .join("\n\n")
 }
 
+/// Build the durable call projection only after proving the response can be
+/// folded again. IDs are scoped to this response's request/round, so reuse by
+/// a later round is valid; duplicates inside one response are not.
+fn durable_tool_calls(tool_uses: &[Value]) -> Result<Vec<Value>, String> {
+    if tool_uses.is_empty() {
+        return Err("stop_reason tool_use but no tool_use blocks".to_string());
+    }
+    let mut ids = std::collections::HashSet::new();
+    tool_uses
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("model tool_use block {index} has no string id"))?;
+            if !ids.insert(id) {
+                return Err(format!("model response repeats tool_use id {id:?}"));
+            }
+            Ok(json!({
+                "id": id,
+                "name": call.get("name").cloned().unwrap_or(Value::Null),
+                "args": call.get("input").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
 /// A fresh, unique direct-child CAS path (CAS paths are single-assignment).
 pub(crate) fn fresh(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2094,6 +2114,29 @@ mod tests {
                 json!({"role":"assistant","content":[call_a, state.calls[1].clone()]})
             ]
         );
+    }
+
+    #[test]
+    fn durable_tool_calls_reject_ids_that_would_brick_replay() {
+        let valid = json!({"type":"tool_use","id":"same","name":"read","input":{}});
+        assert_eq!(
+            durable_tool_calls(std::slice::from_ref(&valid)).unwrap()[0]["id"],
+            "same"
+        );
+        // The same model-local ID remains valid in a later invocation/round.
+        assert!(durable_tool_calls(std::slice::from_ref(&valid)).is_ok());
+
+        let missing = json!({"type":"tool_use","name":"read","input":{}});
+        assert!(durable_tool_calls(&[missing])
+            .unwrap_err()
+            .contains("no string id"));
+        let non_string = json!({"type":"tool_use","id":7,"name":"read","input":{}});
+        assert!(durable_tool_calls(&[non_string])
+            .unwrap_err()
+            .contains("no string id"));
+        assert!(durable_tool_calls(&[valid.clone(), valid])
+            .unwrap_err()
+            .contains("repeats tool_use id"));
     }
 
     #[test]
