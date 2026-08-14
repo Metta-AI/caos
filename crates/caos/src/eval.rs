@@ -367,7 +367,7 @@ fn resolve_expr_base(
         // so evaluating it never re-enters flake-builder's own entry
         // (design/caos-expr.md, "Breaking the cycles"). The formed arg-tree
         // carries the ref as a blob, exactly what the seeder registers.
-        crate::ArgType::Docker => Ok(format!("{}{value}", crate::DOCKER_SCHEME)),
+        crate::ArgType::Docker => Ok(format!("{DOCKER_SCHEME}{value}")),
         // `:hash=<oid>` — an object already in the store (a git image or a curry
         // node), referenced as-is. Location-independent.
         crate::ArgType::Hash => {
