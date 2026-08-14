@@ -391,10 +391,12 @@ arrival runs independently with expanded ancestry so ordinary stack-cycle
 detection can report the cycle; owner loss wakes its waiters with an error.
 After joining or claiming a flight, the dispatcher rereads the best-effort
 Redis result cache before doing work, closing the miss-then-owner handoff race.
-Completed results are normally also pinned under `refs/caos/res/R`. A terminal
-async Q with that exact result ref is not reissued and never appends a new
-`pending` state; this addressability check is stronger than assuming every
-completed result remains in Redis.
+When any participant is a top-level run, the owner retains its flight through
+publication of `refs/caos/res/R` and broadcasts the combined compute and pin
+outcome before another owner may start; a stale earlier result therefore cannot
+overwrite a newer retry. A terminal async Q with that exact result ref is not
+reissued and never appends a new `pending` state; this addressability check is
+stronger than assuming every completed result remains in Redis.
 
 CAOS does not yet durably queue in-flight resolution across a server restart.
 The admitted request and every completed remote event remain on `head`, so any
