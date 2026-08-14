@@ -2449,7 +2449,11 @@ mod git_ref_tests {
         let v = format!("git+https://github.com/o/repo?rev={SHA}&dir=std/deep-deps");
         assert_eq!(
             parse_git_ref(&v).unwrap(),
-            r("git+https://github.com/o/repo", Some(SHA), Some("std/deep-deps"))
+            r(
+                "git+https://github.com/o/repo",
+                Some(SHA),
+                Some("std/deep-deps")
+            )
         );
     }
 
