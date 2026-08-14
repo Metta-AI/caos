@@ -37,7 +37,7 @@ echo world > pkg-direct/name
 cp -r "$BASH" pkg-direct/bash
 cat > pkg-direct/.caos-expr <<'EOF'
 # build this directory by running the bash worker over its files
-run bash -- --worker1:@=build.sh --name:@=name
+run --base:@=bash --worker1:@=build.sh --name:@=name
 EOF
 
 # The same computation written with a bound variable: curry the worker in,
@@ -48,8 +48,8 @@ cp pkg-direct/build.sh pkg-var/build.sh
 cp pkg-direct/name pkg-var/name
 cp -r "$BASH" pkg-var/bash
 cat > pkg-var/.caos-expr <<'EOF'
-G=curry bash -- --worker1:@=build.sh
-run $G -- --name:@=name
+G=curry --base:@=bash --worker1:@=build.sh
+run --base=$G --name:@=name
 EOF
 
 # The same computation with the worker described by a SUBTREE referenced as the
@@ -63,10 +63,10 @@ cp pkg-direct/build.sh pkg-nested/tool/build.sh
 cp pkg-direct/name pkg-nested/name
 cp -r "$BASH" pkg-nested/tool/bash
 cat > pkg-nested/tool/.caos-expr <<'EOF'
-curry bash -- --worker1:@=build.sh
+curry --base:@=bash --worker1:@=build.sh
 EOF
 cat > pkg-nested/.caos-expr <<'EOF'
-run tool -- --name:@=name
+run --base:@=tool --name:@=name
 EOF
 
 # A `:@=` ARG whose target carries a `.caos-expr` is an EXPRESSION, so it is
@@ -86,7 +86,7 @@ echo world > /tmp/out/name
 caos put /tmp/out /cas/out
 EOF
 cat > pkg-argexpr/dep/.caos-expr <<'EOF'
-run bash -- --worker1:@=gen.sh
+run --base:@=bash --worker1:@=gen.sh
 EOF
 cat > pkg-argexpr/read.sh <<'EOF'
 #!/bin/bash
@@ -104,7 +104,7 @@ echo "hello $(cat /cas/args/namedir/name)" > /tmp/out/greeting
 caos put /tmp/out /cas/out
 EOF
 cat > pkg-argexpr/.caos-expr <<'EOF'
-run bash -- --worker1:@=read.sh --namedir:@=dep
+run --base:@=bash --worker1:@=read.sh --namedir:@=dep
 EOF
 
 # A `:@=` target with NO `.caos-expr` is DATA and stays raw — the other half of
@@ -115,7 +115,7 @@ cp -r "$BASH" pkg-argdata/bash
 echo world > pkg-argdata/data/name
 cp pkg-argexpr/read.sh pkg-argdata/read.sh
 cat > pkg-argdata/.caos-expr <<'EOF'
-run bash -- --worker1:@=read.sh --namedir:@=data
+run --base:@=bash --worker1:@=read.sh --namedir:@=data
 EOF
 
 commit "eval-path fixtures"
