@@ -61,10 +61,12 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
         let head = read_ref(&base, refname)?
             .ok_or_else(|| format!("target conversation ref {refname} does not exist"))?;
         let remote = fetch_commit(&base, &head)?;
-        if matches!(
-            task_status(&base, &head, task)?.as_deref(),
-            Some("complete" | "failed")
-        ) {
+        // A retry after a caught failure can legitimately succeed: caught
+        // failures are not cached, so rerunning the same Q may produce the
+        // other terminal outcome. Only the same outcome is idempotent. A
+        // different one must become the latest durable state so F agrees with
+        // the result this execution of Q will return and pin.
+        if terminal_status_is_current(task_status(&base, &head, task)?.as_deref(), status) {
             return Ok(());
         }
 
@@ -103,6 +105,10 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
     Err(format!(
         "target ref {refname} kept changing after {MAX_CAS_ATTEMPTS} attempts"
     ))
+}
+
+fn terminal_status_is_current(current: Option<&str>, next: &str) -> bool {
+    current == Some(next)
 }
 
 struct RemoteCommit {
@@ -364,5 +370,15 @@ mod tests {
             .as_deref(),
             Some("failed")
         );
+    }
+
+    #[test]
+    fn only_the_same_terminal_outcome_is_idempotent() {
+        assert!(terminal_status_is_current(Some("failed"), "failed"));
+        assert!(terminal_status_is_current(Some("complete"), "complete"));
+        assert!(!terminal_status_is_current(Some("failed"), "complete"));
+        assert!(!terminal_status_is_current(Some("complete"), "failed"));
+        assert!(!terminal_status_is_current(Some("pending"), "complete"));
+        assert!(!terminal_status_is_current(None, "failed"));
     }
 }

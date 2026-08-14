@@ -6,10 +6,11 @@
 //! job (set up the root-owned `/cas`, run `/worker` as an unprivileged user,
 //! post the kind + hash recorded at `/cas/out` back to the server), then
 //! long-polls for more work for its image until an idle TTL passes (see
-//! `design/runner-protocol.md`). It normally records continuations for the
-//! server to resolve after the job; `run-async` is the one command that directly
-//! dispatches `/run`. The shared command logic lives in the `caos` library;
-//! this binary is the worker's CLI surface plus the privileged runner.
+//! `design/runner-protocol.md`). It normally records continuations that the
+//! server resolves after the worker's job finishes; `run-async` is the
+//! deliberate exception that starts a detached top-level computation. The
+//! shared command logic lives in the `caos` library; this binary is the worker's
+//! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
 //! `run-then`, `run-request-then`, `run-async`, `prepare-request`, `curry`, and `runner`.
