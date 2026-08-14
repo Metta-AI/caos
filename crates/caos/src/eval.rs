@@ -343,7 +343,7 @@ fn resolve_expr_image(
     // item breaks a resolution-time cycle: `flake-builder`'s `.caos-expr` names
     // its own image as the sentinel `docker://seeded`, so evaluating it never
     // re-enters flake-builder's own entry (design/caos-expr.md, "Breaking the
-    // cycles"). The formed arg-tree carries the ref as a blob (image_arg_entry),
+    // cycles"). The formed arg-tree carries the ref as a blob (base_arg_entry),
     // exactly what the seeder registers and answers.
     if tok.starts_with(crate::DOCKER_SCHEME) {
         return Ok(tok.to_string());
