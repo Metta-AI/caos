@@ -8,7 +8,7 @@
 # expression, never by a name looked up against a pre-deepened ref.
 #
 # `deep-deps` names the sibling entry BY PATH, and that is what breaks cycle-2
-# (design/caos-expr.md, "Breaking the cycles"): `resolve_expr_image` evaluates
+# (design/caos-expr.md, "Breaking the cycles"): `resolve_expr_base` evaluates
 # the named subtree against ITSELF, so it sees `std/deep-deps`'s own
 # `.caos-expr` — the `docker://seeded-deep-deps` sentinel the core-seeder-runner
 # answers — and never re-enters this root expression. Nothing here needs
