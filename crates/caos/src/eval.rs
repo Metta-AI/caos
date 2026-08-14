@@ -16,15 +16,20 @@
 //! file's *value*:
 //!
 //! ```text
-//! NAME=run   <image> -- [--k=v | --k:@=path]
-//! NAME=curry <image> -- [--k=v | --k:@=path]
-//! curry $NAME -- --worker1:@=path         # the value (a run/curry, or a bare $NAME)
+//! NAME=run   --base:<type>=<image> [--k=v | --k:@=path]
+//! NAME=curry --base:<type>=<image> [--k=v | --k:@=path]
+//! curry --base:@=path --worker1:@=path    # the value (a run/curry, or a bare $NAME)
 //! ```
 //!
 //! Variable names are `[A-Z][A-Z0-9_]*`; the verbs (`run`, `curry`) are
 //! lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`.
 //! A `run` value evaluates to the run's result; a `curry` value to the curried
 //! ArgTree. `$NAME` is the object a prior line produced.
+//!
+//! There is no positional image and no `--`: the worker to run (or curry onto)
+//! is the reserved `--base` arg, typed like any other (`:@=` a path, `:docker=`
+//! a registry ref, `:hash=` an object in the store, or `=$NAME`). Every other
+//! `--k` is an ordinary arg.
 //!
 //! ## Argument resolution
 //!
@@ -33,6 +38,8 @@
 //! - `--k=value` — a literal blob, unless `value` is exactly `$NAME`, which
 //!   binds the object that variable holds (by reference, at its own kind).
 //! - `--k:@=path` — the object at `path` within the input subtree.
+//! - `--k:docker=ref` — the blob `docker://ref`; `--k:hash=oid` — an object the
+//!   store already holds, by oid.
 
 use std::collections::HashMap;
 
@@ -41,7 +48,7 @@ use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use super::{
     assemble_arg_tree, build_secret_store, curry_from_entries, entry_name, fetch_tree_entries,
     is_hex_hash, mark_arg_tree, parse_oid, post_object, post_tree, request_compute,
-    secret_store_header, ClientSecret, Transport,
+    secret_store_header, ClientSecret, Transport, DOCKER_SCHEME,
 };
 
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
@@ -294,17 +301,25 @@ fn eval_command(
             "eval-path: expected `run` or `curry`, got {verb:?}"
         ));
     }
-    let sep = tokens
-        .iter()
-        .position(|&x| x == "--")
-        .ok_or_else(|| format!("eval-path: `{verb}` needs `--` before its args"))?;
-    if sep != 2 {
-        return Err(format!(
-            "eval-path: `{verb}` takes exactly one image before `--`"
-        ));
+    // No positional image and no `--`: every token after the verb is a
+    // `--name[:type]=value` arg. Exactly one names the reserved `base` — the
+    // worker to run (or curry onto); the rest are its args.
+    let mut base: Option<(crate::ArgType, &str)> = None;
+    let mut arg_toks: Vec<&str> = Vec::new();
+    for &tok in &tokens[1..] {
+        let (name, ty, value) = crate::parse_arg(tok)?;
+        if name == "base" {
+            if base.replace((ty, value)).is_some() {
+                return Err(format!("eval-path: `{verb}` given --base twice"));
+            }
+        } else {
+            arg_toks.push(tok);
+        }
     }
-    let image_ref = resolve_expr_image(t, input_tree, tokens[1], env, store)?;
-    let entries = resolve_expr_args(t, input_tree, &tokens[sep + 1..], env, store)?;
+    let (bty, bval) =
+        base.ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
+    let image_ref = resolve_expr_base(t, input_tree, bty, bval, env, store)?;
+    let entries = resolve_expr_args(t, input_tree, &arg_toks, env, store)?;
 
     if verb == "curry" {
         // Mark the returned arg tree, so a caller that embeds it is per-user too
@@ -320,63 +335,80 @@ fn eval_command(
     request_compute(&server, &arg_tree, &secret_store_header(store))
 }
 
-/// Resolve the image token of a command to a ref: a `$NAME` variable, a
-/// `docker://` ref, a bare hash, or a relative path naming an image tree (a
-/// flake dir, a git-docker image, or an evaluable directory) within
-/// `input_tree`. A path is the only way to name another tree — there is no
-/// by-name lookup, so an expression can reach only what its own tree holds.
-fn resolve_expr_image(
+/// Resolve a command's `--base` arg to an image ref string, dispatched on its
+/// explicit type (never sniffed from the value's shape): `$VAR` (an object a
+/// prior line produced), `:@=<path>` (a path naming an image tree in
+/// `input_tree` — a flake dir, a git-docker image, or an evaluable dir, resolved
+/// through its own `.caos-expr`), `:docker=<ref>` (a registry image), or
+/// `:hash=<oid>` (an object already in the store). A path is the only way to
+/// name another tree — there is no by-name lookup, so an expression reaches only
+/// what its own tree holds.
+fn resolve_expr_base(
     t: &dyn Transport,
     input_tree: &str,
-    tok: &str,
+    ty: crate::ArgType,
+    value: &str,
     env: &HashMap<String, (String, String)>,
     store: &[ClientSecret],
 ) -> Result<String, String> {
-    if let Some(var) = tok.strip_prefix('$') {
+    // A `$VAR` base names an object a prior assignment produced, whatever its
+    // declared type — matched first, exactly as `resolve_expr_args` does.
+    if let Some(var) = value.strip_prefix('$') {
         let (_, oid) = env
             .get(var)
             .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
         return Ok(oid.clone());
     }
-    // A `docker://<ref>` image passes straight through — it names a registry
-    // image, not a tree, so there is nothing to resolve. This is how a core
-    // item breaks a resolution-time cycle: `flake-builder`'s `.caos-expr` names
-    // its own image as the sentinel `docker://seeded`, so evaluating it never
-    // re-enters flake-builder's own entry (design/caos-expr.md, "Breaking the
-    // cycles"). The formed arg-tree carries the ref as a blob (base_arg_entry),
-    // exactly what the seeder registers and answers.
-    if tok.starts_with(crate::DOCKER_SCHEME) {
-        return Ok(tok.to_string());
+    match ty {
+        // `:docker=<ref>` — a registry image, carried as the blob
+        // `docker://<ref>` (base_arg_entry stores those bytes). This is how a
+        // core item breaks a resolution-time cycle: `flake-builder`'s
+        // `.caos-expr` names its own image as the sentinel `--base:docker=seeded`,
+        // so evaluating it never re-enters flake-builder's own entry
+        // (design/caos-expr.md, "Breaking the cycles"). The formed arg-tree
+        // carries the ref as a blob, exactly what the seeder registers.
+        crate::ArgType::Docker => Ok(format!("{DOCKER_SCHEME}{value}")),
+        // `:hash=<oid>` — an object already in the store (a git image or a curry
+        // node), referenced as-is. Location-independent.
+        crate::ArgType::Hash => {
+            if !is_hex_hash(value) {
+                return Err(format!(
+                    "eval-path: --base:hash= wants an object hash, got {value:?}"
+                ));
+            }
+            Ok(value.to_string())
+        }
+        // `:@=<path>` — a path naming an image tree within `input_tree`.
+        crate::ArgType::Path => {
+            let (mode, oid) = lookup_in_tree(t, input_tree, value)?
+                .ok_or_else(|| format!("eval-path: base path {value:?} not found in tree"))?;
+            if !mode.is_tree() {
+                return Err(format!("eval-path: base path {value:?} is not a directory"));
+            }
+            // Evaluate the subtree's own `.caos-expr` (if any) to the image it
+            // builds — so a path to an EVALUABLE dependency (a `DEEP-DEPS/<name>`
+            // mount) resolves to its image, not its raw source; a subtree with no
+            // `.caos-expr` (a plain flake dir, a git-docker image) evaluates to
+            // itself. For a seeded worker this dispatches its build — which is
+            // why forming a `run` expr's key needs that worker already seeded
+            // (design/caos-expr.md). Carries the secret store, like any `run`
+            // eval-path performs (design/secrets.md).
+            let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
+            Ok(hash)
+        }
+        crate::ArgType::Literal => Err(
+            "eval-path: --base needs a type: use :@= (path), :docker=, :hash=, or =$VAR"
+                .to_string(),
+        ),
+        crate::ArgType::Commit => Err("eval-path: a commit is not an image base".to_string()),
     }
-    if is_hex_hash(tok) {
-        return Ok(tok.to_string());
-    }
-    let (mode, oid) = lookup_in_tree(t, input_tree, tok)?
-        .ok_or_else(|| format!("eval-path: image path {tok:?} not found in tree"))?;
-    if !mode.is_tree() {
-        return Err(format!("eval-path: image path {tok:?} is not a directory"));
-    }
-    // Evaluate the subtree's own `.caos-expr` (if any) to the image it builds,
-    // so a path to an EVALUABLE dependency resolves to its image, not its raw
-    // source. This is what lets a core item name a dep by a LOCAL path: a
-    // deep-deps mount at `DEEP-DEPS/<name>` carries that dep's (deepened)
-    // source, and `run DEEP-DEPS/<name>` here resolves it through the dep's own
-    // `.caos-expr`, so the dep's build is the dep's business.
-    // A subtree with NO `.caos-expr` evaluates to itself, so a plain flake
-    // dir or a git-docker image tree passes through unchanged. (For a seeded
-    // worker this dispatches its build — which is why forming a `run` expr's
-    // key needs that worker already seeded; see design/caos-expr.md, the
-    // dependency-ordered seeding.) That dispatch carries this evaluation's
-    // secret store, like any other `run` eval-path performs — so a builder is
-    // isolated and injected only if a reader actually names it, and stays
-    // globally shared otherwise (design/secrets.md).
-    let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
-    Ok(hash)
 }
 
-/// Resolve a command's `--name[:@]=value` args to tree entries, against
-/// `input_tree`. See the module grammar: `$NAME`, a literal blob, or a `:@=`
-/// path (within the tree, relative to the `.caos-expr`'s directory).
+/// Resolve a command's `--name:type=value` args to tree entries, against
+/// `input_tree`. Shares the [`crate::parse_arg`] vocabulary: `$VAR`, a literal
+/// blob (`=`), a `:@=` path (within the tree, relative to the `.caos-expr`'s
+/// directory), a `:docker=` ref, or a `:hash=` object already in the store.
+/// (The reserved `base` arg is pulled out by [`eval_command`] before this.)
 fn resolve_expr_args(
     t: &dyn Transport,
     input_tree: &str,
@@ -387,31 +419,37 @@ fn resolve_expr_args(
     let mut entries = Vec::new();
     for &tok in toks {
         let (name, ty, value) = crate::parse_arg(tok)?;
-        // The evaluator resolves literals, paths and `$VAR` object references.
-        // Commit / tree-hash args share the same `parse_arg` vocabulary (so the
-        // type names and their errors are defined once) but aren't wired into
-        // eval resolution yet — that lands with the new locator types (stage 3).
-        match ty {
-            crate::ArgType::Literal | crate::ArgType::Path => {}
-            _ => {
-                return Err(format!(
-                    "eval-path: arg type not yet supported in .caos-expr: {tok:?}"
-                ))
-            }
-        }
-
         let (mode, oid) = if let Some(var) = value.strip_prefix('$') {
+            // `$VAR` names an object a prior assignment produced, whatever the
+            // declared type — matched first.
             let (kind, oid) = env
                 .get(var)
                 .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
             (mode_of_kind(kind), parse_oid(oid)?)
-        } else if matches!(ty, crate::ArgType::Path) {
-            resolve_expr_path(t, input_tree, value, store)?
         } else {
-            (
-                EntryKind::Blob.into(),
-                post_object(t, "blob", value.as_bytes())?,
-            )
+            match ty {
+                crate::ArgType::Literal => (
+                    EntryKind::Blob.into(),
+                    post_object(t, "blob", value.as_bytes())?,
+                ),
+                crate::ArgType::Path => resolve_expr_path(t, input_tree, value, store)?,
+                // `:docker=<ref>` — the blob `docker://<ref>`.
+                crate::ArgType::Docker => (
+                    EntryKind::Blob.into(),
+                    post_object(t, "blob", format!("{DOCKER_SCHEME}{value}").as_bytes())?,
+                ),
+                // `:hash=<oid>` — an object already in the store, by oid (tree
+                // or blob).
+                crate::ArgType::Hash => {
+                    let (kind, _) = t.get_object(value)?;
+                    (mode_of_kind(&kind), parse_oid(value)?)
+                }
+                crate::ArgType::Commit => {
+                    return Err(format!(
+                        "eval-path: :commit= is not supported in .caos-expr yet: {tok:?}"
+                    ))
+                }
+            }
         };
         entries.push(Entry {
             mode,

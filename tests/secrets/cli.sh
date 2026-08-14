@@ -65,7 +65,7 @@ fi
 caos put /tmp/out /cas/out
 EOF
 cat > mytool/.caos-expr <<'EOF'
-curry bash -- --worker1:@=run.sh
+curry --base:@=bash --worker1:@=run.sh
 EOF
 
 # An EMBEDDER: it binds mytool as a `:@=` arg rather than running it. Since a
@@ -88,7 +88,7 @@ echo embedded > /tmp/out/verdict
 caos put /tmp/out /cas/out
 EOF
 cat > embedder/.caos-expr <<'EOF'
-curry bash -- --worker1:@=run.sh --pusher:@=mytool
+curry --base:@=bash --worker1:@=run.sh --pusher:@=mytool
 EOF
 
 echo '.caos-secrets/' > .gitignore
