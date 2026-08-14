@@ -94,7 +94,7 @@
 # through its ARG TREE, and the arg tree is the cache key, so all 28 tests
 # would re-key on every run — losing exactly the per-test caching the shared
 # stack exists to keep. The image hash is already in every test's key, and a
-# worker can read it back with `caos hash /cas/args/image`, so naming the stack
+# worker can read it back with `caos hash /cas/args/base`, so naming the stack
 # after it costs the key nothing. Two trees get two stacks; two runs of one
 # tree share one, which is the point.
 set -euo pipefail
