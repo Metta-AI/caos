@@ -1426,7 +1426,9 @@ fn resume_run(
 /// Rebuild the Anthropic transcript from events. User interjections that land
 /// while a tool batch is outstanding are held until all of that response's
 /// results can be emitted together, in call order, immediately after the
-/// assistant tool-use message.
+/// assistant tool-use message. Terminal async-task notices are synthesized at
+/// their durable event's position on every rebuild, so observing one extends
+/// the transcript permanently instead of moving or disappearing next round.
 fn event_messages(
     log: &progress::ConversationLog,
     include_async_status: bool,
@@ -1463,9 +1465,33 @@ fn event_messages(
         Ok(())
     }
 
+    fn push_user(messages: &mut Vec<Value>, batch: &mut Option<ToolBatch>, user: Value) {
+        if let Some(current) = batch.as_mut() {
+            current.deferred_users.push(user);
+        } else {
+            messages.push(user);
+        }
+    }
+
+    let async_notices = if include_async_status {
+        async_work::tasks(log.events.iter().map(|event| &event.value))
+            .into_iter()
+            .filter(|state| matches!(state.status.as_str(), "complete" | "failed"))
+            .map(|state| {
+                let notice = user_text(&format!(
+                    "Independent task {} is {}. Its result is addressed by that task hash.",
+                    state.task, state.status
+                ));
+                (state.event_index, notice)
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut messages = Vec::new();
     let mut batch: Option<ToolBatch> = None;
-    for event in &log.events {
+    for (event_index, event) in log.events.iter().enumerate() {
         if let Some(response) = event.value.get("response") {
             if batch.is_some() {
                 flush_batch(&mut messages, &mut batch)?;
@@ -1548,30 +1574,13 @@ fn event_messages(
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("user event {} has no string content", event.commit))?;
-            let user = user_text(content);
-            if let Some(current) = batch.as_mut() {
-                current.deferred_users.push(user);
-            } else {
-                messages.push(user);
-            }
+            push_user(&mut messages, &mut batch, user_text(content));
+        }
+        if let Some(notice) = async_notices.get(&event_index) {
+            push_user(&mut messages, &mut batch, notice.clone());
         }
     }
     flush_batch(&mut messages, &mut batch)?;
-    if include_async_status {
-        let latest_response = log
-            .events
-            .iter()
-            .rposition(|event| event.value.get("response").is_some());
-        for state in async_work::tasks(log.events.iter().map(|event| &event.value)) {
-            let unseen = latest_response.map_or(true, |index| state.event_index > index);
-            if unseen && matches!(state.status.as_str(), "complete" | "failed") {
-                messages.push(user_text(&format!(
-                    "Independent task {} is {}. Its result is addressed by that task hash.",
-                    state.task, state.status
-                )));
-            }
-        }
-    }
     Ok(messages)
 }
 
@@ -2092,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_async_notice_is_only_emitted_before_the_next_response() {
+    fn terminal_async_notice_stays_in_the_prompt_prefix_after_a_response() {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
         let mut events = vec![
@@ -2114,11 +2123,28 @@ mod tests {
             "response":[{"type":"text","text":"observed"}]
         }));
         let after_response = event_messages(&log(events), true).unwrap();
-        assert!(!after_response.iter().any(|message| {
-            message["content"]
-                .as_str()
-                .is_some_and(|text| text.contains("Independent task"))
-        }));
+        assert_eq!(
+            &after_response[..before_response.len()],
+            before_response.as_slice()
+        );
+        assert_eq!(
+            after_response
+                .iter()
+                .filter(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Independent task"))
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            after_response.last(),
+            Some(&json!({
+                "role": "assistant",
+                "content": [{"type":"text","text":"observed"}]
+            }))
+        );
     }
 
     #[test]
