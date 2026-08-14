@@ -16,15 +16,20 @@
 //! file's *value*:
 //!
 //! ```text
-//! NAME=run   <image> -- [--k=v | --k:@=path]
-//! NAME=curry <image> -- [--k=v | --k:@=path]
-//! curry $NAME -- --worker1:@=path         # the value (a run/curry, or a bare $NAME)
+//! NAME=run   --base:<type>=<image> [--k=v | --k:@=path]
+//! NAME=curry --base:<type>=<image> [--k=v | --k:@=path]
+//! curry --base:@=path --worker1:@=path    # the value (a run/curry, or a bare $NAME)
 //! ```
 //!
 //! Variable names are `[A-Z][A-Z0-9_]*`; the verbs (`run`, `curry`) are
 //! lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`.
 //! A `run` value evaluates to the run's result; a `curry` value to the curried
 //! ArgTree. `$NAME` is the object a prior line produced.
+//!
+//! There is no positional image and no `--`: the worker to run (or curry onto)
+//! is the reserved `--base` arg, typed like any other (`:@=` a path, `:docker=`
+//! a registry ref, `:hash=` an object in the store, or `=$NAME`). Every other
+//! `--k` is an ordinary arg.
 //!
 //! ## Argument resolution
 //!
@@ -33,6 +38,8 @@
 //! - `--k=value` — a literal blob, unless `value` is exactly `$NAME`, which
 //!   binds the object that variable holds (by reference, at its own kind).
 //! - `--k:@=path` — the object at `path` within the input subtree.
+//! - `--k:docker=ref` — the blob `docker://ref`; `--k:hash=oid` — an object the
+//!   store already holds, by oid.
 
 use std::collections::HashMap;
 
