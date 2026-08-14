@@ -707,8 +707,9 @@ pub fn prepare_queued_request(
 /// protocol-level `user`; this name is presentation metadata only.
 pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<String, String> {
     if let Some(explicit) = explicit {
-        return normalized_username(explicit)
-            .ok_or_else(|| "--username must be nonempty and contain no control characters".into());
+        return normalized_username(explicit).ok_or_else(|| {
+            "--username must be 1-126 UTF-8 bytes and contain no control characters".into()
+        });
     }
     if let Ok(configured) = t.git_capture(&["config", "--get", "user.name"], None) {
         if let Some(configured) = normalized_username(&configured) {
@@ -724,9 +725,14 @@ pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<Stri
     Ok("user".to_string())
 }
 
+const MAX_USERNAME_BYTES: usize = 126;
+
 fn normalized_username(username: &str) -> Option<String> {
     let username = username.trim();
-    (!username.is_empty() && !username.chars().any(char::is_control)).then(|| username.to_string())
+    (!username.is_empty()
+        && username.len() <= MAX_USERNAME_BYTES
+        && !username.chars().any(char::is_control))
+    .then(|| username.to_string())
 }
 
 fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<String, String> {
@@ -796,19 +802,58 @@ pub fn reconcile_active_request(t: &GitTransport, id: &str) -> Result<Option<Str
 const USER_INDEX_PREFIX: &str = "refs/caos/users/";
 
 fn user_key(user: &str) -> Result<String, String> {
-    let user = user.trim();
-    if user.is_empty() || user.chars().any(char::is_control) {
-        return Err(
-            "conversation username must be nonempty and contain no control characters".into(),
-        );
+    let user = normalized_username(user).ok_or_else(|| {
+        "conversation username must be 1-126 UTF-8 bytes and contain no control characters"
+            .to_string()
+    })?;
+    Ok(utf8_ref_key("u-", &user))
+}
+
+fn conversation_key(id: &str) -> Result<String, String> {
+    conversation_ref(id)?;
+    Ok(utf8_ref_key("c-", id))
+}
+
+fn conversation_id_from_key(key: &str) -> Result<String, String> {
+    let hex = key
+        .strip_prefix("c-")
+        .ok_or_else(|| format!("invalid conversation membership key {key:?}"))?;
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return Err(format!("invalid conversation membership key {key:?}"));
     }
-    Ok(format!(
-        "u-{}",
-        user.as_bytes()
+    let bytes = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = lowercase_hex_nibble(pair[0])?;
+            let low = lowercase_hex_nibble(pair[1])?;
+            Some((high << 4) | low)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| format!("invalid conversation membership key {key:?}"))?;
+    let id = String::from_utf8(bytes)
+        .map_err(|_| format!("conversation membership key {key:?} is not UTF-8"))?;
+    conversation_ref(&id)?;
+    Ok(id)
+}
+
+fn utf8_ref_key(prefix: &str, value: &str) -> String {
+    format!(
+        "{prefix}{}",
+        value
+            .as_bytes()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
-    ))
+    )
+}
+
+fn lowercase_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn user_conversation_ref(
@@ -821,7 +866,7 @@ fn user_conversation_ref(
         "{USER_INDEX_PREFIX}{}/conversations/{}/{}",
         user_key(user)?,
         status.ref_component(),
-        id
+        conversation_key(id)?
     ))
 }
 
@@ -974,11 +1019,16 @@ pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(
         t,
         [format!("{active_prefix}*"), format!("{archived_prefix}*")],
     )?;
-    let indexed_ids = indexed
-        .keys()
-        .filter_map(|refname| indexed_conversation_id(refname, &active_prefix, &archived_prefix))
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
+    let mut indexed_ids = HashSet::new();
+    for refname in indexed.keys() {
+        match indexed_conversation_id(refname, &active_prefix, &archived_prefix) {
+            Ok(Some(id)) => {
+                indexed_ids.insert(id);
+            }
+            Ok(None) => {}
+            Err(error) => warn_skipped_conversation(refname, &error),
+        }
+    }
     let title_refs = remote_refs(t, [format!("{CONVERSATION_PREFIX}*/title")])?;
     for (id, head) in remote_conversations(t)? {
         if indexed_ids.contains(&id) {
@@ -1017,14 +1067,18 @@ pub fn publish_unindexed_conversations(t: &GitTransport, user: &str) -> Result<(
     Ok(())
 }
 
-fn indexed_conversation_id<'a>(
-    refname: &'a str,
+fn indexed_conversation_id(
+    refname: &str,
     active_prefix: &str,
     archived_prefix: &str,
-) -> Option<&'a str> {
-    refname
+) -> Result<Option<String>, String> {
+    let Some(key) = refname
         .strip_prefix(active_prefix)
         .or_else(|| refname.strip_prefix(archived_prefix))
+    else {
+        return Ok(None);
+    };
+    conversation_id_from_key(key).map(Some)
 }
 
 pub fn list_user_conversations(
@@ -1044,15 +1098,22 @@ pub fn list_user_conversations(
     let titles = remote_refs(t, [format!("{CONVERSATION_PREFIX}*/title")])?;
     let mut conversations = Vec::new();
     for refname in state.keys() {
-        let Some(id) = refname.strip_prefix(&prefix) else {
+        let Some(key) = refname.strip_prefix(&prefix) else {
             continue;
         };
-        let Some(head) = canonical.get(id) else {
+        let id = match conversation_id_from_key(key) {
+            Ok(id) => id,
+            Err(error) => {
+                warn_skipped_conversation(refname, &error);
+                continue;
+            }
+        };
+        let Some(head) = canonical.get(&id) else {
             continue;
         };
         let summary = (|| {
             let updated_unix = remote_commit_timestamp(t, head)?;
-            let title_ref = conversation_title_ref(id)?;
+            let title_ref = conversation_title_ref(&id)?;
             let title = if let Some(hash) = titles.get(&title_ref) {
                 let (kind, bytes) = t.get_object(hash)?;
                 if kind != "blob" {
@@ -1062,10 +1123,10 @@ pub fn list_user_conversations(
                     .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?;
                 validate_conversation_title(&title)?.to_string()
             } else {
-                id.to_string()
+                id.clone()
             };
             Ok(UserConversationSummary {
-                id: id.to_string(),
+                id: id.clone(),
                 title,
                 head: head.clone(),
                 updated_unix,
@@ -1073,7 +1134,7 @@ pub fn list_user_conversations(
         })();
         match summary {
             Ok(summary) => conversations.push(summary),
-            Err(error) => warn_skipped_conversation(id, &error),
+            Err(error) => warn_skipped_conversation(&id, &error),
         }
     }
     conversations.sort_by(|a, b| {
@@ -2489,25 +2550,24 @@ mod tests {
     }
 
     #[test]
-    fn indexed_conversation_ids_preserve_slashes() {
+    fn membership_keys_preserve_slashes_without_ref_collisions() {
         let active = "refs/caos/users/u-41/conversations/active/";
         let archived = "refs/caos/users/u-41/conversations/archived/";
+        assert_eq!(conversation_key("project").unwrap(), "c-70726f6a656374");
+        let nested = conversation_key("project/talk-1").unwrap();
+        assert_eq!(nested, "c-70726f6a6563742f74616c6b2d31");
         assert_eq!(
-            indexed_conversation_id(
-                "refs/caos/users/u-41/conversations/active/project/talk-1",
-                active,
-                archived,
-            ),
-            Some("project/talk-1")
+            indexed_conversation_id(&format!("{active}{nested}"), active, archived,),
+            Ok(Some("project/talk-1".to_string()))
         );
+        let unicode = conversation_key("café/会話").unwrap();
         assert_eq!(
-            indexed_conversation_id(
-                "refs/caos/users/u-41/conversations/archived/project/talk-2",
-                active,
-                archived,
-            ),
-            Some("project/talk-2")
+            indexed_conversation_id(&format!("{archived}{unicode}"), active, archived,),
+            Ok(Some("café/会話".to_string()))
         );
+        for key in ["project", "c-", "c-0", "c-2F", "c-ff"] {
+            assert!(conversation_id_from_key(key).is_err(), "accepted {key:?}");
+        }
     }
 
     #[test]
@@ -3283,6 +3343,8 @@ mod tests {
             Some("Alice Smith")
         );
         assert!(normalized_username("Alice\nBob").is_none());
+        assert!(normalized_username(&"a".repeat(MAX_USERNAME_BYTES)).is_some());
+        assert!(normalized_username(&"a".repeat(MAX_USERNAME_BYTES + 1)).is_none());
     }
 
     #[test]

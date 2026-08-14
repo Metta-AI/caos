@@ -694,7 +694,7 @@ mod tests {
         for refname in [
             "refs/caos/req/request",
             "refs/caos/res/result",
-            "refs/caos/users/u-1/conversations/active/test",
+            "refs/caos/users/u-1/conversations/active/c-74657374",
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
