@@ -155,11 +155,18 @@ sub-runs) and points `in` at what it built.
 
 ## Cycle detection
 
-The run stack no longer threads through worker env (`CAOS_RUN_STACK` is gone —
-workers never call `/run` anymore). It is an internal argument of the server's
-run pipeline: promise sub-runs carry `parent stack + parent request`, and
-re-entering a request on the stack fails listing the cycle, exactly as before.
-An HTTP `/run` is always top-level (empty stack).
+The run stack no longer threads through worker env (`CAOS_RUN_STACK` is gone).
+It is an internal argument of the server's run pipeline: promise sub-runs carry
+`parent stack + parent request`, and re-entering a request on the stack fails
+listing the cycle, exactly as before. An HTTP `/run` is always top-level (empty
+stack).
+
+`caos run-async` is the deliberate exception to workers normally describing
+sub-runs as continuations: it sends a new HTTP `/run` for detached, independent
+work. The new run does not inherit the caller's stack, so cycle detection does
+not cross that boundary. A request must therefore not use `run-async` as a
+recursive edge; independently dispatched work must be acyclic without relying
+on ancestors from the dispatching run.
 
 ## Parallelism
 
