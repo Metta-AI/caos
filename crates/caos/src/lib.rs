@@ -2193,34 +2193,43 @@ fn resolve_commit_arg(
     Ok(oid)
 }
 
-/// A parsed `--name[:type]=value` argument value. The type marker lives in the
-/// operator, not the value, so the value is unconstrained (it may start with
-/// anything, no escaping). Bare `=` is a literal; `:@=` marks a path; `:commit=`
-/// marks a commit. The grammar
-/// is extensible — a new type adds a variant here and a case in [`parse_kv`].
-enum ArgValue<'a> {
+/// The **type tag** of a `--name[:type]=value` argument — the operator's
+/// explicit choice of how the value is read (never sniffed from the value's
+/// shape, so a value may start with anything, no escaping). Bare `=` is a
+/// literal; `:@=` a path; `:commit=` a commit; `:tree=` a tree hash.
+///
+/// This is the ONE arg-type vocabulary, shared by the CLI/worker arg builder
+/// ([`build_arg_entries`]), the map-then image args, and the `.caos-expr`
+/// evaluator (`resolve_expr_args`), so all of them accept exactly the same types
+/// and emit the same errors. A resolver may still support only a subset — the
+/// evaluator resolves literals and paths today — but they all *parse* through
+/// [`parse_arg`]. The grammar is extensible: a new type adds a variant here, a
+/// case in [`parse_arg`], and an arm in each resolver.
+pub(crate) enum ArgType {
     /// `--name=value` — the value verbatim, stored as a blob.
-    Literal(&'a str),
-    /// `--name:@=path` — the value names a filesystem path to resolve/ingest.
-    Path(&'a str),
+    Literal,
+    /// `--name:@=path` — the value names a path to resolve/ingest (a host path
+    /// on the CLI, a `/cas` path in a worker, a tree path in the evaluator).
+    Path,
     /// `--name:commit=value` — the value names a *commit*, passed **unpeeled**
     /// as a gitlink entry: a commit hash, a `/cas` path recorded as a commit
     /// (worker), or a revspec like `HEAD` (CLI). The explicit opt-in exists
     /// because the default forms peel commits to trees (which image refs rely
     /// on); see [`resolve_commit_arg`].
-    Commit(&'a str),
+    Commit,
     /// `--name:tree=hash` — the value is the hash of a tree the *server*
     /// already holds (typically an earlier run's result), referenced directly
     /// as a tree entry with no content round-trip. This is how results compose
     /// into new requests: e.g. a workspace-build job's `bin` tree feeding a
     /// downstream job as `--bins:tree=<hash>`.
-    Tree(&'a str),
+    Tree,
 }
 
-/// Split a `--name[:type]=value` argument into its name and typed value,
-/// validating that the name is a single path component (it becomes a tree-entry
-/// filename). The types are `@` (a path) and `commit`; bare is a literal.
-fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
+/// Split a `--name[:type]=value` argument into its name, [`ArgType`] and raw
+/// value, validating that the name is a single path component (it becomes a
+/// tree-entry filename). Shared by every arg resolver so the type vocabulary and
+/// its errors are defined exactly once.
+pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
     let body = kv
         .strip_prefix("--")
         .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
@@ -2228,11 +2237,11 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
         .split_once('=')
         .ok_or_else(|| format!("argument must look like --name[:type]=value, got: {kv}"))?;
     // The key is `name` (literal) or `name:type` (typed); the type sits before `=`.
-    let (name, value) = match key.split_once(':') {
-        None => (key, ArgValue::Literal(value)),
-        Some((name, "@")) => (name, ArgValue::Path(value)),
-        Some((name, "commit")) => (name, ArgValue::Commit(value)),
-        Some((name, "tree")) => (name, ArgValue::Tree(value)),
+    let (name, ty) = match key.split_once(':') {
+        None => (key, ArgType::Literal),
+        Some((name, "@")) => (name, ArgType::Path),
+        Some((name, "commit")) => (name, ArgType::Commit),
+        Some((name, "tree")) => (name, ArgType::Tree),
         Some((_, ty)) => {
             return Err(format!(
                 "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
@@ -2246,7 +2255,7 @@ fn parse_kv(kv: &str) -> Result<(&str, ArgValue<'_>), String> {
             "argument name must be a single path component, got: {name:?}"
         ));
     }
-    Ok((name, value))
+    Ok((name, ty, value))
 }
 
 /// Resolve curry layers, build the args tree, bundle + push the request, and run
