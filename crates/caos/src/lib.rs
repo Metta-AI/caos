@@ -2531,9 +2531,9 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
 /// Callers must use it only for independent work whose complete context is in
 /// the ArgTree.
 pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
-    if !is_hex_hash(arg_tree) {
+    if !is_hex_hash(arg_tree) || arg_tree.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(format!(
-            "run-async needs a 40-character ArgTree hash, got {arg_tree:?}"
+            "run-async needs a lowercase 40-character ArgTree hash, got {arg_tree:?}"
         ));
     }
     if !t.has_object(arg_tree)? {
@@ -2541,10 +2541,21 @@ pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
             "run-async needs an already-stored ArgTree, and {arg_tree} is absent"
         ));
     }
-    let (kind, _) = t.get_object(arg_tree)?;
+    let (kind, content) = t.get_object(arg_tree)?;
     if kind != "tree" {
         return Err(format!(
             "run-async needs an ArgTree, but {arg_tree} is a {kind}"
+        ));
+    }
+    let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+        .map_err(|error| format!("run-async ArgTree {arg_tree} is malformed: {error}"))?;
+    if !tree
+        .entries
+        .iter()
+        .any(|entry| entry.filename.to_vec().as_slice() == b"image")
+    {
+        return Err(format!(
+            "run-async needs a runnable ArgTree, but {arg_tree} has no 'image' entry"
         ));
     }
     t.ensure_pushed(arg_tree)?;
@@ -3782,7 +3793,7 @@ mod git_transport_tests {
     }
 
     #[test]
-    fn run_async_rejects_absent_and_non_tree_requests_before_dispatch() {
+    fn run_async_rejects_noncanonical_and_nonrunnable_requests_before_dispatch() {
         let request = "a".repeat(40);
         let missing = ObjectTransport { object: None };
         assert!(caos_run_async(&missing, &request)
@@ -3795,6 +3806,18 @@ mod git_transport_tests {
         assert!(caos_run_async(&blob, &request)
             .unwrap_err()
             .contains("is a blob"));
+
+        let curry_or_plain_tree = ObjectTransport {
+            object: Some(("tree", Vec::new())),
+        };
+        assert!(caos_run_async(&curry_or_plain_tree, &request)
+            .unwrap_err()
+            .contains("has no 'image' entry"));
+
+        let uppercase = request.to_ascii_uppercase();
+        assert!(caos_run_async(&missing, &uppercase)
+            .unwrap_err()
+            .contains("lowercase 40-character"));
     }
 
     fn commit_file(repo: &Path, name: &str, contents: &str, message: &str) -> String {

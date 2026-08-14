@@ -1,2 +1,18 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). deep-deps mounts each of these RECURSIVELY
+# DEEPENED at DEEP-DEPS/<name>, so a std entry brings its own deps
+# (std/<e>/DEPS) with it, and only what an edge CANNOT carry is
+# listed here (design/caos-expr.md):
+#
+#   THE GIT CLOSURE COVERS TREE REFERENCES AND NOTHING ELSE.
+#
+#   - A CURRY'S BASE is a BLOB holding the base image's hash, not a
+#     tree reference: naming `deep-deps` still means naming `runner`.
+#   - A HASH BOUND AS A LITERAL is likewise a blob: rustc's seed binds
+#     `--cargo=<hash>`, so anything rustc builds still means `cargo`.
+#
+# Undeclared is UNAVAILABLE, deliberately: a missing line fails the
+# test loudly rather than letting it borrow something ambient. An
+# unnecessary line only over-keys the test, so when in doubt, declare.
 ../../std/bash bash
 ../../std/flake-builder flake-builder

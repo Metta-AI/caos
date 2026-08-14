@@ -8,8 +8,8 @@
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-remote_exact_ref() { # <ref>
-  curl -fsS -X POST -H 'content-type: application/json' \
+remote_ref_status() { # <ref>
+  curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
     --data "{\"ref\":\"$1\"}" "$CAOS_SERVER_URL/ref/read"
 }
 
@@ -40,10 +40,15 @@ dispatched=$("$CAOS_CLI" run "$launcher" --)
 # Only the disconnected /run request can publish the eventual result ref.
 complete=0
 for _ in $(seq 1 150); do
-  if remote_exact_ref "refs/caos/res/$q" >/dev/null 2>&1; then
-    complete=1
-    break
+  status=""
+  if ! status=$(remote_ref_status "refs/caos/res/$q"); then
+    infra "server unreachable while waiting for dispatched request $q"
   fi
+  case "$status" in
+    200) complete=1; break ;;
+    404) ;;
+    *) infra "server returned HTTP $status while waiting for dispatched request $q" ;;
+  esac
   sleep 0.1
 done
 [ "$complete" -eq 1 ] || fail "dispatched request $q never published a result"
