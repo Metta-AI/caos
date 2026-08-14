@@ -167,15 +167,16 @@ Map children run concurrently (one thread each, `std::thread::scope`), gated
 only by the worker semaphore. `CAOS_MAX_WORKERS` (env, default 8, `0` =
 unlimited) bounds concurrent containers across the whole server.
 
+Identical concurrent requests are single-flighted by request hash. Later
+arrivals wait for the owner's exact outcome without a timeout that could repeat
+effectful work. Before parking, the server checks its cross-thread waits-for
+graph. Only when parking would close a genuine dependency cycle does that
+arrival run independently; its expanded local ancestry then reports the cycle
+instead of hanging. If an owner is lost, its waiters receive an error and a
+later request may become the new owner.
+
 ## Open items
 
-- **Concurrent duplicate runs.** Two identical requests in flight both run
-  (pre-existing: "no locks yet"). Parallel maps make this more likely — a
-  diamond DAG (deep-deps' shared dep) now computes shared nodes once per
-  concurrent parent instead of hitting the cache sequentially. Fix is
-  single-flight keyed on the request hash; to keep clean cycle *errors* (not
-  hangs) it needs a waits-for check before blocking on another thread's
-  in-flight run. Deferred.
 - **Durability.** Promises live in server threads; a server restart loses
   in-flight resolutions (as it lost in-flight runs before). A journaled
   continuation queue would make them resumable.

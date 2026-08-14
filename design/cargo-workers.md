@@ -134,8 +134,11 @@ hits on their `job` keys.
 The workspace DAG has diamonds (`worker-common`), so map-then's deferred
 **single-flight** open item got real — implemented in the server
 (`compute.rs`): identical concurrent requests share one run; a parked waiter
-that times out falls back to running independently, so a cross-thread cycle
-degrades to duplicate work + a clean stack-based cycle error, never a hang.
+waits for the owner's exact outcome without timing out into duplicate work.
+The server runs an arrival independently only when its waits-for graph proves
+that parking would close a cross-thread cycle; the duplicate then grows its
+local ancestry until ordinary stack-based cycle detection reports the error.
+Owner loss wakes waiters with an error so a later request can take ownership.
 
 Known cost: the orchestration (`crate`) jobs re-run on every edit — roughly
 one container per (member, dep-position) pair, deduped by single-flight.

@@ -394,13 +394,28 @@ fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
 }
 
 /// One parked waiter: its ancestor stack, and the ArgTree it waits on — an
-/// edge of the waits-for graph `park_would_deadlock` walks.
-type ParkedEdge = (Vec<String>, String);
+/// edge of the waits-for graph `park_would_deadlock` walks. The ID prevents a
+/// delayed guard from removing an identical edge belonging to a later flight.
+struct ParkedEdge {
+    id: u64,
+    stack: Vec<String>,
+    target: String,
+}
+
+struct ParkedState {
+    next_id: u64,
+    edges: Vec<ParkedEdge>,
+}
 
 /// Every parked waiter, as the edges of that graph.
-fn parked() -> &'static Mutex<Vec<ParkedEdge>> {
-    static PARKED: OnceLock<Mutex<Vec<ParkedEdge>>> = OnceLock::new();
-    PARKED.get_or_init(|| Mutex::new(Vec::new()))
+fn parked() -> &'static Mutex<ParkedState> {
+    static PARKED: OnceLock<Mutex<ParkedState>> = OnceLock::new();
+    PARKED.get_or_init(|| {
+        Mutex::new(ParkedState {
+            next_id: 0,
+            edges: Vec::new(),
+        })
+    })
 }
 
 /// Would parking a waiter (ancestry `stack`) on in-flight `arg_tree` close a wait
@@ -418,9 +433,9 @@ fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
         if stack.contains(&cur) {
             return true;
         }
-        for (wstack, target) in parked.iter() {
-            if wstack.contains(&cur) && seen.insert(target.clone()) {
-                frontier.push(target.clone());
+        for edge in &parked.edges {
+            if edge.stack.contains(&cur) && seen.insert(edge.target.clone()) {
+                frontier.push(edge.target.clone());
             }
         }
     }
@@ -469,18 +484,14 @@ impl Drop for FlightOwner {
 
 /// Removes this waiter's waits-for edge on drop.
 struct ParkGuard {
-    stack: Vec<String>,
-    target: String,
+    id: u64,
 }
 
 impl Drop for ParkGuard {
     fn drop(&mut self) {
         let mut parked = parked().lock().expect("parked lock");
-        if let Some(pos) = parked
-            .iter()
-            .position(|(s, t)| *s == self.stack && *t == self.target)
-        {
-            parked.swap_remove(pos);
+        if let Some(pos) = parked.edges.iter().position(|edge| edge.id == self.id) {
+            parked.edges.swap_remove(pos);
         }
     }
 }
@@ -496,18 +507,22 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
                 return Flight::Unsafe;
             }
             let (tx, rx) = mpsc::channel();
-            waiters.push(tx);
-            parked()
-                .lock()
-                .expect("parked lock")
-                .push((stack.to_vec(), arg_tree.to_string()));
-            Flight::Waiter(
-                rx,
-                ParkGuard {
+            let id = {
+                let mut parked = parked().lock().expect("parked lock");
+                let id = parked.next_id;
+                parked.next_id = parked
+                    .next_id
+                    .checked_add(1)
+                    .expect("parked waiter ID space exhausted");
+                parked.edges.push(ParkedEdge {
+                    id,
                     stack: stack.to_vec(),
                     target: arg_tree.to_string(),
-                },
-            )
+                });
+                id
+            };
+            waiters.push(tx);
+            Flight::Waiter(rx, ParkGuard { id })
         }
         None => {
             table.insert(arg_tree.to_string(), Vec::new());
@@ -525,7 +540,18 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
 fn finish_flight(arg_tree: &str, outcome: &Outcome) {
     let waiters = {
         let mut table = flights().lock().expect("flights lock");
-        table.remove(arg_tree).unwrap_or_default()
+        let waiters = table.remove(arg_tree).unwrap_or_default();
+        // A sent outcome no longer waits on this flight, even if the receiving
+        // thread has not yet been scheduled to drop its ParkGuard. Remove the
+        // completed edges while still holding the flights lock so a new flight
+        // for the same key cannot register an edge that this completion would
+        // mistake for one of its own.
+        parked()
+            .lock()
+            .expect("parked lock")
+            .edges
+            .retain(|edge| edge.target != arg_tree);
+        waiters
     };
     for tx in waiters {
         let _ = tx.send(outcome.clone());
@@ -1770,5 +1796,86 @@ mod single_flight_tests {
             _ => panic!("proven owner loss did not release the flight"),
         };
         drop(replacement);
+    }
+
+    #[test]
+    fn completed_flight_removes_wait_edges_before_waiters_wake() {
+        let request = "f".repeat(40);
+        let ancestor = "1".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        let outcome = Ok(format!("blob {}", "b".repeat(40)));
+        owner.finish(&outcome);
+
+        // Deliberately leave the result unread and the guard alive: completion
+        // itself, rather than waiter scheduling, owns removal of the edge.
+        assert!(!park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+    }
+
+    #[test]
+    fn old_waiter_guard_cannot_remove_a_new_flights_edge() {
+        let request = "a".repeat(40);
+        let ancestor = "2".repeat(40);
+        let first_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (first_rx, first_guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        let first_outcome = Ok(format!("blob {}", "c".repeat(40)));
+        first_owner.finish(&first_outcome);
+
+        let second_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("completed flight did not admit a new owner"),
+        };
+        let (second_rx, second_guard) = match join_flight(&request, std::slice::from_ref(&ancestor))
+        {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("new flight's second arrival did not wait"),
+        };
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        // The first guard is deliberately late. Its edge was already cleared
+        // by first-flight completion; dropping it must not remove the identical
+        // edge registered by the second flight.
+        drop(first_guard);
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        let second_outcome = Ok(format!("blob {}", "d".repeat(40)));
+        second_owner.finish(&second_outcome);
+        assert_eq!(
+            first_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            first_outcome
+        );
+        assert_eq!(
+            second_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            second_outcome
+        );
+        drop(second_guard);
     }
 }
