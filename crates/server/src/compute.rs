@@ -318,12 +318,20 @@ fn run_dispatch(
             Some(entries) => entries,
             None => args_entries(config, arg_tree).map_err(fail)?,
         };
+        // Whether this job's image is a SEEDED SENTINEL, decided on the raw arg
+        // (`docker://seeded…`) rather than on the resolved ref: resolution
+        // strips the scheme, and "an image called seeded-rustc" and "the
+        // seeded-rustc sentinel" are not the same claim. See runner::dispatch.
+        let seeded = image
+            .strip_prefix(DOCKER_SCHEME)
+            .is_some_and(|r| r == "seeded" || r.starts_with("seeded-"));
         // Find the secrets this job's identity is entitled to (design/secrets.md):
         // carried readers whose partial arg tree is a subset of ours. They ride
         // out of band in the job payload — never in the ArgTree, so never in the
         // cache key — and the container runner drops them at `/secret/<name>`.
+        // Read from `arg_entries` before dispatch takes ownership of it.
         let granted = crate::secrets::grant(secrets, &arg_entries);
-        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, granted).map_err(fail)?
+        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, seeded, granted).map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
@@ -997,12 +1005,47 @@ fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
         .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
 }
 
+/// The lock for one cache key, minted on first use. A redis cache read followed
+/// by a redis cache write is CHECK-THEN-ACT, and this server answers requests on
+/// a thread pool: when a suite fans out, every client asks for the same image at
+/// the same moment, every one of them misses, and every one of them does the
+/// whole job. Measured: 29 tests, 29 identical `converted image` lines, each
+/// materializing a ~200 MB tree to a temp dir, tarring it, sha256ing it and
+/// pushing it to the registry. That was ~24s in which the suite created no
+/// containers at all, and it is the skopeo/gzip CPU a `top` during a run shows.
+///
+/// One process per stack, so an in-process lock is the whole requirement — no
+/// redis lock, no lease, nothing to expire. The waiters RE-READ the cache after
+/// acquiring, so the winner's result is what they all return.
+///
+/// The map is never pruned. It holds one small entry per distinct image and
+/// layer this server has ever converted, which is bounded by the work it has
+/// done and is kilobytes at the scale that matters.
+fn key_lock(key: &str) -> std::sync::Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
+    std::sync::Arc::clone(
+        map.entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(Mutex::new(()))),
+    )
+}
+
 /// Convert the git-docker image tree `git_hash` to a real image and push it to
-/// the registry, returning a digest reference. Cached in Redis by git hash.
+/// the registry, returning a digest reference. Cached in Redis by git hash, and
+/// SINGLE-FLIGHTED behind [`key_lock`] — see there for why the cache alone is
+/// not enough.
 fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> {
     let image_key = format!("caos:image:{git_hash}");
     if let Ok(Some(manifest_digest)) = cache_get(&config.redis_addr, &image_key) {
         eprintln!("image cache hit: {git_hash} -> {manifest_digest}");
+        return Ok(image_ref(config, &manifest_digest));
+    }
+    let lock = key_lock(&image_key);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // RE-READ under the lock: while we waited, the winner finished and cached.
+    if let Ok(Some(manifest_digest)) = cache_get(&config.redis_addr, &image_key) {
+        eprintln!("image cache hit (after wait): {git_hash} -> {manifest_digest}");
         return Ok(image_ref(config, &manifest_digest));
     }
 
@@ -1216,6 +1259,20 @@ fn ensure_layer(config: &Config, layer_oid: &str) -> Result<(String, u64), Strin
         if let Some((digest, size)) = value.split_once(' ') {
             if let Ok(size) = size.parse::<u64>() {
                 eprintln!("layer cache hit: {layer_oid} -> {digest}");
+                return Ok((digest.to_string(), size));
+            }
+        }
+    }
+    // Single-flighted for the same reason as the image above, and this is where
+    // the bytes actually are: build_layer_tar materializes the whole tree to a
+    // temp dir and tars it, so N concurrent misses are N full copies of the
+    // layer on disk at once as well as N pushes.
+    let lock = key_lock(&key);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(Some(value)) = cache_get(&config.redis_addr, &key) {
+        if let Some((digest, size)) = value.split_once(' ') {
+            if let Ok(size) = size.parse::<u64>() {
+                eprintln!("layer cache hit (after wait): {layer_oid} -> {digest}");
                 return Ok((digest.to_string(), size));
             }
         }

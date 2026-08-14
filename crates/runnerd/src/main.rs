@@ -43,6 +43,8 @@ const CAOS_BIN: &str = "/bin/caos";
 
 /// Fixed in-container path where a granted engine socket is bind-mounted
 /// (`CAOS_RUNNER_SOCKET`); advertised to the worker as `CAOS_ENGINE_SOCKET`.
+/// Its HOST path rides alongside as `CAOS_ENGINE_SOCKET_HOST`, for a worker
+/// that has to mount it into a container of its own — see `run_container`.
 const ENGINE_SOCKET_PATH: &str = "/run/caos/engine.sock";
 
 /// An image declares in its own config env that it hosts a caos stack and
@@ -127,10 +129,62 @@ fn install_termination_handlers() {
     }
 }
 
+/// Resolve the server URL's host to an ADDRESS, once, and hand that on.
+///
+/// A name costs about a second per lookup inside a worker's netns — the
+/// container resolver is asked for each search-domain permutation, A and AAAA —
+/// and git makes roughly ten lookups per operation. Measured from a worker:
+/// `git ls-remote http://caos-server` 10022ms, the same by address 50ms, and a
+/// single `curl` 1046ms against 41ms. Every worker pays that on every push and
+/// every fetch, so it is the largest fixed cost in a test job.
+///
+/// Resolved HERE because this is the one place it can be paid once: runnerd
+/// outlives every worker, and hands the result to all of them. It also fixes
+/// runnerd's own long-polling, which would otherwise pay a lookup per poll.
+///
+/// IPv4 by preference — the AAAA half is what makes these lookups slow, and a
+/// v6 literal would need bracketing in the URL. An unresolvable name is left
+/// exactly as it was: this is a shortcut, never the thing that decides whether
+/// the server is reachable.
+fn as_address(url: &str) -> String {
+    use std::net::ToSocketAddrs;
+    let resolved = (|| {
+        let (scheme, rest) = url.split_once("://")?;
+        let (hostport, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        let (host, port_text) = match hostport.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+            _ => (hostport, None),
+        };
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return None;
+        }
+        let port: u16 = port_text.and_then(|p| p.parse().ok()).unwrap_or(80);
+        let ip = (host, port)
+            .to_socket_addrs()
+            .ok()?
+            .find(|a| a.is_ipv4())?
+            .ip();
+        Some(match port_text {
+            Some(p) => format!("{scheme}://{ip}:{p}{path}"),
+            None => format!("{scheme}://{ip}{path}"),
+        })
+    })();
+    match resolved {
+        Some(addr) => {
+            eprintln!("caos-runnerd: serving workers {url} as {addr}");
+            addr
+        }
+        None => url.to_string(),
+    }
+}
+
 fn main() {
     install_termination_handlers();
     let config = Arc::new(Config {
-        server_url: env_or("CAOS_SERVER_URL", "http://caos-server"),
+        server_url: as_address(&env_or("CAOS_SERVER_URL", "http://caos-server")),
         token: std::env::var("CAOS_RUNNER_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
@@ -326,11 +380,25 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         if image_wants_socket(config, &job.image_ref) {
             // Hand THIS worker the engine socket so its own inner runnerd can
             // delegate sibling containers to this engine (phase 4). Bind it at
-            // a fixed in-container path and advertise that path, so the worker
-            // never needs to know the host socket's location.
+            // a fixed in-container path and advertise that path, so a worker
+            // that only TALKS to the engine never needs to know the host
+            // socket's location.
+            //
+            // …and the host location too, for the one worker that cannot use
+            // the fixed path: a bind mount's source is resolved on the HOST, so
+            // a worker CREATING a container that itself needs the engine can
+            // only name the socket as the host sees it. That is how a shared
+            // test stack gets started as a detached sibling
+            // (design/faster-tests.md).
+            //
+            // Not a second grant, and not a wider one: it sits inside the same
+            // per-image gate, and a holder of this socket can already read the
+            // host path straight out of the engine by inspecting itself. This
+            // hands it over rather than making it do the archaeology.
             command
                 .args(["-v", &format!("{sock}:{ENGINE_SOCKET_PATH}")])
-                .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")]);
+                .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")])
+                .args(["-e", &format!("CAOS_ENGINE_SOCKET_HOST={sock}")]);
         }
     }
     let out = command

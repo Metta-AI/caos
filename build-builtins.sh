@@ -78,6 +78,16 @@ export CAOS_SERVER_URL=$SERVER_URL
 # us from the store); caosd points it at $CAOS_DATA so it persists per-project.
 CLIENT=${CAOS_CLIENT_REPO:-$PROJECT/.caos-dev/client-repo}
 git init -q "$CLIENT"
+# When the caller says this repo dies with the process (caos-tools/build.sh runs
+# us against a /tmp client inside the build container), turn zlib OFF. Bootstrap
+# writes ~67 MB of freshly-compiled binaries as loose objects and then pushes
+# ~13 MB of pack to a server that was created empty seconds ago, and deflating
+# binaries at level 1 was measured as most of that push. A persistent client repo
+# (caosd's, under $CAOS_DATA) must NOT get this: there the objects are kept.
+if [ "${CAOS_CLIENT_REPO_THROWAWAY:-no}" = yes ]; then
+  git -C "$CLIENT" config core.compression 0
+  git -C "$CLIENT" config pack.compression 0
+fi
 git -C "$CLIENT" remote add caos "$SERVER_URL" 2>/dev/null \
   || git -C "$CLIENT" remote set-url caos "$SERVER_URL"
 
@@ -132,6 +142,13 @@ fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+
+# A phase clock, into the SAME file the calling stage's `ts` writes
+# (caos-tools/build.sh), so this script's phases interleave with the build's in
+# the one report. Off unless the caller names a file: on the host this script
+# runs interactively and its stderr is the report.
+bts() { if [ -n "${CAOS_PHASES:-}" ]; then echo "$(date +%s%3N) builtins: $*" >> "$CAOS_PHASES"; fi; }
+bts "start"
 
 declare -A hash_of
 
@@ -251,6 +268,7 @@ for name in "${image_names[@]}"; do
     worker_tree[$name]=$(git -C "$CLIENT" write-tree --prefix="layer-worker-$name/")
   fi
 done
+bts "staged worker layers"
 
 # The streamed std entries (design/one-stack-image.md): the nix tarball is the
 # CLEAN image — no caos, no user db, no /tmp — and it goes to the registry
@@ -306,6 +324,7 @@ for name in "${image_names[@]}"; do
     } | git -C "$CLIENT" mktree
   )
   echo "$name: git-docker delta ${hash_of[$name]} over $ctag" >&2
+  bts "delta for $name"
 done
 
 # ---- the hand-deepen: SEED KEYS ONLY, never published -----------------------
@@ -357,6 +376,7 @@ for name in "${names[@]}"; do
   # sentinel, seeded like flake-builder (below).
   stage_source "$name"
 done
+bts "staged ${#names[@]} std sources"
 
 # The hand-deepen — SEED KEYS ONLY, never published (see the block header).
 # deepen_entry(name) replaces the entry's top-level DEPS with a DEEP-DEPS/
@@ -412,6 +432,7 @@ for name in "${names[@]}"; do
   hash_of[$name]=$(deepen_entry "$name")
   echo "$name: deepened entry (seed key) ${hash_of[$name]}" >&2
 done
+bts "hand-deepened ${#names[@]} entries"
 
 # What a caller's `--in:@=.` actually resolves to: the entry MINUS its own
 # `.caos-expr`. eval-path hands an expression its directory excluding the
@@ -487,7 +508,9 @@ fi
 if [ -n "$runner_delta" ] && [ -n "${bin_path[deep-deps]:-}" ] && [ -n "${hash_of[deep-deps]:-}" ]; then
   install -m 755 "${bin_path[deep-deps]}/bin/worker-deep-deps" "$CLIENT/seed-deep-deps"
   git -C "$CLIENT" add seed-deep-deps
+  bts "staged deep-deps seed inputs"
   dd_curry=$(cd "$CLIENT" && "$caos" curry "$runner_delta" -- "--worker1:@=seed-deep-deps")
+  bts "curried deep-deps"
   dd_blob=$(printf 'docker://seeded-deep-deps' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record deep-deps \
     "$(printf '{"image":"%s","in":"%s"}' "$dd_blob" "${in_of[deep-deps]}")" "$dd_curry"
@@ -508,9 +531,11 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   # pool and curries every built binary onto it, so no caller passes one. A hash
   # literal like `--cargo`, because that is what a seed result can bind — when
   # rustc stops being seeded its expression binds DEEP-DEPS/runner instead.
+  bts "staged rustc seed inputs"
   rustc_curry=$(cd "$CLIENT" && "$caos" curry "$runner_delta" -- \
     "--worker1:@=seed-rustc" "--cargo=$cargo_delta" "--runner=$runner_delta" \
     "--worker-common:@=seed-rustc-wc")
+  bts "curried rustc"
   rustc_blob=$(printf 'docker://seeded-rustc' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record rustc \
     "$(printf '{"image":"%s","in":"%s"}' "$rustc_blob" "${in_of[rustc]}")" "$rustc_curry"
@@ -529,9 +554,11 @@ fi
 
 if [ -n "$seed_entries" ]; then
   seed_tree=$(printf '%s' "$seed_entries" | git -C "$CLIENT" mktree)
+  bts "mktree"
   git -C "$CLIENT" push -q --force caos "$seed_tree:refs/caos/seed"
   git -C "$CLIENT" update-ref refs/caos/seed "$seed_tree"
   echo "refs/caos/seed -> $seed_tree" >&2
 fi
+bts "pushed seed records"
 
 echo "$seed_tree"
