@@ -2152,18 +2152,30 @@ fn build_arg_entries(
                 EntryKind::Commit.into(),
                 resolve_commit_arg(t, cas, value).map_err(|e| format!("`{name}`: {e}"))?,
             ),
-            // `--name:tree=hash` — a tree the server already holds (an earlier
-            // result), referenced by hash. Verified server-side to be a tree so
-            // a typo fails here, not as a bad materialization in the worker.
-            ArgType::Tree => {
+            // `--name:hash=oid` — an object the server already holds (an earlier
+            // result), referenced by oid: a tree or a blob. Verified server-side
+            // so a typo fails here, not as a bad materialization in the worker.
+            ArgType::Hash => {
                 let (kind, _) = t
                     .get_object(value)
-                    .map_err(|e| format!("`{name}`: tree {value}: {e}"))?;
-                if kind != "tree" {
-                    return Err(format!("`{name}`: {value} is a {kind}, not a tree"));
-                }
-                (EntryKind::Tree.into(), parse_oid(value)?)
+                    .map_err(|e| format!("`{name}`: object {value}: {e}"))?;
+                let mode = match kind.as_str() {
+                    "tree" => EntryKind::Tree,
+                    "blob" => EntryKind::Blob,
+                    other => {
+                        return Err(format!(
+                            "`{name}`: {value} is a {other}; :hash= names a tree or blob"
+                        ))
+                    }
+                };
+                (mode.into(), parse_oid(value)?)
             }
+            // `--name:docker=ref` — a docker image ref, stored as the blob
+            // `docker://<ref>` (the representation the server expects).
+            ArgType::Docker => (
+                EntryKind::Blob.into(),
+                post_object(t, "blob", format!("{DOCKER_SCHEME}{value}").as_bytes())?,
+            ),
         };
 
         entries.push(Entry {
@@ -2232,7 +2244,8 @@ fn resolve_commit_arg(
 /// The **type tag** of a `--name[:type]=value` argument — the operator's
 /// explicit choice of how the value is read (never sniffed from the value's
 /// shape, so a value may start with anything, no escaping). Bare `=` is a
-/// literal; `:@=` a path; `:commit=` a commit; `:tree=` a tree hash.
+/// literal; `:@=` a path; `:commit=` a commit; `:hash=` an object by oid;
+/// `:docker=` a docker ref.
 ///
 /// This is the ONE arg-type vocabulary, shared by the CLI/worker arg builder
 /// ([`build_arg_entries`]), the map-then image args, and the `.caos-expr`
@@ -2253,12 +2266,18 @@ pub(crate) enum ArgType {
     /// because the default forms peel commits to trees (which image refs rely
     /// on); see [`resolve_commit_arg`].
     Commit,
-    /// `--name:tree=hash` — the value is the hash of a tree the *server*
+    /// `--name:hash=oid` — the value is the hash of an object the *server*
     /// already holds (typically an earlier run's result), referenced directly
-    /// as a tree entry with no content round-trip. This is how results compose
-    /// into new requests: e.g. a workspace-build job's `bin` tree feeding a
-    /// downstream job as `--bins:tree=<hash>`.
-    Tree,
+    /// by oid with no content round-trip: a **tree** or a **blob**. This is how
+    /// results compose into new requests: e.g. a workspace-build job's `bin`
+    /// tree feeding a downstream job as `--bins:hash=<oid>`. (Generalizes the
+    /// former `:tree=`, which was tree-only.)
+    Hash,
+    /// `--name:docker=ref` — a docker image ref, stored as the blob
+    /// `docker://<ref>` (the representation the server and [`base_arg_entry`]
+    /// expect). The typed form is how a docker image is named without sniffing
+    /// a bare token for a `docker://` prefix.
+    Docker,
 }
 
 /// Split a `--name[:type]=value` argument into its name, [`ArgType`] and raw
@@ -2277,12 +2296,13 @@ pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
         None => (key, ArgType::Literal),
         Some((name, "@")) => (name, ArgType::Path),
         Some((name, "commit")) => (name, ArgType::Commit),
-        Some((name, "tree")) => (name, ArgType::Tree),
+        Some((name, "hash")) => (name, ArgType::Hash),
+        Some((name, "docker")) => (name, ArgType::Docker),
         Some((_, ty)) => {
             return Err(format!(
                 "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
-                 --name:@=value (path), --name:commit=value (commit), or \
-                 --name:tree=hash (a tree the server already holds)"
+                 --name:@=path, --name:commit=rev, --name:hash=oid \
+                 (a tree/blob the server holds), or --name:docker=ref"
             ))
         }
     };

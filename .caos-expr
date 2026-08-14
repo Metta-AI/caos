@@ -10,7 +10,7 @@
 # re-keys a test is what the test actually reaches for.
 #
 # `std/deep-deps` is named BY PATH, and that is what breaks the cycle:
-# `resolve_expr_image` evaluates a path-named subtree against ITSELF, so it sees
+# `resolve_expr_base` evaluates a path-named subtree against ITSELF, so it sees
 # `std/deep-deps`'s own `.caos-expr` — the `docker://seeded-deep-deps` sentinel
 # the core-seeder-runner answers — and never re-enters this expression. Nor does
 # the result: `eval_path` descends into what an expression produced without
@@ -21,4 +21,4 @@
 # That is why `std/runner` exists as a seeded `{.caos-expr}` sentinel rather
 # than a name published straight from a host-built delta, and why the test
 # fixture binary moved to `std/llm-stub` instead of riding in a build output.
-run std/deep-deps -- --in:@=.
+run --base:@=std/deep-deps --in:@=.

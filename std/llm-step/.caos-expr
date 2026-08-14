@@ -7,15 +7,15 @@
 # `llm-client/`. No runner is named: rustc DEPENDS on the pool and curries the
 # built binary onto it itself.
 #
-# THE TOOL IMAGES ARE BOUND HERE, not by the caller. Each `curry DEEP-DEPS/x --`
+# THE TOOL IMAGES ARE BOUND HERE, not by the caller. Each `curry --base:@=x`
 # resolves that mount through its own `.caos-expr` to the image it builds (a
 # curry with no args is the ready-to-run ArgTree), and `--k=$VAR` binds that
 # object BY REFERENCE. So a caller resolves llm-step and gets a step that
 # already knows its tools — it never has to name bash-tool, rgrep, bash or merge,
 # which are llm-step's dependencies and not the caller's business.
-BASH_TOOL=curry DEEP-DEPS/bash-tool --
-GREP=curry DEEP-DEPS/rgrep --
-TOOLS=curry DEEP-DEPS/bash --
-MERGE=curry DEEP-DEPS/merge --
-STEP=run DEEP-DEPS/rustc -- --src:@=. --dep0:@=DEEP-DEPS/llm-client
-curry $STEP -- --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE
+BASH_TOOL=curry --base:@=DEEP-DEPS/bash-tool
+GREP=curry --base:@=DEEP-DEPS/rgrep
+TOOLS=curry --base:@=DEEP-DEPS/bash
+MERGE=curry --base:@=DEEP-DEPS/merge
+STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client
+curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE
