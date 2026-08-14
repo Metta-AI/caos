@@ -428,14 +428,15 @@ fn resolve_expr_args(
             (mode_of_kind(kind), parse_oid(oid)?)
         } else {
             match ty {
-                crate::ArgType::Literal => {
-                    (EntryKind::Blob.into(), post_object(t, "blob", value.as_bytes())?)
-                }
+                crate::ArgType::Literal => (
+                    EntryKind::Blob.into(),
+                    post_object(t, "blob", value.as_bytes())?,
+                ),
                 crate::ArgType::Path => resolve_expr_path(t, input_tree, value, store)?,
                 // `:docker=<ref>` — the blob `docker://<ref>`.
                 crate::ArgType::Docker => (
                     EntryKind::Blob.into(),
-                    post_object(t, "blob", format!("{}{value}", crate::DOCKER_SCHEME).as_bytes())?,
+                    post_object(t, "blob", format!("{DOCKER_SCHEME}{value}").as_bytes())?,
                 ),
                 // `:hash=<oid>` — an object already in the store, by oid (tree
                 // or blob).
