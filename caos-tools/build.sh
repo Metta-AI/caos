@@ -139,7 +139,7 @@ reduce)
   caos put "$F" /cas/flake-builder
 
   # Each run ends a stage, so resolving it ends this one; `build-env` runs it.
-  env=$(caos curry /cas/args/image -- \
+  env=$(caos curry /cas/args/base -- \
     "--worker1:@=/cas/args/worker1" --stage=build-env \
     "--reduced:@=/cas/reduced" "--src:@=/cas/src") \
     || fail "currying the build-env stage"
@@ -153,7 +153,7 @@ build-env)
   # through as a curried arg so `make` can reach it: run-then passes only --in
   # and --result.
   caos get /cas/args/result
-  launch=$(caos curry /cas/args/image -- \
+  launch=$(caos curry /cas/args/base -- \
     "--worker1:@=/cas/args/worker1" --stage=launch "--src:@=/cas/args/src") \
     || fail "currying the launch stage"
 
