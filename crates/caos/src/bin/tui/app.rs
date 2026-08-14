@@ -3462,6 +3462,16 @@ mod tests {
             .collect()
     }
 
+    fn rendered_header(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .iter()
+            .take(buffer.area.width as usize)
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn composer_edits_utf8_and_moves_between_lines() {
         let mut composer = Composer::default();
@@ -4122,14 +4132,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
-        let header = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .take(100)
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let header = rendered_header(&terminal);
         let selection_end = header
             .find("copy-anywhere")
             .map(|column| column + "copy-anywhere".len() - 1)
@@ -4745,14 +4748,7 @@ mod tests {
 
         terminal.draw(|frame| render(&app, frame)).unwrap();
 
-        let header = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .take(100)
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let header = rendered_header(&terminal);
         assert!(header.contains("caos"));
         assert!(header.contains("user tester"));
         assert!(header.contains("A concise title"));

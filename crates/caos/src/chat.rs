@@ -826,15 +826,15 @@ pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<Stri
             "--username must be 1-126 UTF-8 bytes and contain no control characters".into()
         });
     }
-    if let Ok(configured) = t.git_capture(&["config", "--get", "user.name"], None) {
-        if let Some(configured) = normalized_username(&configured) {
-            return Ok(configured);
-        }
-    }
     if let Some(user) = std::env::var_os("USER") {
         let user = user.to_string_lossy();
         if let Some(user) = normalized_username(&user) {
             return Ok(user);
+        }
+    }
+    if let Ok(configured) = t.git_capture(&["config", "--get", "user.name"], None) {
+        if let Some(configured) = normalized_username(&configured) {
+            return Ok(configured);
         }
     }
     Ok("user".to_string())
@@ -842,7 +842,8 @@ pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<Stri
 
 const MAX_USERNAME_BYTES: usize = 126;
 
-fn normalized_username(username: &str) -> Option<String> {
+/// Canonicalize a presentation identity shared by line and full-screen clients.
+pub fn normalized_username(username: &str) -> Option<String> {
     let username = username.trim();
     (!username.is_empty()
         && username.len() <= MAX_USERNAME_BYTES

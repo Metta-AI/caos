@@ -1,6 +1,6 @@
 //! TUI command-line arguments.
 
-use caos::chat::TurnOptions;
+use caos::chat::{normalized_username, TurnOptions};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Args {
@@ -49,9 +49,12 @@ impl Args {
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }
         }
-        parsed.user = user_flag
+        let user = user_flag
             .or(default_user)
             .ok_or_else(|| "--username is required when $USER is not set".to_string())?;
+        parsed.user = normalized_username(&user).ok_or_else(|| {
+            "--username must be nonempty and contain no control characters".to_string()
+        })?;
         if parsed.turn.system.is_some() && parsed.turn.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
         }
@@ -110,12 +113,30 @@ mod tests {
         assert_eq!(explicit.user, "Bob");
         assert_eq!(explicit.turn.username.as_deref(), Some("Bob"));
 
+        let normalized = Args::parse_with_default_user(
+            &["--username".to_string(), "  Alice Smith  ".to_string()],
+            Some("alice".to_string()),
+        )
+        .unwrap();
+        assert_eq!(normalized.user, "Alice Smith");
+        assert_eq!(normalized.turn.username.as_deref(), Some("Alice Smith"));
+
         let no_ambient =
             Args::parse_with_default_user(&["--username".to_string(), "bob".to_string()], None)
                 .unwrap();
         assert_eq!(no_ambient.user, "bob");
 
         assert!(Args::parse_with_default_user(&[], None).is_err());
+        assert!(Args::parse_with_default_user(
+            &["--username".to_string(), " \t ".to_string()],
+            Some("alice".to_string()),
+        )
+        .is_err());
+        assert!(Args::parse_with_default_user(
+            &["--username".to_string(), "alice\nbob".to_string()],
+            Some("alice".to_string()),
+        )
+        .is_err());
     }
 
     #[test]
