@@ -222,13 +222,10 @@ fn run_work_request_inner(
                 config.trace.cache(trace_id, span_id, true);
             }
             eprintln!("cache hit: arg_tree={arg_tree} -> {result}");
-            // A cached result is already the canonical completed value for this
-            // request. Publish it before reporting top-level success; sub-runs
-            // do not create result refs.
-            if stack.is_empty() {
-                pin_result(config, arg_tree, &result)?;
-            }
-            return Ok(result);
+            let outcome = complete_cache_hit(arg_tree, stack, result, |result| {
+                pin_result(config, arg_tree, result)
+            });
+            return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
         }
         Ok(None) => {
             if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
@@ -534,27 +531,53 @@ fn claim_flight_after_miss(
             }
         },
         Flight::Waiter(rx, guard) => {
-            let outcome = rx.recv();
-            drop(guard);
-            match outcome {
-                Ok(outcome) => {
-                    eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
-                    FlightDisposition::Complete {
-                        outcome,
-                        cache_hit: false,
-                        owner: None,
-                    }
-                }
-                Err(_) => FlightDisposition::Complete {
-                    outcome: Err((
-                        500,
-                        format!("single-flight owner for {arg_tree} ended without an outcome"),
-                    )),
-                    cache_hit: false,
-                    owner: None,
-                },
+            let outcome = wait_for_flight(arg_tree, rx, guard);
+            FlightDisposition::Complete {
+                outcome,
+                cache_hit: false,
+                owner: None,
             }
         }
+    }
+}
+
+/// Complete a cache hit without letting an external caller bypass a live
+/// flight. A top-level hit either owns a short publication-only flight or waits
+/// for the existing owner's newer compute-and-publication outcome. Promise
+/// sub-runs keep the direct cache-hit path: they publish no durable result ref,
+/// and joining after a hit would add waits-for edges that cache resolution does
+/// not need.
+fn complete_cache_hit(
+    arg_tree: &str,
+    stack: &[String],
+    result: String,
+    publish: impl FnOnce(&str) -> Result<(), HttpError>,
+) -> Outcome {
+    if !stack.is_empty() {
+        return Ok(result);
+    }
+    match join_flight(arg_tree, stack) {
+        Flight::Owner(owner) => owner.finish_with(Ok(result), publish),
+        Flight::Waiter(rx, guard) => wait_for_flight(arg_tree, rx, guard),
+        Flight::Unsafe => Err((
+            500,
+            format!("top-level cache hit for {arg_tree} could not join its result flight"),
+        )),
+    }
+}
+
+fn wait_for_flight(arg_tree: &str, rx: mpsc::Receiver<Outcome>, guard: ParkGuard) -> Outcome {
+    let outcome = rx.recv();
+    drop(guard);
+    match outcome {
+        Ok(outcome) => {
+            eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
+            outcome
+        }
+        Err(_) => Err((
+            500,
+            format!("single-flight owner for {arg_tree} ended without an outcome"),
+        )),
     }
 }
 
@@ -2048,6 +2071,52 @@ mod single_flight_tests {
         );
         let error = parse_arg_tree(&format!("req={}", "A".repeat(40))).unwrap_err();
         assert_eq!(error.status(), 400);
+    }
+
+    #[test]
+    fn top_level_cache_hit_waits_for_an_existing_flights_outcome() {
+        let request = "0".repeat(40);
+        let ancestor = "b".repeat(40);
+        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+
+        // This caller read an older cached value while the existing executor
+        // got a transient cache error and is producing a newer outcome. It must
+        // join that executor instead of publishing the stale cache hit itself.
+        let stale_cache = format!("tree {}", "c".repeat(40));
+        let request_for_hit = request.clone();
+        let cache_hit = std::thread::spawn(move || {
+            complete_cache_hit(&request_for_hit, &[], stale_cache, |_| {
+                panic!("cache-hit waiter attempted to publish")
+            })
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let joined = flights()
+                .lock()
+                .expect("flights lock")
+                .get(&request)
+                .is_some_and(|flight| flight.waiters.len() == 1);
+            if joined {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cache-hit caller did not join the existing flight"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!cache_hit.is_finished());
+
+        let newer = format!("tree {}", "d".repeat(40));
+        assert_eq!(
+            owner.finish_with(Ok(newer.clone()), |_| Ok(())),
+            Ok(newer.clone())
+        );
+        assert_eq!(cache_hit.join().unwrap(), Ok(newer));
     }
 
     #[test]
