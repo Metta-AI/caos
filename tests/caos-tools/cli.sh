@@ -79,7 +79,7 @@ echo "You are a coding agent." > system.txt
 commit "workspace + tools"
 base=$(mkcommit "HEAD:ws" "base")
 human1=$(mkcommit "HEAD:ws" \
-  '{"author":"user","content":"run the hello tool","v":2}' \
+  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"run the hello tool\"}" \
   "$base")
 
 echo "== script the stub LLM (call; edit-then-call; arg calls; end) ==" >&2
@@ -121,7 +121,7 @@ request=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$human1")
 [ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
   || fail "prepared request is not exact Q: $request"
 admitted=$(mkcommit "HEAD:ws" \
-  "{\"v\":2,\"request\":\"$request\",\"request_head\":\"$human1\",\"status\":\"queued\"}" \
+  "{\"request\":\"$request\",\"request_head\":\"$human1\",\"status\":\"queued\"}" \
   "$human1")
 git push --quiet caos "$admitted:$conversation_ref" \
   || fail "publishing the request admission"

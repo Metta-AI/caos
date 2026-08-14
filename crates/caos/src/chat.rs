@@ -19,7 +19,6 @@ use super::{curry_object, prepare_request, request_compute, GitTransport, Transp
 
 const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
 const HEAD_SUFFIX: &str = "/head";
-const EVENT_VERSION: u64 = 2;
 const MAX_CONVERSATION_ID_BYTES: usize = 124;
 const MAX_APPEND_ATTEMPTS: usize = 32;
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -326,19 +325,11 @@ fn durable_conversation_from_local(
     let mut fork_base = None;
     loop {
         let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
-        let value = match serde_json::from_str::<Value>(message.trim()) {
-            Ok(value) if is_conversation_event(&value) => value,
-            // The first non-event parent is the ordinary workspace commit on
-            // which the conversation began. The canonical tip itself, however,
-            // must always be an event: treating a corrupt or mispointed tip as
-            // an empty conversation makes intact history appear to vanish.
-            _ if !newest_first.is_empty() => break,
-            _ => {
-                return Err(format!(
-                    "conversation head {head} is not a version-{EVENT_VERSION} event"
-                ))
-            }
-        };
+        let value = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
+            format!("conversation history commit {current} is not a JSON event: {error}")
+        })?;
+        validate_conversation_event(&value)
+            .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
         let parent = t
             .git_capture(
                 &["rev-parse", "--verify", "--quiet", &format!("{current}^1")],
@@ -348,7 +339,9 @@ fn durable_conversation_from_local(
             .trim()
             .to_string();
         validate_hash(&parent, "conversation event parent")?;
-        if fork_base.is_none() && validate_fork_marker(&value, &parent)? {
+        let is_root = validate_event_base(&value, &parent)?;
+        let is_fork = validate_fork_marker(&value, &parent)?;
+        if fork_base.is_none() && is_fork {
             // The commit graph is authoritative. `forked_from` is retained as
             // readable metadata, but it may never choose a Git argument.
             fork_base = Some(parent.clone());
@@ -358,6 +351,9 @@ fn durable_conversation_from_local(
             value,
         });
         current = parent;
+        if is_root {
+            break;
+        }
     }
     newest_first.reverse();
     let snapshot = fold_events(id, head, &newest_first)?;
@@ -590,12 +586,12 @@ where
         }
 
         let mut user_event = json!({
-            "v": EVENT_VERSION,
             "author": "user",
             "username": username,
             "content": message,
         });
         if observed.is_none() {
+            user_event["base"] = Value::String(parent.clone());
             user_event["title"] = Value::String(initial_title.clone());
         }
 
@@ -698,7 +694,6 @@ where
         // cycle; publishing the admission tip makes both visible in one CAS.
         let request = prepare(t, options, id, &user)?;
         let admission = json!({
-            "v": EVENT_VERSION,
             "status": "queued",
             "request": request.clone(),
             "request_head": user,
@@ -1307,18 +1302,15 @@ pub fn fork_conversation(
     let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
     let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
     fetch_commit(t, from)?;
-    let source_message = t.git_capture(&["show", "-s", "--format=%B", from], None)?;
-    let source_event = serde_json::from_str::<Value>(source_message.trim())
-        .map_err(|_| format!("fork source {from} is not a conversation event"))?;
-    if !is_conversation_event(&source_event) {
-        return Err(format!("fork source {from} is not a conversation event"));
-    }
+    // A JSON-looking ordinary commit is not a valid fork source. Validate the
+    // complete inherited event spine through its explicit root boundary.
+    durable_conversation_from_local(t, id, from)
+        .map_err(|error| format!("invalid fork source {from}: {error}"))?;
     let tree = t
         .git_capture(&["rev-parse", &format!("{from}^{{tree}}")], None)?
         .trim()
         .to_string();
     let event = json!({
-        "v": EVENT_VERSION,
         "forked_from": from,
         "title": title,
         "status": "idle",
@@ -2122,11 +2114,9 @@ fn create_event_commit_with_parents(
     for parent in parents {
         validate_hash(parent, "parent")?;
     }
-    if !is_conversation_event(event) {
-        return Err(format!(
-            "conversation event must be a JSON object with numeric version {EVENT_VERSION}"
-        ));
-    }
+    validate_conversation_event(event)?;
+    validate_event_base(event, parents[0])?;
+    validate_fork_marker(event, parents[0])?;
     let message = serde_json::to_string(event)
         .map_err(|error| format!("serializing conversation event: {error}"))?;
     let mut args = vec!["commit-tree", tree];
@@ -2453,7 +2443,7 @@ fn try_push_new_conversation(
 /// Find a structurally identical event on the observed first-parent history.
 /// Git commit IDs include author/committer timestamps, so two clients can build
 /// the same logical fork marker with different IDs even though its tree,
-/// parents, and version-tagged event are identical.
+/// parents, and event payload are identical.
 fn equivalent_event_ancestor(
     t: &GitTransport,
     id: &str,
@@ -2463,11 +2453,8 @@ fn equivalent_event_ancestor(
     let candidate_message = t.git_capture(&["show", "-s", "--format=%B", candidate], None)?;
     let candidate_event = serde_json::from_str::<Value>(candidate_message.trim())
         .map_err(|_| format!("new conversation head {candidate} is not a conversation event"))?;
-    if !is_conversation_event(&candidate_event) {
-        return Err(format!(
-            "new conversation head {candidate} is not a version-{EVENT_VERSION} event"
-        ));
-    }
+    validate_conversation_event(&candidate_event)
+        .map_err(|error| format!("invalid new conversation head {candidate}: {error}"))?;
     let candidate_tree = t
         .git_capture(&["show", "-s", "--format=%T", candidate], None)?
         .trim()
@@ -2597,11 +2584,12 @@ fn warn_skipped_conversation(id: &str, error: &str) {
 fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> {
     validate_hash(hash, "conversation tip")?;
     let mut current = hash.to_string();
+    let mut newest_activity_timestamp = None;
     // Worker events deliberately use epoch-zero commit identities so recovery
     // recreates the same proposal. Follow raw commit objects (not their trees)
     // to the newest user event or locally-created fork marker, whose ordinary
     // client timestamp is the useful measure of recent activity.
-    for _ in 0..4096 {
+    loop {
         let (kind, content) = t.get_object(&current)?;
         if kind != "commit" {
             return Err(format!(
@@ -2614,29 +2602,29 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
         let (headers, message) = text.split_once("\n\n").ok_or_else(|| {
             format!("conversation history commit {current} has no message separator")
         })?;
-        let event = match serde_json::from_str::<Value>(message.trim()) {
-            Ok(event) if is_conversation_event(&event) => event,
-            _ => {
-                return Err(format!(
-                    "conversation history commit {current} is not a version-{EVENT_VERSION} event"
-                ))
-            }
-        };
+        let event = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
+            format!("conversation history commit {current} is not a JSON event: {error}")
+        })?;
+        validate_conversation_event(&event)
+            .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
         let parent = first_parent_header(headers)
             .ok_or_else(|| format!("conversation event {current} has no first parent"))?;
         validate_hash(parent, "conversation event parent")?;
-        if event.get("forked_from").is_some() {
-            validate_fork_marker(&event, parent)?;
-            return commit_timestamp(headers, &current);
+        let is_root = validate_event_base(&event, parent)?;
+        let is_fork = validate_fork_marker(&event, parent)?;
+        if newest_activity_timestamp.is_none()
+            && (is_fork || event.get("author").and_then(Value::as_str) == Some("user"))
+        {
+            newest_activity_timestamp = Some(commit_timestamp(headers, &current)?);
         }
-        if event.get("author").and_then(Value::as_str) == Some("user") {
-            return commit_timestamp(headers, &current);
+        if is_root {
+            return match newest_activity_timestamp {
+                Some(timestamp) => Ok(timestamp),
+                None => commit_timestamp(headers, &current),
+            };
         }
         current = parent.to_string();
     }
-    Err(format!(
-        "conversation history from {hash} exceeded 4096 commits before a user event"
-    ))
 }
 
 fn first_parent_header(headers: &str) -> Option<&str> {
@@ -2793,14 +2781,45 @@ fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_conversation_event(value: &Value) -> bool {
-    value.is_object() && value.get("v").and_then(Value::as_u64) == Some(EVENT_VERSION)
+fn validate_conversation_event(value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "conversation event must be a JSON object".to_string())?;
+    if object.contains_key("v") {
+        return Err(
+            "conversation event must not carry a version; refs/caos/v2 selects the protocol"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Return true only for the absolute root of the inherited event spine.
+/// `base` is data rather than a heuristic: it must name the root's first
+/// parent exactly, so ordinary JSON commit messages cannot extend the log.
+fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(base) = event.get("base") else {
+        return Ok(false);
+    };
+    let base = base
+        .as_str()
+        .ok_or_else(|| "conversation event base is not a string".to_string())?;
+    validate_hash(base, "conversation base")?;
+    if base != first_parent {
+        return Err(format!(
+            "conversation root declares base {base}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
 }
 
 fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
     let Some(declared) = event.get("forked_from") else {
         return Ok(false);
     };
+    if event.get("base").is_some() {
+        return Err("a conversation fork marker must not introduce a new base".to_string());
+    }
     let declared = declared
         .as_str()
         .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
@@ -3273,7 +3292,7 @@ mod tests {
             &tree,
             &base,
             &json!({
-                "v": EVENT_VERSION,
+                "base": base,
                 "author": "user",
                 "username": "Source",
                 "content": "inherited message",
@@ -3323,11 +3342,11 @@ mod tests {
             "one",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[
-                event_at(user, json!({"v": EVENT_VERSION, "author": "user", "username": "Alice", "content": "hello", "title": "First"})),
-                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": user, "status": "queued"})),
-                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"})),
-                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "", "calls": [{"name": "bash"}]})),
-                event(json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "done", "status": "idle"})),
+                event_at(user, json!({"author": "user", "username": "Alice", "content": "hello", "title": "First"})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": user, "status": "queued"})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "", "calls": [{"name": "bash"}]})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "done", "status": "idle"})),
             ],
         )
         .unwrap();
@@ -3347,8 +3366,10 @@ mod tests {
             "fallback",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[
-                event(json!({"v": 2, "title": "old", "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})),
-                event(json!({"v": 2, "title": null, "request": null})),
+                event(
+                    json!({"title": "old", "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}),
+                ),
+                event(json!({"title": null, "request": null})),
             ],
         )
         .unwrap();
@@ -3407,14 +3428,22 @@ mod tests {
     }
 
     #[test]
-    fn event_version_is_numeric_exact_and_required() {
-        assert!(is_conversation_event(&json!({"v": EVENT_VERSION})));
-        assert!(!is_conversation_event(&json!({"kind": "caos-chat-event"})));
-        assert!(!is_conversation_event(&json!({"kind": "other"})));
-        assert!(!is_conversation_event(&json!({"v": 1})));
-        assert!(!is_conversation_event(&json!({"v": 3})));
-        assert!(!is_conversation_event(&json!({"v": "2"})));
-        assert!(!is_conversation_event(&json!({})));
+    fn event_version_lives_only_in_the_ref_namespace() {
+        assert!(validate_conversation_event(&json!({})).is_ok());
+        assert!(validate_conversation_event(&json!({"author": "user"})).is_ok());
+        assert!(validate_conversation_event(&json!({"v": 2})).is_err());
+        assert!(validate_conversation_event(&json!({"v": "2"})).is_err());
+        assert!(validate_conversation_event(&json!([])).is_err());
+    }
+
+    #[test]
+    fn explicit_base_must_match_the_first_parent() {
+        let base = "a".repeat(40);
+        assert_eq!(validate_event_base(&json!({}), &base), Ok(false));
+        assert_eq!(validate_event_base(&json!({"base": base}), &base), Ok(true));
+        assert!(validate_event_base(&json!({"base": "b".repeat(40)}), &base).is_err());
+        assert!(validate_event_base(&json!({"base": 7}), &base).is_err());
+        assert!(validate_fork_marker(&json!({"base": base, "forked_from": base}), &base).is_err());
     }
 
     #[test]
@@ -3530,7 +3559,6 @@ mod tests {
     #[test]
     fn mixed_tool_result_blocks_render_text_instead_of_json() {
         let events = durable_turn_events(&event(json!({
-            "v": 2,
             "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "round": 2,
             "result": {
@@ -3559,19 +3587,19 @@ mod tests {
             &[
                 event_at(
                     queued,
-                    json!({"v": EVENT_VERSION, "author": "user", "content": "start"}),
+                    json!({"author": "user", "content": "start"}),
                 ),
                 event_at(
                     admitted,
-                    json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": queued, "status": "queued"}),
+                    json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": queued, "status": "queued"}),
                 ),
                 event_at(
                     "3333333333333333333333333333333333333333",
-                    json!({"v": EVENT_VERSION, "author": "user", "content": "also this"}),
+                    json!({"author": "user", "content": "also this"}),
                 ),
                 event_at(
                     "4444444444444444444444444444444444444444",
-                    json!({"v": EVENT_VERSION, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"}),
+                    json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"}),
                 ),
             ],
         )
@@ -3592,10 +3620,10 @@ mod tests {
             "one",
             "2222222222222222222222222222222222222222",
             &[
-                event_at(user, json!({"v": 2,"author":"user","content":"start"})),
+                event_at(user, json!({"author":"user","content":"start"})),
                 event_at(
                     "2222222222222222222222222222222222222222",
-                    json!({"v": 2,"request":request,"request_head":user,"status":"queued"}),
+                    json!({"request":request,"request_head":user,"status":"queued"}),
                 ),
             ],
         )
@@ -3744,7 +3772,7 @@ mod tests {
             &winner_tree,
             &base,
             &json!({
-                "v": EVENT_VERSION,
+                "base": base,
                 "author": "user",
                 "username": "Bob",
                 "content": "winning turn"
@@ -3757,7 +3785,6 @@ mod tests {
             &winner_tree,
             &winner_user,
             &json!({
-                "v": EVENT_VERSION,
                 "status": "queued",
                 "request": winner_request,
                 "request_head": winner_user
@@ -3833,7 +3860,7 @@ mod tests {
             "one",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[event(
-                json!({"v": 2, "author": "user", "username": 7, "content": "hello"}),
+                json!({"author": "user", "username": 7, "content": "hello"}),
             )],
         )
         .unwrap_err();
@@ -3865,8 +3892,93 @@ mod tests {
 
         let transport = GitTransport::discover(&repo).unwrap();
         let error = conversation_snapshot_at(&transport, "broken", &malformed).unwrap_err();
-        assert!(error.contains("conversation head"));
-        assert!(error.contains("version-2"));
+        assert!(error.contains("not a JSON event"));
+
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn explicit_base_is_the_only_history_boundary() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "caos-chat-explicit-base-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "test");
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        // A JSON-looking ordinary commit must not be mistaken for another
+        // event after the explicit root has been reached.
+        test_git(
+            &repo,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                r#"{"author":"user","content":"not chat history"}"#,
+            ],
+        );
+        let transport = GitTransport::discover(&repo).unwrap();
+        let base = test_git(&repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let root = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({"base": base, "author": "user", "content": "actual message"}),
+        )
+        .unwrap();
+        let head = create_event_commit(
+            &transport,
+            &tree,
+            &root,
+            &json!({"author": "assistant", "content": "answer", "status": "idle"}),
+        )
+        .unwrap();
+        let conversation = durable_conversation_from_local(&transport, "chat", &head).unwrap();
+        assert_eq!(conversation.base_commit, base);
+        assert_eq!(conversation.snapshot.messages.len(), 2);
+        assert_eq!(conversation.snapshot.messages[0].content, "actual message");
+
+        let missing = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({"author": "user", "content": "missing boundary"}),
+        )
+        .unwrap();
+        let error = conversation_snapshot_at(&transport, "missing", &missing).unwrap_err();
+        assert!(error.contains("has no first parent"), "{error}");
+        let error = remote_commit_timestamp(&transport, &missing).unwrap_err();
+        assert!(error.contains("has no first parent"), "{error}");
+
+        let wrong = "b".repeat(40);
+        let mismatched_message = serde_json::to_string(
+            &json!({"base": wrong, "author": "user", "content": "wrong boundary"}),
+        )
+        .unwrap();
+        let mismatched = test_git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", &mismatched_message],
+        );
+        let error = conversation_snapshot_at(&transport, "mismatched", &mismatched).unwrap_err();
+        assert!(error.contains("declares base"), "{error}");
+
+        let malformed = test_git(
+            &repo,
+            &["commit-tree", &tree, "-p", &root, "-m", "not an event"],
+        );
+        let after_malformed =
+            create_event_commit(&transport, &tree, &malformed, &json!({"status": "idle"})).unwrap();
+        let error =
+            conversation_snapshot_at(&transport, "malformed", &after_malformed).unwrap_err();
+        assert!(error.contains(&malformed), "{error}");
+        assert!(error.contains("not a JSON event"), "{error}");
 
         std::fs::remove_dir_all(repo).unwrap();
     }
@@ -3887,10 +3999,8 @@ mod tests {
         std::fs::write(repo.join("workspace"), "base\n").unwrap();
         test_git(&repo, &["add", "workspace"]);
         let tree = test_git(&repo, &["write-tree"]);
-        let message = serde_json::to_string(
-            &json!({"v": EVENT_VERSION, "author": "user", "content": "orphan"}),
-        )
-        .unwrap();
+        let message =
+            serde_json::to_string(&json!({"author": "user", "content": "orphan"})).unwrap();
         let root_event = test_git(&repo, &["commit-tree", &tree, "-m", &message]);
 
         let transport = GitTransport::discover(&repo).unwrap();
@@ -3934,17 +4044,15 @@ mod tests {
             &transport,
             &tree,
             &base,
-            &json!({"v": 2,"author":"user","username":"Alice","content":"valid"}),
+            &json!({"base":base,"author":"user","username":"Alice","content":"valid"}),
         )
         .unwrap();
         let malformed = test_git(
             &repo,
             &["commit-tree", &tree, "-p", &base, "-m", "not an event"],
         );
-        let parentless_message = serde_json::to_string(
-            &json!({"v": EVENT_VERSION, "author": "user", "content": "orphan"}),
-        )
-        .unwrap();
+        let parentless_message =
+            serde_json::to_string(&json!({"author": "user", "content": "orphan"})).unwrap();
         let parentless = test_git(&repo, &["commit-tree", &tree, "-m", &parentless_message]);
         let good_ref = conversation_ref("good").unwrap();
         let broken_ref = conversation_ref("broken").unwrap();
@@ -4105,7 +4213,7 @@ mod tests {
             &seed_transport,
             &tree,
             &base,
-            &json!({"v": 2,"author":"user","username":"seed","content":"start"}),
+            &json!({"base":base,"author":"user","username":"seed","content":"start"}),
         )
         .unwrap();
         let request = "b".repeat(40);
@@ -4113,7 +4221,7 @@ mod tests {
             &seed_transport,
             &tree,
             &user,
-            &json!({"v": 2,"status":"queued","request":request,"request_head":user}),
+            &json!({"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
         let refname = conversation_ref("shared").unwrap();
@@ -4195,7 +4303,7 @@ mod tests {
             &transport,
             &tree,
             &base,
-            &json!({"v": 2,"author":"user","username":"Alice","content":"start"}),
+            &json!({"base":base,"author":"user","username":"Alice","content":"start"}),
         )
         .unwrap();
         let request = "c".repeat(40);
@@ -4203,7 +4311,7 @@ mod tests {
             &transport,
             &tree,
             &user,
-            &json!({"v": 2,"status":"queued","request":request,"request_head":user}),
+            &json!({"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
         let refname = conversation_ref("shared").unwrap();
@@ -4383,7 +4491,7 @@ mod tests {
             &transport,
             &base_tree,
             &base,
-            &json!({"v": 2,"author":"user","content":"start"}),
+            &json!({"base":base,"author":"user","content":"start"}),
         )
         .unwrap();
         let request = "b".repeat(40);
@@ -4391,7 +4499,7 @@ mod tests {
             &transport,
             &base_tree,
             &user,
-            &json!({"v": 2,"status":"queued","request":request,"request_head":user}),
+            &json!({"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
 
@@ -4402,7 +4510,7 @@ mod tests {
             &transport,
             &current_tree,
             &admitted,
-            &json!({"v": 2,"author":"user","username":"Bob","content":"concurrent"}),
+            &json!({"author":"user","username":"Bob","content":"concurrent"}),
         )
         .unwrap();
 
@@ -4461,7 +4569,7 @@ mod tests {
             &transport,
             &current_tree,
             &current,
-            &json!({"v": EVENT_VERSION, "request": request, "status": "idle"}),
+            &json!({"request": request, "status": "idle"}),
         )
         .unwrap();
         test_git(
@@ -4684,7 +4792,6 @@ mod tests {
 
         let tree = test_git(&source_repo, &["rev-parse", &format!("{source}^{{tree}}")]);
         let event = serde_json::to_string(&json!({
-            "v": EVENT_VERSION,
             "forked_from": source,
             "title": "talk-3",
             "status": "idle",
@@ -4740,17 +4847,22 @@ mod tests {
         let transport = GitTransport::discover(&source_repo).unwrap();
         let tree = test_git(&source_repo, &["rev-parse", &format!("{source}^{{tree}}")]);
         let output = root.join("must-not-be-created");
-        let malicious = create_event_commit(
-            &transport,
-            &tree,
-            &source,
-            &json!({
-                "v": EVENT_VERSION,
-                "forked_from": format!("--output={}", output.display()),
-                "status": "idle"
-            }),
-        )
+        let malicious_message = serde_json::to_string(&json!({
+            "forked_from": format!("--output={}", output.display()),
+            "status": "idle"
+        }))
         .unwrap();
+        let malicious = test_git(
+            &source_repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &source,
+                "-m",
+                &malicious_message,
+            ],
+        );
         let malicious_ref = conversation_ref("malicious").unwrap();
         test_git(
             &source_repo,
@@ -4766,13 +4878,19 @@ mod tests {
         assert!(!output.exists());
 
         let base = test_git(&source_repo, &["rev-parse", &format!("{source}^1")]);
-        let mismatched = create_event_commit(
-            &transport,
-            &tree,
-            &source,
-            &json!({"v": EVENT_VERSION, "forked_from": base, "status": "idle"}),
-        )
-        .unwrap();
+        let mismatched_message =
+            serde_json::to_string(&json!({"forked_from": base, "status": "idle"})).unwrap();
+        let mismatched = test_git(
+            &source_repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &source,
+                "-m",
+                &mismatched_message,
+            ],
+        );
         let mismatch_ref = conversation_ref("mismatch").unwrap();
         test_git(
             &source_repo,
@@ -4796,7 +4914,7 @@ mod tests {
         let base = test_git(&source_repo, &["rev-parse", "HEAD"]);
         let tree = test_git(&source_repo, &["rev-parse", "HEAD^{tree}"]);
         let message = serde_json::to_string(&json!({
-            "v": EVENT_VERSION,
+            "base": base,
             "author": "user",
             "username": "Source",
             "content": "old source",
@@ -5139,7 +5257,7 @@ mod tests {
             &tree,
             &base,
             &json!({
-                "v": 2,
+                "base": base,
                 "author": "user",
                 "username": "seed",
                 "content": "start"
@@ -5152,7 +5270,6 @@ mod tests {
             &tree,
             &first,
             &json!({
-                "v": 2,
                 "status": "queued",
                 "request": request,
                 "request_head": first,

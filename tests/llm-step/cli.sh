@@ -30,14 +30,26 @@ fetch_head() {
   printf '%s\n' "$head"
 }
 assert_event_spine() { # <head> <stop>
-  local current=$1 stop=$2 count=0 message
+  local current=$1 stop=$2 count=0 message parent declared_base roots=0
   while [ "$current" != "$stop" ]; do
     message=$(git show -s --format=%B "$current")
-    grep -Eq '"v"[[:space:]]*:[[:space:]]*2([,}])' <<<"$message" \
-      || fail "non-chat commit on event spine: $current"
-    current=$(git rev-parse "$current^")
+    jq -e 'type == "object" and (has("v") | not)' <<<"$message" >/dev/null \
+      || fail "invalid event on conversation spine: $current"
+    parent=$(git rev-parse "$current^1")
+    declared_base=$(jq -r '.base // empty' <<<"$message")
+    if [ -n "$declared_base" ]; then
+      [ "$declared_base" = "$parent" ] \
+        || fail "root event $current does not name its first parent as base"
+      [ "$declared_base" = "$stop" ] \
+        || fail "root event $current names the wrong conversation base"
+      roots=$((roots + 1))
+    elif [ "$parent" = "$stop" ]; then
+      fail "oldest event $current has no explicit base"
+    fi
+    current=$parent
     count=$((count + 1))
   done
+  [ "$roots" -eq 1 ] || fail "event spine did not contain exactly one explicit base"
   [ "$count" -ge 2 ] || fail "event spine is unexpectedly short"
 }
 
@@ -140,16 +152,16 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --conversation="$conv")
 
 user1=$(mkcommit "HEAD:ws" \
-  '{"author":"user","content":"create out.txt containing hi, then confirm","v":2}' \
+  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"create out.txt containing hi, then confirm\"}" \
   "$base")
 request1=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user1")
 [ "${#request1}" -eq 40 ] && [[ "$request1" =~ ^[0-9a-f]+$ ]] \
   || fail "first prepared request is not exact Q: $request1"
 admitted1=$(mkcommit "HEAD:ws" \
-  "{\"v\":2,\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
+  "{\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
   "$user1")
 early_interjection=$(mkcommit "HEAD:ws" \
-  "{\"v\":2,\"author\":\"user\",\"content\":\"$EARLY_INTERJECTION_TEXT\",\"username\":\"racer\"}" \
+  "{\"author\":\"user\",\"content\":\"$EARLY_INTERJECTION_TEXT\",\"username\":\"racer\"}" \
   "$admitted1")
 git push --quiet caos "$early_interjection:$conversation_ref" \
   || fail "publishing queued event and pre-start interjection"
@@ -199,12 +211,12 @@ grep -qF 'exit: 3' stub/request-3.json || fail "failed command result missing"
 
 tree1=$(git rev-parse "$head1^{tree}")
 user2=$(mkcommit "$tree1" \
-  '{"author":"user","content":"and now?","v":2}' "$head1")
+  '{"author":"user","content":"and now?"}' "$head1")
 request2=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user2")
 [ "${#request2}" -eq 40 ] && [[ "$request2" =~ ^[0-9a-f]+$ ]] \
   || fail "second prepared request is not exact Q: $request2"
 admitted2=$(mkcommit "$tree1" \
-  "{\"v\":2,\"request\":\"$request2\",\"request_head\":\"$user2\",\"status\":\"queued\"}" \
+  "{\"request\":\"$request2\",\"request_head\":\"$user2\",\"status\":\"queued\"}" \
   "$user2")
 git push --quiet caos "$admitted2:$conversation_ref" || fail "publishing second request admission"
 "$CAOS_CLI" run "$request2" -- >/tmp/llm-step-result-2 2>/tmp/llm-step-error-2 &
@@ -233,7 +245,7 @@ grep -qF "\"request\":\"$request2\"" <<<"$running2_event" \
 grep -qF '"status":"running"' <<<"$running2_event" \
   || fail "worker request event is not running"
 interjection=$(mkcommit "$tree1" \
-  "{\"v\":2,\"author\":\"user\",\"content\":\"$INTERJECTION_TEXT\",\"username\":\"racer\"}" \
+  "{\"author\":\"user\",\"content\":\"$INTERJECTION_TEXT\",\"username\":\"racer\"}" \
   "$observed")
 git push --quiet --force-with-lease="$conversation_ref:$observed" \
   caos "$interjection:$conversation_ref" || fail "publishing terminal-race interjection"
@@ -285,7 +297,7 @@ grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" stub/request-
 echo "== model-issued independent work ==" >&2
 tree2=$(git rev-parse "$head2^{tree}")
 user3=$(mkcommit "$tree2" \
-  '{"author":"user","content":"queue the independent request","v":2,"status":"queued"}' \
+  '{"author":"user","content":"queue the independent request","status":"queued"}' \
   "$head2")
 request3=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user3")
 [ "${#request3}" -eq 40 ] && [[ "$request3" =~ ^[0-9a-f]+$ ]] \
@@ -366,7 +378,7 @@ done
 
 tree3=$(git rev-parse "$completion_head^{tree}")
 user4=$(mkcommit "$tree3" \
-  '{"author":"user","content":"what completed?","v":2,"status":"queued"}' \
+  '{"author":"user","content":"what completed?","status":"queued"}' \
   "$completion_head")
 request4=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user4")
 git push --quiet caos "$user4:$conversation_ref" \

@@ -25,7 +25,7 @@ remote_tip() { # <ref>
   printf '%s\n' "${lines%%[[:space:]]*}"
 }
 capture_events() { # <head> <base> <output>
-  local current=$1 base_commit=$2 output=$3 count=0 message
+  local current=$1 base_commit=$2 output=$3 count=0 message parent declared_base roots=0
   : > "$output"
   while [ "$current" != "$base_commit" ]; do
     count=$((count + 1))
@@ -33,13 +33,23 @@ capture_events() { # <head> <base> <output>
       fail "event spine did not reach the conversation base"
     fi
     message=$(git show -s --format=%B "$current" | tr -d '\n')
-    case "$message" in
-      *'"v":2'*) ;;
-      *) fail "non-chat commit $current on the event spine: $message" ;;
-    esac
+    jq -e 'type == "object" and (has("v") | not)' <<<"$message" >/dev/null \
+      || fail "invalid event $current on the conversation spine: $message"
     printf '%s\n' "$message" >> "$output"
-    current=$(git rev-parse "$current^1")
+    parent=$(git rev-parse "$current^1")
+    declared_base=$(jq -r '.base // empty' <<<"$message")
+    if [ -n "$declared_base" ]; then
+      [ "$declared_base" = "$parent" ] \
+        || fail "root event $current does not name its first parent as base"
+      [ "$declared_base" = "$base_commit" ] \
+        || fail "root event $current names the wrong conversation base"
+      roots=$((roots + 1))
+    elif [ "$parent" = "$base_commit" ]; then
+      fail "oldest event $current has no explicit base"
+    fi
+    current=$parent
   done
+  [ "$roots" -eq 1 ] || fail "event spine did not contain exactly one explicit base"
   EVENT_COUNT=$count
 }
 
@@ -247,8 +257,9 @@ grep -qF "$T3_TEXT" talk.out || fail "fresh conversation response is missing"
 auto_ref="refs/caos/v2/conversations/$fresh/head"
 auto_tip=$(remote_tip "$auto_ref") || fail "talk --new did not create $auto_ref"
 git fetch -q caos "$auto_tip"
-git show -s --format=%B "$auto_tip" | grep -qF '"v":2' \
-  || fail "fresh conversation head is not a chat event"
+git show -s --format=%B "$auto_tip" \
+  | jq -e 'type == "object" and (has("v") | not)' >/dev/null \
+  || fail "fresh conversation head is not an unversioned JSON event"
 if git ls-remote --refs caos "refs/caos/v2/conversations/$fresh/from-*" | grep -q .; then
   fail "fresh conversation created legacy refs"
 fi

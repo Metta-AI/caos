@@ -3550,7 +3550,7 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map_err(|error| format!("reading the clock: {error}"))?
         .as_nanos();
     let descriptor = format!(
-        "caos conversation v2\ncreator {user}\ncreated {created}\nprocess {}\n",
+        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
         std::process::id()
     );
     t.put_object("blob", descriptor.as_bytes())
@@ -3710,7 +3710,7 @@ mod tests {
         let base = git_output(repo, &["rev-parse", "HEAD"]);
         let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
         let event = serde_json::to_string(&serde_json::json!({
-            "v": 2,
+            "base": base,
             "author": "user",
             "username": username,
             "content": message,
@@ -3731,7 +3731,7 @@ mod tests {
         let base = git_output(repo, &["rev-parse", "HEAD"]);
         let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
         let user_event = serde_json::to_string(&serde_json::json!({
-            "v": 2,
+            "base": base,
             "author": "user",
             "username": username,
             "content": message,
@@ -3743,7 +3743,6 @@ mod tests {
         );
         let request = "b".repeat(40);
         let admission = serde_json::to_string(&serde_json::json!({
-            "v": 2,
             "status": "queued",
             "request": request,
             "request_head": user,
@@ -6591,7 +6590,7 @@ mod tests {
             .command_error
             .as_deref()
             .unwrap()
-            .contains("not a conversation event"));
+            .contains("not a JSON event"));
         assert!(conversation_head(&transport, &pending_id)
             .unwrap()
             .is_none());

@@ -162,7 +162,7 @@ fn ensure_request_running(
         match request_start_disposition(&log, run, head)? {
             RequestStart::Running => return Ok(log),
             RequestStart::Claim { expected, tree } => {
-                let event = json!({"v": 2, "request": run, "status": "running"});
+                let event = json!({"request": run, "status": "running"});
                 match progress::append_event_at_head(conversation, &expected, &event, &tree)? {
                     progress::ConditionalAppend::Appended(_) => {
                         return progress::conversation_log(conversation)
@@ -585,7 +585,6 @@ fn llm_round(
             let tree = cas_hash(ws)?;
             let conversation = conversation(cfg)?;
             let event = json!({
-                "v": 2,
                 "request": run,
                 "round": round,
                 "author": "assistant",
@@ -611,7 +610,6 @@ fn llm_round(
             let calls = durable_calls.ok_or("validated tool_use response has no calls")?;
             let tree = cas_hash(ws)?;
             let event = json!({
-                "v": 2,
                 "request": run,
                 "round": round,
                 "author": "assistant",
@@ -1318,7 +1316,7 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
         .last()
         .map(|event| event.tree.clone())
         .ok_or("conversation has no events")?;
-    let event = json!({"v": 2, "async": {"task": task, "status": "pending"}});
+    let event = json!({"async": {"task": task, "status": "pending"}});
     let mut observed_status = None;
     retry_pending_append(
         &log.head,
@@ -1657,7 +1655,6 @@ fn append_tool_result(
                     "content": [{"type": "text", "text": error}],
                 });
                 let event = json!({
-                    "v": 2,
                     "request": run,
                     "round": round,
                     "status": "failed",
@@ -1690,7 +1687,7 @@ fn append_tool_result(
                 }
             }
         };
-        let event = json!({"v": 2, "request": run, "round": round, "result": result});
+        let event = json!({"request": run, "round": round, "result": result});
         match progress::append_event_at_head_with_parent(
             conversation(cfg)?,
             &current.head,
@@ -1762,7 +1759,6 @@ where
             .ok_or("conversation has no events")?;
         let round = latest_round(&log, run)?.map_or(0, |state| state.round);
         let event = json!({
-            "v": 2,
             "request": run,
             "round": round,
             "status": "failed",
@@ -2113,10 +2109,10 @@ mod tests {
         let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{"path":"a"}});
         let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{"path":"b"}});
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"hello","status":"queued"}),
-            json!({"v": 2,"request":run,"status":"running"}),
-            json!({"v": 2,"request":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
-            json!({"v": 2,"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"author":"user","content":"hello","status":"queued"}),
+            json!({"request":run,"status":"running"}),
+            json!({"request":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
+            json!({"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
         ]);
 
         assert_eq!(active_request(&history).unwrap(), run);
@@ -2175,11 +2171,11 @@ mod tests {
         let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{}});
         let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{}});
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"start"}),
-            json!({"v": 2,"request":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
-            json!({"v": 2,"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
-            json!({"v": 2,"author":"user","content":"also do this"}),
-            json!({"v": 2,"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
+            json!({"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"author":"user","content":"also do this"}),
+            json!({"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
         ]);
         assert_eq!(
             event_messages(&history, false).unwrap(),
@@ -2201,9 +2197,9 @@ mod tests {
         let call = json!({"type":"tool_use","id":"same","name":"read","input":{}});
         let result = json!({"type":"tool_result","tool_use_id":"same","content":"ok"});
         let history = log(vec![
-            json!({"v": 2,"request":run,"round":0,"response":[call.clone()]}),
-            json!({"v": 2,"request":run,"round":0,"result":result}),
-            json!({"v": 2,"request":run,"round":1,"response":[call]}),
+            json!({"request":run,"round":0,"response":[call.clone()]}),
+            json!({"request":run,"round":0,"result":result}),
+            json!({"request":run,"round":1,"response":[call]}),
         ]);
         let state = latest_round(&history, &run).unwrap().unwrap();
         assert_eq!(state.round, 1);
@@ -2215,9 +2211,9 @@ mod tests {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
         let mut events = vec![
-            json!({"v":2,"author":"user","content":"start"}),
-            json!({"v":2,"request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
-            json!({"v":2,"async":{"task":task,"status":"complete"}}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
+            json!({"async":{"task":task,"status":"complete"}}),
         ];
         let before_response = event_messages(&log(events.clone()), true).unwrap();
         assert!(before_response.iter().any(|message| {
@@ -2227,7 +2223,6 @@ mod tests {
         }));
 
         events.push(json!({
-            "v":2,
             "request":run,
             "round":1,
             "response":[{"type":"text","text":"observed"}]
@@ -2262,8 +2257,8 @@ mod tests {
         let old = "a".repeat(40);
         let current = "b".repeat(40);
         let history = log(vec![
-            json!({"v": 2,"request":old,"round":0,"status":"idle"}),
-            json!({"v": 2,"request":current,"status":"running"}),
+            json!({"request":old,"round":0,"status":"idle"}),
+            json!({"request":current,"status":"running"}),
         ]);
         assert!(terminal_for_run(&history, &old).unwrap().is_some());
         assert!(terminal_for_run(&history, &current).unwrap().is_none());
@@ -2274,9 +2269,9 @@ mod tests {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
         let history = log(vec![
-            json!({"v":2,"request":run,"status":"running"}),
-            json!({"v":2,"async":{"task":task,"status":"pending"}}),
-            json!({"v":2,"request":run,"round":0,"status":"failed","error":"boom"}),
+            json!({"request":run,"status":"running"}),
+            json!({"async":{"task":task,"status":"pending"}}),
+            json!({"request":run,"round":0,"status":"failed","error":"boom"}),
         ]);
         let reconciliations = std::cell::Cell::new(0);
 
@@ -2304,13 +2299,13 @@ mod tests {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
         let running = log(vec![
-            json!({"v":2,"request":run,"status":"running"}),
-            json!({"v":2,"async":{"task":task,"status":"pending"}}),
+            json!({"request":run,"status":"running"}),
+            json!({"async":{"task":task,"status":"pending"}}),
         ]);
         let terminal = log(vec![
-            json!({"v":2,"request":run,"status":"running"}),
-            json!({"v":2,"async":{"task":task,"status":"pending"}}),
-            json!({"v":2,"request":run,"round":0,"status":"failed","error":"boom"}),
+            json!({"request":run,"status":"running"}),
+            json!({"async":{"task":task,"status":"pending"}}),
+            json!({"request":run,"round":0,"status":"failed","error":"boom"}),
         ]);
         let mut loads = std::collections::VecDeque::from([running, terminal]);
         let appends = std::cell::Cell::new(0);
@@ -2355,8 +2350,8 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"start"}),
-            json!({"v": 2,"author":"user","content":"also this"}),
+            json!({"author":"user","content":"start"}),
+            json!({"author":"user","content":"also this"}),
         ]);
         let error = request_start_disposition(&history, &run, &queued).unwrap_err();
         assert!(error.contains("no admission event"), "{error}");
@@ -2368,9 +2363,9 @@ mod tests {
         let other = "c".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"start"}),
-            json!({"v": 2,"request":run,"request_head":queued,"status":"queued"}),
-            json!({"v": 2,"request":run,"status":"running"}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"request_head":queued,"status":"queued"}),
+            json!({"request":run,"status":"running"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &run, &queued).unwrap(),
@@ -2385,9 +2380,9 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"start"}),
-            json!({"v": 2,"request":run,"request_head":queued,"status":"queued"}),
-            json!({"v": 2,"author":"user","content":"also this"}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"request_head":queued,"status":"queued"}),
+            json!({"author":"user","content":"also this"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &run, &queued).unwrap(),
@@ -2403,8 +2398,8 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"start"}),
-            json!({"v": 2,"request":run,"request_head":"c".repeat(40),"status":"queued"}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"request_head":"c".repeat(40),"status":"queued"}),
         ]);
         let error = request_start_disposition(&history, &run, &queued).unwrap_err();
         assert!(error.contains("records head"), "{error}");
@@ -2417,12 +2412,12 @@ mod tests {
         let old_head = format!("{:040x}", 0);
         let new_head = format!("{:040x}", 4);
         let history = log(vec![
-            json!({"v": 2,"author":"user","content":"old"}),
-            json!({"v": 2,"request":old,"request_head":old_head,"status":"queued"}),
-            json!({"v": 2,"request":old,"status":"running"}),
-            json!({"v": 2,"request":old,"status":"failed"}),
-            json!({"v": 2,"author":"user","content":"new"}),
-            json!({"v": 2,"request":new,"request_head":new_head,"status":"queued"}),
+            json!({"author":"user","content":"old"}),
+            json!({"request":old,"request_head":old_head,"status":"queued"}),
+            json!({"request":old,"status":"running"}),
+            json!({"request":old,"status":"failed"}),
+            json!({"author":"user","content":"new"}),
+            json!({"request":new,"request_head":new_head,"status":"queued"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &old, &old_head).unwrap(),

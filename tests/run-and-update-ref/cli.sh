@@ -31,7 +31,7 @@ only_status_event() {
   [ "$(git rev-parse "$before^{tree}")" = "$(git rev-parse "$after^{tree}")" ] \
     || fail "status event changed the workspace"
   [ "$(git show -s --format=%B "$after" | jq -r --arg task "$task" \
-      'select(.v == 2 and .async.task == $task) | .async.status')" = "$status" ] \
+      'select((has("v") | not) and (has("base") | not) and .async.task == $task) | .async.status')" = "$status" ] \
     || fail "status event did not record $task as $status"
 }
 
@@ -53,7 +53,7 @@ echo "== initialize two conversation heads ==" >&2
 printf 'workspace survives\n' > workspace.txt
 commit "conversation base"
 base=$(git rev-parse HEAD)
-initial_head=$(printf '%s\n' '{"v":2,"status":"idle"}' \
+initial_head=$(printf '%s\n' "{\"base\":\"$base\",\"status\":\"idle\"}" \
   | git -c user.email=test@caos -c user.name=caos \
     commit-tree "$base^{tree}" -p "$base")
 suffix=${base:0:12}

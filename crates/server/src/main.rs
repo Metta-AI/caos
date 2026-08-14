@@ -116,6 +116,20 @@ fn install_termination_handlers() {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--validate-pre-receive") {
+        let mut input = String::new();
+        if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+            eprintln!("caos: reading pre-receive commands: {error}");
+            std::process::exit(1);
+        }
+        let git_dir = std::env::var("GIT_DIR").unwrap_or_else(|_| ".".to_string());
+        if let Err(error) = refs::validate_pre_receive(&git_dir, &input) {
+            eprintln!("caos: {}", error.message());
+            std::process::exit(1);
+        }
+        return;
+    }
+
     install_termination_handlers();
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
