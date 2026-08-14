@@ -1178,6 +1178,14 @@ impl ConversationState {
     }
 
     fn mark_pending_submission(&mut self, id: u64, commit: String) {
+        if self
+            .transcript
+            .iter()
+            .any(|entry| entry.commit.as_deref() == Some(commit.as_str()))
+        {
+            self.discard_pending_submission(id);
+            return;
+        }
         if let Some(pending) = self
             .pending_submissions
             .iter_mut()
@@ -2647,6 +2655,41 @@ impl App {
                 state.status = format!("forked from {}", short_hash(source));
             }
             Err(error) => {
+                if self.conversations.len() == 1 {
+                    // The origin may have been closed while the fork was in
+                    // flight. Never leave the failed fork placeholder usable:
+                    // its base was deliberately cleared so a later submit
+                    // cannot create a marker-less imitation of the fork.
+                    let state = &self.conversations[index];
+                    let id = state.id.clone();
+                    let title = state.title.clone();
+                    let composer = state.composer.clone();
+                    match new_conversation_options(state.turn_options.clone(), None, &self.repo_dir)
+                    {
+                        Ok((options, base)) => {
+                            let mut replacement = ConversationState::new_virtual(
+                                id,
+                                title,
+                                options,
+                                format!("ready from {}; enter a prompt", short_hash(&base)),
+                            );
+                            replacement.composer = composer;
+                            replacement.show_command_error(format!(
+                                "creating conversation fork failed: {error}; opened a new conversation instead"
+                            ));
+                            self.conversations[index] = replacement;
+                        }
+                        Err(fallback_error) => {
+                            // Keeping `forking` set makes this placeholder
+                            // non-submittable until the user opens another
+                            // conversation or fixes the repository state.
+                            self.conversations[index].show_command_error(format!(
+                                "creating conversation fork failed: {error}; creating a safe replacement also failed: {fallback_error}"
+                            ));
+                        }
+                    }
+                    return;
+                }
                 let selected_fork = self.selected == index;
                 self.conversations.remove(index);
                 if self.selected > index {
@@ -6211,6 +6254,41 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn failed_last_conversation_fork_keeps_a_safe_app_state() {
+        let (repo, remote, tip) = repo_with_default_branch("last-fork-failure", "main");
+        let mut fork = state("forked");
+        fork.forking = true;
+        fork.composer.insert_str("preserve this draft");
+        let (mut app, _) = app_with(vec![fork]);
+        app.repo_dir = repo.clone();
+
+        app.finish_fork(
+            "forked",
+            "closed-origin",
+            &"a".repeat(40),
+            Err("remote rejected the fork".to_string()),
+        );
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected, 0);
+        assert!(!app.selected().forking);
+        assert_eq!(
+            app.selected().turn_options.base.as_deref(),
+            Some(tip.as_str())
+        );
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        assert!(app.selected().remote_title.is_none());
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .is_some_and(|error| error.contains("remote rejected the fork")));
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]

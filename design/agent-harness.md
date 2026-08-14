@@ -6,12 +6,16 @@
 > Current chat is isolated below `refs/caos/v2/`; the old unversioned refs may
 > remain in place and are invisible to the v2 clients.
 
-**Status:** steps 1–5 implemented — run-then + first-class commits, the
-bounded bash tool (`crates/worker-bash-tool`), the stateless llm-call worker
-(`crates/worker-llm-call`), the llm-step driver (`crates/worker-llm-step`), and the chat client (`caos-cli chat`,
-`crates/caos/src/chat.rs`). Builds on map-then (`map-then.md`). Where this
-note and the code diverged during implementation, the note has been updated
-to match the code; the deltas are called out inline.
+**Status:** historical for conversation storage and turn lifecycle. The
+run-then, tool, and model-loop background remains useful, but the commit shapes,
+multi-ref protocol, progress/status refs, and client ownership described below
+were superseded by the single append-only event log in `chat.md`. Treat that
+document and the current code as normative; this note is retained as the
+implementation history that led to them. The implemented background includes
+run-then and first-class commits, the bounded bash tool
+(`crates/worker-bash-tool`), the stateless llm-call worker
+(`crates/worker-llm-call`), and the llm-step driver
+(`crates/worker-llm-step`).
 
 ## Idea
 
