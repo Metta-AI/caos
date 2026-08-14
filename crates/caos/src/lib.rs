@@ -3282,7 +3282,7 @@ pub(crate) fn mark_arg_tree(
         return Ok(oid.to_string());
     }
     let (image_ref, bound) = unwrap_curry(t, oid)?;
-    let image_entry = image_arg_entry(t, &image_ref)?;
+    let image_entry = base_arg_entry(t, &image_ref)?;
     let mut base: std::collections::BTreeMap<String, String> = bound
         .iter()
         .map(|e| {
@@ -3292,7 +3292,7 @@ pub(crate) fn mark_arg_tree(
             )
         })
         .collect();
-    base.insert("image".to_string(), image_entry.oid.to_string());
+    base.insert("base".to_string(), image_entry.oid.to_string());
     let Some(digest) = client_secret_hash(store, &base)? else {
         return Ok(oid.to_string());
     };
