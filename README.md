@@ -342,7 +342,7 @@ blocking, user-facing run):
 1. assembles the args into a git **tree** — the **ArgTree** — including the
    `--base` image under the reserved `base` entry and (when set) the cache-busting
    salt under a reserved `salt` entry (see
-   [arguments](#arguments-literals-and-paths));
+   [arguments](#arguments-literals-paths-and-pinned-refs));
 2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —
    nothing wraps it, so the ArgTree is the whole cache key;
 3. gets the ArgTree onto the server — one negotiated `git push` to
@@ -397,13 +397,15 @@ there is no positional image anywhere, and nothing sniffs a bare token:
   builds, one without it to itself); inside a worker any `/cas` path, resolved to
   the hash recorded on it;
 - `:docker=<ref>` — an **ordinary docker image**, stored as the blob
-  `docker://<ref>`.
+  `docker://<ref>`;
+- `:@@=<git ref>` — a worker that lives in **another repo**, pinned by commit
+  sha and fetched by the client (see the arg types below). This is how a project
+  depends on caos without vendoring it.
 
-### Arguments: literals and paths
+### Arguments: literals, paths and pinned refs
 
-An argument is a **literal** or a **path**, chosen by the *operator* — not by
-sniffing the value — so a value is never misread and may contain anything (no
-escaping):
+An argument's type is chosen by the *operator* — never by sniffing the value —
+so a value is never misread and may contain anything (no escaping):
 
 - `--name=value` → a literal string, stored as a blob;
 - `--name:@=path` → a path (the `@` nods to curl/HTTPie). It's resolved doing as
@@ -430,10 +432,24 @@ escaping):
   worker a commit is a file holding the raw commit object; `caos put-commit`
   mints one (at `/cas/out` it makes `commit <hash>` the run's result). See
   `design/commits.md`.
+- `--name:hash=<oid>` → an object the server already holds — a tree or a blob,
+  typically an earlier run's result — referenced by oid with no round-trip;
+- `--name:docker=<ref>` → the blob `docker://<ref>`;
+- `--name:@@=<git ref>` → a tree in **another repo**, named by a nix-style
+  flake-reference (`git+https://host/repo?rev=<40-hex>&dir=sub`, `git+ssh://…`,
+  `git+file://…`, `github:owner/repo`, or a local `path:./dir`). **A URL is a
+  name; a hash is content**, so `rev` is mandatory and must be a full commit
+  sha — a `ref=` naming a branch is refused, because a mutable input has no
+  business in a cache key. The **client** resolves url+rev → oid at eval time
+  (fetching the closure), and the arg entry is that oid, byte-for-byte what a
+  local `:@=` of the same content would produce: the URL never enters an
+  ArgTree, so two consumers pinning the same rev share the whole subgraph by
+  hash. Fetching is a client capability — a **worker cannot do it**, which is
+  what keeps workers network-free. See `design/flake-inputs.md`.
 
-The grammar is `--name[:type]=value` and extensible: `@` (path) and `commit`
-are the types today, leaving room for more. The worker `caos` has no host
-filesystem (only `/cas`), so a non-`/cas` path there is an error.
+The grammar is `--name[:type]=value` and extensible: a new type is a variant, a
+parse arm and a case in each resolver. The worker `caos` has no host filesystem
+(only `/cas`), so a non-`/cas` path there is an error.
 
 ### Other subcommands
 

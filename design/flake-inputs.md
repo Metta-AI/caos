@@ -17,8 +17,8 @@ traps have already been sprung.
 | 2B | `.caos-expr` grammar collapse: `run`/`curry` take `--base`, no positional/`--`; add `:docker=`/`:hash=`; migrate all `.caos-expr` | ✅ done (33/33), **no redeploy needed** |
 | 3 | `:@@=` remote git-ref *parse* (`GitRef{url,rev,dir}` + validation) | ✅ done (33/33), **no redeploy needed** |
 | 2C | CLI + worker `caos` grammar collapse: drop the positional image (and the `--`) everywhere; type the map-then positions; delete the last sniffers | ✅ done (33/33), **needed a redeploy** |
-| **4** | **`:@@=` *resolution* (client-side fetch → oid): the `parse_arg` arm, `ArgType::Remote`, and the fetch/descend/ingest behind it** | **← NEXT, not started** |
-| 6 | Docs + tests (SPEC, README, a remote-ref test) | ongoing |
+| 4 | `:@@=` *resolution* (client-side fetch → oid) | ✅ done (34/34), **no redeploy needed** |
+| 6 | Docs + tests (README, `tests/remote-ref`) | ✅ done with 4 |
 
 The end goal past stage 4: a consumer repo pins caos with one
 `--base:@@=git+https://…caos?rev=<sha>` locator, grafts it in at
@@ -87,15 +87,16 @@ for "where a tree comes from," and it already covers remote-pinned and local.
 
 One parser, one `ArgType` enum, shared by the CLI (`crates/caos/src/lib.rs`,
 `parse_arg`) and the `.caos-expr` evaluator (`crates/caos/src/eval.rs`,
-`resolve_expr_args`). **Stage 1 already unified them** — the enum is
-`ArgType { Literal, Path, Commit, Tree }` today; 2B/3 add `Docker`, `Hash`
-(rename of/over `Tree`), and `Remote` (`:@@=`).
+`resolve_expr_args`). **Stage 1 already unified them**; the enum is now
+`ArgType { Literal, Path, Remote, Commit, Hash, Docker }` — `Hash` the rename
+of/over stage 1's `Tree`, `Docker` and `Hash` added by 2B, `Remote` (`:@@=`) by
+stage 4.
 
 | form | meaning | representation in the arg tree | status |
 |---|---|---|---|
 | `--n=v` | literal string | blob | done |
 | `--n:@=<path>` | a path into the **ambient** git repo, relative to the `.caos-expr` dir — **unchanged**, always a bare path, never a scheme | tree/blob oid | done |
-| `--n:@@=<ref>` | a **proper nix-style ref** to a tree in another repo (or local) | tree/blob oid (resolved at eval time) | stage 3/4 |
+| `--n:@@=<ref>` | a **proper nix-style ref** to a tree in another repo (or local) | tree/blob oid (resolved at eval time) | done |
 | `--n:hash=<oid>` | an existing object by hash (generalizes today's `:tree=` to blob/tree) | that oid | 2B |
 | `--n:commit=<rev>` | unpeeled commit — **unchanged** | gitlink (mode 160000) | done |
 | `--n:docker=<ref>` | a docker image ref | blob `docker://<ref>` | 2B |
@@ -114,7 +115,7 @@ Notes:
 - **`:hash=` generalizes the existing `:tree=`** to a blob or tree by oid (verify
   it exists). `:commit=` stays separate (the *unpeeled* form).
 
-## `:@@=` locator grammar (nix-style) — stage 3/4
+## `:@@=` locator grammar (nix-style)
 
 Canonical:
 
@@ -149,6 +150,49 @@ Parser safety (verified against current code): the token is whitespace-free;
 value; the `:`-type split runs on the **key** only, so `://` is untouched; and
 `.caos-expr` comments are **full-line only** (`eval.rs` trims then checks
 `starts_with('#')`), so a value may contain anything.
+
+## Stage 4: `:@@=` resolution — ✅ DONE
+
+Client-side only, so it landed with **no redeploy**; 34/34 with a new
+`tests/remote-ref`. `ArgType::Remote` + the `parse_arg` arm, and one resolver —
+`resolve_remote_arg` — behind every `:@@=` position:
+
+- **`Transport::fetch_git_ref(url, rev)`**, defaulting to `Ok(None)`. That
+  default IS the security story, not an oversight: a worker cannot reach a
+  network, so it gets "resolving a remote ref is a CLIENT capability" rather
+  than a way to smuggle one in. By the time a worker sees a `:@@=` arg it is an
+  ordinary oid. `tests/remote-ref/check.sh` asserts the refusal from inside a
+  worker.
+- **Pin, fetch, then select** — the order is the content-addressing argument.
+  `git fetch --depth 1 <url> <rev>` (the granularity a host will serve), peel the
+  commit to its tree, descend `dir=`. A `path:` skips the fetch and ingests a
+  live local directory, exactly as `:@=` does.
+- **Wired in three places, each behaving like its `:@=` sibling** — that is the
+  whole rule, so where a tree came from never changes what naming it means:
+  `build_arg_entries` (a plain arg → the oid), `resolve_base` (an image → the
+  oid, then evaluated), and `resolve_expr_args`/`resolve_expr_base` in the
+  evaluator (evaluated if it carries a `.caos-expr`, raw if not — the
+  worker-vs-data rule, now factored out as `eval_if_evaluable` and shared).
+- **A rev is a pin, so re-resolving is free.** `fetch_git_ref` returns early when
+  the commit is already local; the test proves it by DELETING the source repo
+  and resolving again.
+
+### ⚠️ `git fetch` and a partial ALTERNATE object store
+
+`git fetch` runs a connectivity check — `rev-list --not --all --alternate-refs`
+— which walks the tips of every **alternate** object store as well. A repo whose
+alternate holds a deliberate SUBSET then fails with `missing blob object <x>`
+naming an object that has nothing to do with the fetch, blamed on the fetch.
+The test harness creates exactly that shape (`tests/lib/run-test.sh` points the
+client at `/tmp/seed-git/objects`, "exactly what this test declared"), so the
+first green-on-the-host run of `tests/remote-ref` failed in the suite.
+
+Fixed with `-c core.alternateRefsCommand=true` (a command that prints nothing)
+on **this fetch only**. Alternate tips are an EXCLUSION set, so dropping them
+makes the check verify our closure and only ours — stricter, not looser — which
+is safe precisely because a `--depth 1` fetch is self-contained. Do NOT copy it
+to `fetch_object_negotiated`: a chat commit's history may legitimately live in
+an alternate, and there the tips are doing real work.
 
 ---
 
@@ -292,12 +336,24 @@ must keep image-trees vs args-trees apart the same way.**
 
 ---
 
-## Consumer root `.caos-expr` (the payoff, stage 4+)
+## Consumer root `.caos-expr` (the payoff)
 
-A non-nix consumer pins caos directly and needs **no expander at all**:
+The SIMPLE half of this now works and is tested. A consumer entry that only
+needs one caos worker names it by locator and curries its own script on —
+`tests/remote-ref` runs exactly this, with a synthetic consumer repo:
 
 ```
-CAOS=run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=. -- ...
+curry --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/bash --worker1:@=run.sh
+```
+
+Nothing of caos is committed in the consumer; the pin is the whole dependency,
+and the ArgTree carries caos' oids, not its URL.
+
+What remains is the WHOLE-TREE case — a consumer that wants `DEPS`/`DEEP-DEPS`
+of its own, so its directories can declare deps against caos' `std/*`:
+
+```
+CAOS=run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=. ...
 # graft CAOS in at flake-inputs/caos, then run its deep-deps over the merged tree
 ```
 
@@ -319,11 +375,18 @@ is a mechanical mapping. Not scheduled; noted so the choices line up.
 
 ## Open / deferred
 
-- The **consumer graft/merge worker** and the **`flake.lock` codegen hook** are
-  sketched, not scheduled — they sit on top of the `:@@=` primitive and nothing
-  in this repo needs them yet.
+Stages 1–4 are done; the grammar and the locator are finished. What is left is
+built ON them, and nothing in this repo needs it yet:
+
+- The **consumer graft/merge worker** (whole-tree mounting, above) and the
+  **`flake.lock` codegen hook** — sketched, not scheduled.
 - A **worker-side** fetch (network in a container) is explicitly **out of
   scope**; if ever wanted it is a distinct, explicit grant, never something the
-  general locator smuggles in.
-- **`map-then`/`run-then` positional `<in>`**: decide in 2B whether it collapses
-  (probably not — it's data, not a base).
+  general locator smuggles in. The `Ok(None)` default on
+  `Transport::fetch_git_ref` is what holds that line, and `tests/remote-ref`
+  asserts it from inside a worker.
+- **`ref=` (a branch/tag) stays refused**, with no plan to relax it. Anyone who
+  wants "track main" wants a lockfile, which is the codegen hook above — the
+  refusal is the invariant, not a missing feature.
+- **`map-then`/`run-then` positional `<in>`**: resolved in 2C — it stays
+  positional. It is the data the continuation is over, not a base.

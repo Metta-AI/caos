@@ -60,6 +60,20 @@ Every script here runs with it, and two constructs quietly break under it.
   binary and blame the code. Build one output per invocation. (`--refresh` is not
   needed: nix picks up dirty-tree edits fine.)
 
+# Git
+
+- **A `git fetch` can fail over an object it never asked for.** The post-fetch
+  connectivity check is `rev-list --not --all --alternate-refs`, so it walks the
+  tips of every ALTERNATE object store too. The test harness gives each client
+  repo an alternate holding a deliberate SUBSET (`tests/lib/run-test.sh` →
+  `/tmp/seed-git/objects`, "exactly what this test declared"), so any fetch there
+  dies with `missing blob object <x>` naming an object with nothing to do with
+  the fetch — and blames the fetch. It cost a session on `tests/remote-ref`,
+  where the same command was green on the host and red in the suite. Add `-c
+  core.alternateRefsCommand=true` when the fetched closure stands alone
+  (`:@@=`'s `--depth 1` fetch does); do NOT add it where the alternate's tips are
+  legitimately part of the history you are completing.
+
 # Caches and defaults, when a suite fans out
 
 Both of these presented as "the tests are slow", cost a long time to find, and

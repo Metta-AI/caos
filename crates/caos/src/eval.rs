@@ -38,8 +38,15 @@
 //! - `--k=value` — a literal blob, unless `value` is exactly `$NAME`, which
 //!   binds the object that variable holds (by reference, at its own kind).
 //! - `--k:@=path` — the object at `path` within the input subtree.
+//! - `--k:@@=<git ref>` — a tree from ANOTHER repo, pinned by commit sha and
+//!   fetched by the client at eval time; only the resulting oid enters the arg
+//!   tree, so the URL is never part of a cache key (design/flake-inputs.md).
 //! - `--k:docker=ref` — the blob `docker://ref`; `--k:hash=oid` — an object the
 //!   store already holds, by oid.
+//!
+//! A `:@=` or `:@@=` target that carries a `.caos-expr` is itself an EXPRESSION
+//! and is evaluated; one that does not is DATA, referenced raw. Where the tree
+//! came from makes no difference to what naming it means.
 
 use std::collections::HashMap;
 
@@ -396,8 +403,23 @@ fn resolve_expr_base(
             let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
             Ok(hash)
         }
+        // `:@@=<ref>` — the base lives in ANOTHER repo. Fetched by the client
+        // (never a worker), then evaluated exactly like a `:@=` path: this is
+        // what lets a consumer's root expression name caos itself by a pinned
+        // locator and get a runnable image back (design/flake-inputs.md).
+        crate::ArgType::Remote => {
+            let (mode, oid) = crate::resolve_remote_arg(t, value)?;
+            if !mode.is_tree() {
+                return Err(format!(
+                    "eval-path: git ref {value:?} names a file, not an image tree"
+                ));
+            }
+            let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
+            Ok(hash)
+        }
         crate::ArgType::Literal => Err(
-            "eval-path: --base needs a type: use :@= (path), :docker=, :hash=, or =$VAR"
+            "eval-path: --base needs a type: use :@= (path), :@@= (a git ref), :docker=, \
+             :hash=, or =$VAR"
                 .to_string(),
         ),
         crate::ArgType::Commit => Err("eval-path: a commit is not an image base".to_string()),
@@ -433,6 +455,14 @@ fn resolve_expr_args(
                     post_object(t, "blob", value.as_bytes())?,
                 ),
                 crate::ArgType::Path => resolve_expr_path(t, input_tree, value, store)?,
+                // `:@@=<ref>` — a tree from ANOTHER repo, fetched by the client
+                // and then treated exactly as a `:@=` target: evaluated if it
+                // carries a `.caos-expr`, referenced raw if not. The same rule,
+                // applied to a tree that arrived from elsewhere.
+                crate::ArgType::Remote => {
+                    let (mode, oid) = crate::resolve_remote_arg(t, value)?;
+                    eval_if_evaluable(t, mode, oid, store)?
+                }
                 // `:docker=<ref>` — the blob `docker://<ref>`.
                 crate::ArgType::Docker => (
                     EntryKind::Blob.into(),
@@ -486,6 +516,23 @@ fn resolve_expr_path(
 ) -> Result<(EntryMode, gix::ObjectId), String> {
     let (mode, oid) = lookup_in_tree(t, input_tree, value)?
         .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))?;
+    eval_if_evaluable(t, mode, oid, store)
+}
+
+/// The worker-vs-data rule, applied to an object an arg resolved to: a TREE
+/// carrying a `.caos-expr` is an expression and is evaluated; anything else — a
+/// blob, or a tree without one — is data and is referenced raw.
+///
+/// Shared by `:@=` ([`resolve_expr_path`]) and `:@@=`
+/// ([`crate::resolve_remote_arg`]), so where the tree CAME FROM makes no
+/// difference to what naming it means. See [`resolve_expr_path`] for why
+/// evaluating here is what closes caller-propagation, and why nothing recurses.
+fn eval_if_evaluable(
+    t: &dyn Transport,
+    mode: EntryMode,
+    oid: gix::ObjectId,
+    store: &[ClientSecret],
+) -> Result<(EntryMode, gix::ObjectId), String> {
     if !mode.is_tree() {
         return Ok((mode, oid));
     }
@@ -503,7 +550,7 @@ fn resolve_expr_path(
 /// the entry's `(mode, oid)` — `None` if any component is missing or a
 /// non-final component isn't a directory. An empty `rel` (or `.`) is the tree
 /// itself.
-fn lookup_in_tree(
+pub(crate) fn lookup_in_tree(
     t: &dyn Transport,
     tree_oid: &str,
     rel: &str,

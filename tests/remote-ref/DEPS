@@ -1,0 +1,11 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). deep-deps mounts each of these RECURSIVELY
+# DEEPENED at DEEP-DEPS/<name>, so a std entry brings its own deps
+# (std/<e>/DEPS) with it, and only what an edge CANNOT carry is
+# listed here (design/caos-expr.md).
+#
+# `bash` twice over: it is this test's own worker, and it is also
+# what the synthetic CONSUMER repo pins by `:@@=` locator — the same
+# entry reached the two different ways the test compares.
+../../std/bash bash
+../../std/flake-builder flake-builder

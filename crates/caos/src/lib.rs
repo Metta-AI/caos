@@ -321,6 +321,19 @@ pub trait Transport {
         Ok(None)
     }
 
+    /// Fetch commit `rev` (and its tree) from the FOREIGN repo at `url` into
+    /// local storage, for a `:@@=` arg — or `Ok(None)` if this transport cannot
+    /// reach a network at all.
+    ///
+    /// `None` is the default **and the security story**: fetching is a CLIENT
+    /// capability, so a worker — which has no network by construction — gets a
+    /// plain "cannot fetch" rather than a way to smuggle one in. By the time a
+    /// worker sees this arg it is an ordinary oid, resolved before the request
+    /// was ever formed (design/flake-inputs.md).
+    fn fetch_git_ref(&self, _url: &str, _rev: &str) -> Result<Option<()>, String> {
+        Ok(None)
+    }
+
     /// Base URL of the caos server for compute (`/run`). HTTP transport: the
     /// configured server (the worker's injected [`SERVER_ENV`]). Git transport:
     /// the `caos` remote's URL — the same place the CLI already points, so a
@@ -639,6 +652,62 @@ impl Transport for GitTransport {
         parse_oid(out.trim()).map(Some)
     }
 
+    fn fetch_git_ref(&self, url: &str, rev: &str) -> Result<Option<()>, String> {
+        // ALREADY HAVE IT? A rev is a full commit sha, so local presence is
+        // authoritative — the bytes cannot have changed under the name. This is
+        // the whole memo: pinning by content means a second evaluation of the
+        // same locator costs nothing, and a lockfile-pinned consumer never
+        // touches the network twice.
+        if self.have_commit(rev) {
+            return Ok(Some(()));
+        }
+        // `--depth 1`: we want ONE commit's tree, not a repo's history. That is
+        // also the granularity a host will serve — GitHub answers a sha in a
+        // want only when it is reachable (`uploadpack.allowReachableSHA1InWant`),
+        // which is exactly why the locator pins a COMMIT and selects within it
+        // with `dir=` rather than naming a subtree hash (design/flake-inputs.md).
+        //
+        // `--no-tags` and `--no-write-fetch-head` keep a foreign repo from
+        // leaving anything behind in the caller's: nothing is referenced, so the
+        // objects are ordinary unreachable ones the next `git gc` may drop —
+        // re-fetching them is a cache miss, never a correctness problem.
+        //
+        // `core.alternateRefsCommand=true` (a command that prints nothing) is
+        // load-bearing, and cost a debugging session. git's post-fetch
+        // connectivity check runs `rev-list --not --all --alternate-refs`, so it
+        // walks the tips of every ALTERNATE object store as well — and a repo
+        // whose alternate holds a deliberate SUBSET (the test harness points the
+        // client at exactly that, tests/lib/run-test.sh) then dies with
+        // `missing blob object <x>` naming an object that has nothing to do with
+        // the fetch, blamed on the fetch. Dropping those tips makes the check
+        // verify OUR closure and only ours, which is stricter, not looser.
+        //
+        // Narrow to this fetch on purpose: alternate tips are an exclusion set,
+        // so suppressing them is only safe when the fetched closure stands
+        // alone. It does here (`--depth 1` — a commit and its tree), and it does
+        // NOT for `fetch_object_negotiated`, where a chat commit's history may
+        // legitimately live in an alternate.
+        self.run_git(&[
+            "-c",
+            "core.alternateRefsCommand=true",
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--depth",
+            "1",
+            url,
+            rev,
+        ])
+        .map_err(|e| format!("fetching {rev} from {url}: {e}"))?;
+        if !self.have_commit(rev) {
+            return Err(format!("{url} did not deliver commit {rev}"));
+        }
+        Ok(Some(()))
+    }
+
     fn server_url(&self) -> Result<String, String> {
         // The `caos` remote's URL *is* the server: the CLI already pushes/fetches
         // objects there, and /run lives at the same host. So a person configures
@@ -808,6 +877,19 @@ impl GitTransport {
 }
 
 impl GitTransport {
+    /// Does the local repo already hold `rev` as a COMMIT?
+    ///
+    /// A SUBPROCESS on purpose, rather than the cached `self.repo`: a `git fetch`
+    /// lands a new pack that the already-open odb handle will not see, and this
+    /// is called on both sides of exactly that fetch. (`get_object` solves the
+    /// same problem by re-opening; here one `cat-file` is simpler and is already
+    /// a process boundary.) `^{commit}` also does the type check for us — a rev
+    /// that names a tree or a tag object is not a pin we can peel.
+    fn have_commit(&self, rev: &str) -> bool {
+        self.git_capture(&["cat-file", "-e", &format!("{rev}^{{commit}}")], None)
+            .is_ok()
+    }
+
     /// Run a network Git command in this transport's bound working tree.
     fn run_git(&self, args: &[&str]) -> Result<(), String> {
         self.git_capture(args, None).map(|_| ())
@@ -2183,6 +2265,12 @@ fn build_arg_entries(
                 EntryKind::Blob.into(),
                 post_object(t, "blob", format!("{DOCKER_SCHEME}{value}").as_bytes())?,
             ),
+            // `--name:@@=ref` — a tree in another repo, fetched here (client
+            // only) and reduced to its oid, so what the request carries is
+            // indistinguishable from a local path arg.
+            ArgType::Remote => {
+                resolve_remote_arg(t, value).map_err(|e| format!("`{name}`: {e}"))?
+            }
         };
 
         entries.push(Entry {
@@ -2285,6 +2373,16 @@ pub(crate) enum ArgType {
     /// expect). The typed form is how a docker image is named without sniffing
     /// a bare token for a `docker://` prefix.
     Docker,
+    /// `--name:@@=ref` — a tree in ANOTHER repo, named by a nix-style locator
+    /// ([`GitRef`]) and pinned by a commit sha. The CLIENT fetches it at eval
+    /// time and the arg entry is the resulting oid, byte-for-byte as if it had
+    /// come from a local `:@=` — so the URL is a fetch coordinate and never
+    /// enters an ArgTree or a cache key (design/flake-inputs.md).
+    ///
+    /// The sibling of [`ArgType::Path`], not a replacement: `:@=` stays a bare
+    /// path because that is the common case, and `:@@=` carries the full ref
+    /// grammar for the rare one.
+    Remote,
 }
 
 /// Split a `--name[:type]=value` argument into its name, [`ArgType`] and raw
@@ -2302,13 +2400,14 @@ pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
     let (name, ty) = match key.split_once(':') {
         None => (key, ArgType::Literal),
         Some((name, "@")) => (name, ArgType::Path),
+        Some((name, "@@")) => (name, ArgType::Remote),
         Some((name, "commit")) => (name, ArgType::Commit),
         Some((name, "hash")) => (name, ArgType::Hash),
         Some((name, "docker")) => (name, ArgType::Docker),
         Some((_, ty)) => {
             return Err(format!(
                 "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
-                 --name:@=path, --name:commit=rev, --name:hash=oid \
+                 --name:@=path, --name:@@=<git ref>, --name:commit=rev, --name:hash=oid \
                  (a tree/blob the server holds), or --name:docker=ref"
             ))
         }
@@ -2387,8 +2486,21 @@ fn resolve_base(
             Some(cas) => resolve_cas_image(t, cas, value),
             None => resolve_cli_image(t, value),
         },
+        // `:@@=<ref>` — the worker lives in ANOTHER repo: fetch it, then treat
+        // the result exactly as a `:@=` directory, evaluating it if it carries a
+        // `.caos-expr`. This is the consumer story's entry point — a project
+        // names caos' `std/<x>` by locator and gets a runnable image, with only
+        // the oid entering its cache key (design/flake-inputs.md).
+        ArgType::Remote => {
+            let (mode, oid) = resolve_remote_arg(t, value)?;
+            if !mode.is_tree() {
+                return Err(format!("git ref {value:?} names a file, not an image tree"));
+            }
+            eval::eval_tree(t, &oid.to_string())
+        }
         ArgType::Literal => Err(format!(
-            "an image needs a type: use --name:@=path, --name:docker=ref or --name:hash=oid, got {value:?}"
+            "an image needs a type: use --name:@=path, --name:@@=<git ref>, \
+             --name:docker=ref or --name:hash=oid, got {value:?}"
         )),
         ArgType::Commit => Err("a commit is not an image".to_string()),
     }
@@ -2403,13 +2515,8 @@ fn resolve_base(
 /// full-length commit sha) is MANDATORY for a git fetch, and the client resolves
 /// `url@rev → oid` at eval time so the oid, never the URL, enters the arg tree /
 /// cache key. A `path:` names a plain local directory instead (hashed live, like
-/// `:@=`), so it carries no rev. Resolution itself is a later stage; this only
-/// parses and validates.
-///
-/// NOTE: constructed and validated here (unit-tested below); the RESOLUTION that
-/// reads these fields — fetch `url`@`rev`, descend `dir` — lands in the next
-/// stage (design/flake-inputs.md, `:@@=` stage 4), hence `allow(dead_code)`.
-#[allow(dead_code)]
+/// `:@=`), so it carries no rev. [`resolve_remote_arg`] is the resolution these
+/// fields drive.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct GitRef {
     /// The fetch URL — everything before `?`: `git+https://…`, `git+ssh://…`,
@@ -2422,21 +2529,101 @@ pub(crate) struct GitRef {
     pub dir: Option<String>,
 }
 
-#[allow(dead_code)]
 impl GitRef {
     /// A `path:` locator names a plain local directory — no git fetch, no rev —
     /// resolved by ingesting the tree, like a `:@=` path.
     pub fn is_plain_dir(&self) -> bool {
         self.url.starts_with("path:")
     }
+
+    /// The URL to hand `git fetch`. The locator's scheme is nix's, which prefixes
+    /// a transport with `git+` and abbreviates GitHub — neither of which git
+    /// itself understands, so the `git+` comes off and `github:o/r` expands to
+    /// the HTTPS URL it stands for. This is the ONE place the sugar is undone:
+    /// the parsed `url` stays exactly what the caller wrote, so an error message
+    /// quotes their locator rather than something normalized behind their back.
+    pub fn fetch_url(&self) -> String {
+        if let Some(rest) = self.url.strip_prefix("git+") {
+            return rest.to_string();
+        }
+        if let Some(rest) = self.url.strip_prefix("github:") {
+            return format!("https://github.com/{rest}");
+        }
+        self.url.clone()
+    }
+}
+
+/// Resolve a `--name:@@=<ref>` argument to the `(mode, oid)` of the tree (or
+/// blob) it names, fetching from another repo if that is what the locator says.
+/// The oid is all that survives: URL and rev are fetch coordinates, so the arg
+/// entry is byte-for-byte what a local `:@=` of the same content would produce
+/// and two consumers pinning the same rev share the whole subgraph by hash
+/// (design/flake-inputs.md).
+///
+/// Three steps, and the ORDER is the content-addressing argument: pin (the rev,
+/// already validated by [`parse_git_ref`]), fetch, then select (`dir=`). We fetch
+/// a COMMIT because that is what a host will serve, and descend within it —
+/// rather than naming a subtree hash, which nothing would hand us.
+fn resolve_remote_arg(
+    t: &dyn Transport,
+    value: &str,
+) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+    let git_ref = parse_git_ref(value)?;
+
+    // `path:` — a live local directory, hashed now, exactly like a `:@=` path
+    // (so "only what git tracks is visible" still holds). No rev: there is
+    // nothing to pin, because there is no fetch.
+    let root = if git_ref.is_plain_dir() {
+        let dir = git_ref
+            .url
+            .strip_prefix("path:")
+            .expect("is_plain_dir checked the prefix");
+        let (mode, oid) = t.ingest_path(dir)?.ok_or_else(|| {
+            format!("`:@@=path:` reads a host directory, which this client cannot do ({dir})")
+        })?;
+        if git_ref.dir.is_none() {
+            return Ok((mode, oid));
+        }
+        oid
+    } else {
+        let rev = git_ref
+            .rev
+            .as_deref()
+            .expect("parse_git_ref requires a rev for every fetch scheme");
+        let url = git_ref.fetch_url();
+        t.fetch_git_ref(&url, rev)?.ok_or_else(|| {
+            format!(
+                "cannot fetch {value:?}: resolving a remote ref is a CLIENT capability, \
+                 so a `:@@=` arg must already be an oid by the time a worker sees it"
+            )
+        })?;
+        // Peel the pinned commit to its tree. Everything below is ordinary
+        // object reading, against objects the fetch just made local.
+        let (kind, content) = t.get_object(rev)?;
+        if kind != "commit" {
+            return Err(format!(
+                "git ref {value:?}: {rev} is a {kind}, not a commit"
+            ));
+        }
+        // Bound rather than returned inline: the parsed commit BORROWS `content`,
+        // and a block's tail temporaries outlive its locals.
+        let commit = gix::objs::CommitRef::from_bytes(&content, gix::hash::Kind::Sha1)
+            .map_err(|e| format!("git ref {value:?}: malformed commit {rev}: {e}"))?;
+        commit.tree()
+    };
+
+    let Some(dir) = git_ref.dir.as_deref() else {
+        return Ok((gix::objs::tree::EntryKind::Tree.into(), root));
+    };
+    eval::lookup_in_tree(t, &root.to_string(), dir)?
+        .ok_or_else(|| format!("git ref {value:?}: no `{dir}` in the fetched tree"))
 }
 
 /// Parse a `:@@=` locator value into a [`GitRef`], validating the
 /// content-addressing invariant: a git fetch MUST pin a commit (`rev=<40-hex>`),
 /// a mutable `ref=` (branch/tag) is rejected, and a `path:` takes no rev. The
-/// scheme chooses the meaning — never sniffed from the value's shape. Resolution
-/// is a separate step (stage 4); this is pure string logic (unit-tested).
-#[allow(dead_code)]
+/// scheme chooses the meaning — never sniffed from the value's shape. Pure
+/// string logic (unit-tested); [`resolve_remote_arg`] does the fetching.
 pub(crate) fn parse_git_ref(value: &str) -> Result<GitRef, String> {
     let (url, query) = value.split_once('?').unwrap_or((value, ""));
     if url.is_empty() {
