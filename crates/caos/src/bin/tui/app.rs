@@ -5,11 +5,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_head, conversation_replay, conversation_snapshot,
-    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
-    generate_conversation_title, list_user_conversations, publish_unindexed_conversations,
-    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationReplay, ConversationRole,
+    archive_user_conversation, conversation_head, conversation_ref, conversation_replay,
+    conversation_snapshot, conversation_workspace_diff, describe_tool_set,
+    first_available_conversation_name, generate_conversation_title, list_user_conversations,
+    publish_unindexed_conversations, publish_user_conversation, resume_request, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationReplay,
+    ConversationRole,
     ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
     UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
@@ -121,6 +122,12 @@ struct LoadedConversation {
     snapshot: ConversationSnapshot,
     replay: ConversationReplay,
     workspace_diff: WorkspaceDiff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceNotice {
+    refname: String,
+    head: String,
 }
 
 struct RemotePollEntry {
@@ -906,6 +913,7 @@ struct ConversationState {
     composer: Composer,
     status: String,
     command_error: Option<String>,
+    reference_notice: Option<ReferenceNotice>,
     publish_prompt: bool,
     running: bool,
     local_turn: bool,
@@ -941,6 +949,7 @@ impl ConversationState {
             composer: Composer::default(),
             status,
             command_error: None,
+            reference_notice: None,
             publish_prompt: false,
             running: false,
             local_turn: false,
@@ -1702,6 +1711,15 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(value) = ui::reference_copy_at(self, area, mouse.column, mouse.row) {
+                self.selecting_transcript = false;
+                self.selecting_screen = false;
+                self.screen_selection = None;
+                self.selected_mut().transcript_selection = None;
+                return MouseAction::Copy(value);
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp
                 if self.view == View::Activity
@@ -1748,28 +1766,32 @@ impl App {
                 self.start_screen_selection(mouse.column, mouse.row, area)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.selecting_transcript => {
+                if self.selected().transcript_selection.is_none() {
+                    self.selecting_transcript = false;
+                    return MouseAction::Ignored;
+                }
                 if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
                 {
-                    self.selected_mut()
-                        .transcript_selection
-                        .as_mut()
-                        .expect("dragging starts with a transcript selection")
-                        .head = point;
+                    if let Some(selection) = self.selected_mut().transcript_selection.as_mut() {
+                        selection.head = point;
+                    }
                     MouseAction::Redraw
                 } else {
                     MouseAction::Ignored
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.selecting_transcript => {
+                if self.selected().transcript_selection.is_none() {
+                    self.selecting_transcript = false;
+                    return MouseAction::Ignored;
+                }
                 if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
                 {
-                    self.selected_mut()
-                        .transcript_selection
-                        .as_mut()
-                        .expect("dragging starts with a transcript selection")
-                        .head = point;
+                    if let Some(selection) = self.selected_mut().transcript_selection.as_mut() {
+                        selection.head = point;
+                    }
                 }
                 self.selecting_transcript = false;
                 ui::transcript_selection_text(self.selected(), area)
@@ -2061,17 +2083,31 @@ impl App {
 
     fn show_selected_ref(&mut self) {
         let id = self.selected().id.clone();
+        let refname = match conversation_ref(&id) {
+            Ok(refname) => refname,
+            Err(error) => {
+                self.selected_mut().reference_notice = None;
+                self.selected_mut().show_command_error(error);
+                return;
+            }
+        };
         match self
             .transport()
             .and_then(|transport| conversation_head(&transport, &id))
         {
-            Ok(Some(head)) => self.selected_mut().push_info(format!(
-                "Conversation ref: refs/caos/v2/conversations/{id}/head\nHead commit: {head}"
-            )),
-            Ok(None) => self
-                .selected_mut()
-                .show_command_error("this conversation has no remote ref until its first message"),
-            Err(error) => self.selected_mut().show_command_error(error),
+            Ok(Some(head)) => {
+                self.selected_mut().reference_notice = Some(ReferenceNotice { refname, head });
+            }
+            Ok(None) => {
+                self.selected_mut().reference_notice = None;
+                self.selected_mut().show_command_error(
+                    "this conversation has no remote ref until its first message",
+                );
+            }
+            Err(error) => {
+                self.selected_mut().reference_notice = None;
+                self.selected_mut().show_command_error(error);
+            }
         }
     }
 
@@ -4644,6 +4680,39 @@ mod tests {
     }
 
     #[test]
+    fn stale_transcript_drag_state_is_ignored_instead_of_panicking() {
+        let mut selected = state("talk-1");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text: "hello".to_string(),
+            pending_id: None,
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 27,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.selecting_transcript = true;
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left)), area),
+            MouseAction::Ignored
+        );
+        assert!(!app.selecting_transcript);
+
+        app.selecting_transcript = true;
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)), area),
+            MouseAction::Ignored
+        );
+        assert!(!app.selecting_transcript);
+    }
+
+    #[test]
     fn full_layout_renders_chat_activity_and_prompt() {
         let mut selected = state("review-api");
         selected.transcript = vec![
@@ -5624,18 +5693,71 @@ mod tests {
     fn ref_command_shows_a_copyable_canonical_ref_and_full_head() {
         let (repo, remote, _) = repo_with_default_branch("show-ref", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        let head = seed_idle_conversation(&repo, "shared", "Alice", "hello");
+        let id = "_shared_name_";
+        let head = seed_idle_conversation(&repo, id, "Alice", "hello");
 
-        let (mut app, _) = app_with(vec![state("shared")]);
+        let (mut app, _) = app_with(vec![state(id)]);
         app.repo_dir = repo.clone();
         app.show_selected_ref();
 
-        let shown = app.selected().transcript.last().unwrap();
-        assert_eq!(shown.role, EntryRole::Info);
-        assert!(shown
-            .text
-            .contains("refs/caos/v2/conversations/shared/head"));
-        assert!(shown.text.contains(&head));
+        let refname = conversation_ref(id).unwrap();
+        assert!(app.selected().transcript.is_empty());
+        assert_eq!(
+            app.selected().reference_notice,
+            Some(ReferenceNotice {
+                refname: refname.clone(),
+                head: head.clone(),
+            })
+        );
+
+        // A coherent reload must not erase this presentation-only result.
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = conversation_load(&transport, id).unwrap().unwrap();
+        app.selected_mut().apply_load(load, "Alice");
+        assert_eq!(
+            app.selected().reference_notice,
+            Some(ReferenceNotice {
+                refname: refname.clone(),
+                head: head.clone(),
+            })
+        );
+
+        // Narrow rendering clips raw text instead of markdown-parsing or
+        // soft-wrapping it, while clicks return the complete underlying value.
+        let area = Rect::new(0, 0, 70, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("_shared_"));
+
+        let copy_rows = (0..area.height)
+            .filter_map(|row| ui::reference_copy_at(&app, area, 27, row).map(|value| (row, value)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copy_rows.iter().map(|(_, value)| value).collect::<Vec<_>>(),
+            vec![&refname, &head]
+        );
+        for (row, expected) in copy_rows {
+            assert_eq!(
+                app.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 27,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                ),
+                MouseAction::Copy(expected)
+            );
+        }
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();

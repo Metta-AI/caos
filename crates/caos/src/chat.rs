@@ -1910,7 +1910,8 @@ fn push_head_cas_git(
     Err(pushed.expect_err("checked error above"))
 }
 
-fn conversation_ref(id: &str) -> Result<String, String> {
+/// Return the canonical append-only head ref for a validated conversation ID.
+pub fn conversation_ref(id: &str) -> Result<String, String> {
     if id.is_empty()
         || id.len() > MAX_CONVERSATION_ID_BYTES
         || id.ends_with('.')
