@@ -46,7 +46,7 @@ fn start() -> Result<(), String> {
     // (content-addressed, hence identical), plus the head commit to remember.
     // The head is a commit-valued CAS path, so it rides the curry as a gitlink.
     let me = caos_curry(
-        &arg("image"),
+        &arg("base"),
         &[
             ("worker1", Arg::Path(&arg("worker1"))),
             ("head", Arg::Path(&arg("head"))),

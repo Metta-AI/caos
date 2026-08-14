@@ -210,7 +210,7 @@ fn matches(required: &ArgTree, arg_entries: &ArgTree) -> bool {
 /// A `docker://seeded…` job's `image` arg is the blob of the sentinel string
 /// itself, and the seed record `build-builtins.sh` publishes for that sentinel
 /// carries the same blob in its `required` — so a parked poll whose
-/// `required["image"]` equals the job's `image` IS this sentinel's seeder, and
+/// `required["base"]` equals the job's `base` IS this sentinel's seeder, and
 /// nobody else's. If that poll is parked and does not match the job, the two
 /// sides disagree about the rest of the key and no amount of waiting fixes it:
 /// the seeder answers one arg tree and the caller formed another.
@@ -244,10 +244,10 @@ fn disagreeing_seeder<'a>(
     entries: &ArgTree,
     polls: impl Iterator<Item = &'a ArgTree>,
 ) -> Option<String> {
-    let image = entries.get("image")?;
+    let image = entries.get("base")?;
     let mut closest: Option<Vec<String>> = None;
     for required in polls {
-        if required.get("image") != Some(image) {
+        if required.get("base") != Some(image) {
             continue;
         }
         // A matching poll would have been claimed by `offer_job`; if one is
@@ -446,7 +446,7 @@ pub(crate) fn dispatch(
                 };
                 match job.phase {
                     Phase::Pending { deadline, .. } if now >= deadline => {
-                        // ONLY for a seeded job. A `required["image"]` match is
+                        // ONLY for a seeded job. A `required["base"]` match is
                         // evidence of a seeder only when the image is a
                         // sentinel; on an ordinary job it is just a warm runner
                         // holding the same image, and calling that "the seeder"
@@ -736,8 +736,8 @@ mod tests {
     /// blob `sent`) answers `in=aaa`, and the caller formed `in=bbb`.
     #[test]
     fn a_parked_seeder_that_disagrees_is_a_verdict() {
-        let job = args(&[("image", "sent"), ("in", "bbb"), ("std", "s")]);
-        let seeder = args(&[("image", "sent"), ("in", "aaa")]);
+        let job = args(&[("base", "sent"), ("in", "bbb"), ("std", "s")]);
+        let seeder = args(&[("base", "sent"), ("in", "aaa")]);
         let why = disagreeing_seeder(&job, [&seeder].into_iter()).expect("a verdict");
         assert!(
             why.contains("in: seeder answers aaa, the job asks bbb"),
@@ -749,8 +749,8 @@ mod tests {
     /// generic runnerd poll are not evidence about this key, so keep waiting.
     #[test]
     fn only_the_same_sentinel_counts() {
-        let job = args(&[("image", "sent"), ("in", "bbb")]);
-        let other = args(&[("image", "other-sent"), ("in", "aaa")]);
+        let job = args(&[("base", "sent"), ("in", "bbb")]);
+        let other = args(&[("base", "other-sent"), ("in", "aaa")]);
         let generic = args(&[]);
         assert!(disagreeing_seeder(&job, [&other, &generic].into_iter()).is_none());
         // …and with nothing parked at all.
@@ -762,22 +762,17 @@ mod tests {
     /// a matching poll is never a verdict.
     #[test]
     fn a_matching_seeder_is_not_a_verdict() {
-        let job = args(&[
-            ("image", "sent"),
-            ("in", "aaa"),
-            ("std", "s"),
-            ("salt", "x"),
-        ]);
-        let seeder = args(&[("image", "sent"), ("in", "aaa")]);
+        let job = args(&[("base", "sent"), ("in", "aaa"), ("std", "s"), ("salt", "x")]);
+        let seeder = args(&[("base", "sent"), ("in", "aaa")]);
         assert!(disagreeing_seeder(&job, [&seeder].into_iter()).is_none());
     }
 
     /// Two seeders disagree; the message names the one sharing more of the key.
     #[test]
     fn the_closest_disagreement_is_reported() {
-        let job = args(&[("image", "sent"), ("in", "bbb"), ("worker1", "w")]);
-        let far = args(&[("image", "sent"), ("in", "aaa"), ("worker1", "zzz")]);
-        let near = args(&[("image", "sent"), ("in", "aaa"), ("worker1", "w")]);
+        let job = args(&[("base", "sent"), ("in", "bbb"), ("worker1", "w")]);
+        let far = args(&[("base", "sent"), ("in", "aaa"), ("worker1", "zzz")]);
+        let near = args(&[("base", "sent"), ("in", "aaa"), ("worker1", "w")]);
         let why = disagreeing_seeder(&job, [&far, &near].into_iter()).expect("a verdict");
         assert!(!why.contains("worker1"), "{why}");
     }

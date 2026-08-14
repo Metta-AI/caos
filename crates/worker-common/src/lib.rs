@@ -15,7 +15,7 @@
 //! What a worker curries and calls is an *ArgTree*, not an image (SPEC, "Work"):
 //! currying takes an ArgTree and args and returns a new ArgTree, and its in-code
 //! form is a curry node (`{base, args, .caos-curry}`). An image is just one arg
-//! (the reserved `image`), so the *simplest* ArgTree is a bare image — which is
+//! (the reserved `base`), so the *simplest* ArgTree is a bare image — which is
 //! exactly what `own_image` hands you: an image ref, the value under
 //! that one arg. `caos curry` binds args onto such a ref to build a richer
 //! ArgTree; the `map`/`then`/`run` operands are ArgTree refs (a bare image, or a
@@ -71,8 +71,8 @@ pub fn secret(name: &str) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|e| format!("reading secret {name}: {e}"))
 }
 
-/// This worker's *own* image ref — the request's reserved `image` args entry,
-/// which a git image materializes as a tree at `/cas/args/image`. It's the
+/// This worker's *own* image ref — the request's reserved `base` args entry,
+/// which a git image materializes as a tree at `/cas/args/base`. It's the
 /// UNWRAPPED base image (never a curry node), so curry your args back onto it to
 /// recurse by calling yourself — an ArgTree built from the exact image running,
 /// needing no std lookup, for any git image (a rustc-built worker as much as a
@@ -82,11 +82,11 @@ pub fn secret(name: &str) -> Result<String, String> {
 /// Reaching for this to rebuild your whole ArgTree by hand? Prefer
 /// [`own_args_tree`] + [`caos_recurry`], which carry every other arg forward.
 pub fn own_image() -> String {
-    arg("image")
+    arg("base")
 }
 
 /// This worker's *own* ArgTree — the git hash of the args tree the server
-/// materialized at `/cas/args` (the `image` base plus every bound and call arg).
+/// materialized at `/cas/args` (the `base` image plus every bound and call arg).
 /// Unlike [`own_image`], which is just the base, this is the WHOLE ArgTree, so a
 /// worker can recurse by currying it *forward* — [`caos_recurry`] — instead of
 /// re-listing its config arg by arg (miss one and it silently vanishes next

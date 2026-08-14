@@ -210,7 +210,7 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
     had to change — it can't eval a `.caos-expr`, so it forms the single
     flake-builder key it knows.
   - The flake-builder **worker** (`std/flake-builder/worker`) now self-references
-    via `/cas/args/image` (its own resolved image), not `/cas/std/flake-builder`
+    via `/cas/args/base` (its own resolved image), not `/cas/std/flake-builder`
     (which, as a source entry, would hand the server a raw flake to rebuild and
     cycle).
 - **Harness seed plumbing**: `build.sh`'s `make` stage pushes `refs/caos/seed`

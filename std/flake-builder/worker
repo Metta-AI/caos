@@ -42,16 +42,16 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 case "$stage" in
 
 orchestrate)
-  # Curry the build/stack stages onto our OWN resolved image (/cas/args/image),
+  # Curry the build/stack stages onto our OWN resolved image (/cas/args/base),
   # never onto a materialized flake-builder ENTRY. An entry is a SOURCE tree
   # (its `.caos-expr` resolves to the seeded image), so currying one would hand
   # the server a raw flake to rebuild — and, since building a flake needs
-  # flake-builder, that cycles. /cas/args/image is
+  # flake-builder, that cycles. /cas/args/base is
   # the image THIS run already resolved to — the flake-builder delta — so the
   # self-reference is a plain image ref (design/caos-expr.md: a worker reaches
-  # its own image at /cas/args/image to call itself).
-  build=$(caos curry /cas/args/image -- --stage=build) || fail "currying build"
-  stack=$(caos curry /cas/args/image -- --stage=stack) || fail "currying stack"
+  # its own image at /cas/args/base to call itself).
+  build=$(caos curry /cas/args/base -- --stage=build) || fail "currying build"
+  stack=$(caos curry /cas/args/base -- --stage=stack) || fail "currying stack"
   caos run-then /cas/args/in -- --run="$build" --then="$stack"
   ;;
 
