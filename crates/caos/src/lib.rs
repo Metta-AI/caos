@@ -2375,9 +2375,9 @@ pub(crate) fn parse_git_ref(value: &str) -> Result<GitRef, String> {
 
     let (mut rev, mut dir, mut has_ref) = (None, None, false);
     for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair.split_once('=').ok_or_else(|| {
-            format!("git ref {value:?}: query part {pair:?} is not key=value")
-        })?;
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("git ref {value:?}: query part {pair:?} is not key=value"))?;
         match k {
             "rev" if rev.replace(v.to_string()).is_some() => {
                 return Err(format!("git ref {value:?}: rev given twice"))
