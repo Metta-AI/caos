@@ -2355,24 +2355,24 @@ fn assemble_arg_tree(
     // only ever sees a plain args tree.
     let (image, bound) = unwrap_curry(t, image)?;
 
-    // The worker (image) rides *in* the args tree under the reserved `image`
+    // The worker (image) rides *in* the args tree under the reserved `base`
     // entry, rather than as a sibling of `args` in the request. So a computation
     // is identified entirely by its args (an executor can match on the worker
     // alongside the rest), and a worker — which sees its args at `/cas/args` —
-    // reaches its own image at `/cas/args/image` to call itself. Merged last so
+    // reaches its own image at `/cas/args/base` to call itself. Merged last so
     // the reserved name wins over any like-named user arg.
     //
     // A git-docker image *is* a git tree, so we reference it by that tree (the
     // entry's oid is the image tree): the image then travels inside the request's
-    // own object graph — no separate push — and materializes at `/cas/args/image`
+    // own object graph — no separate push — and materializes at `/cas/args/base`
     // as a real directory whose recorded hash is the image, so recursion can pass
     // that path straight to `caos run`. A `docker://` ref has no git object to
     // embed, so it rides as a blob naming the registry ref.
-    let image_entry = image_arg_entry(t, &image)?;
+    let image_entry = base_arg_entry(t, &image)?;
     let mut arg_entries = merge_entries(merge_entries(bound, call), vec![image_entry]);
 
     // The cache-busting salt (empty by default) rides *in* the args tree under the
-    // reserved `salt` entry, exactly like `image` — per SPEC an ArgTree is a git
+    // reserved `salt` entry, exactly like `base` — per SPEC an ArgTree is a git
     // tree of named args including `salt`, so the salt belongs there rather than
     // as a sibling of `args` in the request. Since the args tree is the cache key,
     // a salted run is simply a different args tree; it needs no keying of its own.
