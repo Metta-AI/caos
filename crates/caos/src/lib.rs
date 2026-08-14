@@ -2338,8 +2338,8 @@ fn prepare_request(
     assemble_arg_tree(t, image, call, store)
 }
 
-/// Assemble a runnable ArgTree from a base `image` ref and the caller's already
-/// resolved `call` args, folding in the reserved `image`/`salt`/`std` entries,
+/// Assemble a runnable ArgTree from a base image ref and the caller's already
+/// resolved `call` args, folding in the reserved `base`/`salt`/`std` entries,
 /// storing it, and getting it onto the server. Returns the ArgTree hash (the
 /// request id and cache key). Shared by [`prepare_request`] (which resolves
 /// `call` from kvs) and the `.caos-expr` evaluator (which resolves `call`
