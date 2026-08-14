@@ -141,15 +141,10 @@ pub(crate) fn run(
     if let Some(id) = &trace_id {
         config.trace.end(id);
     }
+    // Top-level publication is part of `run_work_request`: a flight owner pins
+    // before releasing its ownership, and waiters receive that combined
+    // compute-and-publication outcome.
     let result = result?;
-    // Pin an external run's result so a client can fetch it by ref and it
-    // survives gc; sub-runs set no ref (they'd flood the namespace).
-    // For a blocking caller this ref is convenient; for a disconnected caller
-    // it is the only durable way to discover the eventual result from Q.
-    // Therefore a run is not successful until publication succeeds. Repeating
-    // exact Q is safe: the compute result is cached, and the retry comes
-    // straight back here.
-    pin_result(config, &arg_tree, &result)?;
     Ok(format!("{result}\n").into_bytes())
 }
 
@@ -174,7 +169,7 @@ fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
 /// ancestor ArgTree hashes — empty = top-level), returning the fully-resolved
 /// `"<type> <hash>"`. The whole pipeline behind both `GET /run` and promise
 /// sub-runs: cache lookup → run-cycle detection → the container run → promise
-/// resolution → cache store.
+/// resolution → cache store → top-level result publication.
 fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, HttpError> {
     let span_id = request.trace_id.and_then(|id| config.trace.start(id));
     let result = run_work_request_inner(config, request, span_id);
@@ -227,6 +222,12 @@ fn run_work_request_inner(
                 config.trace.cache(trace_id, span_id, true);
             }
             eprintln!("cache hit: arg_tree={arg_tree} -> {result}");
+            // A cached result is already the canonical completed value for this
+            // request. Publish it before reporting top-level success; sub-runs
+            // do not create result refs.
+            if stack.is_empty() {
+                pin_result(config, arg_tree, &result)?;
+            }
             return Ok(result);
         }
         Ok(None) => {
@@ -270,22 +271,35 @@ fn run_work_request_inner(
     // errors cleanly. An owner guard clears and broadcasts if its thread
     // unwinds; a waiter never promotes itself merely because a valid run is
     // slow, since duplicate execution may repeat external side effects.
-    let owner =
+    let (outcome, owner) =
         match claim_flight_after_miss(arg_tree, stack, || cache_get(&config.redis_addr, &key)) {
-            FlightDisposition::Run(owner) => owner,
-            FlightDisposition::Complete { outcome, cache_hit } => {
+            FlightDisposition::Run(owner) => (
+                run_dispatch(config, request, &image, &salt, &key, traced_arg_entries),
+                owner,
+            ),
+            FlightDisposition::Complete {
+                outcome,
+                cache_hit,
+                owner,
+            } => {
                 if cache_hit {
                     if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
                         config.trace.cache(trace_id, span_id, true);
                     }
                 }
-                return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
+                (outcome, owner)
             }
         };
-    let outcome = run_dispatch(config, request, &image, &salt, &key, traced_arg_entries);
-    if let Some(owner) = owner {
-        owner.finish(&outcome);
-    }
+    let outcome = match owner {
+        // Any top-level participant marks the shared flight for publication,
+        // even when its executor entered as a promise sub-run. The owner keeps
+        // the flight fenced until that publication finishes.
+        Some(owner) => owner.finish_with(outcome, |result| pin_result(config, arg_tree, result)),
+        // A waiter receives the owner's already-published outcome. The only
+        // ownerless executor is a cycle-breaking sub-run: an external request
+        // has no ancestors, so it can never take the unsafe path.
+        None => outcome,
+    };
     outcome.map_err(|(status, msg)| HttpError::new(status, msg))
 }
 
@@ -381,9 +395,16 @@ fn run_dispatch(
 /// A run's outcome in plain data, so it can be sent to every parked waiter.
 type Outcome = Result<String, (u16, String)>;
 
-/// In-flight runs: ArgTree hash → the channels of parked waiters.
-fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
-    static FLIGHTS: OnceLock<Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>>> = OnceLock::new();
+struct FlightEntry {
+    waiters: Vec<mpsc::Sender<Outcome>>,
+    /// At least one participant is a top-level HTTP run and therefore needs
+    /// the result pinned before the flight completes.
+    publish_result: bool,
+}
+
+/// In-flight runs: ArgTree hash → the flight's waiters and publication need.
+fn flights() -> &'static Mutex<HashMap<String, FlightEntry>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<String, FlightEntry>>> = OnceLock::new();
     FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -450,8 +471,14 @@ enum FlightDisposition {
     /// This arrival must execute. `Some` owns the canonical flight; `None` is
     /// the independent duplicate required to expose a cross-thread cycle.
     Run(Option<FlightOwner>),
-    /// A live owner or the post-claim cache re-read supplied the outcome.
-    Complete { outcome: Outcome, cache_hit: bool },
+    /// A live owner or the post-claim cache re-read supplied the outcome. The
+    /// latter retains its owner so top-level publication happens before the
+    /// flight is released.
+    Complete {
+        outcome: Outcome,
+        cache_hit: bool,
+        owner: Option<FlightOwner>,
+    },
 }
 
 /// Join the flight after an initial cache miss, then re-read the cache if this
@@ -470,10 +497,10 @@ fn claim_flight_after_miss(
             Ok(Some(result)) => {
                 eprintln!("cache hit after single-flight claim: arg_tree={arg_tree} -> {result}");
                 let outcome = Ok(result);
-                owner.finish(&outcome);
                 FlightDisposition::Complete {
                     outcome,
                     cache_hit: true,
+                    owner: Some(owner),
                 }
             }
             Ok(None) => FlightDisposition::Run(Some(owner)),
@@ -490,6 +517,7 @@ fn claim_flight_after_miss(
                 FlightDisposition::Complete {
                     outcome: Ok(result),
                     cache_hit: true,
+                    owner: None,
                 }
             }
             Ok(None) => {
@@ -514,6 +542,7 @@ fn claim_flight_after_miss(
                     FlightDisposition::Complete {
                         outcome,
                         cache_hit: false,
+                        owner: None,
                     }
                 }
                 Err(_) => FlightDisposition::Complete {
@@ -522,6 +551,7 @@ fn claim_flight_after_miss(
                         format!("single-flight owner for {arg_tree} ended without an outcome"),
                     )),
                     cache_hit: false,
+                    owner: None,
                 },
             }
         }
@@ -537,9 +567,37 @@ struct FlightOwner {
 }
 
 impl FlightOwner {
+    #[cfg(test)]
     fn finish(mut self, outcome: &Outcome) {
-        self.finished = true;
         finish_flight(&self.arg_tree, outcome);
+        self.finished = true;
+    }
+
+    /// If an external participant requested durable publication, publish while
+    /// this owner remains in the flight table, then broadcast the combined
+    /// outcome. A publication failure is therefore seen by every waiter.
+    fn finish_with(
+        mut self,
+        outcome: Outcome,
+        publish: impl FnOnce(&str) -> Result<(), HttpError>,
+    ) -> Outcome {
+        let outcome = if reserve_publication_or_finish(&self.arg_tree, &outcome) {
+            match outcome {
+                Ok(result) => match publish(&result) {
+                    Ok(()) => Ok(result),
+                    Err(error) => Err((error.status(), error.message().to_string())),
+                },
+                Err(error) => Err(error),
+            }
+        } else {
+            // `reserve_publication_or_finish` already removed the flight and
+            // broadcast this outcome atomically with deciding no pin was needed.
+            self.finished = true;
+            return outcome;
+        };
+        finish_flight(&self.arg_tree, &outcome);
+        self.finished = true;
+        outcome
     }
 }
 
@@ -575,7 +633,7 @@ impl Drop for ParkGuard {
 fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
     let mut table = flights().lock().expect("flights lock");
     match table.get_mut(arg_tree) {
-        Some(waiters) => {
+        Some(flight) => {
             // The waits-for check runs under the flights lock, so a
             // concurrent park can't slip in between the check and the edge
             // registration.
@@ -597,11 +655,23 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
                 });
                 id
             };
-            waiters.push(tx);
+            flight.waiters.push(tx);
+            // An external request may join a flight whose executor is a
+            // promise sub-run. Record its need here so that executor publishes
+            // before waking it.
+            if stack.is_empty() {
+                flight.publish_result = true;
+            }
             Flight::Waiter(rx, ParkGuard { id })
         }
         None => {
-            table.insert(arg_tree.to_string(), Vec::new());
+            table.insert(
+                arg_tree.to_string(),
+                FlightEntry {
+                    waiters: Vec::new(),
+                    publish_result: stack.is_empty(),
+                },
+            );
             Flight::Owner(FlightOwner {
                 arg_tree: arg_tree.to_string(),
                 finished: false,
@@ -610,25 +680,60 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
     }
 }
 
+/// Decide, under the flight-table lock, whether successful completion needs a
+/// publication phase. If it does, leave the entry present so new arrivals keep
+/// waiting while the ref is pinned. Otherwise remove and broadcast now; an
+/// external request racing this decision either marks the existing flight
+/// first or becomes the next owner after removal.
+fn reserve_publication_or_finish(arg_tree: &str, outcome: &Outcome) -> bool {
+    let waiters = {
+        let mut table = flights().lock().expect("flights lock");
+        if outcome.is_ok()
+            && table
+                .get(arg_tree)
+                .is_some_and(|flight| flight.publish_result)
+        {
+            return true;
+        }
+        take_flight(&mut table, arg_tree)
+    };
+    broadcast(waiters, outcome);
+    false
+}
+
 /// Broadcast the outcome to every parked waiter and clear the entry. Only the
 /// owner calls this; an unsafe cycle-breaking duplicate must not steal its
 /// waiters or publish a cycle error as the canonical flight outcome.
 fn finish_flight(arg_tree: &str, outcome: &Outcome) {
     let waiters = {
         let mut table = flights().lock().expect("flights lock");
-        let waiters = table.remove(arg_tree).unwrap_or_default();
-        // A sent outcome no longer waits on this flight, even if the receiving
-        // thread has not yet been scheduled to drop its ParkGuard. Remove the
-        // completed edges while still holding the flights lock so a new flight
-        // for the same key cannot register an edge that this completion would
-        // mistake for one of its own.
-        parked()
-            .lock()
-            .expect("parked lock")
-            .edges
-            .retain(|edge| edge.target != arg_tree);
-        waiters
+        take_flight(&mut table, arg_tree)
     };
+    broadcast(waiters, outcome);
+}
+
+fn take_flight(
+    table: &mut HashMap<String, FlightEntry>,
+    arg_tree: &str,
+) -> Vec<mpsc::Sender<Outcome>> {
+    let waiters = table
+        .remove(arg_tree)
+        .map(|flight| flight.waiters)
+        .unwrap_or_default();
+    // A sent outcome no longer waits on this flight, even if the receiving
+    // thread has not yet been scheduled to drop its ParkGuard. Remove the
+    // completed edges while still holding the flights lock so a new flight for
+    // the same key cannot register an edge that this completion would mistake
+    // for one of its own.
+    parked()
+        .lock()
+        .expect("parked lock")
+        .edges
+        .retain(|edge| edge.target != arg_tree);
+    waiters
+}
+
+fn broadcast(waiters: Vec<mpsc::Sender<Outcome>>, outcome: &Outcome) {
     for tx in waiters {
         let _ = tx.send(outcome.clone());
     }
@@ -1963,6 +2068,87 @@ mod single_flight_tests {
     }
 
     #[test]
+    fn top_level_publication_happens_before_the_flight_is_released() {
+        let request = "7".repeat(40);
+        let ancestor = "4".repeat(40);
+        // Promise resolution may be the executor even though an external run
+        // joins later and is the participant that requires durable publication.
+        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+
+        // A caught worker failure is itself a valid tree result, but is not
+        // cached. A retry may therefore produce a later success. While the
+        // earlier result is being published, that retry must still be a waiter
+        // rather than a new owner that could publish first.
+        let caught_failure = format!("tree {}", "6".repeat(40));
+        let mut published = None;
+        let outcome = owner.finish_with(Ok(caught_failure.clone()), |result| {
+            let (late_rx, late_guard) = match join_flight(&request, &[]) {
+                Flight::Waiter(rx, guard) => (rx, guard),
+                _ => panic!("flight was released before result publication"),
+            };
+            drop(late_rx);
+            drop(late_guard);
+            published = Some(result.to_string());
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(caught_failure.clone()));
+        assert_eq!(published.as_deref(), Some(caught_failure.as_str()));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(caught_failure)
+        );
+        drop(guard);
+
+        // Only after publication completes may the retry become owner and
+        // replace that result with its successful outcome.
+        let successor = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("published flight did not admit a successor"),
+        };
+        let success = format!("tree {}", "5".repeat(40));
+        let outcome = successor.finish_with(Ok(success.clone()), |result| {
+            published = Some(result.to_string());
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(success.clone()));
+        assert_eq!(published.as_deref(), Some(success.as_str()));
+    }
+
+    #[test]
+    fn publication_failure_is_broadcast_before_a_retry_can_own() {
+        let request = "3".repeat(40);
+        let ancestor = "2".repeat(40);
+        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("external arrival did not wait"),
+        };
+
+        let outcome = owner.finish_with(Ok(format!("tree {}", "1".repeat(40))), |_| {
+            Err(HttpError::new(503, "pin failed"))
+        });
+        assert_eq!(outcome, Err((503, "pin failed".to_string())));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+
+        let replacement = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("publication failure did not release the flight"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
     fn a_stale_cache_miss_rereads_after_becoming_owner() {
         let request = "9".repeat(40);
         let first_owner = match join_flight(&request, &[]) {
@@ -1995,9 +2181,16 @@ mod single_flight_tests {
 
         assert!(reread_saw_new_owner);
         match disposition {
-            FlightDisposition::Complete { outcome, cache_hit } => {
+            FlightDisposition::Complete {
+                outcome,
+                cache_hit,
+                owner,
+            } => {
                 assert!(cache_hit);
                 assert_eq!(outcome, Ok(cached_result));
+                owner
+                    .expect("post-claim cache hit must retain its owner")
+                    .finish(&outcome);
             }
             FlightDisposition::Run(owner) => {
                 drop(owner);
