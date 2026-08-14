@@ -167,6 +167,14 @@ git ls-remote --refs caos "refs/caos/conversations/$conv/*" > conversation.refs
 [ "$(wc -l < conversation.refs)" -eq 1 ] || fail "conversation has side refs"
 grep -q "[[:space:]]$ref$" conversation.refs || fail "the sole ref is not canonical head"
 
+conversation_key="c-$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')"
+git ls-remote --refs caos \
+  "refs/caos/users/*/conversations/active/$conversation_key" > membership.refs
+[ "$(wc -l < membership.refs)" -eq 1 ] \
+  || fail "conversation does not have exactly one creator membership ref"
+grep -q "[[:space:]]refs/caos/users/[^/]*/conversations/active/$conversation_key$" membership.refs \
+  || fail "creator membership is not active"
+
 echo "== remote work survives loss of its submitting client ==" >&2
 "$CAOS_CLI" chat "$conv" -m "and now?" "${opts[@]}" >turn2.out 2>turn2.err &
 client_pid=$!

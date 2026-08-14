@@ -629,8 +629,6 @@ a stale copy of the crate being built.
   second run is a caos cache hit with nix never invoked.
 - Phase 2's exact mechanism (merged target dirs at the fixed path looks
   viable per the spike; metadata pipelining and raw rustc stay fallbacks).
-- Single-flight on request hash (map-then's open item) — required before the
-  per-crate DAG makes diamond recompiles common.
 - How stack config designates the relaxed-confinement class (per-image
   grant, like the network grant), and the `caosd up` host probe for
   unprivileged-userns policy.

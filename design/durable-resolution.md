@@ -4,9 +4,8 @@
 threads, in-process single-flight and cycle stacks) is correct and fine for a
 single-server prototype; this note is the intended evolution for durability
 and horizontal scaling. Decided in a design discussion (2026-07); not yet
-built. Pairs with the remaining durability and horizontal-scaling limitation
-in `map-then.md`; concurrent duplicate runs are already joined by the current
-single-server implementation.
+built. Pairs with the durability open item in `map-then.md`; concurrent
+duplicate runs are already joined by the current single-server implementation.
 
 ## Problem
 

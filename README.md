@@ -41,7 +41,7 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `worker-common` | — | Shared library for the Rust workers. |
 | `worker-runner` | — (`std/runner`'s `/worker`) | The in-image runner trampoline: receives a compiled worker binary as its `worker1` arg and execs it, so every compiled worker rides one shared image as `curry(std/runner, worker1=<binary>)`. |
 | `worker-rustc` | — (run as `curry(runner, worker1)`) | Builds a worker from Rust source. See [workers](#workers). |
-| `worker-bash-tool`, `worker-llm-call`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: bounded bash, stateless LLM calls, durable LLM turns, and recursive grep. See `design/agent-harness.md`. |
+| `worker-bash-tool`, `worker-llm-call`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: bounded bash, stateless LLM calls, durable LLM turns, and recursive grep. See `design/chat.md` for the current chat protocol and `design/agent-harness.md` for its historical rationale. |
 | `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (pinned toolchain + pre-compiled deps + this binary as `/worker`; its image is host-built and streamed like the runner, `caos-worker-cargo-docker` — see `std/cargo/` and `design/cargo-workers.md`) — the agent's `build`/`test` tools. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the LLM worker tests. |
 
@@ -199,25 +199,30 @@ match on the worker alongside the rest, and a worker, seeing its args at
 3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es
    through its promise sub-runs (below); re-entering one on the stack has no
    fixpoint, so the run fails listing the cycle;
-4. **resolve the image** — a `docker://<ref>` is used directly; one of our git
+4. **join an in-flight request** — the first cold miss for an `argTreeHash` is
+   the owner; concurrent arrivals wait for its exact outcome. An arrival runs
+   independently only when waiting would close a cross-thread dependency cycle,
+   allowing the ordinary stack check to report that cycle instead of deadlocking;
+5. **resolve the image** — a `docker://<ref>` is used directly; one of our git
    images is converted to a real image, pushed to the registry, and run by
    digest (see [git images](#git-images));
-5. **dispatch to a runner** — the job is matched against the hanging
+6. **dispatch to a runner** — the job is matched against the hanging
    `/runner/poll`s (a runner's required args are name → oid pairs the
    ArgTree's top level must equal; most specific match wins, so a warm runner
    already running this image beats the generic `caos-runnerd`, which starts a
    fresh container `/bin/caos runner --job=<json>`);
-6. the runner posts back either the result, `"<type> <hash>"`, or a
+7. the runner posts back either the result, `"<type> <hash>"`, or a
    **promise**, `"promise <hash>"`: a map-then continuation the worker recorded
    instead of a value (see
    [map-then](#map-then-sub-computations-without-blocking)). The worker has
    already moved on; the server **resolves** the promise — running `map` over
    the children in parallel, then `then` — through this same pipeline, so
    sub-runs are cached, cycle-checked, and may themselves promise;
-7. **cache** the resolved result, and for an **external** run (one that arrived
+8. **cache** the resolved result, and for an **external** run (one that arrived
    over HTTP) pin `refs/caos/res/<argTreeHash>` at it, for durability and as a
-   fetch/watch point. Result refs are hidden from broad Git advertisements but
-   remain available through exact `POST /ref/read` lookup. Sub-runs set no ref.
+   fetch/watch point. Result refs are hidden from upload-pack/fetch
+   advertisements, but receive-pack can negotiate them and exact
+   `POST /ref/read` lookup remains available. Sub-runs set no ref.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
@@ -300,8 +305,9 @@ logic — the difference is the **transport** and the privilege model.
     host path;
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
-  - `talk` / `chat` — agent conversations over the harness
-    (design/agent-harness.md); `caos talk "<prompt>"` is the everyday form;
+  - `talk` / `chat` — agent conversations over the current protocol
+    (`design/chat.md`; `design/agent-harness.md` records historical rationale);
+    `caos talk "<prompt>"` is the everyday form;
   - `secrets [--check]` — tend the git-ignored `.caos-secrets` store: fill a
     missing `entropy=`, warn on a weak one (`--check` reports only and exits
     non-zero, for CI). Offline — no server (design/secrets.md).
@@ -623,6 +629,7 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   needs a `musl` cross-toolchain to stay static — see the commented
   `buildInputs`/`nativeBuildInputs` in `flake.nix`.
 - **Cleanup (dev)**: transient `refs/caos/req/*` are pruned after ten minutes.
-  Durable `refs/caos/res/*` are hidden from broad advertisements but still
-  accumulate (content-addressed, so they dedup); a deployment that does not need
+  Durable `refs/caos/res/*` are hidden from upload-pack/fetch advertisements but
+  remain visible to receive-pack negotiation and exact `/ref/read`; they still
+  accumulate (content-addressed, so they dedup). A deployment that does not need
   indefinite result lookup should define a retention policy and run `git gc`.
