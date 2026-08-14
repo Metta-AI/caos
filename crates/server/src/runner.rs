@@ -210,7 +210,7 @@ fn matches(required: &ArgTree, arg_entries: &ArgTree) -> bool {
 /// A `docker://seeded…` job's `image` arg is the blob of the sentinel string
 /// itself, and the seed record `build-builtins.sh` publishes for that sentinel
 /// carries the same blob in its `required` — so a parked poll whose
-/// `required["image"]` equals the job's `image` IS this sentinel's seeder, and
+/// `required["base"]` equals the job's `base` IS this sentinel's seeder, and
 /// nobody else's. If that poll is parked and does not match the job, the two
 /// sides disagree about the rest of the key and no amount of waiting fixes it:
 /// the seeder answers one arg tree and the caller formed another.
@@ -446,7 +446,7 @@ pub(crate) fn dispatch(
                 };
                 match job.phase {
                     Phase::Pending { deadline, .. } if now >= deadline => {
-                        // ONLY for a seeded job. A `required["image"]` match is
+                        // ONLY for a seeded job. A `required["base"]` match is
                         // evidence of a seeder only when the image is a
                         // sentinel; on an ordinary job it is just a warm runner
                         // holding the same image, and calling that "the seeder"
