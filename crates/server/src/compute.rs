@@ -731,17 +731,17 @@ fn run_image(
     let (image, bound) = unwrap_curry(config, image_ref)?;
     let store_err = |e: String| HttpError::new(500, format!("building sub-request: {e}"));
 
-    // The worker image rides *in* the ArgTree under the reserved `image` entry
+    // The worker image rides *in* the ArgTree under the reserved `base` entry
     // (embedded as the image's own tree for a git image, a ref blob for
     // `docker://`) — the same shape the client builds, merged last so the
     // reserved name wins over any like-named user arg.
     let image_entry = if image.len() == 40 && image.bytes().all(|b| b.is_ascii_hexdigit()) {
         let oid = gix::ObjectId::from_hex(image.as_bytes())
             .map_err(|e| HttpError::new(500, format!("invalid image hash: {e}")))?;
-        named_entry("image", EntryKind::Tree.into(), oid)
+        named_entry("base", EntryKind::Tree.into(), oid)
     } else {
         named_entry(
-            "image",
+            "base",
             EntryKind::Blob.into(),
             store_git_blob(config, image.as_bytes()).map_err(store_err)?,
         )
