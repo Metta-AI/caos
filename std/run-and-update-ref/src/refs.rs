@@ -188,12 +188,19 @@ fn task_status(
             Ok(event) if event.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) => event,
             _ => return Ok(None),
         };
+        let parent = required_event_parent(commit.parent.as_deref(), &hash)?;
         if let Some(status) = event_task_status(&event, task) {
             return Ok(Some(status));
         }
-        current = commit.parent;
+        current = Some(parent);
     }
     Ok(None)
+}
+
+fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
+    parent
+        .map(str::to_string)
+        .ok_or_else(|| format!("conversation event {event} has no first parent"))
 }
 
 /// Read one event defensively. Conversation history is append-only, so a
@@ -389,6 +396,14 @@ mod tests {
         assert!(validate_hash(&"A".repeat(40), "test hash")
             .unwrap_err()
             .contains("lowercase"));
+    }
+
+    #[test]
+    fn recognized_root_event_is_rejected() {
+        let event = "a".repeat(40);
+        assert!(required_event_parent(None, &event)
+            .unwrap_err()
+            .contains("no first parent"));
     }
 
     #[test]
