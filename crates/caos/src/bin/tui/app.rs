@@ -2602,18 +2602,18 @@ impl App {
                     Ok(()) => {
                         if let Some(fallback) = state.automatic_title_fallback.clone() {
                             state.remote_title.get_or_insert_with(|| fallback.clone());
-                            if !state.automatic_title && state.title != fallback {
-                                if compare_and_set_conversation_title(
+                            if !state.automatic_title
+                                && state.title != fallback
+                                && compare_and_set_conversation_title(
                                     &transport,
                                     &state.id,
                                     &fallback,
                                     &state.title,
                                 )
                                 .unwrap_or(false)
-                                {
-                                    state.remote_title = Some(state.title.clone());
-                                    state.automatic_title_fallback = None;
-                                }
+                            {
+                                state.remote_title = Some(state.title.clone());
+                                state.automatic_title_fallback = None;
                             }
                         }
                         let _ = state.reload(&transport, &user);

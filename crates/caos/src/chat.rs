@@ -1323,10 +1323,12 @@ pub fn fork_conversation(
     let fork = push_new_conversation(
         t,
         id,
-        &refname,
-        &title_ref,
-        &active_ref,
-        &archived_ref,
+        NewConversationRefs {
+            head: &refname,
+            title: &title_ref,
+            active: &active_ref,
+            archived: &archived_ref,
+        },
         &candidate,
         &title_hash,
     )?;
@@ -2217,29 +2219,23 @@ fn push_head_cas_git(
     Err(pushed.expect_err("checked error above"))
 }
 
+struct NewConversationRefs<'a> {
+    head: &'a str,
+    title: &'a str,
+    active: &'a str,
+    archived: &'a str,
+}
+
 /// Publish a new canonical head, title, and active membership as one create-only
 /// transaction while proving archived membership absent.
 fn push_new_conversation(
     t: &GitTransport,
     id: &str,
-    head_ref: &str,
-    title_ref: &str,
-    active_ref: &str,
-    archived_ref: &str,
+    refs: NewConversationRefs<'_>,
     head: &str,
     title_hash: &str,
 ) -> Result<String, String> {
-    if let Some(published) = try_push_new_conversation(
-        t,
-        id,
-        head_ref,
-        title_ref,
-        active_ref,
-        archived_ref,
-        head,
-        title_hash,
-        true,
-    )? {
+    if let Some(published) = try_push_new_conversation(t, id, refs, head, title_hash, true)? {
         Ok(published)
     } else {
         Err(format!("conversation {id:?} was created concurrently"))
@@ -2261,10 +2257,12 @@ fn try_push_initial_conversation(
     try_push_new_conversation(
         t,
         id,
-        head_ref,
-        &title_ref,
-        &active_ref,
-        &archived_ref,
+        NewConversationRefs {
+            head: head_ref,
+            title: &title_ref,
+            active: &active_ref,
+            archived: &archived_ref,
+        },
         head,
         &title_hash,
         false,
@@ -2275,14 +2273,17 @@ fn try_push_initial_conversation(
 fn try_push_new_conversation(
     t: &GitTransport,
     id: &str,
-    head_ref: &str,
-    title_ref: &str,
-    active_ref: &str,
-    archived_ref: &str,
+    refs: NewConversationRefs<'_>,
     head: &str,
     title_hash: &str,
     recover_existing: bool,
 ) -> Result<Option<String>, String> {
+    let NewConversationRefs {
+        head: head_ref,
+        title: title_ref,
+        active: active_ref,
+        archived: archived_ref,
+    } = refs;
     validate_hash(head, "new conversation head")?;
     validate_hash(title_hash, "new conversation title")?;
     let leases = [head_ref, title_ref, active_ref, archived_ref]
@@ -4483,10 +4484,12 @@ mod tests {
         let recovered = push_new_conversation(
             &transport,
             id,
-            &head_ref,
-            &title_ref,
-            &active_ref,
-            &archived_ref,
+            NewConversationRefs {
+                head: &head_ref,
+                title: &title_ref,
+                active: &active_ref,
+                archived: &archived_ref,
+            },
             &candidate,
             &title_hash,
         )
