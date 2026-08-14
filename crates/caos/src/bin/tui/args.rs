@@ -61,7 +61,7 @@ impl Args {
         }
         parsed.user = match user_flag {
             Some(user) => normalized_username(&user).ok_or_else(|| {
-                "--username must be nonempty and contain no control or invisible formatting characters"
+                "--username must be 1-126 UTF-8 bytes and contain no control or invisible formatting characters"
                     .to_string()
             })?,
             None => {

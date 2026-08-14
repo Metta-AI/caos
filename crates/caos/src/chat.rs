@@ -827,11 +827,8 @@ pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<Stri
                 .into()
         });
     }
-    if let Some(user) = std::env::var_os("USER") {
-        let user = user.to_string_lossy();
-        if let Some(user) = normalized_username(&user) {
-            return Ok(user);
-        }
+    if let Some(user) = ambient_username(std::env::var("USER"))? {
+        return Ok(user);
     }
     if let Ok(configured) = t.git_capture(&["config", "--get", "user.name"], None) {
         if let Some(configured) = normalized_username(&configured) {
@@ -841,9 +838,21 @@ pub fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<Stri
     Ok("user".to_string())
 }
 
-const MAX_USERNAME_BYTES: usize = 126;
+fn ambient_username(value: Result<String, std::env::VarError>) -> Result<Option<String>, String> {
+    match value {
+        Ok(user) => normalized_username(&user).map(Some).ok_or_else(|| {
+            "$USER is not a usable identity; pass --username explicitly".to_string()
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("$USER is not valid UTF-8; pass --username explicitly".to_string())
+        }
+    }
+}
 
 /// Canonicalize a presentation identity shared by line and full-screen clients.
+const MAX_USERNAME_BYTES: usize = 126;
+
 pub fn normalized_username(username: &str) -> Option<String> {
     let username = username.trim();
     (!username.is_empty()
@@ -3586,6 +3595,19 @@ mod tests {
         assert!(normalized_username("Ali\u{200b}ce").is_none());
         assert!(normalized_username("Ali\u{200d}ce").is_none());
         assert!(normalized_username("Alice\u{fe0f}").is_none());
+        assert!(normalized_username(&"a".repeat(MAX_USERNAME_BYTES)).is_some());
+        assert!(normalized_username(&"a".repeat(MAX_USERNAME_BYTES + 1)).is_none());
+        assert_eq!(
+            ambient_username(Ok("  Alice Smith  ".to_string())).unwrap(),
+            Some("Alice Smith".to_string())
+        );
+        assert!(ambient_username(Ok("  ".to_string()))
+            .unwrap_err()
+            .contains("$USER"));
+        assert_eq!(
+            ambient_username(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
         assert_eq!(
             user_key("  Alice Smith  ").as_deref(),
             Ok("u-416c69636520536d697468")
