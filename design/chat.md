@@ -130,10 +130,12 @@ newer conversation or draft state.
 
 ### Tool calls
 
-Before running tools, `llm-step` commits the model's complete response,
-including ordered `{id, name, args}` calls. Inline tools run directly; compute
-tools suspend `llm-step` through ordinary serial `run-then`. `llm-step` commits
-each result before the next model call. Recovery repeats the same CAOS request.
+Before recording or running tools, `llm-step` validates that every tool-use ID
+is a string and is unique within that model response. It then commits the
+complete response, including ordered `{id, name, args}` calls. Inline tools run
+directly; compute tools suspend `llm-step` through ordinary serial `run-then`.
+`llm-step` commits each result before the next model call. Recovery repeats the
+same CAOS request.
 
 ### Independent work
 
@@ -586,7 +588,8 @@ into a reported failure.
 
 An ordinary tool call suspends the conversation:
 
-1. `llm-step` appends the model step containing `{id, name, args}`.
+1. `llm-step` validates string, per-response-unique call IDs, then appends the
+   model step containing `{id, name, args}`.
 2. Inline tools run in `llm-step`. For a compute tool, `llm-step` yields a
    `run-then`: `run` is the tool worker and `then` is the `llm-step`
    continuation.
