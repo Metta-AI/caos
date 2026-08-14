@@ -2152,18 +2152,30 @@ fn build_arg_entries(
                 EntryKind::Commit.into(),
                 resolve_commit_arg(t, cas, value).map_err(|e| format!("`{name}`: {e}"))?,
             ),
-            // `--name:tree=hash` — a tree the server already holds (an earlier
-            // result), referenced by hash. Verified server-side to be a tree so
-            // a typo fails here, not as a bad materialization in the worker.
-            ArgType::Tree => {
+            // `--name:hash=oid` — an object the server already holds (an earlier
+            // result), referenced by oid: a tree or a blob. Verified server-side
+            // so a typo fails here, not as a bad materialization in the worker.
+            ArgType::Hash => {
                 let (kind, _) = t
                     .get_object(value)
-                    .map_err(|e| format!("`{name}`: tree {value}: {e}"))?;
-                if kind != "tree" {
-                    return Err(format!("`{name}`: {value} is a {kind}, not a tree"));
-                }
-                (EntryKind::Tree.into(), parse_oid(value)?)
+                    .map_err(|e| format!("`{name}`: object {value}: {e}"))?;
+                let mode = match kind.as_str() {
+                    "tree" => EntryKind::Tree,
+                    "blob" => EntryKind::Blob,
+                    other => {
+                        return Err(format!(
+                            "`{name}`: {value} is a {other}; :hash= names a tree or blob"
+                        ))
+                    }
+                };
+                (mode.into(), parse_oid(value)?)
             }
+            // `--name:docker=ref` — a docker image ref, stored as the blob
+            // `docker://<ref>` (the representation the server expects).
+            ArgType::Docker => (
+                EntryKind::Blob.into(),
+                post_object(t, "blob", format!("{DOCKER_SCHEME}{value}").as_bytes())?,
+            ),
         };
 
         entries.push(Entry {
