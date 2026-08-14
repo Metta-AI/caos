@@ -3639,7 +3639,10 @@ mod tests {
                 let transport = GitTransport::discover(alice).unwrap();
                 submit_message(
                     &transport,
-                    &TurnOptions::default(),
+                    &TurnOptions {
+                        username: Some("Alice".to_string()),
+                        ..TurnOptions::default()
+                    },
                     "shared",
                     "  from Alice\n",
                 )
@@ -3650,7 +3653,16 @@ mod tests {
             let bob = bob.clone();
             move || {
                 let transport = GitTransport::discover(bob).unwrap();
-                submit_message(&transport, &TurnOptions::default(), "shared", "from Bob").unwrap()
+                submit_message(
+                    &transport,
+                    &TurnOptions {
+                        username: Some("Bob".to_string()),
+                        ..TurnOptions::default()
+                    },
+                    "shared",
+                    "from Bob",
+                )
+                .unwrap()
             }
         });
         let alice_result = alice_thread.join().unwrap();
