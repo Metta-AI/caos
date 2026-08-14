@@ -2777,7 +2777,7 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map_err(|error| format!("reading the clock: {error}"))?
         .as_nanos();
     let descriptor = format!(
-        "caos conversation v2\ncreator {user}\ncreated {created}\nprocess {}\n",
+        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
         std::process::id()
     );
     t.put_object("blob", descriptor.as_bytes())
@@ -4762,12 +4762,13 @@ mod tests {
                 "-p",
                 &base,
                 "-m",
-                r#"{"v":2,"author":"user","username":"Alice","content":"hello from Alice"}"#,
+                r#"{"kind": "caos-chat-event","author":"user","username":"Alice","content":"hello from Alice"}"#,
             ],
         );
         let request = "b".repeat(40);
-        let admission_message =
-            format!(r#"{{"v":2,"status":"queued","request":"{request}","request_head":"{user}"}}"#);
+        let admission_message = format!(
+            r#"{{"kind": "caos-chat-event","status":"queued","request":"{request}","request_head":"{user}"}}"#
+        );
         let admitted = git_output(
             &repo,
             &["commit-tree", &tree, "-p", &user, "-m", &admission_message],
@@ -4778,7 +4779,7 @@ mod tests {
                 "push",
                 "-q",
                 "caos",
-                &format!("{admitted}:refs/caos/v2/conversations/shared/head"),
+                &format!("{admitted}:refs/caos/conversations/shared/head"),
             ],
         );
 
@@ -4850,7 +4851,7 @@ mod tests {
     fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/v2/conversations/talk-1/from-user:caos-tools".to_string(),
+            source: "refs/caos/conversations/talk-1/from-user:caos-tools".to_string(),
             tools: vec![caos::chat::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),

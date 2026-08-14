@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::{Config, HttpError};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
-const HOOK_MARKER: &str = "# managed by caos-server: append-only v2 conversation heads";
+const HOOK_MARKER: &str = "# managed by caos-server: append-only conversation heads";
 
 /// Defense in depth for callers that still use ordinary receive-pack. The HTTP
 /// append endpoint performs the same append check, but a ref invariant is not
@@ -23,7 +23,7 @@ const HOOK_MARKER: &str = "# managed by caos-server: append-only v2 conversation
 /// advertised for object negotiation, so the hook also protects that
 /// server-owned namespace from client updates.
 const PRE_RECEIVE_HOOK_BODY: &str = r#"set -euo pipefail
-# managed by caos-server: append-only v2 conversation heads
+# managed by caos-server: append-only conversation heads
 zero=0000000000000000000000000000000000000000
 while IFS=' ' read -r old new refname; do
   case "$refname" in
@@ -31,7 +31,7 @@ while IFS=' ' read -r old new refname; do
       echo "caos: refusing client update to server-owned ref $refname" >&2
       exit 1
       ;;
-    refs/caos/v2/conversations/*/head) ;;
+    refs/caos/conversations/*/head) ;;
     *) continue ;;
   esac
 
@@ -520,7 +520,7 @@ mod tests {
         );
         let broken = write_object(&dir, "commit", &body);
         let request = serde_json::json!({
-            "ref": "refs/caos/v2/conversations/broken/head",
+            "ref": "refs/caos/conversations/broken/head",
             "expected": null,
             "new": broken,
         })
@@ -535,7 +535,7 @@ mod tests {
     fn append_endpoint_is_atomic_batched_and_idempotent() {
         let (dir, a, b, c, d) = repo();
         let config = config(&dir);
-        let refname = "refs/caos/v2/conversations/test/head";
+        let refname = "refs/caos/conversations/test/head";
         let request = |expected: Option<&str>, new: &str| {
             serde_json::json!({"ref": refname, "expected": expected, "new": new}).to_string()
         };
@@ -584,7 +584,7 @@ mod tests {
         let (dir, a, b, c, _d) = repo();
         install_hook(&dir).unwrap();
         install_hook(&dir).unwrap();
-        let refname = "refs/caos/v2/conversations/test/head";
+        let refname = "refs/caos/conversations/test/head";
         let push = |source: &str, force: bool| {
             let mut command = Command::new("git");
             command.args(["-C", &dir, "push", "--quiet"]);

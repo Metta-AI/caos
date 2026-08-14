@@ -16,7 +16,8 @@
 //! So we sweep at startup, in the same spirit as the repo config `main` reasserts
 //! on every boot: expected damage, fixed each time we start. Before removing a
 //! broken ref, we restore its newest readable reflog value when one exists.
-//! This rule is deliberately generic: the server does not interpret ref names.
+//! Mutable workspace refs validate the commit's tree closure; immutable
+//! request/result refs validate only their named object.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -77,16 +78,17 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
     let mut paths = Vec::new();
     collect_files(&Path::new(git_dir).join("refs"), &mut paths);
     let mut removed = 0;
-    // Conversation, user-index, and result refs commonly share most of their
-    // workspace closure. Validate each reachable object once per startup, not
-    // once per ref; failed subtrees are deliberately not memoized.
+    // Conversation and user-index refs commonly share most of their workspace
+    // closure. Validate each reachable object once per startup, not once per
+    // ref; failed subtrees are deliberately not memoized.
     let mut memo = IntegrityMemo::default();
     for path in paths {
         let name = ref_name(git_dir, &path);
-        let Some(reason) = breakage(repo, &path, &mut memo) else {
+        let depth = integrity_depth(&name);
+        let Some(reason) = breakage(repo, &path, depth, &mut memo) else {
             continue;
         };
-        if recover_ref(repo, git_dir, &name, &path, &mut memo) {
+        if recover_ref(repo, git_dir, &name, &path, depth, &mut memo) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -106,6 +108,7 @@ fn recover_ref(
     git_dir: &str,
     name: &str,
     path: &Path,
+    depth: IntegrityDepth,
     memo: &mut IntegrityMemo,
 ) -> bool {
     let log = Path::new(git_dir).join("logs").join(name);
@@ -121,7 +124,7 @@ fn recover_ref(
             let Ok(id) = gix::ObjectId::from_hex(candidate.as_bytes()) else {
                 continue;
             };
-            if intact_ref_target(repo, id, memo).is_err() {
+            if intact_ref_target(repo, id, depth, memo).is_err() {
                 continue;
             }
             match replace_ref_file(path, candidate) {
@@ -145,34 +148,51 @@ enum ClosureKind {
     Blob,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum IntegrityDepth {
+    TargetOnly,
+    WorkspaceClosure,
+}
+
+fn integrity_depth(refname: &str) -> IntegrityDepth {
+    if refname.starts_with("refs/caos/req/") || refname.starts_with("refs/caos/res/") {
+        IntegrityDepth::TargetOnly
+    } else {
+        IntegrityDepth::WorkspaceClosure
+    }
+}
+
 #[derive(Default)]
 struct IntegrityMemo {
-    targets: HashSet<gix::ObjectId>,
+    targets: HashSet<(gix::ObjectId, IntegrityDepth)>,
     closure: HashSet<(gix::ObjectId, ClosureKind)>,
 }
 
-/// Validate a ref target. Commit targets include their workspace tree, but not
-/// their parents: this lets recovery roll back past one damaged append without
-/// making the server understand what the ref represents.
+/// Validate a ref target. Durable conversation/index refs include a commit's
+/// workspace tree, but not its parents: this lets recovery roll back past one
+/// damaged append. Content-addressed request/result refs only need their named
+/// object to be readable; traversing every request workspace would turn startup
+/// repair into a scan of unrelated immutable history.
 fn intact_ref_target(
     repo: &gix::Repository,
     id: gix::ObjectId,
+    depth: IntegrityDepth,
     memo: &mut IntegrityMemo,
 ) -> Result<(), String> {
-    if memo.targets.contains(&id) {
+    if memo.targets.contains(&(id, depth)) {
         return Ok(());
     }
     let object = repo
         .find_object(id)
         .map_err(|error| format!("object {id} is unreadable: {error}"))?;
-    if object.kind != gix::object::Kind::Commit {
-        memo.targets.insert(id);
+    if depth == IntegrityDepth::TargetOnly || object.kind != gix::object::Kind::Commit {
+        memo.targets.insert((id, depth));
         return Ok(());
     }
     let commit = gix::objs::CommitRef::from_bytes(&object.data, gix::hash::Kind::Sha1)
         .map_err(|error| format!("commit {id} is malformed: {error}"))?;
     intact_tree(repo, commit.tree(), &mut memo.closure)?;
-    memo.targets.insert(id);
+    memo.targets.insert((id, depth));
     Ok(())
 }
 
@@ -284,7 +304,12 @@ fn replace_ref_file(path: &Path, hash: &str) -> std::io::Result<()> {
 /// Why `path` is not a usable ref, or `None` if it is fine (or if we could not
 /// read it — an unreadable ref file is not evidence of a lost object, so it
 /// keeps the benefit of the doubt).
-fn breakage(repo: &gix::Repository, path: &Path, memo: &mut IntegrityMemo) -> Option<String> {
+fn breakage(
+    repo: &gix::Repository,
+    path: &Path,
+    depth: IntegrityDepth,
+    memo: &mut IntegrityMemo,
+) -> Option<String> {
     let content = match std::fs::read(path) {
         Ok(content) => content,
         Err(err) => {
@@ -305,7 +330,7 @@ fn breakage(repo: &gix::Repository, path: &Path, memo: &mut IntegrityMemo) -> Op
     let Ok(id) = gix::ObjectId::from_hex(text.as_bytes()) else {
         return Some(format!("unparsable content {text:?}"));
     };
-    intact_ref_target(repo, id, memo).err()
+    intact_ref_target(repo, id, depth, memo).err()
 }
 
 /// Every regular file under `dir`, recursively.
@@ -485,13 +510,42 @@ mod tests {
         let second = gix::ObjectId::from_hex(second.as_bytes()).unwrap();
         let mut memo = IntegrityMemo::default();
 
-        intact_ref_target(&repo, first, &mut memo).unwrap();
+        intact_ref_target(&repo, first, IntegrityDepth::WorkspaceClosure, &mut memo).unwrap();
         let closure_objects = memo.closure.len();
         assert!(closure_objects > 0);
-        intact_ref_target(&repo, second, &mut memo).unwrap();
+        intact_ref_target(&repo, second, IntegrityDepth::WorkspaceClosure, &mut memo).unwrap();
 
         assert_eq!(memo.targets.len(), 2);
         assert_eq!(memo.closure.len(), closure_objects);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn request_and_result_refs_do_not_scan_workspace_closures() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let blob = git_stdin(&dir, &["hash-object", "-w", "--stdin"], b"lost");
+        let tree = git_stdin(
+            &dir,
+            &["mktree"],
+            format!("100644 blob {blob}\tfile\n").as_bytes(),
+        );
+        let damaged = git_stdin(&dir, &["commit-tree", &tree, "-m", "request"], b"");
+        let request = plant_ref(&dir, "refs/caos/req/request", &format!("{damaged}\n"));
+        let result = plant_ref(&dir, "refs/caos/res/result", &format!("{damaged}\n"));
+        let conversation = plant_ref(
+            &dir,
+            "refs/caos/conversations/chat/head",
+            &format!("{damaged}\n"),
+        );
+        let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
+        std::fs::remove_file(blob_path).unwrap();
+
+        assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
+        assert!(request.exists());
+        assert!(result.exists());
+        assert!(!conversation.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -69,7 +69,7 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry llm-step and run the turn ==" >&2
 conv="max-tokens-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-conversation_ref="refs/caos/v2/conversations/$conv/head"
+conversation_ref="refs/caos/conversations/$conv/head"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
@@ -81,12 +81,15 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --conversation="$conv")
 
 human1=$(mkcommit "HEAD:ws" \
-  '{"author":"user","content":"write me a long answer","status":"queued","v":2}' \
+  '{"author":"user","content":"write me a long answer","kind":"caos-chat-event"}' \
   "$base")
 request=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$human1")
 [ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
   || fail "prepared request is not exact Q: $request"
-git push --quiet caos "$human1:$conversation_ref" || fail "publishing queued event"
+admitted=$(mkcommit "HEAD:ws" \
+  "{\"kind\":\"caos-chat-event\",\"request\":\"$request\",\"request_head\":\"$human1\",\"status\":\"queued\"}" \
+  "$human1")
+git push --quiet caos "$admitted:$conversation_ref" || fail "publishing request admission"
 "$CAOS_CLI" run "$request" -- > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"

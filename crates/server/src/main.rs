@@ -224,7 +224,7 @@ fn main() {
     // Keep previous values as a generic recovery path if a ref tip is damaged
     // despite the fsync policy above. `always` includes refs outside
     // refs/heads. Automatic GC is disabled above, so these logs do not expire
-    // by themselves; design/chat-v2.md records bounded retention/pruning as
+    // by themselves; design/chat.md records bounded retention/pruning as
     // follow-up work. Until that policy exists, retain recovery history rather
     // than inventing an expiry window that can silently remove the only sound
     // value for a damaged ref.
@@ -694,7 +694,7 @@ mod tests {
         for refname in [
             "refs/caos/req/request",
             "refs/caos/res/result",
-            "refs/caos/v2/users/u-1/conversations/active/test",
+            "refs/caos/users/u-1/conversations/active/test",
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
@@ -726,7 +726,7 @@ mod tests {
         ]);
         assert!(!upload.contains("refs/caos/req/"));
         assert!(!upload.contains("refs/caos/res/"));
-        assert!(upload.contains("refs/caos/v2/users/"));
+        assert!(upload.contains("refs/caos/users/"));
 
         let receive = git(&[
             "receive-pack",
@@ -736,7 +736,7 @@ mod tests {
         ]);
         assert!(receive.contains("refs/caos/req/"));
         assert!(receive.contains("refs/caos/res/"));
-        assert!(receive.contains("refs/caos/v2/users/"));
+        assert!(receive.contains("refs/caos/users/"));
 
         let config = super::Config {
             registry_push_url: String::new(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end v2 conversation test with a scripted LLM. The worker owns the
+# End-to-end conversation test with a scripted LLM. The worker owns the
 # canonical head after dispatch; its result object is deliberately ignored.
 set -euo pipefail
 
@@ -33,8 +33,8 @@ assert_event_spine() { # <head> <stop>
   local current=$1 stop=$2 count=0 message
   while [ "$current" != "$stop" ]; do
     message=$(git show -s --format=%B "$current")
-    grep -Eq '"v"[[:space:]]*:[[:space:]]*2' <<<"$message" \
-      || fail "non-v2 commit on event spine: $current"
+    grep -Eq '"kind"[[:space:]]*:[[:space:]]*"caos-chat-event"' <<<"$message" \
+      || fail "non-chat commit on event spine: $current"
     current=$(git rev-parse "$current^")
     count=$((count + 1))
   done
@@ -101,21 +101,24 @@ done
 
 echo "== dispatch first turn ==" >&2
 conv="llm-step-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-conversation_ref="refs/caos/v2/conversations/$conv/head"
+conversation_ref="refs/caos/conversations/$conv/head"
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --api-key=test-key --system:@=system.txt \
   --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")
 
 user1=$(mkcommit "HEAD:ws" \
-  '{"author":"user","content":"create out.txt containing hi, then confirm","status":"queued","v":2}' \
+  '{"author":"user","content":"create out.txt containing hi, then confirm","kind":"caos-chat-event"}' \
   "$base")
 request1=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user1")
 [ "${#request1}" -eq 40 ] && [[ "$request1" =~ ^[0-9a-f]+$ ]] \
   || fail "first prepared request is not exact Q: $request1"
-early_interjection=$(mkcommit "HEAD:ws" \
-  "{\"author\":\"user\",\"content\":\"$EARLY_INTERJECTION_TEXT\",\"username\":\"racer\",\"v\":2}" \
+admitted1=$(mkcommit "HEAD:ws" \
+  "{\"kind\":\"caos-chat-event\",\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
   "$user1")
+early_interjection=$(mkcommit "HEAD:ws" \
+  "{\"kind\":\"caos-chat-event\",\"author\":\"user\",\"content\":\"$EARLY_INTERJECTION_TEXT\",\"username\":\"racer\"}" \
+  "$admitted1")
 git push --quiet caos "$early_interjection:$conversation_ref" \
   || fail "publishing queued event and pre-start interjection"
 "$CAOS_CLI" run "$request1" -- >/tmp/llm-step-result || fail "running first turn"
@@ -164,11 +167,14 @@ grep -qF 'exit: 3' stub/request-3.json || fail "failed command result missing"
 
 tree1=$(git rev-parse "$head1^{tree}")
 user2=$(mkcommit "$tree1" \
-  '{"author":"user","content":"and now?","status":"queued","v":2}' "$head1")
+  '{"author":"user","content":"and now?","kind":"caos-chat-event"}' "$head1")
 request2=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user2")
 [ "${#request2}" -eq 40 ] && [[ "$request2" =~ ^[0-9a-f]+$ ]] \
   || fail "second prepared request is not exact Q: $request2"
-git push --quiet caos "$user2:$conversation_ref" || fail "publishing second queued event"
+admitted2=$(mkcommit "$tree1" \
+  "{\"kind\":\"caos-chat-event\",\"request\":\"$request2\",\"request_head\":\"$user2\",\"status\":\"queued\"}" \
+  "$user2")
+git push --quiet caos "$admitted2:$conversation_ref" || fail "publishing second request admission"
 "$CAOS_CLI" run "$request2" -- >/tmp/llm-step-result-2 2>/tmp/llm-step-error-2 &
 run2_pid=$!
 
@@ -187,15 +193,15 @@ done
 
 observed=$(fetch_head)
 running2=$observed
-[ "$(git rev-parse "$running2^1")" = "$user2" ] \
-  || fail "worker running event is not immediately after the queued event"
+[ "$(git rev-parse "$running2^1")" = "$admitted2" ] \
+  || fail "worker running event is not immediately after the admission event"
 running2_event=$(git show -s --format=%B "$running2")
 grep -qF "\"request\":\"$request2\"" <<<"$running2_event" \
   || fail "worker did not record the second running request"
 grep -qF '"status":"running"' <<<"$running2_event" \
   || fail "worker request event is not running"
 interjection=$(mkcommit "$tree1" \
-  "{\"author\":\"user\",\"content\":\"$INTERJECTION_TEXT\",\"username\":\"racer\",\"v\":2}" \
+  "{\"kind\":\"caos-chat-event\",\"author\":\"user\",\"content\":\"$INTERJECTION_TEXT\",\"username\":\"racer\"}" \
   "$observed")
 git push --quiet --force-with-lease="$conversation_ref:$observed" \
   caos "$interjection:$conversation_ref" || fail "publishing terminal-race interjection"

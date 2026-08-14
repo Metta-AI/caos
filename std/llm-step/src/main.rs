@@ -156,7 +156,7 @@ fn ensure_request_running(
         match request_start_disposition(&log, run, head)? {
             RequestStart::Running => return Ok(log),
             RequestStart::Claim { expected, tree } => {
-                let event = json!({"v": 2, "request": run, "status": "running"});
+                let event = json!({"kind": "caos-chat-event", "request": run, "status": "running"});
                 match progress::append_event_at_head(conversation, &expected, &event, &tree)? {
                     progress::ConditionalAppend::Appended(_) => {
                         return progress::conversation_log(conversation)
@@ -553,7 +553,7 @@ fn llm_round(
             let tree = cas_hash(ws)?;
             let conversation = conversation(cfg)?;
             let event = json!({
-                "v": 2,
+                "kind": "caos-chat-event",
                 "request": run,
                 "round": round,
                 "author": "assistant",
@@ -585,7 +585,7 @@ fn llm_round(
                 })
                 .collect();
             let event = json!({
-                "v": 2,
+                "kind": "caos-chat-event",
                 "request": run,
                 "round": round,
                 "author": "assistant",
@@ -926,7 +926,7 @@ fn self_curry(
 fn conversation(cfg: &Config) -> Result<&str, String> {
     cfg.conversation
         .as_deref()
-        .ok_or_else(|| "llm-step requires --conversation in chat v2".to_string())
+        .ok_or_else(|| "llm-step requires --conversation".to_string())
 }
 
 fn active_request(log: &progress::ConversationLog) -> Result<String, String> {
@@ -969,35 +969,33 @@ fn request_start_disposition(
         .ok_or_else(|| format!("request head {head} is not on the conversation event spine"))?;
 
     let recorded = request_after_head(log, position)?;
-    if let Some(recorded) = recorded.as_deref() {
-        if recorded != run {
-            return Err(format!(
-                "request head {head} already belongs to request {recorded}, not {run}"
-            ));
-        }
+    let recorded = recorded.ok_or_else(|| format!("request head {head} has no admission event"))?;
+    if recorded != run {
+        return Err(format!(
+            "request head {head} already belongs to request {recorded}, not {run}"
+        ));
+    }
+    // A completed request is idempotent even if a later request is now queued.
+    // The caller rereads this exact terminal result instead of letting the old
+    // worker reclaim against the newer conversation status.
+    if terminal_for_run(log, run)?.is_some() {
+        return Ok(RequestStart::Running);
     }
 
-    // Original v2 logs put `queued` on the anchor itself. Atomic admission
-    // instead puts it on the following request event, because that event can
-    // name both the already-known anchor and the request without a hash cycle.
-    let legacy_queued_anchor = log.events[position]
-        .value
-        .get("status")
-        .and_then(Value::as_str)
-        == Some("queued");
-    if recorded.is_none() && !legacy_queued_anchor {
-        return Err(format!("request head {head} is not a queued event"));
+    let active = active_request(log)?;
+    if active != run {
+        return Err(format!(
+            "request {run} is stale; the conversation's active request is {active}"
+        ));
     }
     let latest_status = log.events[position..]
         .iter()
+        .filter(|event| event.value.get("request").and_then(Value::as_str) == Some(run))
         .filter_map(|event| event.value.get("status"))
         .last()
         .and_then(Value::as_str);
     match latest_status {
         Some("running") => return Ok(RequestStart::Running),
-        // A terminal event for this exact request is also idempotent. `start`
-        // rereads it immediately after this check and returns its result.
-        Some("idle" | "failed") if recorded.is_some() => return Ok(RequestStart::Running),
         Some("queued") => {}
         other => {
             return Err(format!(
@@ -1021,9 +1019,13 @@ fn request_after_head(
     log: &progress::ConversationLog,
     position: usize,
 ) -> Result<Option<String>, String> {
-    let request_event = log.events[position + 1..]
-        .iter()
-        .find(|event| event.value.get("request").and_then(Value::as_str).is_some());
+    let request_event = log.events.get(position + 1).filter(|event| {
+        event
+            .value
+            .get("request")
+            .and_then(Value::as_str)
+            .is_some()
+    });
     let request = request_event
         .and_then(|event| event.value.get("request"))
         .and_then(Value::as_str)
@@ -1031,10 +1033,12 @@ fn request_after_head(
     if let Some(request) = &request {
         validate_run_hash(request)?;
     }
-    if let Some(recorded_head) = request_event
-        .and_then(|event| event.value.get("request_head"))
-        .and_then(Value::as_str)
-    {
+    if let Some(request_event) = request_event {
+        let recorded_head = request_event
+            .value
+            .get("request_head")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("request event after {} has no request_head", log.events[position].commit))?;
         validate_run_hash(recorded_head)?;
         let expected = &log.events[position].commit;
         if recorded_head != expected {
@@ -1474,7 +1478,7 @@ fn append_tool_result(
                     "content": [{"type": "text", "text": error}],
                 });
                 let event = json!({
-                    "v": 2,
+                    "kind": "caos-chat-event",
                     "request": run,
                     "round": round,
                     "status": "failed",
@@ -1507,7 +1511,7 @@ fn append_tool_result(
                 }
             }
         };
-        let event = json!({"v": 2, "request": run, "round": round, "result": result});
+        let event = json!({"kind": "caos-chat-event", "request": run, "round": round, "result": result});
         match progress::append_event_at_head_with_parent(
             conversation(cfg)?,
             &current.head,
@@ -1565,7 +1569,7 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
             .ok_or("conversation has no events")?;
         let round = latest_round(&log, &run)?.map_or(0, |state| state.round);
         let event = json!({
-            "v": 2,
+            "kind": "caos-chat-event",
             "request": run,
             "round": round,
             "status": "failed",
@@ -1839,10 +1843,10 @@ mod tests {
         let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{"path":"a"}});
         let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{"path":"b"}});
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"hello","status":"queued"}),
-            json!({"v":2,"request":run,"status":"running"}),
-            json!({"v":2,"request":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
-            json!({"v":2,"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"kind": "caos-chat-event","author":"user","content":"hello","status":"queued"}),
+            json!({"kind": "caos-chat-event","request":run,"status":"running"}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
         ]);
 
         assert_eq!(active_request(&history).unwrap(), run);
@@ -1865,11 +1869,11 @@ mod tests {
         let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{}});
         let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{}});
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"start"}),
-            json!({"v":2,"request":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
-            json!({"v":2,"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
-            json!({"v":2,"author":"user","content":"also do this"}),
-            json!({"v":2,"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
+            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"kind": "caos-chat-event","author":"user","content":"also do this"}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
         ]);
         assert_eq!(
             event_messages(&history).unwrap(),
@@ -1891,9 +1895,9 @@ mod tests {
         let call = json!({"type":"tool_use","id":"same","name":"read","input":{}});
         let result = json!({"type":"tool_result","tool_use_id":"same","content":"ok"});
         let history = log(vec![
-            json!({"v":2,"request":run,"round":0,"response":[call.clone()]}),
-            json!({"v":2,"request":run,"round":0,"result":result}),
-            json!({"v":2,"request":run,"round":1,"response":[call]}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"response":[call.clone()]}),
+            json!({"kind": "caos-chat-event","request":run,"round":0,"result":result}),
+            json!({"kind": "caos-chat-event","request":run,"round":1,"response":[call]}),
         ]);
         let state = latest_round(&history, &run).unwrap().unwrap();
         assert_eq!(state.round, 1);
@@ -1905,28 +1909,23 @@ mod tests {
         let old = "a".repeat(40);
         let current = "b".repeat(40);
         let history = log(vec![
-            json!({"v":2,"request":old,"round":0,"status":"idle"}),
-            json!({"v":2,"request":current,"status":"running"}),
+            json!({"kind": "caos-chat-event","request":old,"round":0,"status":"idle"}),
+            json!({"kind": "caos-chat-event","request":current,"status":"running"}),
         ]);
         assert!(terminal_for_run(&history, &old).unwrap().is_some());
         assert!(terminal_for_run(&history, &current).unwrap().is_none());
     }
 
     #[test]
-    fn queued_start_claims_after_user_interjections() {
+    fn original_unadmitted_anchor_is_rejected() {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"start","status":"queued"}),
-            json!({"v":2,"author":"user","content":"also this"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"also this"}),
         ]);
-        assert_eq!(
-            request_start_disposition(&history, &run, &queued).unwrap(),
-            RequestStart::Claim {
-                expected: "f".repeat(40),
-                tree: "a".repeat(40),
-            }
-        );
+        let error = request_start_disposition(&history, &run, &queued).unwrap_err();
+        assert!(error.contains("no admission event"), "{error}");
     }
 
     #[test]
@@ -1935,8 +1934,9 @@ mod tests {
         let other = "c".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"start","status":"queued"}),
-            json!({"v":2,"request":run,"status":"running"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            json!({"kind": "caos-chat-event","request":run,"request_head":queued,"status":"queued"}),
+            json!({"kind": "caos-chat-event","request":run,"status":"running"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &run, &queued).unwrap(),
@@ -1951,9 +1951,9 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"start"}),
-            json!({"v":2,"request":run,"request_head":queued,"status":"queued"}),
-            json!({"v":2,"author":"user","content":"also this"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            json!({"kind": "caos-chat-event","request":run,"request_head":queued,"status":"queued"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"also this"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &run, &queued).unwrap(),
@@ -1969,23 +1969,38 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"start"}),
-            json!({"v":2,"request":run,"request_head":"c".repeat(40),"status":"queued"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            json!({"kind": "caos-chat-event","request":run,"request_head":"c".repeat(40),"status":"queued"}),
         ]);
         let error = request_start_disposition(&history, &run, &queued).unwrap_err();
         assert!(error.contains("records head"), "{error}");
     }
 
     #[test]
-    fn queued_start_cannot_claim_after_state_moves_on() {
-        let run = "b".repeat(40);
-        let queued = format!("{:040x}", 0);
+    fn terminal_old_request_cannot_reclaim_after_new_request_is_queued() {
+        let old = "b".repeat(40);
+        let new = "c".repeat(40);
+        let old_head = format!("{:040x}", 0);
+        let new_head = format!("{:040x}", 4);
         let history = log(vec![
-            json!({"v":2,"author":"user","content":"start","status":"queued"}),
-            json!({"v":2,"status":"failed"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"old"}),
+            json!({"kind": "caos-chat-event","request":old,"request_head":old_head,"status":"queued"}),
+            json!({"kind": "caos-chat-event","request":old,"status":"running"}),
+            json!({"kind": "caos-chat-event","request":old,"status":"failed"}),
+            json!({"kind": "caos-chat-event","author":"user","content":"new"}),
+            json!({"kind": "caos-chat-event","request":new,"request_head":new_head,"status":"queued"}),
         ]);
-        let error = request_start_disposition(&history, &run, &queued).unwrap_err();
-        assert!(error.contains("no longer current"), "{error}");
+        assert_eq!(
+            request_start_disposition(&history, &old, &old_head).unwrap(),
+            RequestStart::Running
+        );
+        assert_eq!(
+            request_start_disposition(&history, &new, &new_head).unwrap(),
+            RequestStart::Claim {
+                expected: "f".repeat(40),
+                tree: "a".repeat(40),
+            }
+        );
     }
 
     #[test]

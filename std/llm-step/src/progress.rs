@@ -3,7 +3,7 @@
 //! The worker image has no `git`, so this module uses the server's object API
 //! and exact-ref compare-and-append endpoint. Event objects are stored before
 //! the ref moves. A successful return therefore means the event is reachable
-//! from `refs/caos/v2/conversations/<id>/head`; failures are never downgraded
+//! from `refs/caos/conversations/<id>/head`; failures are never downgraded
 //! to observability warnings.
 
 use std::cmp::Ordering;
@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
+
+const EVENT_KIND: &str = "caos-chat-event";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendResult {
@@ -44,7 +46,7 @@ type CommitCache = Mutex<HashMap<(String, String), RemoteCommit>>;
 // newly appended events instead of another HTTP GET for the entire history.
 static COMMIT_CACHE: OnceLock<CommitCache> = OnceLock::new();
 
-/// One version-2 event on the canonical first-parent conversation spine.
+/// One chat event on the canonical first-parent conversation spine.
 #[derive(Debug, Clone)]
 pub struct ConversationEvent {
     pub commit: String,
@@ -184,13 +186,15 @@ fn append_event_at_head_inner(
 }
 
 fn validate_event(event: &Value) -> Result<(), String> {
-    if !event.is_object() || event.get("v").and_then(Value::as_u64) != Some(2) {
-        return Err("conversation event must be a version-2 JSON object".to_string());
+    if !event.is_object() || event.get("kind").and_then(Value::as_str) != Some(EVENT_KIND) {
+        return Err(format!(
+            "conversation event must be a JSON object with kind {EVENT_KIND:?}"
+        ));
     }
     Ok(())
 }
 
-/// Read all version-2 events reachable from the canonical conversation head,
+/// Read all chat events reachable from the canonical conversation head,
 /// following only the first parent. The first non-event commit is the
 /// workspace base and is deliberately excluded.
 pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
@@ -204,11 +208,14 @@ pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
     loop {
         let commit = fetch_commit(&base, &current)?;
         let value = match serde_json::from_str::<Value>(commit.message.trim()) {
-            Ok(value) if value.is_object() && value.get("v").and_then(Value::as_u64) == Some(2) => {
+            Ok(value)
+                if value.is_object()
+                    && value.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) =>
+            {
                 value
             }
             _ if !newest_first.is_empty() => break,
-            _ => return Err(format!("conversation head {head} is not a version-2 event")),
+            _ => return Err(format!("conversation head {head} is not a {EVENT_KIND} event")),
         };
         let parent = commit.parents.first().cloned();
         newest_first.push(ConversationEvent {
@@ -230,12 +237,13 @@ pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
 
 fn conversation_ref(conversation: &str) -> Result<String, String> {
     validate_conversation(conversation)?;
-    Ok(format!("refs/caos/v2/conversations/{conversation}/head"))
+    Ok(format!("refs/caos/conversations/{conversation}/head"))
 }
 
 /// A conservative in-worker equivalent of `git check-ref-format` for the id
-/// portion. In particular, `head` is reserved as *any* path component: allowing
-/// `a/head/b` would make its ref collide with conversation `a`'s ref-as-file.
+/// portion. In particular, canonical ref channels are reserved as *any* path
+/// component: allowing `a/head/b` would make its ref collide with conversation
+/// `a`'s ref-as-file, while `title` collides with its title ref.
 fn validate_conversation(conversation: &str) -> Result<(), String> {
     if conversation.is_empty() || conversation.len() > 512 {
         return Err(format!("invalid conversation name {conversation:?}"));
@@ -255,7 +263,7 @@ fn validate_conversation(conversation: &str) -> Result<(), String> {
     for component in conversation.split('/') {
         if component.is_empty()
             || component == "."
-            || component == "head"
+            || matches!(component, "head" | "title")
             || component.starts_with('.')
             || component.ends_with(".lock")
         {
@@ -854,14 +862,14 @@ mod tests {
     const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     #[test]
-    fn validates_conversation_ids_and_reserves_head_components() {
+    fn validates_conversation_ids_and_reserves_ref_channel_components() {
         assert_eq!(
             conversation_ref("project/talk-1").unwrap(),
-            "refs/caos/v2/conversations/project/talk-1/head"
+            "refs/caos/conversations/project/talk-1/head"
         );
         for invalid in [
-            "", "bad name", "a//b", "a/../b", ".hidden", "a.lock", "head", "a/head/b", "a~b",
-            "a@{b",
+            "", "bad name", "a//b", "a/../b", ".hidden", "a.lock", "head", "a/head/b",
+            "title", "a/title/b", "a~b", "a@{b",
         ] {
             assert!(
                 conversation_ref(invalid).is_err(),
@@ -1057,9 +1065,10 @@ mod tests {
     }
 
     #[test]
-    fn only_version_two_objects_are_events() {
-        assert!(validate_event(&serde_json::json!({"v": 2})).is_ok());
-        assert!(validate_event(&serde_json::json!({"v": 1})).is_err());
+    fn only_stably_discriminated_objects_are_events() {
+        assert!(validate_event(&serde_json::json!({"kind": "caos-chat-event"})).is_ok());
+        assert!(validate_event(&serde_json::json!({"kind": "other"})).is_err());
+        assert!(validate_event(&serde_json::json!({"v": 2})).is_err());
         assert!(validate_event(&serde_json::json!({"status": "idle"})).is_err());
         assert!(validate_event(&serde_json::json!([])).is_err());
     }
@@ -1078,7 +1087,7 @@ mod tests {
     #[test]
     fn fetched_commit_cache_reuses_immutable_spine_objects_per_server() {
         let content = format!(
-            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"v\":2}}\n"
+            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"kind\":\"caos-chat-event\"}}\n"
         );
         let mut object = format!("commit {}\0", content.len()).into_bytes();
         object.extend_from_slice(content.as_bytes());
