@@ -2253,12 +2253,18 @@ pub(crate) enum ArgType {
     /// because the default forms peel commits to trees (which image refs rely
     /// on); see [`resolve_commit_arg`].
     Commit,
-    /// `--name:tree=hash` — the value is the hash of a tree the *server*
+    /// `--name:hash=oid` — the value is the hash of an object the *server*
     /// already holds (typically an earlier run's result), referenced directly
-    /// as a tree entry with no content round-trip. This is how results compose
-    /// into new requests: e.g. a workspace-build job's `bin` tree feeding a
-    /// downstream job as `--bins:tree=<hash>`.
-    Tree,
+    /// by oid with no content round-trip: a **tree** or a **blob**. This is how
+    /// results compose into new requests: e.g. a workspace-build job's `bin`
+    /// tree feeding a downstream job as `--bins:hash=<oid>`. (Generalizes the
+    /// former `:tree=`, which was tree-only.)
+    Hash,
+    /// `--name:docker=ref` — a docker image ref, stored as the blob
+    /// `docker://<ref>` (the representation the server and [`base_arg_entry`]
+    /// expect). The typed form is how a docker image is named without sniffing
+    /// a bare token for a `docker://` prefix.
+    Docker,
 }
 
 /// Split a `--name[:type]=value` argument into its name, [`ArgType`] and raw
@@ -2277,12 +2283,13 @@ pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
         None => (key, ArgType::Literal),
         Some((name, "@")) => (name, ArgType::Path),
         Some((name, "commit")) => (name, ArgType::Commit),
-        Some((name, "tree")) => (name, ArgType::Tree),
+        Some((name, "hash")) => (name, ArgType::Hash),
+        Some((name, "docker")) => (name, ArgType::Docker),
         Some((_, ty)) => {
             return Err(format!(
                 "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
-                 --name:@=value (path), --name:commit=value (commit), or \
-                 --name:tree=hash (a tree the server already holds)"
+                 --name:@=path, --name:commit=rev, --name:hash=oid \
+                 (a tree/blob the server holds), or --name:docker=ref"
             ))
         }
     };
