@@ -38,7 +38,7 @@ grep -q 'needs --then' /tmp/err \
 # ...and map-then has no catch at all: catching is scoped to the single-valued
 # form, where "the step failed" has one unambiguous meaning. (`--catch=1`, not
 # the bare flag: map-then declares no markers, so the flag never reaches the
-# allowed-name check — it fails earlier, on parse_kv wanting a `=value`.)
+# allowed-name check — it fails earlier, on parse_arg wanting a `=value`.)
 if caos map-then /cas/args/in -- --map="$img" --catch=1 2>/tmp/err; then
   fail "map-then accepted --catch"
 fi
