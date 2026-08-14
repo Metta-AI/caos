@@ -2502,6 +2502,7 @@ fn record_continuation(
             continue;
         }
         let (name, ty, value) = parse_arg(kv)?;
+        let Some(&name) = allowed.iter().find(|&&a| a == name) else {
             let mut flags = allowed
                 .iter()
                 .map(|a| format!("--{a}"))
