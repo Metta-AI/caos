@@ -5,8 +5,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_head, conversation_ref, conversation_reference,
-    conversation_replay, conversation_snapshot, conversation_workspace_diff, describe_tool_set,
+    archive_user_conversation, conversation_head, conversation_reference, conversation_replay,
+    conversation_snapshot, conversation_workspace_diff, describe_tool_set,
     first_available_conversation_name, generate_conversation_title, list_user_conversations,
     publish_unindexed_conversations, publish_user_conversation, resume_request, run_chat_turn,
     set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationReplay,
@@ -1254,9 +1254,7 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
-        } else if self.reference_loading {
-            self.status.clone()
-        } else if self.publishing {
+        } else if self.reference_loading || self.publishing {
             self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
             attention.clone()
@@ -3382,6 +3380,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caos::chat::conversation_ref;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
