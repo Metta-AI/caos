@@ -881,7 +881,7 @@ const COMMANDS: [Command; 7] = [
     Command {
         name: "/invite",
         usage: "/invite <username>",
-        description: "add this conversation to another username's sidebar (case-sensitive)",
+        description: "add to one username's sidebar (case-sensitive; spaces allowed)",
         action: CommandAction::Invite,
         takes_argument: true,
     },
@@ -1530,6 +1530,7 @@ impl App {
         }
         let mut conversations =
             list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
+        let mut relist = false;
         if let Some(requested) = args.conversation.clone() {
             if conversations
                 .iter()
@@ -1545,23 +1546,19 @@ impl App {
                     .any(|conversation| conversation.id == requested)
                 {
                     unarchive_user_conversation(&transport, &args.user, &requested)?;
-                    conversations = list_user_conversations(
-                        &transport,
-                        &args.user,
-                        UserConversationStatus::Active,
-                    )?;
-                } else if let Some(snapshot) = conversation_snapshot(&transport, &requested)? {
+                    relist = true;
+                } else if conversation_snapshot(&transport, &requested)?.is_some() {
                     if args.new_conversation {
                         return Err(format!("conversation {requested:?} already exists"));
                     }
-                    publish_user_conversation(&transport, &args.user, &requested, &snapshot.title)?;
-                    conversations = list_user_conversations(
-                        &transport,
-                        &args.user,
-                        UserConversationStatus::Active,
-                    )?;
+                    invite_user_to_conversation(&transport, &args.user, &requested)?;
+                    relist = true;
                 }
             }
+        }
+        if relist {
+            conversations =
+                list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
         }
         let selected_name = choose_conversation(
             args.conversation.as_deref(),
@@ -2166,7 +2163,7 @@ impl App {
             .and_then(|transport| invite_user_to_conversation(&transport, user, &id))
         {
             Ok(()) => self.selected_mut().push_info(format!(
-                "Invited user {user}. Their TUI must use exactly `--username {user}`."
+                "Invited username {user:?}. They must select that exact case-sensitive identity."
             )),
             Err(error) => self.selected_mut().show_command_error(error),
         }
@@ -3937,9 +3934,9 @@ mod tests {
         assert_eq!(command.action, CommandAction::Reference);
         assert!(arguments.is_empty());
 
-        let (command, arguments) = parse_command("/invite Bob").unwrap();
+        let (command, arguments) = parse_command("/invite Bob Smith").unwrap();
         assert_eq!(command.action, CommandAction::Invite);
-        assert_eq!(arguments, "Bob");
+        assert_eq!(arguments, "Bob Smith");
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
