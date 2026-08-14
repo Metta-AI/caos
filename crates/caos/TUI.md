@@ -43,9 +43,11 @@ caos tui --unarchive ID   restore one conversation to the active list
 ```
 
 `--user` defaults to `$USER`. Active and archived membership is stored on the
-CAOS server under `refs/caos/users/<user>/conversations/{active,archived}/`,
-not in local TUI state. Existing local conversation refs are imported the first
-time that user opens the TUI.
+CAOS server under
+`refs/caos/v2/users/<user-key>/conversations/{active,archived}/`, not in local
+TUI state. Only v2 membership refs populate the sidebar. Unversioned chat refs
+remain stored but invisible: v2 clients do not read, import, rename, migrate,
+or delete them.
 
 ## Controls
 

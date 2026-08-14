@@ -3,31 +3,21 @@
 **Status:** implemented by this stack except for the items explicitly listed
 under Deferred work.
 
-This is a destructive replacement of the earlier chat formats. It deliberately
-uses the existing unversioned ref namespace and has no compatibility reader or
-migration path. Before switching a development repository to this format,
-delete every old ref below both `refs/caos/conversations/` and
-`refs/caos/users/` in the client and server repositories. Old commits may be
-garbage-collected after their reflogs and any other refs stop retaining them.
-
-For example, from each repository that stores chat refs:
-
-```sh
-git for-each-ref --format='delete %(refname)' \
-  refs/caos/conversations/ refs/caos/users/ |
-  git update-ref --stdin
-```
-
-Do not run an old and a new chat binary against the same repository. A rollout
-means stopping the old binaries, wiping those ref subtrees, and then starting
-only the new binaries.
+This format is version 2. Its refs live only below `refs/caos/v2/`, and every
+event carries the exact numeric discriminator `"v": 2`. There is no
+compatibility reader or migration path. Existing unversioned refs below
+`refs/caos/conversations/` and `refs/caos/users/` remain untouched and are
+invisible to the v2 UI, so upgrading presents an empty chat list without
+requiring old data to be deleted. A user who needs an old conversation must
+open it with the old software; the v2 client never imports, rewrites, or infers
+state from it.
 
 ## Distilled
 
 A conversation is one append-only ref:
 
 ```text
-F = refs/caos/conversations/<id>/head
+F = refs/caos/v2/conversations/<id>/head
 ```
 
 `F` is the sole authority for transcript, workspace, and foreground and async
@@ -42,18 +32,17 @@ the expected old hash to the new hash. Raw Git pushes remain available for
 multi-ref presentation updates, with a server-owned hook enforcing the same
 append rule for conversation heads.
 
-The canonical tip must be an event with the exact stable discriminator
-`"kind": "caos-chat-event"`. Replay follows first parents while that
-discriminator is present; the first non-event parent is the ordinary workspace
-base, not chat history. Each event therefore has a first parent: an ordinary
-conversation's initial event first-parents the resolved workspace base, while
-a materialized fork's initial marker first-parents the selected source event. A
-parentless recognized event is malformed. Its tree is the current workspace
-plus reserved `.caos` state; ordinary bases and user proposals may not supply a
-top-level `.caos` entry. There is no numeric event-format version, compatibility
-reader, or interpretation of an unknown kind as an older event. Durable object
-and request identities accepted at protocol boundaries are canonical lowercase
-40-character hexadecimal Git SHA-1 IDs.
+The canonical tip must be an event with the exact numeric discriminator
+`"v": 2`. Replay follows first parents while that discriminator is present;
+the first non-v2 parent is the ordinary workspace base, not chat history. Each
+event therefore has a first parent: an ordinary conversation's initial event
+first-parents the resolved workspace base, while a materialized fork's initial
+marker first-parents the selected source event. A parentless recognized event
+is malformed. Its tree is the current workspace plus reserved `.caos` state;
+ordinary bases and user proposals may not supply a top-level `.caos` entry.
+The reader does not accept missing, string-valued, or other numeric versions as
+chat events. Durable object and request identities accepted at protocol
+boundaries are canonical lowercase 40-character hexadecimal Git SHA-1 IDs.
 `author` plus `content` adds a transcript message; human messages use `author:
 user` and one case-sensitive `username` for attribution and display. Clients
 separately use that same resolved identity when they write sidebar membership
@@ -147,7 +136,7 @@ task ID = hash(Q)
 ```
 
 If Q has no recorded state, `llm-step` commits
-`{"kind":"caos-chat-event","async":{"task":"<Q>","status":"pending"}}`,
+`{"v":2,"async":{"task":"<Q>","status":"pending"}}`,
 calls the generic nonblocking
 `/bin/caos run-async Q`, returns `Q` to the model, and continues. Repeating the
 same tool request folds the existing state for Q and does not append another
@@ -201,22 +190,23 @@ payload the model reads. `/run` is execution, never a substitute for a read.
 A conversation is one append-only ref:
 
 ```text
-refs/caos/conversations/<id>/head -> latest event commit
+refs/caos/v2/conversations/<id>/head -> latest event commit
 ```
 
 Small title and per-user membership refs support the sidebar. Initial creation
 coordinates them atomically with the head; after that they do not take part in
 the conversation append protocol. The title lives at
-`refs/caos/conversations/<id>/title`.
+`refs/caos/v2/conversations/<id>/title`.
 
-Conversation refs live below `refs/caos/conversations/`; sidebar membership
-refs live below `refs/caos/users/`. There is no version component in either
-path. Compatibility comes from a coordinated destructive development cutover,
-not from readers guessing which historical format an unversioned ref contains.
-The canonical tip must be marked `"kind": "caos-chat-event"`; replay follows
-recognized events to the first non-event parent and treats that one commit as
-the ordinary workspace base. The reader does not parse, migrate, rename, or
-republish an older conversation layout.
+Conversation refs live below `refs/caos/v2/conversations/`; sidebar membership
+refs live below `refs/caos/v2/users/`. Only this namespace participates in v2
+discovery, following, writes, and server append enforcement. Existing
+unversioned refs remain present but invisible. The canonical tip must carry
+numeric `"v": 2`; replay follows v2 events to the first non-v2 parent and
+treats that one commit as the ordinary workspace base. The reader does not
+parse, migrate, rename, delete, or republish an older conversation layout.
+This is a chat-protocol guarantee, not an exemption from the server's generic
+repair of refs that point to missing or corrupt Git objects.
 
 For a human identity `U`, its ref-safe key is `u-` followed by the lowercase
 hexadecimal encoding of U's UTF-8 bytes. This is reversible and collision-free,
@@ -228,13 +218,13 @@ single `c-` plus lowercase UTF-8 hexadecimal component. For example,
 membership refs are:
 
 ```text
-refs/caos/users/<user-key>/conversations/active/<conversation-key>
-refs/caos/users/<user-key>/conversations/archived/<conversation-key>
+refs/caos/v2/users/<user-key>/conversations/active/<conversation-key>
+refs/caos/v2/users/<user-key>/conversations/archived/<conversation-key>
 ```
 
-The reader accepts only this keyed membership layout and decodes the component
-back to the exact conversation ID. It does not read or migrate raw-ID
-membership refs; the destructive cutover above removes them.
+The reader accepts only this v2 keyed membership layout and decodes the
+component back to the exact conversation ID. It does not read or migrate raw-ID
+or unversioned membership refs.
 
 The server keeps reflogs for crash repair while automatic Git GC is disabled.
 Those reflogs do not expire on their own. A bounded retention/pruning policy is
@@ -456,7 +446,7 @@ An event commit has:
 
 ```json
 {
-  "kind": "caos-chat-event",
+  "v": 2,
   "author": "assistant",
   "content": "I fixed the race.",
   "title": "Preserve work across disconnects",
@@ -464,17 +454,15 @@ An event commit has:
 }
 ```
 
-Every event must have the exact string discriminator
-`"kind": "caos-chat-event"`. Numeric event versions such as `"v": 2` are not
-part of the format. The canonical tip and every commit treated as history must
-have that kind; the first non-event first parent is the ordinary workspace base
-and ends replay. It is not interpreted as an older chat event. Additive fields
-may be ignored by readers that do not project them; a truly incompatible event
-family needs a different descriptive kind and an explicit reader decision, not
-a numeric counter. Every recognized event must also have a valid first parent;
-a parentless root event is malformed rather than an alternate conversation
-base. Object IDs read from refs, events, and run requests must use the canonical
-lowercase 40-character hexadecimal spelling.
+Every event must have numeric `"v": 2` exactly. The canonical tip and every
+commit treated as history must have that version; the first non-v2 first parent
+is the ordinary workspace base and ends replay. It is not interpreted as an
+older chat event. Additive fields may be ignored by readers that do not project
+them, but a missing, string-valued, or different numeric version is rejected.
+Every recognized event must also have a valid first parent; a parentless root
+event is malformed rather than an alternate conversation base. Object IDs read
+from refs, events, and run requests must use the canonical lowercase
+40-character hexadecimal spelling.
 
 If `content` exists, `author` is required and the pair adds one transcript
 message. Scalar conversation state is folded by scanning the first-parent
@@ -489,7 +477,7 @@ Malformed payloads inside a recognized event are isolated to the projection
 they affect where that is safe. For example, an invalid `async` payload is
 warned about and ignored while later valid task events remain usable. This
 defensive folding is not a compatibility reader: a commit without the exact
-event kind is not accepted as conversation history.
+numeric `"v": 2` discriminator is not accepted as conversation history.
 
 Tool calls and results carry the composite identity
 `(request, round, tool_use_id)`. A model call ID is only round-local and may
@@ -537,8 +525,8 @@ ordered conversation.
 - remain ignorant of conversation event semantics during compute and ref-update
   admission. Current startup repair requires a canonical conversation head to
   be a readable commit with an intact workspace tree; a future chat-aware spine
-  repair is the narrow planned exception and would use the stable discriminator
-  to stop at the ordinary workspace base;
+  repair is the narrow planned exception and would use the numeric v2
+  discriminator to stop at the ordinary workspace base;
 - enforce append-only first-parent updates for the conversation-head namespace,
   including expected-absent creation;
 - provide exact-ref reads and CAS appends so per-event updates do not download a
@@ -653,7 +641,7 @@ The dispatch protocol is:
 
 1. `llm-step` folds Q's state. Only when Q has no recorded status does it
    append a tree-neutral
-   `{"kind":"caos-chat-event","async":{"task":"<Q>","status":"pending"}}`
+   `{"v":2,"async":{"task":"<Q>","status":"pending"}}`
    event; a repeated request for an existing Q returns the folded state without
    resetting it.
 2. When the folded state needs dispatch, it calls `caos run-async Q` without

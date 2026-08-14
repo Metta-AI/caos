@@ -3,8 +3,8 @@
 > **Historical context only.** The authoritative chat design is
 > [`chat.md`](chat.md). The schemas and ref layouts described below document
 > the superseded prototype; the current design does not read or migrate them.
-> Development repositories are destructively wiped at the cutover described in
-> `chat.md`.
+> Current chat is isolated below `refs/caos/v2/`; the old unversioned refs may
+> remain in place and are invisible to the v2 clients.
 
 **Status:** steps 1–5 implemented — run-then + first-class commits, the
 bounded bash tool (`crates/worker-bash-tool`), the stateless llm-call worker
@@ -280,7 +280,7 @@ Two verbs and a full-screen client over one turn engine (implemented —
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one
-  (`refs/caos/conversations/*` by committer date), `-c <name>` picks one, and
+  (`refs/caos/v2/conversations/*` by committer date), `-c <name>` picks one, and
   `--new` mints a fresh auto-named `talk-<n>`. The chosen conversation is
   announced on stderr. With no prompt on a terminal it loops — one turn per
   line, ctrl-d ends, a failed turn is reported and the loop continues (the
@@ -292,9 +292,9 @@ Two verbs and a full-screen client over one turn engine (implemented —
   own crate. It consumes structured `TurnEvent`s from the same engine,
   reconstructs durable history from server-indexed conversation refs, and
   presents independent virtual conversations in a left sidebar. A stable
-  conversation ID addresses `refs/caos/conversations/<id>/head`; its mutable
+  conversation ID addresses `refs/caos/v2/conversations/<id>/head`; its mutable
   title lives at the sibling `title` ref. Per-user active and archived membership
-  lives under `refs/caos/users/<user-key>/conversations/{active,archived}/`,
+  lives under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
   where `<user-key>` is `u-` plus lowercase hex of the normalized username's
   UTF-8 bytes and each final `<conversation-key>` is `c-` plus lowercase hex of
   the conversation ID's UTF-8 bytes. Usernames are limited to 126 UTF-8 bytes;

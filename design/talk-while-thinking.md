@@ -3,7 +3,8 @@
 > **Historical context only.** The authoritative interjection and append model
 > is [`chat.md`](chat.md). The four-ref layout and migrations below describe the
 > superseded prototype and must not be implemented as a compatibility reader;
-> development repositories use the destructive cutover in `chat.md`.
+> current clients use isolated v2 refs and leave this old unversioned data
+> untouched and invisible.
 
 Steer and cancel a running turn. Extends `agent-harness.md`; terms from there
 (turn, step, human commit `H`, turn merge `M`, `caos-agent`).
