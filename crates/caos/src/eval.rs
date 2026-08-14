@@ -316,8 +316,8 @@ fn eval_command(
             arg_toks.push(tok);
         }
     }
-    let (bty, bval) = base
-        .ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
+    let (bty, bval) =
+        base.ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
     let image_ref = resolve_expr_base(t, input_tree, bty, bval, env, store)?;
     let entries = resolve_expr_args(t, input_tree, &arg_toks, env, store)?;
 
