@@ -5,7 +5,7 @@
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
 //! hash *is* the cache key with nothing keyed alongside it: the worker image, the
 //! standard library `std`, and the cache-busting `salt` all ride inside it under
-//! reserved `image`/`std`/`salt` entries. `/run?req=<argTreeHash>`
+//! reserved `base`/`std`/`salt` entries. `/run?req=<argTreeHash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
 //! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
 //! the registry) → dispatch through the runner rendezvous ([`crate::runner`]:
@@ -178,7 +178,7 @@ fn run_work_request_inner(
         trace_id,
         secrets: _,
     } = *request;
-    // Unpack the ArgTree's two reserved entries: the worker `image` (an embedded
+    // Unpack the ArgTree's two reserved entries: the worker `base` (an embedded
     // tree for a git image, a ref blob for `docker://`) and the cache-busting
     // `salt`. Both are part of the ArgTree — hence part of the cache key —
     // threaded into the worker and inherited by any promise sub-runs this request
@@ -712,7 +712,7 @@ fn resolve_promise(
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
 /// any curry layers and build the ArgTree — worker image folded in under its
-/// reserved `image` entry, salt under `salt`, std under `std` — whose hash IS the
+/// reserved `base` entry, salt under `salt`, std under `std` — whose hash IS the
 /// request, built server-side byte-identically to what a client would build, so
 /// the ArgTree hash (and cache key) is the same no matter who assembles it — and
 /// send it through [`run_work_request`]. Returns `"<type> <hash>"`.
