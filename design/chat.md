@@ -229,6 +229,10 @@ parent is the canonical head and `U` is retained as a second parent when the
 histories differ. This applies only the user's `P..U` delta instead of treating
 all changes since `P` as user edits.
 
+PR publication is an ordinary turn: the agent calls `merge` with the exact
+fetched base, resolves and tests. A clean tree without `.caos` becomes the PR
+snapshot.
+
 `/from` materializes a new conversation before its first new message. Its
 source must be a recognized conversation event whose complete inherited event
 spine validates through a matching explicit root. The marker uses the source
