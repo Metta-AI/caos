@@ -116,6 +116,20 @@ fn install_termination_handlers() {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--validate-pre-receive") {
+        let mut input = String::new();
+        if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+            eprintln!("caos: reading pre-receive commands: {error}");
+            std::process::exit(1);
+        }
+        let git_dir = std::env::var("GIT_DIR").unwrap_or_else(|_| ".".to_string());
+        if let Err(error) = refs::validate_pre_receive(&git_dir, &input) {
+            eprintln!("caos: {}", error.message());
+            std::process::exit(1);
+        }
+        return;
+    }
+
     install_termination_handlers();
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
@@ -694,7 +708,7 @@ mod tests {
         for refname in [
             "refs/caos/req/request",
             "refs/caos/res/result",
-            "refs/caos/users/u-1/conversations/active/c-74657374",
+            "refs/caos/v2/users/u-1/conversations/active/c-74657374",
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
@@ -726,7 +740,7 @@ mod tests {
         ]);
         assert!(!upload.contains("refs/caos/req/"));
         assert!(!upload.contains("refs/caos/res/"));
-        assert!(upload.contains("refs/caos/users/"));
+        assert!(upload.contains("refs/caos/v2/users/"));
 
         let receive = git(&[
             "receive-pack",
@@ -736,7 +750,7 @@ mod tests {
         ]);
         assert!(receive.contains("refs/caos/req/"));
         assert!(receive.contains("refs/caos/res/"));
-        assert!(receive.contains("refs/caos/users/"));
+        assert!(receive.contains("refs/caos/v2/users/"));
 
         let config = super::Config {
             registry_push_url: String::new(),

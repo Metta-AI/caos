@@ -124,12 +124,12 @@ fn start(cfg: &Config) -> Result<(), String> {
     let run = own_args_tree()?;
     let head_hash = cas_hash(&arg("head"))?;
     let log = ensure_request_running(conversation, &run, &head_hash)?;
+    if let Some(terminal) = terminal_for_run(&log, &run)? {
+        return finish_from_terminal(cfg, &log, terminal);
+    }
     // One recovery dispatch at turn entry is enough. Normal tool callbacks do
     // not repeat it and park another single-flight waiter for every tool call.
     reconcile_async_tasks(cfg, &log)?;
-    if let Some(terminal) = terminal_for_run(&log, &run)? {
-        return finish_from_terminal(terminal);
-    }
     let request = active_request(&log)?;
     if request != run {
         return Err(format!(
@@ -162,7 +162,7 @@ fn ensure_request_running(
         match request_start_disposition(&log, run, head)? {
             RequestStart::Running => return Ok(log),
             RequestStart::Claim { expected, tree } => {
-                let event = json!({"kind": "caos-chat-event", "request": run, "status": "running"});
+                let event = json!({"request": run, "status": "running"});
                 match progress::append_event_at_head(conversation, &expected, &event, &tree)? {
                     progress::ConditionalAppend::Appended(_) => {
                         return progress::conversation_log(conversation)
@@ -189,8 +189,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
         .map_err(|error| format!("invalid continuation round: {error}"))?;
     let base_head = read_arg("base-head")?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
-        reconcile_async_tasks(cfg, &log)?;
-        return finish_from_terminal(terminal);
+        return finish_from_terminal(cfg, &log, terminal);
     }
     let request = active_request(&log)?;
     let expected_request = request_for_head(&log, &head_hash)?;
@@ -575,6 +574,10 @@ fn llm_round(
         .filter(|b| b["type"] == "tool_use")
         .cloned()
         .collect();
+    // Prove the response shape is replayable before either terminal arm can
+    // publish it. In particular, an `end_turn` carrying tool calls would leave
+    // a permanently incomplete batch on the append-only conversation spine.
+    let durable_calls = validated_tool_calls(&stop, &tool_uses)?;
 
     match stop.as_str() {
         "end_turn" => {
@@ -582,7 +585,6 @@ fn llm_round(
             let tree = cas_hash(ws)?;
             let conversation = conversation(cfg)?;
             let event = json!({
-                "kind": "caos-chat-event",
                 "request": run,
                 "round": round,
                 "author": "assistant",
@@ -605,22 +607,9 @@ fn llm_round(
             }
         }
         "tool_use" => {
-            if tool_uses.is_empty() {
-                return Err("stop_reason tool_use but no tool_use blocks".to_string());
-            }
+            let calls = durable_calls.ok_or("validated tool_use response has no calls")?;
             let tree = cas_hash(ws)?;
-            let calls: Vec<Value> = tool_uses
-                .iter()
-                .map(|call| {
-                    json!({
-                        "id": call.get("id").cloned().unwrap_or(Value::Null),
-                        "name": call.get("name").cloned().unwrap_or(Value::Null),
-                        "args": call.get("input").cloned().unwrap_or(Value::Null),
-                    })
-                })
-                .collect();
             let event = json!({
-                "kind": "caos-chat-event",
                 "request": run,
                 "round": round,
                 "author": "assistant",
@@ -1235,9 +1224,19 @@ fn terminal_for_run<'a>(
     Ok(None)
 }
 
-fn finish_from_terminal(event: &progress::ConversationEvent) -> Result<(), String> {
+/// An idle foreground terminal event is the successful worker's final recovery
+/// point. Failed terminals return their error here and are reconciled by
+/// `record_failure`, which also owns failures appended by this invocation.
+fn finish_from_terminal(
+    cfg: &Config,
+    log: &progress::ConversationLog,
+    event: &progress::ConversationEvent,
+) -> Result<(), String> {
     match event.value.get("status").and_then(Value::as_str) {
-        Some("idle") => forward_commit(&event.commit),
+        Some("idle") => {
+            reconcile_async_tasks(cfg, log)?;
+            forward_commit(&event.commit)
+        }
         Some(status) => Err(event
             .value
             .get("error")
@@ -1317,7 +1316,7 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
         .last()
         .map(|event| event.tree.clone())
         .ok_or("conversation has no events")?;
-    let event = json!({"kind": "caos-chat-event", "async": {"task": task, "status": "pending"}});
+    let event = json!({"async": {"task": task, "status": "pending"}});
     let mut observed_status = None;
     retry_pending_append(
         &log.head,
@@ -1380,7 +1379,7 @@ fn resume_run(
     log: progress::ConversationLog,
 ) -> Result<(), String> {
     if let Some(terminal) = terminal_for_run(&log, run)? {
-        return finish_from_terminal(terminal);
+        return finish_from_terminal(cfg, &log, terminal);
     }
     let active = active_request(&log)?;
     if active != run || request_for_head(&log, head_hash).as_deref() != Ok(run) {
@@ -1656,7 +1655,6 @@ fn append_tool_result(
                     "content": [{"type": "text", "text": error}],
                 });
                 let event = json!({
-                    "kind": "caos-chat-event",
                     "request": run,
                     "round": round,
                     "status": "failed",
@@ -1689,7 +1687,7 @@ fn append_tool_result(
                 }
             }
         };
-        let event = json!({"kind": "caos-chat-event", "request": run, "round": round, "result": result});
+        let event = json!({"request": run, "round": round, "result": result});
         match progress::append_event_at_head_with_parent(
             conversation(cfg)?,
             &current.head,
@@ -1706,18 +1704,32 @@ fn append_tool_result(
     ))
 }
 
-fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
-    let conversation = conversation(cfg)?;
-    let run = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+fn record_failure_with<L, P, A, R>(
+    run: &str,
+    error: &str,
+    mut load: L,
+    mut append_pending: P,
+    mut append_terminal: A,
+    mut reconcile: R,
+) -> Result<(), String>
+where
+    L: FnMut() -> Result<progress::ConversationLog, String>,
+    P: FnMut(u64, &str, &Value, &str) -> Result<(), String>,
+    A: FnMut(&str, &Value, &str) -> Result<progress::ConditionalAppend, String>,
+    R: FnMut(&progress::ConversationLog) -> Result<(), String>,
+{
     for _ in 0..32 {
-        let log = progress::conversation_log(conversation)?;
-        if terminal_for_run(&log, &run)?.is_some() {
+        let log = load()?;
+        if terminal_for_run(&log, run)?.is_some() {
+            // A retry can arrive after the foreground failure became durable
+            // but before its terminal-boundary recovery ran.
+            reconcile(&log)?;
             return Ok(());
         }
-        if active_request(&log).as_deref() != Ok(run.as_str()) {
+        if active_request(&log).as_deref() != Ok(run) {
             return Ok(());
         }
-        if let Some(state) = latest_round(&log, &run)? {
+        if let Some(state) = latest_round(&log, run)? {
             if let Some(call) = state.pending.first() {
                 let id = call
                     .get("id")
@@ -1736,7 +1748,7 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
                     .last()
                     .map(|event| event.tree.clone())
                     .ok_or("conversation has no events")?;
-                append_tool_result(cfg, &run, state.round, &log.head, &result, &tree, None)?;
+                append_pending(state.round, &log.head, &result, &tree)?;
                 continue;
             }
         }
@@ -1745,20 +1757,40 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
             .last()
             .map(|event| event.tree.as_str())
             .ok_or("conversation has no events")?;
-        let round = latest_round(&log, &run)?.map_or(0, |state| state.round);
+        let round = latest_round(&log, run)?.map_or(0, |state| state.round);
         let event = json!({
-            "kind": "caos-chat-event",
             "request": run,
             "round": round,
             "status": "failed",
             "error": error,
         });
-        match progress::append_event_at_head(conversation, &log.head, &event, tree)? {
-            progress::ConditionalAppend::Appended(_) => return Ok(()),
+        match append_terminal(&log.head, &event, tree)? {
+            progress::ConditionalAppend::Appended(_) => {
+                // This failure is the worker's final safe boundary. Reload so
+                // tasks appended concurrently with the failure are included.
+                let terminal = load()?;
+                reconcile(&terminal)?;
+                return Ok(());
+            }
             progress::ConditionalAppend::HeadChanged(_) => continue,
         }
     }
     Err("conversation kept changing while recording request failure".to_string())
+}
+
+fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let run = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+    record_failure_with(
+        &run,
+        error,
+        || progress::conversation_log(conversation),
+        |round, base_head, result, tree| {
+            append_tool_result(cfg, &run, round, base_head, result, tree, None)
+        },
+        |head, event, tree| progress::append_event_at_head(conversation, head, event, tree),
+        |log| reconcile_async_tasks(cfg, log),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,6 +2024,51 @@ fn response_text(blocks: &[Value]) -> String {
         .join("\n\n")
 }
 
+/// Validate the relationship between a response's stop reason and tool blocks
+/// before the response is recorded. Only `tool_use` may carry calls; an
+/// `end_turn` with calls would be replayed as a batch that can never receive
+/// results.
+fn validated_tool_calls(
+    stop_reason: &str,
+    tool_uses: &[Value],
+) -> Result<Option<Vec<Value>>, String> {
+    match stop_reason {
+        "tool_use" => durable_tool_calls(tool_uses).map(Some),
+        "end_turn" if !tool_uses.is_empty() => {
+            Err("stop_reason end_turn but response contains tool_use blocks".to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Build the durable call projection only after proving the response can be
+/// folded again. IDs are scoped to this response's request/round, so reuse by
+/// a later round is valid; duplicates inside one response are not.
+fn durable_tool_calls(tool_uses: &[Value]) -> Result<Vec<Value>, String> {
+    if tool_uses.is_empty() {
+        return Err("stop_reason tool_use but no tool_use blocks".to_string());
+    }
+    let mut ids = std::collections::HashSet::new();
+    tool_uses
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("model tool_use block {index} has no string id"))?;
+            if !ids.insert(id) {
+                return Err(format!("model response repeats tool_use id {id:?}"));
+            }
+            Ok(json!({
+                "id": id,
+                "name": call.get("name").cloned().unwrap_or(Value::Null),
+                "args": call.get("input").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
 /// A fresh, unique direct-child CAS path (CAS paths are single-assignment).
 pub(crate) fn fresh(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2032,10 +2109,10 @@ mod tests {
         let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{"path":"a"}});
         let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{"path":"b"}});
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"hello","status":"queued"}),
-            json!({"kind": "caos-chat-event","request":run,"status":"running"}),
-            json!({"kind": "caos-chat-event","request":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
-            json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"author":"user","content":"hello","status":"queued"}),
+            json!({"request":run,"status":"running"}),
+            json!({"request":run,"round":0,"response":[call_a.clone(),call_b.clone()],"calls":[]}),
+            json!({"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
         ]);
 
         assert_eq!(active_request(&history).unwrap(), run);
@@ -2053,16 +2130,52 @@ mod tests {
     }
 
     #[test]
+    fn durable_tool_calls_reject_ids_that_would_brick_replay() {
+        let valid = json!({"type":"tool_use","id":"same","name":"read","input":{}});
+        assert_eq!(
+            durable_tool_calls(std::slice::from_ref(&valid)).unwrap()[0]["id"],
+            "same"
+        );
+        // The same model-local ID remains valid in a later invocation/round.
+        assert!(durable_tool_calls(std::slice::from_ref(&valid)).is_ok());
+
+        let missing = json!({"type":"tool_use","name":"read","input":{}});
+        assert!(durable_tool_calls(&[missing])
+            .unwrap_err()
+            .contains("no string id"));
+        let non_string = json!({"type":"tool_use","id":7,"name":"read","input":{}});
+        assert!(durable_tool_calls(&[non_string])
+            .unwrap_err()
+            .contains("no string id"));
+        assert!(durable_tool_calls(&[valid.clone(), valid])
+            .unwrap_err()
+            .contains("repeats tool_use id"));
+    }
+
+    #[test]
+    fn terminal_response_rejects_tool_calls_before_recording() {
+        let call = json!({"type":"tool_use","id":"call","name":"read","input":{}});
+        assert!(validated_tool_calls("end_turn", &[]).unwrap().is_none());
+        assert!(validated_tool_calls("end_turn", &[call.clone()])
+            .unwrap_err()
+            .contains("end_turn"));
+        assert_eq!(
+            validated_tool_calls("tool_use", &[call]).unwrap().unwrap()[0]["id"],
+            "call"
+        );
+    }
+
+    #[test]
     fn interjections_follow_a_complete_ordered_tool_result_batch() {
         let run = "b".repeat(40);
         let call_a = json!({"type":"tool_use","id":"a","name":"read","input":{}});
         let call_b = json!({"type":"tool_use","id":"b","name":"read","input":{}});
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
-            json!({"kind": "caos-chat-event","request":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
-            json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
-            json!({"kind": "caos-chat-event","author":"user","content":"also do this"}),
-            json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"round":0,"response":[call_a.clone(),call_b.clone()]}),
+            json!({"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"a","content":"one"}}),
+            json!({"author":"user","content":"also do this"}),
+            json!({"request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
         ]);
         assert_eq!(
             event_messages(&history, false).unwrap(),
@@ -2084,9 +2197,9 @@ mod tests {
         let call = json!({"type":"tool_use","id":"same","name":"read","input":{}});
         let result = json!({"type":"tool_result","tool_use_id":"same","content":"ok"});
         let history = log(vec![
-            json!({"kind": "caos-chat-event","request":run,"round":0,"response":[call.clone()]}),
-            json!({"kind": "caos-chat-event","request":run,"round":0,"result":result}),
-            json!({"kind": "caos-chat-event","request":run,"round":1,"response":[call]}),
+            json!({"request":run,"round":0,"response":[call.clone()]}),
+            json!({"request":run,"round":0,"result":result}),
+            json!({"request":run,"round":1,"response":[call]}),
         ]);
         let state = latest_round(&history, &run).unwrap().unwrap();
         assert_eq!(state.round, 1);
@@ -2098,9 +2211,9 @@ mod tests {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
         let mut events = vec![
-            json!({"kind":"caos-chat-event","author":"user","content":"start"}),
-            json!({"kind":"caos-chat-event","request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
-            json!({"kind":"caos-chat-event","async":{"task":task,"status":"complete"}}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
+            json!({"async":{"task":task,"status":"complete"}}),
         ];
         let before_response = event_messages(&log(events.clone()), true).unwrap();
         assert!(before_response.iter().any(|message| {
@@ -2110,7 +2223,6 @@ mod tests {
         }));
 
         events.push(json!({
-            "kind":"caos-chat-event",
             "request":run,
             "round":1,
             "response":[{"type":"text","text":"observed"}]
@@ -2145,11 +2257,92 @@ mod tests {
         let old = "a".repeat(40);
         let current = "b".repeat(40);
         let history = log(vec![
-            json!({"kind": "caos-chat-event","request":old,"round":0,"status":"idle"}),
-            json!({"kind": "caos-chat-event","request":current,"status":"running"}),
+            json!({"request":old,"round":0,"status":"idle"}),
+            json!({"request":current,"status":"running"}),
         ]);
         assert!(terminal_for_run(&history, &old).unwrap().is_some());
         assert!(terminal_for_run(&history, &current).unwrap().is_none());
+    }
+
+    #[test]
+    fn preexisting_failed_terminal_reconciles_before_failure_recording_returns() {
+        let run = "b".repeat(40);
+        let task = "c".repeat(40);
+        let history = log(vec![
+            json!({"request":run,"status":"running"}),
+            json!({"async":{"task":task,"status":"pending"}}),
+            json!({"request":run,"round":0,"status":"failed","error":"boom"}),
+        ]);
+        let reconciliations = std::cell::Cell::new(0);
+
+        record_failure_with(
+            &run,
+            "boom",
+            || Ok(history.clone()),
+            |_, _, _, _| panic!("a terminal request cannot have a pending foreground call"),
+            |_, _, _| panic!("an existing terminal must not be appended again"),
+            |terminal| {
+                reconciliations.set(reconciliations.get() + 1);
+                let tasks = async_work::tasks(terminal.events.iter().map(|event| &event.value));
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].task, task);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reconciliations.get(), 1);
+    }
+
+    #[test]
+    fn newly_appended_failed_terminal_reloads_then_reconciles() {
+        let run = "b".repeat(40);
+        let task = "c".repeat(40);
+        let running = log(vec![
+            json!({"request":run,"status":"running"}),
+            json!({"async":{"task":task,"status":"pending"}}),
+        ]);
+        let terminal = log(vec![
+            json!({"request":run,"status":"running"}),
+            json!({"async":{"task":task,"status":"pending"}}),
+            json!({"request":run,"round":0,"status":"failed","error":"boom"}),
+        ]);
+        let mut loads = std::collections::VecDeque::from([running, terminal]);
+        let appends = std::cell::Cell::new(0);
+        let reconciliations = std::cell::Cell::new(0);
+
+        record_failure_with(
+            &run,
+            "boom",
+            || loads.pop_front().ok_or("unexpected extra load".to_string()),
+            |_, _, _, _| panic!("the request has no pending foreground call"),
+            |head, event, tree| {
+                appends.set(appends.get() + 1);
+                assert_eq!(head, "f".repeat(40));
+                assert_eq!(tree, "a".repeat(40));
+                assert_eq!(event["status"], "failed");
+                Ok(progress::ConditionalAppend::Appended(
+                    progress::AppendResult {
+                        commit: "d".repeat(40),
+                        previous_head: head.to_string(),
+                        retries: 0,
+                    },
+                ))
+            },
+            |reloaded| {
+                reconciliations.set(reconciliations.get() + 1);
+                assert!(terminal_for_run(reloaded, &run)?.is_some());
+                let tasks = async_work::tasks(reloaded.events.iter().map(|event| &event.value));
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].task, task);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(loads.is_empty());
+        assert_eq!(appends.get(), 1);
+        assert_eq!(reconciliations.get(), 1);
     }
 
     #[test]
@@ -2157,8 +2350,8 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
-            json!({"kind": "caos-chat-event","author":"user","content":"also this"}),
+            json!({"author":"user","content":"start"}),
+            json!({"author":"user","content":"also this"}),
         ]);
         let error = request_start_disposition(&history, &run, &queued).unwrap_err();
         assert!(error.contains("no admission event"), "{error}");
@@ -2170,9 +2363,9 @@ mod tests {
         let other = "c".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
-            json!({"kind": "caos-chat-event","request":run,"request_head":queued,"status":"queued"}),
-            json!({"kind": "caos-chat-event","request":run,"status":"running"}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"request_head":queued,"status":"queued"}),
+            json!({"request":run,"status":"running"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &run, &queued).unwrap(),
@@ -2187,9 +2380,9 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
-            json!({"kind": "caos-chat-event","request":run,"request_head":queued,"status":"queued"}),
-            json!({"kind": "caos-chat-event","author":"user","content":"also this"}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"request_head":queued,"status":"queued"}),
+            json!({"author":"user","content":"also this"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &run, &queued).unwrap(),
@@ -2205,8 +2398,8 @@ mod tests {
         let run = "b".repeat(40);
         let queued = format!("{:040x}", 0);
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"start"}),
-            json!({"kind": "caos-chat-event","request":run,"request_head":"c".repeat(40),"status":"queued"}),
+            json!({"author":"user","content":"start"}),
+            json!({"request":run,"request_head":"c".repeat(40),"status":"queued"}),
         ]);
         let error = request_start_disposition(&history, &run, &queued).unwrap_err();
         assert!(error.contains("records head"), "{error}");
@@ -2219,12 +2412,12 @@ mod tests {
         let old_head = format!("{:040x}", 0);
         let new_head = format!("{:040x}", 4);
         let history = log(vec![
-            json!({"kind": "caos-chat-event","author":"user","content":"old"}),
-            json!({"kind": "caos-chat-event","request":old,"request_head":old_head,"status":"queued"}),
-            json!({"kind": "caos-chat-event","request":old,"status":"running"}),
-            json!({"kind": "caos-chat-event","request":old,"status":"failed"}),
-            json!({"kind": "caos-chat-event","author":"user","content":"new"}),
-            json!({"kind": "caos-chat-event","request":new,"request_head":new_head,"status":"queued"}),
+            json!({"author":"user","content":"old"}),
+            json!({"request":old,"request_head":old_head,"status":"queued"}),
+            json!({"request":old,"status":"running"}),
+            json!({"request":old,"status":"failed"}),
+            json!({"author":"user","content":"new"}),
+            json!({"request":new,"request_head":new_head,"status":"queued"}),
         ]);
         assert_eq!(
             request_start_disposition(&history, &old, &old_head).unwrap(),

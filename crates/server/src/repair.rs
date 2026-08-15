@@ -158,7 +158,7 @@ enum IntegrityDepth {
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/") || refname.starts_with("refs/caos/res/") {
         IntegrityDepth::TargetOnly
-    } else if refname.starts_with("refs/caos/conversations/") && refname.ends_with("/head") {
+    } else if refname.starts_with("refs/caos/v2/conversations/") && refname.ends_with("/head") {
         IntegrityDepth::ConversationHead
     } else {
         IntegrityDepth::WorkspaceClosure
@@ -551,7 +551,7 @@ mod tests {
         let result = plant_ref(&dir, "refs/caos/res/result", &format!("{damaged}\n"));
         let conversation = plant_ref(
             &dir,
-            "refs/caos/conversations/chat/head",
+            "refs/caos/v2/conversations/chat/head",
             &format!("{damaged}\n"),
         );
         let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
@@ -578,7 +578,7 @@ mod tests {
         let garbage = plant_ref(&dir, "refs/caos/req/garbled", "not a hash\n");
         let missing = plant_ref(
             &dir,
-            "refs/caos/conversations/c95/status",
+            "refs/caos/test-status/c95",
             "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a\n",
         );
 
@@ -602,7 +602,7 @@ mod tests {
         let git_dir = dir.to_string_lossy().into_owned();
         let id = "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a";
         plant_object(&dir, id, 0);
-        let status = plant_ref(&dir, "refs/caos/conversations/c95/status", id);
+        let status = plant_ref(&dir, "refs/caos/test-status/c95", id);
 
         assert_eq!(sweep_empty_loose_objects(&git_dir), 1);
         assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
@@ -617,7 +617,7 @@ mod tests {
         let git_dir = dir.to_string_lossy().into_owned();
         let head = plant_ref(
             &dir,
-            "refs/caos/conversations/c95/head",
+            "refs/caos/v2/conversations/c95/head",
             "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a\n",
         );
 
@@ -640,17 +640,17 @@ mod tests {
             .to_string();
         let head = plant_ref(
             &dir,
-            "refs/caos/conversations/chat/head",
+            "refs/caos/v2/conversations/chat/head",
             &format!("{blob}\n"),
         );
         let title = plant_ref(
             &dir,
-            "refs/caos/conversations/chat/title",
+            "refs/caos/v2/conversations/chat/title",
             &format!("{blob}\n"),
         );
         plant_ref(
             &dir,
-            "logs/refs/caos/conversations/chat/head",
+            "logs/refs/caos/v2/conversations/chat/head",
             &format!(
                 "0000000000000000000000000000000000000000 {intact} caos <caos@caos> 0 +0000\tcreated\n\
                  {intact} {blob} caos <caos@caos> 1 +0000\tinvalid update\n"
@@ -668,6 +668,18 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_v2_heads_receive_conversation_specific_repair() {
+        assert!(matches!(
+            integrity_depth("refs/caos/v2/conversations/chat/head"),
+            IntegrityDepth::ConversationHead
+        ));
+        assert!(matches!(
+            integrity_depth("refs/caos/conversations/chat/head"),
+            IntegrityDepth::WorkspaceClosure
+        ));
     }
 
     #[test]

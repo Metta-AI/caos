@@ -59,7 +59,7 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== dispatch merge turn ==" >&2
 conv="merge-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-conversation_ref="refs/caos/conversations/$conv/head"
+conversation_ref="refs/caos/v2/conversations/$conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --api-key=test-key --system:@=system.txt \
@@ -68,13 +68,13 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --conversation="$conv")
 
 user=$(mkcommit "$base_tree" \
-  '{"author":"user","content":"merge in the feature branch","kind":"caos-chat-event"}' \
+  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"merge in the feature branch\"}" \
   "$base")
 request=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user")
 [ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
   || fail "prepared request is not exact Q: $request"
 admitted=$(mkcommit "$base_tree" \
-  "{\"kind\":\"caos-chat-event\",\"request\":\"$request\",\"request_head\":\"$user\",\"status\":\"queued\"}" "$user")
+  "{\"request\":\"$request\",\"request_head\":\"$user\",\"status\":\"queued\"}" "$user")
 git push --quiet caos "$admitted:$conversation_ref" || fail "publishing request admission"
 "$CAOS_CLI" run "$request" -- >/tmp/merge-result || fail "running merge turn"
 [ -n "$(remote_exact_ref "refs/caos/res/$request")" ] \
@@ -95,13 +95,26 @@ git merge-base --is-ancestor "$feature" "$head" \
 
 current=$head
 count=0
+roots=0
 while [ "$current" != "$base" ]; do
   message=$(git show -s --format=%B "$current")
-  grep -Eq '"kind"[[:space:]]*:[[:space:]]*"caos-chat-event"' <<<"$message" \
-    || fail "non-chat commit on event spine: $current"
-  current=$(git rev-parse "$current^")
+  jq -e 'type == "object" and (has("v") | not)' <<<"$message" >/dev/null \
+    || fail "invalid event on conversation spine: $current"
+  parent=$(git rev-parse "$current^1")
+  declared_base=$(jq -r '.base // empty' <<<"$message")
+  if [ -n "$declared_base" ]; then
+    [ "$declared_base" = "$parent" ] \
+      || fail "root event $current does not name its first parent"
+    [ "$declared_base" = "$base" ] \
+      || fail "root event $current does not name the expected workspace base"
+    roots=$((roots + 1))
+  elif [ "$parent" = "$base" ]; then
+    fail "oldest event $current has no explicit base"
+  fi
+  current=$parent
   count=$((count + 1))
 done
+[ "$roots" -eq 1 ] || fail "event spine did not contain exactly one explicit base"
 [ "$count" -ge 4 ] || fail "merge turn recorded too few events"
 
 events=$(git log --first-parent --format=%B "$base..$head")

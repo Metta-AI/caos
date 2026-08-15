@@ -592,10 +592,27 @@ impl Transport for GitTransport {
         // varies by version: a few extra pushes on the failure path are cheaper
         // than a fragile string test, and a genuine failure just fails N times.
         let mut last = String::new();
+        let mut repair_error = None;
         for attempt in 0..4 {
             match push() {
                 Ok(_) => return Ok(()),
                 Err(e) => last = e,
+            }
+
+            // A result read through `/object/<hash>` is cached one object at a
+            // time, so a server-owned tree can intentionally exist here without
+            // its whole closure. If that tree is embedded in a new request,
+            // `git push` must walk the request and dies at the first absent
+            // descendant. Repair only after a failed push: the common no-op or
+            // delta push stays lazy, while a real hole is fetched as one closure
+            // and the next attempt can use ordinary Git negotiation again.
+            match self.fetch_missing_closures(hash) {
+                Ok(0) => {}
+                Ok(_) => {
+                    repair_error = None;
+                    continue;
+                }
+                Err(error) => repair_error = Some(error),
             }
             // Widening pause: the thing we are waiting for is another client's
             // ref update landing, which is brief but not instant.
@@ -605,7 +622,10 @@ impl Transport for GitTransport {
         // whatever actually defeated the retries, which is the only interesting
         // one (it cost a debugging session — the visible error said "reference
         // already exists" while the real failure was unknown).
-        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+        let repair = repair_error
+            .map(|error| format!("\nrepairing the local object graph also failed: {error}"))
+            .unwrap_or_default();
+        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}{repair}"))
     }
 
     fn ingest_path(
@@ -805,6 +825,42 @@ impl GitTransport {
     /// Run a network Git command in this transport's bound working tree.
     fn run_git(&self, args: &[&str]) -> Result<(), String> {
         self.git_capture(args, None).map(|_| ())
+    }
+
+    /// Fetch closures that a lazy `/object` read left incomplete locally.
+    ///
+    /// `rev-list --missing=print` discovers holes without relying on Git's
+    /// version-specific fatal-error wording. Each printed object is a root the
+    /// server already supplied by hash; fetching that root gets its complete
+    /// closure. A genuinely corrupt locally-created graph still fails clearly
+    /// when the object is absent from the server too.
+    fn fetch_missing_closures(&self, root: &str) -> Result<usize, String> {
+        let listing = self
+            .git_capture(
+                &[
+                    "rev-list",
+                    "--objects",
+                    "--no-object-names",
+                    "--missing=print",
+                    root,
+                ],
+                None,
+            )
+            .map_err(|error| format!("checking the local closure of {root}: {error}"))?;
+        let mut missing = Vec::new();
+        for line in listing.lines() {
+            let Some(hash) = line.strip_prefix('?') else {
+                continue;
+            };
+            parse_oid(hash).map_err(|error| {
+                format!("git reported invalid missing object {hash:?}: {error}")
+            })?;
+            missing.push(hash.to_string());
+        }
+        for hash in &missing {
+            self.fetch_object(hash)?;
+        }
+        Ok(missing.len())
     }
 
     /// Fetch object `hash` (and its closure) from the `caos` remote into the
@@ -3855,6 +3911,28 @@ mod git_transport_tests {
         git_capture_in(args, None, cwd).unwrap()
     }
 
+    fn git_stdin(cwd: &Path, args: &[&str], input: &str) -> String {
+        let mut child = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     fn init_repo(path: &Path) {
         git(path, &["init", "--quiet", "."]);
         git(path, &["config", "user.name", "CAOS Test"]);
@@ -3966,6 +4044,82 @@ mod git_transport_tests {
 
         assert!(error.contains("no `caos` git remote"));
         assert!(error.contains("`git remote add caos <server-url>`"));
+    }
+
+    #[test]
+    fn push_repairs_a_lazily_cached_server_tree() {
+        let root = TestDir::new("push-repairs-partial-tree");
+        let remote = root.path().join("remote.git");
+        let client = root.path().join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&client).unwrap();
+        git(&remote, &["init", "--quiet", "--bare", "."]);
+        git(
+            &remote,
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        init_repo(&client);
+        git(
+            &client,
+            &["remote", "add", CAOS_REMOTE, &remote.to_string_lossy()],
+        );
+
+        // The server has a complete seed tree. The client has lazily read only
+        // the image root, whose layer entry therefore names an absent object.
+        let payload = git_stdin(&remote, &["hash-object", "-w", "--stdin"], "payload\n");
+        let payload = payload.trim();
+        let layer = git_stdin(
+            &remote,
+            &["mktree"],
+            &format!("100644 blob {payload}\tpayload\n"),
+        );
+        let layer = layer.trim();
+        let image = git_stdin(
+            &remote,
+            &["mktree"],
+            &format!("040000 tree {layer}\tlayer00\n"),
+        );
+        let image = image.trim();
+        let seed = git_stdin(
+            &remote,
+            &["mktree"],
+            &format!("040000 tree {image}\timage\n"),
+        );
+        let seed = seed.trim();
+        git(&remote, &["update-ref", "refs/caos/seed", seed]);
+
+        let cached_image = git_stdin(
+            &client,
+            &["mktree", "--missing"],
+            &format!("040000 tree {layer}\tlayer00\n"),
+        );
+        assert_eq!(cached_image.trim(), image);
+        let request = git_stdin(
+            &client,
+            &["mktree"],
+            &format!("040000 tree {image}\tbase\n"),
+        );
+        let request = request.trim();
+        let missing = git(
+            &client,
+            &[
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--missing=print",
+                request,
+            ],
+        );
+        assert!(missing.lines().any(|line| line == format!("?{layer}")));
+
+        GitTransport::discover(&client)
+            .unwrap()
+            .ensure_pushed(request)
+            .unwrap();
+
+        git(&client, &["cat-file", "-e", &format!("{layer}^{{tree}}")]);
+        let request_ref = format!("refs/caos/req/{request}");
+        assert_eq!(git(&remote, &["rev-parse", &request_ref]).trim(), request);
     }
 
     #[test]

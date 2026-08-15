@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 const MAX_CAS_ATTEMPTS: usize = 32;
-const EVENT_KIND: &str = "caos-chat-event";
 
 enum PushResult {
     Updated,
@@ -18,7 +17,7 @@ enum PushResult {
 }
 
 pub fn validate_target_ref(refname: &str) -> Result<(), String> {
-    let Some(rest) = refname.strip_prefix("refs/caos/conversations/") else {
+    let Some(rest) = refname.strip_prefix("refs/caos/v2/conversations/") else {
         return Err(format!(
             "target-ref is not a conversation head: {refname:?}"
         ));
@@ -77,7 +76,7 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
             return Ok(());
         }
 
-        let message = json!({"kind": EVENT_KIND, "async": {"task": task, "status": status}});
+        let message = json!({"async": {"task": task, "status": status}});
         let message = serde_json::to_string(&message)
             .map_err(|error| format!("serializing async status event: {error}"))?;
         let commit = store_commit(&base, &remote.tree, &head, &message)?;
@@ -181,20 +180,75 @@ fn task_status(
     task: &str,
     cache: &mut HashMap<String, RemoteCommit>,
 ) -> Result<Option<String>, String> {
-    let mut current = Some(head.to_string());
-    while let Some(hash) = current {
+    let mut current = head.to_string();
+    let mut newest_status = None;
+    loop {
+        let hash = current;
         let commit = fetch_commit_cached(base, &hash, cache)?;
-        let event = match serde_json::from_str::<Value>(commit.message.trim()) {
-            Ok(event) if event.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) => event,
-            _ => return Ok(None),
-        };
+        let event = parse_spine_event(&commit.message, &hash)?;
         let parent = required_event_parent(commit.parent.as_deref(), &hash)?;
-        if let Some(status) = event_task_status(&event, task) {
-            return Ok(Some(status));
+        let is_root = validate_event_base(&event, &parent)?;
+        validate_fork_marker(&event, &parent)?;
+        if newest_status.is_none() {
+            newest_status = event_task_status(&event, task);
         }
-        current = Some(parent);
+        if is_root {
+            return Ok(newest_status);
+        }
+        current = parent;
     }
-    Ok(None)
+}
+
+fn parse_spine_event(
+    message: &str,
+    commit: &str,
+) -> Result<Value, String> {
+    let event = serde_json::from_str::<Value>(message.trim())
+        .map_err(|error| format!("conversation history commit {commit} is not JSON: {error}"))?;
+    let object = event
+        .as_object()
+        .ok_or_else(|| format!("conversation event {commit} must be a JSON object"))?;
+    if object.contains_key("v") {
+        return Err(format!(
+            "conversation event {commit} must not carry a version; refs/caos/v2 selects the protocol"
+        ));
+    }
+    Ok(event)
+}
+
+fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(base) = event.get("base") else {
+        return Ok(false);
+    };
+    let base = base
+        .as_str()
+        .ok_or_else(|| "conversation event base is not a string".to_string())?;
+    validate_hash(base, "conversation base")?;
+    if base != first_parent {
+        return Err(format!(
+            "conversation root declares base {base}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(forked_from) = event.get("forked_from") else {
+        return Ok(false);
+    };
+    if event.get("base").is_some() {
+        return Err("a conversation fork marker must not introduce a new base".to_string());
+    }
+    let forked_from = forked_from
+        .as_str()
+        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
+    validate_hash(forked_from, "forked_from")?;
+    if forked_from != first_parent {
+        return Err(format!(
+            "conversation fork marker declares {forked_from}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
 }
 
 fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
@@ -407,23 +461,79 @@ mod tests {
     }
 
     #[test]
+    fn event_envelope_is_selected_by_the_ref_namespace() {
+        let head = "a".repeat(40);
+        assert_eq!(parse_spine_event(r#"{}"#, &head), Ok(json!({})));
+        assert!(parse_spine_event(r#"{"status":"idle"}"#, &head).is_ok());
+        assert!(parse_spine_event(r#"{"v":2}"#, &head).is_err());
+        assert!(parse_spine_event(r#"[]"#, &head).is_err());
+        assert!(parse_spine_event("ordinary commit", &head).is_err());
+    }
+
+    #[test]
+    fn explicit_base_must_match_the_first_parent() {
+        let base = "a".repeat(40);
+        assert_eq!(validate_event_base(&json!({}), &base), Ok(false));
+        assert_eq!(
+            validate_event_base(&json!({"base": base}), &base),
+            Ok(true)
+        );
+        assert!(validate_event_base(&json!({"base": "b".repeat(40)}), &base).is_err());
+        assert!(validate_fork_marker(&json!({"forked_from": base}), &base).is_ok());
+        assert!(validate_fork_marker(
+            &json!({"base": base, "forked_from": base}),
+            &base
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn task_status_validates_the_complete_spine_before_returning() {
+        let head = "a".repeat(40);
+        let parent = "b".repeat(40);
+        let task = "c".repeat(40);
+        let mut cache = HashMap::from([
+            (
+                head.clone(),
+                RemoteCommit {
+                    tree: "d".repeat(40),
+                    parent: Some(parent.clone()),
+                    message: json!({"async": {"task": task, "status": "complete"}})
+                        .to_string(),
+                },
+            ),
+            (
+                parent,
+                RemoteCommit {
+                    tree: "e".repeat(40),
+                    parent: None,
+                    message: "{}".to_string(),
+                },
+            ),
+        ]);
+
+        let error = task_status("unused", &head, &task, &mut cache).unwrap_err();
+        assert!(error.contains("no first parent"), "{error}");
+    }
+
+    #[test]
     fn target_ref_is_only_a_conversation_head() {
-        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_ok());
+        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_ok());
         assert!(validate_target_ref("refs/heads/main").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/chat-1/status").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/a/head/b/head").is_err());
-        assert!(validate_target_ref("refs/caos/conversations/a/title/b/head").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/status").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/a/head/b/head").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/a/title/b/head").is_err());
         assert!(validate_target_ref(&format!(
-            "refs/caos/conversations/{}/head",
+            "refs/caos/v2/conversations/{}/head",
             "a".repeat(124)
         ))
         .is_ok());
         assert!(validate_target_ref(&format!(
-            "refs/caos/conversations/{}/head",
+            "refs/caos/v2/conversations/{}/head",
             "a".repeat(125)
         ))
         .is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_err());
+        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_err());
     }
 
     #[test]
@@ -431,14 +541,14 @@ mod tests {
         let task = "a".repeat(40);
         assert_eq!(
             event_task_status(
-                &json!({"kind": EVENT_KIND, "async": {"task": "oops", "status": "complete"}}),
+                &json!({"async": {"task": "oops", "status": "complete"}}),
                 &task
             ),
             None
         );
         assert_eq!(
             event_task_status(
-                &json!({"kind": EVENT_KIND, "async": {"task": task, "status": "failed"}}),
+                &json!({"async": {"task": task, "status": "failed"}}),
                 &task
             )
             .as_deref(),

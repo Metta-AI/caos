@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end chat test against a scripted LLM. The remote
-# refs/caos/conversations/<id>/head ref is authoritative: every accepted
+# refs/caos/v2/conversations/<id>/head ref is authoritative: every accepted
 # event is on its first-parent spine, while title and membership refs are
 # presentation indexes. Remote work keeps advancing the head after the
 # submitting client disappears.
@@ -25,7 +25,7 @@ remote_tip() { # <ref>
   printf '%s\n' "${lines%%[[:space:]]*}"
 }
 capture_events() { # <head> <base> <output>
-  local current=$1 base_commit=$2 output=$3 count=0 message
+  local current=$1 base_commit=$2 output=$3 count=0 message parent declared_base roots=0
   : > "$output"
   while [ "$current" != "$base_commit" ]; do
     count=$((count + 1))
@@ -33,13 +33,23 @@ capture_events() { # <head> <base> <output>
       fail "event spine did not reach the conversation base"
     fi
     message=$(git show -s --format=%B "$current" | tr -d '\n')
-    case "$message" in
-      *'"kind":"caos-chat-event"'*) ;;
-      *) fail "non-chat commit $current on the event spine: $message" ;;
-    esac
+    jq -e 'type == "object" and (has("v") | not)' <<<"$message" >/dev/null \
+      || fail "invalid event $current on the conversation spine: $message"
     printf '%s\n' "$message" >> "$output"
-    current=$(git rev-parse "$current^1")
+    parent=$(git rev-parse "$current^1")
+    declared_base=$(jq -r '.base // empty' <<<"$message")
+    if [ -n "$declared_base" ]; then
+      [ "$declared_base" = "$parent" ] \
+        || fail "root event $current does not name its first parent as base"
+      [ "$declared_base" = "$base_commit" ] \
+        || fail "root event $current names the wrong conversation base"
+      roots=$((roots + 1))
+    elif [ "$parent" = "$base_commit" ]; then
+      fail "oldest event $current has no explicit base"
+    fi
+    current=$parent
   done
+  [ "$roots" -eq 1 ] || fail "event spine did not contain exactly one explicit base"
   EVENT_COUNT=$count
 }
 
@@ -90,9 +100,9 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 test_id=$(printf '%s' "${CAOS_SALT:-$(date +%s%N)}" | tr -cd '0-9a-zA-Z')
 conv="chat-$test_id"
-ref="refs/caos/conversations/$conv/head"
+ref="refs/caos/v2/conversations/$conv/head"
 queued_conv="queued-$conv"
-queued_ref="refs/caos/conversations/$queued_conv/head"
+queued_ref="refs/caos/v2/conversations/$queued_conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 opts=(--model test-model --base-url "http://$stub_host:$port")
 
@@ -120,7 +130,7 @@ if "$CAOS_CLI" chat "bad-$conv" -m "hello" --base "$badbase" "${opts[@]}" 2>base
   fail "chat accepted a base with top-level .caos"
 fi
 grep -q "\.caos" base.err || fail "reserved-base error is unclear"
-if remote_tip "refs/caos/conversations/bad-$conv/head" >/dev/null; then
+if remote_tip "refs/caos/v2/conversations/bad-$conv/head" >/dev/null; then
   fail "reserved-base failure created a conversation"
 fi
 if [ -e stub/request-1.json ]; then
@@ -138,8 +148,9 @@ git fetch -q caos "$tip1"
 [ "$(git show "$tip1:notes/todo.txt")" = "hello notes" ] || fail "untouched file was lost"
 capture_events "$tip1" "$base" turn1.events
 [ "$EVENT_COUNT" -ge 5 ] || fail "tool turn recorded only $EVENT_COUNT durable events"
-grep -qF '"author":"user","content":"create out.txt containing hi"' turn1.events \
-  || fail "user event is missing"
+jq -s -e --arg content "create out.txt containing hi" \
+  'any(.[]; .author == "user" and .content == $content)' \
+  turn1.events >/dev/null || fail "user event is missing"
 grep -q '"request":"[0-9a-f]\{40\}"' turn1.events || fail "exact request was not recorded"
 admission=""
 current=$tip1
@@ -158,33 +169,32 @@ request_head=$(jq -r '.request_head' <<<"$admission_event")
 [ "$(git rev-parse "$admission^1")" = "$request_head" ] \
   || fail "admission does not immediately follow its explicit user request head"
 request_event=$(git show -s --format=%B "$request_head" | tr -d '\n')
-[[ "$request_event" == *'"author":"user","content":"create out.txt containing hi"'* ]] \
+jq -e --arg content "create out.txt containing hi" \
+  '.author == "user" and .content == $content' \
+  <<<"$request_event" >/dev/null \
   || fail "admission request_head does not identify the submitted user event"
 tool_events=$(grep -cF 'toolu_01' turn1.events || true)
 [ "$tool_events" -ge 2 ] || fail "tool call and result were not both recorded"
 grep -qF '"name":"bash"' turn1.events || fail "tool name was not recorded"
 grep -qF "$T1_TEXT" turn1.events || fail "assistant result event is missing"
 
-title_ref="refs/caos/conversations/$conv/title"
-git ls-remote --refs caos "refs/caos/conversations/$conv/*" > conversation.refs
+title_ref="refs/caos/v2/conversations/$conv/title"
+git ls-remote --refs caos "refs/caos/v2/conversations/$conv/*" > conversation.refs
 [ "$(wc -l < conversation.refs)" -eq 2 ] \
   || fail "conversation does not have exactly its head and title refs"
 grep -q "[[:space:]]$ref$" conversation.refs || fail "canonical head ref is missing"
 grep -q "[[:space:]]$title_ref$" conversation.refs || fail "title ref is missing"
 
 git ls-remote --refs caos \
-  "refs/caos/users/*/conversations/*/$conv" > membership.refs
-[ "$(wc -l < membership.refs)" -eq 1 ] \
-  || fail "conversation does not have exactly one creator membership ref"
-grep -q "[[:space:]]refs/caos/users/[^/]*/conversations/active/$conv$" membership.refs \
-  || fail "creator membership is not active"
+  "refs/caos/v2/users/*/conversations/*/$conv" > membership.refs
+[ ! -s membership.refs ] || fail "conversation created a raw-ID membership ref"
 
 conversation_key="c-$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')"
 git ls-remote --refs caos \
-  "refs/caos/users/*/conversations/active/$conversation_key" > membership.refs
+  "refs/caos/v2/users/*/conversations/active/$conversation_key" > membership.refs
 [ "$(wc -l < membership.refs)" -eq 1 ] \
   || fail "conversation does not have exactly one creator membership ref"
-grep -q "[[:space:]]refs/caos/users/[^/]*/conversations/active/$conversation_key$" membership.refs \
+grep -q "[[:space:]]refs/caos/v2/users/[^/]*/conversations/active/$conversation_key$" membership.refs \
   || fail "creator membership is not active"
 
 echo "== remote work survives loss of its submitting client ==" >&2
@@ -225,8 +235,9 @@ done
 [ "$recovered" -eq 1 ] || fail "worker did not finish after client disconnect"
 [ "$tip2" != "$tip1" ] || fail "canonical head did not advance"
 capture_events "$tip2" "$base" turn2.events
-grep -qF '"author":"user","content":"and now?"' turn2.events \
-  || fail "second user event is missing"
+jq -s -e --arg content "and now?" \
+  'any(.[]; .author == "user" and .content == $content)' \
+  turn2.events >/dev/null || fail "second user event is missing"
 grep -qF "$T2_TEXT" turn2.events || fail "post-disconnect assistant event is missing"
 
 # The second request was constructed entirely by replaying the event spine.
@@ -247,12 +258,13 @@ grep -qF "assistant: $T2_TEXT" log.out || fail "log misses recovered assistant e
 fresh="chat-fresh-$test_id"
 "$CAOS_CLI" talk --new -c "$fresh" "fresh start" "${opts[@]}" >talk.out 2>talk.err
 grep -qF "$T3_TEXT" talk.out || fail "fresh conversation response is missing"
-auto_ref="refs/caos/conversations/$fresh/head"
+auto_ref="refs/caos/v2/conversations/$fresh/head"
 auto_tip=$(remote_tip "$auto_ref") || fail "talk --new did not create $auto_ref"
 git fetch -q caos "$auto_tip"
-git show -s --format=%B "$auto_tip" | grep -qF '"kind":"caos-chat-event"' \
-  || fail "fresh conversation head is not a chat event"
-if git ls-remote --refs caos "refs/caos/conversations/$fresh/from-*" | grep -q .; then
+git show -s --format=%B "$auto_tip" \
+  | jq -e 'type == "object" and (has("v") | not)' >/dev/null \
+  || fail "fresh conversation head is not an unversioned JSON event"
+if git ls-remote --refs caos "refs/caos/v2/conversations/$fresh/from-*" | grep -q .; then
   fail "fresh conversation created legacy refs"
 fi
 

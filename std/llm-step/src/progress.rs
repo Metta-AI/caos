@@ -3,7 +3,7 @@
 //! The worker image has no `git`, so this module uses the server's object API
 //! and exact-ref compare-and-append endpoint. Event objects are stored before
 //! the ref moves. A successful return therefore means the event is reachable
-//! from `refs/caos/conversations/<id>/head`; failures are never downgraded
+//! from `refs/caos/v2/conversations/<id>/head`; failures are never downgraded
 //! to observability warnings.
 
 use std::cmp::Ordering;
@@ -12,7 +12,6 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 
-const EVENT_KIND: &str = "caos-chat-event";
 use crate::validate_hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,17 +186,67 @@ fn append_event_at_head_inner(
 }
 
 fn validate_event(event: &Value) -> Result<(), String> {
-    if !event.is_object() || event.get("kind").and_then(Value::as_str) != Some(EVENT_KIND) {
-        return Err(format!(
-            "conversation event must be a JSON object with kind {EVENT_KIND:?}"
-        ));
+    validate_stored_event(event)?;
+    if event.get("base").is_some() {
+        return Err("an append event must not introduce a conversation base".to_string());
+    }
+    if event.get("forked_from").is_some() {
+        return Err("a worker append must not introduce a conversation fork".to_string());
     }
     Ok(())
 }
 
+fn validate_stored_event(event: &Value) -> Result<(), String> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| "conversation event must be a JSON object".to_string())?;
+    if object.contains_key("v") {
+        return Err(
+            "conversation event must not carry a version; refs/caos/v2 selects the protocol"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(base) = event.get("base") else {
+        return Ok(false);
+    };
+    let base = base
+        .as_str()
+        .ok_or_else(|| "conversation event base is not a string".to_string())?;
+    validate_hash(base, "conversation base")?;
+    if base != first_parent {
+        return Err(format!(
+            "conversation root declares base {base}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(forked_from) = event.get("forked_from") else {
+        return Ok(false);
+    };
+    if event.get("base").is_some() {
+        return Err("a conversation fork marker must not introduce a new base".to_string());
+    }
+    let forked_from = forked_from
+        .as_str()
+        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
+    validate_hash(forked_from, "forked_from")?;
+    if forked_from != first_parent {
+        return Err(format!(
+            "conversation fork marker declares {forked_from}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
+}
+
 /// Read all chat events reachable from the canonical conversation head,
-/// following only the first parent. The first non-event commit is the
-/// workspace base and is deliberately excluded.
+/// following only the first parent through the event that explicitly names
+/// its ordinary workspace parent as `base`.
 pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
     let refname = conversation_ref(conversation)?;
     let base = server_base()?;
@@ -208,23 +257,24 @@ pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
 
     loop {
         let commit = fetch_commit(&base, &current)?;
-        let value = match serde_json::from_str::<Value>(commit.message.trim()) {
-            Ok(value)
-                if value.is_object()
-                    && value.get("kind").and_then(Value::as_str) == Some(EVENT_KIND) =>
-            {
-                value
-            }
-            _ if !newest_first.is_empty() => break,
-            _ => return Err(format!("conversation head {head} is not a {EVENT_KIND} event")),
-        };
+        let value = serde_json::from_str::<Value>(commit.message.trim()).map_err(|error| {
+            format!("conversation history commit {current} is not a JSON event: {error}")
+        })?;
+        validate_stored_event(&value)
+            .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
         let parent = commit.parents.first().cloned();
+        let parent = required_event_parent(parent.as_deref(), &current)?;
+        let is_root = validate_event_base(&value, &parent)?;
+        validate_fork_marker(&value, &parent)?;
         newest_first.push(ConversationEvent {
             commit: current.clone(),
             tree: commit.tree,
             value,
         });
-        current = required_event_parent(parent.as_deref(), &current)?;
+        current = parent;
+        if is_root {
+            break;
+        }
     }
     newest_first.reverse();
     Ok(ConversationLog {
@@ -241,14 +291,14 @@ fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, St
 
 pub(crate) fn conversation_ref(conversation: &str) -> Result<String, String> {
     validate_conversation(conversation)?;
-    Ok(format!("refs/caos/conversations/{conversation}/head"))
+    Ok(format!("refs/caos/v2/conversations/{conversation}/head"))
 }
 
 /// Validate an already-formed canonical conversation head ref with the same
 /// grammar used when this crate constructs one from a conversation id.
 pub(crate) fn validate_conversation_ref(refname: &str) -> Result<(), String> {
     let Some(conversation) = refname
-        .strip_prefix("refs/caos/conversations/")
+        .strip_prefix("refs/caos/v2/conversations/")
         .and_then(|rest| rest.strip_suffix("/head"))
     else {
         return Err(format!("invalid target conversation ref {refname:?}"));
@@ -911,7 +961,7 @@ mod tests {
     fn validates_conversation_ids_and_reserves_ref_channel_components() {
         assert_eq!(
             conversation_ref("project/talk-1").unwrap(),
-            "refs/caos/conversations/project/talk-1/head"
+            "refs/caos/v2/conversations/project/talk-1/head"
         );
         assert!(conversation_ref(&"a".repeat(124)).is_ok());
         assert!(conversation_ref(&"a".repeat(125)).is_err());
@@ -929,14 +979,14 @@ mod tests {
             .unwrap_err()
             .contains("lowercase"));
         assert!(
-            validate_conversation_ref("refs/caos/conversations/project/talk-1/head").is_ok()
+            validate_conversation_ref("refs/caos/v2/conversations/project/talk-1/head").is_ok()
         );
         assert!(
-            validate_conversation_ref("refs/caos/conversations/project/head/talk-1/head")
+            validate_conversation_ref("refs/caos/v2/conversations/project/head/talk-1/head")
                 .is_err()
         );
         assert!(validate_conversation_ref(
-            "refs/caos/v2/conversations/project/talk-1/head"
+            "refs/caos/conversations/project/talk-1/head"
         )
         .is_err());
     }
@@ -1140,12 +1190,24 @@ mod tests {
     }
 
     #[test]
-    fn only_stably_discriminated_objects_are_events() {
-        assert!(validate_event(&serde_json::json!({"kind": "caos-chat-event"})).is_ok());
-        assert!(validate_event(&serde_json::json!({"kind": "other"})).is_err());
+    fn append_events_are_unversioned_objects_without_a_base() {
+        assert!(validate_event(&serde_json::json!({"status": "idle"})).is_ok());
+        assert!(validate_event(&serde_json::json!({"kind": "future-field"})).is_ok());
         assert!(validate_event(&serde_json::json!({"v": 2})).is_err());
-        assert!(validate_event(&serde_json::json!({"status": "idle"})).is_err());
+        assert!(validate_event(&serde_json::json!({"base": A})).is_err());
+        assert!(validate_event(&serde_json::json!({"forked_from": A})).is_err());
         assert!(validate_event(&serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn fork_markers_inherit_instead_of_replacing_the_root_boundary() {
+        assert!(validate_fork_marker(&serde_json::json!({"forked_from": A}), A).is_ok());
+        assert!(validate_fork_marker(
+            &serde_json::json!({"base": A, "forked_from": A}),
+            A
+        )
+        .is_err());
+        assert!(validate_fork_marker(&serde_json::json!({"forked_from": B}), A).is_err());
     }
 
     #[test]
@@ -1162,7 +1224,7 @@ mod tests {
     #[test]
     fn fetched_commit_cache_reuses_immutable_spine_objects_per_server() {
         let content = format!(
-            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"kind\":\"caos-chat-event\"}}\n"
+            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"status\":\"idle\"}}\n"
         );
         let mut object = format!("commit {}\0", content.len()).into_bytes();
         object.extend_from_slice(content.as_bytes());

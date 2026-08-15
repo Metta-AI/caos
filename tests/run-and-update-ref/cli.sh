@@ -31,7 +31,7 @@ only_status_event() {
   [ "$(git rev-parse "$before^{tree}")" = "$(git rev-parse "$after^{tree}")" ] \
     || fail "status event changed the workspace"
   [ "$(git show -s --format=%B "$after" | jq -r --arg task "$task" \
-      'select(.async.task == $task) | .async.status')" = "$status" ] \
+      'select((has("v") | not) and (has("base") | not) and .async.task == $task) | .async.status')" = "$status" ] \
     || fail "status event did not record $task as $status"
 }
 
@@ -53,10 +53,13 @@ echo "== initialize two conversation heads ==" >&2
 printf 'workspace survives\n' > workspace.txt
 commit "conversation base"
 base=$(git rev-parse HEAD)
+initial_head=$(printf '%s\n' "{\"base\":\"$base\",\"status\":\"idle\"}" \
+  | git -c user.email=test@caos -c user.name=caos \
+    commit-tree "$base^{tree}" -p "$base")
 suffix=${base:0:12}
-success_ref="refs/caos/conversations/run-update-success-$suffix/head"
-failure_ref="refs/caos/conversations/run-update-failure-$suffix/head"
-git push -q caos "HEAD:$success_ref" "HEAD:$failure_ref"
+success_ref="refs/caos/v2/conversations/run-update-success-$suffix/head"
+failure_ref="refs/caos/v2/conversations/run-update-failure-$suffix/head"
+git push -q caos "$initial_head:$success_ref" "$initial_head:$failure_ref"
 
 worker=$("$CAOS_CLI" curry DEEP-DEPS/run-and-update-ref --)
 prepare_worker=$("$CAOS_CLI" curry DEEP-DEPS/bash -- --worker1:@=test/prepare.sh)
@@ -75,11 +78,11 @@ diff -r expected actual >/dev/null || fail "Q changed R's result contents"
 
 success_head=$(remote_head "$success_ref")
 git -c fetch.negotiationAlgorithm=noop fetch -q caos "$success_head"
-[ "$(git rev-parse "$success_head^")" = "$base" ] \
+[ "$(git rev-parse "$success_head^")" = "$initial_head" ] \
   || fail "complete event is not based on the conversation head"
 [ "$(git show "$success_head:workspace.txt")" = "workspace survives" ] \
   || fail "status append lost the workspace"
-only_status_event "$base" "$success_head" "$success_task" complete
+only_status_event "$initial_head" "$success_head" "$success_task" complete
 [ -n "$(remote_exact_ref "refs/caos/res/$success_task")" ] \
   || fail "status event is not named by Q"
 
@@ -102,9 +105,9 @@ grep -q "exit status: 23" failed/error \
 
 failure_head=$(remote_head "$failure_ref")
 git -c fetch.negotiationAlgorithm=noop fetch -q caos "$failure_head"
-[ "$(git rev-parse "$failure_head^")" = "$base" ] \
+[ "$(git rev-parse "$failure_head^")" = "$initial_head" ] \
   || fail "failed event is not based on the conversation head"
-only_status_event "$base" "$failure_head" "$failure_task" failed
+only_status_event "$initial_head" "$failure_head" "$failure_task" failed
 [ -n "$(remote_exact_ref "refs/caos/res/$failure_task")" ] \
   || fail "structured failure is not available through Q"
 

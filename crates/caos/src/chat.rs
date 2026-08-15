@@ -1,7 +1,7 @@
 //! Chat: one append-only ref containing every durable conversation event.
 //!
 //! The only authoritative pointer is
-//! `refs/caos/conversations/<id>/head`. An idle submit prepares the exact
+//! `refs/caos/v2/conversations/<id>/head`. An idle submit prepares the exact
 //! request from a user event, then publishes that event and its queued admission
 //! child with one compare-and-swap push. A submit during an active run appends
 //! an interjection and returns the already-admitted request for reconciliation.
@@ -17,9 +17,8 @@ use serde_json::{json, Value};
 
 use super::{curry_object, prepare_request, request_compute, GitTransport, Transport, CAOS_REMOTE};
 
-const CONVERSATION_PREFIX: &str = "refs/caos/conversations/";
+const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
 const HEAD_SUFFIX: &str = "/head";
-const EVENT_KIND: &str = "caos-chat-event";
 const MAX_CONVERSATION_ID_BYTES: usize = 124;
 const MAX_APPEND_ATTEMPTS: usize = 32;
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -52,12 +51,16 @@ pub enum TurnEvent {
     AssistantText(String),
     ToolCall {
         step_commit: String,
+        request: String,
+        round: u64,
         tool_use_id: String,
         name: String,
         summary: String,
     },
     ToolResult {
         step_commit: String,
+        request: String,
+        round: u64,
         tool_use_id: String,
         is_error: bool,
         content: String,
@@ -103,6 +106,17 @@ pub struct ConversationTurnEvents {
 pub struct ConversationReplay {
     pub turns: Vec<ConversationTurn>,
     pub turn_events: Vec<ConversationTurnEvents>,
+}
+
+/// One consistent read of the durable conversation spine for rich clients.
+/// Keeping these projections together prevents a reload from walking the same
+/// inherited history once for the transcript, again for the workspace, and a
+/// third time for status.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationLoad {
+    pub snapshot: ConversationSnapshot,
+    pub replay: ConversationReplay,
+    pub workspace_diff: WorkspaceDiff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +200,14 @@ struct StoredEvent {
     value: Value,
 }
 
+#[derive(Clone, Debug)]
+struct DurableConversation {
+    events: Vec<StoredEvent>,
+    base_commit: String,
+    head: String,
+    snapshot: ConversationSnapshot,
+}
+
 /// Choose an explicit conversation, the newest existing one, or a fresh
 /// `talk-N`. The remote canonical refs are the source of truth.
 pub fn pick_conversation(
@@ -240,18 +262,7 @@ pub fn conversation_snapshot(
     t: &GitTransport,
     id: &str,
 ) -> Result<Option<ConversationSnapshot>, String> {
-    let refname = conversation_ref(id)?;
-    let Some(head) = remote_ref(t, &refname)? else {
-        return Ok(None);
-    };
-    fetch_conversation_commit(t, &refname, &head)?;
-
-    let snapshot = conversation_snapshot_at(t, id, &head)?;
-    // This ref is only a fetch-negotiation cache. Once the remote head has
-    // been read successfully, a local lock race or read-only checkout must not
-    // turn that authoritative state into a failed refresh.
-    let _ = update_local_cache(t, &refname, &head);
-    Ok(Some(snapshot))
+    durable_conversation(t, id).map(|conversation| conversation.map(|state| state.snapshot))
 }
 
 /// Read only the authoritative pointer. Followers use this cheap check before
@@ -278,41 +289,80 @@ fn conversation_snapshot_at(
     id: &str,
     head: &str,
 ) -> Result<ConversationSnapshot, String> {
-    fetch_commit(t, head)?;
+    durable_conversation_at(t, id, head).map(|state| state.snapshot)
+}
 
+fn durable_conversation(t: &GitTransport, id: &str) -> Result<Option<DurableConversation>, String> {
+    let refname = conversation_ref(id)?;
+    let Some(head) = remote_ref(t, &refname)? else {
+        return Ok(None);
+    };
+    fetch_conversation_commit(t, &refname, &head)?;
+    let conversation = durable_conversation_from_local(t, id, &head)?;
+    // This ref is only a fetch-negotiation cache. Once the remote head has
+    // been read successfully, a local lock race or read-only checkout must not
+    // turn that authoritative state into a failed refresh.
+    let _ = update_local_cache(t, &refname, &head);
+    Ok(Some(conversation))
+}
+
+fn durable_conversation_at(
+    t: &GitTransport,
+    id: &str,
+    head: &str,
+) -> Result<DurableConversation, String> {
+    fetch_commit(t, head)?;
+    durable_conversation_from_local(t, id, head)
+}
+
+fn durable_conversation_from_local(
+    t: &GitTransport,
+    id: &str,
+    head: &str,
+) -> Result<DurableConversation, String> {
     let mut newest_first = Vec::new();
     let mut current = head.to_string();
+    let mut fork_base = None;
     loop {
         let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
-        let value = match serde_json::from_str::<Value>(message.trim()) {
-            Ok(value) if is_conversation_event(&value) => value,
-            // The first non-event parent is the ordinary workspace commit on
-            // which the conversation began. The canonical tip itself, however,
-            // must always be an event: treating a corrupt or mispointed tip as
-            // an empty conversation makes intact history appear to vanish.
-            _ if !newest_first.is_empty() => break,
-            _ => {
-                return Err(format!(
-                    "conversation head {head} is not a {EVENT_KIND} event"
-                ))
-            }
-        };
+        let value = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
+            format!("conversation history commit {current} is not a JSON event: {error}")
+        })?;
+        validate_conversation_event(&value)
+            .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
+        let parent = t
+            .git_capture(
+                &["rev-parse", "--verify", "--quiet", &format!("{current}^1")],
+                None,
+            )
+            .map_err(|error| format!("conversation event {current} has no first parent: {error}"))?
+            .trim()
+            .to_string();
+        validate_hash(&parent, "conversation event parent")?;
+        let is_root = validate_event_base(&value, &parent)?;
+        let is_fork = validate_fork_marker(&value, &parent)?;
+        if fork_base.is_none() && is_fork {
+            // The commit graph is authoritative. `forked_from` is retained as
+            // readable metadata, but it may never choose a Git argument.
+            fork_base = Some(parent.clone());
+        }
         newest_first.push(StoredEvent {
             commit: current.clone(),
             value,
         });
-        let parent = t
-            .git_capture(
-                &["rev-parse", "--verify", "--quiet", &format!("{current}^")],
-                None,
-            )
-            .map_err(|_| format!("conversation event {current} has no first parent"))?;
-        let parent = parent.trim();
-        validate_hash(parent, "conversation event parent")?;
-        current = parent.to_string();
+        current = parent;
+        if is_root {
+            break;
+        }
     }
     newest_first.reverse();
-    fold_events(id, head, &newest_first)
+    let snapshot = fold_events(id, head, &newest_first)?;
+    Ok(DurableConversation {
+        events: newest_first,
+        base_commit: fork_base.unwrap_or(current),
+        head: head.to_string(),
+        snapshot,
+    })
 }
 
 /// Persist a user message before returning. An idle submit atomically publishes
@@ -536,36 +586,38 @@ where
         }
 
         let mut user_event = json!({
-            "kind": EVENT_KIND,
             "author": "user",
             "username": username,
             "content": message,
         });
         if observed.is_none() {
+            user_event["base"] = Value::String(parent.clone());
             user_event["title"] = Value::String(initial_title.clone());
         }
 
         if let WorkspaceProposal::Conflict(conflict) = &workspace {
             let error = conflict.message();
-            // An interjection never owns the active request's lifecycle. In
-            // particular, a rejected workspace proposal must not append a
-            // conversation-level `failed` event that makes the request's real
-            // owner stop following an otherwise healthy turn.
+            // A conflicting proposal never owns an already-active request's
+            // lifecycle. This check is based on the current durable state, not
+            // on how the submit started: an idle submit can lose its CAS to a
+            // new admission and become an interjection on retry. Appending a
+            // conversation-level `failed` event in that case would terminate
+            // the winner's otherwise healthy turn.
+            if let Some(head) = observed.as_deref() {
+                let snapshot = conversation_snapshot_at(t, id, head)?;
+                if request_is_active(&snapshot.status) {
+                    snapshot.request.ok_or_else(|| {
+                        format!("active conversation {id:?} has no durably recorded request")
+                    })?;
+                    return Err(error);
+                }
+            }
             if !admit_when_idle {
                 return Err(error);
             }
             user_event["status"] = Value::String("failed".to_string());
             user_event["error"] = Value::String(error.clone());
             user_event["workspace_conflict"] = conflict.value();
-            if let Some(head) = observed.as_deref() {
-                let snapshot = conversation_snapshot_at(t, id, head)?;
-                if request_is_active(&snapshot.status) {
-                    let request = snapshot.request.ok_or_else(|| {
-                        format!("active conversation {id:?} has no durably recorded request")
-                    })?;
-                    user_event["request"] = Value::String(request);
-                }
-            }
             let event = create_event_commit_with_parents(
                 t,
                 &parent_tree,
@@ -642,7 +694,6 @@ where
         // cycle; publishing the admission tip makes both visible in one CAS.
         let request = prepare(t, options, id, &user)?;
         let admission = json!({
-            "kind": EVENT_KIND,
             "status": "queued",
             "request": request.clone(),
             "request_head": user,
@@ -1012,7 +1063,7 @@ pub fn reconcile_active_request(t: &GitTransport, id: &str) -> Result<Option<Str
     Ok(Some(request))
 }
 
-const USER_INDEX_PREFIX: &str = "refs/caos/users/";
+const USER_INDEX_PREFIX: &str = "refs/caos/v2/users/";
 
 fn user_key(user: &str) -> Result<String, String> {
     let user = normalized_username(user).ok_or_else(|| {
@@ -1235,6 +1286,54 @@ fn push_active_membership_create_only(
     .map(|_| ())
 }
 
+/// Materialize a fork before its first new message. Replay follows the marker's
+/// first parent, while workspace diffing treats `from` as the fork's base.
+pub fn fork_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: &str,
+    from: &str,
+) -> Result<String, String> {
+    validate_hash(from, "fork source")?;
+    let title = validate_conversation_title(title)?;
+    let refname = conversation_ref(id)?;
+    let title_ref = conversation_title_ref(id)?;
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    fetch_commit(t, from)?;
+    // A JSON-looking ordinary commit is not a valid fork source. Validate the
+    // complete inherited event spine through its explicit root boundary.
+    durable_conversation_from_local(t, id, from)
+        .map_err(|error| format!("invalid fork source {from}: {error}"))?;
+    let tree = t
+        .git_capture(&["rev-parse", &format!("{from}^{{tree}}")], None)?
+        .trim()
+        .to_string();
+    let event = json!({
+        "forked_from": from,
+        "title": title,
+        "status": "idle",
+        "request": Value::Null,
+    });
+    let candidate = create_event_commit(t, &tree, from, &event)?;
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    let fork = push_new_conversation(
+        t,
+        id,
+        NewConversationRefs {
+            head: &refname,
+            title: &title_ref,
+            active: &active_ref,
+            archived: &archived_ref,
+        },
+        &candidate,
+        &title_hash,
+    )?;
+    let _ = update_local_cache(t, &refname, &fork);
+    Ok(fork)
+}
+
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
     let title = validate_conversation_title(title)?;
     let hash = t.put_object("blob", title.as_bytes())?.to_string();
@@ -1251,8 +1350,8 @@ pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result
     .map(|_| ())
 }
 
-/// Replace an automatically chosen title only while the deterministic title
-/// published with the first message is still current. Any manual rename wins.
+/// Replace a generated title only while the caller's last observed title is
+/// still current. A manual rename from another client wins the lease race.
 pub fn compare_and_set_conversation_title(
     t: &GitTransport,
     id: &str,
@@ -1502,32 +1601,6 @@ pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a
     unreachable!("the integer conversation-name space is not finite")
 }
 
-fn durable_conversation_events(
-    t: &GitTransport,
-    id: &str,
-) -> Result<(Vec<StoredEvent>, String, String), String> {
-    let snapshot =
-        conversation_snapshot(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
-    let mut newest_first = Vec::new();
-    let mut current = snapshot.head.clone();
-    loop {
-        let message = t.git_capture(&["show", "-s", "--format=%B", &current], None)?;
-        let value = serde_json::from_str::<Value>(message.trim()).ok();
-        if !value.as_ref().is_some_and(is_conversation_event) {
-            newest_first.reverse();
-            return Ok((newest_first, current, snapshot.head));
-        }
-        newest_first.push(StoredEvent {
-            commit: current.clone(),
-            value: value.expect("checked above"),
-        });
-        current = t
-            .git_capture(&["rev-parse", &format!("{current}^1")], None)?
-            .trim()
-            .to_string();
-    }
-}
-
 fn value_text(value: &Value) -> String {
     value
         .as_str()
@@ -1574,15 +1647,31 @@ fn tool_call_summary(name: &str, args: &Value) -> String {
     }
 }
 
+fn durable_tool_scope(event: &StoredEvent) -> (String, u64) {
+    match (
+        event.value.get("request").and_then(Value::as_str),
+        event.value.get("round").and_then(Value::as_u64),
+    ) {
+        (Some(request), Some(round)) => (request.to_string(), round),
+        // Malformed records were historically rendered best-effort. Keep that
+        // behavior without letting two such records share a bare tool id: an
+        // event-local scope cannot accidentally complete another event's call.
+        _ => (event.commit.clone(), 0),
+    }
+}
+
 fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
     let mut events = Vec::new();
     if let Some(calls) = event.value.get("calls").and_then(Value::as_array) {
+        let (request, round) = durable_tool_scope(event);
         for call in calls {
             let id = call.get("id").and_then(Value::as_str).unwrap_or("tool");
             let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
             let args = call.get("args").cloned().unwrap_or(Value::Null);
             events.push(TurnEvent::ToolCall {
                 step_commit: event.commit.clone(),
+                request: request.clone(),
+                round,
                 tool_use_id: id.to_string(),
                 name: name.to_string(),
                 summary: tool_call_summary(name, &args),
@@ -1590,13 +1679,16 @@ fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
         }
     }
     if let Some(result) = event.value.get("result") {
+        let (request, round) = durable_tool_scope(event);
+        let tool_use_id = result
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
         events.push(TurnEvent::ToolResult {
             step_commit: event.commit.clone(),
-            tool_use_id: result
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string(),
+            request,
+            round,
+            tool_use_id: tool_use_id.to_string(),
             is_error: result
                 .get("is_error")
                 .and_then(Value::as_bool)
@@ -1610,11 +1702,10 @@ fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
     events
 }
 
-pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationReplay, String> {
-    let (events, _base, head) = durable_conversation_events(t, id)?;
+fn replay_from_events(events: &[StoredEvent], head: &str) -> ConversationReplay {
     let mut turns = Vec::new();
     let mut activity = Vec::new();
-    for event in &events {
+    for event in events {
         activity.extend(durable_turn_events(event));
         let Some(content) = event.value.get("content").and_then(Value::as_str) else {
             continue;
@@ -1646,27 +1737,38 @@ pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationRep
             message: content.to_string(),
         });
     }
-    Ok(ConversationReplay {
+    ConversationReplay {
         turns,
         turn_events: (!activity.is_empty())
             .then_some(ConversationTurnEvents {
-                turn_commit: head,
+                turn_commit: head.to_string(),
                 events: activity,
             })
             .into_iter()
             .collect(),
-    })
+    }
 }
 
-pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<WorkspaceDiff, String> {
-    let (_events, base_commit, head) = durable_conversation_events(t, id)?;
+pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationReplay, String> {
+    let conversation =
+        durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    Ok(replay_from_events(&conversation.events, &conversation.head))
+}
+
+fn workspace_diff(
+    t: &GitTransport,
+    base_commit: &str,
+    head: &str,
+) -> Result<WorkspaceDiff, String> {
+    validate_hash(base_commit, "conversation workspace base")?;
+    validate_hash(head, "conversation workspace head")?;
     let patch = t.git_capture(
         &[
             "diff",
             "--no-ext-diff",
             "--no-color",
-            &base_commit,
-            &head,
+            base_commit,
+            head,
             "--",
             ".",
             ":(exclude).caos",
@@ -1674,9 +1776,48 @@ pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<Workspa
         None,
     )?;
     Ok(WorkspaceDiff {
-        base_commit,
-        head,
+        base_commit: base_commit.to_string(),
+        head: head.to_string(),
         patch,
+    })
+}
+
+pub fn conversation_workspace_diff(t: &GitTransport, id: &str) -> Result<WorkspaceDiff, String> {
+    let conversation =
+        durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    workspace_diff(t, &conversation.base_commit, &conversation.head)
+}
+
+/// Build the transcript, status, and workspace projection from one remote read
+/// and one first-parent traversal.
+pub fn conversation_load(t: &GitTransport, id: &str) -> Result<Option<ConversationLoad>, String> {
+    let Some(conversation) = durable_conversation(t, id)? else {
+        return Ok(None);
+    };
+    load_durable_conversation(t, conversation).map(Some)
+}
+
+/// Build all rich-client projections at a head the caller already proved and
+/// holds locally, such as a fork commit accepted by the preceding atomic push.
+pub fn conversation_load_at(
+    t: &GitTransport,
+    id: &str,
+    head: &str,
+) -> Result<ConversationLoad, String> {
+    let conversation = durable_conversation_at(t, id, head)?;
+    load_durable_conversation(t, conversation)
+}
+
+fn load_durable_conversation(
+    t: &GitTransport,
+    conversation: DurableConversation,
+) -> Result<ConversationLoad, String> {
+    let replay = replay_from_events(&conversation.events, &conversation.head);
+    let workspace_diff = workspace_diff(t, &conversation.base_commit, &conversation.head)?;
+    Ok(ConversationLoad {
+        snapshot: conversation.snapshot,
+        replay,
+        workspace_diff,
     })
 }
 
@@ -1973,11 +2114,9 @@ fn create_event_commit_with_parents(
     for parent in parents {
         validate_hash(parent, "parent")?;
     }
-    if !is_conversation_event(event) {
-        return Err(format!(
-            "conversation event must be a JSON object with kind {EVENT_KIND:?}"
-        ));
-    }
+    validate_conversation_event(event)?;
+    validate_event_base(event, parents[0])?;
+    validate_fork_marker(event, parents[0])?;
     let message = serde_json::to_string(event)
         .map_err(|error| format!("serializing conversation event: {error}"))?;
     let mut args = vec!["commit-tree", tree];
@@ -2095,8 +2234,29 @@ fn push_head_cas_git(
     Err(pushed.expect_err("checked error above"))
 }
 
+struct NewConversationRefs<'a> {
+    head: &'a str,
+    title: &'a str,
+    active: &'a str,
+    archived: &'a str,
+}
+
 /// Publish a new canonical head, title, and active membership as one create-only
 /// transaction while proving archived membership absent.
+fn push_new_conversation(
+    t: &GitTransport,
+    id: &str,
+    refs: NewConversationRefs<'_>,
+    head: &str,
+    title_hash: &str,
+) -> Result<String, String> {
+    if let Some(published) = try_push_new_conversation(t, id, refs, head, title_hash, true)? {
+        Ok(published)
+    } else {
+        Err(format!("conversation {id:?} was created concurrently"))
+    }
+}
+
 fn try_push_initial_conversation(
     t: &GitTransport,
     user: &str,
@@ -2109,9 +2269,39 @@ fn try_push_initial_conversation(
     let title_ref = conversation_title_ref(id)?;
     let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
     let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    try_push_new_conversation(
+        t,
+        id,
+        NewConversationRefs {
+            head: head_ref,
+            title: &title_ref,
+            active: &active_ref,
+            archived: &archived_ref,
+        },
+        head,
+        &title_hash,
+        false,
+    )
+    .map(|published| published.is_some())
+}
+
+fn try_push_new_conversation(
+    t: &GitTransport,
+    id: &str,
+    refs: NewConversationRefs<'_>,
+    head: &str,
+    title_hash: &str,
+    recover_existing: bool,
+) -> Result<Option<String>, String> {
+    let NewConversationRefs {
+        head: head_ref,
+        title: title_ref,
+        active: active_ref,
+        archived: archived_ref,
+    } = refs;
     validate_hash(head, "new conversation head")?;
-    validate_hash(&title_hash, "new conversation title")?;
-    let leases = [head_ref, &title_ref, &active_ref, &archived_ref]
+    validate_hash(title_hash, "new conversation title")?;
+    let leases = [head_ref, title_ref, active_ref, archived_ref]
         .map(|refname| format!("--force-with-lease={refname}:"));
     let updates = [
         format!("{head}:{head_ref}"),
@@ -2135,7 +2325,7 @@ fn try_push_initial_conversation(
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     let pushed = t.git_capture(&refs, None);
     if pushed.is_ok() {
-        return Ok(true);
+        return Ok(Some(head.to_string()));
     }
 
     // A disconnected client can miss a successful push response. Once our
@@ -2147,27 +2337,99 @@ fn try_push_initial_conversation(
         t,
         [
             head_ref.to_string(),
-            title_ref.clone(),
-            active_ref.clone(),
-            archived_ref.clone(),
+            title_ref.to_string(),
+            active_ref.to_string(),
+            archived_ref.to_string(),
         ],
     )?;
     if let Some(observed_head) = observed.get(head_ref) {
-        let head_accepted = if observed_head == head {
+        let exact_candidate_accepted = if observed_head == head {
             true
         } else {
             fetch_commit(t, observed_head)?;
             first_parent_contains(t, observed_head, head)?
         };
-        if !head_accepted {
-            return Ok(false);
+        if exact_candidate_accepted && !recover_existing {
+            // Reaching our candidate proves the atomic create transaction
+            // succeeded. Title and membership refs may since have changed
+            // through a valid rename/archive; mutable presentation state must
+            // never turn a durable message back into a reported failure.
+            return Ok(Some(observed_head.clone()));
         }
-        return Ok(true);
+        let accepted_event = if exact_candidate_accepted {
+            Some(head.to_string())
+        } else {
+            recover_existing
+                .then(|| equivalent_event_ancestor(t, id, observed_head, head))
+                .transpose()?
+                .flatten()
+        };
+        let Some(accepted_event) = accepted_event else {
+            return Ok(None);
+        };
+
+        let active_accepted = match observed.get(active_ref) {
+            Some(observed_active) if observed_active == &accepted_event => true,
+            Some(observed_active) => {
+                fetch_commit(t, observed_active)?;
+                first_parent_contains(t, observed_active, &accepted_event)?
+            }
+            None => false,
+        };
+        let title_present = observed.contains_key(title_ref);
+        if active_accepted && observed.contains_key(archived_ref) {
+            return Err(format!("conversation {id:?} is both active and archived"));
+        }
+        if title_present && (active_accepted || observed.contains_key(archived_ref)) {
+            return Ok(Some(observed_head.clone()));
+        }
+
+        // A logically identical fork marker can have a different commit OID
+        // when another client creates it in a later wall-clock second. Once the
+        // canonical marker and a title ref are present, repair only
+        // this user's absent membership. The two empty leases retain the same
+        // active/archived exclusion as the original creation transaction.
+        if recover_existing
+            && !observed.contains_key(active_ref)
+            && !observed.contains_key(archived_ref)
+            && title_present
+        {
+            let pushed =
+                push_active_membership_create_only(t, observed_head, active_ref, archived_ref);
+            if pushed.is_ok() {
+                return Ok(Some(observed_head.clone()));
+            }
+            let recovered = remote_refs(t, [active_ref.to_string(), archived_ref.to_string()])?;
+            if !recovered.contains_key(archived_ref) {
+                if let Some(recovered_active) = recovered.get(active_ref) {
+                    let recovered_accepted = if recovered_active == &accepted_event {
+                        true
+                    } else {
+                        fetch_commit(t, recovered_active)?;
+                        first_parent_contains(t, recovered_active, &accepted_event)?
+                    };
+                    if recovered_accepted {
+                        return Ok(Some(observed_head.clone()));
+                    }
+                }
+            }
+        }
+
+        let mut missing = Vec::new();
+        if !title_present {
+            missing.push(title_ref);
+        }
+        if !active_accepted && !observed.contains_key(archived_ref) {
+            missing.push(active_ref);
+        }
+        return Err(format!(
+            "conversation {id:?} exists, but this creation did not publish required refs: {}",
+            missing.join(", ")
+        ));
     }
-    let occupied = [&title_ref, &active_ref, &archived_ref]
+    let occupied = [title_ref, active_ref, archived_ref]
         .into_iter()
         .filter(|refname| observed.contains_key(*refname))
-        .map(String::as_str)
         .collect::<Vec<_>>();
     if !occupied.is_empty() {
         return Err(format!(
@@ -2176,6 +2438,52 @@ fn try_push_initial_conversation(
         ));
     }
     Err(pushed.expect_err("checked error above"))
+}
+
+/// Find a structurally identical event on the observed first-parent history.
+/// Git commit IDs include author/committer timestamps, so two clients can build
+/// the same logical fork marker with different IDs even though its tree,
+/// parents, and event payload are identical.
+fn equivalent_event_ancestor(
+    t: &GitTransport,
+    id: &str,
+    observed_head: &str,
+    candidate: &str,
+) -> Result<Option<String>, String> {
+    let candidate_message = t.git_capture(&["show", "-s", "--format=%B", candidate], None)?;
+    let candidate_event = serde_json::from_str::<Value>(candidate_message.trim())
+        .map_err(|_| format!("new conversation head {candidate} is not a conversation event"))?;
+    validate_conversation_event(&candidate_event)
+        .map_err(|error| format!("invalid new conversation head {candidate}: {error}"))?;
+    let candidate_tree = t
+        .git_capture(&["show", "-s", "--format=%T", candidate], None)?
+        .trim()
+        .to_string();
+    let candidate_parents = t
+        .git_capture(&["show", "-s", "--format=%P", candidate], None)?
+        .trim()
+        .to_string();
+    let conversation = durable_conversation_from_local(t, id, observed_head)?;
+    for event in conversation.events.iter().rev() {
+        if event.value != candidate_event {
+            continue;
+        }
+        let tree = t
+            .git_capture(&["show", "-s", "--format=%T", &event.commit], None)?
+            .trim()
+            .to_string();
+        if tree != candidate_tree {
+            continue;
+        }
+        let parents = t
+            .git_capture(&["show", "-s", "--format=%P", &event.commit], None)?
+            .trim()
+            .to_string();
+        if parents == candidate_parents {
+            return Ok(Some(event.commit.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Return the canonical append-only head ref for a validated conversation ID.
@@ -2276,11 +2584,12 @@ fn warn_skipped_conversation(id: &str, error: &str) {
 fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> {
     validate_hash(hash, "conversation tip")?;
     let mut current = hash.to_string();
+    let mut newest_activity_timestamp = None;
     // Worker events deliberately use epoch-zero commit identities so recovery
     // recreates the same proposal. Follow raw commit objects (not their trees)
-    // to the newest user event, whose ordinary client timestamp is the useful
-    // measure of which conversation was most recently used.
-    for _ in 0..4096 {
+    // to the newest user event or locally-created fork marker, whose ordinary
+    // client timestamp is the useful measure of recent activity.
+    loop {
         let (kind, content) = t.get_object(&current)?;
         if kind != "commit" {
             return Err(format!(
@@ -2293,39 +2602,48 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
         let (headers, message) = text.split_once("\n\n").ok_or_else(|| {
             format!("conversation history commit {current} has no message separator")
         })?;
-        let event = match serde_json::from_str::<Value>(message.trim()) {
-            Ok(event) if is_conversation_event(&event) => event,
-            _ => {
-                return Err(format!(
-                    "conversation history commit {current} is not a {EVENT_KIND} event"
-                ))
-            }
-        };
-        let parent = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("parent "))
+        let event = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
+            format!("conversation history commit {current} is not a JSON event: {error}")
+        })?;
+        validate_conversation_event(&event)
+            .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
+        let parent = first_parent_header(headers)
             .ok_or_else(|| format!("conversation event {current} has no first parent"))?;
         validate_hash(parent, "conversation event parent")?;
-        if event.get("author").and_then(Value::as_str) == Some("user") {
-            let line = headers
-                .lines()
-                .find(|line| line.starts_with("committer "))
-                .ok_or_else(|| format!("conversation event {current} has no committer header"))?;
-            return line
-                .split_whitespace()
-                .rev()
-                .nth(1)
-                .ok_or_else(|| format!("conversation event {current} has no commit timestamp"))?
-                .parse::<i64>()
-                .map_err(|error| {
-                    format!("conversation event {current} has an invalid timestamp: {error}")
-                });
+        let is_root = validate_event_base(&event, parent)?;
+        let is_fork = validate_fork_marker(&event, parent)?;
+        if newest_activity_timestamp.is_none()
+            && (is_fork || event.get("author").and_then(Value::as_str) == Some("user"))
+        {
+            newest_activity_timestamp = Some(commit_timestamp(headers, &current)?);
+        }
+        if is_root {
+            return match newest_activity_timestamp {
+                Some(timestamp) => Ok(timestamp),
+                None => commit_timestamp(headers, &current),
+            };
         }
         current = parent.to_string();
     }
-    Err(format!(
-        "conversation history from {hash} exceeded 4096 commits before a user event"
-    ))
+}
+
+fn first_parent_header(headers: &str) -> Option<&str> {
+    headers
+        .lines()
+        .find_map(|line| line.strip_prefix("parent "))
+}
+
+fn commit_timestamp(headers: &str, commit: &str) -> Result<i64, String> {
+    let line = headers
+        .lines()
+        .find(|line| line.starts_with("committer "))
+        .ok_or_else(|| format!("conversation event {commit} has no committer header"))?;
+    line.split_whitespace()
+        .rev()
+        .nth(1)
+        .ok_or_else(|| format!("conversation event {commit} has no commit timestamp"))?
+        .parse::<i64>()
+        .map_err(|error| format!("conversation event {commit} has an invalid timestamp: {error}"))
 }
 
 fn fetch_commit(t: &GitTransport, hash: &str) -> Result<(), String> {
@@ -2463,8 +2781,55 @@ fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_conversation_event(value: &Value) -> bool {
-    value.is_object() && value.get("kind").and_then(Value::as_str) == Some(EVENT_KIND)
+fn validate_conversation_event(value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "conversation event must be a JSON object".to_string())?;
+    if object.contains_key("v") {
+        return Err(
+            "conversation event must not carry a version; refs/caos/v2 selects the protocol"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Return true only for the absolute root of the inherited event spine.
+/// `base` is data rather than a heuristic: it must name the root's first
+/// parent exactly, so ordinary JSON commit messages cannot extend the log.
+fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(base) = event.get("base") else {
+        return Ok(false);
+    };
+    let base = base
+        .as_str()
+        .ok_or_else(|| "conversation event base is not a string".to_string())?;
+    validate_hash(base, "conversation base")?;
+    if base != first_parent {
+        return Err(format!(
+            "conversation root declares base {base}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
+    let Some(declared) = event.get("forked_from") else {
+        return Ok(false);
+    };
+    if event.get("base").is_some() {
+        return Err("a conversation fork marker must not introduce a new base".to_string());
+    }
+    let declared = declared
+        .as_str()
+        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
+    validate_hash(declared, "forked_from")?;
+    if declared != first_parent {
+        return Err(format!(
+            "conversation fork marker declares {declared}, but its first parent is {first_parent}"
+        ));
+    }
+    Ok(true)
 }
 
 fn fold_events(
@@ -2519,6 +2884,16 @@ fn fold_events(
     if let Some(request_head) = request_head.as_deref() {
         validate_hash(request_head, "conversation request head")?;
     }
+    let status = status.unwrap_or_else(|| "idle".to_string());
+    if request_is_active(&status) {
+        let request = request
+            .as_deref()
+            .ok_or_else(|| format!("active conversation {id:?} has no durably recorded request"))?;
+        let request_head = request_head.as_deref().ok_or_else(|| {
+            format!("active conversation {id:?} has no durably recorded request head")
+        })?;
+        validate_active_admission(events, request, request_head)?;
+    }
     let title = title
         .or_else(|| {
             messages
@@ -2530,11 +2905,52 @@ fn fold_events(
         id: id.to_string(),
         head: head.to_string(),
         title,
-        status: status.unwrap_or_else(|| "idle".to_string()),
+        status,
         request,
         request_head,
         messages,
     })
+}
+
+/// Prove that the folded active state comes from the protocol's atomic
+/// user-event/admission pair. Without this check, a raw progress event could
+/// make a follower dispatch a request before `llm-step` rejects its history.
+fn validate_active_admission(
+    events: &[StoredEvent],
+    request: &str,
+    request_head: &str,
+) -> Result<(), String> {
+    let position = events
+        .iter()
+        .position(|event| event.commit == request_head)
+        .ok_or_else(|| {
+            format!("active request head {request_head} is not on the conversation event spine")
+        })?;
+    let admission = events.get(position + 1).ok_or_else(|| {
+        format!("active request head {request_head} has no immediate admission event")
+    })?;
+    let admitted_request = admission
+        .value
+        .get("request")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("admission event after {request_head} has no string request"))?;
+    let admitted_head = admission
+        .value
+        .get("request_head")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("admission event after {request_head} has no string request_head")
+        })?;
+    let admitted_status = admission.value.get("status").and_then(Value::as_str);
+    if admitted_request != request
+        || admitted_head != request_head
+        || admitted_status != Some("queued")
+    {
+        return Err(format!(
+            "active request {request} is not admitted by the immediate event after {request_head}"
+        ));
+    }
+    Ok(())
 }
 
 fn waterfall_string(value: &Value, key: &str, target: &mut Option<String>) -> Result<(), String> {
@@ -2779,11 +3195,11 @@ fn run_line_turn(
         if let Some(request) = request {
             resume_request(t, &request)?;
         }
-        let snapshot = conversation_snapshot(t, id)?
+        let durable = durable_conversation(t, id)?
             .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;
-        let (events, _, _) = durable_conversation_events(t, id)?;
+        let snapshot = durable.snapshot;
         let mut current_turn = before_head.is_none();
-        for event in events {
+        for event in durable.events {
             if before_head.as_deref() == Some(event.commit.as_str()) {
                 current_turn = true;
                 continue;
@@ -2887,6 +3303,78 @@ mod tests {
         (root, repo, transport, base)
     }
 
+    fn fork_fixture(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caos-chat-fork-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let remote = root.join("remote.git");
+        let source_repo = root.join("source");
+        let client_repo = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+
+        std::fs::create_dir_all(&source_repo).unwrap();
+        test_git(&source_repo, &["init", "--quiet"]);
+        configure_test_repo(&source_repo, "source");
+        std::fs::write(source_repo.join("workspace"), "source tree\n").unwrap();
+        test_git(&source_repo, &["add", "workspace"]);
+        test_git(&source_repo, &["commit", "--quiet", "-m", "base"]);
+        test_git(
+            &source_repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        let source_transport = GitTransport::discover(&source_repo).unwrap();
+        let base = test_git(&source_repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&source_repo, &["rev-parse", "HEAD^{tree}"]);
+        let source = create_event_commit(
+            &source_transport,
+            &tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "username": "Source",
+                "content": "inherited message",
+                "status": "idle"
+            }),
+        )
+        .unwrap();
+        let source_ref = conversation_ref("source").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{source}:{source_ref}"),
+            ],
+        );
+
+        std::fs::create_dir_all(&client_repo).unwrap();
+        test_git(&client_repo, &["init", "--quiet"]);
+        configure_test_repo(&client_repo, "client");
+        std::fs::write(client_repo.join("client-only"), "different tree\n").unwrap();
+        test_git(&client_repo, &["add", "client-only"]);
+        test_git(&client_repo, &["commit", "--quiet", "-m", "client base"]);
+        test_git(
+            &client_repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        (root, source_repo, client_repo, source)
+    }
+
     fn event(value: Value) -> StoredEvent {
         event_at("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", value)
     }
@@ -2905,11 +3393,11 @@ mod tests {
             "one",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[
-                event_at(user, json!({"kind": EVENT_KIND, "author": "user", "username": "Alice", "content": "hello", "title": "First"})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": user, "status": "queued"})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "", "calls": [{"name": "bash"}]})),
-                event(json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "done", "status": "idle"})),
+                event_at(user, json!({"author": "user", "username": "Alice", "content": "hello", "title": "First"})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": user, "status": "queued"})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "", "calls": [{"name": "bash"}]})),
+                event(json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "author": "assistant", "content": "done", "status": "idle"})),
             ],
         )
         .unwrap();
@@ -2929,8 +3417,10 @@ mod tests {
             "fallback",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[
-                event(json!({"kind": "caos-chat-event", "title": "old", "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})),
-                event(json!({"kind": "caos-chat-event", "title": null, "request": null})),
+                event(
+                    json!({"title": "old", "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}),
+                ),
+                event(json!({"title": null, "request": null})),
             ],
         )
         .unwrap();
@@ -2989,11 +3479,22 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_is_stable_and_required() {
-        assert!(is_conversation_event(&json!({"kind": EVENT_KIND})));
-        assert!(!is_conversation_event(&json!({"kind": "other"})));
-        assert!(!is_conversation_event(&json!({"v": 2})));
-        assert!(!is_conversation_event(&json!({})));
+    fn event_version_lives_only_in_the_ref_namespace() {
+        assert!(validate_conversation_event(&json!({})).is_ok());
+        assert!(validate_conversation_event(&json!({"author": "user"})).is_ok());
+        assert!(validate_conversation_event(&json!({"v": 2})).is_err());
+        assert!(validate_conversation_event(&json!({"v": "2"})).is_err());
+        assert!(validate_conversation_event(&json!([])).is_err());
+    }
+
+    #[test]
+    fn explicit_base_must_match_the_first_parent() {
+        let base = "a".repeat(40);
+        assert_eq!(validate_event_base(&json!({}), &base), Ok(false));
+        assert_eq!(validate_event_base(&json!({"base": base}), &base), Ok(true));
+        assert!(validate_event_base(&json!({"base": "b".repeat(40)}), &base).is_err());
+        assert!(validate_event_base(&json!({"base": 7}), &base).is_err());
+        assert!(validate_fork_marker(&json!({"base": base, "forked_from": base}), &base).is_err());
     }
 
     #[test]
@@ -3003,7 +3504,7 @@ mod tests {
         }
         assert_eq!(
             conversation_ref("project/talk-1").unwrap(),
-            "refs/caos/conversations/project/talk-1/head"
+            "refs/caos/v2/conversations/project/talk-1/head"
         );
         assert!(conversation_ref(&"a".repeat(MAX_CONVERSATION_ID_BYTES)).is_ok());
         assert!(conversation_ref(&"a".repeat(MAX_CONVERSATION_ID_BYTES + 1)).is_err());
@@ -3012,8 +3513,8 @@ mod tests {
 
     #[test]
     fn membership_keys_preserve_slashes_without_ref_collisions() {
-        let active = "refs/caos/users/u-41/conversations/active/";
-        let archived = "refs/caos/users/u-41/conversations/archived/";
+        let active = "refs/caos/v2/users/u-41/conversations/active/";
+        let archived = "refs/caos/v2/users/u-41/conversations/archived/";
         assert_eq!(conversation_key("project").unwrap(), "c-70726f6a656374");
         let nested = conversation_key("project/talk-1").unwrap();
         assert_eq!(nested, "c-70726f6a6563742f74616c6b2d31");
@@ -3109,7 +3610,8 @@ mod tests {
     #[test]
     fn mixed_tool_result_blocks_render_text_instead_of_json() {
         let events = durable_turn_events(&event(json!({
-            "kind": "caos-chat-event",
+            "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "round": 2,
             "result": {
                 "tool_use_id": "toolu_1",
                 "content": [
@@ -3136,19 +3638,19 @@ mod tests {
             &[
                 event_at(
                     queued,
-                    json!({"kind": EVENT_KIND, "author": "user", "content": "start"}),
+                    json!({"author": "user", "content": "start"}),
                 ),
                 event_at(
                     admitted,
-                    json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": queued, "status": "queued"}),
+                    json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "request_head": queued, "status": "queued"}),
                 ),
                 event_at(
                     "3333333333333333333333333333333333333333",
-                    json!({"kind": EVENT_KIND, "author": "user", "content": "also this"}),
+                    json!({"author": "user", "content": "also this"}),
                 ),
                 event_at(
                     "4444444444444444444444444444444444444444",
-                    json!({"kind": EVENT_KIND, "request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"}),
+                    json!({"request": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "running"}),
                 ),
             ],
         )
@@ -3169,10 +3671,10 @@ mod tests {
             "one",
             "2222222222222222222222222222222222222222",
             &[
-                event_at(user, json!({"kind": "caos-chat-event","author":"user","content":"start"})),
+                event_at(user, json!({"author":"user","content":"start"})),
                 event_at(
                     "2222222222222222222222222222222222222222",
-                    json!({"kind": "caos-chat-event","request":request,"request_head":user,"status":"queued"}),
+                    json!({"request":request,"request_head":user,"status":"queued"}),
                 ),
             ],
         )
@@ -3180,6 +3682,49 @@ mod tests {
         assert_eq!(snapshot.status, "queued");
         assert_eq!(snapshot.request.as_deref(), Some(request));
         assert_eq!(snapshot.request_head.as_deref(), Some(user));
+    }
+
+    #[test]
+    fn active_fold_requires_the_immediate_matching_admission() {
+        let user = "1111111111111111111111111111111111111111";
+        let between = "2222222222222222222222222222222222222222";
+        let admission = "3333333333333333333333333333333333333333";
+        let request = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let error = fold_events(
+            "one",
+            admission,
+            &[
+                event_at(user, json!({"author":"user","content":"start"})),
+                event_at(between, json!({"author":"user","content":"interjected"})),
+                event_at(
+                    admission,
+                    json!({"request":request,"request_head":user,"status":"queued"}),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("admission event after"), "{error}");
+
+        let admitted = "2222222222222222222222222222222222222222";
+        let forged = "3333333333333333333333333333333333333333";
+        let other_request = "cccccccccccccccccccccccccccccccccccccccc";
+        let error = fold_events(
+            "one",
+            forged,
+            &[
+                event_at(user, json!({"author":"user","content":"start"})),
+                event_at(
+                    admitted,
+                    json!({"request":request,"request_head":user,"status":"queued"}),
+                ),
+                event_at(
+                    forged,
+                    json!({"request":other_request,"request_head":user,"status":"running"}),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("not admitted"), "{error}");
     }
 
     #[test]
@@ -3308,12 +3853,108 @@ mod tests {
     }
 
     #[test]
+    fn idle_workspace_submit_cannot_fail_a_concurrently_admitted_request() {
+        let (root, repo, transport, base) =
+            conversation_index_fixture("idle-workspace-admission-race");
+        let base_tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+
+        std::fs::write(repo.join("workspace"), "winner\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        let winner_tree = test_git(&repo, &["write-tree"]);
+        let winner_user = create_event_commit(
+            &transport,
+            &winner_tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "username": "Bob",
+                "content": "winning turn"
+            }),
+        )
+        .unwrap();
+        let winner_request = "b".repeat(40);
+        let winner_admission = create_event_commit(
+            &transport,
+            &winner_tree,
+            &winner_user,
+            &json!({
+                "status": "queued",
+                "request": winner_request,
+                "request_head": winner_user
+            }),
+        )
+        .unwrap();
+
+        std::fs::write(repo.join("workspace"), "proposal\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        let proposal_tree = test_git(&repo, &["write-tree"]);
+        let proposal = test_git(
+            &repo,
+            &[
+                "commit-tree",
+                &proposal_tree,
+                "-p",
+                &base,
+                "-m",
+                "losing workspace proposal",
+            ],
+        );
+
+        let refname = conversation_ref("shared").unwrap();
+        let published_winner = std::cell::Cell::new(false);
+        let error = submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "apply my workspace",
+            false,
+            Some(&proposal),
+            |t, _, _, _| {
+                assert!(!published_winner.replace(true));
+                t.git_capture(
+                    &[
+                        "push",
+                        "--quiet",
+                        CAOS_REMOTE,
+                        &format!("{winner_admission}:{refname}"),
+                    ],
+                    None,
+                )?;
+                Ok("a".repeat(40))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("conflicts"), "{error}");
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(winner_admission.as_str()),
+            "the losing proposal terminated the winner's request"
+        );
+        let snapshot = conversation_snapshot(&transport, "shared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status, "queued");
+        assert_eq!(snapshot.request.as_deref(), Some(winner_request.as_str()));
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].content, "winning turn");
+        assert_ne!(winner_tree, base_tree);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn invalid_username_metadata_fails_loudly() {
         let error = fold_events(
             "one",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[event(
-                json!({"kind": "caos-chat-event", "author": "user", "username": 7, "content": "hello"}),
+                json!({"author": "user", "username": 7, "content": "hello"}),
             )],
         )
         .unwrap_err();
@@ -3345,8 +3986,93 @@ mod tests {
 
         let transport = GitTransport::discover(&repo).unwrap();
         let error = conversation_snapshot_at(&transport, "broken", &malformed).unwrap_err();
-        assert!(error.contains("conversation head"));
-        assert!(error.contains("caos-chat-event"));
+        assert!(error.contains("not a JSON event"));
+
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn explicit_base_is_the_only_history_boundary() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "caos-chat-explicit-base-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "test");
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        // A JSON-looking ordinary commit must not be mistaken for another
+        // event after the explicit root has been reached.
+        test_git(
+            &repo,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                r#"{"author":"user","content":"not chat history"}"#,
+            ],
+        );
+        let transport = GitTransport::discover(&repo).unwrap();
+        let base = test_git(&repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let root = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({"base": base, "author": "user", "content": "actual message"}),
+        )
+        .unwrap();
+        let head = create_event_commit(
+            &transport,
+            &tree,
+            &root,
+            &json!({"author": "assistant", "content": "answer", "status": "idle"}),
+        )
+        .unwrap();
+        let conversation = durable_conversation_from_local(&transport, "chat", &head).unwrap();
+        assert_eq!(conversation.base_commit, base);
+        assert_eq!(conversation.snapshot.messages.len(), 2);
+        assert_eq!(conversation.snapshot.messages[0].content, "actual message");
+
+        let missing = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({"author": "user", "content": "missing boundary"}),
+        )
+        .unwrap();
+        let error = conversation_snapshot_at(&transport, "missing", &missing).unwrap_err();
+        assert!(error.contains("has no first parent"), "{error}");
+        let error = remote_commit_timestamp(&transport, &missing).unwrap_err();
+        assert!(error.contains("has no first parent"), "{error}");
+
+        let wrong = "b".repeat(40);
+        let mismatched_message = serde_json::to_string(
+            &json!({"base": wrong, "author": "user", "content": "wrong boundary"}),
+        )
+        .unwrap();
+        let mismatched = test_git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", &mismatched_message],
+        );
+        let error = conversation_snapshot_at(&transport, "mismatched", &mismatched).unwrap_err();
+        assert!(error.contains("declares base"), "{error}");
+
+        let malformed = test_git(
+            &repo,
+            &["commit-tree", &tree, "-p", &root, "-m", "not an event"],
+        );
+        let after_malformed =
+            create_event_commit(&transport, &tree, &malformed, &json!({"status": "idle"})).unwrap();
+        let error =
+            conversation_snapshot_at(&transport, "malformed", &after_malformed).unwrap_err();
+        assert!(error.contains(&malformed), "{error}");
+        assert!(error.contains("not a JSON event"), "{error}");
 
         std::fs::remove_dir_all(repo).unwrap();
     }
@@ -3367,10 +4093,8 @@ mod tests {
         std::fs::write(repo.join("workspace"), "base\n").unwrap();
         test_git(&repo, &["add", "workspace"]);
         let tree = test_git(&repo, &["write-tree"]);
-        let message = serde_json::to_string(
-            &json!({"kind": EVENT_KIND, "author": "user", "content": "orphan"}),
-        )
-        .unwrap();
+        let message =
+            serde_json::to_string(&json!({"author": "user", "content": "orphan"})).unwrap();
         let root_event = test_git(&repo, &["commit-tree", &tree, "-m", &message]);
 
         let transport = GitTransport::discover(&repo).unwrap();
@@ -3414,17 +4138,15 @@ mod tests {
             &transport,
             &tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","username":"Alice","content":"valid"}),
+            &json!({"base":base,"author":"user","username":"Alice","content":"valid"}),
         )
         .unwrap();
         let malformed = test_git(
             &repo,
             &["commit-tree", &tree, "-p", &base, "-m", "not an event"],
         );
-        let parentless_message = serde_json::to_string(
-            &json!({"kind": EVENT_KIND, "author": "user", "content": "orphan"}),
-        )
-        .unwrap();
+        let parentless_message =
+            serde_json::to_string(&json!({"author": "user", "content": "orphan"})).unwrap();
         let parentless = test_git(&repo, &["commit-tree", &tree, "-m", &parentless_message]);
         let good_ref = conversation_ref("good").unwrap();
         let broken_ref = conversation_ref("broken").unwrap();
@@ -3467,6 +4189,93 @@ mod tests {
     }
 
     #[test]
+    fn v2_chat_ignores_and_preserves_unversioned_refs() {
+        let (root, repo, transport, base) = conversation_index_fixture("v2-isolation");
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let legacy = test_git(
+            &repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                r#"{"kind":"caos-chat-event","author":"user","content":"old"}"#,
+            ],
+        );
+        let legacy_head = "refs/caos/conversations/shared/head";
+        let legacy_membership = format!(
+            "refs/caos/users/{}/conversations/active/{}",
+            user_key("Alice Smith").unwrap(),
+            conversation_key("shared").unwrap()
+        );
+        test_git(
+            &repo,
+            &[
+                "push",
+                "--quiet",
+                "--atomic",
+                CAOS_REMOTE,
+                &format!("{legacy}:{legacy_head}"),
+                &format!("{legacy}:{legacy_membership}"),
+            ],
+        );
+
+        assert!(remote_conversations(&transport).unwrap().is_empty());
+        assert!(
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Active,)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            pick_conversation(&transport, None, false).unwrap(),
+            ("talk-1".to_string(), true)
+        );
+
+        let request = "c".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice Smith".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "new v2 conversation",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote_ref(&transport, legacy_head).unwrap().as_deref(),
+            Some(legacy.as_str())
+        );
+        assert_eq!(
+            remote_ref(&transport, &legacy_membership)
+                .unwrap()
+                .as_deref(),
+            Some(legacy.as_str())
+        );
+        assert!(remote_ref(&transport, &conversation_ref("shared").unwrap())
+            .unwrap()
+            .is_some());
+        let listed =
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Active)
+                .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn submit_fetches_a_full_closure_when_only_the_raw_tip_is_local() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3498,7 +4307,7 @@ mod tests {
             &seed_transport,
             &tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","username":"seed","content":"start"}),
+            &json!({"base":base,"author":"user","username":"seed","content":"start"}),
         )
         .unwrap();
         let request = "b".repeat(40);
@@ -3506,7 +4315,7 @@ mod tests {
             &seed_transport,
             &tree,
             &user,
-            &json!({"kind": "caos-chat-event","status":"queued","request":request,"request_head":user}),
+            &json!({"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
         let refname = conversation_ref("shared").unwrap();
@@ -3588,7 +4397,7 @@ mod tests {
             &transport,
             &tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","username":"Alice","content":"start"}),
+            &json!({"base":base,"author":"user","username":"Alice","content":"start"}),
         )
         .unwrap();
         let request = "c".repeat(40);
@@ -3596,7 +4405,7 @@ mod tests {
             &transport,
             &tree,
             &user,
-            &json!({"kind": "caos-chat-event","status":"queued","request":request,"request_head":user}),
+            &json!({"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
         let refname = conversation_ref("shared").unwrap();
@@ -3776,7 +4585,7 @@ mod tests {
             &transport,
             &base_tree,
             &base,
-            &json!({"kind": "caos-chat-event","author":"user","content":"start"}),
+            &json!({"base":base,"author":"user","content":"start"}),
         )
         .unwrap();
         let request = "b".repeat(40);
@@ -3784,7 +4593,7 @@ mod tests {
             &transport,
             &base_tree,
             &user,
-            &json!({"kind": "caos-chat-event","status":"queued","request":request,"request_head":user}),
+            &json!({"status":"queued","request":request,"request_head":user}),
         )
         .unwrap();
 
@@ -3795,7 +4604,7 @@ mod tests {
             &transport,
             &current_tree,
             &admitted,
-            &json!({"kind": "caos-chat-event","author":"user","username":"Bob","content":"concurrent"}),
+            &json!({"author":"user","username":"Bob","content":"concurrent"}),
         )
         .unwrap();
 
@@ -3850,6 +4659,18 @@ mod tests {
         assert_eq!(snapshot.status, "queued");
         assert_eq!(snapshot.request.as_deref(), Some(request.as_str()));
 
+        let idle = create_event_commit(
+            &transport,
+            &current_tree,
+            &current,
+            &json!({"request": request, "status": "idle"}),
+        )
+        .unwrap();
+        test_git(
+            &repo,
+            &["push", "--quiet", CAOS_REMOTE, &format!("{idle}:{refname}")],
+        );
+
         let error = submit_message_with_tree(
             &transport,
             &TurnOptions {
@@ -3865,10 +4686,7 @@ mod tests {
         assert!(error.contains("recorded at"), "{error}");
 
         let tip = remote_ref(&transport, &refname).unwrap().unwrap();
-        assert_eq!(
-            test_git(&repo, &["rev-parse", &format!("{tip}^1")]),
-            current
-        );
+        assert_eq!(test_git(&repo, &["rev-parse", &format!("{tip}^1")]), idle);
         assert_eq!(
             test_git(&repo, &["rev-parse", &format!("{tip}^2")]),
             proposal
@@ -3880,9 +4698,383 @@ mod tests {
         let event: Value =
             serde_json::from_str(&test_git(&repo, &["show", "-s", "--format=%B", &tip])).unwrap();
         assert_eq!(event["status"], "failed");
-        assert_eq!(event["request"], request);
+        assert!(event.get("request").is_none());
         assert_eq!(event["workspace_conflict"]["proposal"], proposal);
         assert_eq!(event["workspace_conflict"]["paths"], json!(["shared.txt"]));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_fetches_a_tree_closure_for_a_tip_only_source() {
+        let (root, source_repo, client_repo, source) = fork_fixture("tip-only");
+        let source_transport = GitTransport::discover(&source_repo).unwrap();
+        let client_transport = GitTransport::discover(&client_repo).unwrap();
+        let (kind, raw_commit) = source_transport.get_object(&source).unwrap();
+        assert_eq!(kind, "commit");
+        assert_eq!(
+            client_transport
+                .put_object("commit", &raw_commit)
+                .unwrap()
+                .to_string(),
+            source
+        );
+        let tree = source_transport
+            .git_capture(&["rev-parse", &format!("{source}^{{tree}}")], None)
+            .unwrap()
+            .trim()
+            .to_string();
+        let (kind, raw_tree) = source_transport.get_object(&tree).unwrap();
+        assert_eq!(kind, "tree");
+        assert_eq!(
+            client_transport
+                .put_object("tree", &raw_tree)
+                .unwrap()
+                .to_string(),
+            tree
+        );
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^{{commit}}")], None)
+            .is_ok());
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^{{tree}}")], None)
+            .is_ok());
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^1^{{commit}}")], None)
+            .is_err());
+
+        let fork =
+            fork_conversation(&client_transport, "Alice", "forked", "talk-1", &source).unwrap();
+
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^{{tree}}")], None)
+            .is_ok());
+        assert!(client_transport
+            .git_capture(&["cat-file", "-e", &format!("{source}^1^{{commit}}")], None)
+            .is_ok());
+        let load = conversation_load(&client_transport, "forked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(load.snapshot.head, fork);
+        assert_eq!(load.replay.turns[0].message, "inherited message");
+        assert_eq!(load.workspace_diff.base_commit, source);
+        assert!(load.workspace_diff.patch.is_empty());
+
+        let head_ref = conversation_ref("forked").unwrap();
+        let title_ref = conversation_title_ref("forked").unwrap();
+        let active_ref =
+            user_conversation_ref("Alice", UserConversationStatus::Active, "forked").unwrap();
+        assert_eq!(
+            remote_ref(&client_transport, &head_ref).unwrap().as_deref(),
+            Some(fork.as_str())
+        );
+        assert_eq!(
+            remote_ref(&client_transport, &active_ref)
+                .unwrap()
+                .as_deref(),
+            Some(fork.as_str())
+        );
+        let title = remote_ref(&client_transport, &title_ref).unwrap().unwrap();
+        assert_eq!(client_transport.get_object(&title).unwrap().1, b"talk-1");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_ref_publication_is_atomic_and_create_only() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("atomic");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let id = "occupied-title";
+        let title_ref = conversation_title_ref(id).unwrap();
+        let existing = transport
+            .put_object("blob", b"existing")
+            .unwrap()
+            .to_string();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{existing}:{title_ref}"),
+            ],
+        );
+
+        let error = fork_conversation(&transport, "Alice", id, "talk-2", &source).unwrap_err();
+        assert!(error.contains("presentation refs"));
+        assert!(remote_ref(&transport, &conversation_ref(id).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(remote_ref(
+            &transport,
+            &user_conversation_ref("Alice", UserConversationStatus::Active, id).unwrap()
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            remote_ref(&transport, &title_ref).unwrap().as_deref(),
+            Some(existing.as_str())
+        );
+
+        let empty =
+            fork_conversation(&transport, "Alice", "empty-title", "  ", &source).unwrap_err();
+        assert!(empty.contains("title"));
+        assert!(
+            remote_ref(&transport, &conversation_ref("empty-title").unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        let first = fork_conversation(&transport, "Alice", "same-fork", "talk-3", &source).unwrap();
+        set_conversation_title(&transport, "same-fork", "Renamed elsewhere").unwrap();
+        let duplicate =
+            fork_conversation(&transport, "Bob", "same-fork", "talk-3", &source).unwrap();
+        assert_eq!(duplicate, first);
+        assert_eq!(
+            remote_ref(&transport, &conversation_ref("same-fork").unwrap())
+                .unwrap()
+                .as_deref(),
+            Some(first.as_str())
+        );
+        assert!(remote_ref(
+            &transport,
+            &user_conversation_ref("Bob", UserConversationStatus::Active, "same-fork").unwrap()
+        )
+        .unwrap()
+        .as_deref()
+        .is_some_and(|head| head == first));
+        let renamed = remote_ref(&transport, &conversation_title_ref("same-fork").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            transport.get_object(&renamed).unwrap().1,
+            b"Renamed elsewhere"
+        );
+
+        let occupied_active =
+            user_conversation_ref("Charlie", UserConversationStatus::Active, "same-fork").unwrap();
+        let unrelated = test_git(&source_repo, &["rev-parse", &format!("{source}^1")]);
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{unrelated}:{occupied_active}"),
+            ],
+        );
+        let rejected =
+            fork_conversation(&transport, "Charlie", "same-fork", "talk-3", &source).unwrap_err();
+        assert!(
+            rejected.contains("did not publish required refs"),
+            "{rejected}"
+        );
+        assert_eq!(
+            remote_ref(&transport, &occupied_active).unwrap().as_deref(),
+            Some(unrelated.as_str())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logically_duplicate_fork_recovers_across_commit_timestamps() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("duplicate-timestamp");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let id = "same-fork";
+        let first = fork_conversation(&transport, "Alice", id, "talk-3", &source).unwrap();
+
+        let tree = test_git(&source_repo, &["rev-parse", &format!("{source}^{{tree}}")]);
+        let event = serde_json::to_string(&json!({
+            "forked_from": source,
+            "title": "talk-3",
+            "status": "idle",
+            "request": Value::Null,
+        }))
+        .unwrap();
+        let output = std::process::Command::new("git")
+            .args(["commit-tree", &tree, "-p", &source, "-m", &event])
+            .env("GIT_AUTHOR_DATE", "2033-05-18T03:33:20 +0000")
+            .env("GIT_COMMITTER_DATE", "2033-05-18T03:33:20 +0000")
+            .current_dir(&source_repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let candidate = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        assert_ne!(candidate, first);
+
+        let head_ref = conversation_ref(id).unwrap();
+        let title_ref = conversation_title_ref(id).unwrap();
+        let active_ref = user_conversation_ref("Bob", UserConversationStatus::Active, id).unwrap();
+        let archived_ref =
+            user_conversation_ref("Bob", UserConversationStatus::Archived, id).unwrap();
+        let title_hash = transport.put_object("blob", b"talk-3").unwrap().to_string();
+        let recovered = push_new_conversation(
+            &transport,
+            id,
+            NewConversationRefs {
+                head: &head_ref,
+                title: &title_ref,
+                active: &active_ref,
+                archived: &archived_ref,
+            },
+            &candidate,
+            &title_hash,
+        )
+        .unwrap();
+
+        assert_eq!(recovered, first);
+        assert_eq!(
+            remote_ref(&transport, &active_ref).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fork_metadata_must_match_the_actual_first_parent() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("marker-validation");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let tree = test_git(&source_repo, &["rev-parse", &format!("{source}^{{tree}}")]);
+        let output = root.join("must-not-be-created");
+        let malicious_message = serde_json::to_string(&json!({
+            "forked_from": format!("--output={}", output.display()),
+            "status": "idle"
+        }))
+        .unwrap();
+        let malicious = test_git(
+            &source_repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &source,
+                "-m",
+                &malicious_message,
+            ],
+        );
+        let malicious_ref = conversation_ref("malicious").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{malicious}:{malicious_ref}"),
+            ],
+        );
+        let error = conversation_workspace_diff(&transport, "malicious").unwrap_err();
+        assert!(error.contains("forked_from"));
+        assert!(!output.exists());
+
+        let base = test_git(&source_repo, &["rev-parse", &format!("{source}^1")]);
+        let mismatched_message =
+            serde_json::to_string(&json!({"forked_from": base, "status": "idle"})).unwrap();
+        let mismatched = test_git(
+            &source_repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &source,
+                "-m",
+                &mismatched_message,
+            ],
+        );
+        let mismatch_ref = conversation_ref("mismatch").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{mismatched}:{mismatch_ref}"),
+            ],
+        );
+        let error = conversation_workspace_diff(&transport, "mismatch").unwrap_err();
+        assert!(error.contains("first parent"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_marker_counts_as_fresh_conversation_activity() {
+        let (root, source_repo, _client_repo, _source) = fork_fixture("timestamp");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        let base = test_git(&source_repo, &["rev-parse", "HEAD"]);
+        let tree = test_git(&source_repo, &["rev-parse", "HEAD^{tree}"]);
+        let message = serde_json::to_string(&json!({
+            "base": base,
+            "author": "user",
+            "username": "Source",
+            "content": "old source",
+            "status": "idle"
+        }))
+        .unwrap();
+        let output = std::process::Command::new("git")
+            .args(["commit-tree", &tree, "-p", &base, "-m", &message])
+            .env("GIT_AUTHOR_DATE", "2001-09-09T01:46:40 +0000")
+            .env("GIT_COMMITTER_DATE", "2001-09-09T01:46:40 +0000")
+            .current_dir(&source_repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let source = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let source_ref = conversation_ref("old-source").unwrap();
+        test_git(
+            &source_repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{source}:{source_ref}"),
+            ],
+        );
+        let old = remote_commit_timestamp(&transport, &source).unwrap();
+        let fork = fork_conversation(&transport, "Alice", "fresh-fork", "talk-3", &source).unwrap();
+        let fork_timestamp = remote_commit_timestamp(&transport, &fork).unwrap();
+        let commit_timestamp = test_git(&source_repo, &["show", "-s", "--format=%ct", &fork])
+            .parse::<i64>()
+            .unwrap();
+
+        assert_eq!(fork_timestamp, commit_timestamp);
+        assert!(fork_timestamp > old);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_title_cas_preserves_a_concurrent_manual_rename() {
+        let (root, source_repo, _client_repo, source) = fork_fixture("title-cas");
+        let transport = GitTransport::discover(&source_repo).unwrap();
+        fork_conversation(&transport, "Alice", "title-fork", "talk-4", &source).unwrap();
+
+        assert!(compare_and_set_conversation_title(
+            &transport,
+            "title-fork",
+            "talk-4",
+            "generated"
+        )
+        .unwrap());
+        set_conversation_title(&transport, "title-fork", "manual").unwrap();
+        assert!(!compare_and_set_conversation_title(
+            &transport,
+            "title-fork",
+            "generated",
+            "late generated"
+        )
+        .unwrap());
+        let title_ref = conversation_title_ref("title-fork").unwrap();
+        let title = remote_ref(&transport, &title_ref).unwrap().unwrap();
+        assert_eq!(transport.get_object(&title).unwrap().1, b"manual");
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4159,7 +5351,7 @@ mod tests {
             &tree,
             &base,
             &json!({
-                "kind": "caos-chat-event",
+                "base": base,
                 "author": "user",
                 "username": "seed",
                 "content": "start"
@@ -4172,7 +5364,6 @@ mod tests {
             &tree,
             &first,
             &json!({
-                "kind": "caos-chat-event",
                 "status": "queued",
                 "request": request,
                 "request_head": first,
@@ -4205,7 +5396,7 @@ mod tests {
 
         // The canonical push must remain successful even when another local
         // process holds the expendable cache ref's lock.
-        let alice_cache = alice.join(".git/refs/caos/conversations/shared");
+        let alice_cache = alice.join(".git/refs/caos/v2/conversations/shared");
         std::fs::create_dir_all(&alice_cache).unwrap();
         std::fs::write(alice_cache.join("head.lock"), "held by another TUI\n").unwrap();
 

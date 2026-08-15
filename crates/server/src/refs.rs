@@ -11,59 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{Config, HttpError};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const HOOK_MARKER: &str = "# managed by caos-server: append-only conversation heads";
-
-/// Defense in depth for callers that still use ordinary receive-pack. The HTTP
-/// append endpoint performs the same append check, but a ref invariant is not
-/// an invariant if another supported write path can bypass it. Result refs stay
-/// advertised for object negotiation, so the hook also protects that
-/// server-owned namespace from client updates.
-const PRE_RECEIVE_HOOK_BODY: &str = r#"set -euo pipefail
-# managed by caos-server: append-only conversation heads
-zero=0000000000000000000000000000000000000000
-while IFS=' ' read -r old new refname; do
-  case "$refname" in
-    refs/caos/res/*)
-      echo "caos: refusing client update to server-owned ref $refname" >&2
-      exit 1
-      ;;
-    refs/caos/conversations/*/head) ;;
-    *) continue ;;
-  esac
-
-  if [ "$new" = "$zero" ]; then
-    echo "caos: refusing to delete append-only ref $refname" >&2
-    exit 1
-  fi
-  new_type=$(git cat-file -t "$new" 2>/dev/null) || {
-    echo "caos: append-only ref $refname must name a stored commit" >&2
-    exit 1
-  }
-  if [ "$new_type" != commit ]; then
-    echo "caos: append-only ref $refname must name a commit" >&2
-    exit 1
-  fi
-  if [ "$old" = "$zero" ]; then
-    continue
-  fi
-
-  found=""
-  while IFS= read -r commit; do
-    if [ "$commit" = "$old" ]; then
-      found=1
-      break
-    fi
-  done < <(git rev-list --first-parent "$new")
-  if [ -z "$found" ]; then
-    echo "caos: $new does not first-parent-descend from $old for $refname" >&2
-    exit 1
-  fi
-done
-"#;
 
 fn bash_in_path() -> Result<PathBuf, String> {
     let path = std::env::var_os("PATH").ok_or("PATH is not set; cannot install Git hook")?;
@@ -83,9 +36,22 @@ fn bash_in_path() -> Result<PathBuf, String> {
     Err("cannot find an executable bash on PATH for Git hook".to_string())
 }
 
+fn shell_word(path: &Path) -> Result<String, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("hook executable path is not UTF-8: {}", path.display()))?;
+    Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
+}
+
 fn pre_receive_hook() -> Result<String, String> {
     let bash = bash_in_path()?;
-    Ok(format!("#!{}\n{PRE_RECEIVE_HOOK_BODY}", bash.display()))
+    let server = std::env::current_exe()
+        .map_err(|error| format!("locating the server executable for Git hook: {error}"))?;
+    Ok(format!(
+        "#!{}\n{HOOK_MARKER}\nexec {} --validate-pre-receive\n",
+        bash.display(),
+        shell_word(&server)?
+    ))
 }
 
 #[derive(Deserialize)]
@@ -100,6 +66,47 @@ struct AppendRequest {
     refname: String,
     expected: Option<String>,
     new: String,
+}
+
+/// Validate the complete receive-pack command set from a pre-receive hook.
+/// The installed hook delegates here instead of maintaining a second event
+/// parser in shell, so raw Git and `/ref/append` enforce one protocol.
+pub(crate) fn validate_pre_receive(git_dir: &str, input: &str) -> Result<(), HttpError> {
+    for line in input.lines() {
+        let mut fields = line.split_whitespace();
+        let old = fields
+            .next()
+            .ok_or_else(|| HttpError::new(400, "pre-receive command has no old object ID"))?;
+        let new = fields
+            .next()
+            .ok_or_else(|| HttpError::new(400, "pre-receive command has no new object ID"))?;
+        let refname = fields
+            .next()
+            .ok_or_else(|| HttpError::new(400, "pre-receive command has no refname"))?;
+        if fields.next().is_some() {
+            return Err(HttpError::new(
+                400,
+                "pre-receive command has unexpected fields",
+            ));
+        }
+        validate_hash(old, "old ref target")?;
+        validate_hash(new, "new ref target")?;
+
+        if refname.starts_with("refs/caos/res/") {
+            return Err(HttpError::new(403, format!("{refname} is server-owned")));
+        }
+        if !is_conversation_head_ref(refname) {
+            continue;
+        }
+        if new == ZERO_OID {
+            return Err(HttpError::new(
+                422,
+                format!("refusing to delete append-only ref {refname}"),
+            ));
+        }
+        validate_conversation_append(git_dir, new, if old == ZERO_OID { None } else { Some(old) })?;
+    }
+    Ok(())
 }
 
 /// Install the server-owned receive-pack guard before accepting requests.
@@ -209,21 +216,9 @@ pub(crate) fn append(config: &Config, body: &str) -> Result<Vec<u8>, HttpError> 
     }
 
     validate_commit(&config.git_dir, &request.new)?;
-    let observed = read_ref(&config.git_dir, &request.refname)?;
-    if observed.as_deref() != request.expected.as_deref() {
-        // The update may have succeeded while its response was lost, and a
-        // later writer may already have appended again. Treat an already
-        // reachable candidate as success so retrying admission is idempotent.
-        if let Some(observed) = observed.as_deref() {
-            if observed == request.new
-                || first_parent_contains(&config.git_dir, observed, &request.new)?
-            {
-                return Ok(format!("{}\n", request.new).into_bytes());
-            }
-        }
-        return Err(conflict(observed.as_deref()));
-    }
-    if let Some(expected) = request.expected.as_deref() {
+    if is_conversation_head_ref(&request.refname) {
+        validate_conversation_append(&config.git_dir, &request.new, request.expected.as_deref())?;
+    } else if let Some(expected) = request.expected.as_deref() {
         if !first_parent_contains(&config.git_dir, &request.new, expected)? {
             return Err(HttpError::new(
                 422,
@@ -235,6 +230,20 @@ pub(crate) fn append(config: &Config, body: &str) -> Result<Vec<u8>, HttpError> 
         }
     }
     validate_connectivity(&config.git_dir, &request.new, request.expected.as_deref())?;
+
+    let observed = read_ref(&config.git_dir, &request.refname)?;
+    if observed.as_deref() != request.expected.as_deref() {
+        // The update may have succeeded while its response was lost, and a
+        // later writer may already have appended again. Candidate validation
+        // above proves expected -> new; only new -> observed remains to prove
+        // before treating the retry as idempotent success.
+        if let Some(observed) = observed.as_deref() {
+            if first_parent_contains(&config.git_dir, observed, &request.new)? {
+                return Ok(format!("{}\n", request.new).into_bytes());
+            }
+        }
+        return Err(conflict(observed.as_deref()));
+    }
 
     let expected = request.expected.as_deref().unwrap_or(ZERO_OID);
     let output = Command::new("git")
@@ -338,6 +347,160 @@ fn validate_commit(git_dir: &str, hash: &str) -> Result<(), HttpError> {
             422,
             format!("new ref target {hash} is not a stored commit"),
         ))
+    }
+}
+
+fn is_conversation_head_ref(refname: &str) -> bool {
+    refname
+        .strip_prefix("refs/caos/v2/conversations/")
+        .and_then(|rest| rest.strip_suffix("/head"))
+        .is_some_and(|conversation| !conversation.is_empty())
+}
+
+struct StoredConversationEvent {
+    first_parent: String,
+    value: Value,
+}
+
+fn read_conversation_event(
+    git_dir: &str,
+    hash: &str,
+) -> Result<StoredConversationEvent, HttpError> {
+    let output = Command::new("git")
+        .args(["-C", git_dir, "cat-file", "commit", hash])
+        .output()
+        .map_err(|error| HttpError::new(500, format!("reading commit {hash}: {error}")))?;
+    if !output.status.success() {
+        return Err(HttpError::new(
+            422,
+            format!("conversation event {hash} is not a stored commit"),
+        ));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|error| {
+        HttpError::new(
+            422,
+            format!("conversation event commit {hash} is not UTF-8: {error}"),
+        )
+    })?;
+    let (headers, message) = text.split_once("\n\n").ok_or_else(|| {
+        HttpError::new(
+            422,
+            format!("conversation event commit {hash} has no message"),
+        )
+    })?;
+    let first_parent = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("parent "))
+        .ok_or_else(|| {
+            HttpError::new(
+                422,
+                format!("conversation event commit {hash} has no first parent"),
+            )
+        })?;
+    validate_hash(first_parent, "conversation event parent")?;
+    let value = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
+        HttpError::new(
+            422,
+            format!("conversation event commit {hash} is not JSON: {error}"),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        HttpError::new(
+            422,
+            format!("conversation event commit {hash} must contain a JSON object"),
+        )
+    })?;
+    if object.contains_key("v") {
+        return Err(HttpError::new(
+            422,
+            format!(
+                "conversation event commit {hash} must not carry a version; refs/caos/v2 selects the protocol"
+            ),
+        ));
+    }
+    Ok(StoredConversationEvent {
+        first_parent: first_parent.to_string(),
+        value,
+    })
+}
+
+fn validate_declared_base(event: &StoredConversationEvent) -> Result<bool, HttpError> {
+    let Some(base) = event.value.get("base") else {
+        return Ok(false);
+    };
+    let base = base
+        .as_str()
+        .ok_or_else(|| HttpError::new(422, "conversation event base must be a string"))?;
+    validate_hash(base, "conversation base")?;
+    if base != event.first_parent {
+        return Err(HttpError::new(
+            422,
+            format!(
+                "conversation root declares base {base}, but its first parent is {}",
+                event.first_parent
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_declared_fork(event: &StoredConversationEvent) -> Result<bool, HttpError> {
+    let Some(forked_from) = event.value.get("forked_from") else {
+        return Ok(false);
+    };
+    if event.value.get("base").is_some() {
+        return Err(HttpError::new(
+            422,
+            "a conversation fork marker must not introduce a new base",
+        ));
+    }
+    let forked_from = forked_from
+        .as_str()
+        .ok_or_else(|| HttpError::new(422, "conversation event forked_from must be a string"))?;
+    validate_hash(forked_from, "forked_from")?;
+    if forked_from != event.first_parent {
+        return Err(HttpError::new(
+            422,
+            format!(
+                "conversation fork marker declares {forked_from}, but its first parent is {}",
+                event.first_parent
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// Validate only the small event envelope needed to preserve the first-parent
+/// boundary. Transcript and run semantics remain client/worker concerns.
+fn validate_conversation_append(
+    git_dir: &str,
+    new_hash: &str,
+    expected: Option<&str>,
+) -> Result<(), HttpError> {
+    let mut current = new_hash.to_string();
+    loop {
+        if expected == Some(current.as_str()) {
+            return Ok(());
+        }
+        let event = read_conversation_event(git_dir, &current)?;
+        let is_root = validate_declared_base(&event)?;
+        let is_fork = validate_declared_fork(&event)?;
+        if expected.is_some() && is_root {
+            return Err(HttpError::new(
+                422,
+                "an update must not introduce a second conversation base",
+            ));
+        }
+        if expected.is_some() && is_fork {
+            return Err(HttpError::new(
+                422,
+                "an update must not introduce a conversation fork marker",
+            ));
+        }
+        if expected.is_none() && is_root {
+            return Ok(());
+        }
+        current = event.first_parent;
     }
 }
 
@@ -491,6 +654,21 @@ mod tests {
         (dir, a, b, c, d)
     }
 
+    fn chat_repo() -> (String, String, String, String, String, String) {
+        let (dir, base, _plain_b, _plain_c, _plain_d) = repo();
+        let tree = git(&["-C", &dir, "rev-parse", &format!("{base}^{{tree}}")]);
+        let root = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"base": base, "status": "idle"}).to_string(),
+            &[&base],
+        );
+        let b = commit(&dir, &tree, r#"{"status":"running"}"#, &[&root]);
+        let c = commit(&dir, &tree, r#"{"status":"idle"}"#, &[&b]);
+        let d = commit(&dir, &tree, r#"{"status":"failed"}"#, &[&root]);
+        (dir, base, root, b, c, d)
+    }
+
     fn config(dir: &str) -> Config {
         Config {
             registry_push_url: String::new(),
@@ -520,11 +698,11 @@ mod tests {
         let config = config(&dir);
         let missing_tree = "1111111111111111111111111111111111111111";
         let body = format!(
-            "tree {missing_tree}\nparent {a}\nauthor caos <caos@caos> 0 +0000\ncommitter caos <caos@caos> 0 +0000\n\nbroken\n"
+            "tree {missing_tree}\nparent {a}\nauthor caos <caos@caos> 0 +0000\ncommitter caos <caos@caos> 0 +0000\n\n{{\"base\":\"{a}\"}}\n"
         );
         let broken = write_object(&dir, "commit", &body);
         let request = serde_json::json!({
-            "ref": "refs/caos/conversations/broken/head",
+            "ref": "refs/caos/v2/conversations/broken/head",
             "expected": null,
             "new": broken,
         })
@@ -537,9 +715,9 @@ mod tests {
 
     #[test]
     fn append_endpoint_is_atomic_batched_and_idempotent() {
-        let (dir, a, b, c, d) = repo();
+        let (dir, a, root, b, c, d) = chat_repo();
         let config = config(&dir);
-        let refname = "refs/caos/conversations/test/head";
+        let refname = "refs/caos/v2/conversations/test/head";
         let request = |expected: Option<&str>, new: &str| {
             serde_json::json!({"ref": refname, "expected": expected, "new": new}).to_string()
         };
@@ -552,11 +730,11 @@ mod tests {
             .unwrap();
         assert_eq!(error.status(), 400);
 
-        if let Err(error) = append(&config, &request(None, &a)) {
+        if let Err(error) = append(&config, &request(None, &root)) {
             panic!("{}: {}", error.status(), error.message());
         }
-        // A -> C admits the complete A -> B -> C first-parent batch.
-        assert!(append(&config, &request(Some(&a), &c)).is_ok());
+        // Root -> C admits the complete Root -> B -> C first-parent batch.
+        assert!(append(&config, &request(Some(&root), &c)).is_ok());
         assert_eq!(
             String::from_utf8(
                 read(&config, &serde_json::json!({"ref": refname}).to_string())
@@ -569,8 +747,12 @@ mod tests {
         );
         // Retrying an update whose response was lost is success, even though
         // its original expected value is now stale.
-        assert!(append(&config, &request(Some(&a), &c)).is_ok());
-        let error = append(&config, &request(Some(&a), &d)).err().unwrap();
+        assert!(append(&config, &request(Some(&root), &c)).is_ok());
+        // An older candidate is not a successful retry merely because the
+        // observed head happens to descend from it.
+        let error = append(&config, &request(Some(&b), &root)).unwrap_err();
+        assert_eq!(error.status(), 422);
+        let error = append(&config, &request(Some(&root), &d)).err().unwrap();
         assert_eq!(error.status(), 409);
         let error = append(&config, &request(Some(&c), &b)).err().unwrap();
         assert_eq!(error.status(), 422);
@@ -584,54 +766,118 @@ mod tests {
         assert_eq!(error.status(), 403);
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn pre_receive_uses_the_same_event_validator_as_exact_append() {
+        let (dir, base, root, b, c, _d) = chat_repo();
+        let refname = "refs/caos/v2/conversations/test/head";
+        let command = |old: &str, new: &str, target: &str| format!("{old} {new} {target}\n");
+
+        // A creation may publish a whole validated event spine, and an update
+        // may likewise admit a batch that reaches its exact old head.
+        assert!(validate_pre_receive(&dir, &command(ZERO_OID, &c, refname)).is_ok());
+        assert!(validate_pre_receive(&dir, &command(&root, &c, refname)).is_ok());
+
+        let tree = git(&["-C", &dir, "rev-parse", &format!("{c}^{{tree}}")]);
+        let versioned = commit(&dir, &tree, r#"{"v":2}"#, &[&c]);
+        assert!(validate_pre_receive(&dir, &command(&c, &versioned, refname)).is_err());
+
+        let second_base = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"base": c}).to_string(),
+            &[&c],
+        );
+        assert!(validate_pre_receive(&dir, &command(&c, &second_base, refname)).is_err());
+
+        let fork_update = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"forked_from": c}).to_string(),
+            &[&c],
+        );
+        assert!(validate_pre_receive(&dir, &command(&c, &fork_update, refname)).is_err());
+
+        let fork_root = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"base": base, "forked_from": base}).to_string(),
+            &[&base],
+        );
+        assert!(validate_pre_receive(
+            &dir,
+            &command(
+                ZERO_OID,
+                &fork_root,
+                "refs/caos/v2/conversations/bad-fork/head",
+            ),
+        )
+        .is_err());
+
+        for message in ["{}\n{}", r#"{"base":""}"#, r#"{"number":01}"#] {
+            let malformed = commit(&dir, &tree, message, &[&c]);
+            assert!(
+                validate_pre_receive(&dir, &command(&c, &malformed, refname)).is_err(),
+                "accepted malformed event {message:?}"
+            );
+        }
+
+        // A rewrite cannot claim an older candidate as a successful retry.
+        assert!(validate_pre_receive(&dir, &command(&c, &b, refname)).is_err());
+        assert!(validate_pre_receive(&dir, &command(&c, ZERO_OID, refname)).is_err());
+        assert!(
+            validate_pre_receive(&dir, &command(&base, &root, "refs/caos/res/request"),).is_err()
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
-    fn receive_pack_hook_rejects_rewrites_but_accepts_batched_appends() {
-        // The production server image includes Bash. The hermetic cargo worker
-        // intentionally exposes only its Rust toolchain, so it can still test
-        // the append predicate but cannot execute this integration-style hook.
-        if bash_in_path().is_err() {
-            return;
-        }
-        let (dir, a, b, c, _d) = repo();
-        install_hook(&dir).unwrap();
-        install_hook(&dir).unwrap();
-        let refname = "refs/caos/conversations/test/head";
-        let push = |source: &str, force: bool| {
-            let mut command = Command::new("git");
-            command.args(["-C", &dir, "push", "--quiet"]);
-            if force {
-                command.arg("--force");
-            }
-            command
-                .args([&dir, &format!("{source}:{refname}")])
-                .output()
-                .unwrap()
-                .status
+    fn append_rejects_invalid_event_envelopes_and_boundaries() {
+        let (dir, base, root, _b, _c, _d) = chat_repo();
+        let config = config(&dir);
+        let refname = "refs/caos/v2/conversations/test/head";
+        let request = |expected: Option<&str>, new: &str| {
+            serde_json::json!({"ref": refname, "expected": expected, "new": new}).to_string()
         };
-        assert!(push(&a, false).success());
-        // One receive-pack ref command jumps across two recorded events.
-        assert!(push(&c, false).success());
-        assert!(!push(&b, true).success());
-        let result_push = Command::new("git")
-            .args([
-                "-C",
-                &dir,
-                "push",
-                "--quiet",
-                &dir,
-                &format!("{a}:refs/caos/res/request"),
-            ])
-            .output()
-            .unwrap()
-            .status;
-        assert!(!result_push.success());
-        let deletion = Command::new("git")
-            .args(["-C", &dir, "push", "--quiet", &dir, &format!(":{refname}")])
-            .output()
-            .unwrap()
-            .status;
-        assert!(!deletion.success());
+        if let Err(error) = append(&config, &request(None, &root)) {
+            panic!("{}: {}", error.status(), error.message());
+        }
+        let tree = git(&["-C", &dir, "rev-parse", &format!("{root}^{{tree}}")]);
+
+        let versioned = commit(&dir, &tree, r#"{"v":2,"status":"running"}"#, &[&root]);
+        let error = append(&config, &request(Some(&root), &versioned)).unwrap_err();
+        assert_eq!(error.status(), 422);
+        assert!(error.message().contains("must not carry a version"));
+
+        let second_base = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"base": root, "status": "idle"}).to_string(),
+            &[&root],
+        );
+        let error = append(&config, &request(Some(&root), &second_base)).unwrap_err();
+        assert_eq!(error.status(), 422);
+        assert!(error.message().contains("second conversation base"));
+
+        let fork_update = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"forked_from": root}).to_string(),
+            &[&root],
+        );
+        let error = append(&config, &request(Some(&root), &fork_update)).unwrap_err();
+        assert_eq!(error.status(), 422);
+        assert!(error.message().contains("fork marker"));
+
+        let fork_root = commit(
+            &dir,
+            &tree,
+            &serde_json::json!({"base": base, "forked_from": base}).to_string(),
+            &[&base],
+        );
+        let error = append(&config, &request(None, &fork_root)).unwrap_err();
+        assert_eq!(error.status(), 422);
+        assert!(error.message().contains("must not introduce a new base"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -642,6 +888,31 @@ mod tests {
         std::fs::write(&hook, [0xff, 0xfe]).unwrap();
         let error = install_hook(&dir).unwrap_err();
         assert!(error.contains("unmanaged pre-receive hook"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_hook_upgrade_delegates_to_the_shared_validator() {
+        if bash_in_path().is_err() {
+            return;
+        }
+        let (dir, _a, _b, _c, _d) = repo();
+        let hook = Path::new(&dir).join("hooks/pre-receive");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n{HOOK_MARKER}\ncase refs/caos/conversations/test/head in\n  refs/caos/conversations/*/head) ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+
+        install_hook(&dir).unwrap();
+
+        let installed = std::fs::read_to_string(&hook).unwrap();
+        assert!(installed.contains(HOOK_MARKER));
+        assert!(installed.contains("--validate-pre-receive"));
+        assert!(!installed.contains("jq"));
+        assert!(!installed.contains("refs/caos/conversations/*/head"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

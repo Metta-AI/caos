@@ -128,7 +128,7 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 conv="tools-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
-ref="refs/caos/conversations/$conv/head"
+ref="refs/caos/v2/conversations/$conv/head"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
