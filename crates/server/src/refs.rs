@@ -6,9 +6,11 @@
 //! move one known head. These endpoints keep the operation generic while making
 //! its cost independent of the number of unrelated refs.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -66,6 +68,19 @@ struct AppendRequest {
     refname: String,
     expected: Option<String>,
     new: String,
+}
+
+#[derive(Deserialize)]
+struct TransactionRequest {
+    updates: Vec<ExactUpdate>,
+}
+
+#[derive(Deserialize)]
+struct ExactUpdate {
+    #[serde(rename = "ref")]
+    refname: String,
+    expected: Option<String>,
+    new: Option<String>,
 }
 
 /// Validate the complete receive-pack command set from a pre-receive hook.
@@ -275,6 +290,124 @@ pub(crate) fn append(config: &Config, body: &str) -> Result<Vec<u8>, HttpError> 
     ))
 }
 
+/// Atomically apply a small set of exact ref comparisons. Unlike `/ref/append`,
+/// this has no ancestry policy of its own; conversation heads still pass the
+/// same append validator. A null `new` verifies or deletes the named ref.
+pub(crate) fn transaction(config: &Config, body: &str) -> Result<Vec<u8>, HttpError> {
+    let request: TransactionRequest = serde_json::from_str(body)
+        .map_err(|error| HttpError::new(400, format!("invalid ref transaction: {error}")))?;
+    if request.updates.is_empty() || request.updates.len() > 64 {
+        return Err(HttpError::new(400, "a ref transaction needs 1-64 updates"));
+    }
+
+    let mut names = HashSet::new();
+    for update in &request.updates {
+        validate_ref(&config.git_dir, &update.refname)?;
+        if !names.insert(update.refname.as_str()) {
+            return Err(HttpError::new(
+                400,
+                format!("duplicate ref in transaction: {}", update.refname),
+            ));
+        }
+        if update.refname.starts_with("refs/caos/res/") {
+            return Err(HttpError::new(
+                403,
+                format!("{} is server-owned", update.refname),
+            ));
+        }
+        if let Some(expected) = update.expected.as_deref() {
+            validate_hash(expected, "expected ref target")?;
+        }
+        if let Some(new) = update.new.as_deref() {
+            validate_hash(new, "new ref target")?;
+            validate_object(&config.git_dir, new)?;
+        }
+        if is_conversation_head_ref(&update.refname) {
+            let new = update.new.as_deref().ok_or_else(|| {
+                HttpError::new(
+                    422,
+                    format!("refusing to delete append-only ref {}", update.refname),
+                )
+            })?;
+            validate_commit(&config.git_dir, new)?;
+            validate_conversation_append(&config.git_dir, new, update.expected.as_deref())?;
+            validate_connectivity(&config.git_dir, new, update.expected.as_deref())?;
+        }
+    }
+
+    for update in &request.updates {
+        let observed = read_ref(&config.git_dir, &update.refname)?;
+        if observed.as_deref() != update.expected.as_deref() {
+            return Err(HttpError::new(
+                409,
+                format!(
+                    "{} changed to {}",
+                    update.refname,
+                    observed.as_deref().unwrap_or("absent")
+                ),
+            ));
+        }
+    }
+
+    let mut commands = String::from("start\n");
+    for update in &request.updates {
+        match (update.expected.as_deref(), update.new.as_deref()) {
+            (None, Some(new)) => commands.push_str(&format!("create {} {new}\n", update.refname)),
+            (Some(expected), Some(new)) => {
+                commands.push_str(&format!("update {} {new} {expected}\n", update.refname));
+            }
+            (Some(expected), None) => {
+                commands.push_str(&format!("delete {} {expected}\n", update.refname));
+            }
+            (None, None) => {
+                commands.push_str(&format!("verify {} {ZERO_OID}\n", update.refname));
+            }
+        }
+    }
+    commands.push_str("prepare\ncommit\n");
+
+    let mut child = Command::new("git")
+        .args([
+            "-C",
+            &config.git_dir,
+            "update-ref",
+            "--create-reflog",
+            "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| HttpError::new(500, format!("running git update-ref: {error}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| HttpError::new(500, "opening git update-ref stdin"))?
+        .write_all(commands.as_bytes())
+        .map_err(|error| HttpError::new(500, format!("writing git update-ref stdin: {error}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| HttpError::new(500, format!("waiting for git update-ref: {error}")))?;
+    if output.status.success() {
+        return Ok(b"ok\n".to_vec());
+    }
+    for update in &request.updates {
+        if read_ref(&config.git_dir, &update.refname)?.as_deref() != update.expected.as_deref() {
+            return Err(HttpError::new(
+                409,
+                format!("ref transaction lost a comparison at {}", update.refname),
+            ));
+        }
+    }
+    Err(HttpError::new(
+        500,
+        format!(
+            "git update-ref transaction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    ))
+}
+
 fn conflict(observed: Option<&str>) -> HttpError {
     HttpError::new(
         409,
@@ -346,6 +479,21 @@ fn validate_commit(git_dir: &str, hash: &str) -> Result<(), HttpError> {
         Err(HttpError::new(
             422,
             format!("new ref target {hash} is not a stored commit"),
+        ))
+    }
+}
+
+fn validate_object(git_dir: &str, hash: &str) -> Result<(), HttpError> {
+    let status = Command::new("git")
+        .args(["-C", git_dir, "cat-file", "-e", hash])
+        .status()
+        .map_err(|error| HttpError::new(500, format!("running git cat-file: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(HttpError::new(
+            422,
+            format!("new ref target {hash} is not stored"),
         ))
     }
 }
@@ -766,6 +914,54 @@ mod tests {
         assert_eq!(error.status(), 403);
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn exact_ref_transaction_creates_conversation_and_indexes_together() {
+        let (dir, _base, root, _b, _c, _d) = chat_repo();
+        let config = config(&dir);
+        let title = write_object(&dir, "blob", "Subagent");
+        let head_ref = "refs/caos/v2/conversations/agent/head";
+        let title_ref = "refs/caos/v2/conversations/agent/title";
+        let active_ref = "refs/caos/v2/users/u-owner/conversations/active/c-agent";
+        let archived_ref = "refs/caos/v2/users/u-owner/conversations/archived/c-agent";
+        let request = serde_json::json!({
+            "updates": [
+                {"ref": head_ref, "expected": null, "new": root},
+                {"ref": title_ref, "expected": null, "new": title},
+                {"ref": active_ref, "expected": null, "new": root},
+                {"ref": archived_ref, "expected": null, "new": null},
+            ]
+        })
+        .to_string();
+
+        assert!(transaction(&config, &request).is_ok());
+        assert_eq!(
+            read_ref(&dir, head_ref).ok().unwrap().as_deref(),
+            Some(root.as_str())
+        );
+        assert_eq!(
+            read_ref(&dir, title_ref).ok().unwrap().as_deref(),
+            Some(title.as_str())
+        );
+        assert_eq!(
+            read_ref(&dir, active_ref).ok().unwrap().as_deref(),
+            Some(root.as_str())
+        );
+        assert_eq!(read_ref(&dir, archived_ref).ok().unwrap(), None);
+
+        let loser_ref = "refs/caos/v2/conversations/loser/title";
+        let loser = serde_json::json!({
+            "updates": [
+                {"ref": loser_ref, "expected": null, "new": title},
+                {"ref": head_ref, "expected": null, "new": root},
+            ]
+        })
+        .to_string();
+        assert_eq!(transaction(&config, &loser).unwrap_err().status(), 409);
+        assert_eq!(read_ref(&dir, loser_ref).ok().unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn pre_receive_uses_the_same_event_validator_as_exact_append() {
         let (dir, base, root, b, c, _d) = chat_repo();

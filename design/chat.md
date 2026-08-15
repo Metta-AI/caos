@@ -48,10 +48,9 @@ dispatch loss and server restart do not require unique client state.
 
 Model steps, tool calls, results, and lifecycle changes are events on that same
 log. Ordinary tools suspend the turn and are serial: the call is recorded before
-execution, and its result before the next model step. Independent work instead
-has a deterministic wrapper request `Q`; statuses fold separately by `Q`, while
-the result remains in ordinary CAOS result storage. The current design records
-and recovers detached work but does not yet let the model consume its result.
+execution, and its result before the next model step. Independent work has a
+deterministic wrapper request `Q`; repeating `run_async` reads its durable status
+and eventual ordinary CAOS result.
 
 Three invariants organize the design:
 
@@ -288,10 +287,12 @@ different outcome from a retry is appended, and the newest terminal event for
 `Q` wins. Before any redispatch, `llm-step` opens `Q`, validates its subrequest,
 and proves its recorded `target-ref` is this conversation's `F`.
 
-`/run` is an execution operation, not a result read. The current model-facing
-surface exposes a durable task ID and status but has no `wait(Q)` or way to
-consume the result. The result ref is currently an addressability and recovery
-probe.
+`spawn_agent` atomically creates an owner-indexed child conversation on a clean
+snapshot descended from the parent workspace. Its transcript starts at its own
+root, while the shared workspace ancestry lets ordinary `merge` apply its
+result. Its prompt supplies the normal fallback title, and the sidebar groups it
+under the parent recorded by `spawned_by`. Parent call/result and child
+prompt/parent link are durable events; the child runs through `run_async`.
 
 ### Following and presentation state
 
@@ -316,15 +317,9 @@ display.
 
 ### Deferred work
 
-- **Async consumption.** Add a side-effect-free operation that reads
-  `refs/caos/res/Q`, plus a model-facing `wait(Q)` or equivalent. Add a durable
-  follower that redispatches pending detached tasks after the foreground
-  `llm-step` exits; today only a later invocation provides another recovery
-  boundary.
-- **Composition.** Define child conversations and subagents, including how
-  child results and files are applied. Detached work also needs an explicit,
-  least-privilege contract for credentials, model settings, and cycle ancestry;
-  it currently receives only context encoded in its ArgTree.
+- **Async recovery.** Add a durable follower that redispatches pending detached
+  tasks after the foreground `llm-step` exits; today only a later invocation
+  provides another recovery boundary.
 - **Fork contract.** Decide how plain commits create an empty transcript, which
   event positions are safe turn boundaries, and whether inherited async tasks
   are reset, translated, or treated as read-only. A pending task currently names

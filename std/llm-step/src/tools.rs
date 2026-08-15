@@ -132,7 +132,17 @@ pub fn grep_declaration() -> Value {
 /// built-in history tools (`log`/`show`/`diff` — see `githist.rs`) are
 /// standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
-    "bash", "grep", "read", "ls", "write", "edit", "log", "show", "diff",
+    "bash",
+    "grep",
+    "read",
+    "ls",
+    "write",
+    "edit",
+    "log",
+    "show",
+    "diff",
+    "spawn_agent",
+    "run_async",
 ];
 
 /// The tree's tool directory (`caos-tools/` in the workspace), expanded one

@@ -960,6 +960,7 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    parent: Option<String>,
     remote_title: Option<String>,
     sidebar_attention: Option<String>,
     automatic_title: bool,
@@ -1002,6 +1003,7 @@ impl ConversationState {
         Self {
             id,
             title,
+            parent: None,
             remote_title,
             sidebar_attention: None,
             automatic_title: false,
@@ -1664,12 +1666,14 @@ impl App {
         let mut states: Vec<ConversationState> = conversations
             .iter()
             .map(|summary| {
-                ConversationState::new(
+                let mut state = ConversationState::new(
                     summary.id.clone(),
                     summary.title.clone(),
                     args.turn.clone(),
                     "ready".to_string(),
-                )
+                );
+                state.parent = summary.parent.clone();
+                state
             })
             .collect();
         for state in &mut states {
@@ -2563,6 +2567,10 @@ impl App {
         for entry in entries {
             if let Some(index) = self.conversation_index(&entry.summary.id) {
                 let state = &mut self.conversations[index];
+                if state.parent != entry.summary.parent {
+                    state.parent = entry.summary.parent.clone();
+                    changed = true;
+                }
                 if state.forking
                     || state.remote_head != entry.observed_head
                     || state.remote_title != entry.observed_title
@@ -2599,9 +2607,28 @@ impl App {
                     self.selected().turn_options.clone(),
                     "shared conversation".to_string(),
                 );
+                state.parent = entry.summary.parent;
                 state.apply_load(*load, &self.user);
-                self.conversations.insert(0, state);
-                self.selected += 1;
+                let insert_at = state
+                    .parent
+                    .as_deref()
+                    .and_then(|parent| self.conversation_index(parent))
+                    .map(|parent_index| {
+                        let mut index = parent_index + 1;
+                        while self
+                            .conversations
+                            .get(index)
+                            .is_some_and(|candidate| candidate.parent == state.parent)
+                        {
+                            index += 1;
+                        }
+                        index
+                    })
+                    .unwrap_or(0);
+                self.conversations.insert(insert_at, state);
+                if insert_at <= self.selected {
+                    self.selected += 1;
+                }
                 changed = true;
             }
         }
@@ -3768,6 +3795,7 @@ mod tests {
             title: id.to_string(),
             head: "a".repeat(40),
             updated_unix: 1,
+            parent: None,
         }
     }
 
@@ -4256,6 +4284,7 @@ mod tests {
                 title: "published fallback".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: None,
             observed_title: None,
@@ -4289,6 +4318,7 @@ mod tests {
                 title: "manual rename".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: None,
             observed_title: None,
@@ -4317,6 +4347,7 @@ mod tests {
                 title: "manual rename".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: None,
             observed_title: Some("published fallback".to_string()),
@@ -4924,6 +4955,7 @@ mod tests {
             title: "A generated title".to_string(),
             head: "a".repeat(40),
             updated_unix: 1,
+            parent: None,
         }];
         assert_eq!(
             choose_conversation(None, true, &conversations).unwrap(),
@@ -5822,6 +5854,8 @@ mod tests {
         selected.status = "calling model…".to_string();
         assert_eq!(selected.sidebar_text(16).1, "calling model…".to_string());
         selected.running = false;
+        let mut child = state("Child task");
+        child.parent = Some(internal_id.to_string());
         let mut generating_title = ConversationState::new(
             internal_id.to_string(),
             "Existing title".to_string(),
@@ -5829,7 +5863,13 @@ mod tests {
             "ready".to_string(),
         );
         generating_title.generating_title = true;
-        let (app, _) = app_with(vec![selected, generating_title, state("Empty title")]);
+        let (mut app, _) = app_with(vec![
+            selected,
+            child,
+            generating_title,
+            state("Empty title"),
+        ]);
+        app.selected = 2;
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -5854,6 +5894,14 @@ mod tests {
             .trim_matches('│')
             .trim()
             .is_empty());
+        let child_row = sidebar_rows
+            .iter()
+            .position(|row| row.contains("Child task"))
+            .unwrap();
+        assert_eq!(
+            sidebar_rows[child_row].find("Child task").unwrap(),
+            sidebar_rows[title_row].find("Readable title").unwrap() + 2
+        );
         assert!(
             sidebar_rows
                 .iter()
@@ -6163,6 +6211,7 @@ mod tests {
                 title: "stale title".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: Some("a".repeat(40)),
             observed_title: Some("old local title".to_string()),

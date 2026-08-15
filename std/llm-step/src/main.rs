@@ -13,6 +13,7 @@
 mod async_work;
 mod githist;
 mod progress;
+mod subagents;
 mod tools;
 
 use std::fs;
@@ -337,6 +338,35 @@ fn drive(
     let mut queue = queue.to_vec();
     while let Some(call) = queue.first().cloned() {
         let name = call["name"].as_str().unwrap_or("");
+        if name == subagents::SPAWN_TOOL {
+            let image = cfg
+                .run_and_update_ref_image
+                .as_deref()
+                .ok_or("spawn_agent was called without a run-and-update-ref image")?;
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            let owner = request_owner(&log, head_hash)?.to_string();
+            let result = subagents::spawn_call(
+                &call,
+                conversation(cfg)?,
+                &owner,
+                run,
+                round,
+                &ws,
+                &wc,
+                &cfg.system,
+                image,
+                |task| ensure_async_status(cfg, task),
+            )?;
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            (ws, _) = canonical_workspace(&log)?;
+            base_head = log.head;
+            append_tool_result(cfg, run, round, &base_head, &result, &cas_hash(&ws)?, None)?;
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            (ws, wc) = canonical_workspace(&log)?;
+            base_head = log.head;
+            queue.remove(0);
+            continue;
+        }
         if name == async_work::TOOL_NAME {
             let image = cfg
                 .run_and_update_ref_image
@@ -453,7 +483,8 @@ fn drive(
         if !tools::is_inline(name) {
             return Err(format!(
                 "model called unknown tool {name:?} (built-ins: bash, grep, read, \
-                 ls, write, edit, merge; plus this workspace's caos-tools/*.sh)"
+                 ls, write, edit, merge, spawn_agent; plus this \
+                 workspace's caos-tools/*.sh)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -977,6 +1008,18 @@ fn active_request(log: &progress::ConversationLog) -> Result<String, String> {
     Ok(request)
 }
 
+fn request_owner<'a>(
+    log: &'a progress::ConversationLog,
+    head: &str,
+) -> Result<&'a str, String> {
+    log.events
+        .iter()
+        .find(|event| event.commit == head)
+        .and_then(|event| event.value.get("username"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("request head {head} has no human owner"))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum RequestStart {
     Running,
@@ -1045,13 +1088,10 @@ fn request_after_head(
     log: &progress::ConversationLog,
     position: usize,
 ) -> Result<Option<String>, String> {
-    let request_event = log.events.get(position + 1).filter(|event| {
-        event
-            .value
-            .get("request")
-            .and_then(Value::as_str)
-            .is_some()
-    });
+    let request_event = log
+        .events
+        .get(position + 1)
+        .filter(|event| event.value.get("request").and_then(Value::as_str).is_some());
     let request = request_event
         .and_then(|event| event.value.get("request"))
         .and_then(Value::as_str)
@@ -1064,7 +1104,12 @@ fn request_after_head(
             .value
             .get("request_head")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("request event after {} has no request_head", log.events[position].commit))?;
+            .ok_or_else(|| {
+                format!(
+                    "request event after {} has no request_head",
+                    log.events[position].commit
+                )
+            })?;
         validate_run_hash(recorded_head)?;
         let expected = &log.events[position].commit;
         if recorded_head != expected {
@@ -1805,6 +1850,7 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
     if cfg.run_and_update_ref_image.is_some() {
+        tools.extend(subagents::declarations());
         tools.push(async_work::declaration());
     }
     if cfg.grep_image.is_some() {

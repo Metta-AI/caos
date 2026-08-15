@@ -127,6 +127,7 @@ pub struct UserConversationSummary {
     pub title: String,
     pub head: String,
     pub updated_unix: i64,
+    pub parent: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1560,7 +1561,7 @@ pub fn list_user_conversations(
             continue;
         };
         let summary = (|| {
-            let updated_unix = remote_commit_timestamp(t, head)?;
+            let metadata = remote_conversation_metadata(t, head)?;
             let title_ref = conversation_title_ref(&id)?;
             let title = if let Some(hash) = titles.get(&title_ref) {
                 let (kind, bytes) = t.get_object(hash)?;
@@ -1577,7 +1578,8 @@ pub fn list_user_conversations(
                 id: id.clone(),
                 title,
                 head: head.clone(),
-                updated_unix,
+                updated_unix: metadata.updated_unix,
+                parent: metadata.parent,
             })
         })();
         match summary {
@@ -1590,7 +1592,50 @@ pub fn list_user_conversations(
             .cmp(&a.updated_unix)
             .then_with(|| b.id.cmp(&a.id))
     });
-    Ok(conversations)
+    Ok(group_child_conversations(conversations))
+}
+
+fn group_child_conversations(
+    conversations: Vec<UserConversationSummary>,
+) -> Vec<UserConversationSummary> {
+    let roots = conversations
+        .iter()
+        .filter(|conversation| conversation.parent.is_none())
+        .map(|conversation| conversation.id.clone())
+        .collect::<HashSet<_>>();
+    let mut children: HashMap<String, Vec<UserConversationSummary>> = HashMap::new();
+    let mut top_level = Vec::new();
+    for conversation in conversations {
+        match conversation
+            .parent
+            .as_ref()
+            .filter(|parent| roots.contains(*parent))
+        {
+            Some(parent) => children
+                .entry(parent.clone())
+                .or_default()
+                .push(conversation),
+            None => top_level.push(conversation),
+        }
+    }
+    top_level.sort_by(|a, b| {
+        let newest = |conversation: &UserConversationSummary| {
+            children
+                .get(&conversation.id)
+                .and_then(|children| children.first())
+                .map(|child| child.updated_unix)
+                .unwrap_or(conversation.updated_unix)
+                .max(conversation.updated_unix)
+        };
+        newest(b).cmp(&newest(a)).then_with(|| b.id.cmp(&a.id))
+    });
+    let mut grouped = Vec::new();
+    for conversation in top_level {
+        let id = conversation.id.clone();
+        grouped.push(conversation);
+        grouped.extend(children.remove(&id).unwrap_or_default());
+    }
+    grouped
 }
 
 pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
@@ -2589,7 +2634,19 @@ fn warn_skipped_conversation(id: &str, error: &str) {
     eprintln!("warning: skipping malformed conversation {id:?}: {error}");
 }
 
+struct RemoteConversationMetadata {
+    updated_unix: i64,
+    parent: Option<String>,
+}
+
 fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> {
+    remote_conversation_metadata(t, hash).map(|metadata| metadata.updated_unix)
+}
+
+fn remote_conversation_metadata(
+    t: &GitTransport,
+    hash: &str,
+) -> Result<RemoteConversationMetadata, String> {
     validate_hash(hash, "conversation tip")?;
     let mut current = hash.to_string();
     let mut newest_activity_timestamp = None;
@@ -2626,10 +2683,31 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
             newest_activity_timestamp = Some(commit_timestamp(headers, &current)?);
         }
         if is_root {
-            return match newest_activity_timestamp {
-                Some(timestamp) => Ok(timestamp),
-                None => commit_timestamp(headers, &current),
+            let updated_unix = match newest_activity_timestamp {
+                Some(timestamp) => timestamp,
+                None => commit_timestamp(headers, &current)?,
             };
+            let parent = match event.get("spawned_by") {
+                None => None,
+                Some(spawned_by) => {
+                    let parent = spawned_by
+                        .get("conversation")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            format!(
+                                "conversation root {current} spawned_by has no string conversation"
+                            )
+                        })?;
+                    conversation_ref(parent).map_err(|error| {
+                        format!("conversation root {current} has invalid parent: {error}")
+                    })?;
+                    Some(parent.to_string())
+                }
+            };
+            return Ok(RemoteConversationMetadata {
+                updated_unix,
+                parent,
+            });
         }
         current = parent.to_string();
     }
@@ -3552,6 +3630,59 @@ mod tests {
         for key in ["project", "c-", "c-0", "c-2F", "c-ff"] {
             assert!(conversation_id_from_key(key).is_err(), "accepted {key:?}");
         }
+    }
+
+    #[test]
+    fn indexed_children_follow_their_parent_without_a_separate_tree_index() {
+        let summary = |id: &str, parent: Option<&str>, updated_unix| UserConversationSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            head: "a".repeat(40),
+            updated_unix,
+            parent: parent.map(str::to_string),
+        };
+        let grouped = group_child_conversations(vec![
+            summary("child", Some("parent"), 4),
+            summary("new-root", None, 3),
+            summary("parent", None, 2),
+            summary("orphan", Some("absent"), 1),
+        ]);
+
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "child", "new-root", "orphan"]
+        );
+    }
+
+    #[test]
+    fn sidebar_metadata_reads_the_durable_parent_from_the_root() {
+        let (root, repo, transport, base) = conversation_index_fixture("child-parent");
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let child = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "content": "delegated task",
+                "spawned_by": {
+                    "conversation": "parent",
+                    "request": "b".repeat(40),
+                    "round": 0,
+                    "call": "toolu_spawn",
+                },
+            }),
+        )
+        .unwrap();
+
+        let metadata = remote_conversation_metadata(&transport, &child).unwrap();
+        assert_eq!(metadata.parent.as_deref(), Some("parent"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

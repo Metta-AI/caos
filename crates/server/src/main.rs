@@ -7,6 +7,7 @@
 //! * `POST /object/` — store the serialized object in the body, return its hash.
 //! * `POST /ref/read` — read one exact ref without a repository-wide advertisement.
 //! * `POST /ref/append` — atomically compare-and-append a commit-valued ref.
+//! * `POST /ref/transaction` — atomically compare and update several exact refs.
 //!
 //! Compute:
 //!
@@ -534,16 +535,18 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
         }
-        Method::Post if path == "/ref/read" || path == "/ref/append" => {
+        Method::Post
+            if path == "/ref/read" || path == "/ref/append" || path == "/ref/transaction" =>
+        {
             let mut body = String::new();
             request
                 .as_reader()
                 .take(16 * 1024)
                 .read_to_string(&mut body)?;
-            if path == "/ref/read" {
-                refs::read(config, &body)
-            } else {
-                refs::append(config, &body)
+            match path.as_str() {
+                "/ref/read" => refs::read(config, &body),
+                "/ref/append" => refs::append(config, &body),
+                _ => refs::transaction(config, &body),
             }
         }
         Method::Post if path == "/runner/poll" || path == "/runner/result" => {
