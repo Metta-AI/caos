@@ -331,12 +331,14 @@ pub trait Transport {
     /// reaches the server over HTTP, and `std/llm-client` and
     /// `std/flake-builder` both call out to the internet).
     ///
-    /// What resolution being CLIENT-side buys is determinism, not confinement.
-    /// The ArgTree is the cache key, so a locator has to become an oid before
-    /// the request is formed; a worker resolving a URL at run time would either
-    /// put a name inside the key or make one key mean different things at
-    /// different times. By the time a worker sees this arg it is an ordinary
-    /// oid, resolved before the request existed (design/flake-inputs.md).
+    /// What resolution being CLIENT-side buys is that the KEY IS CONTENT rather
+    /// than a name — not determinism, which the mandatory full `rev` already
+    /// gives wherever it is resolved. The ArgTree *is* the cache key, so the
+    /// locator must become an oid before the request is formed; otherwise the
+    /// URL sits in the key and two consumers pinning the same rev through
+    /// different URLs get different keys for identical content. By the time a
+    /// worker sees this arg it is an ordinary oid, resolved before the request
+    /// existed (design/flake-inputs.md).
     fn fetch_git_ref(&self, _url: &str, _rev: &str) -> Result<Option<()>, String> {
         Ok(None)
     }

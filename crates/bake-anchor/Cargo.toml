@@ -4,9 +4,10 @@
 # (rgrep, llm-call, llm-step, …) live OUTSIDE the workspace and are compiled by
 # rustc against that bake; without an anchor, deleting their old workspace crates
 # would drop their deps (regex, minreq+rustls, serde_json, tiny_http) from the
-# bake and
-# every source tool would recompile them from scratch (or fail — workers have no
-# network). tests/std-lint enforces `anchor ⊇ every std tool's crates.io deps`.
+# bake and every source tool would recompile them from scratch — or fail, since
+# the bake builds `--offline` against a vendored registry (not because a worker
+# lacks a network; see AGENTS.md "Workers"). tests/std-lint enforces
+# `anchor ⊇ every std tool's crates.io deps`.
 #
 # Keep the versions/features in lockstep with what the std tools declare: cargo
 # fingerprints on features, so a mismatch (e.g. a tool needing a non-default

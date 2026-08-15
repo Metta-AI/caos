@@ -1,0 +1,32 @@
+# std/flake-input-loader — mount a pinned flake input into a consumer's tree
+# (design/flake-inputs.md, "Consumer root"). This directory IS the tool: its
+# Rust source, this manifest, and its `.caos-expr`.
+#
+# serde_json is a crates.io dependency; it needs no special handling because the
+# cargo image seeds the whole workspace's vendored+precompiled deps
+# (std/cargo/bake.nix) and the dev profile below matches the bake, so cargo
+# REUSES the seeded artifact rather than recompiling it. It is anchored for that
+# purpose in crates/bake-anchor.
+[package]
+name = "flake-input-loader"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }
+serde_json = "1"
+
+# Match the caos workspace's dev profile (Cargo.toml) so dependency
+# fingerprints line up with the bake and `serde_json` is reused from the seeded
+# std/cargo target/ rather than recompiled.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

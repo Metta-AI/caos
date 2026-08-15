@@ -19,13 +19,15 @@ traps have already been sprung.
 | 2C | CLI + worker `caos` grammar collapse: drop the positional image (and the `--`) everywhere; type the map-then positions; delete the last sniffers | ✅ done (33/33), **needed a redeploy** |
 | 4 | `:@@=` *resolution* (client-side fetch → oid) | ✅ done (34/34), **no redeploy needed** |
 | 4a | `dir=` descends through EVALUATION, not a raw tree walk — the fix that makes an ordinary `std/<x>` reachable by locator | ✅ done (35/35) |
-| 6 | Docs + tests (README, `tests/remote-ref`) | ✅ done with 4 |
+| 4b | `$CAOS_EXPR` — an expression's own blob, pre-bound; the only way a worker can see the directive that launched it | ✅ done (35/35) |
+| 5 | `std/flake-input-loader` — mount a pinned input into a consumer's tree, checking the pin against `flake.lock` | ✅ done (36/36) |
+| 6 | Docs + tests (README, `tests/remote-ref`, `tests/flake-input-loader`) | ✅ done |
 
-The end goal past stage 4: a consumer repo pins caos with a
-`git+https://…caos?rev=<sha>` locator and reaches `std/*` by descent — nothing
-committed, all content-addressed. The one-worker case works today
-(`tests/remote-ref`); the whole-tree case needs one ordinary worker, not new
-machinery. See **Consumer root** below.
+The goal is met: a consumer repo pins caos with a `git+https://…caos?rev=<sha>`
+locator and reaches `std/*` by descent — nothing committed, all
+content-addressed. Both shapes work and are tested: one worker by locator
+(`tests/remote-ref`) and a whole input mounted into the consumer's evaluated
+tree (`tests/flake-input-loader`). See **Consumer root** below.
 
 ## Working here (hard-won workflow notes)
 
@@ -78,10 +80,12 @@ A **URL is a name; a hash is content.** A remote ref MUST carry a mandatory
 time**, fetching the closure into the CAS. From that point it is an ordinary
 oid. **A URL never sits inside an ArgTree / cache key.** Resolution is a
 **client** step — NOT because a worker lacks a network (it has one; see
-AGENTS.md "Workers"), but because the ArgTree is the cache key and a locator
-must become an oid before the request exists. The resolved arg entry is a plain
-tree/blob oid, so two consumers pinning the same rev share the whole deepened
-subgraph by hash.
+AGENTS.md "Workers"), and NOT for determinism (the mandatory full `rev` gives
+that wherever it resolves), but because the ArgTree IS the cache key: the
+locator must become an oid before the request exists, or the URL sits in the key
+and two consumers pinning the same rev through different URLs get different keys
+for identical content. The resolved arg entry is a plain tree/blob oid, so they
+share the whole deepened subgraph by hash instead.
 
 We borrow **nix's flake-reference string grammar** as the locator *syntax only*.
 No nix runs; nothing evaluates a flake. It is just a well-specified string format
@@ -393,37 +397,54 @@ ordinary worker — one with a `.caos-expr` and `DEPS`, built by rustc — is
 reachable. That is what makes the design below possible; the earlier sketch of a
 graft worker that had to be a flake was an artifact of the bug.
 
-What remains is the WHOLE-TREE case — a consumer that wants `DEPS`/`DEEP-DEPS`
-of its own, so its directories can declare deps against caos' `std/*`. Now that
-a locator reaches an ordinary entry, this is **one line and one new worker**:
+The WHOLE-TREE case — a consumer that wants `DEPS`/`DEEP-DEPS` of its own, so
+its directories can declare deps against caos' `std/*` — is **`std/flake-input-loader`**,
+and it needed no new machinery: it is an ordinary rustc-built entry with a
+`.caos-expr` and `DEPS`, reachable by locator because `dir=` descends through
+evaluation (4a). The consumer's root `.caos-expr` is one line:
 
 ```
-run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/<expander> \
-    --in:@=. --caos:@@=git+https://github.com/org/caos?rev=<sha> --expr=$CAOS_EXPR
+run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/flake-input-loader \
+    --in:@=. --expr=$CAOS_EXPR \
+    --input=caos --input-tree:@@=git+https://github.com/org/caos?rev=<sha>&dir=std \
+    --output-path=caos-std
 ```
 
-The locator appears TWICE, and that is not redundancy to design away — the two
-name different things. `--base` yields the expander's IMAGE; `--caos` yields
-caos' TREE, which is what gets mounted. Resolution happens before the request
-exists, so the tree has to arrive as an already-resolved arg. The duplication is exactly what the
-consistency check below exists to police.
+The caller says WHICH input, WHAT of it to load, and WHERE it goes. Three
+things about that line are load-bearing:
 
-The expander is a normal caos worker — a `.caos-expr`, `DEPS`, built by rustc —
-because resolving that locator evaluates caos from its root, so deep-deps and
-rustc run for the consumer exactly as they do here. There is no bootstrap
-problem to solve and no `std/merge` step: the consumer already has a caos server
-with a seeder and a runner, which is the only precondition.
+- **The locator appears twice on purpose.** `--base` yields the loader's IMAGE;
+  `--input-tree` yields the input's TREE. Passing the tree as an arg is what
+  lets caos' own `:@@=` resolution do the fetching — otherwise the loader would
+  have to find its own way to pull a subtree into the server's git repo. It also
+  keeps the URL out of the key: by the time the worker runs, that arg is an oid.
+- **`--expr=$CAOS_EXPR` is the only way the loader can see the expression**, and
+  the reason is the stripping rule: `--in:@=.` is the consumer's directory MINUS
+  the directive, so `--expr:@=.caos-expr` names a file that is not there
+  (measured: `eval-path: path ".caos-expr" not found in tree`).
+- **`--output-path` may be nested.** Parent directories the consumer's tree does
+  not have are created; every sibling is carried across by REFERENCE (a symlink
+  into `/cas` that `caos put` resolves by recorded hash), so an untouched
+  subtree is never read or copied however large. Overwriting an existing entry
+  is refused — the mount point is meant to be gitignored and absent.
 
-What it does:
+What it checks: the `:@@=` locators in the expression must name the same repo
+and revision that `flake.lock` locks for `--input` — the `nix flake update`
+without regenerating case. Only locators matching that input's locked URL are
+examined, so a consumer pinning several inputs runs the loader once per input
+without the others tripping it, and at least one must match.
 
-- read `--in`'s `flake.nix` / `flake.lock` and determine which caos revision the
-  consumer pins;
-- read the expression that launched it — `--expr=$CAOS_EXPR` — and CHECK that
-  both locators on that line name the same repo and revision as `flake.lock`, so
-  a tree cannot be evaluated against one caos while its lockfile declares
-  another, and the two locators cannot drift apart;
-- return `--in` with the `--caos` tree mounted (say `.caos-input/`, or just its
-  `std/` as `.caos-std/` — naming still open).
+`flake.nix` is checked for PRESENCE only. Parsing it needs a nix parser and buys
+nothing: `flake.lock` is nix's own resolved answer, derived from `flake.nix`,
+and an input that vanished from the flake is dropped from the lock too.
+
+One limit worth stating rather than discovering later: **no worker can verify
+that a tree came from a rev**, because that mapping needs a fetch and by the
+time the worker runs the locator is already an oid. This compares DECLARATIONS —
+a drift detector, not a proof about `--input-tree`'s bytes.
+
+The mount lives only in the evaluation result — content-addressed, deduped,
+never committed; the mount point is **gitignored** in the consumer.
 
 Everything that check needs arrives as an arg: `flake.lock` in `--in`, the tree
 in `--caos`, the declaration in `--expr`. Nothing is fetched, nothing is
@@ -444,30 +465,33 @@ It does not need to run deep-deps itself: the mounted result is an ordinary
 tree, so the consumer's root expression chains to caos' deep-deps in a second
 line if it wants `DEPS` resolution too.
 
-**Pinning from `flake.lock` is lockfile codegen, not runtime magic.** A worker
-can parse `flake.lock` but cannot RESOLVE a locator (that happens client-side,
-before the request is formed), and the
-eval grammar's `$VAR` is an object reference, not a string you can splice into a
-URL. So "keep the caos pin in sync with `flake.lock`" is a **dev/build hook**
-that writes the resolved `git+https://…?rev=<sha>` locator into a tracked
-generated file on `nix flake update`. Keeps nix out of core *and* the evaluator.
-The syntax we chose (nix's) is the one `flake.lock` already emits, so that codegen
-is a mechanical mapping. Not scheduled; noted so the choices line up.
+**Keeping the pin in sync is CHECKED, not generated.** An earlier sketch here
+had a dev/build hook writing the resolved locator into a tracked generated file
+on `nix flake update`. That was dropped for a simple reason: nothing reliably
+runs such a hook, so the generated file becomes a SECOND place to forget, and
+its only enforcement would be a CI step that regenerates and diffs. The loader
+inverts it — the expression stays the single hand-written pin, and the loader
+refuses to run when it disagrees with `flake.lock`. Bumping the lock without
+updating the expression fails loudly at the next evaluation, which is where you
+want to hear about it.
 
 ## Open / deferred
 
-Stages 1–4 are done; the grammar and the locator are finished. What is left is
-built ON them, and nothing in this repo needs it yet:
+Every stage is done: the grammar, the locator, and the consumer story on top of
+them. What is left is optional polish or a deliberate refusal:
 
-- The **consumer input expander** (whole-tree mounting, above) and the
-  **`flake.lock` codegen hook** — sketched, not scheduled.
+- **`$VAR` interpolation into string arguments.** The consumer's root line
+  spells the locator twice (`--base` and `--input-tree`) because a `$VAR` is an
+  object reference, not text you can splice into a value. If `--k=…$PIN…`
+  substituted a string, the pin could be written once. Nice, not needed: the
+  loader's check is what stops the two from drifting.
 - **Worker-side locator resolution** stays out of scope — not for confinement
   (workers have a network), but because it would move resolution AFTER the
   ArgTree is formed, putting a URL inside the cache key. The `Ok(None)` default
   on `Transport::fetch_git_ref` holds that line, and `tests/remote-ref` asserts
   it from inside a worker.
 - **`ref=` (a branch/tag) stays refused**, with no plan to relax it. Anyone who
-  wants "track main" wants a lockfile, which is the codegen hook above — the
-  refusal is the invariant, not a missing feature.
+  wants a lockfile — and `std/flake-input-loader` now CHECKS the expression
+  against one. The refusal is the invariant, not a missing feature.
 - **`map-then`/`run-then` positional `<in>`**: resolved in 2C — it stays
   positional. It is the data the continuation is over, not a base.

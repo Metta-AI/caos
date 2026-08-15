@@ -69,13 +69,16 @@ Every script here runs with it, and two constructs quietly break under it.
   `std/flake-builder`'s worker runs `nix build` (fetching flake inputs from the
   internet) and `skopeo copy` to the registry. A worker that wants the network
   has it.
-- **What is genuinely client-side is `:@@=` RESOLUTION, and the reason is
-  DETERMINISM, not capability.** The ArgTree is the cache key, so a locator has
-  to become an oid before the request is formed; a worker resolving a URL at run
-  time would either put a name inside the key or make one key mean different
-  things at different times. Mechanically, the worker's `HttpTransport` also has
-  no git repo or remote to fetch INTO, which is why `Transport::fetch_git_ref`
-  defaults to `Ok(None)`. Neither of those is a sandbox.
+- **What is genuinely client-side is `:@@=` RESOLUTION, and the reason is that
+  the KEY MUST BE CONTENT, not a name.** Not determinism: a locator carries a
+  mandatory full commit sha, so `url + rev` is deterministic and could be
+  resolved anywhere. The point is that the ArgTree *is* the cache key, so the
+  locator has to become an oid before the request is formed — otherwise the URL
+  sits inside the key and two consumers pinning the same rev through different
+  URLs (a fork, a mirror, ssh vs https) get different keys for identical
+  content. Mechanically, the worker's `HttpTransport` also has no git repo or
+  remote to fetch INTO, which is why `Transport::fetch_git_ref` defaults to
+  `Ok(None)`. Neither of those is a sandbox.
 - **Where "no network" is true it is a BUILD-level choice.** `std/cargo` builds
   `--offline` against a vendored registry (`std/cargo/bake.nix`,
   `vendorCargoDeps`) — which is why a crates.io dep missing from the bake anchor

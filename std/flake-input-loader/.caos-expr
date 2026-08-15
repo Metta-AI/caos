@@ -1,0 +1,10 @@
+# std/flake-input-loader's image (design/flake-inputs.md): build this directory
+# as a Rust project with rustc. `--src:@=.` hands rustc the tool (Cargo.toml +
+# src/; rustc skips the caos metadata — .caos-expr, DEPS, DEEP-DEPS/), named by
+# a LOCAL deep-deps mount declared in DEPS. No runner is named: rustc DEPENDS on
+# the pool and curries the built binary onto it itself.
+#
+# Nothing here is special-cased for a CONSUMER reaching this entry by locator.
+# `--base:@@=…&dir=std/flake-input-loader` descends through evaluation from the
+# repo root, so a pinned consumer resolves this expression exactly as caos does.
+run --base:@=DEEP-DEPS/rustc --src:@=.
