@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end chat test against a scripted LLM. The single remote
-# refs/caos/conversations/<id>/head ref is authoritative: every accepted event
-# is on its first-parent spine, and remote work keeps advancing it after the
+# End-to-end chat test against a scripted LLM. The remote
+# refs/caos/conversations/<id>/head ref is authoritative: every accepted
+# event is on its first-parent spine, while title and membership refs are
+# presentation indexes. Remote work keeps advancing the head after the
 # submitting client disappears.
 set -euo pipefail
 
@@ -87,7 +88,8 @@ if [ -z "$stub_pid" ]; then
 fi
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-conv="chat-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+test_id=$(printf '%s' "${CAOS_SALT:-$(date +%s%N)}" | tr -cd '0-9a-zA-Z')
+conv="chat-$test_id"
 ref="refs/caos/conversations/$conv/head"
 queued_conv="queued-$conv"
 queued_ref="refs/caos/conversations/$queued_conv/head"
@@ -163,9 +165,19 @@ tool_events=$(grep -cF 'toolu_01' turn1.events || true)
 grep -qF '"name":"bash"' turn1.events || fail "tool name was not recorded"
 grep -qF "$T1_TEXT" turn1.events || fail "assistant result event is missing"
 
+title_ref="refs/caos/conversations/$conv/title"
 git ls-remote --refs caos "refs/caos/conversations/$conv/*" > conversation.refs
-[ "$(wc -l < conversation.refs)" -eq 1 ] || fail "conversation has side refs"
-grep -q "[[:space:]]$ref$" conversation.refs || fail "the sole ref is not canonical head"
+[ "$(wc -l < conversation.refs)" -eq 2 ] \
+  || fail "conversation does not have exactly its head and title refs"
+grep -q "[[:space:]]$ref$" conversation.refs || fail "canonical head ref is missing"
+grep -q "[[:space:]]$title_ref$" conversation.refs || fail "title ref is missing"
+
+git ls-remote --refs caos \
+  "refs/caos/users/*/conversations/*/$conv" > membership.refs
+[ "$(wc -l < membership.refs)" -eq 1 ] \
+  || fail "conversation does not have exactly one creator membership ref"
+grep -q "[[:space:]]refs/caos/users/[^/]*/conversations/active/$conv$" membership.refs \
+  || fail "creator membership is not active"
 
 conversation_key="c-$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')"
 git ls-remote --refs caos \
@@ -232,7 +244,7 @@ grep -qF "assistant: $T1_TEXT" log.out || fail "log misses first assistant event
 grep -qF "tester: and now?" log.out || fail "log misses second user event"
 grep -qF "assistant: $T2_TEXT" log.out || fail "log misses recovered assistant event"
 
-fresh="chat-fresh-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+fresh="chat-fresh-$test_id"
 "$CAOS_CLI" talk --new -c "$fresh" "fresh start" "${opts[@]}" >talk.out 2>talk.err
 grep -qF "$T3_TEXT" talk.out || fail "fresh conversation response is missing"
 auto_ref="refs/caos/conversations/$fresh/head"

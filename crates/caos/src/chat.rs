@@ -119,6 +119,13 @@ pub enum UserConversationStatus {
     Archived,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InviteOutcome {
+    Created,
+    AlreadyActive,
+    Archived,
+}
+
 impl UserConversationStatus {
     fn ref_component(self) -> &'static str {
         match self {
@@ -497,6 +504,7 @@ where
         return Err("--system and --system-file are mutually exclusive".to_string());
     }
     let username = resolve_username(t, options.username.as_deref())?;
+    let initial_title = default_title(message);
     for _attempt in 0..MAX_APPEND_ATTEMPTS {
         let observed = remote_ref(t, &refname)?;
         if require_absent && observed.is_some() {
@@ -534,7 +542,7 @@ where
             "content": message,
         });
         if observed.is_none() {
-            user_event["title"] = Value::String(default_title(message));
+            user_event["title"] = Value::String(initial_title.clone());
         }
 
         if let WorkspaceProposal::Conflict(conflict) = &workspace {
@@ -564,10 +572,26 @@ where
                 &[parent.as_str(), conflict.proposal.as_str()],
                 &user_event,
             )?;
-            match push_head_cas(t, &refname, observed.as_deref(), &event)? {
+            let pushed = match observed.as_deref() {
+                Some(observed) => push_head_cas(t, &refname, Some(observed), &event)?,
+                None => try_push_initial_conversation(
+                    t,
+                    &username,
+                    id,
+                    &refname,
+                    &event,
+                    &initial_title,
+                )?,
+            };
+            match pushed {
                 true => {
                     let _ = update_local_cache(t, &refname, &event);
                     return Err(format!("{error}\nconflicting proposal recorded at {event}"));
+                }
+                false if require_absent => {
+                    return Err(format!(
+                    "--new: conversation {id:?} was created by another client; choose another name"
+                ))
                 }
                 false => continue,
             }
@@ -625,7 +649,18 @@ where
         });
         let admitted = create_event_commit(t, &tree, &user, &admission)?;
 
-        match push_head_cas(t, &refname, observed.as_deref(), &admitted)? {
+        let pushed = match observed.as_deref() {
+            Some(observed) => push_head_cas(t, &refname, Some(observed), &admitted)?,
+            None => try_push_initial_conversation(
+                t,
+                &username,
+                id,
+                &refname,
+                &admitted,
+                &initial_title,
+            )?,
+        };
+        match pushed {
             true => {
                 // The user event and exact request become durable together.
                 // Compute is launched only after this boundary.
@@ -634,6 +669,11 @@ where
                     commit: user,
                     request: Some(request),
                 });
+            }
+            false if require_absent => {
+                return Err(format!(
+                    "--new: conversation {id:?} was created by another client; choose another name"
+                ))
             }
             false => continue,
         }
@@ -1092,23 +1132,107 @@ pub fn publish_user_conversation(
     let head = conversation_head(t, id)?
         .ok_or_else(|| format!("cannot publish conversation {id:?} before its first turn"))?;
     fetch_commit(t, &head)?;
+    create_conversation_title_if_absent(t, id, title)?;
+    invite_user_to_conversation_at(t, user, id, &head).map(|_| ())
+}
+
+fn create_conversation_title_if_absent(
+    t: &GitTransport,
+    id: &str,
+    title: &str,
+) -> Result<(), String> {
     let title = validate_conversation_title(title)?;
-    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
     let title_ref = conversation_title_ref(id)?;
+    if remote_ref(t, &title_ref)?.is_some() {
+        return Ok(());
+    }
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    let lease = format!("--force-with-lease={title_ref}:");
+    let update = format!("{title_hash}:{title_ref}");
+    let pushed = t.git_capture(&["push", "--quiet", &lease, CAOS_REMOTE, &update], None);
+    if pushed.is_ok() || remote_ref(t, &title_ref)?.is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "publishing conversation {id:?}: {}",
+            pushed.expect_err("checked error above")
+        ))
+    }
+}
+
+/// Add an existing conversation to another user's active sidebar unless that
+/// user already archived it. The canonical conversation head is unchanged.
+pub fn invite_user_to_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+) -> Result<InviteOutcome, String> {
+    let head = conversation_head(t, id)?
+        .ok_or_else(|| format!("cannot invite to conversation {id:?} before its first turn"))?;
+    fetch_commit(t, &head)?;
+    invite_user_to_conversation_at(t, user, id, &head)
+}
+
+fn invite_user_to_conversation_at(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    head: &str,
+) -> Result<InviteOutcome, String> {
     let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    for _attempt in 0..MAX_APPEND_ATTEMPTS {
+        let before = remote_refs(t, [active_ref.clone(), archived_ref.clone()])?;
+        match (before.get(&active_ref), before.get(&archived_ref)) {
+            (Some(_), Some(_)) => {
+                return Err(format!("conversation {id:?} is both active and archived"))
+            }
+            (Some(_), None) => return Ok(InviteOutcome::AlreadyActive),
+            (None, Some(_)) => return Ok(InviteOutcome::Archived),
+            (None, None) => {}
+        }
+
+        let error = match push_active_membership_create_only(t, head, &active_ref, &archived_ref) {
+            Ok(_) => return Ok(InviteOutcome::Created),
+            Err(error) => error,
+        };
+        let after = remote_refs(t, [active_ref.clone(), archived_ref.clone()])?;
+        if after == before {
+            return Err(format!("inviting {user:?} to conversation {id:?}: {error}"));
+        }
+    }
+    Err(format!(
+        "inviting {user:?} to conversation {id:?}: membership kept changing"
+    ))
+}
+
+fn push_active_membership_create_only(
+    t: &GitTransport,
+    head: &str,
+    active_ref: &str,
+    archived_ref: &str,
+) -> Result<(), String> {
+    // The absent archived ref participates as a no-op deletion. Git then
+    // applies both empty leases to the same atomic transaction, preventing a
+    // stale inviter from recreating active after a concurrent archive.
+    let active_lease = format!("--force-with-lease={active_ref}:");
+    let archived_lease = format!("--force-with-lease={archived_ref}:");
+    let active_update = format!("{head}:{active_ref}");
+    let archived_absence = format!(":{archived_ref}");
     t.git_capture(
         &[
             "push",
             "--quiet",
             "--atomic",
+            &active_lease,
+            &archived_lease,
             CAOS_REMOTE,
-            &format!("+{title_hash}:{title_ref}"),
-            &format!("+{head}:{active_ref}"),
+            &active_update,
+            &archived_absence,
         ],
         None,
     )
     .map(|_| ())
-    .map_err(|error| format!("publishing conversation {id:?}: {error}"))
 }
 
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
@@ -1127,6 +1251,35 @@ pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result
     .map(|_| ())
 }
 
+/// Replace an automatically chosen title only while the deterministic title
+/// published with the first message is still current. Any manual rename wins.
+pub fn compare_and_set_conversation_title(
+    t: &GitTransport,
+    id: &str,
+    expected: &str,
+    title: &str,
+) -> Result<bool, String> {
+    let expected = validate_conversation_title(expected)?;
+    let title = validate_conversation_title(title)?;
+    let expected_hash = t.put_object("blob", expected.as_bytes())?.to_string();
+    let candidate = t.put_object("blob", title.as_bytes())?.to_string();
+    let title_ref = conversation_title_ref(id)?;
+    let lease = format!("--force-with-lease={title_ref}:{expected_hash}");
+    let update = format!("{candidate}:{title_ref}");
+    let pushed = t.git_capture(&["push", "--quiet", &lease, CAOS_REMOTE, &update], None);
+    if pushed.is_ok() {
+        return Ok(true);
+    }
+    let observed = remote_ref(t, &title_ref)?;
+    if observed.as_deref() == Some(candidate.as_str()) {
+        return Ok(true);
+    }
+    if observed.as_deref() != Some(expected_hash.as_str()) {
+        return Ok(false);
+    }
+    Err(pushed.expect_err("checked error above"))
+}
+
 fn move_user_conversation(
     t: &GitTransport,
     user: &str,
@@ -1136,28 +1289,48 @@ fn move_user_conversation(
 ) -> Result<(), String> {
     let from_ref = user_conversation_ref(user, from, id)?;
     let to_ref = user_conversation_ref(user, to, id)?;
-    let refs = remote_refs(t, [from_ref.clone(), to_ref.clone()])?;
-    match (refs.get(&from_ref), refs.get(&to_ref)) {
-        (None, Some(_)) => Ok(()),
-        (None, None) => Err(format!(
-            "conversation {id:?} is not {}",
-            from.ref_component()
-        )),
-        (Some(_), Some(_)) => Err(format!("conversation {id:?} is both active and archived")),
-        (Some(hash), None) => t
-            .git_capture(
-                &[
-                    "push",
-                    "--quiet",
-                    "--atomic",
-                    CAOS_REMOTE,
-                    &format!("{hash}:{to_ref}"),
-                    &format!(":{from_ref}"),
-                ],
-                None,
-            )
-            .map(|_| ()),
+    for _attempt in 0..MAX_APPEND_ATTEMPTS {
+        let before = remote_refs(t, [from_ref.clone(), to_ref.clone()])?;
+        match (before.get(&from_ref), before.get(&to_ref)) {
+            (None, Some(_)) => return Ok(()),
+            (None, None) => {
+                return Err(format!(
+                    "conversation {id:?} is not {}",
+                    from.ref_component()
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!("conversation {id:?} is both active and archived"))
+            }
+            (Some(hash), None) => {
+                let from_lease = format!("--force-with-lease={from_ref}:{hash}");
+                let to_lease = format!("--force-with-lease={to_ref}:");
+                let create = format!("{hash}:{to_ref}");
+                let delete = format!(":{from_ref}");
+                let error = match t.git_capture(
+                    &[
+                        "push",
+                        "--quiet",
+                        "--atomic",
+                        &from_lease,
+                        &to_lease,
+                        CAOS_REMOTE,
+                        &create,
+                        &delete,
+                    ],
+                    None,
+                ) {
+                    Ok(_) => return Ok(()),
+                    Err(error) => error,
+                };
+                let after = remote_refs(t, [from_ref.clone(), to_ref.clone()])?;
+                if after == before {
+                    return Err(error);
+                }
+            }
+        }
     }
+    Err(format!("conversation {id:?} membership kept changing"))
 }
 
 pub fn archive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
@@ -1922,6 +2095,89 @@ fn push_head_cas_git(
     Err(pushed.expect_err("checked error above"))
 }
 
+/// Publish a new canonical head, title, and active membership as one create-only
+/// transaction while proving archived membership absent.
+fn try_push_initial_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    head_ref: &str,
+    head: &str,
+    title: &str,
+) -> Result<bool, String> {
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+    let title_ref = conversation_title_ref(id)?;
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    validate_hash(head, "new conversation head")?;
+    validate_hash(&title_hash, "new conversation title")?;
+    let leases = [head_ref, &title_ref, &active_ref, &archived_ref]
+        .map(|refname| format!("--force-with-lease={refname}:"));
+    let updates = [
+        format!("{head}:{head_ref}"),
+        format!("{title_hash}:{title_ref}"),
+        format!("{head}:{active_ref}"),
+        // Make the archived absence lease effective by including that ref in
+        // the transaction. Deleting a missing ref is a no-op.
+        format!(":{archived_ref}"),
+    ];
+    let args = [
+        vec![
+            "push".to_string(),
+            "--quiet".to_string(),
+            "--atomic".to_string(),
+        ],
+        leases.to_vec(),
+        vec![CAOS_REMOTE.to_string()],
+        updates.to_vec(),
+    ]
+    .concat();
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let pushed = t.git_capture(&refs, None);
+    if pushed.is_ok() {
+        return Ok(true);
+    }
+
+    // A disconnected client can miss a successful push response. Once our
+    // candidate is on the canonical first-parent spine, the atomic transaction
+    // necessarily created all presentation refs too. A later rename, archive,
+    // or membership move is valid newer state and must not turn the durable
+    // message back into a reported failure.
+    let observed = remote_refs(
+        t,
+        [
+            head_ref.to_string(),
+            title_ref.clone(),
+            active_ref.clone(),
+            archived_ref.clone(),
+        ],
+    )?;
+    if let Some(observed_head) = observed.get(head_ref) {
+        let head_accepted = if observed_head == head {
+            true
+        } else {
+            fetch_commit(t, observed_head)?;
+            first_parent_contains(t, observed_head, head)?
+        };
+        if !head_accepted {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    let occupied = [&title_ref, &active_ref, &archived_ref]
+        .into_iter()
+        .filter(|refname| observed.contains_key(*refname))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !occupied.is_empty() {
+        return Err(format!(
+            "conversation {id:?} has existing presentation refs: {}",
+            occupied.join(", ")
+        ));
+    }
+    Err(pushed.expect_err("checked error above"))
+}
+
 /// Return the canonical append-only head ref for a validated conversation ID.
 pub fn conversation_ref(id: &str) -> Result<String, String> {
     if id.is_empty()
@@ -2603,6 +2859,34 @@ mod tests {
         test_git(repo, &["config", "user.email", "test@example.com"]);
     }
 
+    fn conversation_index_fixture(
+        label: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, GitTransport, String) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("caos-chat-{label}-{}-{unique}", std::process::id()));
+        let remote = root.join("remote.git");
+        let repo = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "Alice Smith");
+        test_git(
+            &repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "workspace"]);
+        test_git(&repo, &["commit", "--quiet", "-m", "base"]);
+        let base = test_git(&repo, &["rev-parse", "HEAD"]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        (root, repo, transport, base)
+    }
+
     fn event(value: Value) -> StoredEvent {
         event_at("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", value)
     }
@@ -2745,6 +3029,33 @@ mod tests {
         for key in ["project", "c-", "c-0", "c-2F", "c-ff"] {
             assert!(conversation_id_from_key(key).is_err(), "accepted {key:?}");
         }
+    }
+
+    #[test]
+    fn indexed_conversation_ids_preserve_slashes() {
+        let (root, _repo, transport, base) = conversation_index_fixture("slash-id");
+        let request = "e".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "project/talk-1",
+            "Nested conversation",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+
+        let listed =
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "project/talk-1");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3626,6 +3937,191 @@ mod tests {
             Ok("u-416c69636520536d697468")
         );
         assert!(user_key("Ali\u{200b}ce").is_err());
+    }
+
+    #[test]
+    fn first_line_submit_publishes_title_and_spaced_user_membership() {
+        let (root, repo, transport, base) = conversation_index_fixture("first-submit-index");
+        let request = "c".repeat(40);
+        let options = TurnOptions {
+            base: Some(base.clone()),
+            username: Some("Alice Smith".to_string()),
+            ..TurnOptions::default()
+        };
+
+        assert_eq!(
+            submit_message_inner_with(
+                &transport,
+                &options,
+                "line-created",
+                "  First line conversation  ",
+                false,
+                None,
+                |_, _, _, _| Ok(request.clone()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(request.as_str())
+        );
+
+        let active =
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Active)
+                .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "line-created");
+        assert_eq!(active[0].title, "First line conversation");
+        assert!(list_user_conversations(
+            &transport,
+            "Alice Smith",
+            UserConversationStatus::Archived,
+        )
+        .unwrap()
+        .is_empty());
+
+        let title_ref = conversation_title_ref("line-created").unwrap();
+        let title_hash = remote_ref(&transport, &title_ref).unwrap().unwrap();
+        assert_eq!(
+            transport.get_object(&title_hash).unwrap().1,
+            b"First line conversation"
+        );
+
+        let blocked_archived =
+            user_conversation_ref("Alice Smith", UserConversationStatus::Archived, "blocked")
+                .unwrap();
+        test_git(
+            &repo,
+            &[
+                "push",
+                "--quiet",
+                CAOS_REMOTE,
+                &format!("{base}:{blocked_archived}"),
+            ],
+        );
+        let error = submit_message_inner_with(
+            &transport,
+            &options,
+            "blocked",
+            "Must not unarchive",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap_err();
+        assert!(error.contains("existing presentation refs"), "{error}");
+        assert!(conversation_head(&transport, "blocked").unwrap().is_none());
+        assert!(
+            remote_ref(&transport, &conversation_title_ref("blocked").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(remote_ref(
+            &transport,
+            &user_conversation_ref("Alice Smith", UserConversationStatus::Active, "blocked")
+                .unwrap()
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            remote_ref(&transport, &blocked_archived)
+                .unwrap()
+                .as_deref(),
+            Some(base.as_str())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invite_respects_archived_membership_and_never_rewrites_the_title() {
+        let (root, _repo, transport, base) = conversation_index_fixture("invite-archived");
+        let request = "d".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice Smith".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "Original title",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+        set_conversation_title(&transport, "shared", "Manual title").unwrap();
+        archive_user_conversation(&transport, "Alice Smith", "shared").unwrap();
+
+        // Model an inviter that read both refs before the archive completed.
+        // Its create-only transaction must now lose the archived absence lease.
+        let head = conversation_head(&transport, "shared").unwrap().unwrap();
+        let active_ref =
+            user_conversation_ref("Alice Smith", UserConversationStatus::Active, "shared").unwrap();
+        let archived_ref =
+            user_conversation_ref("Alice Smith", UserConversationStatus::Archived, "shared")
+                .unwrap();
+        assert!(
+            push_active_membership_create_only(&transport, &head, &active_ref, &archived_ref,)
+                .is_err()
+        );
+
+        assert_eq!(
+            invite_user_to_conversation(&transport, "Alice Smith", "shared").unwrap(),
+            InviteOutcome::Archived
+        );
+        assert!(
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Active,)
+                .unwrap()
+                .is_empty()
+        );
+        let archived =
+            list_user_conversations(&transport, "Alice Smith", UserConversationStatus::Archived)
+                .unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].title, "Manual title");
+
+        publish_user_conversation(&transport, "Bob Smith", "shared", "Stale title").unwrap();
+        let bob = list_user_conversations(&transport, "Bob Smith", UserConversationStatus::Active)
+            .unwrap();
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].title, "Manual title");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepted_creation_survives_later_presentation_changes() {
+        let (root, _repo, transport, base) = conversation_index_fixture("creation-recovery");
+        let request = "d".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "Original title",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+        let head = conversation_head(&transport, "shared").unwrap().unwrap();
+        set_conversation_title(&transport, "shared", "Renamed elsewhere").unwrap();
+        archive_user_conversation(&transport, "Alice", "shared").unwrap();
+
+        assert!(try_push_initial_conversation(
+            &transport,
+            "Alice",
+            "shared",
+            &conversation_ref("shared").unwrap(),
+            &head,
+            "Original title",
+        )
+        .unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
