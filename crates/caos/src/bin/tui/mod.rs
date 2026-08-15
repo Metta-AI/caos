@@ -54,7 +54,7 @@ fn run_app(
         };
         let now = Instant::now();
         if !app.selection_locked() && now >= next_remote_poll {
-            changed |= app.poll_remote();
+            app.poll_remote();
             next_remote_poll = now + REMOTE_POLL_TICK;
         }
         let animating = app.has_visible_animation();

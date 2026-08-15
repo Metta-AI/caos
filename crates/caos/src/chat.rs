@@ -351,6 +351,48 @@ fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), 
     Ok(())
 }
 
+/// Persist a message without taking ownership of the surrounding turn
+/// lifecycle. Rich clients use this while another owner is already following
+/// the active request; the returned commit is the durable user event that lets
+/// the client retire its optimistic row after a coherent reload.
+pub fn submit_interjection(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    proposal: Option<&str>,
+) -> Result<String, String> {
+    if let Some(proposal) = proposal {
+        validate_hash(proposal, "submitted workspace commit")?;
+        t.git_capture(&["cat-file", "-e", &format!("{proposal}^{{commit}}")], None)?;
+        reject_reserved_caos(t, proposal, "submitted workspace")?;
+    }
+    submit_message_inner_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        SubmitMessagePolicy {
+            require_absent: false,
+            proposal,
+            admit_when_idle: false,
+        },
+        prepare_queued_request,
+    )
+    .map(|submitted| submitted.commit)
+}
+
+struct SubmittedMessage {
+    commit: String,
+    request: Option<String>,
+}
+
+struct SubmitMessagePolicy<'a> {
+    require_absent: bool,
+    proposal: Option<&'a str>,
+    admit_when_idle: bool,
+}
+
 fn submit_message_inner(
     t: &GitTransport,
     options: &TurnOptions,
@@ -370,6 +412,28 @@ fn submit_message_inner(
     )
 }
 
+fn submit_message_detailed(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    require_absent: bool,
+    proposal: Option<&str>,
+) -> Result<SubmittedMessage, String> {
+    submit_message_inner_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        SubmitMessagePolicy {
+            require_absent,
+            proposal,
+            admit_when_idle: true,
+        },
+        prepare_queued_request,
+    )
+}
+
 fn submit_message_inner_with<F>(
     t: &GitTransport,
     options: &TurnOptions,
@@ -382,6 +446,37 @@ fn submit_message_inner_with<F>(
 where
     F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
 {
+    submit_message_inner_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        SubmitMessagePolicy {
+            require_absent,
+            proposal,
+            admit_when_idle: true,
+        },
+        prepare,
+    )
+    .map(|submitted| submitted.request)
+}
+
+fn submit_message_inner_detailed_with<F>(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    policy: SubmitMessagePolicy<'_>,
+    prepare: F,
+) -> Result<SubmittedMessage, String>
+where
+    F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
+{
+    let SubmitMessagePolicy {
+        require_absent,
+        proposal,
+        admit_when_idle,
+    } = policy;
     let refname = conversation_ref(id)?;
     if message.trim().is_empty() {
         return Err("empty message".to_string());
@@ -432,6 +527,13 @@ where
 
         if let WorkspaceProposal::Conflict(conflict) = &workspace {
             let error = conflict.message();
+            // An interjection never owns the active request's lifecycle. In
+            // particular, a rejected workspace proposal must not append a
+            // conversation-level `failed` event that makes the request's real
+            // owner stop following an otherwise healthy turn.
+            if !admit_when_idle {
+                return Err(error);
+            }
             user_event["status"] = Value::String("failed".to_string());
             user_event["error"] = Value::String(error.clone());
             user_event["workspace_conflict"] = conflict.value();
@@ -477,11 +579,20 @@ where
                         // ref is merely a cache and may be locked by another TUI
                         // in the same checkout.
                         let _ = update_local_cache(t, &refname, &user);
-                        return Ok(Some(request));
+                        return Ok(SubmittedMessage {
+                            commit: user,
+                            request: Some(request),
+                        });
                     }
                     false => continue,
                 }
             }
+        }
+
+        if !admit_when_idle {
+            return Err(format!(
+                "conversation {id:?} is no longer active; submit again to start a new turn"
+            ));
         }
 
         let user = create_event_commit_with_parents(
@@ -507,7 +618,10 @@ where
                 // The user event and exact request become durable together.
                 // Compute is launched only after this boundary.
                 let _ = update_local_cache(t, &refname, &admitted);
-                return Ok(Some(request));
+                return Ok(SubmittedMessage {
+                    commit: user,
+                    request: Some(request),
+                });
             }
             false => continue,
         }
@@ -1344,17 +1458,24 @@ pub fn run_chat_turn(
     id: &str,
     message: &str,
     human_tree: Option<&str>,
+    mut on_submitted: impl FnMut(&str),
     mut emit: impl FnMut(TurnEvent),
 ) -> Result<TurnOutcome, String> {
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
     emit(TurnEvent::Status("saving message".to_string()));
     let submitted = match human_tree {
-        Some(tree) => submit_message_with_tree(t, options, id, message, tree)?,
-        None => submit_message(t, options, id, message)?,
+        Some(tree) => {
+            validate_hash(tree, "submitted workspace commit")?;
+            t.git_capture(&["cat-file", "-e", &format!("{tree}^{{commit}}")], None)?;
+            reject_reserved_caos(t, tree, "submitted workspace")?;
+            submit_message_detailed(t, options, id, message, false, Some(tree))?
+        }
+        None => submit_message_detailed(t, options, id, message, false, None)?,
     };
+    on_submitted(&submitted.commit);
     let started = Instant::now();
     let mut request_result = None;
-    let request = match submitted {
+    let request = match submitted.request {
         Some(request) => Some(request),
         None => conversation_snapshot(t, id)?
             .filter(|snapshot| request_is_active(&snapshot.status))
@@ -3149,6 +3270,21 @@ mod tests {
             Some(admitted.as_str())
         );
 
+        let error = submit_interjection(
+            &transport,
+            &TurnOptions::default(),
+            "shared",
+            "apply this while the turn runs",
+            Some(&proposal),
+        )
+        .unwrap_err();
+        assert!(error.contains("submitted workspace"), "{error}");
+        assert!(error.contains(".caos"), "{error}");
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(admitted.as_str())
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3317,6 +3453,32 @@ mod tests {
                 &format!("{current}:{refname}"),
             ],
         );
+
+        let interjection_error = submit_interjection(
+            &transport,
+            &TurnOptions {
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "shared",
+            "apply my workspace while the turn runs",
+            Some(&proposal),
+        )
+        .unwrap_err();
+        assert!(
+            interjection_error.contains("conflicts"),
+            "{interjection_error}"
+        );
+        assert_eq!(
+            remote_ref(&transport, &refname).unwrap().as_deref(),
+            Some(current.as_str()),
+            "a rejected interjection must not change the active turn"
+        );
+        let snapshot = conversation_snapshot(&transport, "shared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status, "queued");
+        assert_eq!(snapshot.request.as_deref(), Some(request.as_str()));
 
         let error = submit_message_with_tree(
             &transport,

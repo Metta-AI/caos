@@ -121,8 +121,8 @@ grep -qF "\"content\":$P2,\"role\":\"assistant\"}]" stub/request-3.json \
 echo "  ok: two continuations, each prefilling the accumulated response" >&2
 
 echo "== the progress ref advanced to the turn's step-free tip ==" >&2
-# A toolless turn mints no steps, so from-agent is never pushed; the turn
-# commit itself is the run's result and the ref the client advances.
+# A toolless turn mints no tool steps; the turn commit itself is the run's
+# result and the canonical event ref advances to it.
 [ -s turn.commit ] || fail "no turn commit emitted"
 echo "  ok: turn commit emitted as the run result" >&2
 
