@@ -177,6 +177,8 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     };
     let notice_height = if state.command_error.is_some() || state.publish_prompt {
         3
+    } else if state.reference_notice.is_some() {
+        4
     } else {
         0
     };
@@ -214,38 +216,83 @@ fn render_notice(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         );
         return;
     }
-    let Some(ConfirmAction::Publish {
+    if let Some(ConfirmAction::Publish {
         default_base,
         base_input,
     }) = app.confirm_action.as_ref()
-    else {
-        return;
-    };
-    let branch = if base_input.is_empty() {
-        Span::styled(
-            format!("{default_base} (default)"),
-            Style::default().fg(Color::DarkGray),
-        )
-    } else {
-        Span::styled(base_input.clone(), Style::default().fg(Color::Cyan))
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    {
+        let branch = if base_input.is_empty() {
             Span::styled(
-                "Base branch: ",
-                Style::default().add_modifier(Modifier::BOLD),
+                format!("{default_base} (default)"),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::styled(base_input.clone(), Style::default().fg(Color::Cyan))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Base branch: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                branch,
+                Span::styled("│", Style::default().fg(Color::Cyan)),
+            ]))
+            .block(
+                Block::default()
+                    .title(" Publish PR — type a base, Ctrl+P confirms, Esc cancels ")
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .borders(Borders::ALL),
             ),
-            branch,
-            Span::styled("│", Style::default().fg(Color::Cyan)),
-        ]))
-        .block(
-            Block::default()
-                .title(" Publish PR — type a base, Ctrl+P confirms, Esc cancels ")
-                .border_style(Style::default().fg(Color::Cyan))
-                .borders(Borders::ALL),
-        ),
-        area,
-    );
+            area,
+        );
+        return;
+    }
+    if let Some(reference) = state.reference_notice.as_ref() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("Ref:  ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(reference.refname.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Head: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(reference.head.clone()),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .title(" Conversation reference — click a row to copy ")
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+    }
+}
+
+pub(super) fn reference_copy_at(
+    app: &App,
+    terminal: Rect,
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    let state = app.selected();
+    if state.command_error.is_some() || state.publish_prompt || app.palette.is_some() {
+        return None;
+    }
+    let reference = state.reference_notice.as_ref()?;
+    let notice = layout(state, app.view == View::Chat, terminal).notice?;
+    let inner = Block::default().borders(Borders::ALL).inner(notice);
+    let position = Position::new(column, row);
+    if !inner.contains(position) {
+        return None;
+    }
+    match row.saturating_sub(inner.y) {
+        0 => Some(reference.refname.clone()),
+        1 => Some(reference.head.clone()),
+        _ => None,
+    }
 }
 
 pub(super) fn content_contains(

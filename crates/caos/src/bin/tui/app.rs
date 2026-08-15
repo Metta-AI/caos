@@ -5,13 +5,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_head, conversation_replay, conversation_snapshot,
-    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
-    generate_conversation_title, list_user_conversations, publish_unindexed_conversations,
-    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationReplay, ConversationRole,
-    ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    archive_user_conversation, conversation_head, conversation_reference, conversation_replay,
+    conversation_snapshot, conversation_workspace_diff, describe_tool_set,
+    first_available_conversation_name, generate_conversation_title, list_user_conversations,
+    publish_unindexed_conversations, publish_user_conversation, resume_request, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationReplay,
+    ConversationRole, ConversationSnapshot, ToolSetDescription, TurnEvent, TurnOptions,
+    TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -121,6 +121,12 @@ struct LoadedConversation {
     snapshot: ConversationSnapshot,
     replay: ConversationReplay,
     workspace_diff: WorkspaceDiff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceNotice {
+    refname: String,
+    head: String,
 }
 
 struct RemotePollEntry {
@@ -814,6 +820,7 @@ enum CommandAction {
     From,
     Help,
     Palette,
+    Reference,
     Title,
     UpdateTree,
 }
@@ -827,7 +834,7 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 5] = [
+const COMMANDS: [Command; 6] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -861,6 +868,13 @@ const COMMANDS: [Command; 5] = [
         usage: "/commands",
         description: "open the searchable command palette",
         action: CommandAction::Palette,
+        takes_argument: false,
+    },
+    Command {
+        name: "/ref",
+        usage: "/ref",
+        description: "show the copyable conversation ref and full head hash",
+        action: CommandAction::Reference,
         takes_argument: false,
     },
 ];
@@ -898,6 +912,9 @@ struct ConversationState {
     composer: Composer,
     status: String,
     command_error: Option<String>,
+    reference_notice: Option<ReferenceNotice>,
+    reference_loading: bool,
+    reference_generation: u64,
     publish_prompt: bool,
     running: bool,
     local_turn: bool,
@@ -933,6 +950,9 @@ impl ConversationState {
             composer: Composer::default(),
             status,
             command_error: None,
+            reference_notice: None,
+            reference_loading: false,
+            reference_generation: 0,
             publish_prompt: false,
             running: false,
             local_turn: false,
@@ -957,6 +977,13 @@ impl ConversationState {
     }
 
     fn apply_load(&mut self, load: LoadedConversation, current_user: &str) {
+        if self
+            .reference_notice
+            .as_ref()
+            .is_some_and(|notice| notice.head != load.snapshot.head)
+        {
+            self.reference_notice = None;
+        }
         let preserve_local_lifecycle = self.running
             && self.local_turn
             && matches!(load.snapshot.status.as_str(), "queued" | "running")
@@ -1055,6 +1082,7 @@ impl ConversationState {
                 return Some(snapshot);
             }
             Ok(None) => {
+                self.reference_notice = None;
                 self.transcript = self
                     .pending_submissions
                     .iter()
@@ -1226,7 +1254,7 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
-        } else if self.publishing {
+        } else if self.reference_loading || self.publishing {
             self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
             attention.clone()
@@ -1305,6 +1333,12 @@ enum UiMessage {
         conversation: String,
         request: String,
         result: Result<(), String>,
+    },
+    ReferenceLoaded {
+        conversation: String,
+        generation: u64,
+        observed_head: Option<String>,
+        result: Result<(String, Option<String>), String>,
     },
     RemotePolled {
         result: Result<Vec<RemotePollEntry>, String>,
@@ -1694,6 +1728,18 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if self.palette.is_some() || self.confirm_action.is_some() {
+            return MouseAction::Ignored;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(value) = ui::reference_copy_at(self, area, mouse.column, mouse.row) {
+                self.selecting_transcript = false;
+                self.selecting_screen = false;
+                self.screen_selection = None;
+                self.selected_mut().transcript_selection = None;
+                return MouseAction::Copy(value);
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp
                 if self.view == View::Activity
@@ -1740,28 +1786,32 @@ impl App {
                 self.start_screen_selection(mouse.column, mouse.row, area)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.selecting_transcript => {
+                if self.selected().transcript_selection.is_none() {
+                    self.selecting_transcript = false;
+                    return MouseAction::Ignored;
+                }
                 if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
                 {
-                    self.selected_mut()
-                        .transcript_selection
-                        .as_mut()
-                        .expect("dragging starts with a transcript selection")
-                        .head = point;
+                    if let Some(selection) = self.selected_mut().transcript_selection.as_mut() {
+                        selection.head = point;
+                    }
                     MouseAction::Redraw
                 } else {
                     MouseAction::Ignored
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.selecting_transcript => {
+                if self.selected().transcript_selection.is_none() {
+                    self.selecting_transcript = false;
+                    return MouseAction::Ignored;
+                }
                 if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
                 {
-                    self.selected_mut()
-                        .transcript_selection
-                        .as_mut()
-                        .expect("dragging starts with a transcript selection")
-                        .head = point;
+                    if let Some(selection) = self.selected_mut().transcript_selection.as_mut() {
+                        selection.head = point;
+                    }
                 }
                 self.selecting_transcript = false;
                 ui::transcript_selection_text(self.selected(), area)
@@ -1851,6 +1901,12 @@ impl App {
         let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
+        let state = self.selected_mut();
+        state.reference_notice = None;
+        state.reference_loading = false;
+        if state.status == "loading conversation reference" {
+            state.status.clear();
+        }
         // Resolve the prompt into the turn's message and, for `/update-tree`,
         // the tree the human commit should carry. `/from`, `/help`, and
         // `/title` are not turns and return here; everything else falls
@@ -1874,6 +1930,14 @@ impl App {
                 CommandAction::Palette => {
                     if arguments.is_empty() {
                         self.palette = Some(CommandPalette::default());
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
+                    return;
+                }
+                CommandAction::Reference => {
+                    if arguments.is_empty() {
+                        self.show_selected_ref();
                     } else {
                         self.selected_mut().status = format!("usage: {}", command.usage);
                     }
@@ -2043,6 +2107,37 @@ impl App {
         });
     }
 
+    fn show_selected_ref(&mut self) {
+        self.start_reference_lookup(self.selected);
+    }
+
+    fn start_reference_lookup(&mut self, index: usize) {
+        let state = &mut self.conversations[index];
+        if state.reference_loading {
+            return;
+        }
+        state.reference_loading = true;
+        state.reference_generation = state.reference_generation.wrapping_add(1);
+        state.reference_notice = None;
+        state.command_error = None;
+        state.status = "loading conversation reference".to_string();
+        let conversation = state.id.clone();
+        let generation = state.reference_generation;
+        let observed_head = state.remote_head.clone();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir)
+                .and_then(|transport| conversation_reference(&transport, &conversation));
+            let _ = tx.send(UiMessage::ReferenceLoaded {
+                conversation,
+                generation,
+                observed_head,
+                result,
+            });
+        });
+    }
+
     pub(crate) fn drain_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.rx.try_recv() {
@@ -2180,6 +2275,56 @@ impl App {
                             state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
                             state.status = format!("recovery retry pending: {error}");
                         }
+                    }
+                }
+                UiMessage::ReferenceLoaded {
+                    conversation,
+                    generation,
+                    observed_head,
+                    result,
+                } => {
+                    let Some(index) = self.conversation_index(&conversation) else {
+                        continue;
+                    };
+                    if !self.conversations[index].reference_loading
+                        || self.conversations[index].reference_generation != generation
+                    {
+                        continue;
+                    }
+                    let retry = {
+                        let state = &mut self.conversations[index];
+                        state.reference_loading = false;
+                        if state.status == "loading conversation reference" {
+                            state.status.clear();
+                        }
+                        match result {
+                            Ok((_refname, Some(head)))
+                                if state.remote_head != observed_head
+                                    && state.remote_head.as_deref() != Some(head.as_str()) =>
+                            {
+                                true
+                            }
+                            Ok((refname, Some(head))) => {
+                                state.reference_notice = Some(ReferenceNotice { refname, head });
+                                false
+                            }
+                            Ok((_refname, None)) if state.remote_head != observed_head => true,
+                            Ok((_refname, None)) => {
+                                state.reference_notice = None;
+                                state.show_command_error(
+                                    "this conversation has no remote ref until its first message",
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                state.reference_notice = None;
+                                state.show_command_error(error);
+                                false
+                            }
+                        }
+                    };
+                    if retry {
+                        self.start_reference_lookup(index);
                     }
                 }
                 UiMessage::RemotePolled { result } => {
@@ -2503,6 +2648,17 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return;
+        }
+        if key.code == KeyCode::Esc
+            && (self.selected().reference_notice.is_some() || self.selected().reference_loading)
+        {
+            let state = self.selected_mut();
+            state.reference_notice = None;
+            state.reference_loading = false;
+            if state.status == "loading conversation reference" {
+                state.status.clear();
             }
             return;
         }
@@ -3224,6 +3380,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caos::chat::conversation_ref;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -3307,6 +3464,22 @@ mod tests {
                 &format!("{head}:refs/caos/conversations/{id}/head"),
             ],
         );
+    }
+
+    fn seed_idle_conversation(repo: &Path, id: &str, username: &str, message: &str) -> String {
+        let base = git_output(repo, &["rev-parse", "HEAD"]);
+        let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
+        let event = serde_json::to_string(&serde_json::json!({
+            "kind": "caos-chat-event",
+            "author": "user",
+            "username": username,
+            "content": message,
+            "status": "idle",
+        }))
+        .unwrap();
+        let head = git_output(repo, &["commit-tree", &tree, "-p", &base, "-m", &event]);
+        push_test_conversation(repo, id, &head);
+        head
     }
 
     fn seed_queued_conversation(
@@ -3448,6 +3621,18 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for pending submission {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_reference_lookup(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.selected().reference_loading {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for conversation reference"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -3674,7 +3859,14 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/help", "/title", "/update-tree", "/commands"]
+            [
+                "/from",
+                "/help",
+                "/title",
+                "/update-tree",
+                "/commands",
+                "/ref"
+            ]
         );
 
         assert!(composer.select_command(2));
@@ -3706,6 +3898,10 @@ mod tests {
         let (command, arguments) = parse_command("/from\nabc123").unwrap();
         assert_eq!(command.action, CommandAction::From);
         assert_eq!(arguments, "abc123");
+
+        let (command, arguments) = parse_command("/ref").unwrap();
+        assert_eq!(command.action, CommandAction::Reference);
+        assert!(arguments.is_empty());
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
@@ -4582,6 +4778,39 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(footer.ends_with(" 3 chars copied "));
+    }
+
+    #[test]
+    fn stale_transcript_drag_state_is_ignored_instead_of_panicking() {
+        let mut selected = state("talk-1");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text: "hello".to_string(),
+            pending_id: None,
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 27,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.selecting_transcript = true;
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left)), area),
+            MouseAction::Ignored
+        );
+        assert!(!app.selecting_transcript);
+
+        app.selecting_transcript = true;
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)), area),
+            MouseAction::Ignored
+        );
+        assert!(!app.selecting_transcript);
     }
 
     #[test]
@@ -5559,6 +5788,108 @@ mod tests {
         // Polling an unchanged active snapshot cannot fan out more waiters for
         // the same exact request. Completion/failure is consumed by drain.
         assert!(!app.reconcile_active_requests());
+    }
+
+    #[test]
+    fn ref_command_shows_a_copyable_canonical_ref_and_full_head() {
+        let (repo, remote, _) = repo_with_default_branch("show-ref", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let id = "_shared_name_";
+        let head = seed_idle_conversation(&repo, id, "Alice", "hello");
+
+        let (mut app, _) = app_with(vec![state(id)]);
+        app.repo_dir = repo.clone();
+        app.show_selected_ref();
+        assert!(app.selected().reference_loading);
+        wait_for_reference_lookup(&mut app);
+
+        let refname = conversation_ref(id).unwrap();
+        assert!(app.selected().transcript.is_empty());
+        assert_eq!(
+            app.selected().reference_notice,
+            Some(ReferenceNotice {
+                refname: refname.clone(),
+                head: head.clone(),
+            })
+        );
+
+        // A coherent reload must not erase this presentation-only result.
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = load_conversation(&transport, id).unwrap().unwrap();
+        app.selected_mut().apply_load(load.clone(), "Alice");
+        assert_eq!(
+            app.selected().reference_notice,
+            Some(ReferenceNotice {
+                refname: refname.clone(),
+                head: head.clone(),
+            })
+        );
+
+        // Narrow rendering clips raw text instead of markdown-parsing or
+        // soft-wrapping it, while clicks return the complete underlying value.
+        let area = Rect::new(0, 0, 70, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("_shared_"));
+
+        let copy_rows = (0..area.height)
+            .filter_map(|row| ui::reference_copy_at(&app, area, 27, row).map(|value| (row, value)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copy_rows.iter().map(|(_, value)| value).collect::<Vec<_>>(),
+            vec![&refname, &head]
+        );
+        app.palette = Some(CommandPalette::default());
+        assert!(ui::reference_copy_at(&app, area, 27, copy_rows[0].0).is_none());
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 27,
+                    row: copy_rows[0].0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            ),
+            MouseAction::Ignored
+        );
+        app.palette = None;
+        for (row, expected) in copy_rows {
+            assert_eq!(
+                app.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 27,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                ),
+                MouseAction::Copy(expected)
+            );
+        }
+
+        let mut advanced = load;
+        advanced.snapshot.head = "b".repeat(40);
+        advanced.workspace_diff.head = advanced.snapshot.head.clone();
+        app.selected_mut().apply_load(advanced, "Alice");
+        assert!(app.selected().reference_notice.is_none());
+
+        app.selected_mut().reference_notice = Some(ReferenceNotice { refname, head });
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().reference_notice.is_none());
+        assert_eq!(app.focus, Focus::Conversation);
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
     }
 
     #[test]

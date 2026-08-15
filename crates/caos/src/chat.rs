@@ -251,7 +251,19 @@ pub fn conversation_snapshot(
 /// rebuilding the transcript, which makes an unchanged poll independent of the
 /// conversation's length.
 pub fn conversation_head(t: &GitTransport, id: &str) -> Result<Option<String>, String> {
-    remote_ref(t, &conversation_ref(id)?)
+    conversation_reference(t, id).map(|(_, head)| head)
+}
+
+/// Return the validated canonical refname and its authoritative remote value.
+/// Keeping both in one helper prevents presentation clients from validating the
+/// conversation ID twice to display one coherent reference lookup.
+pub fn conversation_reference(
+    t: &GitTransport,
+    id: &str,
+) -> Result<(String, Option<String>), String> {
+    let refname = conversation_ref(id)?;
+    let head = remote_ref(t, &refname)?;
+    Ok((refname, head))
 }
 
 fn conversation_snapshot_at(
@@ -1910,7 +1922,8 @@ fn push_head_cas_git(
     Err(pushed.expect_err("checked error above"))
 }
 
-fn conversation_ref(id: &str) -> Result<String, String> {
+/// Return the canonical append-only head ref for a validated conversation ID.
+pub fn conversation_ref(id: &str) -> Result<String, String> {
     if id.is_empty()
         || id.len() > MAX_CONVERSATION_ID_BYTES
         || id.ends_with('.')
