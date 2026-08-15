@@ -105,10 +105,12 @@ struct WorkRequest<'a> {
 /// The ArgTree being a content-addressed object means its hash *is* the cache key
 /// (it captures everything — image, std, salt and the rest) and the rendezvous
 /// id: an external run also pins `refs/caos/res/<argTreeHash>` at the result, so a
-/// client can fetch it by ref. Only external callers reach this endpoint now (the
-/// CLI, which pushed the ArgTree): workers never call back into `/run` — a
-/// worker's sub-runs are promise resolutions the server performs itself
-/// ([`run_work_request`] recursion).
+/// client can fetch it by ref. Most worker sub-runs are promise resolutions the
+/// server performs itself ([`run_work_request`] recursion); `caos run-async` is
+/// the one worker command that sends this same endpoint and disconnects without
+/// waiting for the result. That dispatch is deliberately a new top-level run:
+/// it has an empty run stack, so stack-based cycle detection does not cross the
+/// detached-work boundary.
 pub(crate) fn run(
     config: &Config,
     query: &str,

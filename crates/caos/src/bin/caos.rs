@@ -6,13 +6,13 @@
 //! job (set up the root-owned `/cas`, run `/worker` as an unprivileged user,
 //! post the kind + hash recorded at `/cas/out` back to the server), then
 //! long-polls for more work for its image until an idle TTL passes (see
-//! `design/runner-protocol.md`). It never triggers compute: its `map-then`
-//! records a map-then continuation the server resolves after the worker's job
-//! finishes. The shared command logic lives in the `caos` library; this binary
-//! is the worker's CLI surface plus the privileged runner.
+//! `design/runner-protocol.md`). It normally records continuations for the
+//! server to resolve after the job; `run-async` is the one command that directly
+//! dispatches `/run`. The shared command logic lives in the `caos` library;
+//! this binary is the worker's CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `prepare-request`, `curry`, and `runner`.
+//! `run-then`, `run-async`, `prepare-request`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::fs::PermissionsExt;
@@ -93,6 +93,12 @@ fn run(args: &[String]) -> Result<(), String> {
         // `--error=<blob>` instead of failing the whole request.
         Some("run-then") => match &args[2..] {
             [input, sep, kvs @ ..] if sep == "--" => caos::caos_run_then(&http()?, input, kvs),
+            _ => Err(usage(args)),
+        },
+        // Send an ordinary /run request for an already-stored ArgTree without
+        // waiting for its result.
+        Some("run-async") => match &args[2..] {
+            [arg_tree] => caos::caos_run_async(&http()?, arg_tree),
             _ => Err(usage(args)),
         },
         // Construct and store the exact flat runnable ArgTree without executing
@@ -471,6 +477,7 @@ fn usage(args: &[String]) -> String {
          {prog} forward <src-cas-path> <dst-cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>] [--catch]\n  \
+         {prog} run-async <arg-tree-hash>\n  \
          {prog} prepare-request <image-or-arg-tree> -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \
          {prog} runner --job=<json>"
