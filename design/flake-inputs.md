@@ -77,9 +77,11 @@ A **URL is a name; a hash is content.** A remote ref MUST carry a mandatory
 `rev` (a full commit sha), and the client resolves `url + rev → oid` **at eval
 time**, fetching the closure into the CAS. From that point it is an ordinary
 oid. **A URL never sits inside an ArgTree / cache key.** Resolution is a
-**client** capability (workers stay pure and network-free — the security story);
-the resolved arg entry is a plain tree/blob oid, so two consumers pinning the
-same rev share the whole deepened subgraph by hash.
+**client** step — NOT because a worker lacks a network (it has one; see
+AGENTS.md "Workers"), but because the ArgTree is the cache key and a locator
+must become an oid before the request exists. The resolved arg entry is a plain
+tree/blob oid, so two consumers pinning the same rev share the whole deepened
+subgraph by hash.
 
 We borrow **nix's flake-reference string grammar** as the locator *syntax only*.
 No nix runs; nothing evaluates a flake. It is just a well-specified string format
@@ -160,10 +162,10 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
 `resolve_remote_arg` — behind every `:@@=` position:
 
 - **`Transport::fetch_git_ref(url, rev)`**, defaulting to `Ok(None)`. That
-  default IS the security story, not an oversight: a worker cannot reach a
-  network, so it gets "resolving a remote ref is a CLIENT capability" rather
-  than a way to smuggle one in. By the time a worker sees a `:@@=` arg it is an
-  ordinary oid. `tests/remote-ref/check.sh` asserts the refusal from inside a
+  default is not an oversight: the worker's `HttpTransport` has no repo to fetch
+  INTO, and resolution belongs before the request exists so the key stays
+  content-addressed. (Not a sandbox — a worker has a network and uses it.) By
+  the time a worker sees a `:@@=` arg it is an ordinary oid. `tests/remote-ref/check.sh` asserts the refusal from inside a
   worker.
 - **Pin, fetch, then select** — the order is the content-addressing argument.
   `git fetch --depth 1 <url> <rev>` (the granularity a host will serve), peel the
@@ -402,8 +404,8 @@ run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/<expander> \
 
 The locator appears TWICE, and that is not redundancy to design away — the two
 name different things. `--base` yields the expander's IMAGE; `--caos` yields
-caos' TREE, which is what gets mounted. A worker cannot fetch, so the tree has
-to arrive as an already-resolved arg. The duplication is exactly what the
+caos' TREE, which is what gets mounted. Resolution happens before the request
+exists, so the tree has to arrive as an already-resolved arg. The duplication is exactly what the
 consistency check below exists to police.
 
 The expander is a normal caos worker — a `.caos-expr`, `DEPS`, built by rustc —
@@ -443,7 +445,8 @@ tree, so the consumer's root expression chains to caos' deep-deps in a second
 line if it wants `DEPS` resolution too.
 
 **Pinning from `flake.lock` is lockfile codegen, not runtime magic.** A worker
-can parse `flake.lock` (pure) but cannot fetch (network is client-only), and the
+can parse `flake.lock` but cannot RESOLVE a locator (that happens client-side,
+before the request is formed), and the
 eval grammar's `$VAR` is an object reference, not a string you can splice into a
 URL. So "keep the caos pin in sync with `flake.lock`" is a **dev/build hook**
 that writes the resolved `git+https://…?rev=<sha>` locator into a tracked
@@ -458,11 +461,11 @@ built ON them, and nothing in this repo needs it yet:
 
 - The **consumer input expander** (whole-tree mounting, above) and the
   **`flake.lock` codegen hook** — sketched, not scheduled.
-- A **worker-side** fetch (network in a container) is explicitly **out of
-  scope**; if ever wanted it is a distinct, explicit grant, never something the
-  general locator smuggles in. The `Ok(None)` default on
-  `Transport::fetch_git_ref` is what holds that line, and `tests/remote-ref`
-  asserts it from inside a worker.
+- **Worker-side locator resolution** stays out of scope — not for confinement
+  (workers have a network), but because it would move resolution AFTER the
+  ArgTree is formed, putting a URL inside the cache key. The `Ok(None)` default
+  on `Transport::fetch_git_ref` holds that line, and `tests/remote-ref` asserts
+  it from inside a worker.
 - **`ref=` (a branch/tag) stays refused**, with no plan to relax it. Anyone who
   wants "track main" wants a lockfile, which is the codegen hook above — the
   refusal is the invariant, not a missing feature.

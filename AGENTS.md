@@ -60,6 +60,28 @@ Every script here runs with it, and two constructs quietly break under it.
   binary and blame the code. Build one output per invocation. (`--refresh` is not
   needed: nix picks up dirty-tree edits fine.)
 
+# Workers
+
+- **Workers are NOT network-free.** This gets asserted over and over and it is
+  wrong. A worker container is launched with `--network caos-net`
+  (`crates/runnerd/src/main.rs`) and has to be — it reaches the server over
+  HTTP. Beyond that, `std/llm-client` posts to `https://api.anthropic.com`, and
+  `std/flake-builder`'s worker runs `nix build` (fetching flake inputs from the
+  internet) and `skopeo copy` to the registry. A worker that wants the network
+  has it.
+- **What is genuinely client-side is `:@@=` RESOLUTION, and the reason is
+  DETERMINISM, not capability.** The ArgTree is the cache key, so a locator has
+  to become an oid before the request is formed; a worker resolving a URL at run
+  time would either put a name inside the key or make one key mean different
+  things at different times. Mechanically, the worker's `HttpTransport` also has
+  no git repo or remote to fetch INTO, which is why `Transport::fetch_git_ref`
+  defaults to `Ok(None)`. Neither of those is a sandbox.
+- **Where "no network" is true it is a BUILD-level choice.** `std/cargo` builds
+  `--offline` against a vendored registry (`std/cargo/bake.nix`,
+  `vendorCargoDeps`) — which is why a crates.io dep missing from the bake anchor
+  fails instead of being fetched (`lint-bake-anchor.sh`). That is the build
+  refusing to reach out, not the container being unable to.
+
 # Git
 
 - **A `git fetch` can fail over an object it never asked for.** The post-fetch

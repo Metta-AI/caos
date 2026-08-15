@@ -444,8 +444,10 @@ so a value is never misread and may contain anything (no escaping):
   (fetching the closure), and the arg entry is that oid, byte-for-byte what a
   local `:@=` of the same content would produce: the URL never enters an
   ArgTree, so two consumers pinning the same rev share the whole subgraph by
-  hash. Fetching is a client capability — a **worker cannot do it**, which is
-  what keeps workers network-free. See `design/flake-inputs.md`.
+  hash. Resolving a locator is a **client** step — not because a worker lacks a
+  network (it has one), but because the ArgTree is the cache key: the locator
+  has to become an oid before the request exists, or a name would sit inside
+  content-addressing. See `design/flake-inputs.md`.
 
 The grammar is `--name[:type]=value` and extensible: a new type is a variant, a
 parse arm and a case in each resolver. The worker `caos` has no host filesystem

@@ -7,9 +7,10 @@
 # own oid, and to the same oid a local `:@=` of the same bytes produces.
 #
 # It also asserts, from in here, that a WORKER cannot resolve a locator at all.
-# That is the security story, not an implementation detail: resolution is a
-# CLIENT capability precisely so the grammar never becomes a way for a sandboxed
-# worker to reach the network (design/flake-inputs.md).
+# Not because a worker lacks a network — it has one, and uses it — but because
+# the ArgTree is the cache key: a locator must become an oid BEFORE the request
+# is formed, or a URL would sit inside content-addressing and one key would mean
+# different things at different times (design/flake-inputs.md).
 set -euo pipefail
 
 out=/tmp/report

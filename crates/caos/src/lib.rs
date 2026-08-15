@@ -322,14 +322,21 @@ pub trait Transport {
     }
 
     /// Fetch commit `rev` (and its tree) from the FOREIGN repo at `url` into
-    /// local storage, for a `:@@=` arg — or `Ok(None)` if this transport cannot
-    /// reach a network at all.
+    /// local storage, for a `:@@=` arg — or `Ok(None)` if this transport has no
+    /// repo to fetch into.
     ///
-    /// `None` is the default **and the security story**: fetching is a CLIENT
-    /// capability, so a worker — which has no network by construction — gets a
-    /// plain "cannot fetch" rather than a way to smuggle one in. By the time a
-    /// worker sees this arg it is an ordinary oid, resolved before the request
-    /// was ever formed (design/flake-inputs.md).
+    /// `None` is the default because the worker's [`HttpTransport`] speaks only
+    /// `/object`: there is no working repo and no `caos` remote to negotiate
+    /// with. NOT because a worker lacks a network — it plainly has one (it
+    /// reaches the server over HTTP, and `std/llm-client` and
+    /// `std/flake-builder` both call out to the internet).
+    ///
+    /// What resolution being CLIENT-side buys is determinism, not confinement.
+    /// The ArgTree is the cache key, so a locator has to become an oid before
+    /// the request is formed; a worker resolving a URL at run time would either
+    /// put a name inside the key or make one key mean different things at
+    /// different times. By the time a worker sees this arg it is an ordinary
+    /// oid, resolved before the request existed (design/flake-inputs.md).
     fn fetch_git_ref(&self, _url: &str, _rev: &str) -> Result<Option<()>, String> {
         Ok(None)
     }

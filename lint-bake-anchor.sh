@@ -3,7 +3,10 @@
 # declares must be present in the bake-anchor crate (crates/bake-anchor), so the
 # std/cargo bake vendors+precompiles it (design/caos-expr.md, Phase 3). Source
 # std tools live OUTSIDE the workspace and compile against that bake; a dep the
-# anchor lacks would recompile from scratch or fail (workers have no network).
+# anchor lacks would recompile from scratch or fail — the bake builds `--offline`
+# against a vendored registry (std/cargo/bake.nix), so there is no crates.io to
+# fall back to. That is the BUILD refusing to reach out, not the container being
+# unable to: workers do have a network (AGENTS.md, "Workers").
 #
 # Names only: version/feature parity is caught by the build-time "did we reuse
 # the bake?" guard (a mismatch recompiles, which that guard flags), which is far
