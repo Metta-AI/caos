@@ -297,12 +297,15 @@ grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" stub/request-
 echo "== model-issued independent work ==" >&2
 tree2=$(git rev-parse "$head2^{tree}")
 user3=$(mkcommit "$tree2" \
-  '{"author":"user","content":"queue the independent request","status":"queued"}' \
+  '{"author":"user","content":"queue the independent request"}' \
   "$head2")
 request3=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user3")
 [ "${#request3}" -eq 40 ] && [[ "$request3" =~ ^[0-9a-f]+$ ]] \
   || fail "third prepared request is not exact Q: $request3"
-git push --quiet caos "$user3:$conversation_ref" \
+admitted3=$(mkcommit "$tree2" \
+  "{\"request\":\"$request3\",\"request_head\":\"$user3\",\"status\":\"queued\"}" \
+  "$user3")
+git push --quiet caos "$admitted3:$conversation_ref" \
   || fail "publishing independent-work queued event"
 "$CAOS_CLI" run "$request3" -- >/tmp/llm-step-result-3 \
   || fail "running independent-work turn"
@@ -378,10 +381,13 @@ done
 
 tree3=$(git rev-parse "$completion_head^{tree}")
 user4=$(mkcommit "$tree3" \
-  '{"author":"user","content":"what completed?","status":"queued"}' \
+  '{"author":"user","content":"what completed?"}' \
   "$completion_head")
 request4=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user4")
-git push --quiet caos "$user4:$conversation_ref" \
+admitted4=$(mkcommit "$tree3" \
+  "{\"request\":\"$request4\",\"request_head\":\"$user4\",\"status\":\"queued\"}" \
+  "$user4")
+git push --quiet caos "$admitted4:$conversation_ref" \
   || fail "publishing post-completion queued event"
 "$CAOS_CLI" run "$request4" -- >/tmp/llm-step-result-4 \
   || fail "running post-completion turn"

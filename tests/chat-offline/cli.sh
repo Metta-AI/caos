@@ -148,8 +148,9 @@ git fetch -q caos "$tip1"
 [ "$(git show "$tip1:notes/todo.txt")" = "hello notes" ] || fail "untouched file was lost"
 capture_events "$tip1" "$base" turn1.events
 [ "$EVENT_COUNT" -ge 5 ] || fail "tool turn recorded only $EVENT_COUNT durable events"
-grep -qF '"author":"user","content":"create out.txt containing hi"' turn1.events \
-  || fail "user event is missing"
+jq -s -e --arg content "create out.txt containing hi" \
+  'any(.[]; .author == "user" and .content == $content)' \
+  turn1.events >/dev/null || fail "user event is missing"
 grep -q '"request":"[0-9a-f]\{40\}"' turn1.events || fail "exact request was not recorded"
 admission=""
 current=$tip1
@@ -168,7 +169,9 @@ request_head=$(jq -r '.request_head' <<<"$admission_event")
 [ "$(git rev-parse "$admission^1")" = "$request_head" ] \
   || fail "admission does not immediately follow its explicit user request head"
 request_event=$(git show -s --format=%B "$request_head" | tr -d '\n')
-[[ "$request_event" == *'"author":"user","content":"create out.txt containing hi"'* ]] \
+jq -e --arg content "create out.txt containing hi" \
+  '.author == "user" and .content == $content' \
+  <<<"$request_event" >/dev/null \
   || fail "admission request_head does not identify the submitted user event"
 tool_events=$(grep -cF 'toolu_01' turn1.events || true)
 [ "$tool_events" -ge 2 ] || fail "tool call and result were not both recorded"
@@ -232,8 +235,9 @@ done
 [ "$recovered" -eq 1 ] || fail "worker did not finish after client disconnect"
 [ "$tip2" != "$tip1" ] || fail "canonical head did not advance"
 capture_events "$tip2" "$base" turn2.events
-grep -qF '"author":"user","content":"and now?"' turn2.events \
-  || fail "second user event is missing"
+jq -s -e --arg content "and now?" \
+  'any(.[]; .author == "user" and .content == $content)' \
+  turn2.events >/dev/null || fail "second user event is missing"
 grep -qF "$T2_TEXT" turn2.events || fail "post-disconnect assistant event is missing"
 
 # The second request was constructed entirely by replaying the event spine.
