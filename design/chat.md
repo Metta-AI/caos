@@ -306,6 +306,10 @@ title generation may replace only that exact value by CAS; a manual or foreign
 rename wins. Membership changes similarly use atomic leases so active and
 archived state cannot both win.
 
+The client passes an explicit model to every `llm-step`. `/model` changes the
+client's last-used model for later turns. Assistant events retain the model for
+display.
+
 ### Deferred work
 
 - **Async consumption.** Add a side-effect-free operation that reads

@@ -12,7 +12,7 @@ use caos::chat::{
     resume_request, run_chat_turn, set_conversation_title, submit_interjection,
     unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
     InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff,
+    UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -97,7 +97,7 @@ pub(crate) enum Focus {
 enum EntryRole {
     Human,
     Peer(String),
-    Agent,
+    Agent(Option<String>),
     Info,
     Notice,
 }
@@ -753,8 +753,49 @@ impl Composer {
             .collect()
     }
 
+    fn model_token(&self) -> Option<(usize, usize, &str)> {
+        const PREFIX: &str = "/model";
+        if self.command_menu_dismissed || !self.text.starts_with(PREFIX) {
+            return None;
+        }
+        let arguments = &self.text[PREFIX.len()..];
+        if !arguments.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let start = arguments
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(offset, _)| PREFIX.len() + offset)
+            .unwrap_or(self.text.len());
+        let end = self.text[start..]
+            .find(char::is_whitespace)
+            .map(|offset| start + offset)
+            .unwrap_or(self.text.len());
+        (self.cursor >= start && self.cursor <= end).then(|| (start, end, &self.text[start..end]))
+    }
+
+    fn model_matches(&self) -> Vec<&'static str> {
+        let Some((_, _, token)) = self.model_token() else {
+            return Vec::new();
+        };
+        MODEL_OPTIONS
+            .iter()
+            .copied()
+            .filter(|model| {
+                model.starts_with(token)
+                    || model
+                        .strip_prefix("claude-")
+                        .is_some_and(|short| short.starts_with(token))
+            })
+            .collect()
+    }
+
+    fn completion_count(&self) -> usize {
+        self.command_matches().len() + self.model_matches().len()
+    }
+
     fn select_command(&mut self, amount: isize) -> bool {
-        let count = self.command_matches().len();
+        let count = self.completion_count();
         if count == 0 {
             return false;
         }
@@ -764,15 +805,22 @@ impl Composer {
     }
 
     fn complete_command(&mut self) -> bool {
-        let Some(command) = self.command_matches().get(self.command_selection).copied() else {
+        if let Some(command) = self.command_matches().get(self.command_selection).copied() {
+            let token_end = self
+                .text
+                .find(char::is_whitespace)
+                .unwrap_or(self.text.len());
+            self.text.replace_range(..token_end, command.name);
+            self.cursor = command.name.len();
+        } else if let (Some((start, end, _)), Some(model)) = (
+            self.model_token(),
+            self.model_matches().get(self.command_selection).copied(),
+        ) {
+            self.text.replace_range(start..end, model);
+            self.cursor = start + model.len();
+        } else {
             return false;
-        };
-        let token_end = self
-            .text
-            .find(char::is_whitespace)
-            .unwrap_or(self.text.len());
-        self.text.replace_range(..token_end, command.name);
-        self.cursor = command.name.len();
+        }
         self.selection_anchor = None;
         if let Some(ch) = self.text[self.cursor..].chars().next() {
             self.cursor += ch.len_utf8();
@@ -785,7 +833,7 @@ impl Composer {
     }
 
     fn dismiss_command_menu(&mut self) -> bool {
-        if self.command_matches().is_empty() {
+        if self.completion_count() == 0 {
             return false;
         }
         self.command_menu_dismissed = true;
@@ -803,6 +851,7 @@ enum CommandAction {
     From,
     Help,
     Invite,
+    Model,
     Palette,
     Reference,
     Title,
@@ -818,7 +867,21 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 7] = [
+// Completion hints for current public models compatible with llm-step's
+// adaptive-thinking request. Explicit strings remain accepted for gateways
+// and newly released models.
+const MODEL_OPTIONS: [&str; 8] = [
+    "default",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+];
+
+const COMMANDS: [Command; 8] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -866,6 +929,13 @@ const COMMANDS: [Command; 7] = [
         usage: "/invite <username>",
         description: "add to one username's sidebar (case-sensitive; spaces allowed)",
         action: CommandAction::Invite,
+        takes_argument: true,
+    },
+    Command {
+        name: "/model",
+        usage: "/model <name|default>",
+        description: "select the model for future turns in this client",
+        action: CommandAction::Model,
         takes_argument: true,
     },
 ];
@@ -1020,7 +1090,7 @@ impl ConversationState {
                         EntryRole::Peer(turn.author)
                     }
                     ConversationRole::Human => EntryRole::Human,
-                    ConversationRole::Agent => EntryRole::Agent,
+                    ConversationRole::Agent => EntryRole::Agent(turn.model),
                 },
                 commit: Some(turn.commit),
                 text: turn.message,
@@ -1529,6 +1599,9 @@ impl App {
         // Fail before taking over the terminal if the repo or remote is invalid.
         let transport = GitTransport::from_cwd()?;
         let repo_dir = transport.work_dir().to_path_buf();
+        args.turn
+            .model
+            .get_or_insert_with(|| DEFAULT_MODEL.to_string());
         if let Some(from) = args.from_commit.clone() {
             let commit = transport
                 .resolve_revspec(&from)?
@@ -1941,9 +2014,8 @@ impl App {
             state.status.clear();
         }
         // Resolve the prompt into the turn's message and, for `/update-tree`,
-        // the tree the human commit should carry. `/from`, `/help`, and
-        // `/title` are not turns and return here; everything else falls
-        // through to run one.
+        // the tree the human commit should carry. Configuration and UI
+        // commands return here; everything else falls through to run one.
         let mut human_tree = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
             if command.takes_argument && arguments.is_empty() {
@@ -1978,6 +2050,24 @@ impl App {
                 }
                 CommandAction::Invite => {
                     self.invite_selected(arguments);
+                    return;
+                }
+                CommandAction::Model => {
+                    if arguments.split_whitespace().count() != 1 {
+                        self.selected_mut()
+                            .show_command_error(format!("usage: {}", command.usage));
+                        return;
+                    }
+                    let model = if arguments == "default" {
+                        DEFAULT_MODEL.to_string()
+                    } else {
+                        arguments.to_string()
+                    };
+                    for state in &mut self.conversations {
+                        state.turn_options.model = Some(model.clone());
+                    }
+                    self.selected_mut()
+                        .push_info(format!("Model for future turns: {model}"));
                     return;
                 }
                 CommandAction::From => {
@@ -2538,7 +2628,7 @@ impl App {
             TurnEvent::AssistantText(text) => {
                 state.note_transcript_append();
                 state.transcript.push(TranscriptEntry {
-                    role: EntryRole::Agent,
+                    role: EntryRole::Agent(state.turn_options.model.clone()),
                     commit: None,
                     text,
                     pending_id: None,
@@ -4295,7 +4385,8 @@ mod tests {
                 "/update-tree",
                 "/commands",
                 "/ref",
-                "/invite"
+                "/invite",
+                "/model"
             ]
         );
 
@@ -4317,6 +4408,12 @@ mod tests {
         assert!(composer.command_matches().is_empty());
         composer.insert_char('x');
         assert!(!composer.command_menu_dismissed);
+
+        let mut composer = Composer::default();
+        composer.insert_str("/model sonnet-5");
+        assert_eq!(composer.model_matches(), ["claude-sonnet-5"]);
+        assert!(composer.complete_command());
+        assert_eq!(composer.text, "/model claude-sonnet-5 ");
     }
 
     #[test]
@@ -4337,6 +4434,10 @@ mod tests {
         assert_eq!(command.action, CommandAction::Invite);
         assert_eq!(arguments, "Bob Smith");
 
+        let (command, arguments) = parse_command("/model claude-sonnet-5").unwrap();
+        assert_eq!(command.action, CommandAction::Model);
+        assert_eq!(arguments, "claude-sonnet-5");
+
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
         assert_eq!(arguments, "include this text");
@@ -4352,6 +4453,45 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn model_command_updates_the_clients_last_used_model() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2")]);
+        app.selected_mut()
+            .composer
+            .insert_str("/model claude-sonnet-5");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.selected().turn_options.model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            app.selected().transcript.last().unwrap().text,
+            "Model for future turns: claude-sonnet-5"
+        );
+        assert_eq!(
+            app.conversations[1].turn_options.model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        app.selected_mut().composer.insert_str("/model default");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.selected().turn_options.model.as_deref(),
+            Some(DEFAULT_MODEL)
+        );
+        assert_eq!(
+            app.conversations[1].turn_options.model.as_deref(),
+            Some(DEFAULT_MODEL)
+        );
+        assert_eq!(
+            app.selected().transcript.last().unwrap().text,
+            format!("Model for future turns: {DEFAULT_MODEL}")
+        );
     }
 
     #[test]
@@ -4450,6 +4590,18 @@ mod tests {
         assert!(
             rendered.contains("/update-tree <message> — fold working-tree edits into the commit")
         );
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/model sonnet-5");
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("claude-sonnet-5"));
     }
 
     #[test]
@@ -4897,7 +5049,7 @@ mod tests {
     fn paused_transcript_shows_unread_and_rendered_lines_below() {
         let mut conversation = state("talk-1");
         conversation.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: None,
             text: (0..60)
                 .map(|line| format!("existing line {line}"))
@@ -5155,7 +5307,7 @@ mod tests {
         conversation.running = true;
         conversation.status = "calling model".to_string();
         conversation.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: None,
             text: (0..60)
                 .map(|line| format!("line {line:02}"))
@@ -5355,7 +5507,7 @@ mod tests {
                 pending_id: None,
             },
             TranscriptEntry {
-                role: EntryRole::Agent,
+                role: EntryRole::Agent(Some("claude-sonnet-5".to_string())),
                 commit: Some("b".repeat(40)),
                 text: "Running them now.".to_string(),
                 pending_id: None,
@@ -5390,6 +5542,7 @@ mod tests {
         assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
         assert!(rendered.contains("Please run the tests"));
+        assert!(rendered.contains("Agent (sonnet-5)"));
         assert!(rendered.contains("Running…"));
         assert!(rendered.contains("$ cargo test"));
         assert!(rendered.contains("Ctrl+T expands"));
@@ -5499,7 +5652,7 @@ mod tests {
     fn idle_chat_header_keeps_only_the_title_and_head_metadata() {
         let mut conversation = state("A concise title");
         conversation.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: Some("b".repeat(40)),
             text: "done".to_string(),
             pending_id: None,
@@ -5568,7 +5721,7 @@ mod tests {
     fn transcript_renders_markdown_emphasis_styles() {
         let mut selected = state("markdown");
         selected.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: None,
             text: "plain **bold** and _italic_".to_string(),
             pending_id: None,

@@ -24,6 +24,7 @@ const MAX_APPEND_ATTEMPTS: usize = 32;
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const AUTO_NAME_PREFIX: &str = "talk-";
 const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin/master"];
+pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
     available tools for file access, builds, tests, and edits. Keep responses concise.";
 
@@ -93,6 +94,7 @@ pub struct ConversationTurn {
     pub short_commit: String,
     pub author: String,
     pub role: ConversationRole,
+    pub model: Option<String>,
     pub message: String,
 }
 
@@ -1020,9 +1022,10 @@ fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<Stri
     if !merge_refs.is_empty() {
         config.push(format!("--merge-refs={merge_refs}"));
     }
-    if let Some(model) = &options.model {
-        config.push(format!("--model={model}"));
-    }
+    config.push(format!(
+        "--model={}",
+        options.model.as_deref().unwrap_or(DEFAULT_MODEL)
+    ));
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
@@ -1734,6 +1737,10 @@ fn replay_from_events(events: &[StoredEvent], head: &str) -> ConversationReplay 
             short_commit: short_hash(&event.commit).to_string(),
             author: display_author,
             role,
+            model: (role == ConversationRole::Agent)
+                .then(|| event.value.get("model").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string),
             message: content.to_string(),
         });
     }
@@ -1943,9 +1950,10 @@ pub fn generate_conversation_title(
         format!("--messages={messages}"),
         "--max-tokens=32".to_string(),
     ];
-    if let Some(model) = &options.model {
-        call.push(format!("--model={model}"));
-    }
+    call.push(format!(
+        "--model={}",
+        options.model.as_deref().unwrap_or(DEFAULT_MODEL)
+    ));
     let arg_tree = prepare_request(t, &llm, None, &call, &[])?;
     let (kind, hash) = request_compute(&t.server_url()?, &arg_tree, "")?;
     if kind != "blob" {
@@ -3409,6 +3417,20 @@ mod tests {
         assert_eq!(snapshot.messages[0].username.as_deref(), Some("Alice"));
         assert_eq!(snapshot.messages[1].content, "done");
         assert_eq!(snapshot.request, None);
+    }
+
+    #[test]
+    fn replay_retains_the_assistant_model() {
+        let replay = replay_from_events(
+            &[event(json!({
+                "author": "assistant",
+                "model": "claude-sonnet-5",
+                "content": "done"
+            }))],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        assert_eq!(replay.turns[0].model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[test]

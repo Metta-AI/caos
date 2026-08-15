@@ -171,7 +171,7 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let composer_width = body[1].width.saturating_sub(2);
     let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
-        state.composer.command_matches().len() as u16
+        state.composer.completion_count() as u16
     } else {
         0
     };
@@ -600,17 +600,23 @@ fn transcript_paragraph(state: &ConversationState, width: u16) -> Paragraph<'sta
         ));
     }
     for entry in &state.transcript {
-        let (label, color) = match &entry.role {
-            EntryRole::Human => ("You".to_string(), Color::Cyan),
-            EntryRole::Peer(author) => (author.clone(), Color::Magenta),
-            EntryRole::Agent => ("Agent".to_string(), Color::Green),
-            EntryRole::Info => ("CAOS".to_string(), Color::Cyan),
-            EntryRole::Notice => ("Error".to_string(), Color::Red),
+        let (label, color, model) = match &entry.role {
+            EntryRole::Human => ("You".to_string(), Color::Cyan, None),
+            EntryRole::Peer(author) => (author.clone(), Color::Magenta, None),
+            EntryRole::Agent(model) => ("Agent".to_string(), Color::Green, model.as_deref()),
+            EntryRole::Info => ("CAOS".to_string(), Color::Cyan, None),
+            EntryRole::Notice => ("Error".to_string(), Color::Red, None),
         };
         let mut heading = vec![Span::styled(
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )];
+        if let Some(model) = model {
+            heading.push(Span::styled(
+                format!(" ({})", model.strip_prefix("claude-").unwrap_or(model)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if let Some(commit) = &entry.commit {
             heading.push(Span::styled(
                 format!("  {}", short_hash(commit)),
@@ -1438,10 +1444,15 @@ fn render_composer(
     } else {
         Vec::new()
     };
+    let models = if view == View::Chat {
+        state.composer.model_matches()
+    } else {
+        Vec::new()
+    };
     let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let command_height = commands.len().min(inner.height as usize) as u16;
+    let command_height = (commands.len() + models.len()).min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
     let composer_area = Rect::new(
         inner.x.saturating_add(2),
@@ -1474,6 +1485,7 @@ fn render_composer(
     );
     render_command_menu(
         &commands,
+        &models,
         state.composer.command_selection,
         frame,
         command_area,
@@ -1566,8 +1578,14 @@ fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
         .collect()
 }
 
-fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame<'_>, area: Rect) {
-    let lines = commands.iter().enumerate().map(|(index, command)| {
+fn render_command_menu(
+    commands: &[&Command],
+    models: &[&str],
+    selected: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let command_lines = commands.iter().enumerate().map(|(index, command)| {
         let marker = if index == selected { "> " } else { "  " };
         let style = if index == selected {
             Style::default()
@@ -1581,7 +1599,22 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
             style,
         )
     });
-    frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
+    let model_lines = models.iter().enumerate().map(|(index, model)| {
+        let index = index + commands.len();
+        let marker = if index == selected { "> " } else { "  " };
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Line::styled(format!("{marker}{model}"), style)
+    });
+    frame.render_widget(
+        Paragraph::new(command_lines.chain(model_lines).collect::<Vec<_>>()),
+        area,
+    );
 }
 
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
