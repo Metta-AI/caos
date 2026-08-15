@@ -6,13 +6,14 @@
 //! job (set up the root-owned `/cas`, run `/worker` as an unprivileged user,
 //! post the kind + hash recorded at `/cas/out` back to the server), then
 //! long-polls for more work for its image until an idle TTL passes (see
-//! `design/runner-protocol.md`). It normally records continuations for the
-//! server to resolve after the job; `run-async` is the one command that directly
-//! dispatches `/run`. The shared command logic lives in the `caos` library;
-//! this binary is the worker's CLI surface plus the privileged runner.
+//! `design/runner-protocol.md`). It normally records continuations that the
+//! server resolves after the worker's job finishes; `run-async` is the
+//! deliberate exception that starts a detached top-level computation. The
+//! shared command logic lives in the `caos` library; this binary is the worker's
+//! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-async`, `prepare-request`, `curry`, and `runner`.
+//! `run-then`, `run-request-then`, `run-async`, `prepare-request`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::fs::PermissionsExt;
@@ -95,6 +96,15 @@ fn run(args: &[String]) -> Result<(), String> {
             [input, sep, kvs @ ..] if sep == "--" => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
+        // `run-request-then <R> -- [--then=<image>] [--catch]` — tail-call the
+        // exact, already-complete ArgTree R, optionally delivering its result
+        // (or caught error) to a callback image.
+        Some("run-request-then") => match &args[2..] {
+            [request, sep, kvs @ ..] if sep == "--" => {
+                caos::caos_run_request_then(&http()?, request, kvs)
+            }
+            _ => Err(usage(args)),
+        },
         // Send an ordinary /run request for an already-stored ArgTree without
         // waiting for its result.
         Some("run-async") => match &args[2..] {
@@ -102,7 +112,7 @@ fn run(args: &[String]) -> Result<(), String> {
             _ => Err(usage(args)),
         },
         // Construct and store the exact flat runnable ArgTree without executing
-        // it. Its hash is the durable request identity.
+        // it. This is the durable identity accepted by run-async.
         Some("prepare-request") => match &args[2..] {
             [image, sep, kvs @ ..] if sep == "--" => {
                 caos::caos_prepare_request(&http()?, image, kvs)
@@ -477,6 +487,7 @@ fn usage(args: &[String]) -> String {
          {prog} forward <src-cas-path> <dst-cas-path>\n  \
          {prog} map-then <in-cas-path> -- [--map=<image>] [--then=<image>]\n  \
          {prog} run-then <in-cas-path> -- --run=<image> [--then=<image>] [--catch]\n  \
+         {prog} run-request-then <arg-tree-hash|cas-path> -- [--then=<image>] [--catch]\n  \
          {prog} run-async <arg-tree-hash>\n  \
          {prog} prepare-request <image-or-arg-tree> -- [--name=value | --name:@=path ...]\n  \
          {prog} curry <arg tree> [--unbind=<name> ...] -- [--name=value | --name:@=path ...]\n  \

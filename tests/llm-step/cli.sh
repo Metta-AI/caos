@@ -56,14 +56,38 @@ git add -A
 gc commit -qm fixtures
 base=$(mkcommit "HEAD:ws" base)
 
+# A second scripted server is a deterministic barrier for the independent
+# worker. It records the worker's request, then blocks on its response FIFO
+# until this test releases it after the primary turn has become idle.
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 stub_pid=""
+gate_pid=""
 cleanup() {
   if [ -n "$stub_pid" ]; then
     kill "$stub_pid" 2>/dev/null || true
   fi
+  if [ -n "$gate_pid" ]; then
+    kill "$gate_pid" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
+
+mkdir async-gate
+mkfifo async-gate/response-1.json
+for _ in 1 2 3 4 5; do
+  gate_port=$((20000 + RANDOM % 20000))
+  "$stub_bin" "0.0.0.0:$gate_port" "$PWD/async-gate" 2>async-gate/log &
+  gate_pid=$!
+  sleep 0.5
+  if kill -0 "$gate_pid" 2>/dev/null; then break; fi
+  gate_pid=""
+done
+[ -n "$gate_pid" ] || fail "could not start async gate: $(cat async-gate/log)"
+
+async_request=$("$CAOS_CLI" prepare-request DEEP-DEPS/bash -- \
+  --worker1:@=test/async.sh --gate-host="$stub_host" --gate-port="$gate_port")
+[ "${#async_request}" -eq 40 ] && [[ "$async_request" =~ ^[0-9a-f]+$ ]] \
+  || fail "independent subrequest is not exact R: $async_request"
 
 R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"cmd":"echo hi > out.txt","paths":[]},"name":"bash","type":"tool_use"}]'
 R2='[{"id":"toolu_02","input":{"cmd":"cat out.txt","paths":["out.txt"]},"name":"bash","type":"tool_use"},{"id":"toolu_03","input":{"cmd":"echo boom >&2; exit 3","paths":[]},"name":"bash","type":"tool_use"}]'
@@ -71,6 +95,8 @@ EARLY_INTERJECTION_TEXT="also preserve the executable bit"
 INTERJECTION_TEXT="one more thing before you finish"
 STALE_T2_TEXT="the workspace still holds out.txt"
 T2_TEXT="yes, I also saw your last message"
+ASYNC_QUEUED_TEXT="the independent task is queued"
+ASYNC_OBSERVED_TEXT="I observed the independent task completion"
 mkdir stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > stub/response-2.json
@@ -82,6 +108,12 @@ printf '{"content":[{"text":"done: out.txt contains hi","type":"text"}],"stop_re
 mkfifo stub/response-4.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$T2_TEXT" \
   > stub/response-5.json
+printf '{"content":[{"id":"toolu_async","input":{"request":"%s"},"name":"run_async","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  "$async_request" > stub/response-6.json
+printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
+  "$ASYNC_QUEUED_TEXT" > stub/response-7.json
+printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
+  "$ASYNC_OBSERVED_TEXT" > stub/response-8.json
 
 for _ in 1 2 3 4 5; do
   port=$((20000 + RANDOM % 20000))
@@ -249,5 +281,107 @@ if grep -qF "$STALE_T2_TEXT" stub/request-5.json; then
 fi
 grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" stub/request-5.json \
   || fail "racing interjection was not replayed in the replacement model call"
+
+echo "== model-issued independent work ==" >&2
+tree2=$(git rev-parse "$head2^{tree}")
+user3=$(mkcommit "$tree2" \
+  '{"author":"user","content":"queue the independent request","kind":"caos-chat-event","status":"queued"}' \
+  "$head2")
+request3=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user3")
+[ "${#request3}" -eq 40 ] && [[ "$request3" =~ ^[0-9a-f]+$ ]] \
+  || fail "third prepared request is not exact Q: $request3"
+git push --quiet caos "$user3:$conversation_ref" \
+  || fail "publishing independent-work queued event"
+"$CAOS_CLI" run "$request3" -- >/tmp/llm-step-result-3 \
+  || fail "running independent-work turn"
+
+# The model got an immediate tool result and ended the primary turn while the
+# independent worker is still held at the separate server's FIFO.
+head3=$(fetch_head)
+terminal3=$(git show -s --format=%B "$head3")
+grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' <<<"$terminal3" \
+  || fail "primary turn did not become idle after run_async"
+grep -qF "$ASYNC_QUEUED_TEXT" <<<"$terminal3" \
+  || fail "primary turn did not finish with its scripted response"
+events3=$(git log --first-parent --format=%B "$user3..$head3")
+grep -qF "\"request\":\"$request3\"" <<<"$events3" \
+  || fail "worker did not record the independent-work running request"
+mapfile -t pending_tasks < <(
+  git log --first-parent --format=%B "$user3..$head3" \
+    | jq -r 'select(.async.status == "pending") | .async.task'
+)
+[ "${#pending_tasks[@]}" -eq 1 ] || fail "run_async did not record exactly one task"
+task=${pending_tasks[0]}
+[ "${#task}" -eq 40 ] && [[ "$task" =~ ^[0-9a-f]+$ ]] \
+  || fail "pending event has invalid task Q: $task"
+grep -qF '"name":"run_async"' stub/request-6.json \
+  || fail "run_async was not registered for the model"
+grep -qF '"tool_use_id":"toolu_async"' stub/request-7.json \
+  || fail "run_async's immediate result was not replayed"
+grep -qF "$task" stub/request-7.json \
+  || fail "run_async's immediate result omitted task Q"
+
+gate_reached=0
+for _ in $(seq 1 300); do
+  if [ -e async-gate/request-1.json ]; then
+    gate_reached=1
+    break
+  fi
+  sleep 0.2
+done
+[ "$gate_reached" -eq 1 ] || fail "independent worker never reached its barrier"
+[ "$(remote_head)" = "$head3" ] \
+  || fail "conversation advanced while independent worker was blocked"
+[ -z "$(remote_exact_ref "refs/caos/res/$task" 2>/dev/null || true)" ] \
+  || fail "independent task published a result before release"
+
+echo "== independent completion and later observation ==" >&2
+printf '{"content":[],"stop_reason":"end_turn"}' > async-gate/response-1.json
+completion_head=""
+for _ in $(seq 1 300); do
+  candidate=$(remote_head)
+  if [ "$candidate" != "$head3" ]; then
+    git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$candidate" \
+      || fail "fetching independent completion"
+    if [ "$(git show -s --format=%B "$candidate" | jq -r '.async.status // empty')" = complete ]; then
+      completion_head=$candidate
+      break
+    fi
+  fi
+  sleep 0.2
+done
+[ -n "$completion_head" ] || fail "independent completion was not appended"
+[ "$(git rev-parse "$completion_head^1")" = "$head3" ] \
+  || fail "independent completion did not append after the primary turn"
+[ "$(git rev-parse "$completion_head^{tree}")" = "$(git rev-parse "$head3^{tree}")" ] \
+  || fail "independent completion changed the workspace"
+
+task_result=""
+for _ in $(seq 1 300); do
+  task_result=$(remote_exact_ref "refs/caos/res/$task" 2>/dev/null || true)
+  if [ -n "$task_result" ]; then break; fi
+  sleep 0.2
+done
+[ -n "$task_result" ] || fail "independent task Q has no result ref"
+
+tree3=$(git rev-parse "$completion_head^{tree}")
+user4=$(mkcommit "$tree3" \
+  '{"author":"user","content":"what completed?","kind":"caos-chat-event","status":"queued"}' \
+  "$completion_head")
+request4=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user4")
+git push --quiet caos "$user4:$conversation_ref" \
+  || fail "publishing post-completion queued event"
+"$CAOS_CLI" run "$request4" -- >/tmp/llm-step-result-4 \
+  || fail "running post-completion turn"
+
+head4=$(fetch_head)
+terminal4=$(git show -s --format=%B "$head4")
+grep -qF "$ASYNC_OBSERVED_TEXT" <<<"$terminal4" \
+  || fail "post-completion turn did not finish"
+notice="Independent task $task is complete. Its result is addressed by that task hash."
+grep -qF "$notice" stub/request-8.json \
+  || fail "later model step did not observe independent completion"
+[ "$(git rev-parse "$head4^{tree}")" = "$tree3" ] \
+  || fail "post-completion observation changed the workspace"
 
 echo "llm-step: ALL PASS" >&2

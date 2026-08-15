@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::Value;
 
 const EVENT_KIND: &str = "caos-chat-event";
+use crate::validate_hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendResult {
@@ -238,9 +239,22 @@ fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, St
         .ok_or_else(|| format!("conversation event {event} has no first parent"))
 }
 
-fn conversation_ref(conversation: &str) -> Result<String, String> {
+pub(crate) fn conversation_ref(conversation: &str) -> Result<String, String> {
     validate_conversation(conversation)?;
     Ok(format!("refs/caos/conversations/{conversation}/head"))
+}
+
+/// Validate an already-formed canonical conversation head ref with the same
+/// grammar used when this crate constructs one from a conversation id.
+pub(crate) fn validate_conversation_ref(refname: &str) -> Result<(), String> {
+    let Some(conversation) = refname
+        .strip_prefix("refs/caos/conversations/")
+        .and_then(|rest| rest.strip_suffix("/head"))
+    else {
+        return Err(format!("invalid target conversation ref {refname:?}"));
+    };
+    validate_conversation(conversation)
+        .map_err(|_| format!("invalid target conversation ref {refname:?}"))
 }
 
 /// A conservative in-worker equivalent of `git check-ref-format` for the id
@@ -272,19 +286,6 @@ fn validate_conversation(conversation: &str) -> Result<(), String> {
         {
             return Err(format!("invalid conversation name {conversation:?}"));
         }
-    }
-    Ok(())
-}
-
-fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(format!(
-            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
-        ));
     }
     Ok(())
 }
@@ -793,6 +794,27 @@ fn server_base() -> Result<String, String> {
     Ok(base.trim_end_matches('/').to_string())
 }
 
+/// Ask whether one exact object exists without parsing subprocess stderr.
+/// Missing is a user-facing 404; transport and server failures remain typed
+/// infrastructure errors.
+pub(crate) fn object_exists(hash: &str) -> Result<bool, String> {
+    validate_hash(hash, "object")?;
+    let url = format!("{}/object/{hash}", server_base()?);
+    let response = minreq::head(&url)
+        .with_timeout(30)
+        .send()
+        .map_err(|error| format!("HEAD {url}: {error}"))?;
+    object_status(&url, response.status_code, &response.reason_phrase)
+}
+
+fn object_status(url: &str, status: i32, reason: &str) -> Result<bool, String> {
+    match status {
+        200..=299 => Ok(true),
+        404 => Ok(false),
+        code => Err(format!("HEAD {url}: {code} {reason}")),
+    }
+}
+
 fn push_ref(
     base: &str,
     refname: &str,
@@ -862,6 +884,14 @@ fn read_ref(base: &str, refname: &str) -> Result<Option<String>, String> {
     Ok(Some(hash.to_string()))
 }
 
+/// Read the exact result ref for a top-level request. Independent-work
+/// reconciliation uses absence as proof that a terminal status has not yet
+/// converged to an addressable result and must be dispatched again.
+pub(crate) fn result_ref(task: &str) -> Result<Option<String>, String> {
+    validate_hash(task, "async task")?;
+    read_ref(&server_base()?, &format!("refs/caos/res/{task}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,6 +928,29 @@ mod tests {
         assert!(validate_hash(&"A".repeat(40), "test hash")
             .unwrap_err()
             .contains("lowercase"));
+        assert!(
+            validate_conversation_ref("refs/caos/conversations/project/talk-1/head").is_ok()
+        );
+        assert!(
+            validate_conversation_ref("refs/caos/conversations/project/head/talk-1/head")
+                .is_err()
+        );
+        assert!(validate_conversation_ref(
+            "refs/caos/v2/conversations/project/talk-1/head"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn object_status_distinguishes_missing_from_broken() {
+        assert_eq!(object_status("http://caos/object/q", 200, "OK"), Ok(true));
+        assert_eq!(
+            object_status("http://caos/object/q", 404, "Not Found"),
+            Ok(false)
+        );
+        assert!(object_status("http://caos/object/q", 503, "Unavailable")
+            .unwrap_err()
+            .contains("503 Unavailable"));
     }
 
     #[derive(Default)]

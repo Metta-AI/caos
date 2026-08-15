@@ -1,0 +1,6 @@
+# The test invokes both bases through hashes held in curry blobs, so their
+# seeded build chain must be named explicitly (see design/caos-expr.md).
+../../std/bash bash
+../../std/run-and-update-ref run-and-update-ref
+../../std/cargo cargo
+../../std/flake-builder flake-builder

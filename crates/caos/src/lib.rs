@@ -2362,8 +2362,8 @@ fn prepare_request(
 /// executing it. This is the worker-side half: CAS paths use `/cas` semantics.
 ///
 /// Unlike [`caos_curry`], the result is not a partial curry node. It is the same
-/// request `run_request` would send to `/run`, so its hash can be recorded as a
-/// durable request identity before execution begins.
+/// request `run_request` would send to `/run`, so it can be recorded durably
+/// and later handed unchanged to `run-async` or `run-request-then`.
 pub fn caos_prepare_request(t: &dyn Transport, image: &str, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let image = resolve_run_image(t, &cas, image)?;
@@ -2474,12 +2474,20 @@ fn assemble_arg_tree(
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
-    record_continuation(t, "map-then", input, kvs, &["map", "then"], &[], |given| {
-        if given.is_empty() {
-            return Err("`map-then` needs --map and/or --then".to_string());
-        }
-        Ok(())
-    })
+    record_continuation(
+        t,
+        "map-then",
+        ContinuationSubject::Input(input),
+        kvs,
+        &["map", "then"],
+        &[],
+        |given| {
+            if given.is_empty() {
+                return Err("`map-then` needs --map and/or --then".to_string());
+            }
+            Ok(())
+        },
+    )
 }
 
 /// `run-then <in> -- --run=<image> [--then=<image>] [--catch]` — the
@@ -2503,7 +2511,7 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
     record_continuation(
         t,
         "run-then",
-        input,
+        ContinuationSubject::Input(input),
         kvs,
         &["run", "then"],
         &["catch"],
@@ -2514,6 +2522,40 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
             if given.contains(&"catch") && !given.contains(&"then") {
                 return Err(
                     "`run-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+/// `run-request-then <R> -- [--then=<image>] [--catch]` — record a promise
+/// that runs the already-complete ArgTree `R` unchanged. With `--then`, its
+/// result is passed as that callback's sole `--result` arg; without one, R's
+/// result is this request's result. `--catch` instead passes a failed R as the
+/// callback's sole `--error` arg and therefore requires `--then`.
+///
+/// `R` may be a 40-character tree hash already stored on the server or a tree
+/// path inside `/cas`. Unlike `run-then`, no `--in` is added and no new request
+/// is assembled around an image: R's hash is the request identity executed by
+/// the promise interpreter.
+pub fn caos_run_request_then(
+    t: &dyn Transport,
+    request: &str,
+    kvs: &[String],
+) -> Result<(), String> {
+    record_continuation(
+        t,
+        "run-request-then",
+        ContinuationSubject::Request(request),
+        kvs,
+        &["then"],
+        &["catch"],
+        |given| {
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`run-request-then --catch` needs --then: the error has to be delivered somewhere"
                         .to_string(),
                 );
             }
@@ -2565,12 +2607,18 @@ pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Shared continuation recorder. `allowed` names image-valued entries and
-/// `markers` names bare presence flags.
+enum ContinuationSubject<'a> {
+    Input(&'a str),
+    Request(&'a str),
+}
+
+/// Shared continuation recorder. `subject` supplies either the ordinary `in`
+/// data entry or an exact `request` ArgTree; `allowed` names image-valued
+/// entries and `markers` names bare presence flags.
 fn record_continuation(
     t: &dyn Transport,
     verb: &str,
-    input: &str,
+    subject: ContinuationSubject<'_>,
     kvs: &[String],
     allowed: &[&'static str],
     markers: &[&'static str],
@@ -2589,15 +2637,49 @@ fn record_continuation(
         ));
     }
 
-    // `in` is the data node the continuation is over: an existing CAS path,
-    // referenced as a real tree entry (mode + recorded hash).
-    let path = validate_descendant(&cas, input)?;
-    let (mode, oid) = cas_entry(&path)?;
-    let mut entries = vec![Entry {
-        mode,
-        filename: b"in".to_vec().into(),
-        oid,
-    }];
+    let subject = match subject {
+        // `in` is the data node the continuation is over: an existing CAS path,
+        // referenced as a real tree entry (mode + recorded hash).
+        ContinuationSubject::Input(input) => {
+            let path = validate_descendant(&cas, input)?;
+            let (mode, oid) = cas_entry(&path)?;
+            Entry {
+                mode,
+                filename: b"in".to_vec().into(),
+                oid,
+            }
+        }
+        // `request` is a complete ArgTree. Store it as a tree entry so the
+        // continuation names R directly rather than a blob that must be
+        // interpreted and rebuilt.
+        ContinuationSubject::Request(request) => {
+            let (mode, oid) = if Path::new(request).starts_with(&cas) {
+                let path = validate_descendant(&cas, request)?;
+                cas_entry(&path)?
+            } else {
+                if !is_hex_hash(request) {
+                    return Err(format!(
+                        "`run-request-then` needs a 40-character ArgTree hash or /cas tree path, got {request:?}"
+                    ));
+                }
+                let (kind, _) = t.get_object(request)?;
+                if kind != "tree" {
+                    return Err(format!("request {request} is a {kind}, not a tree"));
+                }
+                (EntryKind::Tree.into(), parse_oid(request)?)
+            };
+            if !mode.is_tree() {
+                return Err(format!("request {request:?} is not a tree"));
+            }
+            t.ensure_pushed(&oid.to_string())?;
+            Entry {
+                mode: EntryKind::Tree.into(),
+                filename: b"request".to_vec().into(),
+                oid,
+            }
+        }
+    };
+    let mut entries = vec![subject];
 
     let mut given: Vec<&str> = Vec::new();
     for kv in kvs {

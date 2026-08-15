@@ -10,6 +10,7 @@
 //! Continuations carry only the stable run/round/call identity and observed
 //! head; pending queues and results are always reconstructed from the ref.
 
+mod async_work;
 mod githist;
 mod progress;
 mod tools;
@@ -58,6 +59,7 @@ struct Config {
     /// The git-bearing merge worker (std/merge). The `merge` tool is registered
     /// only when present.
     merge_image: Option<String>,
+    run_and_update_ref_image: Option<String>,
     /// The turn-start ref snapshot: `name <hash>` lines the `merge` tool
     /// resolves `--theirs` against (SPEC "Resolving `--theirs`"). Absent = the
     /// tool takes only a bare hash.
@@ -89,6 +91,7 @@ impl Config {
             grep_image: image_arg("grep-image")?,
             tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
+            run_and_update_ref_image: image_arg("run-and-update-ref-image")?,
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg_opt("model")?.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -121,6 +124,9 @@ fn start(cfg: &Config) -> Result<(), String> {
     let run = own_args_tree()?;
     let head_hash = cas_hash(&arg("head"))?;
     let log = ensure_request_running(conversation, &run, &head_hash)?;
+    // One recovery dispatch at turn entry is enough. Normal tool callbacks do
+    // not repeat it and park another single-flight waiter for every tool call.
+    reconcile_async_tasks(cfg, &log)?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
         return finish_from_terminal(terminal);
     }
@@ -183,6 +189,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
         .map_err(|error| format!("invalid continuation round: {error}"))?;
     let base_head = read_arg("base-head")?;
     if let Some(terminal) = terminal_for_run(&log, &run)? {
+        reconcile_async_tasks(cfg, &log)?;
         return finish_from_terminal(terminal);
     }
     let request = active_request(&log)?;
@@ -331,6 +338,28 @@ fn drive(
     let mut queue = queue.to_vec();
     while let Some(call) = queue.first().cloned() {
         let name = call["name"].as_str().unwrap_or("");
+        if name == async_work::TOOL_NAME {
+            let image = cfg
+                .run_and_update_ref_image
+                .as_deref()
+                .ok_or("run_async was called without a run-and-update-ref image")?;
+            let result = async_work::queue_call(&call, conversation(cfg)?, image, |task| {
+                ensure_async_status(cfg, task)
+            })?;
+
+            // Pending publication or the background task may have advanced F.
+            // Fold this tree-neutral tool result over the actual canonical tip,
+            // never over the stale workspace used to construct pending.
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            (ws, _) = canonical_workspace(&log)?;
+            base_head = log.head;
+            append_tool_result(cfg, run, round, &base_head, &result, &cas_hash(&ws)?, None)?;
+            let log = progress::conversation_log(conversation(cfg)?)?;
+            (ws, wc) = canonical_workspace(&log)?;
+            base_head = log.head;
+            queue.remove(0);
+            continue;
+        }
         if name == "bash" {
             return launch(cfg, &call, &ws, &wc, run, round, &base_head);
         }
@@ -562,7 +591,13 @@ fn llm_round(
                 "status": "idle",
             });
             match progress::append_event_at_head(conversation, prev, &event, &tree)? {
-                progress::ConditionalAppend::Appended(appended) => forward_commit(&appended.commit),
+                progress::ConditionalAppend::Appended(appended) => {
+                    // A single post-turn recovery point closes dispatch loss
+                    // before this llm-step process exits. Later recovery is
+                    // owned by a fresh turn/follower, not by tool callbacks.
+                    reconcile_async_tasks(cfg, &progress::conversation_log(conversation)?)?;
+                    forward_commit(&appended.commit)
+                }
                 progress::ConditionalAppend::HeadChanged(_) => {
                     let log = progress::conversation_log(conversation)?;
                     resume_run(cfg, run, head_hash, log)
@@ -1062,13 +1097,17 @@ fn request_for_head(log: &progress::ConversationLog, head: &str) -> Result<Strin
 }
 
 fn validate_run_hash(run: &str) -> Result<(), String> {
-    if run.len() != 40
-        || !run
+    validate_hash(run, "conversation run")
+}
+
+pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
+    if hash.len() != 40
+        || !hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(format!(
-            "conversation run must be a lowercase 40-character hexadecimal hash, got {run:?}"
+            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
         ));
     }
     Ok(())
@@ -1228,6 +1267,112 @@ fn canonical_workspace(log: &progress::ConversationLog) -> Result<(String, Strin
     Ok((ws, wc))
 }
 
+struct ReloadedPending {
+    head: String,
+    /// `Some(tree)` means the pending record is still absent and must be
+    /// rebuilt on this head. `None` means another writer already recorded a
+    /// durable state for the task.
+    workspace: Option<String>,
+}
+
+fn retry_pending_append<A, R>(
+    initial_head: &str,
+    initial_workspace: &str,
+    mut append: A,
+    mut reload: R,
+) -> Result<String, String>
+where
+    A: FnMut(&str, &str) -> Result<progress::ConditionalAppend, String>,
+    R: FnMut() -> Result<ReloadedPending, String>,
+{
+    let mut head = initial_head.to_string();
+    let mut workspace = initial_workspace.to_string();
+    for _ in 0..32 {
+        match append(&head, &workspace)? {
+            progress::ConditionalAppend::Appended(result) => return Ok(result.commit),
+            progress::ConditionalAppend::HeadChanged(_) => {
+                let reloaded = reload()?;
+                head = reloaded.head;
+                let Some(reloaded_workspace) = reloaded.workspace else {
+                    return Ok(head);
+                };
+                workspace = reloaded_workspace;
+            }
+        }
+    }
+    Err("conversation kept changing while recording async task pending".to_string())
+}
+
+fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
+    validate_run_hash(task)?;
+    let conversation = conversation(cfg)?;
+    let log = progress::conversation_log(conversation)?;
+    if let Some(status) =
+        async_work::task_status(log.events.iter().map(|event| &event.value), task)?
+    {
+        return Ok(status);
+    }
+    let tree = log
+        .events
+        .last()
+        .map(|event| event.tree.clone())
+        .ok_or("conversation has no events")?;
+    let event = json!({"kind": "caos-chat-event", "async": {"task": task, "status": "pending"}});
+    let mut observed_status = None;
+    retry_pending_append(
+        &log.head,
+        &tree,
+        |head, workspace| progress::append_event_at_head(conversation, head, &event, workspace),
+        || {
+            let log = progress::conversation_log(conversation)?;
+            let status =
+                async_work::task_status(log.events.iter().map(|event| &event.value), task)?;
+            if let Some(status) = status {
+                observed_status = Some(status);
+                return Ok(ReloadedPending {
+                    head: log.head,
+                    workspace: None,
+                });
+            }
+            let workspace = log
+                .events
+                .last()
+                .map(|event| event.tree.clone())
+                .ok_or("conversation has no events")?;
+            Ok(ReloadedPending {
+                head: log.head,
+                workspace: Some(workspace),
+            })
+        },
+    )?;
+    Ok(observed_status.unwrap_or_else(|| "pending".to_string()))
+}
+
+/// Re-admit pending Qs and terminal Qs whose exact result ref is still absent.
+/// The latter closes the crash window between recording `complete`/`failed`
+/// and the server pinning `refs/caos/res/Q`. Failures are warnings: the durable
+/// state remains on F and a later invocation retries the same Q. Validation
+/// inside `readmit_task` prevents a forged event from targeting another ref.
+fn reconcile_async_tasks(cfg: &Config, log: &progress::ConversationLog) -> Result<(), String> {
+    let tasks = async_work::tasks(log.events.iter().map(|event| &event.value));
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let conversation = conversation(cfg)?;
+    for state in tasks {
+        if !async_work::task_needs_dispatch(&state.task, &state.status) {
+            continue;
+        }
+        if let Err(error) = async_work::readmit_task(&state.task, conversation) {
+            eprintln!(
+                "llm-step: could not re-admit async task {} ({}): {error}",
+                state.task, state.status
+            );
+        }
+    }
+    Ok(())
+}
+
 fn resume_run(
     cfg: &Config,
     run: &str,
@@ -1258,7 +1403,7 @@ fn resume_run(
                 base_head,
             );
         }
-        let messages = event_messages(&log)?;
+        let messages = event_messages(&log, true)?;
         let prev = log.head.clone();
         let next_round = state
             .round
@@ -1266,7 +1411,7 @@ fn resume_run(
             .ok_or_else(|| format!("run {run} exhausted its round counter"))?;
         return llm_round(cfg, messages, &ws, head_hash, &prev, run, next_round);
     }
-    let messages = event_messages(&log)?;
+    let messages = event_messages(&log, true)?;
     let prev = log.head.clone();
     llm_round(cfg, messages, &ws, head_hash, &prev, run, 0)
 }
@@ -1274,8 +1419,13 @@ fn resume_run(
 /// Rebuild the Anthropic transcript from events. User interjections that land
 /// while a tool batch is outstanding are held until all of that response's
 /// results can be emitted together, in call order, immediately after the
-/// assistant tool-use message.
-fn event_messages(log: &progress::ConversationLog) -> Result<Vec<Value>, String> {
+/// assistant tool-use message. Terminal async-task notices are synthesized at
+/// their durable event's position on every rebuild, so observing one extends
+/// the transcript permanently instead of moving or disappearing next round.
+fn event_messages(
+    log: &progress::ConversationLog,
+    include_async_status: bool,
+) -> Result<Vec<Value>, String> {
     struct ToolBatch {
         run: String,
         round: u64,
@@ -1308,9 +1458,33 @@ fn event_messages(log: &progress::ConversationLog) -> Result<Vec<Value>, String>
         Ok(())
     }
 
+    fn push_user(messages: &mut Vec<Value>, batch: &mut Option<ToolBatch>, user: Value) {
+        if let Some(current) = batch.as_mut() {
+            current.deferred_users.push(user);
+        } else {
+            messages.push(user);
+        }
+    }
+
+    let async_notices = if include_async_status {
+        async_work::tasks(log.events.iter().map(|event| &event.value))
+            .into_iter()
+            .filter(|state| matches!(state.status.as_str(), "complete" | "failed"))
+            .map(|state| {
+                let notice = user_text(&format!(
+                    "Independent task {} is {}. Its result is addressed by that task hash.",
+                    state.task, state.status
+                ));
+                (state.event_index, notice)
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut messages = Vec::new();
     let mut batch: Option<ToolBatch> = None;
-    for event in &log.events {
+    for (event_index, event) in log.events.iter().enumerate() {
         if let Some(response) = event.value.get("response") {
             if batch.is_some() {
                 flush_batch(&mut messages, &mut batch)?;
@@ -1393,12 +1567,10 @@ fn event_messages(log: &progress::ConversationLog) -> Result<Vec<Value>, String>
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("user event {} has no string content", event.commit))?;
-            let user = user_text(content);
-            if let Some(current) = batch.as_mut() {
-                current.deferred_users.push(user);
-            } else {
-                messages.push(user);
-            }
+            push_user(&mut messages, &mut batch, user_text(content));
+        }
+        if let Some(notice) = async_notices.get(&event_index) {
+            push_user(&mut messages, &mut batch, notice.clone());
         }
     }
     flush_batch(&mut messages, &mut batch)?;
@@ -1598,6 +1770,9 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
 fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
     tools.extend(tools::declarations());
+    if cfg.run_and_update_ref_image.is_some() {
+        tools.push(async_work::declaration());
+    }
     if cfg.grep_image.is_some() {
         tools.push(tools::grep_declaration());
     }
@@ -1818,7 +1993,7 @@ fn response_text(blocks: &[Value]) -> String {
 }
 
 /// A fresh, unique direct-child CAS path (CAS paths are single-assignment).
-fn fresh(prefix: &str) -> String {
+pub(crate) fn fresh(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("/cas/{prefix}-{n}")
@@ -1829,9 +2004,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conversation_run_hashes_are_canonical_lowercase() {
-        assert!(validate_run_hash(&"a".repeat(40)).is_ok());
-        assert!(validate_run_hash(&"A".repeat(40))
+    fn durable_hashes_are_canonical_lowercase() {
+        assert!(validate_hash(&"a".repeat(40), "test hash").is_ok());
+        assert!(validate_hash(&"A".repeat(40), "test hash")
             .unwrap_err()
             .contains("lowercase"));
     }
@@ -1869,7 +2044,7 @@ mod tests {
         assert_eq!(state.pending, [call_b]);
         // An incomplete tool batch is not sent back to Anthropic yet.
         assert_eq!(
-            event_messages(&history).unwrap(),
+            event_messages(&history, false).unwrap(),
             [
                 json!({"role":"user","content":"hello"}),
                 json!({"role":"assistant","content":[call_a, state.calls[1].clone()]})
@@ -1890,7 +2065,7 @@ mod tests {
             json!({"kind": "caos-chat-event","request":run,"round":0,"result":{"type":"tool_result","tool_use_id":"b","content":"two"}}),
         ]);
         assert_eq!(
-            event_messages(&history).unwrap(),
+            event_messages(&history, false).unwrap(),
             [
                 json!({"role":"user","content":"start"}),
                 json!({"role":"assistant","content":[call_a,call_b]}),
@@ -1916,6 +2091,53 @@ mod tests {
         let state = latest_round(&history, &run).unwrap().unwrap();
         assert_eq!(state.round, 1);
         assert_eq!(state.pending.len(), 1);
+    }
+
+    #[test]
+    fn terminal_async_notice_stays_in_the_prompt_prefix_after_a_response() {
+        let run = "b".repeat(40);
+        let task = "c".repeat(40);
+        let mut events = vec![
+            json!({"kind":"caos-chat-event","author":"user","content":"start"}),
+            json!({"kind":"caos-chat-event","request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
+            json!({"kind":"caos-chat-event","async":{"task":task,"status":"complete"}}),
+        ];
+        let before_response = event_messages(&log(events.clone()), true).unwrap();
+        assert!(before_response.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Independent task"))
+        }));
+
+        events.push(json!({
+            "kind":"caos-chat-event",
+            "request":run,
+            "round":1,
+            "response":[{"type":"text","text":"observed"}]
+        }));
+        let after_response = event_messages(&log(events), true).unwrap();
+        assert_eq!(
+            &after_response[..before_response.len()],
+            before_response.as_slice()
+        );
+        assert_eq!(
+            after_response
+                .iter()
+                .filter(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Independent task"))
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            after_response.last(),
+            Some(&json!({
+                "role": "assistant",
+                "content": [{"type":"text","text":"observed"}]
+            }))
+        );
     }
 
     #[test]
@@ -2015,6 +2237,75 @@ mod tests {
                 tree: "a".repeat(40),
             }
         );
+    }
+
+    #[test]
+    fn pending_append_rebuilds_after_a_head_race() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let mut reloads = 0;
+        let committed = retry_pending_append(
+            "head-0",
+            "workspace-0",
+            |head, workspace| {
+                attempts
+                    .borrow_mut()
+                    .push((head.to_string(), workspace.to_string()));
+                if head == "head-0" {
+                    Ok(progress::ConditionalAppend::HeadChanged(
+                        "head-1".to_string(),
+                    ))
+                } else {
+                    Ok(progress::ConditionalAppend::Appended(
+                        progress::AppendResult {
+                            commit: "pending-commit".to_string(),
+                            previous_head: head.to_string(),
+                            retries: 0,
+                        },
+                    ))
+                }
+            },
+            || {
+                reloads += 1;
+                Ok(ReloadedPending {
+                    head: "head-1".to_string(),
+                    workspace: Some("workspace-1-with-pending".to_string()),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(committed, "pending-commit");
+        assert_eq!(reloads, 1);
+        assert_eq!(
+            attempts.into_inner(),
+            [
+                ("head-0".to_string(), "workspace-0".to_string()),
+                ("head-1".to_string(), "workspace-1-with-pending".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_append_accepts_a_concurrent_durable_record() {
+        let mut attempts = 0;
+        let head = retry_pending_append(
+            "head-0",
+            "workspace-0",
+            |_, _| {
+                attempts += 1;
+                Ok(progress::ConditionalAppend::HeadChanged(
+                    "head-1".to_string(),
+                ))
+            },
+            || {
+                Ok(ReloadedPending {
+                    head: "head-1".to_string(),
+                    workspace: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(head, "head-1");
+        assert_eq!(attempts, 1);
     }
 
     #[test]
