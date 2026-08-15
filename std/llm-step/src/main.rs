@@ -337,6 +337,10 @@ fn drive(
 ) -> Result<(), String> {
     let mut queue = queue.to_vec();
     while let Some(call) = queue.first().cloned() {
+        let observed = progress::conversation_log(conversation(cfg)?)?;
+        if escaped_for_run(&observed, run)? {
+            return finish_interrupted(cfg, run, observed);
+        }
         let name = call["name"].as_str().unwrap_or("");
         if name == subagents::SPAWN_TOOL {
             let image = cfg
@@ -621,7 +625,7 @@ fn llm_round(
                 "author": "assistant",
                 "model": &cfg.model,
                 "content": text,
-                "response": blocks,
+                "response": &blocks,
                 "status": "idle",
             });
             match progress::append_event_at_head(conversation, prev, &event, &tree)? {
@@ -634,7 +638,11 @@ fn llm_round(
                 }
                 progress::ConditionalAppend::HeadChanged(_) => {
                     let log = progress::conversation_log(conversation)?;
-                    resume_run(cfg, run, head_hash, log)
+                    if escaped_after(&log, prev, run)? {
+                        record_interrupted_response(cfg, run, round, &blocks, None, log)
+                    } else {
+                        resume_run(cfg, run, head_hash, log)
+                    }
                 }
             }
         }
@@ -647,8 +655,8 @@ fn llm_round(
                 "author": "assistant",
                 "model": &cfg.model,
                 "content": response_text(&blocks),
-                "response": blocks,
-                "calls": calls,
+                "response": &blocks,
+                "calls": &calls,
             });
             match progress::append_event_at_head(conversation(cfg)?, prev, &event, &tree)? {
                 progress::ConditionalAppend::Appended(_) => resume_run(
@@ -657,12 +665,21 @@ fn llm_round(
                     head_hash,
                     progress::conversation_log(conversation(cfg)?)?,
                 ),
-                progress::ConditionalAppend::HeadChanged(_) => resume_run(
-                    cfg,
-                    run,
-                    head_hash,
-                    progress::conversation_log(conversation(cfg)?)?,
-                ),
+                progress::ConditionalAppend::HeadChanged(_) => {
+                    let log = progress::conversation_log(conversation(cfg)?)?;
+                    if escaped_after(&log, prev, run)? {
+                        record_interrupted_response(
+                            cfg,
+                            run,
+                            round,
+                            &blocks,
+                            Some(&calls),
+                            log,
+                        )
+                    } else {
+                        resume_run(cfg, run, head_hash, log)
+                    }
+                }
             }
         }
         "max_tokens" => Err(format!(
@@ -1271,6 +1288,107 @@ fn terminal_for_run<'a>(
     Ok(None)
 }
 
+fn escaped(events: &[progress::ConversationEvent], run: &str) -> Result<bool, String> {
+    for event in events {
+        let Some(escape) = event.value.get("escape") else {
+            continue;
+        };
+        let request = escape
+            .get("request")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Escape event {} has no string request", event.commit))?;
+        validate_run_hash(request)?;
+        if request == run {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn escaped_for_run(log: &progress::ConversationLog, run: &str) -> Result<bool, String> {
+    escaped(&log.events, run)
+}
+
+/// Inspect exactly the commits that displaced an attempted append. The
+/// expected head must remain on the canonical spine; only its suffix can
+/// interrupt work produced against that head.
+fn escaped_after(
+    log: &progress::ConversationLog,
+    expected_head: &str,
+    run: &str,
+) -> Result<bool, String> {
+    let position = log
+        .events
+        .iter()
+        .position(|event| event.commit == expected_head)
+        .ok_or_else(|| format!("lost append base {expected_head} is not on the event spine"))?;
+    escaped(&log.events[position + 1..], run)
+}
+
+fn finish_interrupted(
+    cfg: &Config,
+    run: &str,
+    initial: progress::ConversationLog,
+) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let mut log = initial;
+    for _ in 0..32 {
+        if let Some(terminal) = terminal_for_run(&log, run)? {
+            return finish_from_terminal(cfg, &log, terminal);
+        }
+        if active_request(&log).as_deref() != Ok(run) {
+            return Err(format!("Escape belongs to stale request {run}"));
+        }
+        if let Some(state) = latest_round(&log, run)? {
+            if let Some(call) = state.pending.first() {
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("pending tool call has no id")?;
+                let result = json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "is_error": true,
+                    "content": [{"type": "text", "text":
+                        "interrupted before this tool ran"}],
+                });
+                let tree = log
+                    .events
+                    .last()
+                    .map(|event| event.tree.clone())
+                    .ok_or("conversation has no events")?;
+                append_tool_result(cfg, run, state.round, &log.head, &result, &tree, None)?;
+                log = progress::conversation_log(conversation)?;
+                continue;
+            }
+        }
+        let tree = log
+            .events
+            .last()
+            .map(|event| event.tree.as_str())
+            .ok_or("conversation has no events")?;
+        let round = latest_round(&log, run)?.map_or(0, |state| state.round);
+        let event = json!({
+            "request": run,
+            "round": round,
+            "status": "idle",
+            "interrupted": true,
+        });
+        match progress::append_event_at_head(conversation, &log.head, &event, tree)? {
+            progress::ConditionalAppend::Appended(_) => {
+                let terminal = progress::conversation_log(conversation)?;
+                let event = terminal_for_run(&terminal, run)?
+                    .ok_or("interrupted request has no terminal event")?;
+                return finish_from_terminal(cfg, &terminal, event);
+            }
+            progress::ConditionalAppend::HeadChanged(_) => {
+                log = progress::conversation_log(conversation)?;
+            }
+        }
+    }
+    Err("conversation kept changing while finishing Escape".to_string())
+}
+
 /// An idle foreground terminal event is the successful worker's final recovery
 /// point. Failed terminals return their error here and are reconciled by
 /// `record_failure`, which also owns failures appended by this invocation.
@@ -1427,6 +1545,9 @@ fn resume_run(
 ) -> Result<(), String> {
     if let Some(terminal) = terminal_for_run(&log, run)? {
         return finish_from_terminal(cfg, &log, terminal);
+    }
+    if escaped_for_run(&log, run)? {
+        return finish_interrupted(cfg, run, log);
     }
     let active = active_request(&log)?;
     if active != run || request_for_head(&log, head_hash).as_deref() != Ok(run) {
@@ -2072,6 +2193,75 @@ fn response_text(blocks: &[Value]) -> String {
         .join("\n\n")
 }
 
+fn record_interrupted_response(
+    cfg: &Config,
+    run: &str,
+    round: u64,
+    blocks: &[Value],
+    calls: Option<&[Value]>,
+    mut log: progress::ConversationLog,
+) -> Result<(), String> {
+    let conversation = conversation(cfg)?;
+    let response = Value::Array(blocks.to_vec());
+    for _ in 0..32 {
+        if let Some(terminal) = terminal_for_run(&log, run)? {
+            return finish_from_terminal(cfg, &log, terminal);
+        }
+        if active_request(&log).as_deref() != Ok(run) {
+            return Err(format!("Escape belongs to stale request {run}"));
+        }
+        if let Some(existing) = log.events.iter().find(|event| {
+            event.value.get("request").and_then(Value::as_str) == Some(run)
+                && event.value.get("round").and_then(Value::as_u64) == Some(round)
+                && event.value.get("response").is_some()
+        }) {
+            if existing.value.get("response") != Some(&response) {
+                return Err(format!(
+                    "run {run} round {round} already has a different model response"
+                ));
+            }
+            return finish_interrupted(cfg, run, log);
+        }
+        let tree = log
+            .events
+            .last()
+            .map(|event| event.tree.as_str())
+            .ok_or("conversation has no events")?;
+        let event = match calls {
+            Some(calls) => json!({
+                "request": run,
+                "round": round,
+                "author": "assistant",
+                "content": response_text(blocks),
+                "response": blocks,
+                "calls": calls,
+            }),
+            None => json!({
+                "request": run,
+                "round": round,
+                "author": "assistant",
+                "content": response_text(blocks),
+                "response": blocks,
+                "status": "idle",
+                "interrupted": true,
+            }),
+        };
+        match progress::append_event_at_head(conversation, &log.head, &event, tree)? {
+            progress::ConditionalAppend::Appended(_) => {
+                return finish_interrupted(
+                    cfg,
+                    run,
+                    progress::conversation_log(conversation)?,
+                )
+            }
+            progress::ConditionalAppend::HeadChanged(_) => {
+                log = progress::conversation_log(conversation)?;
+            }
+        }
+    }
+    Err("conversation kept changing while recording an interrupted response".to_string())
+}
+
 /// Validate the relationship between a response's stop reason and tool blocks
 /// before the response is recorded. Only `tool_use` may carry calls; an
 /// `end_turn` with calls would be replayed as a batch that can never receive
@@ -2310,6 +2500,23 @@ mod tests {
         ]);
         assert!(terminal_for_run(&history, &old).unwrap().is_some());
         assert!(terminal_for_run(&history, &current).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_append_reads_only_its_new_escape_commits() {
+        let old = "a".repeat(40);
+        let current = "b".repeat(40);
+        let history = log(vec![
+            json!({"request":old,"status":"running"}),
+            json!({"escape":{"request":old}}),
+            json!({"escape":{"request":current}}),
+        ]);
+        assert!(escaped_for_run(&history, &old).unwrap());
+        assert!(escaped_for_run(&history, &current).unwrap());
+        assert!(escaped_after(&history, &format!("{:040x}", 0), &old).unwrap());
+        assert!(escaped_after(&history, &format!("{:040x}", 0), &current).unwrap());
+        assert!(!escaped_after(&history, &format!("{:040x}", 1), &old).unwrap());
+        assert!(escaped_after(&history, &format!("{:040x}", 1), &current).unwrap());
     }
 
     #[test]

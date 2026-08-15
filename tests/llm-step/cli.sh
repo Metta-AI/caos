@@ -74,12 +74,16 @@ base=$(mkcommit "HEAD:ws" base)
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 stub_pid=""
 gate_pid=""
+interrupt_pid=""
 cleanup() {
   if [ -n "$stub_pid" ]; then
     kill "$stub_pid" 2>/dev/null || true
   fi
   if [ -n "$gate_pid" ]; then
     kill "$gate_pid" 2>/dev/null || true
+  fi
+  if [ -n "$interrupt_pid" ]; then
+    kill "$interrupt_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -134,6 +138,7 @@ printf '{"content":[{"id":"toolu_spawn","input":{"prompt":"%s"},"name":"spawn_ag
 # The parent and child race for the next API slot. Both terminal responses are
 # equivalent, while FIFOs let the test release each request in observed order.
 mkfifo stub/response-10.json stub/response-11.json
+mkfifo stub/response-15.json
 
 for _ in 1 2 3 4 5; do
   port=$((20000 + RANDOM % 20000))
@@ -528,5 +533,82 @@ grep -qF "$agent_result" stub/request-13.json \
   || fail "merging an unchanged subagent result changed the parent workspace"
 git merge-base --is-ancestor "$agent_result" "$head6" \
   || fail "merged subagent result is absent from parent workspace ancestry"
+
+echo "== durable Escape at a model boundary ==" >&2
+tree6=$(git rev-parse "$head6^{tree}")
+user7=$(mkcommit "$tree6" \
+  '{"author":"user","content":"this prompt was accidental"}' \
+  "$head6")
+request7=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user7")
+admitted7=$(mkcommit "$tree6" \
+  "{\"request\":\"$request7\",\"request_head\":\"$user7\",\"status\":\"queued\"}" \
+  "$user7")
+git push --quiet caos "$admitted7:$conversation_ref" \
+  || fail "publishing Escape-test queued event"
+"$CAOS_CLI" run "$request7" -- >/tmp/llm-step-result-7 2>/tmp/llm-step-error-7 &
+interrupt_pid=$!
+
+request_seen=0
+for _ in $(seq 1 300); do
+  if [ -e stub/request-15.json ]; then
+    request_seen=1
+    break
+  fi
+  if ! kill -0 "$interrupt_pid" 2>/dev/null; then
+    fail "Escape-test turn exited before its blocked response: $(cat /tmp/llm-step-error-7)"
+  fi
+  sleep 0.2
+done
+[ "$request_seen" -eq 1 ] || fail "Escape-test model request never arrived"
+
+escape_parent=$(fetch_head)
+escape_tree=$(git rev-parse "$escape_parent^{tree}")
+escape_commit=$(mkcommit "$escape_tree" \
+  "{\"escape\":{\"request\":\"$request7\"}}" \
+  "$escape_parent")
+git push --quiet --force-with-lease="$conversation_ref:$escape_parent" \
+  caos "$escape_commit:$conversation_ref" || fail "publishing Escape event"
+printf '%s\n' \
+  '{"content":[{"text":"I had started this response.","type":"text"},{"id":"toolu_interrupted","input":{"file_path":"interrupted.txt","content":"must not run\n"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  > stub/response-15.json
+
+for _ in $(seq 1 300); do
+  if [ -e stub/request-16.json ]; then
+    fail "Escape allowed another model round"
+  fi
+  if ! kill -0 "$interrupt_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.2
+done
+if ! wait "$interrupt_pid"; then
+  fail "running Escape-test turn: $(cat /tmp/llm-step-error-7)"
+fi
+interrupt_pid=""
+
+head7=$(fetch_head)
+events7=$(git log --first-parent --format=%B "$user7..$head7")
+terminal7=$(git show -s --format=%B "$head7")
+grep -qF "\"request\":\"$request7\"" <<<"$events7" \
+  || fail "Escape-test request identity was lost"
+grep -qF '"escape"' <<<"$events7" || fail "Escape event is missing"
+grep -qF 'I had started this response.' <<<"$events7" \
+  || fail "in-flight model response was not recorded"
+grep -qF '"tool_use_id":"toolu_interrupted"' <<<"$events7" \
+  || fail "interrupted tool result is missing"
+grep -qF 'interrupted before this tool ran' <<<"$events7" \
+  || fail "interrupted tool was not closed explicitly"
+grep -qF '"is_error":true' <<<"$events7" \
+  || fail "interrupted tool result is not an error"
+grep -qF '"status":"idle"' <<<"$terminal7" \
+  || fail "Escape did not return the conversation to idle"
+grep -qF '"interrupted":true' <<<"$terminal7" \
+  || fail "Escape terminal status is not distinguishable"
+if git cat-file -e "$head7:interrupted.txt" 2>/dev/null; then
+  fail "Escape allowed the pending write tool to run"
+fi
+[ ! -e stub/request-16.json ] || fail "Escape allowed another model round"
+[ -n "$(remote_exact_ref "refs/caos/res/$request7")" ] \
+  || fail "interrupted exact request Q has no result ref"
 
 echo "llm-step: ALL PASS" >&2
