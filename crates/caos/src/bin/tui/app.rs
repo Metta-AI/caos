@@ -23,8 +23,9 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
-    publish_conversation_pr, remote_default_branch,
+    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
+    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
+    publish_merge_target, remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -3608,16 +3609,56 @@ impl App {
             };
             self.selected_mut().publish_prompt = false;
             let name = self.selected().id.clone();
-            let diff = self
+            let conversation_base = self
                 .selected()
                 .diff
-                .clone()
-                .expect("a non-empty diff was checked");
+                .as_ref()
+                .expect("a non-empty diff was checked")
+                .base_commit
+                .clone();
             self.selected_mut().publishing = true;
-            self.selected_mut().status = "publishing a clean conversation branch".to_string();
+            self.selected_mut().status = "fetching the selected PR base".to_string();
             let tx = self.tx.clone();
+            let options = self.selected().turn_options.clone();
+            let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
-                let result = publish_conversation_pr(&name, &diff, &pr_base, &default_base);
+                let result = (|| {
+                    let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
+                    let target = publish_merge_target(
+                        &conversation_base,
+                        &base_commit,
+                        pr_base != default_base,
+                        &repo_dir,
+                    )?;
+                    let transport = GitTransport::discover(&repo_dir)?;
+                    transport.ensure_pushed(&target)?;
+                    let message = format!(
+                        "Prepare this conversation for publication. First call the existing \
+                         `merge` tool with `theirs` exactly `{target}`. Resolve every entry in \
+                         `.caos/conflicts`, then build and test. Finish only when the workspace \
+                         is ready to publish."
+                    );
+                    let outcome = run_chat_turn(
+                        &transport,
+                        &options,
+                        &name,
+                        &message,
+                        None,
+                        |_| {},
+                        |event| {
+                            let _ = tx.send(UiMessage::Turn {
+                                conversation: name.clone(),
+                                event,
+                            });
+                        },
+                    )?;
+                    let workspace = prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
+                    let _ = tx.send(UiMessage::Completed {
+                        conversation: name.clone(),
+                        outcome,
+                    });
+                    publish_conversation_pr(&name, &workspace, &pr_base, &base_commit, &repo_dir)
+                })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
                     result,
