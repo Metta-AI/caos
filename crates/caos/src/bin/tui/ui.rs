@@ -309,6 +309,10 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     let left = Line::from(vec![
         Span::styled(" caos ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(
+            format!("  user {}", app.user),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
             format!("  {}", state.title),
             Style::default().add_modifier(Modifier::BOLD),
         ),
