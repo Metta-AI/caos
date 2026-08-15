@@ -397,7 +397,7 @@ a locator reaches an ordinary entry, this is **one line and one new worker**:
 
 ```
 run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/<expander> \
-    --in:@=. --caos:@@=git+https://github.com/org/caos?rev=<sha>
+    --in:@=. --caos:@@=git+https://github.com/org/caos?rev=<sha> --expr=$CAOS_EXPR
 ```
 
 The locator appears TWICE, and that is not redundancy to design away — the two
@@ -416,14 +416,24 @@ What it does:
 
 - read `--in`'s `flake.nix` / `flake.lock` and determine which caos revision the
   consumer pins;
-- read `--in`'s root `.caos-expr` and CHECK that both locators on that line name
-  that same repo and revision — so a tree cannot be evaluated against one caos
-  while its lockfile declares another, and the two locators cannot drift apart;
+- read the expression that launched it — `--expr=$CAOS_EXPR` — and CHECK that
+  both locators on that line name the same repo and revision as `flake.lock`, so
+  a tree cannot be evaluated against one caos while its lockfile declares
+  another, and the two locators cannot drift apart;
 - return `--in` with the `--caos` tree mounted (say `.caos-input/`, or just its
   `std/` as `.caos-std/` — naming still open).
 
-All three inputs to that check are readable from `--in` and `--caos` alone:
-nothing is fetched, nothing is ambient.
+Everything that check needs arrives as an arg: `flake.lock` in `--in`, the tree
+in `--caos`, the declaration in `--expr`. Nothing is fetched, nothing is
+ambient. `--expr=$CAOS_EXPR` is required because the directive is STRIPPED from
+`--in:@=.` — `--expr:@=.caos-expr` names a file that is not there (measured:
+`eval-path: path ".caos-expr" not found in tree`), which is what `$CAOS_EXPR`
+exists for.
+
+One limit worth stating rather than discovering later: **no worker can verify
+that a tree came from a rev**, because that mapping needs a fetch. So this check
+compares DECLARATIONS — the locators against the lockfile — and is a drift
+detector, not a proof about `--caos`'s contents.
 
 The mount lives only in the evaluation result — content-addressed, deduped,
 never committed; the mount point is **gitignored** in the consumer.

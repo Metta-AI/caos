@@ -118,6 +118,31 @@ cat > pkg-argdata/.caos-expr <<'EOF'
 run --base:@=bash --worker1:@=read.sh --namedir:@=data
 EOF
 
+# `$CAOS_EXPR` — the expression's OWN blob. The point is that this is the only
+# way to get it: the directive is stripped from the tree the expression is
+# evaluated against, so `--expr:@=.caos-expr` names a file that is not there.
+# A worker that must VERIFY the expression which launched it (the consumer-input
+# expander checking its locators against `flake.lock` — design/flake-inputs.md)
+# has no other route.
+mkdir -p pkg-self
+cat > pkg-self/show.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+caos get /cas/args/expr
+mkdir -p /tmp/out
+cp /cas/args/expr /tmp/out/expr
+if [ -e /cas/args/in/.caos-expr ]; then
+  echo yes > /tmp/out/stripped-in
+else
+  echo no > /tmp/out/stripped-in
+fi
+caos put /tmp/out /cas/out
+EOF
+cp -r "$BASH" pkg-self/bash
+cat > pkg-self/.caos-expr <<'EOF'
+run --base:@=bash --worker1:@=show.sh --in:@=. --expr=$CAOS_EXPR
+EOF
+
 commit "eval-path fixtures"
 
 echo "== eval-path evaluates a directory's .caos-expr ==" >&2
@@ -162,6 +187,18 @@ out_dat=$("$CAOS_CLI" eval-path pkg-argdata) || fail "eval-path pkg-argdata fail
 [ "$(cat got-argdata/greeting)" = "hello world" ] \
   || fail "argdata greeting: $(cat got-argdata/greeting)"
 echo "  ok: a target with no .caos-expr is referenced as-is" >&2
+
+echo "== \$CAOS_EXPR hands a worker the expression that launched it ==" >&2
+out_self=$("$CAOS_CLI" eval-path pkg-self) || fail "eval-path pkg-self failed"
+"$CAOS_CLI" get "${out_self##* }" got-self || fail "get ${out_self##* }"
+[ "$(cat got-self/expr)" = "$(cat pkg-self/.caos-expr)" ] \
+  || fail "the worker saw a different expression:
+$(cat got-self/expr)"
+# ...and the same run proves WHY it is needed: the directive is absent from the
+# tree that same expression was evaluated against, so no path could name it.
+[ "$(cat got-self/stripped-in)" = no ] \
+  || fail "the .caos-expr was present in --in:@=. — the stripping rule changed"
+echo "  ok: the worker read its own directive, which --in:@=. does not carry" >&2
 
 echo "== a repeated eval is a cache hit (same hash) ==" >&2
 out3=$("$CAOS_CLI" eval-path pkg-direct)

@@ -26,6 +26,12 @@
 //! A `run` value evaluates to the run's result; a `curry` value to the curried
 //! ArgTree. `$NAME` is the object a prior line produced.
 //!
+//! One variable is pre-bound and reserved: **`$CAOS_EXPR` is this file's own
+//! blob**. Stripping (below) removes the directive from the tree the expression
+//! sees, so this is the only way to hand a worker the text that launched it —
+//! which a worker that VERIFIES its caller's expression needs. Passing it opts
+//! that expression's own bytes into the cache key.
+//!
 //! There is no positional image and no `--`: the worker to run (or curry onto)
 //! is the reserved `--base` arg, typed like any other (`:@=` a path, `:docker=`
 //! a registry ref, `:hash=` an object in the store, or `=$NAME`). Every other
@@ -57,6 +63,9 @@ use super::{
     is_hex_hash, mark_arg_tree, parse_oid, post_object, post_tree, request_compute,
     secret_store_header, ClientSecret, Transport, DOCKER_SCHEME,
 };
+
+/// The reserved variable naming a `.caos-expr`'s OWN blob (see [`eval_expr`]).
+pub(crate) const EXPR_VAR: &str = "CAOS_EXPR";
 
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
 /// tree and descend to `DEEP-DEPS/<name>`.
@@ -227,6 +236,29 @@ fn eval_expr(
         String::from_utf8(content).map_err(|e| format!(".caos-expr {expr_oid} not UTF-8: {e}"))?;
 
     let mut env: HashMap<String, (String, String)> = HashMap::new();
+    // `$CAOS_EXPR` — THIS `.caos-expr`'s own blob, pre-bound so it reads like any
+    // other variable. It exists because [`strip_caos_expr`] removes the
+    // directive from the tree the expression is evaluated against, so an
+    // expression cannot reach its own text by path: `--in:@=.` is deliberately
+    // inert. A worker that must VERIFY the expression that launched it — the
+    // consumer-input expander checking that its locators agree with
+    // `flake.lock` (design/flake-inputs.md) — therefore has no other way to see
+    // it.
+    //
+    // Hermetic, unlike passing `:@@=path:.caos-expr`: this blob comes from the
+    // tree being evaluated, so it is still the right file under
+    // `eval-path --tree=<oid>` and when a THIRD repo pins this one by locator,
+    // where a host path would read whatever the working directory happened to
+    // hold.
+    //
+    // The cost is opt-in and worth stating: an expression that passes `$CAOS_EXPR`
+    // puts its own bytes in the arg tree, so editing a COMMENT in it re-keys
+    // that run — exactly what stripping otherwise buys. That is correct for a
+    // caller whose worker inspects the text: then the text is an input.
+    env.insert(
+        EXPR_VAR.to_string(),
+        ("blob".to_string(), expr_oid.to_string()),
+    );
     let mut value: Option<(String, String)> = None;
     for raw in text.lines() {
         let line = raw.trim();
@@ -237,6 +269,14 @@ fn eval_expr(
             return Err("eval-path: .caos-expr has content after its final expression".to_string());
         }
         if let Some((name, cmd)) = parse_assignment(line) {
+            // Reserved, like `base` and `unbind` on the verbs: a binding that
+            // shadowed it would silently change what a verifier sees.
+            if name == EXPR_VAR {
+                return Err(format!(
+                    "eval-path: ${EXPR_VAR} is reserved (this .caos-expr's own blob) \
+                     and cannot be assigned"
+                ));
+            }
             let v = eval_command(t, input_tree, cmd, &env, store)?;
             env.insert(name.to_string(), v);
         } else {
