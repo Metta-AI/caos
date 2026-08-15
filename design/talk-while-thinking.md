@@ -1,22 +1,24 @@
 # Talk while thinking — spec
 
+> **Historical context only.** The authoritative interjection and append model
+> is [`chat.md`](chat.md). The four-ref layout and migrations below describe the
+> superseded prototype and must not be implemented as a compatibility reader;
+> current clients use isolated v2 refs and leave this old unversioned data
+> untouched and invisible.
+
 Steer and cancel a running turn. Extends `agent-harness.md`; terms from there
 (turn, step, human commit `H`, turn merge `M`, `caos-agent`).
 
 ## Status
 
-- **Done — refs + migration** (Stage 0 below): the four-ref scheme,
-  `validated_refname` reservation, `list_conversations`, both migrations, and
-  their unit tests, in `crates/caos/src/chat.rs` and
-  `crates/worker-llm-step/src/progress.rs`. Behaviour-preserving: the turn
-  lifecycle is unchanged — a turn still advances `from-user` (the renamed
-  conversation ref) only on success, to `M`. Nothing reads or advances
-  `from-user` mid-turn yet.
-- **Designed, not built** — everything mid-turn: interjection, step-as-merge,
-  the `end_turn` re-check, cancellation, concurrent host edits. The **Client /
-  Worker / Commits / Transcript / Cancellation** sections below are the TARGET
-  state; Stages 1–4 track them. `from-user` does **not** advance to `H` at turn
-  start today (that is Stage 1).
+- **Superseded protocol.** The four-ref/`from-user` design below is retained as
+  history, not as the current specification. Current chat uses one append-only
+  event ref; see `chat.md` for the normative ref, commit, CAS, recovery, and
+  ownership rules.
+- **Interjections are built in.** They append user events to that one spine
+  and are consumed at safe model boundaries. Cancellation remains future work.
+  The sections below explain the discarded branch-and-merge proposal and must
+  not be used to infer current ref names or lifecycle behavior.
 
 ## Model
 
