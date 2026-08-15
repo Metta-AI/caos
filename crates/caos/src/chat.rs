@@ -2884,6 +2884,16 @@ fn fold_events(
     if let Some(request_head) = request_head.as_deref() {
         validate_hash(request_head, "conversation request head")?;
     }
+    let status = status.unwrap_or_else(|| "idle".to_string());
+    if request_is_active(&status) {
+        let request = request
+            .as_deref()
+            .ok_or_else(|| format!("active conversation {id:?} has no durably recorded request"))?;
+        let request_head = request_head.as_deref().ok_or_else(|| {
+            format!("active conversation {id:?} has no durably recorded request head")
+        })?;
+        validate_active_admission(events, request, request_head)?;
+    }
     let title = title
         .or_else(|| {
             messages
@@ -2895,11 +2905,52 @@ fn fold_events(
         id: id.to_string(),
         head: head.to_string(),
         title,
-        status: status.unwrap_or_else(|| "idle".to_string()),
+        status,
         request,
         request_head,
         messages,
     })
+}
+
+/// Prove that the folded active state comes from the protocol's atomic
+/// user-event/admission pair. Without this check, a raw progress event could
+/// make a follower dispatch a request before `llm-step` rejects its history.
+fn validate_active_admission(
+    events: &[StoredEvent],
+    request: &str,
+    request_head: &str,
+) -> Result<(), String> {
+    let position = events
+        .iter()
+        .position(|event| event.commit == request_head)
+        .ok_or_else(|| {
+            format!("active request head {request_head} is not on the conversation event spine")
+        })?;
+    let admission = events.get(position + 1).ok_or_else(|| {
+        format!("active request head {request_head} has no immediate admission event")
+    })?;
+    let admitted_request = admission
+        .value
+        .get("request")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("admission event after {request_head} has no string request"))?;
+    let admitted_head = admission
+        .value
+        .get("request_head")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("admission event after {request_head} has no string request_head")
+        })?;
+    let admitted_status = admission.value.get("status").and_then(Value::as_str);
+    if admitted_request != request
+        || admitted_head != request_head
+        || admitted_status != Some("queued")
+    {
+        return Err(format!(
+            "active request {request} is not admitted by the immediate event after {request_head}"
+        ));
+    }
+    Ok(())
 }
 
 fn waterfall_string(value: &Value, key: &str, target: &mut Option<String>) -> Result<(), String> {
@@ -3631,6 +3682,49 @@ mod tests {
         assert_eq!(snapshot.status, "queued");
         assert_eq!(snapshot.request.as_deref(), Some(request));
         assert_eq!(snapshot.request_head.as_deref(), Some(user));
+    }
+
+    #[test]
+    fn active_fold_requires_the_immediate_matching_admission() {
+        let user = "1111111111111111111111111111111111111111";
+        let between = "2222222222222222222222222222222222222222";
+        let admission = "3333333333333333333333333333333333333333";
+        let request = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let error = fold_events(
+            "one",
+            admission,
+            &[
+                event_at(user, json!({"author":"user","content":"start"})),
+                event_at(between, json!({"author":"user","content":"interjected"})),
+                event_at(
+                    admission,
+                    json!({"request":request,"request_head":user,"status":"queued"}),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("admission event after"), "{error}");
+
+        let admitted = "2222222222222222222222222222222222222222";
+        let forged = "3333333333333333333333333333333333333333";
+        let other_request = "cccccccccccccccccccccccccccccccccccccccc";
+        let error = fold_events(
+            "one",
+            forged,
+            &[
+                event_at(user, json!({"author":"user","content":"start"})),
+                event_at(
+                    admitted,
+                    json!({"request":request,"request_head":user,"status":"queued"}),
+                ),
+                event_at(
+                    forged,
+                    json!({"request":other_request,"request_head":user,"status":"running"}),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("not admitted"), "{error}");
     }
 
     #[test]
