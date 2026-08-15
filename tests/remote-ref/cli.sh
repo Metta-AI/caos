@@ -115,7 +115,7 @@ refuses() { # <locator> <error fragment> <what was refused>
 refuses "$REPO"                   "must pin a commit"  "a remote ref with no rev"
 refuses "$REPO?ref=main"          "mutable"            "a branch instead of a commit"
 refuses "$REPO?rev=abc123"        "full-length"        "a short rev"
-refuses "$REPO?rev=$SHA&dir=nope" "no \`nope\`"        "a dir= that isn't in the tree"
+refuses "$REPO?rev=$SHA&dir=nope" "\"nope\" not found"  "a dir= that isn't in the tree"
 refuses "https://h/r?rev=$WS_SHA" "unknown scheme"     "a bare https url"
 echo "  ok: no rev, a mutable ref, a short rev, a missing dir and a bare URL" >&2
 

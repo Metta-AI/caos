@@ -18,12 +18,14 @@ traps have already been sprung.
 | 3 | `:@@=` remote git-ref *parse* (`GitRef{url,rev,dir}` + validation) | ✅ done (33/33), **no redeploy needed** |
 | 2C | CLI + worker `caos` grammar collapse: drop the positional image (and the `--`) everywhere; type the map-then positions; delete the last sniffers | ✅ done (33/33), **needed a redeploy** |
 | 4 | `:@@=` *resolution* (client-side fetch → oid) | ✅ done (34/34), **no redeploy needed** |
+| 4a | `dir=` descends through EVALUATION, not a raw tree walk — the fix that makes an ordinary `std/<x>` reachable by locator | ✅ done (35/35) |
 | 6 | Docs + tests (README, `tests/remote-ref`) | ✅ done with 4 |
 
-The end goal past stage 4: a consumer repo pins caos with one
-`--base:@@=git+https://…caos?rev=<sha>` locator, grafts it in at
-`flake-inputs/caos`, and reaches `std/*` by descent — nothing committed, all
-content-addressed. See **Consumer root** below.
+The end goal past stage 4: a consumer repo pins caos with a
+`git+https://…caos?rev=<sha>` locator and reaches `std/*` by descent — nothing
+committed, all content-addressed. The one-worker case works today
+(`tests/remote-ref`); the whole-tree case needs one ordinary worker, not new
+machinery. See **Consumer root** below.
 
 ## Working here (hard-won workflow notes)
 
@@ -350,20 +352,85 @@ curry --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/bash --worker1
 Nothing of caos is committed in the consumer; the pin is the whole dependency,
 and the ArgTree carries caos' oids, not its URL.
 
+### `dir=` descends through EVALUATION (fixed after stage 4)
+
+Stage 4 shipped `dir=` as a **raw** tree walk (`lookup_in_tree`), evaluating only
+the final subtree. That looked like a hard constraint on the consumer story and
+was not — it was a bug, and it made three quarters of `std/*` unreachable by
+locator:
+
+```
+--base:@@=…&dir=std/rgrep  →  base path "DEEP-DEPS/rustc" not found in tree
+--base:@@=…&dir=std/rustc  →  seeded sentinel docker://seeded-rustc … cannot be answered
+```
+
+Both symptoms are the same mistake. A raw walk hands the evaluator a bare
+`std/<x>` directory, but an entry's expression names `DEEP-DEPS/<dep>` mounts
+that exist only after the ROOT expression has deepened the tree — and a seeded
+entry like `std/rustc` forms its key from its *deepened* entry, which a raw
+fetch cannot reproduce. Nothing about the model required this; `eval-path`
+already descends through evaluation everywhere else, which is exactly how
+`DEEP-DEPS/<x>` resolves inside this repo.
+
+`resolve_remote_arg` now descends with `eval::eval_path` from the fetched root,
+so a locator names a path in the **evaluated** tree. Measured after the change,
+same probe:
+
+| `--base:@@=…&dir=<entry>` | before | after |
+|---|---|---|
+| `std/flake-builder`, `std/deep-deps` | ✅ | ✅ |
+| `std/rustc` | ❌ | ✅ |
+| `std/bash` | ❌ | ✅ |
+
+(`std/rgrep` then fails only because this stack's *seeded* rustc carries a
+pre-2C `worker-common`, so rgrep's post-2C call sites do not compile against it
+— stack staleness a `caosd up` clears, not a locator limit.)
+
+**A pinned consumer therefore sees caos exactly as caos sees itself**, and an
+ordinary worker — one with a `.caos-expr` and `DEPS`, built by rustc — is
+reachable. That is what makes the design below possible; the earlier sketch of a
+graft worker that had to be a flake was an artifact of the bug.
+
 What remains is the WHOLE-TREE case — a consumer that wants `DEPS`/`DEEP-DEPS`
-of its own, so its directories can declare deps against caos' `std/*`:
+of its own, so its directories can declare deps against caos' `std/*`. Now that
+a locator reaches an ordinary entry, this is **one line and one new worker**:
 
 ```
-CAOS=run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=. ...
-# graft CAOS in at flake-inputs/caos, then run its deep-deps over the merged tree
+run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/<expander> \
+    --in:@=. --caos:@@=git+https://github.com/org/caos?rev=<sha>
 ```
 
-Unavoidably two-step: you cannot `run std/deep-deps` until caos is mounted, and
-mounting is what the expression does — deep-deps comes *out of* the mounted
-`$CAOS`. A graft/merge worker (plus `std/merge`) assembles
-`consumer-tree + flake-inputs/caos = caos-tree`. The mount lives only in the
-evaluation result — content-addressed, deduped, never committed;
-`flake-inputs/` is **gitignored** in the consumer.
+The locator appears TWICE, and that is not redundancy to design away — the two
+name different things. `--base` yields the expander's IMAGE; `--caos` yields
+caos' TREE, which is what gets mounted. A worker cannot fetch, so the tree has
+to arrive as an already-resolved arg. The duplication is exactly what the
+consistency check below exists to police.
+
+The expander is a normal caos worker — a `.caos-expr`, `DEPS`, built by rustc —
+because resolving that locator evaluates caos from its root, so deep-deps and
+rustc run for the consumer exactly as they do here. There is no bootstrap
+problem to solve and no `std/merge` step: the consumer already has a caos server
+with a seeder and a runner, which is the only precondition.
+
+What it does:
+
+- read `--in`'s `flake.nix` / `flake.lock` and determine which caos revision the
+  consumer pins;
+- read `--in`'s root `.caos-expr` and CHECK that both locators on that line name
+  that same repo and revision — so a tree cannot be evaluated against one caos
+  while its lockfile declares another, and the two locators cannot drift apart;
+- return `--in` with the `--caos` tree mounted (say `.caos-input/`, or just its
+  `std/` as `.caos-std/` — naming still open).
+
+All three inputs to that check are readable from `--in` and `--caos` alone:
+nothing is fetched, nothing is ambient.
+
+The mount lives only in the evaluation result — content-addressed, deduped,
+never committed; the mount point is **gitignored** in the consumer.
+
+It does not need to run deep-deps itself: the mounted result is an ordinary
+tree, so the consumer's root expression chains to caos' deep-deps in a second
+line if it wants `DEPS` resolution too.
 
 **Pinning from `flake.lock` is lockfile codegen, not runtime magic.** A worker
 can parse `flake.lock` (pure) but cannot fetch (network is client-only), and the
@@ -379,7 +446,7 @@ is a mechanical mapping. Not scheduled; noted so the choices line up.
 Stages 1–4 are done; the grammar and the locator are finished. What is left is
 built ON them, and nothing in this repo needs it yet:
 
-- The **consumer graft/merge worker** (whole-tree mounting, above) and the
+- The **consumer input expander** (whole-tree mounting, above) and the
   **`flake.lock` codegen hook** — sketched, not scheduled.
 - A **worker-side** fetch (network in a container) is explicitly **out of
   scope**; if ever wanted it is a distinct, explicit grant, never something the

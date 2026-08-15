@@ -2399,7 +2399,7 @@ fn build_arg_entries(
             // only) and reduced to its oid, so what the request carries is
             // indistinguishable from a local path arg.
             ArgType::Remote => {
-                resolve_remote_arg(t, value).map_err(|e| format!("`{name}`: {e}"))?
+                resolve_remote_arg(t, value, &[]).map_err(|e| format!("`{name}`: {e}"))?
             }
         };
 
@@ -2622,11 +2622,11 @@ fn resolve_base(
         // names caos' `std/<x>` by locator and gets a runnable image, with only
         // the oid entering its cache key (design/flake-inputs.md).
         ArgType::Remote => {
-            let (mode, oid) = resolve_remote_arg(t, value)?;
+            let (mode, oid) = resolve_remote_arg(t, value, &[])?;
             if !mode.is_tree() {
                 return Err(format!("git ref {value:?} names a file, not an image tree"));
             }
-            eval::eval_tree(t, &oid.to_string())
+            Ok(oid.to_string())
         }
         ArgType::Literal => Err(format!(
             "an image needs a type: use --name:@=path, --name:@@=<git ref>, \
@@ -2694,9 +2694,21 @@ impl GitRef {
 /// already validated by [`parse_git_ref`]), fetch, then select (`dir=`). We fetch
 /// a COMMIT because that is what a host will serve, and descend within it —
 /// rather than naming a subtree hash, which nothing would hand us.
+///
+/// **`dir=` names a path in the EVALUATED tree**, not the raw one: the descent
+/// goes through [`eval::eval_path`], which applies every `.caos-expr` from the
+/// repo root down, exactly as `eval-path` does for a local tree. That is not a
+/// convenience — it is what makes an ordinary std entry reachable at all. A raw
+/// walk hands the evaluator a bare `std/<x>` directory whose expression names
+/// `DEEP-DEPS/<dep>` mounts that only exist once the ROOT expression has
+/// deepened the tree, so it fails with `base path "DEEP-DEPS/…" not found in
+/// tree`; and a seeded entry like `std/rustc` forms its key from its *deepened*
+/// entry, which a raw fetch cannot reproduce. Descending through evaluation
+/// makes a pinned consumer see caos exactly as caos sees itself.
 fn resolve_remote_arg(
     t: &dyn Transport,
     value: &str,
+    store: &[ClientSecret],
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
     let git_ref = parse_git_ref(value)?;
 
@@ -2711,7 +2723,14 @@ fn resolve_remote_arg(
         let (mode, oid) = t.ingest_path(dir)?.ok_or_else(|| {
             format!("`:@@=path:` reads a host directory, which this client cannot do ({dir})")
         })?;
-        if git_ref.dir.is_none() {
+        // A file has nothing to descend into and no expression to apply.
+        if !mode.is_tree() {
+            if let Some(dir) = &git_ref.dir {
+                return Err(format!(
+                    "git ref {value:?}: `dir={dir}` but {} names a file",
+                    git_ref.url
+                ));
+            }
             return Ok((mode, oid));
         }
         oid
@@ -2742,11 +2761,10 @@ fn resolve_remote_arg(
         commit.tree()
     };
 
-    let Some(dir) = git_ref.dir.as_deref() else {
-        return Ok((gix::objs::tree::EntryKind::Tree.into(), root));
-    };
-    eval::lookup_in_tree(t, &root.to_string(), dir)?
-        .ok_or_else(|| format!("git ref {value:?}: no `{dir}` in the fetched tree"))
+    let dir = git_ref.dir.as_deref().unwrap_or("");
+    let (kind, hash) = eval::eval_path(t, &root.to_string(), dir, store)
+        .map_err(|e| format!("git ref {value:?}: {e}"))?;
+    Ok((eval::mode_of_kind(&kind), parse_oid(&hash)?))
 }
 
 /// Parse a `:@@=` locator value into a [`GitRef`], validating the

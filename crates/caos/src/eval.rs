@@ -404,18 +404,18 @@ fn resolve_expr_base(
             Ok(hash)
         }
         // `:@@=<ref>` — the base lives in ANOTHER repo. Fetched by the client
-        // (never a worker), then evaluated exactly like a `:@=` path: this is
-        // what lets a consumer's root expression name caos itself by a pinned
-        // locator and get a runnable image back (design/flake-inputs.md).
+        // (never a worker) and resolved by DESCENT THROUGH EVALUATION, so a
+        // pinned consumer reaches `dir=std/<x>` exactly as caos reaches its own
+        // entries: the root expression deepens the tree, then the entry's own
+        // expression builds it (design/flake-inputs.md).
         crate::ArgType::Remote => {
-            let (mode, oid) = crate::resolve_remote_arg(t, value)?;
+            let (mode, oid) = crate::resolve_remote_arg(t, value, store)?;
             if !mode.is_tree() {
                 return Err(format!(
                     "eval-path: git ref {value:?} names a file, not an image tree"
                 ));
             }
-            let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
-            Ok(hash)
+            Ok(oid.to_string())
         }
         crate::ArgType::Literal => Err(
             "eval-path: --base needs a type: use :@= (path), :@@= (a git ref), :docker=, \
@@ -455,14 +455,11 @@ fn resolve_expr_args(
                     post_object(t, "blob", value.as_bytes())?,
                 ),
                 crate::ArgType::Path => resolve_expr_path(t, input_tree, value, store)?,
-                // `:@@=<ref>` — a tree from ANOTHER repo, fetched by the client
-                // and then treated exactly as a `:@=` target: evaluated if it
-                // carries a `.caos-expr`, referenced raw if not. The same rule,
-                // applied to a tree that arrived from elsewhere.
-                crate::ArgType::Remote => {
-                    let (mode, oid) = crate::resolve_remote_arg(t, value)?;
-                    eval_if_evaluable(t, mode, oid, store)?
-                }
+                // `:@@=<ref>` — a tree from ANOTHER repo. `resolve_remote_arg`
+                // descends `dir=` through evaluation, so this is already the
+                // same rule `:@=` applies (an expression is evaluated, data is
+                // referenced raw) — just to a tree that arrived from elsewhere.
+                crate::ArgType::Remote => crate::resolve_remote_arg(t, value, store)?,
                 // `:docker=<ref>` — the blob `docker://<ref>`.
                 crate::ArgType::Docker => (
                     EntryKind::Blob.into(),
@@ -594,7 +591,7 @@ fn kind_of_mode(mode: EntryMode) -> &'static str {
 
 /// The tree-entry mode for a result kind — the inverse of [`kind_of_mode`], used
 /// to place a `$NAME` variable's object into an args tree at its own kind.
-fn mode_of_kind(kind: &str) -> EntryMode {
+pub(crate) fn mode_of_kind(kind: &str) -> EntryMode {
     match kind {
         "tree" => EntryKind::Tree.into(),
         "commit" => EntryKind::Commit.into(),
