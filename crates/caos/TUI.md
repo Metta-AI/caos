@@ -43,11 +43,16 @@ caos tui --unarchive ID   restore one conversation to the active list
 ```
 
 `--user` defaults to `$USER`. Active and archived membership is stored on the
-CAOS server under
-`refs/caos/v2/users/<user-key>/conversations/{active,archived}/`, not in local
-TUI state. Only v2 membership refs populate the sidebar. Unversioned chat refs
-remain stored but invisible: v2 clients do not read, import, rename, migrate,
-or delete them.
+CAOS server under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
+not in local TUI state. `<user-key>` is `u-` plus lowercase hex of the
+normalized username's UTF-8 bytes; usernames are limited to 126 UTF-8 bytes.
+Each membership ref ends in one `<conversation-key>` component: `c-` plus
+lowercase hex of the conversation ID's UTF-8 bytes. Conversation IDs are
+limited to 124 UTF-8 bytes so Git can create the encoded ref lockfile. This
+preserves IDs containing `/` without creating Git ref file/directory
+collisions. Only these v2 membership refs populate the sidebar. Unversioned
+chat refs remain stored but invisible: v2 clients do not read, import, rename,
+migrate, or delete them.
 
 ## Controls
 

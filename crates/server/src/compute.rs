@@ -114,14 +114,7 @@ pub(crate) fn run(
     query: &str,
     secrets_header: &str,
 ) -> Result<Vec<u8>, HttpError> {
-    let arg_tree = query_param(query, "req")
-        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
-    if arg_tree.is_empty() || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(HttpError::new(
-            400,
-            format!("invalid arg-tree hash: {arg_tree:?}"),
-        ));
-    }
+    let arg_tree = parse_arg_tree(query)?;
     let trace_id = query_param(query, "trace");
     if let Some(id) = &trace_id {
         if !crate::trace::valid_id(id) {
@@ -151,6 +144,23 @@ pub(crate) fn run(
     // survives gc; sub-runs set no ref (they'd flood the namespace).
     pin_result(config, &arg_tree, &result);
     Ok(format!("{result}\n").into_bytes())
+}
+
+/// Parse and validate the request identity.
+fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
+    let arg_tree = query_param(query, "req")
+        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
+    if arg_tree.len() != 40
+        || !arg_tree
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(HttpError::new(
+            400,
+            format!("invalid arg-tree hash: {arg_tree:?}"),
+        ));
+    }
+    Ok(arg_tree)
 }
 
 /// Run WorkRequest `request` (its ArgTree, with `request.stack` the chain of
@@ -250,33 +260,25 @@ fn run_work_request_inner(
     // thread's stack). `park_would_deadlock` walks the parked-waiter graph
     // for exactly that reachability; an unsafe arrival runs independently —
     // the duplicate grows its descendants' stacks and the genuine cycle then
-    // errors cleanly. The recv timeout stays as a belt-and-suspenders
-    // backstop (e.g. an owner that dies without broadcasting).
-    match join_flight(arg_tree, stack) {
-        Flight::Owner => {}
-        Flight::Unsafe => {
-            eprintln!(
-                "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
-            );
-        }
-        Flight::Waiter(rx, guard) => {
-            let outcome = rx.recv_timeout(SINGLE_FLIGHT_TIMEOUT);
-            drop(guard);
-            match outcome {
-                Ok(outcome) => {
-                    eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
-                    return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
+    // errors cleanly. An owner guard clears and broadcasts if its thread
+    // unwinds; a waiter never promotes itself merely because a valid run is
+    // slow, since duplicate execution may repeat external side effects.
+    let owner =
+        match claim_flight_after_miss(arg_tree, stack, || cache_get(&config.redis_addr, &key)) {
+            FlightDisposition::Run(owner) => owner,
+            FlightDisposition::Complete { outcome, cache_hit } => {
+                if cache_hit {
+                    if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
+                        config.trace.cache(trace_id, span_id, true);
+                    }
                 }
-                Err(_) => {
-                    eprintln!(
-                        "single-flight: arg_tree={arg_tree} wait expired; running independently"
-                    );
-                }
+                return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
             }
-        }
-    }
+        };
     let outcome = run_dispatch(config, request, &image, &salt, &key, traced_arg_entries);
-    finish_flight(arg_tree, &outcome);
+    if let Some(owner) = owner {
+        owner.finish(&outcome);
+    }
     outcome.map_err(|(status, msg)| HttpError::new(status, msg))
 }
 
@@ -372,13 +374,6 @@ fn run_dispatch(
 /// A run's outcome in plain data, so it can be sent to every parked waiter.
 type Outcome = Result<String, (u16, String)>;
 
-/// How long a waiter parks on someone else's in-flight run before giving up
-/// and running the request itself. Generous — the flight covers the whole
-/// promise resolution of a possibly deep DAG — but finite, so a cross-thread
-/// cycle degrades to duplicate work (and a clean stack-based cycle error)
-/// instead of a deadlock.
-const SINGLE_FLIGHT_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// In-flight runs: ArgTree hash → the channels of parked waiters.
 fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
     static FLIGHTS: OnceLock<Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>>> = OnceLock::new();
@@ -386,13 +381,28 @@ fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
 }
 
 /// One parked waiter: its ancestor stack, and the ArgTree it waits on — an
-/// edge of the waits-for graph `park_would_deadlock` walks.
-type ParkedEdge = (Vec<String>, String);
+/// edge of the waits-for graph `park_would_deadlock` walks. The ID prevents a
+/// delayed guard from removing an identical edge belonging to a later flight.
+struct ParkedEdge {
+    id: u64,
+    stack: Vec<String>,
+    target: String,
+}
+
+struct ParkedState {
+    next_id: u64,
+    edges: Vec<ParkedEdge>,
+}
 
 /// Every parked waiter, as the edges of that graph.
-fn parked() -> &'static Mutex<Vec<ParkedEdge>> {
-    static PARKED: OnceLock<Mutex<Vec<ParkedEdge>>> = OnceLock::new();
-    PARKED.get_or_init(|| Mutex::new(Vec::new()))
+fn parked() -> &'static Mutex<ParkedState> {
+    static PARKED: OnceLock<Mutex<ParkedState>> = OnceLock::new();
+    PARKED.get_or_init(|| {
+        Mutex::new(ParkedState {
+            next_id: 0,
+            edges: Vec::new(),
+        })
+    })
 }
 
 /// Would parking a waiter (ancestry `stack`) on in-flight `arg_tree` close a wait
@@ -410,9 +420,9 @@ fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
         if stack.contains(&cur) {
             return true;
         }
-        for (wstack, target) in parked.iter() {
-            if wstack.contains(&cur) && seen.insert(target.clone()) {
-                frontier.push(target.clone());
+        for edge in &parked.edges {
+            if edge.stack.contains(&cur) && seen.insert(edge.target.clone()) {
+                frontier.push(edge.target.clone());
             }
         }
     }
@@ -421,7 +431,7 @@ fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
 
 enum Flight {
     /// Nobody is running this request: run it (and `finish_flight` after).
-    Owner,
+    Owner(FlightOwner),
     /// Someone is: park here for their outcome. The guard unregisters the
     /// waits-for edge when the wait ends (either way).
     Waiter(mpsc::Receiver<Outcome>, ParkGuard),
@@ -429,20 +439,128 @@ enum Flight {
     Unsafe,
 }
 
+enum FlightDisposition {
+    /// This arrival must execute. `Some` owns the canonical flight; `None` is
+    /// the independent duplicate required to expose a cross-thread cycle.
+    Run(Option<FlightOwner>),
+    /// A live owner or the post-claim cache re-read supplied the outcome.
+    Complete { outcome: Outcome, cache_hit: bool },
+}
+
+/// Join the flight after an initial cache miss, then re-read the cache if this
+/// arrival will execute. A miss can be descheduled before it reaches the flight
+/// table; the previous owner may finish, cache, and remove its entry meanwhile.
+/// The new owner must therefore check again while its ownership excludes any
+/// other ordinary in-process executor. Unsafe cycle-breaking duplicates also
+/// re-read before repeating possibly effectful work.
+fn claim_flight_after_miss(
+    arg_tree: &str,
+    stack: &[String],
+    reread_cache: impl FnOnce() -> Result<Option<String>, String>,
+) -> FlightDisposition {
+    match join_flight(arg_tree, stack) {
+        Flight::Owner(owner) => match reread_cache() {
+            Ok(Some(result)) => {
+                eprintln!("cache hit after single-flight claim: arg_tree={arg_tree} -> {result}");
+                let outcome = Ok(result);
+                owner.finish(&outcome);
+                FlightDisposition::Complete {
+                    outcome,
+                    cache_hit: true,
+                }
+            }
+            Ok(None) => FlightDisposition::Run(Some(owner)),
+            Err(error) => {
+                eprintln!(
+                    "cache lookup after single-flight claim failed ({error}); running worker: arg_tree={arg_tree}"
+                );
+                FlightDisposition::Run(Some(owner))
+            }
+        },
+        Flight::Unsafe => match reread_cache() {
+            Ok(Some(result)) => {
+                eprintln!("cache hit before cycle-breaking run: arg_tree={arg_tree} -> {result}");
+                FlightDisposition::Complete {
+                    outcome: Ok(result),
+                    cache_hit: true,
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
+                );
+                FlightDisposition::Run(None)
+            }
+            Err(error) => {
+                eprintln!(
+                    "cache lookup before cycle-breaking run failed ({error}); running independently: arg_tree={arg_tree}"
+                );
+                FlightDisposition::Run(None)
+            }
+        },
+        Flight::Waiter(rx, guard) => {
+            let outcome = rx.recv();
+            drop(guard);
+            match outcome {
+                Ok(outcome) => {
+                    eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
+                    FlightDisposition::Complete {
+                        outcome,
+                        cache_hit: false,
+                    }
+                }
+                Err(_) => FlightDisposition::Complete {
+                    outcome: Err((
+                        500,
+                        format!("single-flight owner for {arg_tree} ended without an outcome"),
+                    )),
+                    cache_hit: false,
+                },
+            }
+        }
+    }
+}
+
+/// The unique owner of one in-process flight. Normal completion explicitly
+/// broadcasts its outcome. Unwinding is a provable owner loss, so Drop clears
+/// the entry and wakes waiters with an error; a later request may then own it.
+struct FlightOwner {
+    arg_tree: String,
+    finished: bool,
+}
+
+impl FlightOwner {
+    fn finish(mut self, outcome: &Outcome) {
+        self.finished = true;
+        finish_flight(&self.arg_tree, outcome);
+    }
+}
+
+impl Drop for FlightOwner {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        finish_flight(
+            &self.arg_tree,
+            &Err((
+                500,
+                format!("single-flight owner for {} was lost", self.arg_tree),
+            )),
+        );
+    }
+}
+
 /// Removes this waiter's waits-for edge on drop.
 struct ParkGuard {
-    stack: Vec<String>,
-    target: String,
+    id: u64,
 }
 
 impl Drop for ParkGuard {
     fn drop(&mut self) {
         let mut parked = parked().lock().expect("parked lock");
-        if let Some(pos) = parked
-            .iter()
-            .position(|(s, t)| *s == self.stack && *t == self.target)
-        {
-            parked.swap_remove(pos);
+        if let Some(pos) = parked.edges.iter().position(|edge| edge.id == self.id) {
+            parked.edges.swap_remove(pos);
         }
     }
 }
@@ -458,34 +576,51 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
                 return Flight::Unsafe;
             }
             let (tx, rx) = mpsc::channel();
-            waiters.push(tx);
-            parked()
-                .lock()
-                .expect("parked lock")
-                .push((stack.to_vec(), arg_tree.to_string()));
-            Flight::Waiter(
-                rx,
-                ParkGuard {
+            let id = {
+                let mut parked = parked().lock().expect("parked lock");
+                let id = parked.next_id;
+                parked.next_id = parked
+                    .next_id
+                    .checked_add(1)
+                    .expect("parked waiter ID space exhausted");
+                parked.edges.push(ParkedEdge {
+                    id,
                     stack: stack.to_vec(),
                     target: arg_tree.to_string(),
-                },
-            )
+                });
+                id
+            };
+            waiters.push(tx);
+            Flight::Waiter(rx, ParkGuard { id })
         }
         None => {
             table.insert(arg_tree.to_string(), Vec::new());
-            Flight::Owner
+            Flight::Owner(FlightOwner {
+                arg_tree: arg_tree.to_string(),
+                finished: false,
+            })
         }
     }
 }
 
-/// Broadcast the outcome to every parked waiter and clear the entry. A
-/// timed-out waiter that ran independently also lands here: whoever finishes
-/// first serves the waiters (a valid result is a valid result) and clears the
-/// entry; later finishers broadcast to nobody.
+/// Broadcast the outcome to every parked waiter and clear the entry. Only the
+/// owner calls this; an unsafe cycle-breaking duplicate must not steal its
+/// waiters or publish a cycle error as the canonical flight outcome.
 fn finish_flight(arg_tree: &str, outcome: &Outcome) {
     let waiters = {
         let mut table = flights().lock().expect("flights lock");
-        table.remove(arg_tree).unwrap_or_default()
+        let waiters = table.remove(arg_tree).unwrap_or_default();
+        // A sent outcome no longer waits on this flight, even if the receiving
+        // thread has not yet been scheduled to drop its ParkGuard. Remove the
+        // completed edges while still holding the flights lock so a new flight
+        // for the same key cannot register an edge that this completion would
+        // mistake for one of its own.
+        parked()
+            .lock()
+            .expect("parked lock")
+            .edges
+            .retain(|edge| edge.target != arg_tree);
+        waiters
     };
     for tx in waiters {
         let _ = tx.send(outcome.clone());
@@ -1669,5 +1804,197 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    use super::*;
+
+    #[test]
+    fn external_run_identity_is_canonical_lowercase() {
+        assert_eq!(
+            parse_arg_tree(&format!("req={}", "a".repeat(40)))
+                .ok()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let error = parse_arg_tree(&format!("req={}", "A".repeat(40))).unwrap_err();
+        assert_eq!(error.status(), 400);
+    }
+
+    #[test]
+    fn waiter_receives_the_owners_outcome() {
+        let request = "d".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        let outcome = Ok(format!("blob {}", "a".repeat(40)));
+        owner.finish(&outcome);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+    }
+
+    #[test]
+    fn a_stale_cache_miss_rereads_after_becoming_owner() {
+        let request = "9".repeat(40);
+        let first_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+
+        // This arrival observes a miss while the first owner is live, then is
+        // descheduled until that owner has cached and left the flight table.
+        let mut cached = None;
+        assert!(cached.is_none());
+        let cached_result = format!("blob {}", "8".repeat(40));
+        cached = Some(cached_result.clone());
+        first_owner.finish(&Ok(cached_result.clone()));
+
+        let mut reread_saw_new_owner = false;
+        let disposition = claim_flight_after_miss(&request, &[], || {
+            // The re-read happens only after this stale arrival has claimed a
+            // new flight, so another arrival must observe it as a waiter.
+            match join_flight(&request, &[]) {
+                Flight::Waiter(rx, guard) => {
+                    reread_saw_new_owner = true;
+                    drop(rx);
+                    drop(guard);
+                }
+                _ => panic!("cache re-read ran before flight ownership"),
+            }
+            Ok(cached.clone())
+        });
+
+        assert!(reread_saw_new_owner);
+        match disposition {
+            FlightDisposition::Complete { outcome, cache_hit } => {
+                assert!(cache_hit);
+                assert_eq!(outcome, Ok(cached_result));
+            }
+            FlightDisposition::Run(owner) => {
+                drop(owner);
+                panic!("stale cache miss dispatched duplicate work");
+            }
+        }
+
+        let replacement = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("cache-filled flight was not released"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn losing_an_owner_wakes_waiters_and_allows_a_new_owner() {
+        let request = "e".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        drop(owner);
+        let error = rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.0, 500);
+        assert!(error.1.contains("owner"), "{}", error.1);
+        drop(guard);
+
+        let replacement = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("proven owner loss did not release the flight"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn completed_flight_removes_wait_edges_before_waiters_wake() {
+        let request = "f".repeat(40);
+        let ancestor = "1".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        let outcome = Ok(format!("blob {}", "b".repeat(40)));
+        owner.finish(&outcome);
+
+        // Deliberately leave the result unread and the guard alive: completion
+        // itself, rather than waiter scheduling, owns removal of the edge.
+        assert!(!park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+    }
+
+    #[test]
+    fn old_waiter_guard_cannot_remove_a_new_flights_edge() {
+        let request = "a".repeat(40);
+        let ancestor = "2".repeat(40);
+        let first_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (first_rx, first_guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        let first_outcome = Ok(format!("blob {}", "c".repeat(40)));
+        first_owner.finish(&first_outcome);
+
+        let second_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("completed flight did not admit a new owner"),
+        };
+        let (second_rx, second_guard) = match join_flight(&request, std::slice::from_ref(&ancestor))
+        {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("new flight's second arrival did not wait"),
+        };
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        // The first guard is deliberately late. Its edge was already cleared
+        // by first-flight completion; dropping it must not remove the identical
+        // edge registered by the second flight.
+        drop(first_guard);
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        let second_outcome = Ok(format!("blob {}", "d".repeat(40)));
+        second_owner.finish(&second_outcome);
+        assert_eq!(
+            first_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            first_outcome
+        );
+        assert_eq!(
+            second_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            second_outcome
+        );
+        drop(second_guard);
     }
 }

@@ -127,11 +127,11 @@ result out.
 
 No worker ever waits for another worker: a container either computes a value
 or *describes* the remaining work and exits. The only things that block are
-server threads (cheap, one per pending node) — never worker slots. So a global
-bound on concurrent containers (`CAOS_MAX_WORKERS`, a semaphore acquired only
-for the duration of a single container run and never held while waiting on
-anything else) is safe at any setting ≥ 1: some runnable leaf always holds a
-slot, finishes, and releases it.
+server threads (cheap, one per pending node), while runnable leaves are handed
+to parked runner polls. Capacity is runner-side: a host agent's
+`CAOS_RUNNER_SLOTS` controls its generic polling loops, and other specialized
+runners may contribute more. No server semaphore is held across dependency
+resolution, so a parent cannot occupy the execution slot its child needs.
 
 ## Expressing the old recursion
 
@@ -163,20 +163,21 @@ An HTTP `/run` is always top-level (empty stack).
 
 ## Parallelism
 
-Map children run concurrently (one thread each, `std::thread::scope`), gated
-only by the worker semaphore. `CAOS_MAX_WORKERS` (env, default 8, `0` =
-unlimited) bounds concurrent containers across the whole server.
+Map children resolve concurrently (one server thread each,
+`std::thread::scope`). Actual container concurrency is the available set of
+parked runner polls; for the generic host agent it is configured with
+`CAOS_RUNNER_SLOTS`, not a server-wide semaphore or fixed default.
+
+Identical concurrent requests are single-flighted by request hash. Later
+arrivals wait for the owner's exact outcome without a timeout that could repeat
+effectful work. Before parking, the server checks its cross-thread waits-for
+graph. Only when parking would close a genuine dependency cycle does that
+arrival run independently; its expanded local ancestry then reports the cycle
+instead of hanging. If an owner is lost, its waiters receive an error and a
+later request may become the new owner.
 
 ## Open items
 
-- **Concurrent duplicate runs.** Two identical requests in flight both run
-  (pre-existing: "no locks yet"). Parallel maps make this more likely — a
-  diamond DAG (deep-deps' shared dep) now computes shared nodes once per
-  concurrent parent instead of hitting the cache sequentially. Fix is
-  single-flight keyed on the request hash; to keep clean cycle *errors* (not
-  hangs) it needs a waits-for check before blocking on another thread's
-  in-flight run. Deferred.
 - **Durability.** Promises live in server threads; a server restart loses
   in-flight resolutions (as it lost in-flight runs before). A journaled
   continuation queue would make them resumable.
-- The `serve`/fly dispatch protocol no longer carries `stack`.

@@ -33,7 +33,6 @@ echo "You are a coding agent operating on a git workspace." > system.txt
 commit "workspace + fixtures"
 
 base=$(mkcommit "HEAD:ws" "base")
-human1=$(mkcommit "HEAD:ws" "write me a long answer" "$base")
 
 echo "== script the stub: two truncations, then end_turn ==" >&2
 # response_text joins text blocks with a blank line, so the turn message is the
@@ -69,7 +68,8 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry llm-step and run the turn ==" >&2
-conv="conv-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+conv="max-tokens-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+conversation_ref="refs/caos/conversations/$conv/head"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
@@ -80,16 +80,26 @@ llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")
 
-"$CAOS_CLI" run "$llm" -- --head:commit="$human1" > turn.commit
+human1=$(mkcommit "HEAD:ws" \
+  '{"author":"user","content":"write me a long answer","kind":"caos-chat-event"}' \
+  "$base")
+request=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$human1")
+[ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
+  || fail "prepared request is not exact Q: $request"
+admitted=$(mkcommit "HEAD:ws" \
+  "{\"kind\":\"caos-chat-event\",\"request\":\"$request\",\"request_head\":\"$human1\",\"status\":\"queued\"}" \
+  "$human1")
+git push --quiet caos "$admitted:$conversation_ref" || fail "publishing request admission"
+"$CAOS_CLI" run "$request" -- > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
 
 echo "== the turn advanced and concatenated the three partials ==" >&2
-[ "$(git rev-parse "$turn^")" = "$human1" ] || fail "turn's first parent is not the human turn"
-git rev-parse -q --verify "$turn^2" >/dev/null && fail "a toolless turn should have one parent"
+git merge-base --is-ancestor "$human1" "$turn" \
+  || fail "terminal event does not descend from the queued event"
 [ "$(git show -s --format=%an "$turn")" = "caos-agent" ] || fail "turn author"
 want=$(printf 'Part one.\n\nPart two.\n\nPart three.')
-[ "$(git show -s --format=%B "$turn")" = "$want" ] \
+[ "$(git show -s --format=%B "$turn" | jq -r .content)" = "$want" ] \
   || fail "turn message is not the concatenation of the three partials"
 [ "$(git rev-parse "$turn^{tree}")" = "$(git rev-parse "$human1^{tree}")" ] \
   || fail "toolless turn changed the tree"

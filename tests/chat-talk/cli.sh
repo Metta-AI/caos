@@ -5,8 +5,8 @@
 #
 # The `talk` verb (design/agent-harness.md, "Client"), with NO real API calls:
 # the scripted llm-stub plays the LLM exactly as in tests/llm-step. Covers the
-# sticky pick (a bare `talk` continues the most recent conversation and replays
-# its history), `--new` (mints the next auto-name and carries NO history over),
+# explicit continuation (a `talk -c` replays the conversation's history),
+# `--new` (creates a fresh named conversation and carries NO history over),
 # and the two argument-shape errors, which never reach a server at all.
 #
 # Split out of tests/chat-offline, which drives the `chat` verb and is where
@@ -27,6 +27,13 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
   local tree=$1 msg=$2 parent=${3:-}
   git -c user.email=test@caos -c user.name=caos \
     commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg"
+}
+remote_tip() { # <ref>
+  local lines
+  lines=$(git ls-remote --refs caos "$1")
+  [ -n "$lines" ] || return 1
+  [ "${lines#*$'\n'}" = "$lines" ] || return 1
+  printf '%s\n' "${lines%%[[:space:]]*}"
 }
 
 stage "stage the worker binaries and fixtures"
@@ -103,38 +110,42 @@ stage "seed a two-turn conversation for talk to continue"
 sed 's/^/  seed1| /' seed1.out >&2
 "$CAOS_CLI" chat "$conv" -m "and now?" "${opts[@]}" > seed2.out
 sed 's/^/  seed2| /' seed2.out >&2
-turn2=$(git rev-parse "refs/caos/conversations/$conv/from-user")
-[ -n "$turn2" ] || fail "seed conversation not created"
+ref="refs/caos/conversations/$conv/head"
+turn2=$(remote_tip "$ref") || fail "seed conversation not created"
+git fetch -q caos "$turn2"
 echo "  ok: $conv has two turns" >&2
 
-stage "talk (std worker curries): sticky pick continues $conv"
+stage "talk (std worker curries): explicit pick continues $conv"
 # The workers resolve from the workspace's declared deps and build from source.
-"$CAOS_CLI" talk "still there?" "${opts[@]}" > talk1.out 2>talk1.err
+"$CAOS_CLI" talk -c "$conv" "still there?" "${opts[@]}" > talk1.out 2>talk1.err
 sed 's/^/  talk1| /' talk1.out >&2
 grep -qF "[conversation $conv]" talk1.err \
   || fail "talk did not announce the sticky conversation: $(cat talk1.err)"
-turn3=$(git rev-parse "refs/caos/conversations/$conv/from-user")
+turn3=$(remote_tip "$ref") || fail "talk lost the sticky conversation"
+git fetch -q caos "$turn3"
 [ "$turn3" != "$turn2" ] || fail "talk did not advance the sticky conversation"
-[ "$(git rev-parse "$turn3^^")" = "$turn2" ] || fail "talk turn does not chain onto turn 2"
+git merge-base --is-ancestor "$turn2" "$turn3" \
+  || fail "talk turn does not chain onto turn 2"
 grep -qF "$T3_TEXT" talk1.out || fail "talk's response text not printed"
 grep -qF '{"content":"still there?","role":"user"}]' stub/request-3.json \
   || fail "talk's prompt missing from the request"
 grep -qF '{"content":"and now?","role":"user"}' stub/request-3.json \
   || fail "earlier turns not replayed — talk continued the wrong conversation"
-echo "  ok: std workers, sticky conversation continued and advanced" >&2
+echo "  ok: std workers, selected conversation continued and advanced" >&2
 
-stage "talk --new starts an auto-named conversation"
-"$CAOS_CLI" talk --new "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
+fresh="talk-fresh-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+stage "talk --new starts a named conversation"
+"$CAOS_CLI" talk --new -c "$fresh" "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
 sed 's/^/  talk2| /' talk2.out >&2
-grep -qF "[conversation talk-1 — new]" talk2.err \
-  || fail "talk --new did not announce a new talk-1: $(cat talk2.err)"
-git rev-parse -q --verify refs/caos/conversations/talk-1/from-user >/dev/null \
-  || fail "talk --new did not create refs/caos/conversations/talk-1/from-user"
+grep -qF "[conversation $fresh — new]" talk2.err \
+  || fail "talk --new did not announce $fresh: $(cat talk2.err)"
+remote_tip "refs/caos/conversations/$fresh/head" >/dev/null \
+  || fail "talk --new did not create refs/caos/conversations/$fresh/head"
 grep -qF "$T4_TEXT" talk2.out || fail "talk --new's response text not printed"
 grep -qF '{"content":"and now?","role":"user"}' stub/request-4.json \
   && fail "old conversation replayed into the new one"
 [ ! -f stub/request-5.json ] || fail "unexpected extra LLM round"
-echo "  ok: talk-1 minted, no history carried over" >&2
+echo "  ok: $fresh minted, no history carried over" >&2
 
 stage "talk argument-shape errors"
 if "$CAOS_CLI" talk "one" "two" 2>talk-err; then

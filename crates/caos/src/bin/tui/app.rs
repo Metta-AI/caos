@@ -1,12 +1,14 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_replay, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, generate_conversation_title, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
-    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
+    archive_user_conversation, conversation_replay, conversation_snapshot,
+    conversation_workspace_diff, describe_tool_set, first_available_conversation_name,
+    generate_conversation_title, list_user_conversations, publish_unindexed_conversations,
+    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
+    unarchive_user_conversation, ConversationRole, ConversationSnapshot, ToolSetDescription,
     TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
     UserConversationSummary, WorkspaceDiff,
 };
@@ -89,9 +91,10 @@ pub(crate) enum Focus {
     Conversation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum EntryRole {
     Human,
+    Peer(String),
     Agent,
     Info,
     Notice,
@@ -833,6 +836,10 @@ struct ConversationState {
     command_error: Option<String>,
     publish_prompt: bool,
     running: bool,
+    local_turn: bool,
+    active_request: Option<String>,
+    reconciling_request: Option<String>,
+    reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
     scroll: ScrollState,
@@ -840,6 +847,7 @@ struct ConversationState {
     transcript_selection: Option<TranscriptSelection>,
     activity_selection: Option<usize>,
     activity_detail_scroll: usize,
+    remote_head: Option<String>,
 }
 
 impl ConversationState {
@@ -861,6 +869,10 @@ impl ConversationState {
             command_error: None,
             publish_prompt: false,
             running: false,
+            local_turn: false,
+            active_request: None,
+            reconciling_request: None,
+            reconcile_after: None,
             turn_phase: TurnPhase::System,
             publishing: false,
             scroll: ScrollState::default(),
@@ -868,6 +880,7 @@ impl ConversationState {
             transcript_selection: None,
             activity_selection: None,
             activity_detail_scroll: 0,
+            remote_head: None,
         }
     }
 
@@ -877,7 +890,7 @@ impl ConversationState {
         state
     }
 
-    fn reload(&mut self, transport: &GitTransport) {
+    fn reload(&mut self, transport: &GitTransport, current_user: &str) {
         match conversation_replay(transport, &self.id) {
             Ok(replay) => {
                 self.activities = replay
@@ -892,6 +905,9 @@ impl ConversationState {
                     .into_iter()
                     .map(|turn| TranscriptEntry {
                         role: match turn.role {
+                            ConversationRole::Human if turn.author != current_user => {
+                                EntryRole::Peer(turn.author)
+                            }
                             ConversationRole::Human => EntryRole::Human,
                             ConversationRole::Agent => EntryRole::Agent,
                         },
@@ -917,6 +933,22 @@ impl ConversationState {
             }
         }
         self.transcript_selection = None;
+    }
+
+    fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
+        self.running = matches!(snapshot.status.as_str(), "queued" | "running");
+        self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
+        self.status = match snapshot.status.as_str() {
+            "queued" => "queued".to_string(),
+            "running" => "agent running".to_string(),
+            "idle" => format!("updated {}", short_hash(&snapshot.head)),
+            other => other.to_string(),
+        };
+        if !self.running {
+            self.reconciling_request = None;
+            self.reconcile_after = None;
+            self.local_turn = false;
+        }
     }
 
     fn current_hash(&self) -> Option<&str> {
@@ -1043,6 +1075,11 @@ enum UiMessage {
     Published {
         conversation: String,
         result: Result<String, String>,
+    },
+    Reconciled {
+        conversation: String,
+        request: String,
+        result: Result<(), String>,
     },
 }
 
@@ -1260,16 +1297,21 @@ impl App {
         let mut states: Vec<ConversationState> = conversations
             .iter()
             .map(|summary| {
-                ConversationState::new(
+                let mut state = ConversationState::new(
                     summary.id.clone(),
                     summary.title.clone(),
                     args.turn.clone(),
                     "ready".to_string(),
-                )
+                );
+                state.remote_head = Some(summary.head.clone());
+                state
             })
             .collect();
         for state in &mut states {
-            state.reload(&transport);
+            state.reload(&transport, &args.user);
+            if let Some(snapshot) = conversation_snapshot(&transport, &state.id)? {
+                state.apply_snapshot(&snapshot);
+            }
         }
         let selected_id = if states.iter().any(|state| state.id == selected_name) {
             selected_name.clone()
@@ -1294,7 +1336,7 @@ impl App {
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
-        Ok(Self {
+        let mut app = Self {
             repo_dir,
             user: args.user,
             conversations: states,
@@ -1315,7 +1357,9 @@ impl App {
             focus: Focus::Conversation,
             tx,
             rx,
-        })
+        };
+        app.reconcile_active_requests();
+        Ok(app)
     }
 
     fn selected(&self) -> &ConversationState {
@@ -1328,6 +1372,46 @@ impl App {
 
     fn transport(&self) -> Result<GitTransport, String> {
         GitTransport::discover(&self.repo_dir)
+    }
+
+    /// Ensure every remotely active request has one process-local join. The
+    /// guard is per request, so unchanged 500ms polls cannot create an
+    /// unbounded set of HTTP waiters. Transport failures retry after a small
+    /// backoff; successful joins stay guarded until the ref becomes terminal.
+    fn reconcile_active_requests(&mut self) -> bool {
+        let now = Instant::now();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        let mut started = false;
+        for state in &mut self.conversations {
+            if state.local_turn || !state.running {
+                continue;
+            }
+            let Some(request) = state.active_request.clone() else {
+                continue;
+            };
+            if state.reconciling_request.as_deref() == Some(&request)
+                || state.reconcile_after.is_some_and(|after| after > now)
+            {
+                continue;
+            }
+            state.reconciling_request = Some(request.clone());
+            state.reconcile_after = None;
+            let conversation = state.id.clone();
+            let repo_dir = repo_dir.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = GitTransport::discover(repo_dir)
+                    .and_then(|transport| resume_request(&transport, &request));
+                let _ = tx.send(UiMessage::Reconciled {
+                    conversation,
+                    request,
+                    result,
+                });
+            });
+            started = true;
+        }
+        started
     }
 
     pub(crate) fn should_quit(&self) -> bool {
@@ -1606,6 +1690,7 @@ impl App {
             state.activity_selection = None;
             state.activity_detail_scroll = 0;
             state.running = true;
+            state.local_turn = true;
             state.sidebar_attention = None;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
@@ -1683,9 +1768,24 @@ impl App {
                     conversation,
                     error,
                 } => {
+                    let refresh = self.transport().and_then(|transport| {
+                        let snapshot = conversation_snapshot(&transport, &conversation)?;
+                        Ok((transport, snapshot))
+                    });
+                    let user = self.user.clone();
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
-                        state.running = false;
+                        state.local_turn = false;
+                        if let Ok((transport, snapshot)) = refresh {
+                            state.reload(&transport, &user);
+                            if let Some(snapshot) = snapshot {
+                                state.apply_snapshot(&snapshot);
+                            } else {
+                                state.running = false;
+                            }
+                        } else {
+                            state.running = false;
+                        }
                         state.status = "turn failed".to_string();
                         state.sidebar_attention = Some("Failed — open for details".to_string());
                         state.push_error(error);
@@ -1724,9 +1824,79 @@ impl App {
                         }
                     }
                 }
+                UiMessage::Reconciled {
+                    conversation,
+                    request,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        if state.reconciling_request.as_deref() != Some(&request) {
+                            continue;
+                        }
+                        if let Err(error) = result {
+                            state.reconciling_request = None;
+                            state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
+                            state.status = format!("recovery retry pending: {error}");
+                        }
+                    }
+                }
             }
         }
+        changed |= self.reconcile_active_requests();
         changed
+    }
+
+    /// Follow canonical remote refs so other TUI clients and detached workers
+    /// become visible without any process-local notification channel.
+    pub(crate) fn poll_remote(&mut self) -> bool {
+        let Ok(transport) = self.transport() else {
+            return false;
+        };
+        if publish_unindexed_conversations(&transport, &self.user).is_err() {
+            return false;
+        }
+        let Ok(summaries) =
+            list_user_conversations(&transport, &self.user, UserConversationStatus::Active)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for summary in summaries {
+            if let Some(index) = self.conversation_index(&summary.id) {
+                let state = &mut self.conversations[index];
+                if state.title != summary.title {
+                    state.title = summary.title.clone();
+                    state.automatic_title = false;
+                    changed = true;
+                }
+                if state.remote_head.as_deref() == Some(&summary.head) {
+                    continue;
+                }
+                state.reload(&transport, &self.user);
+                state.remote_head = Some(summary.head.clone());
+                if let Ok(Some(snapshot)) = conversation_snapshot(&transport, &summary.id) {
+                    state.apply_snapshot(&snapshot);
+                }
+                changed = true;
+            } else {
+                let mut state = ConversationState::new(
+                    summary.id.clone(),
+                    summary.title,
+                    self.selected().turn_options.clone(),
+                    "shared conversation".to_string(),
+                );
+                state.reload(&transport, &self.user);
+                state.remote_head = Some(summary.head);
+                if let Ok(Some(snapshot)) = conversation_snapshot(&transport, &summary.id) {
+                    state.apply_snapshot(&snapshot);
+                }
+                self.conversations.insert(0, state);
+                self.selected += 1;
+                changed = true;
+            }
+        }
+        changed | self.reconcile_active_requests()
     }
 
     fn conversation_index(&self, id: &str) -> Option<usize> {
@@ -1812,12 +1982,19 @@ impl App {
         let user = self.user.clone();
         let state = &mut self.conversations[index];
         state.running = false;
+        state.local_turn = false;
+        state.active_request = None;
+        state.reconciling_request = None;
+        state.reconcile_after = None;
         state.sidebar_attention = None;
         state.status = format!("completed {}", outcome.short_commit);
         match transport {
             Ok(transport) => {
                 match publish_user_conversation(&transport, &user, &state.id, &state.title) {
-                    Ok(()) => state.reload(&transport),
+                    Ok(()) => {
+                        state.reload(&transport, &user);
+                        state.remote_head = Some(outcome.commit);
+                    }
                     Err(error) => {
                         state.sidebar_attention = Some("Failed to save conversation".to_string());
                         state.push_error(format!(
@@ -2268,7 +2445,8 @@ impl App {
         if !self.selected().is_busy() {
             match self.transport() {
                 Ok(transport) => {
-                    self.selected_mut().reload(&transport);
+                    let user = self.user.clone();
+                    self.selected_mut().reload(&transport, &user);
                     self.selected_mut().status = "reloaded".to_string();
                 }
                 Err(error) => self.selected_mut().show_command_error(error),
@@ -2599,7 +2777,7 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map_err(|error| format!("reading the clock: {error}"))?
         .as_nanos();
     let descriptor = format!(
-        "caos conversation v1\ncreator {user}\ncreated {created}\nprocess {}\n",
+        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
         std::process::id()
     );
     t.put_object("blob", descriptor.as_bytes())
@@ -2707,6 +2885,21 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    fn git_output(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     fn repo_with_default_branch(name: &str, branch: &str) -> (PathBuf, PathBuf, String) {
@@ -4543,16 +4736,99 @@ mod tests {
         assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
         conversation.scroll.scroll_up(5);
         let transport = GitTransport::discover(&dir).unwrap();
-        conversation.reload(&transport);
+        conversation.reload(&transport, "alice");
         assert!(conversation.diff.is_none());
         assert!(conversation.status.is_empty());
         let error = conversation.transcript.last().unwrap();
         assert_eq!(error.role, EntryRole::Notice);
         assert!(error.text.contains("loading conversation failed"));
-        assert!(error.text.contains("no conversation"));
+        assert!(error.text.contains("caos"));
         assert_eq!(conversation.scroll.offset, Some(7));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remote_poll_discovers_shared_conversations_and_names_the_other_user() {
+        let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let base = git_output(&repo, &["rev-parse", "HEAD"]);
+        let tree = git_output(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let user = git_output(
+            &repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                r#"{"kind": "caos-chat-event","author":"user","username":"Alice","content":"hello from Alice"}"#,
+            ],
+        );
+        let request = "b".repeat(40);
+        let admission_message = format!(
+            r#"{{"kind": "caos-chat-event","status":"queued","request":"{request}","request_head":"{user}"}}"#
+        );
+        let admitted = git_output(
+            &repo,
+            &["commit-tree", &tree, "-p", &user, "-m", &admission_message],
+        );
+        git_ok(
+            &repo,
+            &[
+                "push",
+                "-q",
+                "caos",
+                &format!("{admitted}:refs/caos/conversations/shared/head"),
+            ],
+        );
+
+        let (mut app, _) = app_with(vec![state("local")]);
+        app.repo_dir = repo.clone();
+        app.user = "Bob".to_string();
+        assert!(app.poll_remote());
+
+        let shared = app
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == "shared")
+            .unwrap();
+        assert!(shared.running);
+        assert!(matches!(
+            &shared.transcript[0].role,
+            EntryRole::Peer(author) if author == "Alice"
+        ));
+        assert_eq!(shared.transcript[0].text, "hello from Alice");
+        assert!(!app.poll_remote());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn active_request_reconciliation_has_one_process_local_join() {
+        let request = "b".repeat(40);
+        let mut conversation = state("shared");
+        conversation.running = true;
+        conversation.active_request = Some(request.clone());
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = std::env::temp_dir().join(format!(
+            "caos-cli-tui-missing-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        assert!(app.reconcile_active_requests());
+        assert_eq!(
+            app.selected().reconciling_request.as_deref(),
+            Some(request.as_str())
+        );
+        // Polling an unchanged active snapshot cannot fan out more waiters for
+        // the same exact request. Completion/failure is consumed by drain.
+        assert!(!app.reconcile_active_requests());
     }
 
     #[test]
