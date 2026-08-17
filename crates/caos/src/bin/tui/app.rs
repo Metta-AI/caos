@@ -1065,11 +1065,14 @@ impl ConversationState {
                 .active_request
                 .as_ref()
                 .is_none_or(|request| load.snapshot.request.as_ref() == Some(request));
+        let previous_activity_len = self.activities.len();
+        let followed_activity_tail = self
+            .activity_selection
+            .is_none_or(|selected| selected + 1 == previous_activity_len);
+        let previous_activity_selection = self.activity_selection;
+        let previous_activity_detail_scroll = self.activity_detail_scroll;
         let local_lifecycle = preserve_local_lifecycle.then(|| {
             (
-                self.activities.clone(),
-                self.activity_selection,
-                self.activity_detail_scroll,
                 self.status.clone(),
                 self.turn_phase,
                 self.reconciling_request.clone(),
@@ -1083,8 +1086,18 @@ impl ConversationState {
             .last()
             .map(|turn| replayed_activities(&turn.events))
             .unwrap_or_default();
-        self.activity_selection = self.activities.len().checked_sub(1);
-        self.activity_detail_scroll = 0;
+        if followed_activity_tail && self.activities.len() > previous_activity_len {
+            self.activity_selection = self.activities.len().checked_sub(1);
+            self.activity_detail_scroll = 0;
+        } else if previous_activity_selection
+            .is_some_and(|selected| selected < self.activities.len())
+        {
+            self.activity_selection = previous_activity_selection;
+            self.activity_detail_scroll = previous_activity_detail_scroll;
+        } else {
+            self.activity_selection = self.activities.len().checked_sub(1);
+            self.activity_detail_scroll = 0;
+        }
         let mut transcript: Vec<_> = load
             .replay
             .turns
@@ -1123,19 +1136,7 @@ impl ConversationState {
         self.diff = Some(load.workspace_diff);
         self.remote_head = Some(load.snapshot.head);
         self.transcript_selection = None;
-        if let Some((
-            activities,
-            activity_selection,
-            activity_detail_scroll,
-            status,
-            turn_phase,
-            reconciling_request,
-            reconcile_after,
-        )) = local_lifecycle
-        {
-            self.activities = activities;
-            self.activity_selection = activity_selection;
-            self.activity_detail_scroll = activity_detail_scroll;
+        if let Some((status, turn_phase, reconciling_request, reconcile_after)) = local_lifecycle {
             self.status = status;
             self.turn_phase = turn_phase;
             self.local_turn = true;
@@ -3846,7 +3847,9 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos::chat::{conversation_head, conversation_ref, ConversationReplay};
+    use caos::chat::{
+        conversation_head, conversation_ref, ConversationReplay, ConversationTurnEvents,
+    };
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -6110,7 +6113,7 @@ mod tests {
         wait_for_pending_submission(&mut app, 0);
         assert_eq!(app.selected().status, "running a tool");
         assert_eq!(app.selected().turn_phase, TurnPhase::Model);
-        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().activities.is_empty());
         assert!(app.selected().running);
         assert!(app.selected().local_turn);
         assert!(app.selected().command_error.is_none());
@@ -6168,7 +6171,7 @@ mod tests {
     }
 
     #[test]
-    fn first_durable_load_preserves_a_locally_started_turn() {
+    fn first_durable_load_replays_activity_and_preserves_local_lifecycle() {
         let head = "a".repeat(40);
         let request = "b".repeat(40);
         let mut conversation = state("talk-1");
@@ -6176,7 +6179,6 @@ mod tests {
         conversation.local_turn = true;
         conversation.status = "running a tool".to_string();
         conversation.turn_phase = TurnPhase::Model;
-        conversation.activities.push(activity(1));
         assert!(conversation.active_request.is_none());
 
         conversation.apply_load(
@@ -6193,7 +6195,17 @@ mod tests {
                 },
                 replay: ConversationReplay {
                     turns: Vec::new(),
-                    turn_events: Vec::new(),
+                    turn_events: vec![ConversationTurnEvents {
+                        turn_commit: head.clone(),
+                        events: vec![TurnEvent::ToolCall {
+                            step_commit: "e".repeat(40),
+                            request: request.clone(),
+                            round: 2,
+                            tool_use_id: "sleep".to_string(),
+                            name: "bash".to_string(),
+                            summary: "$ sleep 120; echo done".to_string(),
+                        }],
+                    }],
                 },
                 workspace_diff: WorkspaceDiff {
                     base_commit: "d".repeat(40),
@@ -6206,7 +6218,10 @@ mod tests {
 
         assert_eq!(conversation.status, "running a tool");
         assert_eq!(conversation.turn_phase, TurnPhase::Model);
-        assert_eq!(conversation.activities, vec![activity(1)]);
+        assert_eq!(conversation.activities.len(), 1);
+        assert_eq!(conversation.activities[0].id, "sleep");
+        assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
+        assert_eq!(conversation.activity_selection, Some(0));
         assert_eq!(
             conversation.active_request.as_deref(),
             Some(request.as_str())
