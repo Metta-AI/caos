@@ -584,6 +584,11 @@ spawning no container.
 
 - Build the stack with `nix build`
 - Run the dev stack with `result/bin/caosd up`
+- **Check `caosd version` before believing a bug report.** A devShell that fails
+  to build leaves direnv on the *previous* environment, so the `caosd` on PATH
+  can be far older than the `flake.lock` that names it — and the symptom is an
+  error that reads like a caos bug. `caos-cli`'s usage banner carries the same
+  revision.
 - Test with `caos-cli run-tool test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
 
 ```bash
@@ -591,6 +596,7 @@ caosd up      # bring the stack up + publish all of std, then return. Updates it
 caosd logs    # follow the running stack's logs (Ctrl-C returns; stack stays up)
 caosd down    # stop it (Redis + registry volumes and the server repo are kept)
 caosd reset   # stop and wipe those volumes + the server repo for a clean slate
+caosd version # the caos revision this command was built from
 ```
 
 ```bash

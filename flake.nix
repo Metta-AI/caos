@@ -28,6 +28,23 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
+        # The revision this flake was built from, baked into the host commands
+        # so a person can tell WHICH caos they are running.
+        #
+        # This exists because the failure mode is invisible: a devShell that
+        # fails to build leaves direnv on the PREVIOUS environment ("Falling
+        # back to previous environment!"), so `caosd` can be months older than
+        # the `flake.lock` that names it — and the symptom is an error message
+        # that reads exactly like a caos bug. It cost a session. `caosd version`
+        # and the usage banners answer it in one line.
+        #
+        # `dirtyRev` when the tree has uncommitted changes, so a working build
+        # says so rather than claiming the last commit. Injected at RUNTIME (see
+        # `caos-cli`), never compiled in: a compile-time rev would re-key the
+        # Rust workspace on every commit, so a docs-only commit would rebuild
+        # everything.
+        caosRev = self.rev or self.dirtyRev or "unknown";
+
         # The Linux system whose binaries the Docker images carry. We build for
         # the host's architecture (no arch-cross), so on Linux this is just the
         # host; on macOS it's the matching Linux system, whose general-purpose
@@ -561,12 +578,11 @@
         # `caos-cli` stays for scripts and docs that spell it out. (No collision
         # with the worker-side `caos` binary — that one is baked into images and
         # never lands on a host PATH.)
-        caos-cli =
+        caos-cli-bin =
           if pkgs.stdenv.hostPlatform.isLinux then
-            pkgs.runCommand "caos-cli" { } ''
+            pkgs.runCommand "caos-cli-bin" { } ''
               mkdir -p $out/bin
               cp ${caos}/bin/caos-cli $out/bin/caos-cli
-              ln -s caos-cli $out/bin/caos
             ''
           else
             craneLib.buildPackage (
@@ -574,11 +590,32 @@
               // {
                 cargoArtifacts = nativeCliArtifacts;
                 cargoExtraArgs = "--package caos --bin caos-cli";
-                pname = "caos-cli";
+                pname = "caos-cli-bin";
                 doCheck = false;
-                postInstall = "ln -s caos-cli $out/bin/caos";
               }
             );
+
+        # The shipped command: the binary plus the revision it came from.
+        #
+        # Wrapped rather than compiled in, so the rev costs no rebuild — see
+        # `caosRev`. One wrapper for both platforms, so macOS cannot drift into
+        # printing a different answer.
+        #
+        # TWO wrappers, each with an explicit `--argv0`, rather than one plus a
+        # `caos -> caos-cli` symlink: this `makeWrapper` emits a bare
+        # `exec "<store path>" "$@"` with no `-a "$0"`, so a symlinked name is
+        # lost and `prog_name` reports `caos-cli` however you typed it — every
+        # usage line would then tell a person to run `caos-cli talk` when they
+        # had just typed `caos`. `--argv0` restores the name each entry point is
+        # meant to have. (`--set-default`, so a caller can still override the
+        # rev, e.g. to reproduce what an older build printed.)
+        caos-cli = pkgs.runCommand "caos-cli" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+          mkdir -p $out/bin
+          for name in caos-cli caos; do
+            makeWrapper ${caos-cli-bin}/bin/caos-cli $out/bin/$name \
+              --argv0 $name --set-default CAOS_REV ${caosRev}
+          done
+        '';
 
         # All the host-facing caos commands in one package, so a consumer lists
         # *this* in its devShell and gets `caos-cli` and `caosd` on PATH together
@@ -654,6 +691,12 @@
         #                working stack and not homework — so this is the strict
         #                gate for anything that runs against a stack it did not
         #                just bring up (design/one-stack-image.md).
+        #   caosd version  the caos revision THIS command was built from. Ask it
+        #                before believing a bug report: a devShell that fails to
+        #                build leaves direnv on the previous environment, so the
+        #                `caosd` on PATH can be far older than the `flake.lock`
+        #                that names it, and the symptom looks like a caos bug.
+        #                `caos-cli`'s usage banner carries the same string.
         # `up` hands build-builtins.sh a prebuilt caos-cli, the flake's worker
         # images, and a writable client repo (all via env) so it needs neither
         # `nix` nor a writable repo root — hence it runs from any directory,
@@ -844,7 +887,21 @@
               echo "==> the seeded core is intact ($checked images)" >&2
             }
 
+            # The revision this caosd was built from, printed by `version` and
+            # by every usage banner. A stale binary on PATH is otherwise
+            # indistinguishable from a caos bug (see `caosRev`).
+            CAOS_REV=${caosRev}
+
+            usage() {
+              echo "caosd ($CAOS_REV)"
+              echo "usage: caosd [up|down|reset|logs|std-build|std-check|version]"
+            }
+
             case "''${1:-up}" in
+            version)
+              echo "caosd $CAOS_REV"
+              exit 0
+              ;;
             up)
               # ONE container runs the whole daemon group (design/
               # one-stack-image.md): `caosd serve` is its entrypoint, and the
@@ -956,7 +1013,7 @@
               ;;
             *)
               echo "caosd: unknown command '$1'" >&2
-              echo "usage: caosd [up|down|reset|logs|std-build|std-check]" >&2
+              usage >&2
               exit 2
               ;;
             esac

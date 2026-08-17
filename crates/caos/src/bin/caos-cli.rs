@@ -187,10 +187,22 @@ fn fresh_trace_id() -> String {
     format!("cli-{}-{now}", std::process::id())
 }
 
+/// The caos revision this build came from, injected by the flake's wrapper
+/// (`CAOS_REV`) rather than compiled in — a compile-time rev would re-key the
+/// Rust workspace on every commit. `unknown` when run straight out of `cargo
+/// build`, or from any build that did not set it, which is the honest answer:
+/// the point of printing it is to tell a STALE command apart from a current
+/// one, and a binary that cannot say is not evidence that it is current.
+fn build_rev() -> String {
+    std::env::var("CAOS_REV").unwrap_or_else(|_| "unknown".to_string())
+}
+
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
+    let rev = build_rev();
     format!(
-        "usage:\n  \
+        "{prog} ({rev})\n\
+         usage:\n  \
          {prog} run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [--name=value | --name:@=path ...]\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is --base:@=<dir>, --base:docker=<ref> or --base:hash=<oid>)\n  \
