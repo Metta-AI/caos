@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use llm_client::{post_messages, DEFAULT_BASE_URL, DEFAULT_MODEL};
+use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, forward, link, own_args_tree, path, read_arg,
@@ -93,7 +93,7 @@ impl Config {
             merge_image: image_arg("merge-image")?,
             run_and_update_ref_image: image_arg("run-and-update-ref-image")?,
             merge_refs: read_arg_opt("merge-refs")?,
-            model: read_arg_opt("model")?.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            model: read_arg("model")?,
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             conversation: read_arg_opt("conversation")?,
         })
@@ -588,6 +588,7 @@ fn llm_round(
                 "request": run,
                 "round": round,
                 "author": "assistant",
+                "model": &cfg.model,
                 "content": text,
                 "response": blocks,
                 "status": "idle",
@@ -613,6 +614,7 @@ fn llm_round(
                 "request": run,
                 "round": round,
                 "author": "assistant",
+                "model": &cfg.model,
                 "content": response_text(&blocks),
                 "response": blocks,
                 "calls": calls,

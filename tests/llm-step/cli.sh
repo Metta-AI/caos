@@ -186,6 +186,7 @@ grep -qF '"tool_use_id":"toolu_01"' <<<"$events1" || fail "tool result was not r
 grep -qF '"tool_use_id":"toolu_03"' <<<"$events1" || fail "second-round result was not recorded"
 grep -qF '"is_error":true' <<<"$events1" || fail "failed tool result lost its error bit"
 grep -qF 'done: out.txt contains hi' <<<"$events1" || fail "assistant transcript was not recorded"
+grep -qF '"model":"test-model"' <<<"$events1" || fail "assistant model was not recorded"
 terminal1=$(git show -s --format=%B "$head1")
 grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' <<<"$terminal1" \
   || fail "turn did not become idle"
