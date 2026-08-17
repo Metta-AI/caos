@@ -21,10 +21,10 @@ commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -q
 
 # Salt each source with the per-run marker so every run compiles a NOVEL worker
 # binary — then `first-run` is always a genuine cold path, never a cache hit
-# from a previous run. CAOS_SALT is unique per `tests/run.sh` invocation; injected
-# into the greeting string (not a comment — comments are stripped, leaving the
-# binary identical). The asserted substrings still match.
-uniq=$(printf '%s' "${CAOS_SALT:-$(date +%s%N)}" | tr -cd '0-9a-zA-Z')
+# from a previous run. CAOS_TEST_RUN_ID is unique per actual test execution;
+# injected into the greeting string (not a comment — comments are stripped,
+# leaving the binary identical). The asserted substrings still match.
+uniq=$(printf '%s' "$CAOS_TEST_RUN_ID" | tr -cd '0-9a-zA-Z')
 greeter=$(<test/greeter.rs)
 edited=$(<test/greeter-edited.rs)
 printf '%s\n' "${greeter//source-built worker/source-built worker $uniq}" >g1.rs

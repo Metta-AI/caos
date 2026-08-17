@@ -260,6 +260,11 @@ fanout)
     [ -e "/cas/args/ws/tests/$t/cli.sh" ] || continue
     mkdir -p "/tmp/sel/$t"
     ln -s "/cas/args/ws/tests/$t" "/tmp/sel/$t/test"
+    # Stable input, not the execution nonce: run-test.sh combines this name
+    # with a nonce only AFTER the per-test job has missed cache and started.
+    # That gives mutable test refs an owner without re-keying every test on
+    # every suite invocation.
+    printf '%s' "$t" > "/tmp/sel/$t/name"
     if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
     # ONE SHARED STACK for the whole suite, instead of one per test
     # (design/faster-tests.md). Every test asks for it and the first to ask

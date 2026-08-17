@@ -221,12 +221,14 @@ remaining work is mechanical — a per-test harness script parameterized over
 `tests/<name>`, fixture binaries as args (with a `nix` shim for tests that
 build fixtures), a thin process-mode `std` published inside (each entry
 `curry(dummy, bin=<binary>)`), and a `test-all` map. Two isolation lessons are
-load-bearing, both from the same root cause — a nested stack shares the
-outer's ambient environment:
+load-bearing, both from the same root cause: a nested stack shares more than a
+caller might guess.
 
-- The runner hands worker scripts the OUTER run's `CAOS_STD`/`CAOS_SALT`; an
-  inner client that inherits them builds requests naming a std tree the inner
-  server has never seen. Inner harnesses unset both.
+- An inherited cache salt is not a stack or test-run namespace. `CAOS_STD` no
+  longer exists; `CAOS_SALT` remains visible to the inner client, while the
+  image-keyed stack, CAS, Git remote, and mutable refs can be shared with runs
+  carrying other salt values. Tests prefix mutable refs with the explicit
+  execution identity described in `tests/README.md`.
 - **A nested stack must not share the outer redis.** The worker's container
   sits on the outer `caos-net`, where `caos-redis` resolves — but the result
   cache maps *request-hash → object-hash*, and object presence is per-repo.
@@ -319,9 +321,10 @@ job, not the poisoned shared one. `run-then` remains the strongest single
 check: continuations, nested runs, and cycle detection all resolve through
 the inner server driving socket-delegated siblings.
 
-Nested jobs run **unsalted**: their isolation is inherent (a fresh hermetic
-stack per job), and the per-run salt would re-key every job every run —
-defeating exactly the cross-run memoization the fold exists for.
+At this phase nested jobs ran **unsalted** because each had a fresh hermetic
+stack. The later shared-stack design superseded that boundary: the current
+runner leaves `CAOS_SALT` inherited, while mutable test refs are isolated by
+the explicit execution prefix in `tests/README.md`.
 
 `chat-online` folds too (so: **all 16, no host batch, nested is the default
 for a new tests/<name>/cli.sh**): the API key rides as an ordinary request

@@ -585,8 +585,12 @@ caos-cli run-tool build      # the worker images, from the deployed binaries
 caos-cli run-tool test       # images + the whole test suite
 caos-cli run-tool test --only="unit-test rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
-CAOS_SALT=$(date +%s) caos-cli run-tool test   # force a re-run (retry a flake)
+caos-cli run-tool test --test-salt=$(date +%s) # force every test to re-run
 ```
+
+Test jobs for one built image share a persistent stack, CAS, and Git remote,
+even across different `CAOS_SALT` values. See `tests/README.md` for the mutable
+ref isolation contract.
 
 nix builds only the *host* stack — the server, the runner daemon, the seeder,
 and the seeded core images. Everything the suite tests is compiled from the

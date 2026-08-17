@@ -26,10 +26,11 @@ git config user.email chat-online-test@caos
 
 # Cheapest model that supports adaptive thinking (the worker always sends
 # thinking:{type:"adaptive"}; haiku-4-5 rejects it with a 400).
-"$CAOS_CLI" talk --model claude-sonnet-5 \
+conv="${CAOS_TEST_RUN_ID}-talk-online"
+"$CAOS_CLI" talk --new -c "$conv" --model claude-sonnet-5 \
   "Use the bash tool to run \`echo pong\`, then reply with just its output."
 
-# A fresh repo has no conversations, so talk auto-named the first one talk-1.
-git rev-parse -q --verify refs/caos/v2/conversations/talk-1/head >/dev/null \
+# The shared test stack may hold conversations from an earlier execution.
+git rev-parse -q --verify "refs/caos/v2/conversations/$conv/head" >/dev/null \
   || { echo "chat-online: FAIL — conversation ref missing" >&2; exit 1; }
-echo "chat-online: one real turn PASSED (conversation talk-1)" >&2
+echo "chat-online: one real turn PASSED (conversation $conv)" >&2

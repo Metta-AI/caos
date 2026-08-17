@@ -32,4 +32,16 @@ echo "== lint-bake-anchor.sh: every std tool's crates.io deps are anchored ==" >
 bash "$CAOS_PROJECT/lint-bake-anchor.sh" \
   || fail "a std tool's crates.io dep is missing from bake-anchor (see above)"
 
+# Salt is cache identity, not a test-run namespace. A nested test may share its
+# stack and Git remote with runs carrying other salts, so silently removing the
+# inherited value makes the boundary lie about both facts. Split the word below
+# so this lint does not match its own source.
+echo "== CAOS_SALT is never removed from an inherited environment ==" >&2
+salt_scrub_pattern='un''set([[:space:]]+[-A-Za-z_][A-Za-z0-9_]*)*[[:space:]]+CAOS_SALT([[:space:];#]|$)'
+salt_env_scrub_pattern='(^|[[:space:];])([^[:space:];]*/)?en''v[[:space:]]+([^#;]*[[:space:]])?(-u[[:space:]]+CAOS_SALT|--unset(=|[[:space:]]+)CAOS_SALT)([[:space:];#]|$)'
+if grep -R -n -E --exclude-dir=.git \
+    -e "$salt_scrub_pattern" -e "$salt_env_scrub_pattern" "$CAOS_PROJECT"; then
+  fail "CAOS_SALT is cache control, not ambient state to scrub (tests/README.md)"
+fi
+
 echo "std-lint: ALL PASS" >&2
