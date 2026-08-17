@@ -1,0 +1,22 @@
+# std/hello — the smallest useful worker: it mirrors its arguments back. This
+# directory IS the tool: its Rust source, this manifest, and its `.caos-expr`.
+#
+# No crates.io dependencies, deliberately. This is what a person runs to check
+# that a caos installation works, so it should fail for one reason only — the
+# installation — and never because a vendored dep drifted from the std/cargo
+# bake. That is also why there is no `[profile.dev.package."*"]` block here:
+# with nothing from crates.io there is no bake artifact to line fingerprints up
+# with (contrast std/rgrep, which carries one for `regex`).
+[package]
+name = "hello"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }

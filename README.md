@@ -599,6 +599,21 @@ caosd reset   # stop and wipe those volumes + the server repo for a clean slate
 caosd version # the caos revision this command was built from
 ```
 
+**Is the installation working?** `std/hello` mirrors its arguments back, which
+exercises the whole path — a client forms an ArgTree, the server schedules it, a
+runner starts a container, a worker reads `/cas/args`, a result comes back — and
+puts the answer on stdout in one command:
+
+```bash
+caos-cli run --base:@=DEEP-DEPS/hello --greeting=hi --who=world
+# hello: 2 arguments
+#   greeting = hi
+#   who = world
+```
+
+Declare it first (`./std/hello hello` in your `DEPS`, or reach it by locator:
+`--base:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/hello`).
+
 ```bash
 caos-cli run-tool build      # the worker images, from the deployed binaries
 caos-cli run-tool test       # images + the whole test suite

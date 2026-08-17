@@ -1,0 +1,7 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). deep-deps mounts each of these RECURSIVELY
+# DEEPENED at DEEP-DEPS/<name> (design/caos-expr.md). `cargo` for
+# the same reason tests/rgrep declares it: rustc's seed binds
+# `--cargo=<hash>` as a LITERAL, which the git closure does not follow.
+../../std/hello hello
+../../std/cargo cargo
