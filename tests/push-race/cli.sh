@@ -33,9 +33,7 @@ set -euo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # The object must be NEW, or the ref already exists and there is no create to
-# race over — the bug would sit right here and the test would pass. A per-run
-# marker is the same device tests/rust-worker uses to force a genuine cold
-# path. The common runner supplies a fresh identity for every actual execution.
+# race over — the bug would sit right here and the test would pass.
 marker="$CAOS_TEST_RUN_ID"
 printf 'push-race probe %s\n' "$marker" > probe
 git add probe

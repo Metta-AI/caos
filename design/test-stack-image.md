@@ -55,9 +55,8 @@ distinction is exactly the distinction between the two stacks:
   result, and it is what the ambient environment resolves to throughout.
 - the **tested** `caos` / `caos-cli` at `/caos/bin`. The interpreter never
   puts these on its own `PATH`. It sets them at the call site and nowhere
-  else. `CAOS_SALT` stays inherited: salt changes cache identity, not which
-  image-keyed stack or persistent Git ref namespace a test reaches. Mutable
-  test refs use the separate execution prefix described in `tests/README.md`.
+  else, with `CAOS_STD` and `CAOS_SALT` scrubbed (the outer run's values must
+  not reach the inner client — `cargo-workers.md`, phase 3).
 
 **Keeping them straight is two independent choices, and both matter.** *Which
 binary* decides whose semantics and protocol you speak: the outer server and

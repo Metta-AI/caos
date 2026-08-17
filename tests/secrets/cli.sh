@@ -93,10 +93,6 @@ EOF
 
 echo '.caos-secrets/' > .gitignore
 commit "secrets fixtures"
-# Publish the commit so the pinned tree (below) is on the server for the
-# `mytool` reader to resolve against. The stack's Git remote outlives this test,
-# so even a throwaway publishing anchor belongs to this execution's namespace.
-# The reader finds the tree by hash, never by this name.
 git push -q caos "HEAD:refs/heads/${CAOS_TEST_RUN_ID}-secrets-test" \
   || fail "pushing workspace to caos"
 

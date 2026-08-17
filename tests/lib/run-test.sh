@@ -86,11 +86,6 @@ case "$TEST_NAME" in
   "" | *[!a-z0-9-]*) fail "invalid test name: $TEST_NAME" ;;
 esac
 
-# A test may run again against the SAME persistent, image-keyed stack even when
-# the two outer runs carry different CAOS_SALT values. Name every mutable ref
-# from an execution prefix decided here, before cli.sh runs. The nonce is born
-# only after this per-test job misses cache, so it does not enter the ArgTree or
-# defeat unchanged-test caching. See tests/README.md.
 CAOS_TEST_RUN_ID="$(date +%s%N)-$TEST_NAME-$$-$RANDOM"
 export CAOS_TEST_RUN_ID
 

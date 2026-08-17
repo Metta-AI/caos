@@ -281,9 +281,9 @@ if [ "$ROLE" != client ]; then
   fail "unknown role \`$ROLE\`; the only job role is \`client\` (\`stack\` is not a caos job — it comes from the environment)"
 fi
 
-# CAOS_SALT remains ambient across this boundary. It changes cache identities,
-# not the image-keyed stack or its persistent Git ref namespace; tests use the
-# separate execution prefix from tests/lib/run-test.sh for mutable names.
+# The OUTER run's salt must not reach the inner client (the phase-3
+# isolation lesson). Scrubbed here, so nothing worker1 starts inherits it.
+unset CAOS_SALT
 
 SOCK=${CAOS_ENGINE_SOCKET:?the test stack needs a granted engine socket}
 [ -S "$SOCK" ] || fail "engine socket $SOCK is not a socket"
