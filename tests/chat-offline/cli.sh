@@ -98,11 +98,12 @@ if [ -z "$stub_pid" ]; then
 fi
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-test_id=$(printf '%s' "${CAOS_SALT:-$(date +%s%N)}" | tr -cd '0-9a-zA-Z')
-conv="chat-$test_id"
+test_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_id}-chat"
 ref="refs/caos/v2/conversations/$conv/head"
-queued_conv="queued-$conv"
+queued_conv="${test_id}-queued-chat"
 queued_ref="refs/caos/v2/conversations/$queued_conv/head"
+bad_conv="${test_id}-bad-chat"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 opts=(--model test-model --base-url "http://$stub_host:$port")
 
@@ -126,11 +127,11 @@ echo reserved > bad/.caos/marker
 git add bad
 git -c user.email=test@caos -c user.name=caos commit -qm "reserved base"
 badbase=$(mkcommit "HEAD:bad" "bad base")
-if "$CAOS_CLI" chat "bad-$conv" -m "hello" --base "$badbase" "${opts[@]}" 2>base.err; then
+if "$CAOS_CLI" chat "$bad_conv" -m "hello" --base "$badbase" "${opts[@]}" 2>base.err; then
   fail "chat accepted a base with top-level .caos"
 fi
 grep -q "\.caos" base.err || fail "reserved-base error is unclear"
-if remote_tip "refs/caos/v2/conversations/bad-$conv/head" >/dev/null; then
+if remote_tip "refs/caos/v2/conversations/$bad_conv/head" >/dev/null; then
   fail "reserved-base failure created a conversation"
 fi
 if [ -e stub/request-1.json ]; then
@@ -255,7 +256,7 @@ grep -qF "assistant: $T1_TEXT" log.out || fail "log misses first assistant event
 grep -qF "tester: and now?" log.out || fail "log misses second user event"
 grep -qF "assistant: $T2_TEXT" log.out || fail "log misses recovered assistant event"
 
-fresh="chat-fresh-$test_id"
+fresh="${test_id}-chat-fresh"
 "$CAOS_CLI" talk --new -c "$fresh" "fresh start" "${opts[@]}" >talk.out 2>talk.err
 grep -qF "$T3_TEXT" talk.out || fail "fresh conversation response is missing"
 auto_ref="refs/caos/v2/conversations/$fresh/head"

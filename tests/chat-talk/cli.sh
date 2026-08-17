@@ -99,7 +99,8 @@ done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-conv="talkseed-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-talkseed"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
@@ -133,7 +134,7 @@ grep -qF '{"content":"and now?","role":"user"}' stub/request-3.json \
   || fail "earlier turns not replayed — talk continued the wrong conversation"
 echo "  ok: std workers, selected conversation continued and advanced" >&2
 
-fresh="talk-fresh-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+fresh="${test_run_id}-talk-fresh"
 stage "talk --new starts a named conversation"
 "$CAOS_CLI" talk --new -c "$fresh" "fresh start" "${opts[@]}" > talk2.out 2>talk2.err
 sed 's/^/  talk2| /' talk2.out >&2
