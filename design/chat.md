@@ -312,6 +312,9 @@ Each local submission remains optimistically visible until its exact durable
 commit appears. Peer appends cannot erase it. On failure, the client restores
 the submitted text only if doing so will not replace a newer draft.
 
+Activity is refolded from the durable log whenever the head changes. The client
+retains only its selection and scroll position across that refresh.
+
 The initial transaction creates a deterministic fallback title. Asynchronous
 title generation may replace only that exact value by CAS; a manual or foreign
 rename wins. Membership changes similarly use atomic leases so active and
