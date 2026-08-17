@@ -21,12 +21,12 @@ Caos breaks building and testing into small pieces and caches the results. When 
 
 Today, most people run most of their agent workloads on their local machine for convenience. When the work no longer fits, they buy a desktop and try to interact with it over tmux. If the work grows further, they have to split it up between cloud instances. If an agent wants to spin up subagents on other computers, it gets even more annoying
 
-Caos runs work well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers
+Caos runs well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers
 
 # What
 
 * Your code is already in git. You already know docker
-* Caos provides to glue to use git as a distributed file system and docker containers as functions. We cache the results in redis
+* Caos provides the glue to use git as a distributed file system and docker containers as functions. We cache the results in redis
 * Workers (containers) receive their inputs as git objects, and lazily load only as much as they need. They stage their results into git. None of this is committed or clogs your main git repo
 * Workers can call other workers. They can also define other workers in their git return values (similar to functional programming)
 * Once we've run a worker with an input, we cache the mapping to the output value and reuse it for future requests
