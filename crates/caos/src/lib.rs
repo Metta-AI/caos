@@ -3420,33 +3420,49 @@ fn resolve_cas_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// evaluating it, which is the only image form the CLI reads off the filesystem
 /// (`:docker=` and `:hash=` name things that need no host at all).
 ///
-/// A directory is the only name a caller needs, because a tree says how it is
-/// built. There is deliberately no name-to-image lookup here: the CLI resolves
-/// a dependency by DESCENT through the tree it was handed (`DEEP-DEPS/<name>`),
+/// A path is the only name a caller needs, because a tree says how it is built.
+/// There is deliberately no name-to-image lookup here: the CLI resolves a
+/// dependency by DESCENT through the tree it was handed (`DEEP-DEPS/<name>`),
 /// which is what makes a caller's dependencies its own declared edges rather
 /// than whatever an ambient library happens to hold.
+///
+/// The descent starts at the WORKSPACE ROOT, not at the named directory. It used
+/// to ingest only that directory and evaluate it in isolation, which quietly made
+/// the local operator weaker than the remote one:
+///
+/// ```text
+/// $ caos-cli eval-path std/hello            # descends from the root
+/// tree e72a747…
+/// $ caos-cli run --base:@=std/hello         # evaluated in isolation
+/// eval-path: base path "DEEP-DEPS/rustc" not found in tree
+/// ```
+///
+/// Both failed for the same reason a raw `:@@=` walk did (design/flake-inputs.md,
+/// 4a): an entry's expression names `DEEP-DEPS/<dep>` mounts that exist only once
+/// the ROOT expression has deepened the tree, so evaluating the entry alone can
+/// never see them — a pinned consumer could reach `std/hello` while this repo
+/// could not reach its own.
+///
+/// Two consequences. The path need not exist ON DISK, since `DEEP-DEPS/<name>`
+/// is created by the root expression; and in a repo carrying a root `.caos-expr`
+/// a `:@=` image deepens the whole tree first — a cached run, and exactly what
+/// `eval-path` and `run-tool` already do.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    // Ingest the directory exactly like a `--name:@=path` arg (git-tracked paths
-    // only) and hand the server its tree hash. A flake dir is NOT special-cased
-    // here or on the server — it carries a `.caos-expr` naming its builder, and
-    // the evaluation below turns it into an image, so what the server receives is
-    // already one (design/caos-expr.md).
-    if !Path::new(image).is_dir() {
-        return Err(format!(
-            "`:@=` names a directory to ingest; {image:?} is not one \
-             (a registry image is --base:docker=<ref>, an object --base:hash=<oid>)"
-        ));
-    }
-    let (_, oid) = t
-        .ingest_path(image)?
-        .ok_or_else(|| format!("this transport cannot ingest the image dir {image}"))?;
-    // A tree carrying a `.caos-expr` says how it is built, so resolving it means
-    // evaluating it — the same rule `resolve_expr_base` applies to a path named
-    // inside an expression. This is what lets a caller name a dependency by its
-    // deep-deps mount (`--base:@=DEEP-DEPS/rgrep`) — a path it holds, not a name
-    // it looks up; a tree with no `.caos-expr` (a plain flake dir, a git-docker
-    // image) evaluates to itself and nothing changes.
-    eval::eval_tree(t, &oid.to_string())
+    // The tracked workspace (dirty edits included), exactly as `eval-path` with
+    // no `--tree` starts. A flake dir is NOT special-cased here or on the
+    // server — it carries a `.caos-expr` naming its builder, and the evaluation
+    // turns it into an image, so what the server receives is already one
+    // (design/caos-expr.md).
+    let (_, ws) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+    // Descend THROUGH evaluation: each `.caos-expr` from the root down is
+    // applied, and `image` is looked up in what the one above it produced. A
+    // tree with no `.caos-expr` (a plain flake dir, a git-docker image)
+    // evaluates to itself and nothing changes.
+    eval::eval_path(t, &ws.to_string(), image, &[])
+        .map(|(_kind, hash)| hash)
+        .map_err(|e| format!("resolving {image:?}: {e}"))
 }
 
 /// `curry [--unbind=<name> …] --base:<type>=<arg tree> [--name=value ...]` —

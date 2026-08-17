@@ -4,4 +4,7 @@
 # the same reason tests/rgrep declares it: rustc's seed binds
 # `--cargo=<hash>` as a LITERAL, which the git closure does not follow.
 ../../std/hello hello
+# `bash` for the nested-base fixture in cli.sh: it needs an ANCESTOR expression,
+# and the cheapest one to write is a bash run.
+../../std/bash bash
 ../../std/cargo cargo

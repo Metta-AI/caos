@@ -93,19 +93,6 @@ pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String
         })
 }
 
-/// Evaluate a tree's own root `.caos-expr` to the object it builds; a tree
-/// carrying none evaluates to itself.
-///
-/// This is the rule [`resolve_expr_base`] applies to a path named *inside* an
-/// expression, lifted to the CLI boundary — so a caller reaches a dependency by
-/// its deep-deps mount (`run --base:@=DEEP-DEPS/rgrep`) exactly as an expression does,
-/// rather than by any name looked up outside the tree it was handed.
-pub(crate) fn eval_tree(t: &dyn Transport, tree: &str) -> Result<String, String> {
-    // As in [`eval_workspace_dep`]: the result is an image that the caller's own
-    // arg-tree assembly marks, so this walk carries no store.
-    eval_path(t, tree, "", &[]).map(|(_kind, oid)| oid)
-}
-
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
 /// root of the tree down to `<path>` and print the resulting object's
 /// `"<kind> <hash>"`. With no `--tree`, the tracked workspace tree is the start
