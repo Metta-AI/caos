@@ -21,12 +21,12 @@ Caos breaks building and testing into small pieces and caches the results. When 
 
 Today, most people run most of their agent workloads on their local machine for convenience. When the work no longer fits, they buy a desktop and try to interact with it over tmux. If the work grows further, they have to split it up between cloud instances. If an agent wants to spin up subagents on other computers, it gets even more annoying
 
-Caos runs work well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers
+Caos runs well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers
 
 # What
 
 * Your code is already in git. You already know docker
-* Caos provides to glue to use git as a distributed file system and docker containers as functions. We cache the results in redis
+* Caos provides the glue to use git as a distributed file system and docker containers as functions. We cache the results in redis
 * Workers (containers) receive their inputs as git objects, and lazily load only as much as they need. They stage their results into git. None of this is committed or clogs your main git repo
 * Workers can call other workers. They can also define other workers in their git return values (similar to functional programming)
 * Once we've run a worker with an input, we cache the mapping to the output value and reuse it for future requests
@@ -41,7 +41,7 @@ Caos runs work well-defined binaries with well-defined inputs and well-defined e
 | `worker-common` | — | Shared library for the Rust workers. |
 | `worker-runner` | — (`std/runner`'s `/worker`) | The in-image runner trampoline: receives a compiled worker binary as its `worker1` arg and execs it, so every compiled worker rides one shared image as `curry(std/runner, worker1=<binary>)`. |
 | `worker-rustc` | — (run as `curry(runner, worker1)`) | Builds a worker from Rust source. See [workers](#workers). |
-| `worker-bash-tool`, `worker-llm-call`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: bounded bash, stateless LLM calls, durable LLM turns, and recursive grep. See `design/agent-harness.md`. |
+| `worker-bash-tool`, `worker-llm-call`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: bounded bash, stateless LLM calls, durable LLM turns, and recursive grep. See `design/chat.md` for the current chat protocol and `design/agent-harness.md` for its historical rationale. |
 | `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (pinned toolchain + pre-compiled deps + this binary as `/worker`; its image is host-built and streamed like the runner, `caos-worker-cargo-docker` — see `std/cargo/` and `design/cargo-workers.md`) — the agent's `build`/`test` tools. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the LLM worker tests. |
 
@@ -148,11 +148,12 @@ dev, `caosd up` creates a dedicated bare repo for it under `CAOS_DATA` (see
 
 It serves requests **concurrently — one thread per request** — so a worker can
 fetch objects while its own `/run` is in flight, and several top-level runs can
-proceed at once. Workers never call back into `/run`: a worker that needs
-sub-computations records a **map-then continuation** as its result and finishes
-its job, and the server resolves it (see [compute](#compute)) — so no worker
-ever waits on another worker and nothing can deadlock. Capacity lives
-runner-side: the set of hanging `/runner/poll`s *is* the pool.
+proceed at once. Ordinary dependent sub-computations use a **map-then
+continuation**: the worker records the continuation as its result and finishes
+its job before the server resolves it (see [compute](#compute)). `run-async` is
+the deliberate exception: it starts a detached `/run` request from a worker and
+returns the request hash immediately, without waiting for that subrequest.
+Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 
 | Request | Behaviour |
 |---|---|
@@ -163,6 +164,7 @@ runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
+| `POST /ref/read`, `POST /ref/append` | Exact ref lookup and first-parent compare-and-append, used by durable event logs without downloading every advertised ref. |
 
 The git transport is what makes the server a `caos` remote: `git http-backend`
 runs `upload-pack`/`receive-pack` over the same `/git` repo, with hooks intact
@@ -198,24 +200,30 @@ match on the worker alongside the rest, and a worker, seeing its args at
 3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es
    through its promise sub-runs (below); re-entering one on the stack has no
    fixpoint, so the run fails listing the cycle;
-4. **resolve the image** — a `docker://<ref>` is used directly; one of our git
+4. **join an in-flight request** — the first cold miss for an `argTreeHash` is
+   the owner; concurrent arrivals wait for its exact outcome. An arrival runs
+   independently only when waiting would close a cross-thread dependency cycle,
+   allowing the ordinary stack check to report that cycle instead of deadlocking;
+5. **resolve the image** — a `docker://<ref>` is used directly; one of our git
    images is converted to a real image, pushed to the registry, and run by
    digest (see [git images](#git-images));
-5. **dispatch to a runner** — the job is matched against the hanging
+6. **dispatch to a runner** — the job is matched against the hanging
    `/runner/poll`s (a runner's required args are name → oid pairs the
    ArgTree's top level must equal; most specific match wins, so a warm runner
    already running this image beats the generic `caos-runnerd`, which starts a
    fresh container `/bin/caos runner --job=<json>`);
-6. the runner posts back either the result, `"<type> <hash>"`, or a
+7. the runner posts back either the result, `"<type> <hash>"`, or a
    **promise**, `"promise <hash>"`: a map-then continuation the worker recorded
    instead of a value (see
    [map-then](#map-then-sub-computations-without-blocking)). The worker has
    already moved on; the server **resolves** the promise — running `map` over
    the children in parallel, then `then` — through this same pipeline, so
    sub-runs are cached, cycle-checked, and may themselves promise;
-7. **cache** the resolved result, and for an **external** run (one that arrived
+8. **cache** the resolved result, and for an **external** run (one that arrived
    over HTTP) pin `refs/caos/res/<argTreeHash>` at it, for durability and as a
-   fetch/watch point. Sub-runs set no ref.
+   fetch/watch point. Result refs are hidden from upload-pack/fetch
+   advertisements, but receive-pack can negotiate them and exact
+   `POST /ref/read` lookup remains available. Sub-runs set no ref.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
@@ -252,8 +260,11 @@ Results, converted images, and built layers are cached in Redis
 (`caos:result:<argTreeHash>`, `caos:image:<git-hash>`, `caos:layer:<tree-hash>`).
 A hit on the result key skips the container entirely (logged `cache hit …` vs
 `cache miss …`). Redis is best-effort: if it's unreachable the server logs and
-runs uncached. There are no locks yet, so two identical cold-cache requests may
-both run.
+runs uncached. Cold misses are single-flighted in the server: identical
+requests join one live owner, and image conversion and layer publication use
+the same per-key pattern. A request runs independently only when the waits-for
+graph proves that joining would form a cycle. Losing an owner fails and wakes
+its waiters so a later arrival can become the new owner.
 
 ### Git images
 
@@ -295,8 +306,9 @@ logic — the difference is the **transport** and the privilege model.
     host path;
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
-  - `talk` / `chat` — agent conversations over the harness
-    (design/agent-harness.md); `caos talk "<prompt>"` is the everyday form;
+  - `talk` / `chat` — agent conversations over the current protocol
+    (`design/chat.md`; `design/agent-harness.md` records historical rationale);
+    `caos talk "<prompt>"` is the everyday form;
   - `secrets [--check]` — tend the git-ignored `.caos-secrets` store: fill a
     missing `entropy=`, warn on a weak one (`--check` reports only and exits
     non-zero, for CI). Offline — no server (design/secrets.md).
@@ -663,6 +675,8 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
 - **Native (C) dependencies**: a crate linking C libraries (e.g. `openssl`)
   needs a `musl` cross-toolchain to stay static — see the commented
   `buildInputs`/`nativeBuildInputs` in `flake.nix`.
-- **Cleanup (dev)**: `refs/caos/req/*` and `refs/caos/res/*` accumulate on the
-  server repo (content-addressed, so they dedup); a real deployment should expire
-  them by age and `git gc`.
+- **Cleanup (dev)**: transient `refs/caos/req/*` are pruned after ten minutes.
+  Durable `refs/caos/res/*` are hidden from upload-pack/fetch advertisements but
+  remain visible to receive-pack negotiation and exact `/ref/read`; they still
+  accumulate (content-addressed, so they dedup). A deployment that does not need
+  indefinite result lookup should define a retention policy and run `git gc`.

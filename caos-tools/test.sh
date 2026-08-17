@@ -144,7 +144,9 @@ deepener)
   # core-seeder-runner answers it with the host's image — no evaluator in the
   # worker, no blocking run, no world crossing. If the sentinel ever changes,
   # this forms a key nothing answers and the job fails loudly on the pending
-  # timeout; it cannot quietly deepen with the wrong thing.
+  # timeout; it cannot quietly deepen with the wrong thing. As with ordinary
+  # expression evaluation, `--in:@=.` excludes the expression file itself, so
+  # project that entry before forming the manual sentinel request.
   caos get /cas/args/in/std
   caos get /cas/args/in/std/deep-deps
 

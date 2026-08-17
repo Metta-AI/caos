@@ -1,14 +1,18 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, conversation_replay, conversation_workspace_diff, describe_tool_set,
-    first_available_conversation_name, generate_conversation_title, list_user_conversations,
-    publish_unindexed_conversations, publish_user_conversation, run_chat_turn,
-    set_conversation_title, unarchive_user_conversation, ConversationRole, ToolSetDescription,
-    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
-    UserConversationSummary, WorkspaceDiff,
+    archive_user_conversation, compare_and_set_conversation_title, conversation_load,
+    conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
+    first_available_conversation_name, fork_conversation, generate_conversation_title,
+    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
+    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
+    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
+    InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
+    UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -19,8 +23,9 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
-    publish_conversation_pr, remote_default_branch,
+    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
+    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
+    publish_merge_target, remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -89,10 +94,11 @@ pub(crate) enum Focus {
     Conversation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum EntryRole {
     Human,
-    Agent,
+    Peer(String),
+    Agent(Option<String>),
     Info,
     Notice,
 }
@@ -102,6 +108,27 @@ struct TranscriptEntry {
     role: EntryRole,
     commit: Option<String>,
     text: String,
+    pending_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSubmission {
+    id: u64,
+    text: String,
+    commit: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceNotice {
+    refname: String,
+    head: String,
+}
+
+struct RemotePollEntry {
+    summary: UserConversationSummary,
+    observed_head: Option<String>,
+    observed_title: Option<String>,
+    load: Option<Result<Box<ConversationLoad>, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +168,8 @@ enum ActivityState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Activity {
+    request: String,
+    round: u64,
     id: String,
     step_commit: String,
     name: String,
@@ -150,6 +179,10 @@ struct Activity {
 }
 
 impl Activity {
+    fn answers(&self, request: &str, round: u64, tool_use_id: &str) -> bool {
+        self.request == request && self.round == round && self.id == tool_use_id
+    }
+
     fn running_verb(&self) -> &'static str {
         match self.name.as_str() {
             "bash" => "Running",
@@ -180,10 +213,14 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
         match event {
             TurnEvent::ToolCall {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 name,
                 summary,
             } => activities.push(Activity {
+                request: request.clone(),
+                round: *round,
                 id: tool_use_id.clone(),
                 step_commit: step_commit.clone(),
                 name: name.clone(),
@@ -193,13 +230,15 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
             }),
             TurnEvent::ToolResult {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 is_error,
                 content,
             } => {
                 if let Some(activity) = activities
                     .iter_mut()
-                    .find(|activity| activity.id == *tool_use_id)
+                    .find(|activity| activity.answers(request, *round, tool_use_id))
                 {
                     activity.state = if *is_error {
                         ActivityState::Failed
@@ -209,6 +248,8 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
                     activity.detail = content.clone();
                 } else {
                     activities.push(Activity {
+                        request: request.clone(),
+                        round: *round,
                         id: tool_use_id.clone(),
                         step_commit: step_commit.clone(),
                         name: "result".to_string(),
@@ -561,6 +602,20 @@ impl Composer {
         Some(message)
     }
 
+    /// Put a failed submission back in the draft without replacing anything
+    /// the user typed while the request was in flight.
+    fn restore_message(&mut self, message: &str) {
+        if self.expanded_text().trim() == message.trim() {
+            return;
+        }
+        self.selection_anchor = None;
+        self.cursor = self.text.len();
+        if !self.text.is_empty() {
+            self.insert_str("\n\n");
+        }
+        self.insert_str(message);
+    }
+
     fn clear(&mut self) -> bool {
         if self.text.is_empty() && self.pending_pastes.is_empty() {
             return false;
@@ -699,8 +754,49 @@ impl Composer {
             .collect()
     }
 
+    fn model_token(&self) -> Option<(usize, usize, &str)> {
+        const PREFIX: &str = "/model";
+        if self.command_menu_dismissed || !self.text.starts_with(PREFIX) {
+            return None;
+        }
+        let arguments = &self.text[PREFIX.len()..];
+        if !arguments.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let start = arguments
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(offset, _)| PREFIX.len() + offset)
+            .unwrap_or(self.text.len());
+        let end = self.text[start..]
+            .find(char::is_whitespace)
+            .map(|offset| start + offset)
+            .unwrap_or(self.text.len());
+        (self.cursor >= start && self.cursor <= end).then(|| (start, end, &self.text[start..end]))
+    }
+
+    fn model_matches(&self) -> Vec<&'static str> {
+        let Some((_, _, token)) = self.model_token() else {
+            return Vec::new();
+        };
+        MODEL_OPTIONS
+            .iter()
+            .copied()
+            .filter(|model| {
+                model.starts_with(token)
+                    || model
+                        .strip_prefix("claude-")
+                        .is_some_and(|short| short.starts_with(token))
+            })
+            .collect()
+    }
+
+    fn completion_count(&self) -> usize {
+        self.command_matches().len() + self.model_matches().len()
+    }
+
     fn select_command(&mut self, amount: isize) -> bool {
-        let count = self.command_matches().len();
+        let count = self.completion_count();
         if count == 0 {
             return false;
         }
@@ -710,15 +806,22 @@ impl Composer {
     }
 
     fn complete_command(&mut self) -> bool {
-        let Some(command) = self.command_matches().get(self.command_selection).copied() else {
+        if let Some(command) = self.command_matches().get(self.command_selection).copied() {
+            let token_end = self
+                .text
+                .find(char::is_whitespace)
+                .unwrap_or(self.text.len());
+            self.text.replace_range(..token_end, command.name);
+            self.cursor = command.name.len();
+        } else if let (Some((start, end, _)), Some(model)) = (
+            self.model_token(),
+            self.model_matches().get(self.command_selection).copied(),
+        ) {
+            self.text.replace_range(start..end, model);
+            self.cursor = start + model.len();
+        } else {
             return false;
-        };
-        let token_end = self
-            .text
-            .find(char::is_whitespace)
-            .unwrap_or(self.text.len());
-        self.text.replace_range(..token_end, command.name);
-        self.cursor = command.name.len();
+        }
         self.selection_anchor = None;
         if let Some(ch) = self.text[self.cursor..].chars().next() {
             self.cursor += ch.len_utf8();
@@ -731,7 +834,7 @@ impl Composer {
     }
 
     fn dismiss_command_menu(&mut self) -> bool {
-        if self.command_matches().is_empty() {
+        if self.completion_count() == 0 {
             return false;
         }
         self.command_menu_dismissed = true;
@@ -748,7 +851,10 @@ impl Composer {
 enum CommandAction {
     From,
     Help,
+    Invite,
+    Model,
     Palette,
+    Reference,
     Title,
     UpdateTree,
 }
@@ -762,7 +868,21 @@ struct Command {
     takes_argument: bool,
 }
 
-const COMMANDS: [Command; 5] = [
+// Completion hints for current public models compatible with llm-step's
+// adaptive-thinking request. Explicit strings remain accepted for gateways
+// and newly released models.
+const MODEL_OPTIONS: [&str; 8] = [
+    "default",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+];
+
+const COMMANDS: [Command; 8] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -798,6 +918,27 @@ const COMMANDS: [Command; 5] = [
         action: CommandAction::Palette,
         takes_argument: false,
     },
+    Command {
+        name: "/ref",
+        usage: "/ref",
+        description: "show the copyable conversation ref and full head hash",
+        action: CommandAction::Reference,
+        takes_argument: false,
+    },
+    Command {
+        name: "/invite",
+        usage: "/invite <username>",
+        description: "add to one username's sidebar (case-sensitive; spaces allowed)",
+        action: CommandAction::Invite,
+        takes_argument: true,
+    },
+    Command {
+        name: "/model",
+        usage: "/model <name|default>",
+        description: "select the model for future turns in this client",
+        action: CommandAction::Model,
+        takes_argument: true,
+    },
 ];
 
 fn parse_command(message: &str) -> Option<(&'static Command, &str)> {
@@ -819,104 +960,237 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    remote_title: Option<String>,
     sidebar_attention: Option<String>,
     automatic_title: bool,
     automatic_title_fallback_applied: bool,
+    automatic_title_fallback: Option<String>,
     generating_title: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
+    pending_submissions: Vec<PendingSubmission>,
+    next_pending_submission: u64,
     activities: Vec<Activity>,
     diff: Option<WorkspaceDiff>,
     tool_set: Option<Result<ToolSetDescription, String>>,
     composer: Composer,
     status: String,
     command_error: Option<String>,
+    reference_notice: Option<ReferenceNotice>,
+    reference_loading: bool,
+    reference_generation: u64,
     publish_prompt: bool,
     running: bool,
+    local_turn: bool,
+    active_request: Option<String>,
+    reconciling_request: Option<String>,
+    reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
+    forking: bool,
     scroll: ScrollState,
     unread_below: bool,
     transcript_selection: Option<TranscriptSelection>,
     activity_selection: Option<usize>,
     activity_detail_scroll: usize,
+    remote_head: Option<String>,
 }
 
 impl ConversationState {
     fn new(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
+        let remote_title = Some(title.clone());
         Self {
             id,
             title,
+            remote_title,
             sidebar_attention: None,
             automatic_title: false,
             automatic_title_fallback_applied: false,
+            automatic_title_fallback: None,
             generating_title: false,
             turn_options,
             transcript: Vec::new(),
+            pending_submissions: Vec::new(),
+            next_pending_submission: 0,
             activities: Vec::new(),
             diff: None,
             tool_set: None,
             composer: Composer::default(),
             status,
             command_error: None,
+            reference_notice: None,
+            reference_loading: false,
+            reference_generation: 0,
             publish_prompt: false,
             running: false,
+            local_turn: false,
+            active_request: None,
+            reconciling_request: None,
+            reconcile_after: None,
             turn_phase: TurnPhase::System,
             publishing: false,
+            forking: false,
             scroll: ScrollState::default(),
             unread_below: false,
             transcript_selection: None,
             activity_selection: None,
             activity_detail_scroll: 0,
+            remote_head: None,
         }
     }
 
     fn new_virtual(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         let mut state = Self::new(id, title, turn_options, status);
         state.automatic_title = true;
+        state.remote_title = None;
         state
     }
 
-    fn reload(&mut self, transport: &GitTransport) {
-        match conversation_replay(transport, &self.id) {
-            Ok(replay) => {
-                self.activities = replay
-                    .turn_events
-                    .last()
-                    .map(|turn| replayed_activities(&turn.events))
-                    .unwrap_or_default();
-                self.activity_selection = self.activities.len().checked_sub(1);
-                self.activity_detail_scroll = 0;
-                self.transcript = replay
-                    .turns
-                    .into_iter()
-                    .map(|turn| TranscriptEntry {
-                        role: match turn.role {
-                            ConversationRole::Human => EntryRole::Human,
-                            ConversationRole::Agent => EntryRole::Agent,
-                        },
-                        commit: Some(turn.commit),
-                        text: turn.message,
+    fn apply_load(&mut self, load: ConversationLoad, current_user: &str) {
+        if self
+            .reference_notice
+            .as_ref()
+            .is_some_and(|notice| notice.head != load.snapshot.head)
+        {
+            self.reference_notice = None;
+        }
+        let preserve_local_lifecycle = self.running
+            && self.local_turn
+            && matches!(load.snapshot.status.as_str(), "queued" | "running")
+            && self
+                .active_request
+                .as_ref()
+                .is_none_or(|request| load.snapshot.request.as_ref() == Some(request));
+        let local_lifecycle = preserve_local_lifecycle.then(|| {
+            (
+                self.activities.clone(),
+                self.activity_selection,
+                self.activity_detail_scroll,
+                self.status.clone(),
+                self.turn_phase,
+                self.reconciling_request.clone(),
+                self.reconcile_after,
+            )
+        });
+        self.apply_snapshot(&load.snapshot);
+        self.activities = load
+            .replay
+            .turn_events
+            .last()
+            .map(|turn| replayed_activities(&turn.events))
+            .unwrap_or_default();
+        self.activity_selection = self.activities.len().checked_sub(1);
+        self.activity_detail_scroll = 0;
+        let mut transcript: Vec<_> = load
+            .replay
+            .turns
+            .into_iter()
+            .map(|turn| TranscriptEntry {
+                role: match turn.role {
+                    ConversationRole::Human if turn.author != current_user => {
+                        EntryRole::Peer(turn.author)
+                    }
+                    ConversationRole::Human => EntryRole::Human,
+                    ConversationRole::Agent => EntryRole::Agent(turn.model),
+                },
+                commit: Some(turn.commit),
+                text: turn.message,
+                pending_id: None,
+            })
+            .collect();
+        self.pending_submissions.retain(|pending| {
+            pending.commit.as_ref().is_none_or(|commit| {
+                !transcript
+                    .iter()
+                    .any(|entry| entry.commit.as_deref() == Some(commit))
+            })
+        });
+        transcript.extend(
+            self.pending_submissions
+                .iter()
+                .map(|pending| TranscriptEntry {
+                    role: EntryRole::Human,
+                    commit: None,
+                    text: pending.text.clone(),
+                    pending_id: Some(pending.id),
+                }),
+        );
+        self.transcript = transcript;
+        self.diff = Some(load.workspace_diff);
+        self.remote_head = Some(load.snapshot.head);
+        self.transcript_selection = None;
+        if let Some((
+            activities,
+            activity_selection,
+            activity_detail_scroll,
+            status,
+            turn_phase,
+            reconciling_request,
+            reconcile_after,
+        )) = local_lifecycle
+        {
+            self.activities = activities;
+            self.activity_selection = activity_selection;
+            self.activity_detail_scroll = activity_detail_scroll;
+            self.status = status;
+            self.turn_phase = turn_phase;
+            self.local_turn = true;
+            self.reconciling_request = reconciling_request;
+            self.reconcile_after = reconcile_after;
+        }
+    }
+
+    fn reload(
+        &mut self,
+        transport: &GitTransport,
+        current_user: &str,
+    ) -> Option<ConversationSnapshot> {
+        match conversation_load(transport, &self.id) {
+            Ok(Some(load)) => {
+                let snapshot = load.snapshot.clone();
+                self.apply_load(load, current_user);
+                return Some(snapshot);
+            }
+            Ok(None) => {
+                self.reference_notice = None;
+                self.transcript = self
+                    .pending_submissions
+                    .iter()
+                    .map(|pending| TranscriptEntry {
+                        role: EntryRole::Human,
+                        commit: None,
+                        text: pending.text.clone(),
+                        pending_id: Some(pending.id),
                     })
                     .collect();
-                match conversation_workspace_diff(transport, &self.id) {
-                    Ok(diff) => self.diff = Some(diff),
-                    Err(error) => {
-                        self.diff = None;
-                        self.push_error(format!("loading workspace changes failed: {error}"));
-                    }
-                }
-            }
-            Err(error) => {
-                self.transcript.clear();
                 self.activities.clear();
                 self.activity_selection = None;
                 self.activity_detail_scroll = 0;
                 self.diff = None;
+                self.remote_head = None;
+            }
+            Err(error) => {
                 self.push_error(format!("loading conversation failed: {error}"));
             }
         }
         self.transcript_selection = None;
+        None
+    }
+
+    fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
+        self.running = matches!(snapshot.status.as_str(), "queued" | "running");
+        self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
+        self.status = match snapshot.status.as_str() {
+            "queued" => "queued".to_string(),
+            "running" => "agent running".to_string(),
+            "idle" => format!("updated {}", short_hash(&snapshot.head)),
+            other => other.to_string(),
+        };
+        if !self.running {
+            self.reconciling_request = None;
+            self.reconcile_after = None;
+            self.local_turn = false;
+        }
     }
 
     fn current_hash(&self) -> Option<&str> {
@@ -927,7 +1201,7 @@ impl ConversationState {
     }
 
     fn is_busy(&self) -> bool {
-        self.running || self.publishing
+        self.running || self.publishing || self.forking
     }
 
     fn push_error(&mut self, error: impl Into<String>) {
@@ -937,6 +1211,7 @@ impl ConversationState {
             role: EntryRole::Notice,
             commit: None,
             text: error.into(),
+            pending_id: None,
         });
         self.transcript_selection = None;
     }
@@ -948,6 +1223,7 @@ impl ConversationState {
             role: EntryRole::Info,
             commit: None,
             text: message.into(),
+            pending_id: None,
         });
         self.transcript_selection = None;
     }
@@ -958,10 +1234,81 @@ impl ConversationState {
         self.transcript_selection = None;
     }
 
+    fn show_command_error_preserving_status(&mut self, error: impl Into<String>) {
+        self.command_error = Some(error.into());
+        self.transcript_selection = None;
+    }
+
     fn note_transcript_append(&mut self) {
         if self.scroll.offset.is_some() {
             self.unread_below = true;
         }
+    }
+
+    fn queue_pending_submission(&mut self, text: String) -> u64 {
+        let id = self.next_pending_submission;
+        self.next_pending_submission = self.next_pending_submission.wrapping_add(1);
+        self.pending_submissions.push(PendingSubmission {
+            id,
+            text: text.clone(),
+            commit: None,
+        });
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text,
+            pending_id: Some(id),
+        });
+        id
+    }
+
+    fn mark_pending_submission(&mut self, id: u64, commit: String) {
+        if self
+            .transcript
+            .iter()
+            .any(|entry| entry.commit.as_deref() == Some(commit.as_str()))
+        {
+            self.discard_pending_submission(id);
+            return;
+        }
+        if let Some(pending) = self
+            .pending_submissions
+            .iter_mut()
+            .find(|pending| pending.id == id)
+        {
+            pending.commit = Some(commit);
+        }
+        let durable_is_visible = self
+            .pending_submissions
+            .iter()
+            .find(|pending| pending.id == id)
+            .and_then(|pending| pending.commit.as_deref())
+            .is_some_and(|commit| {
+                self.transcript
+                    .iter()
+                    .any(|entry| entry.commit.as_deref() == Some(commit))
+            });
+        if durable_is_visible {
+            self.discard_pending_submission(id);
+        }
+    }
+
+    fn discard_pending_submission(&mut self, id: u64) {
+        self.pending_submissions.retain(|pending| pending.id != id);
+        self.transcript.retain(|entry| entry.pending_id != Some(id));
+    }
+
+    fn restore_pending_submission(&mut self, id: u64) {
+        let Some(pending) = self
+            .pending_submissions
+            .iter()
+            .find(|pending| pending.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.discard_pending_submission(id);
+        self.composer.restore_message(&pending.text);
     }
 
     fn follow_tail(&mut self) {
@@ -970,8 +1317,12 @@ impl ConversationState {
     }
 
     fn apply_automatic_title(&mut self, prompt: &str) {
-        if self.automatic_title && !self.automatic_title_fallback_applied {
-            self.title = automatic_title(prompt);
+        if !self.automatic_title_fallback_applied {
+            let fallback = automatic_title(prompt);
+            if self.automatic_title {
+                self.title = fallback.clone();
+            }
+            self.automatic_title_fallback = Some(fallback);
             self.automatic_title_fallback_applied = true;
         }
     }
@@ -985,7 +1336,7 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
-        } else if self.publishing {
+        } else if self.reference_loading || self.publishing {
             self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
             attention.clone()
@@ -1024,17 +1375,39 @@ impl ConversationState {
 }
 
 enum UiMessage {
+    Forked {
+        conversation: String,
+        origin: String,
+        source: String,
+        result: Result<(String, Box<ConversationLoad>), String>,
+    },
     Turn {
         conversation: String,
         event: TurnEvent,
     },
     Failed {
         conversation: String,
+        pending_id: u64,
         error: String,
     },
     Completed {
         conversation: String,
         outcome: TurnOutcome,
+    },
+    SubmissionCommitted {
+        conversation: String,
+        pending_id: u64,
+        commit: String,
+    },
+    InterjectionRefreshed {
+        conversation: String,
+        observed_head: Option<String>,
+        load: Result<Box<ConversationLoad>, String>,
+    },
+    InterjectionFailed {
+        conversation: String,
+        pending_id: u64,
+        error: String,
     },
     TitleGenerated {
         conversation: String,
@@ -1043,6 +1416,20 @@ enum UiMessage {
     Published {
         conversation: String,
         result: Result<String, String>,
+    },
+    Reconciled {
+        conversation: String,
+        request: String,
+        result: Result<(), String>,
+    },
+    ReferenceLoaded {
+        conversation: String,
+        generation: u64,
+        observed_head: Option<String>,
+        result: Result<(String, Option<String>), String>,
+    },
+    RemotePolled {
+        result: Result<Vec<RemotePollEntry>, String>,
     },
 }
 
@@ -1201,6 +1588,7 @@ pub(crate) struct App {
     copied_chars: Option<usize>,
     animation_frame: usize,
     enhanced_keyboard: bool,
+    remote_polling: bool,
     view: View,
     focus: Focus,
     tx: Sender<UiMessage>,
@@ -1212,6 +1600,9 @@ impl App {
         // Fail before taking over the terminal if the repo or remote is invalid.
         let transport = GitTransport::from_cwd()?;
         let repo_dir = transport.work_dir().to_path_buf();
+        args.turn
+            .model
+            .get_or_insert_with(|| DEFAULT_MODEL.to_string());
         if let Some(from) = args.from_commit.clone() {
             let commit = transport
                 .resolve_revspec(&from)?
@@ -1220,10 +1611,20 @@ impl App {
             args.from_commit = Some(commit.clone());
             args.turn.base = Some(commit);
         }
-        publish_unindexed_conversations(&transport, &args.user)?;
         let mut conversations =
             list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
-        if let Some(requested) = args.conversation.as_deref() {
+        let mut relist = false;
+        if let Some(requested) = args.conversation.clone() {
+            if args.new_conversation
+                && (conversations
+                    .iter()
+                    .any(|conversation| conversation.id == requested)
+                    || conversation_snapshot(&transport, &requested)?.is_some())
+            {
+                return Err(format!(
+                    "--new: conversation {requested:?} already exists; omit --new to continue it"
+                ));
+            }
             if conversations
                 .iter()
                 .all(|conversation| conversation.id != requested)
@@ -1237,16 +1638,19 @@ impl App {
                     .iter()
                     .any(|conversation| conversation.id == requested)
                 {
-                    unarchive_user_conversation(&transport, &args.user, requested)?;
-                    conversations = list_user_conversations(
-                        &transport,
-                        &args.user,
-                        UserConversationStatus::Active,
-                    )?;
+                    unarchive_user_conversation(&transport, &args.user, &requested)?;
+                    relist = true;
+                } else if conversation_snapshot(&transport, &requested)?.is_some() {
+                    invite_user_to_conversation(&transport, &args.user, &requested)?;
+                    relist = true;
                 }
             }
         }
-        let selected_name = choose_conversation(
+        if relist {
+            conversations =
+                list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
+        }
+        let choice = choose_conversation(
             args.conversation.as_deref(),
             args.new_conversation,
             &conversations,
@@ -1269,32 +1673,32 @@ impl App {
             })
             .collect();
         for state in &mut states {
-            state.reload(&transport);
+            let _ = state.reload(&transport, &args.user);
         }
-        let selected_id = if states.iter().any(|state| state.id == selected_name) {
-            selected_name.clone()
-        } else {
-            let id = if args.conversation.is_some() {
-                selected_name.clone()
-            } else {
-                fresh_conversation_id(&transport, &args.user)?
-            };
-            states.insert(
-                0,
-                ConversationState::new_virtual(
-                    id.clone(),
-                    selected_name.clone(),
-                    new_conversation_options(args.turn.clone(), args.turn.base, &repo_dir)?.0,
-                    initial_status,
-                ),
-            );
-            id
+        let selected_id = match choice {
+            ConversationChoice::Existing(id) => id,
+            ConversationChoice::New { id, title } => {
+                let id = match id {
+                    Some(id) => id,
+                    None => fresh_conversation_id(&transport, &args.user)?,
+                };
+                states.insert(
+                    0,
+                    ConversationState::new_virtual(
+                        id.clone(),
+                        title,
+                        new_conversation_options(args.turn.clone(), args.turn.base, &repo_dir)?.0,
+                        initial_status,
+                    ),
+                );
+                id
+            }
         };
         let selected = states
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
-        Ok(Self {
+        let mut app = Self {
             repo_dir,
             user: args.user,
             conversations: states,
@@ -1311,11 +1715,14 @@ impl App {
             copied_chars: None,
             animation_frame: 0,
             enhanced_keyboard: false,
+            remote_polling: false,
             view: View::Chat,
             focus: Focus::Conversation,
             tx,
             rx,
-        })
+        };
+        app.reconcile_active_requests();
+        Ok(app)
     }
 
     fn selected(&self) -> &ConversationState {
@@ -1328,6 +1735,46 @@ impl App {
 
     fn transport(&self) -> Result<GitTransport, String> {
         GitTransport::discover(&self.repo_dir)
+    }
+
+    /// Ensure every remotely active request has one process-local join. The
+    /// guard is per request, so unchanged 500ms polls cannot create an
+    /// unbounded set of HTTP waiters. Transport failures retry after a small
+    /// backoff; successful joins stay guarded until the ref becomes terminal.
+    fn reconcile_active_requests(&mut self) -> bool {
+        let now = Instant::now();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        let mut started = false;
+        for state in &mut self.conversations {
+            if state.local_turn || !state.running {
+                continue;
+            }
+            let Some(request) = state.active_request.clone() else {
+                continue;
+            };
+            if state.reconciling_request.as_deref() == Some(&request)
+                || state.reconcile_after.is_some_and(|after| after > now)
+            {
+                continue;
+            }
+            state.reconciling_request = Some(request.clone());
+            state.reconcile_after = None;
+            let conversation = state.id.clone();
+            let repo_dir = repo_dir.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = GitTransport::discover(repo_dir)
+                    .and_then(|transport| resume_request(&transport, &request));
+                let _ = tx.send(UiMessage::Reconciled {
+                    conversation,
+                    request,
+                    result,
+                });
+            });
+            started = true;
+        }
+        started
     }
 
     pub(crate) fn should_quit(&self) -> bool {
@@ -1383,6 +1830,18 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if self.palette.is_some() || self.confirm_action.is_some() {
+            return MouseAction::Ignored;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(value) = ui::reference_copy_at(self, area, mouse.column, mouse.row) {
+                self.selecting_transcript = false;
+                self.selecting_screen = false;
+                self.screen_selection = None;
+                self.selected_mut().transcript_selection = None;
+                return MouseAction::Copy(value);
+            }
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp
                 if self.view == View::Activity
@@ -1429,28 +1888,32 @@ impl App {
                 self.start_screen_selection(mouse.column, mouse.row, area)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.selecting_transcript => {
+                if self.selected().transcript_selection.is_none() {
+                    self.selecting_transcript = false;
+                    return MouseAction::Ignored;
+                }
                 if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
                 {
-                    self.selected_mut()
-                        .transcript_selection
-                        .as_mut()
-                        .expect("dragging starts with a transcript selection")
-                        .head = point;
+                    if let Some(selection) = self.selected_mut().transcript_selection.as_mut() {
+                        selection.head = point;
+                    }
                     MouseAction::Redraw
                 } else {
                     MouseAction::Ignored
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.selecting_transcript => {
+                if self.selected().transcript_selection.is_none() {
+                    self.selecting_transcript = false;
+                    return MouseAction::Ignored;
+                }
                 if let Some(point) =
                     ui::transcript_point(self.selected(), area, mouse.column, mouse.row)
                 {
-                    self.selected_mut()
-                        .transcript_selection
-                        .as_mut()
-                        .expect("dragging starts with a transcript selection")
-                        .head = point;
+                    if let Some(selection) = self.selected_mut().transcript_selection.as_mut() {
+                        selection.head = point;
+                    }
                 }
                 self.selecting_transcript = false;
                 ui::transcript_selection_text(self.selected(), area)
@@ -1531,18 +1994,29 @@ impl App {
     }
 
     fn start_turn(&mut self) {
-        if self.selected().is_busy() {
+        if self.selected().forking {
             self.selected_mut()
-                .show_command_error("this conversation already has an operation running");
+                .show_command_error("wait for this conversation fork to finish");
             return;
         }
+        if self.selected().publishing {
+            self.selected_mut()
+                .show_command_error("finish publishing before sending another message");
+            return;
+        }
+        let interjecting = self.selected().running;
         let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
+        let state = self.selected_mut();
+        state.reference_notice = None;
+        state.reference_loading = false;
+        if state.status == "loading conversation reference" {
+            state.status.clear();
+        }
         // Resolve the prompt into the turn's message and, for `/update-tree`,
-        // the tree the human commit should carry. `/from`, `/help`, and
-        // `/title` are not turns and return here; everything else falls
-        // through to run one.
+        // the tree the human commit should carry. Configuration and UI
+        // commands return here; everything else falls through to run one.
         let mut human_tree = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
             if command.takes_argument && arguments.is_empty() {
@@ -1565,6 +2039,36 @@ impl App {
                     } else {
                         self.selected_mut().status = format!("usage: {}", command.usage);
                     }
+                    return;
+                }
+                CommandAction::Reference => {
+                    if arguments.is_empty() {
+                        self.show_selected_ref();
+                    } else {
+                        self.selected_mut().status = format!("usage: {}", command.usage);
+                    }
+                    return;
+                }
+                CommandAction::Invite => {
+                    self.invite_selected(arguments);
+                    return;
+                }
+                CommandAction::Model => {
+                    if arguments.split_whitespace().count() != 1 {
+                        self.selected_mut()
+                            .show_command_error(format!("usage: {}", command.usage));
+                        return;
+                    }
+                    let model = if arguments == "default" {
+                        DEFAULT_MODEL.to_string()
+                    } else {
+                        arguments.to_string()
+                    };
+                    for state in &mut self.conversations {
+                        state.turn_options.model = Some(model.clone());
+                    }
+                    self.selected_mut()
+                        .push_info(format!("Model for future turns: {model}"));
                     return;
                 }
                 CommandAction::From => {
@@ -1590,28 +2094,33 @@ impl App {
             raw
         };
         let should_generate_title =
-            self.selected().automatic_title && !self.selected().generating_title;
-        {
+            !interjecting && self.selected().automatic_title && !self.selected().generating_title;
+        let observed_head = self.selected().remote_head.clone();
+        let pending_id = if interjecting {
+            let state = self.selected_mut();
+            let pending_id = state.queue_pending_submission(message.clone());
+            state.follow_tail();
+            state.transcript_selection = None;
+            pending_id
+        } else {
             let state = self.selected_mut();
             state.apply_automatic_title(&message);
             if should_generate_title {
                 state.generating_title = true;
             }
-            state.transcript.push(TranscriptEntry {
-                role: EntryRole::Human,
-                commit: None,
-                text: message.clone(),
-            });
+            let pending_id = state.queue_pending_submission(message.clone());
             state.activities.clear();
             state.activity_selection = None;
             state.activity_detail_scroll = 0;
             state.running = true;
+            state.local_turn = true;
             state.sidebar_attention = None;
             state.turn_phase = TurnPhase::System;
             state.status = "starting turn".to_string();
             state.follow_tail();
             state.transcript_selection = None;
-        }
+            pending_id
+        };
 
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
@@ -1633,6 +2142,58 @@ impl App {
                 });
             });
         }
+        if interjecting {
+            std::thread::spawn(move || {
+                let transport = match GitTransport::discover(repo_dir) {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        let _ = tx.send(UiMessage::InterjectionFailed {
+                            conversation,
+                            pending_id,
+                            error,
+                        });
+                        return;
+                    }
+                };
+                match submit_interjection(
+                    &transport,
+                    &options,
+                    &conversation,
+                    &message,
+                    human_tree.as_deref(),
+                ) {
+                    Ok(commit) => {
+                        let _ = tx.send(UiMessage::SubmissionCommitted {
+                            conversation: conversation.clone(),
+                            pending_id,
+                            commit,
+                        });
+                        let load = conversation_load(&transport, &conversation)
+                            .and_then(|load| {
+                                load.ok_or_else(|| {
+                                    format!(
+                                        "conversation {conversation:?} disappeared after submit"
+                                    )
+                                })
+                            })
+                            .map(Box::new);
+                        let _ = tx.send(UiMessage::InterjectionRefreshed {
+                            conversation,
+                            observed_head,
+                            load,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(UiMessage::InterjectionFailed {
+                            conversation,
+                            pending_id,
+                            error,
+                        });
+                    }
+                }
+            });
+            return;
+        }
         std::thread::spawn(move || {
             let result = GitTransport::discover(repo_dir).and_then(|transport| {
                 let outcome = run_chat_turn(
@@ -1641,6 +2202,13 @@ impl App {
                     &conversation,
                     &message,
                     human_tree.as_deref(),
+                    |commit| {
+                        let _ = tx.send(UiMessage::SubmissionCommitted {
+                            conversation: conversation.clone(),
+                            pending_id,
+                            commit: commit.to_string(),
+                        });
+                    },
                     |event| {
                         if matches!(event, TurnEvent::Completed(_)) {
                             return;
@@ -1660,10 +2228,61 @@ impl App {
             if let Err(error) = result {
                 let _ = tx.send(UiMessage::Failed {
                     conversation,
+                    pending_id,
                     error,
                 });
             }
         });
+    }
+
+    fn show_selected_ref(&mut self) {
+        self.start_reference_lookup(self.selected);
+    }
+
+    fn start_reference_lookup(&mut self, index: usize) {
+        let state = &mut self.conversations[index];
+        if state.reference_loading {
+            return;
+        }
+        state.reference_loading = true;
+        state.reference_generation = state.reference_generation.wrapping_add(1);
+        state.reference_notice = None;
+        state.command_error = None;
+        state.status = "loading conversation reference".to_string();
+        let conversation = state.id.clone();
+        let generation = state.reference_generation;
+        let observed_head = state.remote_head.clone();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir)
+                .and_then(|transport| conversation_reference(&transport, &conversation));
+            let _ = tx.send(UiMessage::ReferenceLoaded {
+                conversation,
+                generation,
+                observed_head,
+                result,
+            });
+        });
+    }
+
+    fn invite_selected(&mut self, user: &str) {
+        let id = self.selected().id.clone();
+        match self
+            .transport()
+            .and_then(|transport| invite_user_to_conversation(&transport, user, &id))
+        {
+            Ok(InviteOutcome::Created) => self.selected_mut().push_info(format!(
+                "Invited username {user:?}. They must select that exact case-sensitive identity."
+            )),
+            Ok(InviteOutcome::AlreadyActive) => self.selected_mut().push_info(format!(
+                "Username {user:?} already has this conversation active."
+            )),
+            Ok(InviteOutcome::Archived) => self.selected_mut().push_info(format!(
+                "Username {user:?} has archived this conversation; their choice was preserved."
+            )),
+            Err(error) => self.selected_mut().show_command_error(error),
+        }
     }
 
     pub(crate) fn drain_messages(&mut self) -> bool {
@@ -1671,6 +2290,12 @@ impl App {
         while let Ok(message) = self.rx.try_recv() {
             changed = true;
             match message {
+                UiMessage::Forked {
+                    conversation,
+                    origin,
+                    source,
+                    result,
+                } => self.finish_fork(&conversation, &origin, &source, result),
                 UiMessage::Turn {
                     conversation,
                     event,
@@ -1681,14 +2306,36 @@ impl App {
                 }
                 UiMessage::Failed {
                     conversation,
+                    pending_id,
                     error,
                 } => {
+                    let transport = self.transport();
+                    let user = self.user.clone();
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
-                        state.running = false;
-                        state.status = "turn failed".to_string();
-                        state.sidebar_attention = Some("Failed — open for details".to_string());
-                        state.push_error(error);
+                        state.local_turn = false;
+                        let refreshed = transport
+                            .as_ref()
+                            .ok()
+                            .and_then(|transport| state.reload(transport, &user));
+                        if refreshed.is_none() {
+                            state.running = false;
+                            state.active_request = None;
+                            state.reconciling_request = None;
+                            state.remote_head = None;
+                        }
+                        state.restore_pending_submission(pending_id);
+                        if state.running {
+                            state.sidebar_attention =
+                                Some("Local follower failed — turn still active".to_string());
+                            state.show_command_error_preserving_status(format!(
+                                "following turn failed: {error}"
+                            ));
+                        } else {
+                            state.sidebar_attention = Some("Failed — open for details".to_string());
+                            state.push_error(error);
+                            state.status = "turn failed".to_string();
+                        }
                     }
                 }
                 UiMessage::Completed {
@@ -1697,6 +2344,50 @@ impl App {
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
                         self.finish_turn(index, outcome);
+                    }
+                }
+                UiMessage::SubmissionCommitted {
+                    conversation,
+                    pending_id,
+                    commit,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.conversations[index].mark_pending_submission(pending_id, commit);
+                    }
+                }
+                UiMessage::InterjectionRefreshed {
+                    conversation,
+                    observed_head,
+                    load,
+                } => {
+                    let user = self.user.clone();
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        if state.remote_head != observed_head {
+                            continue;
+                        }
+                        match load {
+                            Ok(load) => state.apply_load(*load, &user),
+                            Err(error) => {
+                                state.remote_head = None;
+                                state.show_command_error_preserving_status(format!(
+                                    "message saved, but refreshing it failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                UiMessage::InterjectionFailed {
+                    conversation,
+                    pending_id,
+                    error,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.restore_pending_submission(pending_id);
+                        state.show_command_error_preserving_status(format!(
+                            "sending message failed: {error}"
+                        ));
                     }
                 }
                 UiMessage::TitleGenerated {
@@ -1724,6 +2415,194 @@ impl App {
                         }
                     }
                 }
+                UiMessage::Reconciled {
+                    conversation,
+                    request,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        if state.reconciling_request.as_deref() != Some(&request) {
+                            continue;
+                        }
+                        if let Err(error) = result {
+                            state.reconciling_request = None;
+                            state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
+                            state.status = format!("recovery retry pending: {error}");
+                        }
+                    }
+                }
+                UiMessage::ReferenceLoaded {
+                    conversation,
+                    generation,
+                    observed_head,
+                    result,
+                } => {
+                    let Some(index) = self.conversation_index(&conversation) else {
+                        continue;
+                    };
+                    if !self.conversations[index].reference_loading
+                        || self.conversations[index].reference_generation != generation
+                    {
+                        continue;
+                    }
+                    let retry = {
+                        let state = &mut self.conversations[index];
+                        state.reference_loading = false;
+                        if state.status == "loading conversation reference" {
+                            state.status.clear();
+                        }
+                        match result {
+                            Ok((_refname, Some(head)))
+                                if state.remote_head != observed_head
+                                    && state.remote_head.as_deref() != Some(head.as_str()) =>
+                            {
+                                true
+                            }
+                            Ok((refname, Some(head))) => {
+                                state.reference_notice = Some(ReferenceNotice { refname, head });
+                                false
+                            }
+                            Ok((_refname, None)) if state.remote_head != observed_head => true,
+                            Ok((_refname, None)) => {
+                                state.reference_notice = None;
+                                state.show_command_error(
+                                    "this conversation has no remote ref until its first message",
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                state.reference_notice = None;
+                                state.show_command_error(error);
+                                false
+                            }
+                        }
+                    };
+                    if retry {
+                        self.start_reference_lookup(index);
+                    }
+                }
+                UiMessage::RemotePolled { result } => {
+                    self.remote_polling = false;
+                    if let Ok(entries) = result {
+                        changed |= self.apply_remote_poll(entries);
+                    }
+                }
+            }
+        }
+        changed |= self.reconcile_active_requests();
+        changed
+    }
+
+    /// Schedule a canonical-ref refresh so network and Git work never block the
+    /// input/render loop. At most one refresh may be in flight; its versioned
+    /// result is applied from `drain_messages` only if the local state has not
+    /// advanced in the meantime.
+    pub(crate) fn poll_remote(&mut self) {
+        if self.remote_polling {
+            return;
+        }
+        self.remote_polling = true;
+        let observed: HashMap<_, _> = self
+            .conversations
+            .iter()
+            .map(|state| {
+                (
+                    state.id.clone(),
+                    (
+                        state.remote_head.clone(),
+                        state.remote_title.clone(),
+                        state.forking,
+                    ),
+                )
+            })
+            .collect();
+        let repo_dir = self.repo_dir.clone();
+        let user = self.user.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                let summaries =
+                    list_user_conversations(&transport, &user, UserConversationStatus::Active)?;
+                Ok(summaries
+                    .into_iter()
+                    .map(|summary| {
+                        let (observed_head, observed_title, forking) = observed
+                            .get(&summary.id)
+                            .cloned()
+                            .unwrap_or((None, None, false));
+                        let load = (!forking
+                            && observed_head.as_deref() != Some(summary.head.as_str()))
+                        .then(|| {
+                            conversation_load(&transport, &summary.id)
+                                .and_then(|load| {
+                                    load.ok_or_else(|| {
+                                        format!(
+                                            "conversation {:?} disappeared during refresh",
+                                            summary.id
+                                        )
+                                    })
+                                })
+                                .map(Box::new)
+                        });
+                        RemotePollEntry {
+                            summary,
+                            observed_head,
+                            observed_title,
+                            load,
+                        }
+                    })
+                    .collect())
+            });
+            let _ = tx.send(UiMessage::RemotePolled { result });
+        });
+    }
+
+    fn apply_remote_poll(&mut self, entries: Vec<RemotePollEntry>) -> bool {
+        let mut changed = false;
+        for entry in entries {
+            if let Some(index) = self.conversation_index(&entry.summary.id) {
+                let state = &mut self.conversations[index];
+                if state.forking
+                    || state.remote_head != entry.observed_head
+                    || state.remote_title != entry.observed_title
+                {
+                    continue;
+                }
+                if state.remote_title.as_deref() != Some(entry.summary.title.as_str()) {
+                    let first_automatic_publication = state.generating_title
+                        && state.automatic_title
+                        && entry.observed_title.is_none()
+                        && state.automatic_title_fallback.as_deref()
+                            == Some(entry.summary.title.as_str());
+                    state.remote_title = Some(entry.summary.title.clone());
+                    if !first_automatic_publication {
+                        state.title = entry.summary.title.clone();
+                        state.automatic_title = false;
+                    }
+                    changed = true;
+                }
+                if let Some(load) = entry.load {
+                    match load {
+                        Ok(load) => state.apply_load(*load, &self.user),
+                        Err(error) => {
+                            state.remote_head = None;
+                            state.push_error(format!("loading conversation failed: {error}"));
+                        }
+                    }
+                    changed = true;
+                }
+            } else if let Some(Ok(load)) = entry.load {
+                let mut state = ConversationState::new(
+                    entry.summary.id.clone(),
+                    entry.summary.title,
+                    self.selected().turn_options.clone(),
+                    "shared conversation".to_string(),
+                );
+                state.apply_load(*load, &self.user);
+                self.conversations.insert(0, state);
+                self.selected += 1;
+                changed = true;
             }
         }
         changed
@@ -1750,19 +2629,24 @@ impl App {
             TurnEvent::AssistantText(text) => {
                 state.note_transcript_append();
                 state.transcript.push(TranscriptEntry {
-                    role: EntryRole::Agent,
+                    role: EntryRole::Agent(state.turn_options.model.clone()),
                     commit: None,
                     text,
+                    pending_id: None,
                 });
                 state.transcript_selection = None;
             }
             TurnEvent::ToolCall {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 name,
                 summary,
             } => {
                 state.push_activity(Activity {
+                    request,
+                    round,
                     id: tool_use_id,
                     step_commit,
                     name,
@@ -1773,6 +2657,8 @@ impl App {
             }
             TurnEvent::ToolResult {
                 step_commit,
+                request,
+                round,
                 tool_use_id,
                 is_error,
                 content,
@@ -1780,7 +2666,7 @@ impl App {
                 if let Some(activity) = state
                     .activities
                     .iter_mut()
-                    .find(|activity| activity.id == tool_use_id)
+                    .find(|activity| activity.answers(&request, round, &tool_use_id))
                 {
                     activity.state = if is_error {
                         ActivityState::Failed
@@ -1790,6 +2676,8 @@ impl App {
                     activity.detail = content;
                 } else {
                     state.push_activity(Activity {
+                        request,
+                        round,
                         id: tool_use_id.clone(),
                         step_commit,
                         name: "result".to_string(),
@@ -1812,12 +2700,40 @@ impl App {
         let user = self.user.clone();
         let state = &mut self.conversations[index];
         state.running = false;
+        state.local_turn = false;
+        state.active_request = None;
+        state.reconciling_request = None;
+        state.reconcile_after = None;
         state.sidebar_attention = None;
         state.status = format!("completed {}", outcome.short_commit);
         match transport {
             Ok(transport) => {
-                match publish_user_conversation(&transport, &user, &state.id, &state.title) {
-                    Ok(()) => state.reload(&transport),
+                let published_title = state.title.clone();
+                let initial_title = state
+                    .automatic_title_fallback
+                    .as_deref()
+                    .unwrap_or(&published_title);
+                match publish_user_conversation(&transport, &user, &state.id, initial_title) {
+                    Ok(()) => {
+                        if let Some(fallback) = state.automatic_title_fallback.clone() {
+                            state.remote_title.get_or_insert_with(|| fallback.clone());
+                            if !state.automatic_title
+                                && state.title != fallback
+                                && compare_and_set_conversation_title(
+                                    &transport,
+                                    &state.id,
+                                    &fallback,
+                                    &state.title,
+                                )
+                                .unwrap_or(false)
+                            {
+                                state.remote_title = Some(state.title.clone());
+                                state.automatic_title_fallback = None;
+                            }
+                        }
+                        let _ = state.reload(&transport, &user);
+                        state.remote_head = Some(outcome.commit);
+                    }
                     Err(error) => {
                         state.sidebar_attention = Some("Failed to save conversation".to_string());
                         state.push_error(format!(
@@ -1833,6 +2749,60 @@ impl App {
         }
     }
 
+    fn finish_fork(
+        &mut self,
+        conversation: &str,
+        _origin: &str,
+        source: &str,
+        result: Result<(String, Box<ConversationLoad>), String>,
+    ) {
+        let Some(index) = self.conversation_index(conversation) else {
+            return;
+        };
+        match result {
+            Ok((fork, load)) => {
+                let remote_title = load.snapshot.title.clone();
+                let state = &mut self.conversations[index];
+                state.forking = false;
+                state.apply_load(*load, &self.user);
+                state.remote_head = Some(fork);
+                state.remote_title = Some(remote_title);
+                state.status = format!("forked from {}", short_hash(source));
+            }
+            Err(error) => {
+                // Never discard text typed while the fork was in flight. Turn
+                // the placeholder into an ordinary new conversation in place,
+                // independent of how many other tabs happen to be open.
+                let state = &self.conversations[index];
+                let id = state.id.clone();
+                let title = state.title.clone();
+                let composer = state.composer.clone();
+                match new_conversation_options(state.turn_options.clone(), None, &self.repo_dir) {
+                    Ok((options, base)) => {
+                        let mut replacement = ConversationState::new_virtual(
+                            id,
+                            title,
+                            options,
+                            format!("ready from {}; enter a prompt", short_hash(&base)),
+                        );
+                        replacement.composer = composer;
+                        replacement.show_command_error(format!(
+                            "creating conversation fork failed: {error}; opened a new conversation instead"
+                        ));
+                        self.conversations[index] = replacement;
+                    }
+                    Err(fallback_error) => {
+                        // Keeping `forking` set makes this placeholder
+                        // non-submittable until the user fixes repository state.
+                        self.conversations[index].show_command_error(format!(
+                            "creating conversation fork failed: {error}; creating a safe replacement also failed: {fallback_error}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn finish_title_generation(&mut self, index: usize, result: Result<String, String>) {
         let transport = self.transport();
         let state = &mut self.conversations[index];
@@ -1840,17 +2810,28 @@ impl App {
         if !state.automatic_title {
             return;
         }
-        state.automatic_title = false;
         let title = match result {
             Ok(title) => title,
             Err(_) => return,
         };
+        state.automatic_title = false;
         if state.current_hash().is_some() {
+            let Some(expected) = state
+                .remote_title
+                .clone()
+                .or_else(|| state.automatic_title_fallback.clone())
+            else {
+                return;
+            };
             let Ok(transport) = transport else {
                 return;
             };
-            if set_conversation_title(&transport, &state.id, &title).is_err() {
-                return;
+            match compare_and_set_conversation_title(&transport, &state.id, &expected, &title) {
+                Ok(true) => {
+                    state.remote_title = Some(title.clone());
+                    state.automatic_title_fallback = None;
+                }
+                Ok(false) | Err(_) => return,
             }
         }
         state.title = title;
@@ -1931,6 +2912,17 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return;
+        }
+        if key.code == KeyCode::Esc
+            && (self.selected().reference_notice.is_some() || self.selected().reference_loading)
+        {
+            let state = self.selected_mut();
+            state.reference_notice = None;
+            state.reference_loading = false;
+            if state.status == "loading conversation reference" {
+                state.status.clear();
             }
             return;
         }
@@ -2268,7 +3260,8 @@ impl App {
         if !self.selected().is_busy() {
             match self.transport() {
                 Ok(transport) => {
-                    self.selected_mut().reload(&transport);
+                    let user = self.user.clone();
+                    let _ = self.selected_mut().reload(&transport, &user);
                     self.selected_mut().status = "reloaded".to_string();
                 }
                 Err(error) => self.selected_mut().show_command_error(error),
@@ -2364,25 +3357,67 @@ impl App {
                 return;
             }
         };
-        let (options, base) = match new_conversation_options(
-            self.selected().turn_options.clone(),
-            base,
-            &self.repo_dir,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                self.selected_mut().show_command_error(error);
-                return;
+        let origin = self.selected().id.clone();
+        let previous_options = self.selected().turn_options.clone();
+        let (state, fork_source) = match base {
+            None => {
+                let (options, base) =
+                    match new_conversation_options(previous_options, None, &self.repo_dir) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.selected_mut().show_command_error(error);
+                            return;
+                        }
+                    };
+                (
+                    ConversationState::new_virtual(
+                        id.clone(),
+                        title.clone(),
+                        options,
+                        format!("ready from {}; enter a prompt", short_hash(&base)),
+                    ),
+                    None,
+                )
+            }
+            Some(from) => {
+                // Once materialized, the canonical first parent carries the
+                // fork source. Keeping it as a fallback base would let a lost
+                // remote ref silently recreate a marker-less conversation.
+                let mut options = previous_options;
+                options.base = None;
+                let mut state = ConversationState::new_virtual(
+                    id.clone(),
+                    title.clone(),
+                    options,
+                    format!("forking from {}", short_hash(&from)),
+                );
+                state.forking = true;
+                state.remote_title = Some(title.clone());
+                (state, Some(from))
             }
         };
-        let status = format!("ready from {}; enter a prompt", short_hash(&base));
-        self.conversations.insert(
-            0,
-            ConversationState::new_virtual(id, title, options, status),
-        );
+        self.conversations.insert(0, state);
         self.selected = 0;
         self.view = View::Chat;
         self.confirm_action = None;
+        if let Some(source) = fork_source {
+            let tx = self.tx.clone();
+            let repo_dir = self.repo_dir.clone();
+            let user = self.user.clone();
+            std::thread::spawn(move || {
+                let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                    let fork = fork_conversation(&transport, &user, &id, &title, &source)?;
+                    let load = conversation_load_at(&transport, &id, &fork)?;
+                    Ok((fork, Box::new(load)))
+                });
+                let _ = tx.send(UiMessage::Forked {
+                    conversation: id,
+                    origin,
+                    source,
+                    result,
+                });
+            });
+        }
     }
 
     fn select_relative(&mut self, amount: isize) {
@@ -2477,7 +3512,8 @@ impl App {
                 .show_command_error("conversation title must be one line");
             return;
         }
-        if self.selected().current_hash().is_some() {
+        let published = self.selected().current_hash().is_some();
+        if published {
             let id = self.selected().id.clone();
             if let Err(error) = self
                 .transport()
@@ -2489,7 +3525,13 @@ impl App {
         }
         let state = self.selected_mut();
         state.title = title.to_string();
+        if published {
+            state.remote_title = Some(title.to_string());
+        }
         state.automatic_title = false;
+        if published {
+            state.automatic_title_fallback = None;
+        }
         state.status = format!("renamed conversation to {title:?}");
     }
 
@@ -2567,16 +3609,56 @@ impl App {
             };
             self.selected_mut().publish_prompt = false;
             let name = self.selected().id.clone();
-            let diff = self
+            let conversation_base = self
                 .selected()
                 .diff
-                .clone()
-                .expect("a non-empty diff was checked");
+                .as_ref()
+                .expect("a non-empty diff was checked")
+                .base_commit
+                .clone();
             self.selected_mut().publishing = true;
-            self.selected_mut().status = "publishing a clean conversation branch".to_string();
+            self.selected_mut().status = "fetching the selected PR base".to_string();
             let tx = self.tx.clone();
+            let options = self.selected().turn_options.clone();
+            let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
-                let result = publish_conversation_pr(&name, &diff, &pr_base, &default_base);
+                let result = (|| {
+                    let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
+                    let target = publish_merge_target(
+                        &conversation_base,
+                        &base_commit,
+                        pr_base != default_base,
+                        &repo_dir,
+                    )?;
+                    let transport = GitTransport::discover(&repo_dir)?;
+                    transport.ensure_pushed(&target)?;
+                    let message = format!(
+                        "Prepare this conversation for publication. First call the existing \
+                         `merge` tool with `theirs` exactly `{target}`. Resolve every entry in \
+                         `.caos/conflicts`, then build and test. Finish only when the workspace \
+                         is ready to publish."
+                    );
+                    let outcome = run_chat_turn(
+                        &transport,
+                        &options,
+                        &name,
+                        &message,
+                        None,
+                        |_| {},
+                        |event| {
+                            let _ = tx.send(UiMessage::Turn {
+                                conversation: name.clone(),
+                                event,
+                            });
+                        },
+                    )?;
+                    let workspace = prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
+                    let _ = tx.send(UiMessage::Completed {
+                        conversation: name.clone(),
+                        outcome,
+                    });
+                    publish_conversation_pr(&name, &workspace, &pr_base, &base_commit, &repo_dir)
+                })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
                     result,
@@ -2599,7 +3681,7 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map_err(|error| format!("reading the clock: {error}"))?
         .as_nanos();
     let descriptor = format!(
-        "caos conversation v1\ncreator {user}\ncreated {created}\nprocess {}\n",
+        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
         std::process::id()
     );
     t.put_object("blob", descriptor.as_bytes())
@@ -2619,11 +3701,17 @@ fn new_conversation_options(
     Ok((options, base))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConversationChoice {
+    Existing(String),
+    New { id: Option<String>, title: String },
+}
+
 fn choose_conversation(
     requested: Option<&str>,
     new: bool,
     conversations: &[UserConversationSummary],
-) -> Result<String, String> {
+) -> Result<ConversationChoice, String> {
     if let Some(requested) = requested {
         if new
             && conversations
@@ -2634,23 +3722,36 @@ fn choose_conversation(
                 "--new: conversation {requested:?} already exists; omit --new to continue it"
             ));
         }
-        return Ok(requested.to_string());
+        if conversations
+            .iter()
+            .any(|conversation| conversation.id == requested)
+        {
+            return Ok(ConversationChoice::Existing(requested.to_string()));
+        }
+        return Ok(ConversationChoice::New {
+            id: Some(requested.to_string()),
+            title: requested.to_string(),
+        });
     }
     if !new {
         if let Some(latest) = conversations.first() {
-            return Ok(latest.id.clone());
+            return Ok(ConversationChoice::Existing(latest.id.clone()));
         }
     }
-    Ok(first_available_conversation_name(
-        conversations
-            .iter()
-            .map(|conversation| conversation.title.as_str()),
-    ))
+    Ok(ConversationChoice::New {
+        id: None,
+        title: first_available_conversation_name(
+            conversations
+                .iter()
+                .map(|conversation| conversation.title.as_str()),
+        ),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caos::chat::{conversation_head, conversation_ref, ConversationReplay};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -2709,6 +3810,80 @@ mod tests {
             .success());
     }
 
+    fn git_output(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn push_test_conversation(repo: &Path, id: &str, head: &str) {
+        git_ok(
+            repo,
+            &[
+                "push",
+                "-q",
+                "caos",
+                &format!("{head}:refs/caos/v2/conversations/{id}/head"),
+            ],
+        );
+    }
+
+    fn seed_idle_conversation(repo: &Path, id: &str, username: &str, message: &str) -> String {
+        let base = git_output(repo, &["rev-parse", "HEAD"]);
+        let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
+        let event = serde_json::to_string(&serde_json::json!({
+            "base": base,
+            "author": "user",
+            "username": username,
+            "content": message,
+            "status": "idle",
+        }))
+        .unwrap();
+        let head = git_output(repo, &["commit-tree", &tree, "-p", &base, "-m", &event]);
+        push_test_conversation(repo, id, &head);
+        head
+    }
+
+    fn seed_queued_conversation(
+        repo: &Path,
+        id: &str,
+        username: &str,
+        message: &str,
+    ) -> (String, String) {
+        let base = git_output(repo, &["rev-parse", "HEAD"]);
+        let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
+        let user_event = serde_json::to_string(&serde_json::json!({
+            "base": base,
+            "author": "user",
+            "username": username,
+            "content": message,
+        }))
+        .unwrap();
+        let user = git_output(
+            repo,
+            &["commit-tree", &tree, "-p", &base, "-m", &user_event],
+        );
+        let request = "b".repeat(40);
+        let admission = serde_json::to_string(&serde_json::json!({
+            "status": "queued",
+            "request": request,
+            "request_head": user,
+        }))
+        .unwrap();
+        let head = git_output(repo, &["commit-tree", &tree, "-p", &user, "-m", &admission]);
+        push_test_conversation(repo, id, &head);
+        (head, request)
+    }
+
     fn repo_with_default_branch(name: &str, branch: &str) -> (PathBuf, PathBuf, String) {
         let dir = throwaway_repo(name);
         git_ok(&dir, &["config", "user.name", "CAOS test"]);
@@ -2752,6 +3927,8 @@ mod tests {
 
     fn activity(number: usize) -> Activity {
         Activity {
+            request: "a".repeat(40),
+            round: number as u64,
             id: format!("tool-{number}"),
             step_commit: format!("{number:040x}"),
             name: "bash".to_string(),
@@ -2780,6 +3957,7 @@ mod tests {
                 copied_chars: None,
                 animation_frame: 0,
                 enhanced_keyboard: false,
+                remote_polling: false,
                 view: View::Chat,
                 focus: Focus::Conversation,
                 tx: tx.clone(),
@@ -2790,12 +3968,81 @@ mod tests {
         )
     }
 
+    fn wait_for_fork(app: &mut App, id: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.drain_messages();
+            match app.conversation_index(id) {
+                Some(index) if !app.conversations[index].forking => return true,
+                None => return false,
+                Some(_) => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for fork {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_remote_poll(app: &mut App) {
+        app.poll_remote();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.remote_polling {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for remote poll"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_pending_submission(app: &mut App, id: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .selected()
+            .pending_submissions
+            .iter()
+            .any(|pending| pending.id == id)
+        {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for pending submission {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_reference_lookup(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.selected().reference_loading {
+            app.drain_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for conversation reference"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn rendered_main_pane(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buffer = terminal.backend().buffer();
         buffer
             .content
             .chunks(buffer.area.width as usize)
             .map(|row| row.iter().skip(26).map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn rendered_header(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .iter()
+            .take(buffer.area.width as usize)
+            .map(|cell| cell.symbol())
             .collect()
     }
 
@@ -2992,6 +4239,177 @@ mod tests {
     }
 
     #[test]
+    fn first_remote_title_publication_does_not_cancel_generation() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("published fallback");
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "internal-id".to_string(),
+                title: "published fallback".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: None,
+            observed_title: None,
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "published fallback");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("published fallback")
+        );
+        assert!(app.selected().automatic_title);
+        assert!(app.selected().generating_title);
+    }
+
+    #[test]
+    fn first_observed_foreign_title_cancels_automatic_generation() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("published fallback");
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "internal-id".to_string(),
+                title: "manual rename".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: None,
+            observed_title: None,
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "manual rename");
+        assert!(!app.selected().automatic_title);
+    }
+
+    #[test]
+    fn later_remote_title_change_cancels_generation_as_a_manual_rename() {
+        let mut conversation = ConversationState::new_virtual(
+            "internal-id".to_string(),
+            "local fallback".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.remote_title = Some("published fallback".to_string());
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "internal-id".to_string(),
+                title: "manual rename".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: None,
+            observed_title: Some("published fallback".to_string()),
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "manual rename");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("manual rename")
+        );
+        assert!(!app.selected().automatic_title);
+    }
+
+    #[test]
+    fn completed_first_turn_publishes_a_title_generated_before_its_first_reload() {
+        let (repo, remote, _) = repo_with_default_branch("early-generated-title", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let head = seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        publish_user_conversation(&transport, "tester", "new-talk", "fallback prompt").unwrap();
+
+        let mut conversation = ConversationState::new_virtual(
+            "new-talk".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("fallback prompt");
+        conversation.title = "Generated title".to_string();
+        conversation.automatic_title = false;
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+
+        app.finish_turn(
+            0,
+            TurnOutcome {
+                conversation: "new-talk".to_string(),
+                commit: head.clone(),
+                short_commit: short_hash(&head).to_string(),
+            },
+        );
+
+        assert_eq!(app.selected().title, "Generated title");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("Generated title")
+        );
+        let listed =
+            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed[0].title, "Generated title");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn generated_title_uses_fallback_when_remote_title_is_not_cached() {
+        let (repo, remote, _) = repo_with_default_branch("unknown-remote-title", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        publish_user_conversation(&transport, "tester", "new-talk", "fallback prompt").unwrap();
+
+        let mut conversation = ConversationState::new_virtual(
+            "new-talk".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("fallback prompt");
+        conversation.generating_title = true;
+        conversation.apply_load(
+            conversation_load(&transport, "new-talk").unwrap().unwrap(),
+            "tester",
+        );
+        assert!(conversation.current_hash().is_some());
+        assert!(conversation.remote_title.is_none());
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+
+        app.finish_title_generation(0, Ok("Generated title".to_string()));
+
+        assert_eq!(app.selected().title, "Generated title");
+        let listed =
+            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed[0].title, "Generated title");
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
     fn composer_filters_selects_completes_and_dismisses_commands() {
         let mut composer = Composer::default();
         composer.insert_str("/");
@@ -3001,7 +4419,16 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/from", "/help", "/title", "/update-tree", "/commands"]
+            [
+                "/from",
+                "/help",
+                "/title",
+                "/update-tree",
+                "/commands",
+                "/ref",
+                "/invite",
+                "/model"
+            ]
         );
 
         assert!(composer.select_command(2));
@@ -3022,6 +4449,12 @@ mod tests {
         assert!(composer.command_matches().is_empty());
         composer.insert_char('x');
         assert!(!composer.command_menu_dismissed);
+
+        let mut composer = Composer::default();
+        composer.insert_str("/model sonnet-5");
+        assert_eq!(composer.model_matches(), ["claude-sonnet-5"]);
+        assert!(composer.complete_command());
+        assert_eq!(composer.text, "/model claude-sonnet-5 ");
     }
 
     #[test]
@@ -3033,6 +4466,18 @@ mod tests {
         let (command, arguments) = parse_command("/from\nabc123").unwrap();
         assert_eq!(command.action, CommandAction::From);
         assert_eq!(arguments, "abc123");
+
+        let (command, arguments) = parse_command("/ref").unwrap();
+        assert_eq!(command.action, CommandAction::Reference);
+        assert!(arguments.is_empty());
+
+        let (command, arguments) = parse_command("/invite Bob Smith").unwrap();
+        assert_eq!(command.action, CommandAction::Invite);
+        assert_eq!(arguments, "Bob Smith");
+
+        let (command, arguments) = parse_command("/model claude-sonnet-5").unwrap();
+        assert_eq!(command.action, CommandAction::Model);
+        assert_eq!(arguments, "claude-sonnet-5");
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
         assert_eq!(command.action, CommandAction::UpdateTree);
@@ -3049,6 +4494,45 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn model_command_updates_the_clients_last_used_model() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2")]);
+        app.selected_mut()
+            .composer
+            .insert_str("/model claude-sonnet-5");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.selected().turn_options.model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            app.selected().transcript.last().unwrap().text,
+            "Model for future turns: claude-sonnet-5"
+        );
+        assert_eq!(
+            app.conversations[1].turn_options.model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        app.selected_mut().composer.insert_str("/model default");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.selected().turn_options.model.as_deref(),
+            Some(DEFAULT_MODEL)
+        );
+        assert_eq!(
+            app.conversations[1].turn_options.model.as_deref(),
+            Some(DEFAULT_MODEL)
+        );
+        assert_eq!(
+            app.selected().transcript.last().unwrap().text,
+            format!("Model for future turns: {DEFAULT_MODEL}")
+        );
     }
 
     #[test]
@@ -3147,6 +4631,18 @@ mod tests {
         assert!(
             rendered.contains("/update-tree <message> — fold working-tree edits into the commit")
         );
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/model sonnet-5");
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("claude-sonnet-5"));
     }
 
     #[test]
@@ -3393,16 +4889,22 @@ mod tests {
         let conversations = vec![summary("recent"), summary("talk-1")];
         assert_eq!(
             choose_conversation(None, false, &conversations).unwrap(),
-            "recent"
+            ConversationChoice::Existing("recent".to_string())
         );
         assert_eq!(
             choose_conversation(None, true, &conversations).unwrap(),
-            "talk-2"
+            ConversationChoice::New {
+                id: None,
+                title: "talk-2".to_string(),
+            }
         );
         assert!(choose_conversation(Some("recent"), true, &conversations).is_err());
         assert_eq!(
             choose_conversation(Some("named"), false, &conversations).unwrap(),
-            "named"
+            ConversationChoice::New {
+                id: Some("named".to_string()),
+                title: "named".to_string(),
+            }
         );
         assert_eq!(
             first_available_conversation_name(
@@ -3412,6 +4914,23 @@ mod tests {
                     .chain(std::iter::once("talk-2")),
             ),
             "talk-3"
+        );
+    }
+
+    #[test]
+    fn new_conversation_titles_never_reopen_a_matching_id() {
+        let conversations = vec![UserConversationSummary {
+            id: "talk-1".to_string(),
+            title: "A generated title".to_string(),
+            head: "a".repeat(40),
+            updated_unix: 1,
+        }];
+        assert_eq!(
+            choose_conversation(None, true, &conversations).unwrap(),
+            ConversationChoice::New {
+                id: None,
+                title: "talk-1".to_string(),
+            }
         );
     }
 
@@ -3459,6 +4978,11 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
+        let header = rendered_header(&terminal);
+        let selection_end = header
+            .find("copy-anywhere")
+            .map(|column| column + "copy-anywhere".len() - 1)
+            .unwrap() as u16;
         app.capture_screen(terminal.backend().buffer());
         let area = Rect::new(0, 0, 100, 30);
         let mouse = |kind, column| MouseEvent {
@@ -3473,10 +4997,16 @@ mod tests {
             MouseAction::Redraw
         );
         assert_eq!(
-            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20), area),
+            app.handle_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), selection_end),
+                area
+            ),
             MouseAction::Redraw
         );
-        let copied = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 20), area);
+        let copied = app.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), selection_end),
+            area,
+        );
 
         assert!(
             matches!(copied, MouseAction::Copy(ref text) if text.contains("caos") && text.contains("copy-anywhere"))
@@ -3485,10 +5015,10 @@ mod tests {
 
     #[test]
     fn cli_options_match_the_line_client_surface() {
-        // --user rides along so the test never depends on ambient $USER
+        // --username rides along so the test never depends on ambient $USER
         // (the cargo worker's environment has none).
         let args = Args::parse(&[
-            "--user".into(),
+            "--username".into(),
             "tester".into(),
             "--from".into(),
             "5ec3751".into(),
@@ -3506,7 +5036,7 @@ mod tests {
     #[test]
     fn from_commit_rejects_conflicting_conversation_options() {
         assert!(Args::parse(&[
-            "--user".into(),
+            "--username".into(),
             "tester".into(),
             "--from".into(),
             "5ec3751".into(),
@@ -3515,7 +5045,7 @@ mod tests {
         ])
         .is_err());
         assert!(Args::parse(&[
-            "--user".into(),
+            "--username".into(),
             "tester".into(),
             "--from".into(),
             "5ec3751".into(),
@@ -3560,12 +5090,13 @@ mod tests {
     fn paused_transcript_shows_unread_and_rendered_lines_below() {
         let mut conversation = state("talk-1");
         conversation.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: None,
             text: (0..60)
                 .map(|line| format!("existing line {line}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            pending_id: None,
         });
         let (mut app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
@@ -3646,15 +5177,20 @@ mod tests {
 
     #[test]
     fn replayed_activity_restores_tool_results() {
+        let request = "a".repeat(40);
         let activities = replayed_activities(&[
             TurnEvent::ToolCall {
                 step_commit: "1".repeat(40),
+                request: request.clone(),
+                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 name: "read".to_string(),
                 summary: "read README.md".to_string(),
             },
             TurnEvent::ToolResult {
                 step_commit: "2".repeat(40),
+                request,
+                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 is_error: false,
                 content: "README contents".to_string(),
@@ -3668,6 +5204,71 @@ mod tests {
     }
 
     #[test]
+    fn replayed_activity_scopes_reused_ids_by_request_and_round() {
+        let request_a = "a".repeat(40);
+        let request_b = "b".repeat(40);
+        let events = [
+            TurnEvent::ToolCall {
+                step_commit: "1".repeat(40),
+                request: request_a.clone(),
+                round: 0,
+                tool_use_id: "reused".to_string(),
+                name: "read".to_string(),
+                summary: "first call".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "2".repeat(40),
+                request: request_a.clone(),
+                round: 0,
+                tool_use_id: "reused".to_string(),
+                is_error: false,
+                content: "first result".to_string(),
+            },
+            TurnEvent::ToolCall {
+                step_commit: "3".repeat(40),
+                request: request_a.clone(),
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                name: "read".to_string(),
+                summary: "second call".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "4".repeat(40),
+                request: request_a,
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                is_error: true,
+                content: "second result".to_string(),
+            },
+            TurnEvent::ToolCall {
+                step_commit: "5".repeat(40),
+                request: request_b.clone(),
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                name: "read".to_string(),
+                summary: "third call".to_string(),
+            },
+            TurnEvent::ToolResult {
+                step_commit: "6".repeat(40),
+                request: request_b,
+                round: 1,
+                tool_use_id: "reused".to_string(),
+                is_error: false,
+                content: "third result".to_string(),
+            },
+        ];
+
+        let activities = replayed_activities(&events);
+        assert_eq!(activities.len(), 3);
+        assert_eq!(activities[0].state, ActivityState::Succeeded);
+        assert_eq!(activities[0].detail, "first result");
+        assert_eq!(activities[1].state, ActivityState::Failed);
+        assert_eq!(activities[1].detail, "second result");
+        assert_eq!(activities[2].state, ActivityState::Succeeded);
+        assert_eq!(activities[2].detail, "third result");
+    }
+
+    #[test]
     fn new_activity_follows_only_a_selection_at_the_tail() {
         let mut conversation = state("talk-1");
         conversation.activities = vec![activity(1), activity(2)];
@@ -3678,6 +5279,8 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "3".repeat(40),
+                request: "a".repeat(40),
+                round: 0,
                 tool_use_id: "tool-3".to_string(),
                 name: "bash".to_string(),
                 summary: "third".to_string(),
@@ -3690,6 +5293,8 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "4".repeat(40),
+                request: "a".repeat(40),
+                round: 0,
                 tool_use_id: "tool-4".to_string(),
                 name: "bash".to_string(),
                 summary: "fourth".to_string(),
@@ -3743,12 +5348,13 @@ mod tests {
         conversation.running = true;
         conversation.status = "calling model".to_string();
         conversation.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: None,
             text: (0..60)
                 .map(|line| format!("line {line:02}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            pending_id: None,
         });
         let (mut app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
@@ -3852,6 +5458,7 @@ mod tests {
             role: EntryRole::Human,
             commit: None,
             text: "hello".to_string(),
+            pending_id: None,
         });
         let (mut app, _) = app_with(vec![selected]);
         let area = Rect::new(0, 0, 100, 30);
@@ -3898,6 +5505,39 @@ mod tests {
     }
 
     #[test]
+    fn stale_transcript_drag_state_is_ignored_instead_of_panicking() {
+        let mut selected = state("talk-1");
+        selected.transcript.push(TranscriptEntry {
+            role: EntryRole::Human,
+            commit: None,
+            text: "hello".to_string(),
+            pending_id: None,
+        });
+        let (mut app, _) = app_with(vec![selected]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 27,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.selecting_transcript = true;
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left)), area),
+            MouseAction::Ignored
+        );
+        assert!(!app.selecting_transcript);
+
+        app.selecting_transcript = true;
+        assert_eq!(
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)), area),
+            MouseAction::Ignored
+        );
+        assert!(!app.selecting_transcript);
+    }
+
+    #[test]
     fn full_layout_renders_chat_activity_and_prompt() {
         let mut selected = state("review-api");
         selected.transcript = vec![
@@ -3905,14 +5545,18 @@ mod tests {
                 role: EntryRole::Human,
                 commit: Some("a".repeat(40)),
                 text: "Please run the tests".to_string(),
+                pending_id: None,
             },
             TranscriptEntry {
-                role: EntryRole::Agent,
+                role: EntryRole::Agent(Some("claude-sonnet-5".to_string())),
                 commit: Some("b".repeat(40)),
                 text: "Running them now.".to_string(),
+                pending_id: None,
             },
         ];
         selected.activities = vec![Activity {
+            request: "a".repeat(40),
+            round: 0,
             id: "tool-1".to_string(),
             step_commit: "c".repeat(40),
             name: "bash".to_string(),
@@ -3939,6 +5583,7 @@ mod tests {
         assert!(rendered.contains("other-chat"));
         assert!(rendered.contains("head bbbbbbb"));
         assert!(rendered.contains("Please run the tests"));
+        assert!(rendered.contains("Agent (sonnet-5)"));
         assert!(rendered.contains("Running…"));
         assert!(rendered.contains("$ cargo test"));
         assert!(rendered.contains("Ctrl+T expands"));
@@ -4048,9 +5693,10 @@ mod tests {
     fn idle_chat_header_keeps_only_the_title_and_head_metadata() {
         let mut conversation = state("A concise title");
         conversation.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: Some("b".repeat(40)),
             text: "done".to_string(),
+            pending_id: None,
         });
         let (app, _) = app_with(vec![conversation]);
         let backend = TestBackend::new(100, 30);
@@ -4058,15 +5704,9 @@ mod tests {
 
         terminal.draw(|frame| render(&app, frame)).unwrap();
 
-        let header = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .take(100)
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let header = rendered_header(&terminal);
         assert!(header.contains("caos"));
+        assert!(header.contains("user tester"));
         assert!(header.contains("A concise title"));
         assert!(header.contains("head bbbbbbb"));
         assert!(!header.contains("idle"));
@@ -4122,9 +5762,10 @@ mod tests {
     fn transcript_renders_markdown_emphasis_styles() {
         let mut selected = state("markdown");
         selected.transcript.push(TranscriptEntry {
-            role: EntryRole::Agent,
+            role: EntryRole::Agent(None),
             commit: None,
             text: "plain **bold** and _italic_".to_string(),
+            pending_id: None,
         });
         let (app, _) = app_with(vec![selected]);
         let backend = TestBackend::new(100, 30);
@@ -4295,31 +5936,269 @@ mod tests {
     }
 
     #[test]
-    fn rejected_prompt_uses_the_command_panel_instead_of_a_chat_entry() {
+    fn active_turn_accepts_an_interjection() {
+        let (repo, remote, _) = repo_with_default_branch("active-interjection", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let (head, request) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let mut conversation = state("talk-1");
         conversation.running = true;
+        conversation.local_turn = true;
+        conversation.remote_head = Some(head);
+        conversation.active_request = Some(request);
+        conversation.status = "running a tool".to_string();
+        conversation.turn_phase = TurnPhase::Model;
+        conversation.activities.push(activity(1));
+        conversation.activity_selection = Some(0);
         conversation.composer.insert_str("another prompt");
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.selected().transcript.len(), 1);
+        assert_eq!(app.selected().transcript[0].role, EntryRole::Human);
+        assert_eq!(app.selected().transcript[0].text, "another prompt");
+        assert_eq!(app.selected().pending_submissions.len(), 1);
+        assert_eq!(app.selected().status, "running a tool");
+        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
+        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().running);
+        assert!(app.selected().local_turn);
+        assert!(app.selected().command_error.is_none());
+
+        wait_for_pending_submission(&mut app, 0);
+        assert_eq!(app.selected().status, "running a tool");
+        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
+        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().running);
+        assert!(app.selected().local_turn);
+        assert!(app.selected().command_error.is_none());
+        assert_eq!(
+            app.selected()
+                .transcript
+                .iter()
+                .filter(|entry| entry.text == "another prompt")
+                .count(),
+            1
+        );
+        assert!(app
+            .selected()
+            .transcript
+            .iter()
+            .find(|entry| entry.text == "another prompt")
+            .unwrap()
+            .commit
+            .is_some());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn pending_interjection_survives_a_stale_reload_until_its_commit_is_visible() {
+        let (repo, remote, _) = repo_with_default_branch("pending-interjection", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
+        let durable_commit = load.replay.turns[0].commit.clone();
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("another prompt".to_string());
+
+        conversation.apply_load(load.clone(), "Alice");
+        assert_eq!(conversation.pending_submissions.len(), 1);
+        assert_eq!(
+            conversation.transcript.last().unwrap().text,
+            "another prompt"
+        );
+        assert_eq!(
+            conversation.transcript.last().unwrap().pending_id,
+            Some(pending_id)
+        );
+
+        conversation.mark_pending_submission(pending_id, durable_commit);
+        conversation.apply_load(load, "Alice");
+        assert!(conversation.pending_submissions.is_empty());
+        assert_eq!(conversation.transcript.len(), 1);
+        assert!(conversation.transcript[0].pending_id.is_none());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn first_durable_load_preserves_a_locally_started_turn() {
+        let head = "a".repeat(40);
+        let request = "b".repeat(40);
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.local_turn = true;
+        conversation.status = "running a tool".to_string();
+        conversation.turn_phase = TurnPhase::Model;
+        conversation.activities.push(activity(1));
+        assert!(conversation.active_request.is_none());
+
+        conversation.apply_load(
+            ConversationLoad {
+                snapshot: ConversationSnapshot {
+                    id: "talk-1".to_string(),
+                    head: head.clone(),
+                    title: "talk-1".to_string(),
+                    status: "queued".to_string(),
+                    request: Some(request.clone()),
+                    request_head: Some("c".repeat(40)),
+                    messages: Vec::new(),
+                },
+                replay: ConversationReplay {
+                    turns: Vec::new(),
+                    turn_events: Vec::new(),
+                },
+                workspace_diff: WorkspaceDiff {
+                    base_commit: "d".repeat(40),
+                    head: head.clone(),
+                    patch: String::new(),
+                },
+            },
+            "tester",
+        );
+
+        assert_eq!(conversation.status, "running a tool");
+        assert_eq!(conversation.turn_phase, TurnPhase::Model);
+        assert_eq!(conversation.activities, vec![activity(1)]);
+        assert_eq!(
+            conversation.active_request.as_deref(),
+            Some(request.as_str())
+        );
+        assert_eq!(conversation.remote_head.as_deref(), Some(head.as_str()));
+    }
+
+    #[test]
+    fn learning_a_commit_retires_an_already_visible_optimistic_row() {
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("hello".to_string());
+        let commit = "a".repeat(40);
+        conversation.transcript.insert(
+            0,
+            TranscriptEntry {
+                role: EntryRole::Human,
+                commit: Some(commit.clone()),
+                text: "hello".to_string(),
+                pending_id: None,
+            },
+        );
+
+        conversation.mark_pending_submission(pending_id, commit);
+
+        assert!(conversation.pending_submissions.is_empty());
+        assert_eq!(conversation.transcript.len(), 1);
+        assert!(conversation.transcript[0].pending_id.is_none());
+    }
+
+    #[test]
+    fn failed_submission_restores_text_without_replacing_a_newer_draft() {
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("failed message".to_string());
+        conversation.composer.insert_str("newer draft");
+
+        conversation.restore_pending_submission(pending_id);
+
+        assert!(conversation.pending_submissions.is_empty());
+        assert!(conversation.transcript.is_empty());
+        assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
+    }
+
+    #[test]
+    fn stale_interjection_refresh_cannot_roll_back_a_newer_head() {
+        let old_head = "a".repeat(40);
+        let new_head = "b".repeat(40);
+        let mut conversation = state("talk-1");
+        conversation.remote_head = Some(new_head.clone());
+        conversation.status = "completed bbbbbbbb".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+        tx.send(UiMessage::InterjectionRefreshed {
+            conversation: "talk-1".to_string(),
+            observed_head: Some(old_head.clone()),
+            load: Ok(Box::new(ConversationLoad {
+                snapshot: ConversationSnapshot {
+                    id: "talk-1".to_string(),
+                    head: old_head.clone(),
+                    title: "talk-1".to_string(),
+                    status: "queued".to_string(),
+                    request: Some("c".repeat(40)),
+                    request_head: Some("d".repeat(40)),
+                    messages: Vec::new(),
+                },
+                replay: ConversationReplay {
+                    turns: Vec::new(),
+                    turn_events: Vec::new(),
+                },
+                workspace_diff: WorkspaceDiff {
+                    base_commit: "e".repeat(40),
+                    head: old_head,
+                    patch: String::new(),
+                },
+            })),
+        })
+        .unwrap();
+
+        assert!(app.drain_messages());
+        assert_eq!(
+            app.selected().remote_head.as_deref(),
+            Some(new_head.as_str())
+        );
+        assert_eq!(app.selected().status, "completed bbbbbbbb");
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn stale_remote_poll_result_does_not_overwrite_newer_local_state() {
+        let mut conversation = state("local title");
+        conversation.id = "shared".to_string();
+        conversation.remote_head = Some("b".repeat(40));
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(!app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "shared".to_string(),
+                title: "stale title".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+            },
+            observed_head: Some("a".repeat(40)),
+            observed_title: Some("old local title".to_string()),
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "local title");
+        assert_eq!(
+            app.selected().remote_head.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn publishing_gate_keeps_the_draft_and_shows_the_command_error_panel() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "publishing".to_string();
+        conversation.composer.insert_str("do not send yet");
         let (mut app, _) = app_with(vec![conversation]);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
+        assert!(app.selected().publishing);
+        assert_eq!(app.selected().composer.text, "do not send yet");
         assert!(app.selected().transcript.is_empty());
         assert_eq!(
             app.selected().command_error.as_deref(),
-            Some("this conversation already has an operation running")
+            Some("finish publishing before sending another message")
         );
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Command error"));
-        assert!(rendered.contains("this conversation already has an operation running"));
+        assert!(rendered_main_pane(&terminal)
+            .join("\n")
+            .contains("finish publishing before sending another message"));
     }
 
     #[test]
@@ -4543,16 +6422,375 @@ mod tests {
         assert_eq!(scroll_offset(20, 10, &conversation.scroll), 12);
         conversation.scroll.scroll_up(5);
         let transport = GitTransport::discover(&dir).unwrap();
-        conversation.reload(&transport);
+        let _ = conversation.reload(&transport, "alice");
         assert!(conversation.diff.is_none());
         assert!(conversation.status.is_empty());
         let error = conversation.transcript.last().unwrap();
         assert_eq!(error.role, EntryRole::Notice);
         assert!(error.text.contains("loading conversation failed"));
-        assert!(error.text.contains("no conversation"));
+        assert!(error.text.contains("caos"));
         assert_eq!(conversation.scroll.offset, Some(7));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remote_poll_discovers_invited_conversations_and_names_the_other_user() {
+        let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let (_, request) = seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
+        invite_user_to_conversation(&transport, "Bob", "shared").unwrap();
+
+        let (mut app, _) = app_with(vec![state("local")]);
+        app.repo_dir = repo.clone();
+        app.user = "Bob".to_string();
+        wait_for_remote_poll(&mut app);
+
+        let shared = app
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == "shared")
+            .unwrap();
+        assert!(shared.running);
+        assert_eq!(shared.active_request.as_deref(), Some(request.as_str()));
+        assert_eq!(
+            shared.reconciling_request.as_deref(),
+            Some(request.as_str())
+        );
+        assert!(matches!(
+            &shared.transcript[0].role,
+            EntryRole::Peer(author) if author == "Alice"
+        ));
+        assert_eq!(shared.transcript[0].text, "hello from Alice");
+        wait_for_remote_poll(&mut app);
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn active_request_reconciliation_has_one_process_local_join() {
+        let request = "b".repeat(40);
+        let mut conversation = state("shared");
+        conversation.running = true;
+        conversation.active_request = Some(request.clone());
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = std::env::temp_dir().join(format!(
+            "caos-cli-tui-missing-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        assert!(app.reconcile_active_requests());
+        assert_eq!(
+            app.selected().reconciling_request.as_deref(),
+            Some(request.as_str())
+        );
+        // Polling an unchanged active snapshot cannot fan out more waiters for
+        // the same exact request. Completion/failure is consumed by drain.
+        assert!(!app.reconcile_active_requests());
+    }
+
+    #[test]
+    fn ref_command_shows_a_copyable_canonical_ref_and_full_head() {
+        let (repo, remote, _) = repo_with_default_branch("show-ref", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let id = "_shared_name_";
+        let head = seed_idle_conversation(&repo, id, "Alice", "hello");
+
+        let (mut app, _) = app_with(vec![state(id)]);
+        app.repo_dir = repo.clone();
+        app.show_selected_ref();
+        assert!(app.selected().reference_loading);
+        wait_for_reference_lookup(&mut app);
+
+        let refname = conversation_ref(id).unwrap();
+        assert!(app.selected().transcript.is_empty());
+        assert_eq!(
+            app.selected().reference_notice,
+            Some(ReferenceNotice {
+                refname: refname.clone(),
+                head: head.clone(),
+            })
+        );
+
+        // A coherent reload must not erase this presentation-only result.
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = conversation_load(&transport, id).unwrap().unwrap();
+        app.selected_mut().apply_load(load.clone(), "Alice");
+        assert_eq!(
+            app.selected().reference_notice,
+            Some(ReferenceNotice {
+                refname: refname.clone(),
+                head: head.clone(),
+            })
+        );
+
+        // Narrow rendering clips raw text instead of markdown-parsing or
+        // soft-wrapping it, while clicks return the complete underlying value.
+        let area = Rect::new(0, 0, 70, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("_shared_"));
+
+        let copy_rows = (0..area.height)
+            .filter_map(|row| ui::reference_copy_at(&app, area, 27, row).map(|value| (row, value)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copy_rows.iter().map(|(_, value)| value).collect::<Vec<_>>(),
+            vec![&refname, &head]
+        );
+        app.palette = Some(CommandPalette::default());
+        assert!(ui::reference_copy_at(&app, area, 27, copy_rows[0].0).is_none());
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 27,
+                    row: copy_rows[0].0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            ),
+            MouseAction::Ignored
+        );
+        app.palette = None;
+        for (row, expected) in copy_rows {
+            assert_eq!(
+                app.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 27,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                ),
+                MouseAction::Copy(expected)
+            );
+        }
+
+        let mut advanced = load;
+        advanced.snapshot.head = "b".repeat(40);
+        advanced.workspace_diff.head = advanced.snapshot.head.clone();
+        app.selected_mut().apply_load(advanced, "Alice");
+        assert!(app.selected().reference_notice.is_none());
+
+        app.selected_mut().reference_notice = Some(ReferenceNotice { refname, head });
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().reference_notice.is_none());
+        assert_eq!(app.focus, Focus::Conversation);
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn failed_last_conversation_fork_keeps_a_safe_app_state() {
+        let (repo, remote, tip) = repo_with_default_branch("last-fork-failure", "main");
+        let mut fork = state("forked");
+        fork.forking = true;
+        fork.composer.insert_str("preserve this draft");
+        let (mut app, _) = app_with(vec![fork]);
+        app.repo_dir = repo.clone();
+
+        app.finish_fork(
+            "forked",
+            "closed-origin",
+            &"a".repeat(40),
+            Err("remote rejected the fork".to_string()),
+        );
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected, 0);
+        assert!(!app.selected().forking);
+        assert_eq!(
+            app.selected().turn_options.base.as_deref(),
+            Some(tip.as_str())
+        );
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        assert!(app.selected().remote_title.is_none());
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .is_some_and(|error| error.contains("remote rejected the fork")));
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn failed_fork_preserves_its_draft_with_other_conversations_open() {
+        let (repo, remote, tip) = repo_with_default_branch("multi-fork-failure", "main");
+        let mut fork = state("forked");
+        fork.forking = true;
+        fork.composer.insert_str("preserve this draft");
+        let (mut app, _) = app_with(vec![state("origin"), fork]);
+        app.repo_dir = repo.clone();
+        app.selected = 1;
+
+        app.finish_fork(
+            "forked",
+            "origin",
+            &"a".repeat(40),
+            Err("remote rejected the fork".to_string()),
+        );
+
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().id, "forked");
+        assert!(!app.selected().forking);
+        assert_eq!(
+            app.selected().turn_options.base.as_deref(),
+            Some(tip.as_str())
+        );
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn from_materializes_inherited_history_immediately() {
+        let (repo, remote, _) = repo_with_default_branch("durable-fork", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source.clone()));
+
+        let fork_id = app.selected().id.clone();
+        assert_ne!(fork_id, "original");
+        assert!(app.selected().forking);
+        assert!(app.selected().is_busy());
+        assert!(app.selected().transcript.is_empty());
+        assert!(wait_for_fork(&mut app, &fork_id));
+        assert_eq!(app.selected().transcript[0].text, "inherited message");
+        assert!(conversation_head(&transport, &fork_id).unwrap().is_some());
+        assert_eq!(app.selected().diff.as_ref().unwrap().base_commit, source);
+        assert!(app.selected().diff.as_ref().unwrap().patch.is_empty());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn fork_placeholder_does_not_cancel_automatic_title_generation() {
+        let (repo, remote, _) = repo_with_default_branch("fork-title", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source));
+        let fork_id = app.selected().id.clone();
+        assert!(wait_for_fork(&mut app, &fork_id));
+        let placeholder = app.selected().title.clone();
+        app.selected_mut()
+            .apply_automatic_title("fallback from the first prompt");
+        app.selected_mut().generating_title = true;
+
+        wait_for_remote_poll(&mut app);
+        assert_eq!(app.selected().title, "fallback from the first prompt");
+        assert!(app.selected().automatic_title);
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some(placeholder.as_str())
+        );
+
+        app.finish_title_generation(0, Ok("Generated fork title".to_string()));
+        assert_eq!(app.selected().title, "Generated fork title");
+        assert_eq!(
+            app.selected().remote_title.as_deref(),
+            Some("Generated fork title")
+        );
+        let summary = list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == fork_id)
+            .unwrap();
+        assert_eq!(summary.title, "Generated fork title");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn generated_fork_title_does_not_overwrite_an_external_rename() {
+        let (repo, remote, _) = repo_with_default_branch("fork-title-race", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+        let (mut app, _) = app_with(vec![state("original")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(source));
+        let fork_id = app.selected().id.clone();
+        assert!(wait_for_fork(&mut app, &fork_id));
+        app.selected_mut().apply_automatic_title("fallback");
+        app.selected_mut().generating_title = true;
+        set_conversation_title(&transport, &fork_id, "External rename").unwrap();
+
+        app.finish_title_generation(0, Ok("Late generated title".to_string()));
+        assert_ne!(app.selected().title, "Late generated title");
+        wait_for_remote_poll(&mut app);
+        assert_eq!(app.selected().title, "External rename");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn plain_commit_fork_failure_never_becomes_a_markerless_conversation() {
+        let (repo, remote, plain_commit) = repo_with_default_branch("plain-fork", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let (mut app, _) = app_with(vec![state("origin")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.start_new_conversation(Some(plain_commit));
+        let pending_id = app.selected().id.clone();
+        app.selected_mut().composer.insert_str("must not submit");
+        app.start_turn();
+        assert!(app.selected().forking);
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("fork"));
+
+        assert!(wait_for_fork(&mut app, &pending_id));
+        assert_eq!(app.selected().id, pending_id);
+        assert_eq!(app.selected().composer.text, "must not submit");
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("not a JSON event"));
+        assert!(conversation_head(&transport, &pending_id)
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
     }
 
     #[test]
@@ -4575,7 +6813,7 @@ mod tests {
     fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/conversations/talk-1/from-user:caos-tools".to_string(),
+            source: "refs/caos/v2/conversations/talk-1/head:caos-tools".to_string(),
             tools: vec![caos::chat::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),
@@ -4605,7 +6843,7 @@ mod tests {
             .collect();
         assert!(rendered.contains("Always available"));
         assert!(rendered.contains("read, ls, write, edit"));
-        assert!(rendered.contains("talk-1/from-user:caos-tools"));
+        assert!(rendered.contains("talk-1/head:caos-tools"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("Build everything the tree defines."));
         assert!(rendered.contains("[docker://caos-std-bash]"));

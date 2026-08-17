@@ -14,7 +14,9 @@
 
 Since extended with the **single-valued form**, `caos run-then` (the
 continuation gained a `run` entry, mutually exclusive with `map`; see
-[Run-then](#run-then-the-single-valued-form)).
+[Run-then](#run-then-the-single-valued-form)), and the **exact-request form**,
+`caos run-request-then` (see
+[Run-request-then](#run-request-then-the-exact-request-form)).
 
 ## Problem
 
@@ -45,16 +47,16 @@ reserved NAMES rather than a region.
 - **`caos map-then <in> [--map:<t>=<img>] [--then:<t>=<img>]`** (worker form) writes
   `/cas/out` as a **promise placeholder** naming a continuation object;
   `entrypoint` reports `promise <hash>` instead of `blob/tree <hash>`.
-- The **continuation** is a content-addressed tree `{in, map?, run?, then?,
-  catch?}`: `in` is a real tree entry (the data node, mode + oid);
-  `map`/`run`/`then` are blobs naming images (resolved to hashes / `docker://`
-  refs client-side, so the server never sees `/cas` paths); `catch` is a marker
-  blob whose presence is the whole signal (see
-  [Catch](#catch-a-failing-run-as-a-value)). `map` and `run` are **mutually
-  exclusive** — the worker CLI's two verbs (`map-then` takes only
-  `--map`/`--then`, `run-then` only `--run`/`--then`/`--catch`) enforce that
-  client-side, and the server rejects a continuation carrying both as defense
-  in depth.
+- The **continuation** is one of two content-addressed shapes:
+  `{in, map?|run?|then?, catch?}` or `{request, then?, catch?}`. `in` is a real
+  tree entry (the data node, mode + oid); `request` is a real tree entry naming
+  one complete ArgTree; `map`/`run`/`then` are blobs naming images (resolved to
+  hashes / `docker://` refs client-side, so the server never sees `/cas` paths);
+  `catch` is a marker blob whose presence is the whole signal (see
+  [Catch](#catch-a-failing-single-valued-step-as-a-value)). `map`, `run`, and
+  `request` are **mutually exclusive**, and `request` excludes `in`. The worker
+  CLI verbs enforce those shapes client-side and the server re-checks them as
+  defense in depth.
 - The **server**, on a `promise` result, resolves it — one path, a *middle
   step* then `then`:
   1. if `map` is given and `in` is a tree: run `map` with `--in=<child>` for
@@ -63,12 +65,14 @@ reserved NAMES rather than a region.
      names;
   2. if `run` is given: **one** sub-run, `run(--in=<in>)`, yielding R — the
      single-valued form (see below);
-  3. if `then` is given: the request's result is `then(--in=<in>
-     [, --children=<children> | --result=<R>])` — the extra arg only when a
-     middle step ran;
-  4. with no `then`, the middle step's own result is the request's result —
-     the `children` tree after a `map`, R after a `run`. With no middle step,
-     `then(--in=<in>)` is a plain tail call.
+  3. if `request` is given: execute that exact ArgTree unchanged, yielding R —
+     the exact-request form (see below);
+  4. if `then` is given: the request's result is `then(--in=<in>
+     [, --children=<children> | --result=<R>])` for the `in` shape. For the
+     exact-request shape it is `then(--result=<R>)`, with no synthesized `in`;
+  5. with no `then`, the middle step's own result is the request's result —
+     the `children` tree after a `map`, R after a `run` or exact `request`. With
+     no middle step, `then(--in=<in>)` is a plain tail call.
 
   Every sub-run goes through the same internal pipeline (cache → cycle check →
   dispatch → promise resolution), so promises nest arbitrarily: a `map` child,
@@ -98,7 +102,23 @@ first-class commits) as much as a blob or tree.
 `caos-cli run` is **unchanged**: it still blocks at the top level (it holds no
 worker slot), and the server resolves all promises before answering.
 
-## Catch: a failing `run` as a value
+## Run-request-then: the exact-request form
+
+`caos run-request-then <R> [--then:<t>=<img>] [--catch]` (helpers
+`worker_common::run_request_then` and `run_request_then_catching`) records
+`{request: R, then?, catch?}`. `R` is already a complete ArgTree: the server
+executes that exact request identity without adding an `in` argument or
+reassembling it around an image. With no `then`, R's result is returned
+unchanged. With `then`, the callback receives only `--result=<R-result>`; it
+does not receive `--in`.
+
+The shape is intentionally exclusive: `request` cannot coexist with `in`,
+`map`, or `run`. `catch` requires `then`; when R fails, the callback receives
+only `--error=<blob>` instead of `--result`. This is the durable-work primitive:
+the exact recorded request can be reissued after recovery without reconstructing
+its arguments.
+
+## Catch: a failing single-valued step as a value
 
 `caos run-then <in> --run:<t>=<img> --then:<t>=<img> --catch` (helper:
 `worker_common::run_then_catching`) records a `catch` marker alongside the rest.
@@ -119,9 +139,10 @@ tool results, and the model's in-turn work.
 Two constraints, both enforced client-side and re-checked by the interpreter:
 
 - **`catch` needs `then`.** An error with no recipient is just an error.
-- **`catch` is `run`-only.** A caught `map` would have to say *which* child
-  failed and what the surviving siblings' results mean; nothing needs that yet,
-  and guessing the shape now would be the wrong guess.
+- **`catch` is single-valued.** It applies to `run` or exact `request`. A caught
+  `map` would have to say *which* child failed and what the surviving siblings'
+  results mean; nothing needs that yet, and guessing the shape now would be the
+  wrong guess.
 
 A request whose resolution caught a failure is **not memoized**. Sub-run
 failures are deliberately uncached (`cargo-workers.md`); folding one into a
@@ -134,11 +155,11 @@ result out.
 
 No worker ever waits for another worker: a container either computes a value
 or *describes* the remaining work and exits. The only things that block are
-server threads (cheap, one per pending node) — never worker slots. So a global
-bound on concurrent containers (`CAOS_MAX_WORKERS`, a semaphore acquired only
-for the duration of a single container run and never held while waiting on
-anything else) is safe at any setting ≥ 1: some runnable leaf always holds a
-slot, finishes, and releases it.
+server threads (cheap, one per pending node), while runnable leaves are handed
+to parked runner polls. Capacity is runner-side: a host agent's
+`CAOS_RUNNER_SLOTS` controls its generic polling loops, and other specialized
+runners may contribute more. No server semaphore is held across dependency
+resolution, so a parent cannot occupy the execution slot its child needs.
 
 ## Expressing the old recursion
 
@@ -162,28 +183,36 @@ sub-runs) and points `in` at what it built.
 
 ## Cycle detection
 
-The run stack no longer threads through worker env (`CAOS_RUN_STACK` is gone —
-workers never call `/run` anymore). It is an internal argument of the server's
-run pipeline: promise sub-runs carry `parent stack + parent request`, and
-re-entering a request on the stack fails listing the cycle, exactly as before.
-An HTTP `/run` is always top-level (empty stack).
+The run stack no longer threads through worker env (`CAOS_RUN_STACK` is gone).
+It is an internal argument of the server's run pipeline: promise sub-runs carry
+`parent stack + parent request`, and re-entering a request on the stack fails
+listing the cycle, exactly as before. An HTTP `/run` is always top-level (empty
+stack).
+
+`caos run-async` is the deliberate exception to workers normally describing
+sub-runs as continuations: it sends a new HTTP `/run` for detached, independent
+work. The new run does not inherit the caller's stack, so cycle detection does
+not cross that boundary. A request must therefore not use `run-async` as a
+recursive edge; independently dispatched work must be acyclic without relying
+on ancestors from the dispatching run.
 
 ## Parallelism
 
-Map children run concurrently (one thread each, `std::thread::scope`), gated
-only by the worker semaphore. `CAOS_MAX_WORKERS` (env, default 8, `0` =
-unlimited) bounds concurrent containers across the whole server.
+Map children resolve concurrently (one server thread each,
+`std::thread::scope`). Actual container concurrency is the available set of
+parked runner polls; for the generic host agent it is configured with
+`CAOS_RUNNER_SLOTS`, not a server-wide semaphore or fixed default.
+
+Identical concurrent requests are single-flighted by request hash. Later
+arrivals wait for the owner's exact outcome without a timeout that could repeat
+effectful work. Before parking, the server checks its cross-thread waits-for
+graph. Only when parking would close a genuine dependency cycle does that
+arrival run independently; its expanded local ancestry then reports the cycle
+instead of hanging. If an owner is lost, its waiters receive an error and a
+later request may become the new owner.
 
 ## Open items
 
-- **Concurrent duplicate runs.** Two identical requests in flight both run
-  (pre-existing: "no locks yet"). Parallel maps make this more likely — a
-  diamond DAG (deep-deps' shared dep) now computes shared nodes once per
-  concurrent parent instead of hitting the cache sequentially. Fix is
-  single-flight keyed on the request hash; to keep clean cycle *errors* (not
-  hangs) it needs a waits-for check before blocking on another thread's
-  in-flight run. Deferred.
 - **Durability.** Promises live in server threads; a server restart loses
   in-flight resolutions (as it lost in-flight runs before). A journaled
   continuation queue would make them resumable.
-- The `serve`/fly dispatch protocol no longer carries `stack`.

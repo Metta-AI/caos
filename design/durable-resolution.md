@@ -4,8 +4,8 @@
 threads, in-process single-flight and cycle stacks) is correct and fine for a
 single-server prototype; this note is the intended evolution for durability
 and horizontal scaling. Decided in a design discussion (2026-07); not yet
-built. Pairs with the open items in `map-then.md` ("Durability",
-"Concurrent duplicate runs").
+built. Pairs with the durability open item in `map-then.md`; concurrent
+duplicate runs are already joined by the current single-server implementation.
 
 ## Problem
 
@@ -25,7 +25,7 @@ exits — the load-bearing invariant), but the server does. Consequences:
 
 ## The rework: store the work, don't block on it
 
-The continuation `{in, map?, run?, then?}` is *already* content-addressed
+The continuation `{in, map?, run?, then?, catch?}` is *already* content-addressed
 data. So resolution becomes an explicit work queue instead of a call stack:
 
 - a table of **pending nodes**, each with its outstanding-child count and its
@@ -37,8 +37,9 @@ data. So resolution becomes an explicit work queue instead of a call stack:
 
 All of this state lives in **Redis**, which is what makes it both durable
 (survives a restart) and multi-server (any instance pulls pending nodes). The
-result cache and pinned refs are already in Redis; this extends the same
-principle to the in-flight state.
+best-effort result cache is already in Redis, while pinned results are Git refs;
+this proposal extends Redis from cached results to authoritative in-flight
+state.
 
 ## Single-flight becomes a lease
 
@@ -47,8 +48,10 @@ thread on a channel — it's a **Redis lease**: `SETNX caos:lease:<req>` with a
 TTL elects the owner; a duplicate simply **appends its continuation to that
 request's waiter list** and does nothing else. When the owner completes it
 fans the result out to the waiter list (the same `flights` idea, but the
-waiter is a stored continuation, not a `mpsc::Sender`). Lease renewal /
-expiry reaps an owner that dies mid-run.
+waiter is a stored continuation, not a `mpsc::Sender`). Lease renewal can show
+liveness, but ambiguous expiry cannot by itself authorize another execution:
+effectful work needs fencing or an independently idempotent effect protocol
+before a replacement owner may run.
 
 Consequence: the **deadlock** concern disappears entirely — there are no
 blocked threads to deadlock, so the in-process `parked` registry and the
@@ -87,9 +90,9 @@ request**:
    multiple stacks per request.
 
 The distributed case is rare (two clients concurrently asking for opposite
-ends of a mutual dependency); a **timeout reaper** is an acceptable cheaper
-alternative to the edge walk if eager detection isn't wanted — wasteful,
-never wrong.
+ends of a mutual dependency). A timeout can report or reap dead bookkeeping,
+but must not start duplicate execution unless the effect protocol is fenced or
+idempotent; otherwise the wait-for edge walk is required for eager progress.
 
 ## What this retires
 
@@ -104,9 +107,10 @@ never wrong.
 - **Detection latency** — a cycle may sit in the queue a few hops (or, for
   the reaper option, a timeout) before it's caught. Bounded by cycle length;
   a cyclic computation was never going to produce a value anyway.
-- **Lease liveness** — TTL + renewal must cover the longest legitimate run;
-  too short re-runs (wasteful, first-write-wins keeps it correct), too long
-  delays reaping a dead owner.
+- **Lease liveness** — TTL + renewal must cover the longest legitimate run.
+  Too long delays reaping a dead owner; too short is ambiguous and must not
+  trigger a replacement without fencing or idempotent effects. First-write-wins
+  protects only the cached result, not external side effects.
 - **The rewrite itself** — turning recursive blocking resolution into an
   explicit state machine with completion-keyed wakeups is real work; do it
   when durability or horizontal scaling is the goal, not before.

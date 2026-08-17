@@ -88,9 +88,23 @@ pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String
     // a reader match, so it carries no store of its own — no marking here.
     eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"), &[])
         .map(|(_kind, hash)| hash)
-        .map_err(|e| {
-            format!("resolving {name:?} from the workspace: {e}\n  declare it in ./DEPS, e.g. `./std/{name} {name}`")
-        })
+        .map_err(|error| workspace_dep_error(name, &error))
+}
+
+fn workspace_dep_error(name: &str, error: &str) -> String {
+    let mut message = format!("resolving {name:?} from the workspace: {error}");
+    // A transport, worker, or expression failure does not imply a missing DEPS
+    // line. Offer the declaration hint only when the actual tree walk says its
+    // deep-deps mount is absent.
+    if error.starts_with("eval-path: ")
+        && error.contains(" not found in ")
+        && (error.contains("\"DEEP-DEPS\"") || error.contains(&format!("{name:?}")))
+    {
+        message.push_str(&format!(
+            "\n  declare it in ./DEPS, e.g. `./std/{name} {name}`"
+        ));
+    }
+    message
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
@@ -623,5 +637,22 @@ pub(crate) fn mode_of_kind(kind: &str) -> EntryMode {
         "tree" => EntryKind::Tree.into(),
         "commit" => EntryKind::Commit.into(),
         _ => EntryKind::Blob.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_dep_error;
+
+    #[test]
+    fn workspace_dependency_hint_only_follows_a_missing_mount() {
+        let missing = workspace_dep_error(
+            "llm-step",
+            "eval-path: \"llm-step\" not found in 0123456789abcdef",
+        );
+        assert!(missing.contains("declare it in ./DEPS"), "{missing}");
+
+        let push = workspace_dep_error("llm-step", "git push failed: bad tree object");
+        assert!(!push.contains("declare it in ./DEPS"), "{push}");
     }
 }

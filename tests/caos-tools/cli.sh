@@ -78,7 +78,9 @@ EOF
 echo "You are a coding agent." > system.txt
 commit "workspace + tools"
 base=$(mkcommit "HEAD:ws" "base")
-human1=$(mkcommit "HEAD:ws" "run the hello tool" "$base")
+human1=$(mkcommit "HEAD:ws" \
+  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"run the hello tool\"}" \
+  "$base")
 
 echo "== script the stub LLM (call; edit-then-call; arg calls; end) ==" >&2
 R1='[{"id":"toolu_01","input":{},"name":"hello","type":"tool_use"}]'
@@ -109,15 +111,25 @@ trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== run the turn ==" >&2
 conv="ct-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+conversation_ref="refs/caos/v2/conversations/$conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
   --api-key=test-key --system:@=system.txt \
   --model=test-model \
   --base-url="http://$stub_host:$port" --conversation="$conv")
-"$CAOS_CLI" run --base:hash="$llm" --head:commit="$human1" > turn.commit
+request=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$human1")
+[ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
+  || fail "prepared request is not exact Q: $request"
+admitted=$(mkcommit "HEAD:ws" \
+  "{\"request\":\"$request\",\"request_head\":\"$human1\",\"status\":\"queued\"}" \
+  "$human1")
+git push --quiet caos "$admitted:$conversation_ref" \
+  || fail "publishing the request admission"
+"$CAOS_CLI" run --base:hash="$request" > turn.commit
 turn=$(git hash-object -t commit --stdin < turn.commit)
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
-[ "$(git show -s --format=%s "$turn")" = "tools done" ] || fail "turn message"
+git show -s --format=%B "$turn" | grep -qF '"content":"tools done"' \
+  || fail "terminal assistant event"
 
 echo "== registration: hello advertised with its #@doc; bash not shadowed ==" >&2
 grep -qF '"name":"hello"' stub/request-1.json || fail "hello not registered"

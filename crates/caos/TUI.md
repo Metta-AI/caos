@@ -35,17 +35,26 @@ you to check the running service and the `caos` git remote.
 
 ```text
 caos tui                  continue the most recent conversation
-caos tui --user alice     use alice's active conversation list
+caos tui --username alice use alice's active conversation list
 caos tui --new            start a fresh conversation
 caos tui --from 5ec3751   branch from a completed turn
 caos tui --list-archived  list archived conversation IDs and titles
 caos tui --unarchive ID   restore one conversation to the active list
 ```
 
-`--user` defaults to `$USER`. Active and archived membership is stored on the
-CAOS server under `refs/caos/users/<user>/conversations/{active,archived}/`,
-not in local TUI state. Existing local conversation refs are imported the first
-time that user opens the TUI.
+`--username` defaults to `$USER`. If `$USER` is a shared container account such
+as `root` or `ubuntu`, pass a personal `--username`; persisted identity is future
+work. Active and archived membership is stored on the
+CAOS server under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
+not in local TUI state. `<user-key>` is `u-` plus lowercase hex of the
+normalized username's UTF-8 bytes; usernames are limited to 126 UTF-8 bytes.
+Each membership ref ends in one `<conversation-key>` component: `c-` plus
+lowercase hex of the conversation ID's UTF-8 bytes. Conversation IDs are
+limited to 124 UTF-8 bytes so Git can create the encoded ref lockfile. This
+preserves IDs containing `/` without creating Git ref file/directory
+collisions. Only these v2 membership refs populate the sidebar. Unversioned
+chat refs remain stored but invisible: v2 clients do not read, import, rename,
+migrate, or delete them.
 
 ## Controls
 
@@ -99,7 +108,9 @@ running and is not added to the transcript or title.
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
 TUI. Enter `/title <new title>` to change the shared title without changing the
-conversation ID or HEAD. Enter `/update-tree <message>` to send an ordinary
+conversation ID or HEAD. Enter `/model <name>` to select the client-wide model
+for later turns; known model names type ahead. `/model default` restores the
+client default. Enter `/update-tree <message>` to send an ordinary
 user turn whose commit also folds in your current working-tree changes — the
 intended companion to `Ctrl+L` (check out the head, edit files, then
 `/update-tree <message>` with the text you want in that turn). Activity entries
@@ -186,20 +197,16 @@ matches it exactly.
 
 Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
 branch prompt with `origin`'s advertised default selected; type another branch
-to override it, then press `Ctrl+P` again. CAOS creates or replaces
-`caos/<conversation>` with one clean snapshot commit directly above the fetched
-tip of that base. For the default branch, the snapshot contains the
-conversation's complete workspace. For another branch, CAOS applies only the
-changes made since this conversation started, so a child conversation can be
-stacked on its parent's clean published snapshot without re-merging the parent
-conversation's internal history. Both paths merge without touching the
-checkout or index. Non-conflicting upstream changes survive; a conflict stops
-publication and lists its paths in the command-error panel. CAOS pushes the
-clean snapshot and uses the authenticated `gh` CLI to find or open its pull
-request against the chosen base. Republish replaces the commit instead of
-retaining earlier snapshots, and the branch excludes the conversation's
-internal step DAG and `.caos` metadata even when one conversation starts from
-another conversation's head.
+to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn that
+merges the exact fetched base with the standard `merge` tool, then resolves and
+tests the result. For another base, only this conversation's delta is applied,
+so child conversations form clean PR stacks. Unresolved conflicts stop before
+the branch moves. The checkout and index remain untouched.
+
+CAOS creates or replaces `caos/<conversation>` with one clean snapshot commit
+directly above the selected base, pushes it, and uses the authenticated `gh`
+CLI to find or open its pull request. The snapshot excludes the internal step
+DAG and `.caos` metadata.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git

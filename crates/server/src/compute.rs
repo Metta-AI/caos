@@ -105,23 +105,18 @@ struct WorkRequest<'a> {
 /// The ArgTree being a content-addressed object means its hash *is* the cache key
 /// (it captures everything — image, std, salt and the rest) and the rendezvous
 /// id: an external run also pins `refs/caos/res/<argTreeHash>` at the result, so a
-/// client can fetch it by ref. Only external callers reach this endpoint now (the
-/// CLI, which pushed the ArgTree): workers never call back into `/run` — a
-/// worker's sub-runs are promise resolutions the server performs itself
-/// ([`run_work_request`] recursion).
+/// client can fetch it by ref. Most worker sub-runs are promise resolutions the
+/// server performs itself ([`run_work_request`] recursion); `caos run-async` is
+/// the one worker command that sends this same endpoint and disconnects without
+/// waiting for the result. That dispatch is deliberately a new top-level run:
+/// it has an empty run stack, so stack-based cycle detection does not cross the
+/// detached-work boundary.
 pub(crate) fn run(
     config: &Config,
     query: &str,
     secrets_header: &str,
 ) -> Result<Vec<u8>, HttpError> {
-    let arg_tree = query_param(query, "req")
-        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
-    if arg_tree.is_empty() || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(HttpError::new(
-            400,
-            format!("invalid arg-tree hash: {arg_tree:?}"),
-        ));
-    }
+    let arg_tree = parse_arg_tree(query)?;
     let trace_id = query_param(query, "trace");
     if let Some(id) = &trace_id {
         if !crate::trace::valid_id(id) {
@@ -146,18 +141,35 @@ pub(crate) fn run(
     if let Some(id) = &trace_id {
         config.trace.end(id);
     }
+    // Top-level publication is part of `run_work_request`: a flight owner pins
+    // before releasing its ownership, and waiters receive that combined
+    // compute-and-publication outcome.
     let result = result?;
-    // Pin an external run's result so a client can fetch it by ref and it
-    // survives gc; sub-runs set no ref (they'd flood the namespace).
-    pin_result(config, &arg_tree, &result);
     Ok(format!("{result}\n").into_bytes())
+}
+
+/// Parse and validate the request identity.
+fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
+    let arg_tree = query_param(query, "req")
+        .ok_or_else(|| HttpError::new(400, "missing 'req' query parameter"))?;
+    if arg_tree.len() != 40
+        || !arg_tree
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(HttpError::new(
+            400,
+            format!("invalid arg-tree hash: {arg_tree:?}"),
+        ));
+    }
+    Ok(arg_tree)
 }
 
 /// Run WorkRequest `request` (its ArgTree, with `request.stack` the chain of
 /// ancestor ArgTree hashes — empty = top-level), returning the fully-resolved
 /// `"<type> <hash>"`. The whole pipeline behind both `GET /run` and promise
 /// sub-runs: cache lookup → run-cycle detection → the container run → promise
-/// resolution → cache store.
+/// resolution → cache store → top-level result publication.
 fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, HttpError> {
     let span_id = request.trace_id.and_then(|id| config.trace.start(id));
     let result = run_work_request_inner(config, request, span_id);
@@ -210,7 +222,10 @@ fn run_work_request_inner(
                 config.trace.cache(trace_id, span_id, true);
             }
             eprintln!("cache hit: arg_tree={arg_tree} -> {result}");
-            return Ok(result);
+            let outcome = complete_cache_hit(arg_tree, stack, result, |result| {
+                pin_result(config, arg_tree, result)
+            });
+            return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
         }
         Ok(None) => {
             if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
@@ -250,33 +265,38 @@ fn run_work_request_inner(
     // thread's stack). `park_would_deadlock` walks the parked-waiter graph
     // for exactly that reachability; an unsafe arrival runs independently —
     // the duplicate grows its descendants' stacks and the genuine cycle then
-    // errors cleanly. The recv timeout stays as a belt-and-suspenders
-    // backstop (e.g. an owner that dies without broadcasting).
-    match join_flight(arg_tree, stack) {
-        Flight::Owner => {}
-        Flight::Unsafe => {
-            eprintln!(
-                "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
-            );
-        }
-        Flight::Waiter(rx, guard) => {
-            let outcome = rx.recv_timeout(SINGLE_FLIGHT_TIMEOUT);
-            drop(guard);
-            match outcome {
-                Ok(outcome) => {
-                    eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
-                    return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
+    // errors cleanly. An owner guard clears and broadcasts if its thread
+    // unwinds; a waiter never promotes itself merely because a valid run is
+    // slow, since duplicate execution may repeat external side effects.
+    let (outcome, owner) =
+        match claim_flight_after_miss(arg_tree, stack, || cache_get(&config.redis_addr, &key)) {
+            FlightDisposition::Run(owner) => (
+                run_dispatch(config, request, &image, &salt, &key, traced_arg_entries),
+                owner,
+            ),
+            FlightDisposition::Complete {
+                outcome,
+                cache_hit,
+                owner,
+            } => {
+                if cache_hit {
+                    if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
+                        config.trace.cache(trace_id, span_id, true);
+                    }
                 }
-                Err(_) => {
-                    eprintln!(
-                        "single-flight: arg_tree={arg_tree} wait expired; running independently"
-                    );
-                }
+                (outcome, owner)
             }
-        }
-    }
-    let outcome = run_dispatch(config, request, &image, &salt, &key, traced_arg_entries);
-    finish_flight(arg_tree, &outcome);
+        };
+    let outcome = match owner {
+        // Any top-level participant marks the shared flight for publication,
+        // even when its executor entered as a promise sub-run. The owner keeps
+        // the flight fenced until that publication finishes.
+        Some(owner) => owner.finish_with(outcome, |result| pin_result(config, arg_tree, result)),
+        // A waiter receives the owner's already-published outcome. The only
+        // ownerless executor is a cycle-breaking sub-run: an external request
+        // has no ancestors, so it can never take the unsafe path.
+        None => outcome,
+    };
     outcome.map_err(|(status, msg)| HttpError::new(status, msg))
 }
 
@@ -372,27 +392,42 @@ fn run_dispatch(
 /// A run's outcome in plain data, so it can be sent to every parked waiter.
 type Outcome = Result<String, (u16, String)>;
 
-/// How long a waiter parks on someone else's in-flight run before giving up
-/// and running the request itself. Generous — the flight covers the whole
-/// promise resolution of a possibly deep DAG — but finite, so a cross-thread
-/// cycle degrades to duplicate work (and a clean stack-based cycle error)
-/// instead of a deadlock.
-const SINGLE_FLIGHT_TIMEOUT: Duration = Duration::from_secs(900);
+struct FlightEntry {
+    waiters: Vec<mpsc::Sender<Outcome>>,
+    /// At least one participant is a top-level HTTP run and therefore needs
+    /// the result pinned before the flight completes.
+    publish_result: bool,
+}
 
-/// In-flight runs: ArgTree hash → the channels of parked waiters.
-fn flights() -> &'static Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>> {
-    static FLIGHTS: OnceLock<Mutex<HashMap<String, Vec<mpsc::Sender<Outcome>>>>> = OnceLock::new();
+/// In-flight runs: ArgTree hash → the flight's waiters and publication need.
+fn flights() -> &'static Mutex<HashMap<String, FlightEntry>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<String, FlightEntry>>> = OnceLock::new();
     FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// One parked waiter: its ancestor stack, and the ArgTree it waits on — an
-/// edge of the waits-for graph `park_would_deadlock` walks.
-type ParkedEdge = (Vec<String>, String);
+/// edge of the waits-for graph `park_would_deadlock` walks. The ID prevents a
+/// delayed guard from removing an identical edge belonging to a later flight.
+struct ParkedEdge {
+    id: u64,
+    stack: Vec<String>,
+    target: String,
+}
+
+struct ParkedState {
+    next_id: u64,
+    edges: Vec<ParkedEdge>,
+}
 
 /// Every parked waiter, as the edges of that graph.
-fn parked() -> &'static Mutex<Vec<ParkedEdge>> {
-    static PARKED: OnceLock<Mutex<Vec<ParkedEdge>>> = OnceLock::new();
-    PARKED.get_or_init(|| Mutex::new(Vec::new()))
+fn parked() -> &'static Mutex<ParkedState> {
+    static PARKED: OnceLock<Mutex<ParkedState>> = OnceLock::new();
+    PARKED.get_or_init(|| {
+        Mutex::new(ParkedState {
+            next_id: 0,
+            edges: Vec::new(),
+        })
+    })
 }
 
 /// Would parking a waiter (ancestry `stack`) on in-flight `arg_tree` close a wait
@@ -410,9 +445,9 @@ fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
         if stack.contains(&cur) {
             return true;
         }
-        for (wstack, target) in parked.iter() {
-            if wstack.contains(&cur) && seen.insert(target.clone()) {
-                frontier.push(target.clone());
+        for edge in &parked.edges {
+            if edge.stack.contains(&cur) && seen.insert(edge.target.clone()) {
+                frontier.push(edge.target.clone());
             }
         }
     }
@@ -421,7 +456,7 @@ fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
 
 enum Flight {
     /// Nobody is running this request: run it (and `finish_flight` after).
-    Owner,
+    Owner(FlightOwner),
     /// Someone is: park here for their outcome. The guard unregisters the
     /// waits-for edge when the wait ends (either way).
     Waiter(mpsc::Receiver<Outcome>, ParkGuard),
@@ -429,20 +464,191 @@ enum Flight {
     Unsafe,
 }
 
+enum FlightDisposition {
+    /// This arrival must execute. `Some` owns the canonical flight; `None` is
+    /// the independent duplicate required to expose a cross-thread cycle.
+    Run(Option<FlightOwner>),
+    /// A live owner or the post-claim cache re-read supplied the outcome. The
+    /// latter retains its owner so top-level publication happens before the
+    /// flight is released.
+    Complete {
+        outcome: Outcome,
+        cache_hit: bool,
+        owner: Option<FlightOwner>,
+    },
+}
+
+/// Join the flight after an initial cache miss, then re-read the cache if this
+/// arrival will execute. A miss can be descheduled before it reaches the flight
+/// table; the previous owner may finish, cache, and remove its entry meanwhile.
+/// The new owner must therefore check again while its ownership excludes any
+/// other ordinary in-process executor. Unsafe cycle-breaking duplicates also
+/// re-read before repeating possibly effectful work.
+fn claim_flight_after_miss(
+    arg_tree: &str,
+    stack: &[String],
+    reread_cache: impl FnOnce() -> Result<Option<String>, String>,
+) -> FlightDisposition {
+    match join_flight(arg_tree, stack) {
+        Flight::Owner(owner) => match reread_cache() {
+            Ok(Some(result)) => {
+                eprintln!("cache hit after single-flight claim: arg_tree={arg_tree} -> {result}");
+                let outcome = Ok(result);
+                FlightDisposition::Complete {
+                    outcome,
+                    cache_hit: true,
+                    owner: Some(owner),
+                }
+            }
+            Ok(None) => FlightDisposition::Run(Some(owner)),
+            Err(error) => {
+                eprintln!(
+                    "cache lookup after single-flight claim failed ({error}); running worker: arg_tree={arg_tree}"
+                );
+                FlightDisposition::Run(Some(owner))
+            }
+        },
+        Flight::Unsafe => match reread_cache() {
+            Ok(Some(result)) => {
+                eprintln!("cache hit before cycle-breaking run: arg_tree={arg_tree} -> {result}");
+                FlightDisposition::Complete {
+                    outcome: Ok(result),
+                    cache_hit: true,
+                    owner: None,
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "single-flight: arg_tree={arg_tree} parking would deadlock; running independently"
+                );
+                FlightDisposition::Run(None)
+            }
+            Err(error) => {
+                eprintln!(
+                    "cache lookup before cycle-breaking run failed ({error}); running independently: arg_tree={arg_tree}"
+                );
+                FlightDisposition::Run(None)
+            }
+        },
+        Flight::Waiter(rx, guard) => {
+            let outcome = wait_for_flight(arg_tree, rx, guard);
+            FlightDisposition::Complete {
+                outcome,
+                cache_hit: false,
+                owner: None,
+            }
+        }
+    }
+}
+
+/// Complete a cache hit without letting an external caller bypass a live
+/// flight. A top-level hit either owns a short publication-only flight or waits
+/// for the existing owner's newer compute-and-publication outcome. Promise
+/// sub-runs keep the direct cache-hit path: they publish no durable result ref,
+/// and joining after a hit would add waits-for edges that cache resolution does
+/// not need.
+fn complete_cache_hit(
+    arg_tree: &str,
+    stack: &[String],
+    result: String,
+    publish: impl FnOnce(&str) -> Result<(), HttpError>,
+) -> Outcome {
+    if !stack.is_empty() {
+        return Ok(result);
+    }
+    match join_flight(arg_tree, stack) {
+        Flight::Owner(owner) => owner.finish_with(Ok(result), publish),
+        Flight::Waiter(rx, guard) => wait_for_flight(arg_tree, rx, guard),
+        Flight::Unsafe => Err((
+            500,
+            format!("top-level cache hit for {arg_tree} could not join its result flight"),
+        )),
+    }
+}
+
+fn wait_for_flight(arg_tree: &str, rx: mpsc::Receiver<Outcome>, guard: ParkGuard) -> Outcome {
+    let outcome = rx.recv();
+    drop(guard);
+    match outcome {
+        Ok(outcome) => {
+            eprintln!("single-flight: arg_tree={arg_tree} joined an in-flight run");
+            outcome
+        }
+        Err(_) => Err((
+            500,
+            format!("single-flight owner for {arg_tree} ended without an outcome"),
+        )),
+    }
+}
+
+/// The unique owner of one in-process flight. Normal completion explicitly
+/// broadcasts its outcome. Unwinding is a provable owner loss, so Drop clears
+/// the entry and wakes waiters with an error; a later request may then own it.
+struct FlightOwner {
+    arg_tree: String,
+    finished: bool,
+}
+
+impl FlightOwner {
+    #[cfg(test)]
+    fn finish(mut self, outcome: &Outcome) {
+        finish_flight(&self.arg_tree, outcome);
+        self.finished = true;
+    }
+
+    /// If an external participant requested durable publication, publish while
+    /// this owner remains in the flight table, then broadcast the combined
+    /// outcome. A publication failure is therefore seen by every waiter.
+    fn finish_with(
+        mut self,
+        outcome: Outcome,
+        publish: impl FnOnce(&str) -> Result<(), HttpError>,
+    ) -> Outcome {
+        let outcome = if reserve_publication_or_finish(&self.arg_tree, &outcome) {
+            match outcome {
+                Ok(result) => match publish(&result) {
+                    Ok(()) => Ok(result),
+                    Err(error) => Err((error.status(), error.message().to_string())),
+                },
+                Err(error) => Err(error),
+            }
+        } else {
+            // `reserve_publication_or_finish` already removed the flight and
+            // broadcast this outcome atomically with deciding no pin was needed.
+            self.finished = true;
+            return outcome;
+        };
+        finish_flight(&self.arg_tree, &outcome);
+        self.finished = true;
+        outcome
+    }
+}
+
+impl Drop for FlightOwner {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        finish_flight(
+            &self.arg_tree,
+            &Err((
+                500,
+                format!("single-flight owner for {} was lost", self.arg_tree),
+            )),
+        );
+    }
+}
+
 /// Removes this waiter's waits-for edge on drop.
 struct ParkGuard {
-    stack: Vec<String>,
-    target: String,
+    id: u64,
 }
 
 impl Drop for ParkGuard {
     fn drop(&mut self) {
         let mut parked = parked().lock().expect("parked lock");
-        if let Some(pos) = parked
-            .iter()
-            .position(|(s, t)| *s == self.stack && *t == self.target)
-        {
-            parked.swap_remove(pos);
+        if let Some(pos) = parked.edges.iter().position(|edge| edge.id == self.id) {
+            parked.edges.swap_remove(pos);
         }
     }
 }
@@ -450,7 +656,7 @@ impl Drop for ParkGuard {
 fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
     let mut table = flights().lock().expect("flights lock");
     match table.get_mut(arg_tree) {
-        Some(waiters) => {
+        Some(flight) => {
             // The waits-for check runs under the flights lock, so a
             // concurrent park can't slip in between the check and the edge
             // registration.
@@ -458,35 +664,99 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
                 return Flight::Unsafe;
             }
             let (tx, rx) = mpsc::channel();
-            waiters.push(tx);
-            parked()
-                .lock()
-                .expect("parked lock")
-                .push((stack.to_vec(), arg_tree.to_string()));
-            Flight::Waiter(
-                rx,
-                ParkGuard {
+            let id = {
+                let mut parked = parked().lock().expect("parked lock");
+                let id = parked.next_id;
+                parked.next_id = parked
+                    .next_id
+                    .checked_add(1)
+                    .expect("parked waiter ID space exhausted");
+                parked.edges.push(ParkedEdge {
+                    id,
                     stack: stack.to_vec(),
                     target: arg_tree.to_string(),
-                },
-            )
+                });
+                id
+            };
+            flight.waiters.push(tx);
+            // An external request may join a flight whose executor is a
+            // promise sub-run. Record its need here so that executor publishes
+            // before waking it.
+            if stack.is_empty() {
+                flight.publish_result = true;
+            }
+            Flight::Waiter(rx, ParkGuard { id })
         }
         None => {
-            table.insert(arg_tree.to_string(), Vec::new());
-            Flight::Owner
+            table.insert(
+                arg_tree.to_string(),
+                FlightEntry {
+                    waiters: Vec::new(),
+                    publish_result: stack.is_empty(),
+                },
+            );
+            Flight::Owner(FlightOwner {
+                arg_tree: arg_tree.to_string(),
+                finished: false,
+            })
         }
     }
 }
 
-/// Broadcast the outcome to every parked waiter and clear the entry. A
-/// timed-out waiter that ran independently also lands here: whoever finishes
-/// first serves the waiters (a valid result is a valid result) and clears the
-/// entry; later finishers broadcast to nobody.
+/// Decide, under the flight-table lock, whether successful completion needs a
+/// publication phase. If it does, leave the entry present so new arrivals keep
+/// waiting while the ref is pinned. Otherwise remove and broadcast now; an
+/// external request racing this decision either marks the existing flight
+/// first or becomes the next owner after removal.
+fn reserve_publication_or_finish(arg_tree: &str, outcome: &Outcome) -> bool {
+    let waiters = {
+        let mut table = flights().lock().expect("flights lock");
+        if outcome.is_ok()
+            && table
+                .get(arg_tree)
+                .is_some_and(|flight| flight.publish_result)
+        {
+            return true;
+        }
+        take_flight(&mut table, arg_tree)
+    };
+    broadcast(waiters, outcome);
+    false
+}
+
+/// Broadcast the outcome to every parked waiter and clear the entry. Only the
+/// owner calls this; an unsafe cycle-breaking duplicate must not steal its
+/// waiters or publish a cycle error as the canonical flight outcome.
 fn finish_flight(arg_tree: &str, outcome: &Outcome) {
     let waiters = {
         let mut table = flights().lock().expect("flights lock");
-        table.remove(arg_tree).unwrap_or_default()
+        take_flight(&mut table, arg_tree)
     };
+    broadcast(waiters, outcome);
+}
+
+fn take_flight(
+    table: &mut HashMap<String, FlightEntry>,
+    arg_tree: &str,
+) -> Vec<mpsc::Sender<Outcome>> {
+    let waiters = table
+        .remove(arg_tree)
+        .map(|flight| flight.waiters)
+        .unwrap_or_default();
+    // A sent outcome no longer waits on this flight, even if the receiving
+    // thread has not yet been scheduled to drop its ParkGuard. Remove the
+    // completed edges while still holding the flights lock so a new flight for
+    // the same key cannot register an edge that this completion would mistake
+    // for one of its own.
+    parked()
+        .lock()
+        .expect("parked lock")
+        .edges
+        .retain(|edge| edge.target != arg_tree);
+    waiters
+}
+
+fn broadcast(waiters: Vec<mpsc::Sender<Outcome>>, outcome: &Outcome) {
     for tx in waiters {
         let _ = tx.send(outcome.clone());
     }
@@ -494,9 +764,10 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 
 // ---- Promise resolution ------------------------------------------------------
 
-/// Resolve a continuation — a tree `{in, map?, run?, then?, catch?}` where `in`
-/// is a real tree entry (the data node) and `map`/`run`/`then` are blobs naming
-/// images (see `design/map-then.md`). `map` and `run` are mutually exclusive
+/// Resolve a continuation — either `{in, map?|run?|then?, catch?}` or
+/// `{request, then?, catch?}`. `request` is a tree entry naming an already
+/// complete ArgTree, executed unchanged; `map`/`run`/`then` are blobs naming
+/// images. The three middle forms `map`/`run`/`request` are mutually exclusive
 /// (the client already refuses to record both; this is defense in depth). One
 /// resolution path covers both forms — a *middle step*, then `then`:
 ///
@@ -505,24 +776,22 @@ fn finish_flight(arg_tree: &str, outcome: &Outcome) {
 ///    into a `children` tree under the original names;
 /// 2. if `run` is given: one sub-run, `run(--in=<in>)` — the single-valued
 ///    form. Its result R may be any kind (a commit as much as a blob/tree);
-/// 3. the result is `then(--in=<in>[, --children=<children> | --result=<R>])`
-///    if `then` is given (the extra arg only when a middle step ran), else the
-///    middle step's own result — the `children` tree, or R. With no middle
-///    step, `then(--in=<in>)` is a plain tail call.
+/// 3. if `request` is given: run exactly that ArgTree, adding no args;
+/// 4. `then` receives the available args: `--in` for the image forms, plus
+///    `--children`/`--result`; the exact-request form passes only `--result`.
 ///
 /// Every sub-run goes through [`run_work_request`], so promises nest arbitrarily (a map
 /// child, a `run`, or a `then` may itself promise) and each sub-run gets its
 /// own memoization and cycle detection (via `stack`).
 ///
-/// **`catch`** (a marker blob, `run` only) makes a FAILING `run` a value the
-/// `then` receives rather than an error that propagates: `then(--in=<in>,
-/// --error=<blob>)`, the blob holding the failure text, exactly where
-/// `--result` would have been. Without it a failed sub-run fails the whole
+/// **`catch`** (a marker blob, `run` or `request`) makes a failing middle step a
+/// value `then` receives as `--error=<blob>`, exactly where `--result` would
+/// have been. Without it a failed sub-run fails the whole
 /// request, which is the right default for a pipeline — but wrong for a driver
 /// that must survive its callee, the agent loop being the case that forced it
-/// (`design/agent-harness.md`, "Tool failures are values"). Scoped to `run`
-/// deliberately: a caught `map` would have to say WHICH child failed and what
-/// the surviving siblings' results mean, and nothing needs that yet.
+/// (`design/agent-harness.md`, "Tool failures are values"). A caught `map`
+/// would have to say WHICH child failed and what the surviving siblings'
+/// results mean, so catch remains single-valued (`run` or `request`).
 ///
 /// The bool in the return says a catch fired. It rides out to [`run_dispatch`]
 /// so the enclosing request is NOT memoized: sub-run failures are uncached by
@@ -541,6 +810,7 @@ fn resolve_promise(
     use gix::objs::tree::EntryKind;
 
     let mut input: Option<gix::objs::tree::Entry> = None;
+    let mut request: Option<String> = None;
     let (mut map, mut run, mut then) = (None, None, None);
     let mut catch = false;
     for entry in fetch_tree(config, cont)
@@ -548,6 +818,13 @@ fn resolve_promise(
     {
         match entry.name.as_str() {
             "in" => input = Some(named_entry("in", entry.mode, entry.oid)),
+            "request" if entry.mode.is_tree() => request = Some(entry.oid.to_string()),
+            "request" => {
+                return Err(HttpError::new(
+                    500,
+                    format!("continuation {cont} has a non-tree 'request' entry"),
+                ))
+            }
             "map" => map = Some(blob_string(config, &entry.oid.to_string())?),
             "run" => run = Some(blob_string(config, &entry.oid.to_string())?),
             "then" => then = Some(blob_string(config, &entry.oid.to_string())?),
@@ -561,46 +838,21 @@ fn resolve_promise(
             }
         }
     }
-    let input =
-        input.ok_or_else(|| HttpError::new(500, format!("continuation {cont} missing 'in'")))?;
-    if map.is_some() && run.is_some() {
-        return Err(HttpError::new(
-            500,
-            format!("continuation {cont} has both 'map' and 'run' (they are mutually exclusive)"),
-        ));
-    }
-    if map.is_none() && run.is_none() && then.is_none() {
-        return Err(HttpError::new(
-            500,
-            format!("continuation {cont} has none of 'map', 'run', or 'then'"),
-        ));
-    }
-    // Both checked here rather than client-side only: a continuation is a tree
-    // any worker can hand us, so the interpreter states its own contract.
-    if catch && run.is_none() {
-        return Err(HttpError::new(
-            500,
-            format!("continuation {cont} has 'catch' without 'run' (catch covers the run step)"),
-        ));
-    }
-    if catch && then.is_none() {
-        return Err(HttpError::new(
-            500,
-            format!(
-                "continuation {cont} has 'catch' without 'then' (nothing would receive the error)"
-            ),
-        ));
-    }
-
-    // Set when `catch` turns a failed `run` into an `--error` arg; rides out to
-    // [`run_dispatch`], which then skips memoizing this request.
-    let mut caught = false;
+    validate_continuation_shape(
+        cont,
+        input.is_some(),
+        map.is_some(),
+        run.is_some(),
+        request.is_some(),
+        then.is_some(),
+        catch,
+    )?;
 
     // The middle step, if any: `map` fans out over `in`'s children and yields a
-    // `children` tree; `run` is one sub-run yielding a `result` entry. Either
-    // way we get (the extra arg `then` receives, the result when there is no
-    // `then`).
-    let mid: Option<(gix::objs::tree::Entry, String)> = if let Some(img) = &map {
+    // `children` tree; `run` builds one request from its image + `in`; `request`
+    // runs an already-complete ArgTree unchanged.
+    let mid: Option<(gix::objs::tree::Entry, String, bool)> = if let Some(img) = &map {
+        let input = input.as_ref().expect("validated input");
         // Map the children in parallel — one thread per child, each a full
         // [`run_work_request`] (so a child may itself promise). Concurrency is bounded by
         // the runner pool, not the thread count; threads are cheap and mostly
@@ -650,49 +902,58 @@ fn resolve_promise(
         Some((
             named_entry("children", EntryKind::Tree.into(), children_tree),
             format!("tree {children_tree}"),
+            false,
         ))
     } else if let Some(img) = &run {
+        let input = input.as_ref().expect("validated input");
         // The single-valued form: `run(--in=<in>)`, fully resolved by [`run_work_request`]
         // (so a promise R leaves behind is already collapsed to a value here).
-        match run_image(
+        Some(continuation_result(
             config,
-            img,
-            vec![input.clone()],
-            salt,
-            stack,
-            trace_id,
-            secrets,
-        ) {
-            Ok(result) => Some((result_entry("result", &result)?, result)),
-            // `catch`: the failure becomes `--error`, a blob of the message the
-            // caller would otherwise have seen as a 500. `then` is required
-            // alongside `catch` (checked above), so the unused second element
-            // of the pair never reaches a caller.
-            Err(e) if catch => {
-                let text = e.message().to_string();
-                eprintln!("caught sub-run failure in continuation {cont}: {text}");
-                caught = true;
-                let oid = store_git_blob(config, text.as_bytes())
-                    .map_err(|e| HttpError::new(500, format!("storing error blob: {e}")))?;
-                Some((
-                    named_entry("error", EntryKind::Blob.into(), oid),
-                    format!("blob {oid}"),
-                ))
-            }
-            Err(e) => return Err(e),
-        }
+            cont,
+            run_image(
+                config,
+                img,
+                vec![input.clone()],
+                salt,
+                stack,
+                trace_id,
+                secrets,
+            ),
+            catch,
+        )?)
+    } else if let Some(arg_tree) = &request {
+        Some(continuation_result(
+            config,
+            cont,
+            run_work_request(
+                config,
+                &WorkRequest {
+                    arg_tree,
+                    stack,
+                    trace_id,
+                    secrets,
+                },
+            ),
+            catch,
+        )?)
     } else {
         None
     };
 
+    let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught);
+
     match (then, mid) {
-        // `then` combines: it gets the original `in`, plus the middle step's
-        // contribution when one ran — (`--in`, `--children`) after a map,
-        // (`--in`, `--result`) after a run, (`--in`, `--error`) after a caught
-        // run, bare `--in` for a plain tail call.
+        // `then` combines: it gets the original `in` when this is an image
+        // continuation, plus the middle step's contribution when one ran. An
+        // exact-request continuation has no `in`, so it passes only `result`
+        // or `error`.
         (Some(img), mid) => {
-            let mut args = vec![input];
-            if let Some((extra, _)) = mid {
+            let mut args = Vec::new();
+            if let Some(input) = input {
+                args.push(input);
+            }
+            if let Some((extra, _, _)) = mid {
                 args.push(extra);
             }
             Ok((
@@ -701,12 +962,99 @@ fn resolve_promise(
             ))
         }
         // No `then`: the middle step's own result is the request's result.
-        (None, Some((_, result))) => Ok((result, caught)),
+        (None, Some((_, result, _))) => Ok((result, caught)),
         // Unreachable — the presence check above requires some step.
         (None, None) => Err(HttpError::new(
             500,
             format!("continuation {cont} has no step to run"),
         )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_continuation_shape(
+    cont: &str,
+    has_input: bool,
+    has_map: bool,
+    has_run: bool,
+    has_request: bool,
+    has_then: bool,
+    catch: bool,
+) -> Result<(), HttpError> {
+    let middle_count = usize::from(has_map) + usize::from(has_run) + usize::from(has_request);
+    if middle_count > 1 {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has more than one of 'map', 'run', and 'request' (they are mutually exclusive)"
+            ),
+        ));
+    }
+    if has_request && has_input {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has both 'request' and 'in'"),
+        ));
+    }
+    if !has_request && !has_input {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} missing 'in'"),
+        ));
+    }
+    if middle_count == 0 && !has_then {
+        return Err(HttpError::new(
+            500,
+            format!("continuation {cont} has none of 'map', 'run', 'request', or 'then'"),
+        ));
+    }
+    // Both checked here rather than client-side only: a continuation is a tree
+    // any worker can hand us, so the interpreter states its own contract.
+    if catch && !has_run && !has_request {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has 'catch' without 'run' or 'request' (catch covers one exact step)"
+            ),
+        ));
+    }
+    if catch && !has_then {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "continuation {cont} has 'catch' without 'then' (nothing would receive the error)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Turn one single-valued middle step into the callback entry/result pair,
+/// optionally representing a failure as an `error` blob. Shared by rebuilt
+/// `run` requests and exact `request` continuations so catch semantics cannot
+/// drift between them.
+fn continuation_result(
+    config: &Config,
+    cont: &str,
+    result: Result<String, HttpError>,
+    catch: bool,
+) -> Result<(gix::objs::tree::Entry, String, bool), HttpError> {
+    use gix::objs::tree::EntryKind;
+
+    match result {
+        Ok(result) => Ok((result_entry("result", &result)?, result, false)),
+        Err(error) if catch => {
+            let text = error.message().to_string();
+            eprintln!("caught sub-run failure in continuation {cont}: {text}");
+            let oid = store_git_blob(config, text.as_bytes())
+                .map_err(|e| HttpError::new(500, format!("storing error blob: {e}")))?;
+            Ok((
+                named_entry("error", EntryKind::Blob.into(), oid),
+                format!("blob {oid}"),
+                true,
+            ))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -947,23 +1295,46 @@ fn result_hash(result: &str) -> &str {
 }
 
 /// Pin `refs/caos/res/<argTreeHash>` at the result so a client can fetch it by
-/// ref and it survives gc. Best-effort: a failure just means the result isn't
-/// ref-pinned (it's still cached and reachable by hash). `result` is
-/// `"<type> <hash>"`.
-fn pin_result(config: &Config, arg_tree: &str, result: &str) {
+/// ref and it survives gc. This is part of top-level run success, particularly
+/// when the HTTP caller disconnected before the eventual result.
+fn pin_result(config: &Config, arg_tree: &str, result: &str) -> Result<(), HttpError> {
     let hash = result_hash(result);
     if hash.is_empty() {
-        return;
+        return Err(HttpError::new(
+            500,
+            format!("cannot pin malformed result {result:?}"),
+        ));
     }
     let refname = format!("refs/caos/res/{arg_tree}");
-    match Command::new("git")
-        .args(["-C", &config.git_dir, "update-ref", &refname, hash])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("warning: git update-ref {refname} exited with {status}"),
-        Err(e) => eprintln!("warning: pinning {refname}: {e}"),
+    pin_result_in(&config.git_dir, &refname, hash)
+}
+
+fn pin_result_in(git_dir: &str, refname: &str, hash: &str) -> Result<(), HttpError> {
+    const ATTEMPTS: usize = 8;
+    let mut last_error = String::new();
+    for attempt in 0..ATTEMPTS {
+        match Command::new("git")
+            .args(["-C", git_dir, "update-ref", refname, hash])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                last_error = format!(
+                    "git update-ref exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(error) => last_error = format!("running git update-ref: {error}"),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
+    Err(HttpError::new(
+        500,
+        format!("pinning {refname} after {ATTEMPTS} attempts: {last_error}"),
+    ))
 }
 
 /// Resolve the `image` parameter to a reference the host docker daemon can run.
@@ -1517,20 +1888,34 @@ fn push_blob(config: &Config, digest: &str, data: &[u8]) -> Result<(), String> {
 
 /// Upload a manifest to the registry, addressed by its digest.
 fn push_manifest(config: &Config, digest: &str, data: &[u8]) -> Result<(), String> {
+    const ATTEMPTS: usize = 8;
     let base = config.registry_push_url.trim_end_matches('/');
     let url = format!("{base}/v2/{REGISTRY_REPO}/manifests/{digest}");
-    let response = minreq::put(&url)
-        .with_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-        .with_body(data.to_vec())
-        .send()
-        .map_err(|e| format!("PUT {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "uploading manifest {digest}: {} {}",
-            response.status_code, response.reason_phrase
-        ));
+    for attempt in 0..ATTEMPTS {
+        let response = minreq::put(&url)
+            .with_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .with_body(data.to_vec())
+            .send()
+            .map_err(|e| format!("PUT {url}: {e}"))?;
+        if (200..300).contains(&response.status_code) {
+            return Ok(());
+        }
+        // Concurrent conversion of one cold image can race in distribution:
+        // one request observes the shared layer while its content link is
+        // still becoming visible, and the manifest PUT briefly reports
+        // `manifest blob unknown` (400). The manifest is content-addressed, so
+        // retrying this one response is idempotent. Other client errors are
+        // permanent; server errors remain loud instead of being hidden here.
+        if response.status_code != 400 || attempt + 1 == ATTEMPTS {
+            return Err(format!(
+                "uploading manifest {digest}: {} {}",
+                response.status_code, response.reason_phrase
+            ));
+        }
+        let delay_ms = 25_u64 << attempt.min(6);
+        std::thread::sleep(Duration::from_millis(delay_ms));
     }
-    Ok(())
+    unreachable!("manifest upload loop either succeeds or returns its last error")
 }
 
 /// Hex sha256 of `data`.
@@ -1669,5 +2054,451 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    use super::*;
+
+    #[test]
+    fn external_run_identity_is_canonical_lowercase() {
+        assert_eq!(
+            parse_arg_tree(&format!("req={}", "a".repeat(40)))
+                .ok()
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let error = parse_arg_tree(&format!("req={}", "A".repeat(40))).unwrap_err();
+        assert_eq!(error.status(), 400);
+    }
+
+    #[test]
+    fn top_level_cache_hit_waits_for_an_existing_flights_outcome() {
+        let request = "0".repeat(40);
+        let ancestor = "b".repeat(40);
+        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+
+        // This caller read an older cached value while the existing executor
+        // got a transient cache error and is producing a newer outcome. It must
+        // join that executor instead of publishing the stale cache hit itself.
+        let stale_cache = format!("tree {}", "c".repeat(40));
+        let request_for_hit = request.clone();
+        let cache_hit = std::thread::spawn(move || {
+            complete_cache_hit(&request_for_hit, &[], stale_cache, |_| {
+                panic!("cache-hit waiter attempted to publish")
+            })
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let joined = flights()
+                .lock()
+                .expect("flights lock")
+                .get(&request)
+                .is_some_and(|flight| flight.waiters.len() == 1);
+            if joined {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cache-hit caller did not join the existing flight"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!cache_hit.is_finished());
+
+        let newer = format!("tree {}", "d".repeat(40));
+        assert_eq!(
+            owner.finish_with(Ok(newer.clone()), |_| Ok(())),
+            Ok(newer.clone())
+        );
+        assert_eq!(cache_hit.join().unwrap(), Ok(newer));
+    }
+
+    #[test]
+    fn waiter_receives_the_owners_outcome() {
+        let request = "d".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        let outcome = Ok(format!("blob {}", "a".repeat(40)));
+        owner.finish(&outcome);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+    }
+
+    #[test]
+    fn top_level_publication_happens_before_the_flight_is_released() {
+        let request = "7".repeat(40);
+        let ancestor = "4".repeat(40);
+        // Promise resolution may be the executor even though an external run
+        // joins later and is the participant that requires durable publication.
+        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+
+        // A caught worker failure is itself a valid tree result, but is not
+        // cached. A retry may therefore produce a later success. While the
+        // earlier result is being published, that retry must still be a waiter
+        // rather than a new owner that could publish first.
+        let caught_failure = format!("tree {}", "6".repeat(40));
+        let mut published = None;
+        let outcome = owner.finish_with(Ok(caught_failure.clone()), |result| {
+            let (late_rx, late_guard) = match join_flight(&request, &[]) {
+                Flight::Waiter(rx, guard) => (rx, guard),
+                _ => panic!("flight was released before result publication"),
+            };
+            drop(late_rx);
+            drop(late_guard);
+            published = Some(result.to_string());
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(caught_failure.clone()));
+        assert_eq!(published.as_deref(), Some(caught_failure.as_str()));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(caught_failure)
+        );
+        drop(guard);
+
+        // Only after publication completes may the retry become owner and
+        // replace that result with its successful outcome.
+        let successor = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("published flight did not admit a successor"),
+        };
+        let success = format!("tree {}", "5".repeat(40));
+        let outcome = successor.finish_with(Ok(success.clone()), |result| {
+            published = Some(result.to_string());
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(success.clone()));
+        assert_eq!(published.as_deref(), Some(success.as_str()));
+    }
+
+    #[test]
+    fn publication_failure_is_broadcast_before_a_retry_can_own() {
+        let request = "3".repeat(40);
+        let ancestor = "2".repeat(40);
+        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("external arrival did not wait"),
+        };
+
+        let outcome = owner.finish_with(Ok(format!("tree {}", "1".repeat(40))), |_| {
+            Err(HttpError::new(503, "pin failed"))
+        });
+        assert_eq!(outcome, Err((503, "pin failed".to_string())));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+
+        let replacement = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("publication failure did not release the flight"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn a_stale_cache_miss_rereads_after_becoming_owner() {
+        let request = "9".repeat(40);
+        let first_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+
+        // This arrival observes a miss while the first owner is live, then is
+        // descheduled until that owner has cached and left the flight table.
+        let mut cached = None;
+        assert!(cached.is_none());
+        let cached_result = format!("blob {}", "8".repeat(40));
+        cached = Some(cached_result.clone());
+        first_owner.finish(&Ok(cached_result.clone()));
+
+        let mut reread_saw_new_owner = false;
+        let disposition = claim_flight_after_miss(&request, &[], || {
+            // The re-read happens only after this stale arrival has claimed a
+            // new flight, so another arrival must observe it as a waiter.
+            match join_flight(&request, &[]) {
+                Flight::Waiter(rx, guard) => {
+                    reread_saw_new_owner = true;
+                    drop(rx);
+                    drop(guard);
+                }
+                _ => panic!("cache re-read ran before flight ownership"),
+            }
+            Ok(cached.clone())
+        });
+
+        assert!(reread_saw_new_owner);
+        match disposition {
+            FlightDisposition::Complete {
+                outcome,
+                cache_hit,
+                owner,
+            } => {
+                assert!(cache_hit);
+                assert_eq!(outcome, Ok(cached_result));
+                owner
+                    .expect("post-claim cache hit must retain its owner")
+                    .finish(&outcome);
+            }
+            FlightDisposition::Run(owner) => {
+                drop(owner);
+                panic!("stale cache miss dispatched duplicate work");
+            }
+        }
+
+        let replacement = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("cache-filled flight was not released"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn losing_an_owner_wakes_waiters_and_allows_a_new_owner() {
+        let request = "e".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, &[]) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        drop(owner);
+        let error = rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.0, 500);
+        assert!(error.1.contains("owner"), "{}", error.1);
+        drop(guard);
+
+        let replacement = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("proven owner loss did not release the flight"),
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn completed_flight_removes_wait_edges_before_waiters_wake() {
+        let request = "f".repeat(40);
+        let ancestor = "1".repeat(40);
+        let owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (rx, guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        let outcome = Ok(format!("blob {}", "b".repeat(40)));
+        owner.finish(&outcome);
+
+        // Deliberately leave the result unread and the guard alive: completion
+        // itself, rather than waiter scheduling, owns removal of the edge.
+        assert!(!park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
+        drop(guard);
+    }
+
+    #[test]
+    fn old_waiter_guard_cannot_remove_a_new_flights_edge() {
+        let request = "a".repeat(40);
+        let ancestor = "2".repeat(40);
+        let first_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("first arrival was not the owner"),
+        };
+        let (first_rx, first_guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("second arrival did not wait"),
+        };
+        let first_outcome = Ok(format!("blob {}", "c".repeat(40)));
+        first_owner.finish(&first_outcome);
+
+        let second_owner = match join_flight(&request, &[]) {
+            Flight::Owner(owner) => owner,
+            _ => panic!("completed flight did not admit a new owner"),
+        };
+        let (second_rx, second_guard) = match join_flight(&request, std::slice::from_ref(&ancestor))
+        {
+            Flight::Waiter(rx, guard) => (rx, guard),
+            _ => panic!("new flight's second arrival did not wait"),
+        };
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        // The first guard is deliberately late. Its edge was already cleared
+        // by first-flight completion; dropping it must not remove the identical
+        // edge registered by the second flight.
+        drop(first_guard);
+        assert!(park_would_deadlock(
+            &ancestor,
+            std::slice::from_ref(&request)
+        ));
+
+        let second_outcome = Ok(format!("blob {}", "d".repeat(40)));
+        second_owner.finish(&second_outcome);
+        assert_eq!(
+            first_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            first_outcome
+        );
+        assert_eq!(
+            second_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            second_outcome
+        );
+        drop(second_guard);
+    }
+}
+
+#[cfg(test)]
+mod continuation_shape_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    fn shape(
+        has_input: bool,
+        has_map: bool,
+        has_run: bool,
+        has_request: bool,
+        has_then: bool,
+        catch: bool,
+    ) -> Result<(), HttpError> {
+        validate_continuation_shape(
+            "test-continuation",
+            has_input,
+            has_map,
+            has_run,
+            has_request,
+            has_then,
+            catch,
+        )
+    }
+
+    #[test]
+    fn exact_request_is_exclusive_with_input_map_and_run() {
+        for (input, map, run) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let error = shape(input, map, run, true, false, false).unwrap_err();
+            assert!(
+                error.message().contains("mutually exclusive")
+                    || error.message().contains("both 'request' and 'in'"),
+                "{}",
+                error.message()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_request_allows_a_result_callback_or_plain_tail_call() {
+        assert!(shape(false, false, false, true, false, false).is_ok());
+        assert!(shape(false, false, false, true, true, false).is_ok());
+    }
+
+    #[test]
+    fn exact_request_catch_requires_a_callback() {
+        let error = shape(false, false, false, true, false, true).unwrap_err();
+        assert!(error.message().contains("without 'then'"));
+        assert!(shape(false, false, false, true, true, true).is_ok());
+    }
+
+    #[test]
+    fn result_pin_retries_a_transient_ref_lock() {
+        let git_dir = std::env::temp_dir().join(format!(
+            "caos-pin-result-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let init = Command::new("git")
+            .args(["init", "--bare", git_dir.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let mut hash_object = Command::new("git")
+            .args([
+                "-C",
+                git_dir.to_str().unwrap(),
+                "hash-object",
+                "-w",
+                "--stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hash_object
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"result")
+            .unwrap();
+        let object = hash_object.wait_with_output().unwrap();
+        assert!(object.status.success());
+        let hash = String::from_utf8(object.stdout).unwrap().trim().to_string();
+
+        let refname = "refs/caos/res/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let lock = git_dir.join(format!("{refname}.lock"));
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"held").unwrap();
+        let unlock = std::thread::spawn({
+            let lock = lock.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(25));
+                std::fs::remove_file(lock).unwrap();
+            }
+        });
+
+        if let Err(error) = pin_result_in(git_dir.to_str().unwrap(), refname, &hash) {
+            panic!("{}", error.message());
+        }
+        unlock.join().unwrap();
+        let pinned = Command::new("git")
+            .args(["-C", git_dir.to_str().unwrap(), "rev-parse", refname])
+            .output()
+            .unwrap();
+        assert!(pinned.status.success());
+        assert_eq!(String::from_utf8(pinned.stdout).unwrap().trim(), hash);
+        std::fs::remove_dir_all(git_dir).unwrap();
     }
 }

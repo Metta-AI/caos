@@ -1,11 +1,21 @@
 # Agent harness: conversations as commit chains — design note
 
-**Status:** steps 1–5 implemented — run-then + first-class commits, the
-bounded bash tool (`crates/worker-bash-tool`), the stateless llm-call worker
-(`crates/worker-llm-call`), the llm-step driver (`crates/worker-llm-step`), and the chat client (`caos-cli chat`,
-`crates/caos/src/chat.rs`). Builds on map-then (`map-then.md`). Where this
-note and the code diverged during implementation, the note has been updated
-to match the code; the deltas are called out inline.
+> **Historical context only.** The authoritative chat design is
+> [`chat.md`](chat.md). The schemas and ref layouts described below document
+> the superseded prototype; the current design does not read or migrate them.
+> Current chat is isolated below `refs/caos/v2/`; the old unversioned refs may
+> remain in place and are invisible to the v2 clients.
+
+**Status:** historical for conversation storage and turn lifecycle. The
+run-then, tool, and model-loop background remains useful, but the commit shapes,
+multi-ref protocol, progress/status refs, and client ownership described below
+were superseded by the single append-only event log in `chat.md`. Treat that
+document and the current code as normative; this note is retained as the
+implementation history that led to them. The implemented background includes
+run-then and first-class commits, the bounded bash tool
+(`crates/worker-bash-tool`), the stateless llm-call worker
+(`crates/worker-llm-call`), and the llm-step driver
+(`crates/worker-llm-step`).
 
 ## Idea
 
@@ -88,8 +98,7 @@ own image):
 
 - `head:commit=` — the human-turn commit to answer (the conversation head);
 - curried config: `api-key`, `system` (the system prompt), `bash-image` (the
-  tool registry — just bash for now, an image ref), and optionally `model`
-  (default `claude-opus-4-8`), `base-url` (default
+  tool registry — just bash for now, an image ref), `model`, `base-url` (default
   `https://api.anthropic.com`; tests point it at a stub), `conversation`
   (names the progress ref);
 - continuation state, curried by the worker itself between tool calls:
@@ -265,6 +274,8 @@ conversation content). Same best-effort contract as the progress ref.
 
 ## Client
 
+### Current surface inventory
+
 Two verbs and a full-screen client over one turn engine (implemented —
 `crates/caos/src/chat.rs`, tested end-to-end against the stub in
 `tests/chat-offline` for `chat`, `tests/chat-talk` for `talk`, and
@@ -272,7 +283,7 @@ Two verbs and a full-screen client over one turn engine (implemented —
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one
-  (`refs/caos/conversations/*` by committer date), `-c <name>` picks one, and
+  (`refs/caos/v2/conversations/*` by committer date), `-c <name>` picks one, and
   `--new` mints a fresh auto-named `talk-<n>`. The chosen conversation is
   announced on stderr. With no prompt on a terminal it loops — one turn per
   line, ctrl-d ends, a failed turn is reported and the loop continues (the
@@ -284,10 +295,18 @@ Two verbs and a full-screen client over one turn engine (implemented —
   own crate. It consumes structured `TurnEvent`s from the same engine,
   reconstructs durable history from server-indexed conversation refs, and
   presents independent virtual conversations in a left sidebar. A stable
-  conversation ID addresses `refs/caos/conversations/<id>/from-user`; its mutable
+  conversation ID addresses `refs/caos/v2/conversations/<id>/head`; its mutable
   title lives at the sibling `title` ref. Per-user active and archived membership
-  lives under `refs/caos/users/<user>/conversations/{active,archived}/`, with
-  `--user` defaulting to `$USER`. `Ctrl+W` atomically archives for that user
+  lives under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
+  where `<user-key>` is `u-` plus lowercase hex of the normalized username's
+  UTF-8 bytes and each final `<conversation-key>` is `c-` plus lowercase hex of
+  the conversation ID's UTF-8 bytes. Usernames are limited to 126 UTF-8 bytes;
+  conversation IDs are limited to 124, leaving room for the encoded terminal
+  component's Git `.lock` suffix. Keeping the ID in one reversible component
+  avoids Git ref file/directory collisions for IDs containing `/`.
+  `--username` defaults to `$USER`; shared container accounts such as `root`
+  must pass a personal value until persisted identity is implemented.
+  `Ctrl+W` atomically archives for that user
   without changing HEAD or another user's state; `--list-archived` and
   `--unarchive` recover old conversations. Every conversation retains its own
   transcript, prompt, activity, diff, and running worker thread, so turns can
@@ -313,6 +332,11 @@ Two verbs and a full-screen client over one turn engine (implemented —
   opening, running, switching, or publishing conversations never mutates the
   checkout. Progress remains one completed API round at a time, and a running
   turn is not cancellable until the server/runner protocol grows cancellation.
+
+### Superseded protocol detail
+
+The remainder of this section describes the historical protocol named in the
+document banner, not the current chat implementation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>/from-user` (in

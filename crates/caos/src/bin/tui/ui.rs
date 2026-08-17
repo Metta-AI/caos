@@ -171,12 +171,14 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let composer_width = body[1].width.saturating_sub(2);
     let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
-        state.composer.command_matches().len() as u16
+        state.composer.completion_count() as u16
     } else {
         0
     };
     let notice_height = if state.command_error.is_some() || state.publish_prompt {
         3
+    } else if state.reference_notice.is_some() {
+        4
     } else {
         0
     };
@@ -214,38 +216,83 @@ fn render_notice(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         );
         return;
     }
-    let Some(ConfirmAction::Publish {
+    if let Some(ConfirmAction::Publish {
         default_base,
         base_input,
     }) = app.confirm_action.as_ref()
-    else {
-        return;
-    };
-    let branch = if base_input.is_empty() {
-        Span::styled(
-            format!("{default_base} (default)"),
-            Style::default().fg(Color::DarkGray),
-        )
-    } else {
-        Span::styled(base_input.clone(), Style::default().fg(Color::Cyan))
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    {
+        let branch = if base_input.is_empty() {
             Span::styled(
-                "Base branch: ",
-                Style::default().add_modifier(Modifier::BOLD),
+                format!("{default_base} (default)"),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::styled(base_input.clone(), Style::default().fg(Color::Cyan))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Base branch: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                branch,
+                Span::styled("│", Style::default().fg(Color::Cyan)),
+            ]))
+            .block(
+                Block::default()
+                    .title(" Publish PR — type a base, Ctrl+P confirms, Esc cancels ")
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .borders(Borders::ALL),
             ),
-            branch,
-            Span::styled("│", Style::default().fg(Color::Cyan)),
-        ]))
-        .block(
-            Block::default()
-                .title(" Publish PR — type a base, Ctrl+P confirms, Esc cancels ")
-                .border_style(Style::default().fg(Color::Cyan))
-                .borders(Borders::ALL),
-        ),
-        area,
-    );
+            area,
+        );
+        return;
+    }
+    if let Some(reference) = state.reference_notice.as_ref() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("Ref:  ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(reference.refname.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Head: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(reference.head.clone()),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .title(" Conversation reference — click a row to copy ")
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+    }
+}
+
+pub(super) fn reference_copy_at(
+    app: &App,
+    terminal: Rect,
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    let state = app.selected();
+    if state.command_error.is_some() || state.publish_prompt || app.palette.is_some() {
+        return None;
+    }
+    let reference = state.reference_notice.as_ref()?;
+    let notice = layout(state, app.view == View::Chat, terminal).notice?;
+    let inner = Block::default().borders(Borders::ALL).inner(notice);
+    let position = Position::new(column, row);
+    if !inner.contains(position) {
+        return None;
+    }
+    match row.saturating_sub(inner.y) {
+        0 => Some(reference.refname.clone()),
+        1 => Some(reference.head.clone()),
+        _ => None,
+    }
 }
 
 pub(super) fn content_contains(
@@ -308,6 +355,10 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         .count();
     let left = Line::from(vec![
         Span::styled(" caos ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(
+            format!("  user {}", app.user),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(
             format!("  {}", state.title),
             Style::default().add_modifier(Modifier::BOLD),
@@ -549,16 +600,23 @@ fn transcript_paragraph(state: &ConversationState, width: u16) -> Paragraph<'sta
         ));
     }
     for entry in &state.transcript {
-        let (label, color) = match entry.role {
-            EntryRole::Human => ("You", Color::Cyan),
-            EntryRole::Agent => ("Agent", Color::Green),
-            EntryRole::Info => ("CAOS", Color::Cyan),
-            EntryRole::Notice => ("Error", Color::Red),
+        let (label, color, model) = match &entry.role {
+            EntryRole::Human => ("You".to_string(), Color::Cyan, None),
+            EntryRole::Peer(author) => (author.clone(), Color::Magenta, None),
+            EntryRole::Agent(model) => ("Agent".to_string(), Color::Green, model.as_deref()),
+            EntryRole::Info => ("CAOS".to_string(), Color::Cyan, None),
+            EntryRole::Notice => ("Error".to_string(), Color::Red, None),
         };
         let mut heading = vec![Span::styled(
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )];
+        if let Some(model) = model {
+            heading.push(Span::styled(
+                format!(" ({})", model.strip_prefix("claude-").unwrap_or(model)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if let Some(commit) = &entry.commit {
             heading.push(Span::styled(
                 format!("  {}", short_hash(commit)),
@@ -1386,10 +1444,15 @@ fn render_composer(
     } else {
         Vec::new()
     };
+    let models = if view == View::Chat {
+        state.composer.model_matches()
+    } else {
+        Vec::new()
+    };
     let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let command_height = commands.len().min(inner.height as usize) as u16;
+    let command_height = (commands.len() + models.len()).min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
     let composer_area = Rect::new(
         inner.x.saturating_add(2),
@@ -1422,6 +1485,7 @@ fn render_composer(
     );
     render_command_menu(
         &commands,
+        &models,
         state.composer.command_selection,
         frame,
         command_area,
@@ -1514,8 +1578,14 @@ fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
         .collect()
 }
 
-fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame<'_>, area: Rect) {
-    let lines = commands.iter().enumerate().map(|(index, command)| {
+fn render_command_menu(
+    commands: &[&Command],
+    models: &[&str],
+    selected: usize,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let command_lines = commands.iter().enumerate().map(|(index, command)| {
         let marker = if index == selected { "> " } else { "  " };
         let style = if index == selected {
             Style::default()
@@ -1529,7 +1599,22 @@ fn render_command_menu(commands: &[&Command], selected: usize, frame: &mut Frame
             style,
         )
     });
-    frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
+    let model_lines = models.iter().enumerate().map(|(index, model)| {
+        let index = index + commands.len();
+        let marker = if index == selected { "> " } else { "  " };
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Line::styled(format!("{marker}{model}"), style)
+    });
+    frame.render_widget(
+        Paragraph::new(command_lines.chain(model_lines).collect::<Vec<_>>()),
+        area,
+    );
 }
 
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {

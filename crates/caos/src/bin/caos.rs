@@ -6,13 +6,14 @@
 //! job (set up the root-owned `/cas`, run `/worker` as an unprivileged user,
 //! post the kind + hash recorded at `/cas/out` back to the server), then
 //! long-polls for more work for its image until an idle TTL passes (see
-//! `design/runner-protocol.md`). It never triggers compute: its `map-then`
-//! records a map-then continuation the server resolves after the worker's job
-//! finishes. The shared command logic lives in the `caos` library; this binary
-//! is the worker's CLI surface plus the privileged runner.
+//! `design/runner-protocol.md`). It normally records continuations that the
+//! server resolves after the worker's job finishes; `run-async` is the
+//! deliberate exception that starts a detached top-level computation. The
+//! shared command logic lives in the `caos` library; this binary is the worker's
+//! CLI surface plus the privileged runner.
 //!
-//! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `map-then`,
-//! `run-then`, `curry`, and `runner`.
+//! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
+//! `run-then`, `run-request-then`, `run-async`, `prepare-request`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::fs::PermissionsExt;
@@ -73,6 +74,12 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(path), None) => caos::cas_hash(path),
             _ => Err(usage(args)),
         },
+        // `forward <src> <dst>` — preserve a blob/tree/commit CAS value under
+        // another path without fetching or re-uploading it.
+        Some("forward") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(src), Some(dst), None) => caos::forward(src, dst),
+            _ => Err(usage(args)),
+        },
         // `map-then <in> [--map:<type>=<image>] [--then:<type>=<image>]` —
         // record a map-then
         // continuation over the CAS path `<in>` as this worker's result at
@@ -90,6 +97,23 @@ fn run(args: &[String]) -> Result<(), String> {
             [input, kvs @ ..] => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
+        // `run-request-then <R> [--then:<type>=<image>] [--catch]` — tail-call
+        // the exact, already-complete ArgTree R, optionally delivering its
+        // result (or caught error) to a callback image.
+        Some("run-request-then") => match &args[2..] {
+            [request, kvs @ ..] => caos::caos_run_request_then(&http()?, request, kvs),
+            _ => Err(usage(args)),
+        },
+        // Send an ordinary /run request for an already-stored ArgTree without
+        // waiting for its result.
+        Some("run-async") => match &args[2..] {
+            [arg_tree] => caos::caos_run_async(&http()?, arg_tree),
+            _ => Err(usage(args)),
+        },
+        // `prepare-request --base:<type>=<image> [...]` — construct and store the
+        // exact flat runnable ArgTree without executing it. This is the durable
+        // identity accepted by run-async.
+        Some("prepare-request") => caos::caos_prepare_request(&http()?, &args[2..]),
         // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
         // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
         // args tree like `own_args_tree`), printing a ref to the resulting curried
@@ -452,8 +476,12 @@ fn usage(args: &[String]) -> String {
          {prog} put <src-path> <cas-path>\n  \
          {prog} put-commit <src-file> <cas-path>\n  \
          {prog} hash <cas-path>\n  \
+         {prog} forward <src-cas-path> <dst-cas-path>\n  \
          {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n  \
          {prog} run-then <in-cas-path> --run:<type>=<image> [--then:<type>=<image>] [--catch]\n  \
+         {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
+         {prog} run-async <arg-tree-hash>\n  \
+         {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is :@=<cas path>, :docker=<ref> or :hash=<oid>)\n  \
          {prog} runner --job=<json>"

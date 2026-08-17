@@ -31,6 +31,13 @@ mkcommit() { # <tree> <message> [parent] -> a commit minted with plain git
   git -c user.email=test@caos -c user.name=caos \
     commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg"
 }
+remote_tip() { # <ref>
+  local lines
+  lines=$(git ls-remote --refs caos "$1")
+  [ -n "$lines" ] || return 1
+  [ "${lines#*$'\n'}" = "$lines" ] || return 1
+  printf '%s\n' "${lines%%[[:space:]]*}"
+}
 
 stage "stage the worker binaries and fixtures"
 # The agent workers are std SOURCE entries, not host binaries: chat resolves
@@ -121,6 +128,7 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 conv="tools-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+ref="refs/caos/v2/conversations/$conv/head"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
@@ -129,7 +137,8 @@ opts=(--model test-model --base-url "http://$stub_host:$port")
 stage "inline file tools: write/read/edit/ls in ONE round trip"
 "$CAOS_CLI" chat "$conv" -m "exercise the file tools" --base "$base" "${opts[@]}" > inline.out
 sed 's/^/  inline| /' inline.out >&2
-turn_inline=$(git rev-parse "refs/caos/conversations/$conv/from-user")
+turn_inline=$(remote_tip "$ref") || fail "inline-tool conversation has no head"
+git fetch -q caos "$turn_inline"
 [ "$(git show "$turn_inline:notes/new.txt")" = "goodbye world" ] \
   || fail "write+edit did not land in the turn tree"
 [ "$(git show "$turn_inline:notes/todo.txt")" = "hello notes" ] || fail "sibling file lost"
@@ -148,7 +157,8 @@ echo "  ok: five calls, one round trip, error as value, tree updated" >&2
 stage "mixed queue: inline write -> bash sub-run -> inline edit"
 "$CAOS_CLI" chat "$conv" -m "mix inline and bash" "${opts[@]}" > mixed.out
 sed 's/^/  mixed| /' mixed.out >&2
-turn_mixed=$(git rev-parse "refs/caos/conversations/$conv/from-user")
+turn_mixed=$(remote_tip "$ref") || fail "mixed-tool turn has no head"
+git fetch -q caos "$turn_mixed"
 [ "$(git show "$turn_mixed:mix.txt")" = "world" ] || fail "post-bash edit did not land"
 [ "$(git show "$turn_mixed:mix3.txt")" = "HELLO" ] || fail "bash did not see the inline write"
 # The request also replays earlier turns' tool_results, so assert this
@@ -161,7 +171,8 @@ echo "  ok: write -> bash -> edit, serial over one queue" >&2
 stage "grep: sparse-tree fold — root, scoped, and invalid pattern"
 "$CAOS_CLI" chat "$conv" -m "search the workspace" "${opts[@]}" > grep.out
 sed 's/^/  grep| /' grep.out >&2
-turn_grep=$(git rev-parse "refs/caos/conversations/$conv/from-user")
+turn_grep=$(remote_tip "$ref") || fail "grep turn has no head"
+git fetch -q caos "$turn_grep"
 git diff --quiet "$turn_mixed" "$turn_grep" -- || fail "grep changed the workspace tree"
 grep -qF "grep hello" grep.out || fail "root grep progress line missing"
 grep -qF "grep goodbye notes" grep.out || fail "scoped grep progress line missing"
