@@ -8,11 +8,11 @@ use caos::chat::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
     first_available_conversation_name, fork_conversation, generate_conversation_title,
-    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
-    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
-    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
-    InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
+    interrupt_request, invite_user_to_conversation, list_user_conversations,
+    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
+    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
+    ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
+    TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -960,6 +960,7 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 struct ConversationState {
     id: String,
     title: String,
+    parent: Option<String>,
     remote_title: Option<String>,
     sidebar_attention: Option<String>,
     automatic_title: bool,
@@ -981,6 +982,7 @@ struct ConversationState {
     reference_generation: u64,
     publish_prompt: bool,
     running: bool,
+    interrupting: bool,
     local_turn: bool,
     active_request: Option<String>,
     reconciling_request: Option<String>,
@@ -1002,6 +1004,7 @@ impl ConversationState {
         Self {
             id,
             title,
+            parent: None,
             remote_title,
             sidebar_attention: None,
             automatic_title: false,
@@ -1023,6 +1026,7 @@ impl ConversationState {
             reference_generation: 0,
             publish_prompt: false,
             running: false,
+            interrupting: false,
             local_turn: false,
             active_request: None,
             reconciling_request: None,
@@ -1061,11 +1065,14 @@ impl ConversationState {
                 .active_request
                 .as_ref()
                 .is_none_or(|request| load.snapshot.request.as_ref() == Some(request));
+        let previous_activity_len = self.activities.len();
+        let followed_activity_tail = self
+            .activity_selection
+            .is_none_or(|selected| selected + 1 == previous_activity_len);
+        let previous_activity_selection = self.activity_selection;
+        let previous_activity_detail_scroll = self.activity_detail_scroll;
         let local_lifecycle = preserve_local_lifecycle.then(|| {
             (
-                self.activities.clone(),
-                self.activity_selection,
-                self.activity_detail_scroll,
                 self.status.clone(),
                 self.turn_phase,
                 self.reconciling_request.clone(),
@@ -1079,8 +1086,18 @@ impl ConversationState {
             .last()
             .map(|turn| replayed_activities(&turn.events))
             .unwrap_or_default();
-        self.activity_selection = self.activities.len().checked_sub(1);
-        self.activity_detail_scroll = 0;
+        if followed_activity_tail && self.activities.len() > previous_activity_len {
+            self.activity_selection = self.activities.len().checked_sub(1);
+            self.activity_detail_scroll = 0;
+        } else if previous_activity_selection
+            .is_some_and(|selected| selected < self.activities.len())
+        {
+            self.activity_selection = previous_activity_selection;
+            self.activity_detail_scroll = previous_activity_detail_scroll;
+        } else {
+            self.activity_selection = self.activities.len().checked_sub(1);
+            self.activity_detail_scroll = 0;
+        }
         let mut transcript: Vec<_> = load
             .replay
             .turns
@@ -1119,19 +1136,7 @@ impl ConversationState {
         self.diff = Some(load.workspace_diff);
         self.remote_head = Some(load.snapshot.head);
         self.transcript_selection = None;
-        if let Some((
-            activities,
-            activity_selection,
-            activity_detail_scroll,
-            status,
-            turn_phase,
-            reconciling_request,
-            reconcile_after,
-        )) = local_lifecycle
-        {
-            self.activities = activities;
-            self.activity_selection = activity_selection;
-            self.activity_detail_scroll = activity_detail_scroll;
+        if let Some((status, turn_phase, reconciling_request, reconcile_after)) = local_lifecycle {
             self.status = status;
             self.turn_phase = turn_phase;
             self.local_turn = true;
@@ -1183,10 +1188,14 @@ impl ConversationState {
         self.status = match snapshot.status.as_str() {
             "queued" => "queued".to_string(),
             "running" => "agent running".to_string(),
+            "idle" if snapshot.interrupted => {
+                format!("interrupted {}", short_hash(&snapshot.head))
+            }
             "idle" => format!("updated {}", short_hash(&snapshot.head)),
             other => other.to_string(),
         };
         if !self.running {
+            self.interrupting = false;
             self.reconciling_request = None;
             self.reconcile_after = None;
             self.local_turn = false;
@@ -1393,6 +1402,10 @@ enum UiMessage {
     Completed {
         conversation: String,
         outcome: TurnOutcome,
+    },
+    Interrupted {
+        conversation: String,
+        result: Result<String, String>,
     },
     SubmissionCommitted {
         conversation: String,
@@ -1664,12 +1677,14 @@ impl App {
         let mut states: Vec<ConversationState> = conversations
             .iter()
             .map(|summary| {
-                ConversationState::new(
+                let mut state = ConversationState::new(
                     summary.id.clone(),
                     summary.title.clone(),
                     args.turn.clone(),
                     "ready".to_string(),
-                )
+                );
+                state.parent = summary.parent.clone();
+                state
             })
             .collect();
         for state in &mut states {
@@ -2239,6 +2254,38 @@ impl App {
         self.start_reference_lookup(self.selected);
     }
 
+    fn interrupt_selected(&mut self) {
+        if !self.selected().running || self.selected().interrupting {
+            return;
+        }
+        let wait_for_admission = self.selected().active_request.is_none();
+        let conversation = self.selected().id.clone();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        self.selected_mut().interrupting = true;
+        self.selected_mut().status = "stopping agent".to_string();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                let attempts = if wait_for_admission { 40 } else { 1 };
+                let mut last_error = None;
+                for attempt in 0..attempts {
+                    match interrupt_request(&transport, &conversation) {
+                        Ok(commit) => return Ok(commit),
+                        Err(error) => last_error = Some(error),
+                    }
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(Duration::from_millis(125));
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| "recording Escape failed".to_string()))
+            });
+            let _ = tx.send(UiMessage::Interrupted {
+                conversation,
+                result,
+            });
+        });
+    }
+
     fn start_reference_lookup(&mut self, index: usize) {
         let state = &mut self.conversations[index];
         if state.reference_loading {
@@ -2344,6 +2391,25 @@ impl App {
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
                         self.finish_turn(index, outcome);
+                    }
+                }
+                UiMessage::Interrupted {
+                    conversation,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        match result {
+                            Ok(_) if state.running => state.status = "stopping agent".to_string(),
+                            Ok(_) => state.interrupting = false,
+                            Err(error) if state.running => {
+                                state.interrupting = false;
+                                state.show_command_error_preserving_status(format!(
+                                    "interrupting turn failed: {error}"
+                                ));
+                            }
+                            Err(_) => state.interrupting = false,
+                        }
                     }
                 }
                 UiMessage::SubmissionCommitted {
@@ -2563,6 +2629,10 @@ impl App {
         for entry in entries {
             if let Some(index) = self.conversation_index(&entry.summary.id) {
                 let state = &mut self.conversations[index];
+                if state.parent != entry.summary.parent {
+                    state.parent = entry.summary.parent.clone();
+                    changed = true;
+                }
                 if state.forking
                     || state.remote_head != entry.observed_head
                     || state.remote_title != entry.observed_title
@@ -2599,9 +2669,28 @@ impl App {
                     self.selected().turn_options.clone(),
                     "shared conversation".to_string(),
                 );
+                state.parent = entry.summary.parent;
                 state.apply_load(*load, &self.user);
-                self.conversations.insert(0, state);
-                self.selected += 1;
+                let insert_at = state
+                    .parent
+                    .as_deref()
+                    .and_then(|parent| self.conversation_index(parent))
+                    .map(|parent_index| {
+                        let mut index = parent_index + 1;
+                        while self
+                            .conversations
+                            .get(index)
+                            .is_some_and(|candidate| candidate.parent == state.parent)
+                        {
+                            index += 1;
+                        }
+                        index
+                    })
+                    .unwrap_or(0);
+                self.conversations.insert(insert_at, state);
+                if insert_at <= self.selected {
+                    self.selected += 1;
+                }
                 changed = true;
             }
         }
@@ -2700,12 +2789,17 @@ impl App {
         let user = self.user.clone();
         let state = &mut self.conversations[index];
         state.running = false;
+        state.interrupting = false;
         state.local_turn = false;
         state.active_request = None;
         state.reconciling_request = None;
         state.reconcile_after = None;
         state.sidebar_attention = None;
-        state.status = format!("completed {}", outcome.short_commit);
+        state.status = if outcome.interrupted {
+            format!("interrupted {}", outcome.short_commit)
+        } else {
+            format!("completed {}", outcome.short_commit)
+        };
         match transport {
             Ok(transport) => {
                 let published_title = state.title.clone();
@@ -2850,6 +2944,10 @@ impl App {
             if key.code == KeyCode::Esc {
                 self.selection_locked = false;
             }
+            return;
+        }
+        if key.code == KeyCode::Esc && self.selected().running {
+            self.interrupt_selected();
             return;
         }
         let is_palette = key
@@ -3125,9 +3223,7 @@ impl App {
                 self.selected_mut().composer.complete_command();
             }
             KeyCode::Esc => {
-                if !self.selected_mut().composer.dismiss_command_menu() {
-                    self.focus = Focus::List;
-                }
+                self.selected_mut().composer.dismiss_command_menu();
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
@@ -3751,7 +3847,9 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos::chat::{conversation_head, conversation_ref, ConversationReplay};
+    use caos::chat::{
+        conversation_head, conversation_ref, ConversationReplay, ConversationTurnEvents,
+    };
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -3768,6 +3866,7 @@ mod tests {
             title: id.to_string(),
             head: "a".repeat(40),
             updated_unix: 1,
+            parent: None,
         }
     }
 
@@ -4256,6 +4355,7 @@ mod tests {
                 title: "published fallback".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: None,
             observed_title: None,
@@ -4289,6 +4389,7 @@ mod tests {
                 title: "manual rename".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: None,
             observed_title: None,
@@ -4317,6 +4418,7 @@ mod tests {
                 title: "manual rename".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: None,
             observed_title: Some("published fallback".to_string()),
@@ -4357,6 +4459,7 @@ mod tests {
                 conversation: "new-talk".to_string(),
                 commit: head.clone(),
                 short_commit: short_hash(&head).to_string(),
+                interrupted: false,
             },
         );
 
@@ -4857,13 +4960,18 @@ mod tests {
     }
 
     #[test]
+    fn escape_does_not_focus_the_conversation_list() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.focus(), Focus::Conversation);
+    }
+
+    #[test]
     fn list_focus_navigates_conversations_and_enter_opens_the_conversation() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
-        assert_eq!(app.focus(), Focus::Conversation);
-
-        // Esc with an empty command menu moves focus to the conversation list.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.focus(), Focus::List);
+        app.focus = Focus::List;
 
         // Up/Down move through conversations while the list is focused.
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -4882,6 +4990,25 @@ mod tests {
         assert_eq!(app.focus(), Focus::Conversation);
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.selected().composer.text, "x");
+    }
+
+    #[test]
+    fn escape_interrupts_before_list_or_view_navigation() {
+        let mut running = state("talk-1");
+        running.running = true;
+        let (mut app, _) = app_with(vec![running]);
+        app.repo_dir = std::env::temp_dir().join(format!(
+            "missing-caos-interrupt-test-repo-{}",
+            std::process::id()
+        ));
+        app.focus = Focus::List;
+        app.view = View::Activity;
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.selected().interrupting);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.view, View::Activity);
     }
 
     #[test]
@@ -4924,6 +5051,7 @@ mod tests {
             title: "A generated title".to_string(),
             head: "a".repeat(40),
             updated_unix: 1,
+            parent: None,
         }];
         assert_eq!(
             choose_conversation(None, true, &conversations).unwrap(),
@@ -5822,6 +5950,8 @@ mod tests {
         selected.status = "calling model…".to_string();
         assert_eq!(selected.sidebar_text(16).1, "calling model…".to_string());
         selected.running = false;
+        let mut child = state("Child task");
+        child.parent = Some(internal_id.to_string());
         let mut generating_title = ConversationState::new(
             internal_id.to_string(),
             "Existing title".to_string(),
@@ -5829,7 +5959,13 @@ mod tests {
             "ready".to_string(),
         );
         generating_title.generating_title = true;
-        let (app, _) = app_with(vec![selected, generating_title, state("Empty title")]);
+        let (mut app, _) = app_with(vec![
+            selected,
+            child,
+            generating_title,
+            state("Empty title"),
+        ]);
+        app.selected = 2;
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -5854,6 +5990,14 @@ mod tests {
             .trim_matches('│')
             .trim()
             .is_empty());
+        let child_row = sidebar_rows
+            .iter()
+            .position(|row| row.contains("Child task"))
+            .unwrap();
+        assert_eq!(
+            sidebar_rows[child_row].find("Child task").unwrap(),
+            sidebar_rows[title_row].find("Readable title").unwrap() + 2
+        );
         assert!(
             sidebar_rows
                 .iter()
@@ -5969,7 +6113,7 @@ mod tests {
         wait_for_pending_submission(&mut app, 0);
         assert_eq!(app.selected().status, "running a tool");
         assert_eq!(app.selected().turn_phase, TurnPhase::Model);
-        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().activities.is_empty());
         assert!(app.selected().running);
         assert!(app.selected().local_turn);
         assert!(app.selected().command_error.is_none());
@@ -6027,7 +6171,7 @@ mod tests {
     }
 
     #[test]
-    fn first_durable_load_preserves_a_locally_started_turn() {
+    fn first_durable_load_replays_activity_and_preserves_local_lifecycle() {
         let head = "a".repeat(40);
         let request = "b".repeat(40);
         let mut conversation = state("talk-1");
@@ -6035,7 +6179,6 @@ mod tests {
         conversation.local_turn = true;
         conversation.status = "running a tool".to_string();
         conversation.turn_phase = TurnPhase::Model;
-        conversation.activities.push(activity(1));
         assert!(conversation.active_request.is_none());
 
         conversation.apply_load(
@@ -6047,11 +6190,22 @@ mod tests {
                     status: "queued".to_string(),
                     request: Some(request.clone()),
                     request_head: Some("c".repeat(40)),
+                    interrupted: false,
                     messages: Vec::new(),
                 },
                 replay: ConversationReplay {
                     turns: Vec::new(),
-                    turn_events: Vec::new(),
+                    turn_events: vec![ConversationTurnEvents {
+                        turn_commit: head.clone(),
+                        events: vec![TurnEvent::ToolCall {
+                            step_commit: "e".repeat(40),
+                            request: request.clone(),
+                            round: 2,
+                            tool_use_id: "sleep".to_string(),
+                            name: "bash".to_string(),
+                            summary: "$ sleep 120; echo done".to_string(),
+                        }],
+                    }],
                 },
                 workspace_diff: WorkspaceDiff {
                     base_commit: "d".repeat(40),
@@ -6064,7 +6218,10 @@ mod tests {
 
         assert_eq!(conversation.status, "running a tool");
         assert_eq!(conversation.turn_phase, TurnPhase::Model);
-        assert_eq!(conversation.activities, vec![activity(1)]);
+        assert_eq!(conversation.activities.len(), 1);
+        assert_eq!(conversation.activities[0].id, "sleep");
+        assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
+        assert_eq!(conversation.activity_selection, Some(0));
         assert_eq!(
             conversation.active_request.as_deref(),
             Some(request.as_str())
@@ -6126,6 +6283,7 @@ mod tests {
                     status: "queued".to_string(),
                     request: Some("c".repeat(40)),
                     request_head: Some("d".repeat(40)),
+                    interrupted: false,
                     messages: Vec::new(),
                 },
                 replay: ConversationReplay {
@@ -6163,6 +6321,7 @@ mod tests {
                 title: "stale title".to_string(),
                 head: "a".repeat(40),
                 updated_unix: 1,
+                parent: None,
             },
             observed_head: Some("a".repeat(40)),
             observed_title: Some("old local title".to_string()),

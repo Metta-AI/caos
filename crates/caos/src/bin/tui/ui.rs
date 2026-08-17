@@ -448,6 +448,12 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .conversations
         .iter()
         .map(|state| {
+            let is_child = state.parent.as_ref().is_some_and(|parent| {
+                app.conversations
+                    .iter()
+                    .any(|candidate| candidate.id == *parent)
+            });
+            let indent = if is_child { "  " } else { "" };
             let (mark, color) = if state.running {
                 ("*", Color::Yellow)
             } else if state.generating_title {
@@ -457,14 +463,17 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             } else {
                 (" ", Color::DarkGray)
             };
-            let (title, detail) = state.sidebar_text(detail_width);
+            let (title, detail) = state.sidebar_text(
+                detail_width.saturating_sub(u16::try_from(indent.len()).unwrap_or(u16::MAX)),
+            );
             ListItem::new(vec![
                 Line::from(vec![
+                    Span::raw(indent),
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
                     Span::raw(title),
                 ]),
                 Line::from(vec![
-                    Span::raw("  "),
+                    Span::raw(format!("{indent}  ")),
                     Span::styled(
                         detail,
                         Style::default()
@@ -1395,7 +1404,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+L          check out the conversation commit locally"),
         Line::raw("  Ctrl+P twice    publish a replaceable snapshot and open a PR"),
         Line::raw("  Ctrl+N          start a new conversation"),
-        Line::raw("  Esc             focus the conversation list"),
+        Line::raw("  Esc             stop a running agent or dismiss the current layer"),
         Line::raw("  Ctrl+E          archive from the conversation list"),
         Line::raw("  Ctrl+Up/Down    switch conversations"),
         Line::raw("  Ctrl+T          toggle activity details"),
@@ -1618,16 +1627,30 @@ fn render_command_menu(
 }
 
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let footer = if app.palette.is_some() {
+    let footer = if app.selection_locked {
+        Line::styled(
+            " Selection lock: redraws paused, ^Y/Esc resumes",
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )
+    } else if app.selected().running
+        && (app.focus() != Focus::Conversation
+            || app.view != View::Chat
+            || app.palette.is_some()
+            || app.confirm_action.is_some())
+    {
+        let send_shortcut = if app.enhanced_keyboard() {
+            "^Enter"
+        } else {
+            "^S"
+        };
+        Line::raw(format!(
+            " Agent running: {send_shortcut} interject  Esc stop  ^T activity  ^Up/Dn switch  ^C quit"
+        ))
+    } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
     } else if matches!(app.confirm_action, Some(ConfirmAction::Publish { .. })) {
         Line::raw(
             " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
-        )
-    } else if app.selection_locked {
-        Line::styled(
-            " Selection lock: redraws paused, ^Y/Esc resumes",
-            Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.focus() == Focus::List {
         Line::raw(
@@ -1645,8 +1668,13 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         } else {
             "^S"
         };
+        let escape = if app.selected().running {
+            "  Esc stop"
+        } else {
+            ""
+        };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  ^H help  Esc list  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);

@@ -74,12 +74,16 @@ base=$(mkcommit "HEAD:ws" base)
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 stub_pid=""
 gate_pid=""
+interrupt_pid=""
 cleanup() {
   if [ -n "$stub_pid" ]; then
     kill "$stub_pid" 2>/dev/null || true
   fi
   if [ -n "$gate_pid" ]; then
     kill "$gate_pid" 2>/dev/null || true
+  fi
+  if [ -n "$interrupt_pid" ]; then
+    kill "$interrupt_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -109,6 +113,9 @@ STALE_T2_TEXT="the workspace still holds out.txt"
 T2_TEXT="yes, I also saw your last message"
 ASYNC_QUEUED_TEXT="the independent task is queued"
 ASYNC_OBSERVED_TEXT="I observed the independent task completion"
+SUBAGENT_PROMPT="inspect the snapshot and report the notes file"
+SUBAGENT_DONE_TEXT="subagent round complete"
+RESULT_DONE_TEXT="I inspected the subagent result"
 mkdir stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > stub/response-2.json
@@ -126,6 +133,12 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
   "$ASYNC_QUEUED_TEXT" > stub/response-7.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
   "$ASYNC_OBSERVED_TEXT" > stub/response-8.json
+printf '{"content":[{"id":"toolu_spawn","input":{"prompt":"%s"},"name":"spawn_agent","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  "$SUBAGENT_PROMPT" > stub/response-9.json
+# The parent and child race for the next API slot. Both terminal responses are
+# equivalent, while FIFOs let the test release each request in observed order.
+mkfifo stub/response-10.json stub/response-11.json
+mkfifo stub/response-15.json
 
 for _ in 1 2 3 4 5; do
   port=$((20000 + RANDOM % 20000))
@@ -144,7 +157,7 @@ done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
 
 echo "== dispatch first turn ==" >&2
-conv="llm-step-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+conv="llm-step-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')-$$"
 conversation_ref="refs/caos/v2/conversations/$conv/head"
 llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
   --api-key=test-key --system:@=system.txt \
@@ -402,5 +415,200 @@ grep -qF "$notice" stub/request-8.json \
   || fail "later model step did not observe independent completion"
 [ "$(git rev-parse "$head4^{tree}")" = "$tree3" ] \
   || fail "post-completion observation changed the workspace"
+
+echo "== durable subagent and explicit result read ==" >&2
+tree4=$(git rev-parse "$head4^{tree}")
+user5=$(mkcommit "$tree4" \
+  '{"author":"user","username":"Alice","content":"delegate a focused check"}' \
+  "$head4")
+request5=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user5")
+admitted5=$(mkcommit "$tree4" \
+  "{\"request\":\"$request5\",\"request_head\":\"$user5\",\"status\":\"queued\"}" \
+  "$user5")
+git push --quiet caos "$admitted5:$conversation_ref" \
+  || fail "publishing subagent queued event"
+"$CAOS_CLI" run "$request5" -- >/tmp/llm-step-result-5 2>/tmp/llm-step-error-5 &
+spawn_pid=$!
+
+for request_number in 10 11; do
+  request_seen=0
+  for _ in $(seq 1 300); do
+    if [ -e "stub/request-$request_number.json" ]; then
+      request_seen=1
+      break
+    fi
+    sleep 0.2
+  done
+  [ "$request_seen" -eq 1 ] || fail "subagent API request $request_number never arrived"
+  printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
+    "$SUBAGENT_DONE_TEXT" > "stub/response-$request_number.json"
+done
+if ! wait "$spawn_pid"; then
+  fail "running subagent turn: $(cat /tmp/llm-step-error-5)"
+fi
+
+head5=$(fetch_head)
+events5=$(git log --first-parent --format=%B "$user5..$head5")
+spawn_detail=$(jq -r \
+  'select(.result.tool_use_id == "toolu_spawn") | .result.content[0].text' \
+  <<<"$events5")
+[ -n "$spawn_detail" ] || fail "spawn_agent result was not recorded"
+agent=$(jq -r '.agent // empty' <<<"$spawn_detail")
+agent_task=$(jq -r '.task // empty' <<<"$spawn_detail")
+agent_request=$(jq -r '.request // empty' <<<"$spawn_detail")
+[[ "$agent" = agent-* ]] || fail "spawn_agent returned invalid child id: $agent"
+[ "${#agent_task}" -eq 40 ] && [[ "$agent_task" =~ ^[0-9a-f]+$ ]] \
+  || fail "spawn_agent returned invalid task: $agent_task"
+[ "${#agent_request}" -eq 40 ] && [[ "$agent_request" =~ ^[0-9a-f]+$ ]] \
+  || fail "spawn_agent returned invalid request: $agent_request"
+
+agent_result=""
+for _ in $(seq 1 300); do
+  agent_result=$(remote_exact_ref "refs/caos/res/$agent_task" 2>/dev/null || true)
+  if [ -n "$agent_result" ]; then break; fi
+  sleep 0.2
+done
+[ -n "$agent_result" ] || fail "subagent task has no result ref"
+agent_ref="refs/caos/v2/conversations/$agent/head"
+agent_head=$(git ls-remote --refs caos "$agent_ref")
+agent_head=${agent_head%%$'\t'*}
+[ "$agent_head" = "$agent_result" ] || fail "subagent result is not its canonical head"
+git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$agent_head" \
+  || fail "fetching subagent head"
+agent_key=$(printf '%s' "$agent" | od -An -tx1 | tr -d ' \n')
+active_ref="refs/caos/v2/users/u-416c696365/conversations/active/c-$agent_key"
+[ -n "$(remote_exact_ref "$active_ref")" ] \
+  || fail "subagent is absent from its human owner's active index"
+title_ref="refs/caos/v2/conversations/$agent/title"
+title=$(remote_exact_ref "$title_ref")
+[ -n "$title" ] || fail "subagent has no title ref"
+git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$title" \
+  || fail "fetching subagent title"
+[ "$(git cat-file blob "$title")" = "$SUBAGENT_PROMPT" ] || fail "subagent title is wrong"
+grep -qF "$SUBAGENT_DONE_TEXT" <<<"$(git show -s --format=%B "$agent_head")" \
+  || fail "subagent terminal report is missing"
+[ "$(git show "$agent_head:notes/todo.txt")" = "hello notes" ] \
+  || fail "subagent did not inherit the clean workspace snapshot"
+if git cat-file -e "$agent_head:.caos" 2>/dev/null; then
+  fail "subagent inherited parent harness state"
+fi
+agent_events=$(git log --first-parent --format=%B "$agent_head")
+grep -qF "\"conversation\":\"$conv\"" <<<"$agent_events" \
+  || fail "subagent root lacks its durable parent conversation"
+grep -qF "\"request\":\"$request5\"" <<<"$agent_events" \
+  || fail "subagent root lacks its durable parent request"
+grep -qF '"call":"toolu_spawn"' <<<"$agent_events" \
+  || fail "subagent root lacks its durable parent call"
+grep -qF '"username":"Alice"' <<<"$agent_events" \
+  || fail "subagent root lacks its human owner"
+
+printf '{"content":[{"id":"toolu_result","input":{"request":"%s"},"name":"run_async","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  "$agent_request" > stub/response-12.json
+printf '{"content":[{"id":"toolu_merge","input":{"theirs":"%s"},"name":"merge","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  "$agent_result" > stub/response-13.json
+printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
+  "$RESULT_DONE_TEXT" > stub/response-14.json
+completion5=$(remote_head)
+git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$completion5" \
+  || fail "fetching subagent completion event"
+tree5=$(git rev-parse "$completion5^{tree}")
+user6=$(mkcommit "$tree5" \
+  '{"author":"user","content":"inspect the delegated result"}' \
+  "$completion5")
+request6=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user6")
+admitted6=$(mkcommit "$tree5" \
+  "{\"request\":\"$request6\",\"request_head\":\"$user6\",\"status\":\"queued\"}" \
+  "$user6")
+git push --quiet caos "$admitted6:$conversation_ref" \
+  || fail "publishing result-inspection queued event"
+"$CAOS_CLI" run "$request6" -- >/tmp/llm-step-result-6 \
+  || fail "running result-inspection turn"
+
+head6=$(fetch_head)
+grep -qF "$RESULT_DONE_TEXT" <<<"$(git show -s --format=%B "$head6")" \
+  || fail "result-inspection turn did not finish"
+grep -qF "$agent_result" stub/request-13.json \
+  || fail "run_async did not return the child workspace commit"
+[ "$(git rev-parse "$head6^{tree}")" = "$tree5" ] \
+  || fail "merging an unchanged subagent result changed the parent workspace"
+git merge-base --is-ancestor "$agent_result" "$head6" \
+  || fail "merged subagent result is absent from parent workspace ancestry"
+
+echo "== durable Escape at a model boundary ==" >&2
+tree6=$(git rev-parse "$head6^{tree}")
+user7=$(mkcommit "$tree6" \
+  '{"author":"user","content":"this prompt was accidental"}' \
+  "$head6")
+request7=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user7")
+admitted7=$(mkcommit "$tree6" \
+  "{\"request\":\"$request7\",\"request_head\":\"$user7\",\"status\":\"queued\"}" \
+  "$user7")
+git push --quiet caos "$admitted7:$conversation_ref" \
+  || fail "publishing Escape-test queued event"
+"$CAOS_CLI" run "$request7" -- >/tmp/llm-step-result-7 2>/tmp/llm-step-error-7 &
+interrupt_pid=$!
+
+request_seen=0
+for _ in $(seq 1 300); do
+  if [ -e stub/request-15.json ]; then
+    request_seen=1
+    break
+  fi
+  if ! kill -0 "$interrupt_pid" 2>/dev/null; then
+    fail "Escape-test turn exited before its blocked response: $(cat /tmp/llm-step-error-7)"
+  fi
+  sleep 0.2
+done
+[ "$request_seen" -eq 1 ] || fail "Escape-test model request never arrived"
+
+escape_parent=$(fetch_head)
+escape_tree=$(git rev-parse "$escape_parent^{tree}")
+escape_commit=$(mkcommit "$escape_tree" \
+  "{\"escape\":{\"request\":\"$request7\"}}" \
+  "$escape_parent")
+git push --quiet --force-with-lease="$conversation_ref:$escape_parent" \
+  caos "$escape_commit:$conversation_ref" || fail "publishing Escape event"
+printf '%s\n' \
+  '{"content":[{"text":"I had started this response.","type":"text"},{"id":"toolu_interrupted","input":{"file_path":"interrupted.txt","content":"must not run\n"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  > stub/response-15.json
+
+for _ in $(seq 1 300); do
+  if [ -e stub/request-16.json ]; then
+    fail "Escape allowed another model round"
+  fi
+  if ! kill -0 "$interrupt_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.2
+done
+if ! wait "$interrupt_pid"; then
+  fail "running Escape-test turn: $(cat /tmp/llm-step-error-7)"
+fi
+interrupt_pid=""
+
+head7=$(fetch_head)
+events7=$(git log --first-parent --format=%B "$user7..$head7")
+terminal7=$(git show -s --format=%B "$head7")
+grep -qF "\"request\":\"$request7\"" <<<"$events7" \
+  || fail "Escape-test request identity was lost"
+grep -qF '"escape"' <<<"$events7" || fail "Escape event is missing"
+grep -qF 'I had started this response.' <<<"$events7" \
+  || fail "in-flight model response was not recorded"
+grep -qF '"tool_use_id":"toolu_interrupted"' <<<"$events7" \
+  || fail "interrupted tool result is missing"
+grep -qF 'interrupted before this tool ran' <<<"$events7" \
+  || fail "interrupted tool was not closed explicitly"
+grep -qF '"is_error":true' <<<"$events7" \
+  || fail "interrupted tool result is not an error"
+grep -qF '"status":"idle"' <<<"$terminal7" \
+  || fail "Escape did not return the conversation to idle"
+grep -qF '"interrupted":true' <<<"$terminal7" \
+  || fail "Escape terminal status is not distinguishable"
+if git cat-file -e "$head7:interrupted.txt" 2>/dev/null; then
+  fail "Escape allowed the pending write tool to run"
+fi
+[ ! -e stub/request-16.json ] || fail "Escape allowed another model round"
+[ -n "$(remote_exact_ref "refs/caos/res/$request7")" ] \
+  || fail "interrupted exact request Q has no result ref"
 
 echo "llm-step: ALL PASS" >&2

@@ -80,6 +80,7 @@ pub struct TurnOutcome {
     pub conversation: String,
     pub commit: String,
     pub short_commit: String,
+    pub interrupted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +128,7 @@ pub struct UserConversationSummary {
     pub title: String,
     pub head: String,
     pub updated_unix: i64,
+    pub parent: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +195,7 @@ pub struct ConversationSnapshot {
     /// retained after the worker records `request`, so a follower can identify
     /// the turn without treating later interjections as its input head.
     pub request_head: Option<String>,
+    pub interrupted: bool,
     pub messages: Vec<ConversationMessage>,
 }
 
@@ -451,6 +454,49 @@ pub fn submit_interjection(
         prepare_queued_request,
     )
     .map(|submitted| submitted.commit)
+}
+
+/// Append a tree-neutral Escape event for the active request. The worker
+/// observes it at its next durable boundary, records any result already in
+/// flight, and closes the request without continuing.
+pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
+    let refname = conversation_ref(id)?;
+    for _ in 0..32 {
+        let conversation =
+            durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+        if !request_is_active(&conversation.snapshot.status) {
+            return Err(format!("conversation {id:?} has no active request"));
+        }
+        let request =
+            conversation.snapshot.request.as_deref().ok_or_else(|| {
+                format!("active conversation {id:?} has no durably recorded request")
+            })?;
+        if let Some(existing) = conversation.events.iter().find(|event| {
+            event
+                .value
+                .get("escape")
+                .and_then(|escape| escape.get("request"))
+                .and_then(Value::as_str)
+                == Some(request)
+        }) {
+            return Ok(existing.commit.clone());
+        }
+        let tree = t
+            .git_capture(
+                &["rev-parse", &format!("{}^{{tree}}", conversation.head)],
+                None,
+            )?
+            .trim()
+            .to_string();
+        let event = json!({"escape": {"request": request}});
+        let candidate = create_event_commit(t, &tree, &conversation.head, &event)?;
+        if push_head_cas(t, &refname, Some(&conversation.head), &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "conversation {id:?} kept changing while recording Escape"
+    ))
 }
 
 struct SubmittedMessage {
@@ -1560,7 +1606,7 @@ pub fn list_user_conversations(
             continue;
         };
         let summary = (|| {
-            let updated_unix = remote_commit_timestamp(t, head)?;
+            let metadata = remote_conversation_metadata(t, head)?;
             let title_ref = conversation_title_ref(&id)?;
             let title = if let Some(hash) = titles.get(&title_ref) {
                 let (kind, bytes) = t.get_object(hash)?;
@@ -1577,7 +1623,8 @@ pub fn list_user_conversations(
                 id: id.clone(),
                 title,
                 head: head.clone(),
-                updated_unix,
+                updated_unix: metadata.updated_unix,
+                parent: metadata.parent,
             })
         })();
         match summary {
@@ -1590,7 +1637,50 @@ pub fn list_user_conversations(
             .cmp(&a.updated_unix)
             .then_with(|| b.id.cmp(&a.id))
     });
-    Ok(conversations)
+    Ok(group_child_conversations(conversations))
+}
+
+fn group_child_conversations(
+    conversations: Vec<UserConversationSummary>,
+) -> Vec<UserConversationSummary> {
+    let roots = conversations
+        .iter()
+        .filter(|conversation| conversation.parent.is_none())
+        .map(|conversation| conversation.id.clone())
+        .collect::<HashSet<_>>();
+    let mut children: HashMap<String, Vec<UserConversationSummary>> = HashMap::new();
+    let mut top_level = Vec::new();
+    for conversation in conversations {
+        match conversation
+            .parent
+            .as_ref()
+            .filter(|parent| roots.contains(*parent))
+        {
+            Some(parent) => children
+                .entry(parent.clone())
+                .or_default()
+                .push(conversation),
+            None => top_level.push(conversation),
+        }
+    }
+    top_level.sort_by(|a, b| {
+        let newest = |conversation: &UserConversationSummary| {
+            children
+                .get(&conversation.id)
+                .and_then(|children| children.first())
+                .map(|child| child.updated_unix)
+                .unwrap_or(conversation.updated_unix)
+                .max(conversation.updated_unix)
+        };
+        newest(b).cmp(&newest(a)).then_with(|| b.id.cmp(&a.id))
+    });
+    let mut grouped = Vec::new();
+    for conversation in top_level {
+        let id = conversation.id.clone();
+        grouped.push(conversation);
+        grouped.extend(children.remove(&id).unwrap_or_default());
+    }
+    grouped
 }
 
 pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
@@ -1902,6 +1992,7 @@ pub fn run_chat_turn(
                     conversation: id.to_string(),
                     short_commit: short_hash(&snapshot.head).to_string(),
                     commit: snapshot.head,
+                    interrupted: snapshot.interrupted,
                 })
             }
             "failed" => return Err(format!("conversation request ended {}", snapshot.status)),
@@ -2589,7 +2680,19 @@ fn warn_skipped_conversation(id: &str, error: &str) {
     eprintln!("warning: skipping malformed conversation {id:?}: {error}");
 }
 
+struct RemoteConversationMetadata {
+    updated_unix: i64,
+    parent: Option<String>,
+}
+
 fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> {
+    remote_conversation_metadata(t, hash).map(|metadata| metadata.updated_unix)
+}
+
+fn remote_conversation_metadata(
+    t: &GitTransport,
+    hash: &str,
+) -> Result<RemoteConversationMetadata, String> {
     validate_hash(hash, "conversation tip")?;
     let mut current = hash.to_string();
     let mut newest_activity_timestamp = None;
@@ -2626,10 +2729,31 @@ fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> 
             newest_activity_timestamp = Some(commit_timestamp(headers, &current)?);
         }
         if is_root {
-            return match newest_activity_timestamp {
-                Some(timestamp) => Ok(timestamp),
-                None => commit_timestamp(headers, &current),
+            let updated_unix = match newest_activity_timestamp {
+                Some(timestamp) => timestamp,
+                None => commit_timestamp(headers, &current)?,
             };
+            let parent = match event.get("spawned_by") {
+                None => None,
+                Some(spawned_by) => {
+                    let parent = spawned_by
+                        .get("conversation")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            format!(
+                                "conversation root {current} spawned_by has no string conversation"
+                            )
+                        })?;
+                    conversation_ref(parent).map_err(|error| {
+                        format!("conversation root {current} has invalid parent: {error}")
+                    })?;
+                    Some(parent.to_string())
+                }
+            };
+            return Ok(RemoteConversationMetadata {
+                updated_unix,
+                parent,
+            });
         }
         current = parent.to_string();
     }
@@ -2850,6 +2974,7 @@ fn fold_events(
     let mut status: Option<String> = None;
     let mut request: Option<String> = None;
     let mut request_head: Option<String> = None;
+    let mut interrupted = false;
     for event in events {
         let value = &event.value;
         if let Some(content) = value.get("content") {
@@ -2881,6 +3006,18 @@ fn fold_events(
         waterfall_string(value, "status", &mut status)?;
         waterfall_string(value, "request", &mut request)?;
         waterfall_string(value, "request_head", &mut request_head)?;
+        if let Some(event_status) = value.get("status").and_then(Value::as_str) {
+            if matches!(event_status, "queued" | "running") {
+                interrupted = false;
+            } else if matches!(event_status, "idle" | "failed") {
+                interrupted = match value.get("interrupted") {
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        "conversation event interrupted is not a boolean".to_string()
+                    })?,
+                    None => false,
+                };
+            }
+        }
         if let Some("idle" | "failed") = value.get("status").and_then(Value::as_str) {
             request = None;
             request_head = None;
@@ -2916,6 +3053,7 @@ fn fold_events(
         status,
         request,
         request_head,
+        interrupted,
         messages,
     })
 }
@@ -3417,6 +3555,58 @@ mod tests {
         assert_eq!(snapshot.messages[0].username.as_deref(), Some("Alice"));
         assert_eq!(snapshot.messages[1].content, "done");
         assert_eq!(snapshot.request, None);
+        assert!(!snapshot.interrupted);
+    }
+
+    #[test]
+    fn escape_is_idempotent_and_projects_an_interrupted_terminal() {
+        let (root, repo, transport, base) = conversation_index_fixture("escape");
+        let request = "b".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "escape-test",
+            "Stop this turn",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+
+        let escaped = interrupt_request(&transport, "escape-test").unwrap();
+        assert_eq!(
+            interrupt_request(&transport, "escape-test").unwrap(),
+            escaped
+        );
+        let escaped_snapshot = conversation_snapshot(&transport, "escape-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(escaped_snapshot.status, "queued");
+        assert_eq!(escaped_snapshot.request.as_deref(), Some(request.as_str()));
+        assert!(!escaped_snapshot.interrupted);
+
+        let tree = test_git(&repo, &["rev-parse", &format!("{escaped}^{{tree}}")]);
+        let terminal = create_event_commit(
+            &transport,
+            &tree,
+            &escaped,
+            &json!({"request":request,"status":"idle","interrupted":true}),
+        )
+        .unwrap();
+        let refname = conversation_ref("escape-test").unwrap();
+        assert!(push_head_cas(&transport, &refname, Some(&escaped), &terminal).unwrap());
+        let terminal_snapshot = conversation_snapshot(&transport, "escape-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal_snapshot.status, "idle");
+        assert!(terminal_snapshot.interrupted);
+        assert!(terminal_snapshot.request.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3552,6 +3742,59 @@ mod tests {
         for key in ["project", "c-", "c-0", "c-2F", "c-ff"] {
             assert!(conversation_id_from_key(key).is_err(), "accepted {key:?}");
         }
+    }
+
+    #[test]
+    fn indexed_children_follow_their_parent_without_a_separate_tree_index() {
+        let summary = |id: &str, parent: Option<&str>, updated_unix| UserConversationSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            head: "a".repeat(40),
+            updated_unix,
+            parent: parent.map(str::to_string),
+        };
+        let grouped = group_child_conversations(vec![
+            summary("child", Some("parent"), 4),
+            summary("new-root", None, 3),
+            summary("parent", None, 2),
+            summary("orphan", Some("absent"), 1),
+        ]);
+
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "child", "new-root", "orphan"]
+        );
+    }
+
+    #[test]
+    fn sidebar_metadata_reads_the_durable_parent_from_the_root() {
+        let (root, repo, transport, base) = conversation_index_fixture("child-parent");
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let child = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "content": "delegated task",
+                "spawned_by": {
+                    "conversation": "parent",
+                    "request": "b".repeat(40),
+                    "round": 0,
+                    "call": "toolu_spawn",
+                },
+            }),
+        )
+        .unwrap();
+
+        let metadata = remote_conversation_metadata(&transport, &child).unwrap();
+        assert_eq!(metadata.parent.as_deref(), Some("parent"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

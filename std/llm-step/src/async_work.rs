@@ -24,7 +24,7 @@ pub const TOOL_NAME: &str = "run_async";
 pub fn declaration() -> Value {
     json!({
         "name": TOOL_NAME,
-        "description": "Start an already-constructed CAOS request in the background. The request must be a complete 40-character ArgTree hash already stored in CAOS. Returns a task hash immediately; that same hash names the eventual CAOS result. Use this only for independent work whose complete context is in the request: detached work does not inherit secrets, credentials, model settings, or other ambient execution context.",
+        "description": "Start or inspect an already-constructed CAOS request in the background. The request must be a complete 40-character ArgTree hash already stored in CAOS. Repeating the same request reads the same durable task; once complete, the result includes its result hash. Use this only for independent work whose complete context is in the request: detached work does not inherit secrets, credentials, model settings, or other ambient execution context.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -116,7 +116,22 @@ where
         eprintln!("llm-step: {error}; the durable task state will cause a later recovery to retry");
     }
 
-    Ok(result_block(call_id, &task, &status))
+    let result = if matches!(status.as_str(), "complete" | "failed") {
+        progress::result_ref(&task)?
+    } else {
+        None
+    };
+    let visible_status = if status != "pending" && result.is_none() {
+        "finishing"
+    } else {
+        &status
+    };
+    Ok(result_block(
+        call_id,
+        &task,
+        visible_status,
+        result.as_deref(),
+    ))
 }
 
 /// Check the model-supplied hash before publishing `pending`. A missing object
@@ -149,8 +164,13 @@ fn request_tree_error(request: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-fn result_block(call_id: &str, task: &str, status: &str) -> Value {
-    let text = json!({"task": task, "status": status}).to_string();
+pub(crate) fn result_block(
+    call_id: &str,
+    task: &str,
+    status: &str,
+    result: Option<&str>,
+) -> Value {
+    let text = json!({"task": task, "status": status, "result": result}).to_string();
     json!({
         "type": "tool_result",
         "tool_use_id": call_id,
@@ -234,6 +254,18 @@ pub(crate) fn task_status<'a>(
 pub(crate) fn readmit_task(task: &str, conversation: &str) -> Result<(), String> {
     validate_hash(task, "async task")?;
     let target_ref = progress::conversation_ref(conversation)?;
+    let (subreq, recorded_target) = task_request(task)?;
+    if recorded_target != target_ref {
+        return Err(format!(
+            "async task {task} does not target current conversation ref {target_ref}"
+        ));
+    }
+    validate_subrequest(&subreq)?;
+    dispatch(task)
+}
+
+pub(crate) fn task_request(task: &str) -> Result<(String, String), String> {
+    validate_hash(task, "async task")?;
     let request = fresh("async-request");
     caos(["get-hash", task, &request])?;
     caos(["get", &request])?;
@@ -243,12 +275,19 @@ pub(crate) fn readmit_task(task: &str, conversation: &str) -> Result<(), String>
     let subreq = read_literal_arg(&request, task, "subreq")?;
     validate_subrequest(&subreq)?;
     let recorded_target = read_literal_arg(&request, task, "target-ref")?;
-    if recorded_target != target_ref {
-        return Err(format!(
-            "async task {task} does not target current conversation ref {target_ref}"
-        ));
+    progress::validate_conversation_ref(&recorded_target)?;
+    Ok((subreq, recorded_target))
+}
+
+pub(crate) fn request_literal(request: &str, name: &str) -> Result<String, String> {
+    validate_hash(request, "request")?;
+    let materialized = fresh("async-subrequest-details");
+    caos(["get-hash", request, &materialized])?;
+    caos(["get", &materialized])?;
+    if !Path::new(&materialized).is_dir() {
+        return Err(format!("request {request} is not an ArgTree"));
     }
-    dispatch(task)
+    read_literal_arg(&materialized, request, name)
 }
 
 fn read_literal_arg(request: &str, task: &str, name: &str) -> Result<String, String> {
