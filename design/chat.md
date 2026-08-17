@@ -220,6 +220,12 @@ observes admitted `queued` or `running` state can resubmit the same request, and
 `llm-step` reconstructs its continuation from the log and ordinary tool
 results.
 
+### Interrupts
+
+Escape is an ordinary tree-neutral event scoped to `R`. A worker that loses CAS
+reads the commits after its attempted base; an intervening Escape preserves its
+result, closes unrun calls, and ends `R` idle without another model step.
+
 ### Workspace changes and forks
 
 For a checkout based on `P`, the client snapshots the proposal as `U` and
@@ -313,7 +319,8 @@ archived state cannot both win.
 
 The client passes an explicit model to every `llm-step`. `/model` changes the
 client's last-used model for later turns. Assistant events retain the model for
-display.
+display. Escape interrupts a running request; otherwise it focuses the
+conversation list.
 
 ### Deferred work
 

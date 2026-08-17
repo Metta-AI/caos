@@ -8,11 +8,11 @@ use caos::chat::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
     first_available_conversation_name, fork_conversation, generate_conversation_title,
-    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
-    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
-    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
-    InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
+    interrupt_request, invite_user_to_conversation, list_user_conversations,
+    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
+    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
+    ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
+    TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -982,6 +982,7 @@ struct ConversationState {
     reference_generation: u64,
     publish_prompt: bool,
     running: bool,
+    interrupting: bool,
     local_turn: bool,
     active_request: Option<String>,
     reconciling_request: Option<String>,
@@ -1025,6 +1026,7 @@ impl ConversationState {
             reference_generation: 0,
             publish_prompt: false,
             running: false,
+            interrupting: false,
             local_turn: false,
             active_request: None,
             reconciling_request: None,
@@ -1185,10 +1187,14 @@ impl ConversationState {
         self.status = match snapshot.status.as_str() {
             "queued" => "queued".to_string(),
             "running" => "agent running".to_string(),
+            "idle" if snapshot.interrupted => {
+                format!("interrupted {}", short_hash(&snapshot.head))
+            }
             "idle" => format!("updated {}", short_hash(&snapshot.head)),
             other => other.to_string(),
         };
         if !self.running {
+            self.interrupting = false;
             self.reconciling_request = None;
             self.reconcile_after = None;
             self.local_turn = false;
@@ -1395,6 +1401,10 @@ enum UiMessage {
     Completed {
         conversation: String,
         outcome: TurnOutcome,
+    },
+    Interrupted {
+        conversation: String,
+        result: Result<String, String>,
     },
     SubmissionCommitted {
         conversation: String,
@@ -2243,6 +2253,38 @@ impl App {
         self.start_reference_lookup(self.selected);
     }
 
+    fn interrupt_selected(&mut self) {
+        if !self.selected().running || self.selected().interrupting {
+            return;
+        }
+        let wait_for_admission = self.selected().active_request.is_none();
+        let conversation = self.selected().id.clone();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        self.selected_mut().interrupting = true;
+        self.selected_mut().status = "stopping agent".to_string();
+        std::thread::spawn(move || {
+            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+                let attempts = if wait_for_admission { 40 } else { 1 };
+                let mut last_error = None;
+                for attempt in 0..attempts {
+                    match interrupt_request(&transport, &conversation) {
+                        Ok(commit) => return Ok(commit),
+                        Err(error) => last_error = Some(error),
+                    }
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(Duration::from_millis(125));
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| "recording Escape failed".to_string()))
+            });
+            let _ = tx.send(UiMessage::Interrupted {
+                conversation,
+                result,
+            });
+        });
+    }
+
     fn start_reference_lookup(&mut self, index: usize) {
         let state = &mut self.conversations[index];
         if state.reference_loading {
@@ -2348,6 +2390,25 @@ impl App {
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
                         self.finish_turn(index, outcome);
+                    }
+                }
+                UiMessage::Interrupted {
+                    conversation,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        match result {
+                            Ok(_) if state.running => state.status = "stopping agent".to_string(),
+                            Ok(_) => state.interrupting = false,
+                            Err(error) if state.running => {
+                                state.interrupting = false;
+                                state.show_command_error_preserving_status(format!(
+                                    "interrupting turn failed: {error}"
+                                ));
+                            }
+                            Err(_) => state.interrupting = false,
+                        }
                     }
                 }
                 UiMessage::SubmissionCommitted {
@@ -2727,12 +2788,17 @@ impl App {
         let user = self.user.clone();
         let state = &mut self.conversations[index];
         state.running = false;
+        state.interrupting = false;
         state.local_turn = false;
         state.active_request = None;
         state.reconciling_request = None;
         state.reconcile_after = None;
         state.sidebar_attention = None;
-        state.status = format!("completed {}", outcome.short_commit);
+        state.status = if outcome.interrupted {
+            format!("interrupted {}", outcome.short_commit)
+        } else {
+            format!("completed {}", outcome.short_commit)
+        };
         match transport {
             Ok(transport) => {
                 let published_title = state.title.clone();
@@ -2877,6 +2943,10 @@ impl App {
             if key.code == KeyCode::Esc {
                 self.selection_locked = false;
             }
+            return;
+        }
+        if key.code == KeyCode::Esc && self.selected().running {
+            self.interrupt_selected();
             return;
         }
         let is_palette = key
@@ -3152,9 +3222,7 @@ impl App {
                 self.selected_mut().composer.complete_command();
             }
             KeyCode::Esc => {
-                if !self.selected_mut().composer.dismiss_command_menu() {
-                    self.focus = Focus::List;
-                }
+                self.selected_mut().composer.dismiss_command_menu();
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
@@ -4388,6 +4456,7 @@ mod tests {
                 conversation: "new-talk".to_string(),
                 commit: head.clone(),
                 short_commit: short_hash(&head).to_string(),
+                interrupted: false,
             },
         );
 
@@ -4888,13 +4957,18 @@ mod tests {
     }
 
     #[test]
+    fn escape_does_not_focus_the_conversation_list() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.focus(), Focus::Conversation);
+    }
+
+    #[test]
     fn list_focus_navigates_conversations_and_enter_opens_the_conversation() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
-        assert_eq!(app.focus(), Focus::Conversation);
-
-        // Esc with an empty command menu moves focus to the conversation list.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.focus(), Focus::List);
+        app.focus = Focus::List;
 
         // Up/Down move through conversations while the list is focused.
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -4913,6 +4987,25 @@ mod tests {
         assert_eq!(app.focus(), Focus::Conversation);
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.selected().composer.text, "x");
+    }
+
+    #[test]
+    fn escape_interrupts_before_list_or_view_navigation() {
+        let mut running = state("talk-1");
+        running.running = true;
+        let (mut app, _) = app_with(vec![running]);
+        app.repo_dir = std::env::temp_dir().join(format!(
+            "missing-caos-interrupt-test-repo-{}",
+            std::process::id()
+        ));
+        app.focus = Focus::List;
+        app.view = View::Activity;
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.selected().interrupting);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.view, View::Activity);
     }
 
     #[test]
@@ -6095,6 +6188,7 @@ mod tests {
                     status: "queued".to_string(),
                     request: Some(request.clone()),
                     request_head: Some("c".repeat(40)),
+                    interrupted: false,
                     messages: Vec::new(),
                 },
                 replay: ConversationReplay {
@@ -6174,6 +6268,7 @@ mod tests {
                     status: "queued".to_string(),
                     request: Some("c".repeat(40)),
                     request_head: Some("d".repeat(40)),
+                    interrupted: false,
                     messages: Vec::new(),
                 },
                 replay: ConversationReplay {

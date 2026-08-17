@@ -80,6 +80,7 @@ pub struct TurnOutcome {
     pub conversation: String,
     pub commit: String,
     pub short_commit: String,
+    pub interrupted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,6 +195,7 @@ pub struct ConversationSnapshot {
     /// retained after the worker records `request`, so a follower can identify
     /// the turn without treating later interjections as its input head.
     pub request_head: Option<String>,
+    pub interrupted: bool,
     pub messages: Vec<ConversationMessage>,
 }
 
@@ -452,6 +454,49 @@ pub fn submit_interjection(
         prepare_queued_request,
     )
     .map(|submitted| submitted.commit)
+}
+
+/// Append a tree-neutral Escape event for the active request. The worker
+/// observes it at its next durable boundary, records any result already in
+/// flight, and closes the request without continuing.
+pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
+    let refname = conversation_ref(id)?;
+    for _ in 0..32 {
+        let conversation =
+            durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+        if !request_is_active(&conversation.snapshot.status) {
+            return Err(format!("conversation {id:?} has no active request"));
+        }
+        let request =
+            conversation.snapshot.request.as_deref().ok_or_else(|| {
+                format!("active conversation {id:?} has no durably recorded request")
+            })?;
+        if let Some(existing) = conversation.events.iter().find(|event| {
+            event
+                .value
+                .get("escape")
+                .and_then(|escape| escape.get("request"))
+                .and_then(Value::as_str)
+                == Some(request)
+        }) {
+            return Ok(existing.commit.clone());
+        }
+        let tree = t
+            .git_capture(
+                &["rev-parse", &format!("{}^{{tree}}", conversation.head)],
+                None,
+            )?
+            .trim()
+            .to_string();
+        let event = json!({"escape": {"request": request}});
+        let candidate = create_event_commit(t, &tree, &conversation.head, &event)?;
+        if push_head_cas(t, &refname, Some(&conversation.head), &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "conversation {id:?} kept changing while recording Escape"
+    ))
 }
 
 struct SubmittedMessage {
@@ -1947,6 +1992,7 @@ pub fn run_chat_turn(
                     conversation: id.to_string(),
                     short_commit: short_hash(&snapshot.head).to_string(),
                     commit: snapshot.head,
+                    interrupted: snapshot.interrupted,
                 })
             }
             "failed" => return Err(format!("conversation request ended {}", snapshot.status)),
@@ -2928,6 +2974,7 @@ fn fold_events(
     let mut status: Option<String> = None;
     let mut request: Option<String> = None;
     let mut request_head: Option<String> = None;
+    let mut interrupted = false;
     for event in events {
         let value = &event.value;
         if let Some(content) = value.get("content") {
@@ -2959,6 +3006,18 @@ fn fold_events(
         waterfall_string(value, "status", &mut status)?;
         waterfall_string(value, "request", &mut request)?;
         waterfall_string(value, "request_head", &mut request_head)?;
+        if let Some(event_status) = value.get("status").and_then(Value::as_str) {
+            if matches!(event_status, "queued" | "running") {
+                interrupted = false;
+            } else if matches!(event_status, "idle" | "failed") {
+                interrupted = match value.get("interrupted") {
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        "conversation event interrupted is not a boolean".to_string()
+                    })?,
+                    None => false,
+                };
+            }
+        }
         if let Some("idle" | "failed") = value.get("status").and_then(Value::as_str) {
             request = None;
             request_head = None;
@@ -2994,6 +3053,7 @@ fn fold_events(
         status,
         request,
         request_head,
+        interrupted,
         messages,
     })
 }
@@ -3495,6 +3555,58 @@ mod tests {
         assert_eq!(snapshot.messages[0].username.as_deref(), Some("Alice"));
         assert_eq!(snapshot.messages[1].content, "done");
         assert_eq!(snapshot.request, None);
+        assert!(!snapshot.interrupted);
+    }
+
+    #[test]
+    fn escape_is_idempotent_and_projects_an_interrupted_terminal() {
+        let (root, repo, transport, base) = conversation_index_fixture("escape");
+        let request = "b".repeat(40);
+        submit_message_inner_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "escape-test",
+            "Stop this turn",
+            false,
+            None,
+            |_, _, _, _| Ok(request.clone()),
+        )
+        .unwrap();
+
+        let escaped = interrupt_request(&transport, "escape-test").unwrap();
+        assert_eq!(
+            interrupt_request(&transport, "escape-test").unwrap(),
+            escaped
+        );
+        let escaped_snapshot = conversation_snapshot(&transport, "escape-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(escaped_snapshot.status, "queued");
+        assert_eq!(escaped_snapshot.request.as_deref(), Some(request.as_str()));
+        assert!(!escaped_snapshot.interrupted);
+
+        let tree = test_git(&repo, &["rev-parse", &format!("{escaped}^{{tree}}")]);
+        let terminal = create_event_commit(
+            &transport,
+            &tree,
+            &escaped,
+            &json!({"request":request,"status":"idle","interrupted":true}),
+        )
+        .unwrap();
+        let refname = conversation_ref("escape-test").unwrap();
+        assert!(push_head_cas(&transport, &refname, Some(&escaped), &terminal).unwrap());
+        let terminal_snapshot = conversation_snapshot(&transport, "escape-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal_snapshot.status, "idle");
+        assert!(terminal_snapshot.interrupted);
+        assert!(terminal_snapshot.request.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
