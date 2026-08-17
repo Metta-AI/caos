@@ -56,9 +56,9 @@ base=$(git rev-parse HEAD)
 initial_head=$(printf '%s\n' "{\"base\":\"$base\",\"status\":\"idle\"}" \
   | git -c user.email=test@caos -c user.name=caos \
     commit-tree "$base^{tree}" -p "$base")
-suffix=${base:0:12}
-success_ref="refs/caos/v2/conversations/run-update-success-$suffix/head"
-failure_ref="refs/caos/v2/conversations/run-update-failure-$suffix/head"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+success_ref="refs/caos/v2/conversations/${test_run_id}-run-update-success/head"
+failure_ref="refs/caos/v2/conversations/${test_run_id}-run-update-failure/head"
 git push -q caos "$initial_head:$success_ref" "$initial_head:$failure_ref"
 
 worker=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/run-and-update-ref)

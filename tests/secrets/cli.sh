@@ -93,20 +93,8 @@ EOF
 
 echo '.caos-secrets/' > .gitignore
 commit "secrets fixtures"
-# Publish the commit so the pinned tree (below) is on the server for the
-# `mytool` reader to resolve against.
-#
-# FORCED, because the stack this pushes to is SHARED and outlives the run
-# (design/faster-tests.md). On a private stack the ref was always absent and the
-# push was a create; on a shared one the previous run's `secrets-test` is still
-# there, this commit is not a descendant of it, and the push is rejected
-# non-fast-forward — green on a cold stack, red on the very next run.
-#
-# Forcing is right rather than merely expedient: this ref is a PUBLISHING
-# ANCHOR, not history. All it has to do is make the commit's objects reachable
-# on the server so the `mytool` reader can resolve the pinned tree below, and
-# the reader finds that tree by hash, never by this name.
-git push -q --force caos HEAD:refs/heads/secrets-test \
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" \
   || fail "pushing workspace to caos"
 
 # --- the store (git-ignored, per-user, NOT committed) ------------------------

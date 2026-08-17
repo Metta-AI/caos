@@ -110,7 +110,8 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== run the turn ==" >&2
-conv="ct-$(printf '%s' "${CAOS_SALT:-dev}" | tr -cd '0-9a-zA-Z')"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-ct"
 conversation_ref="refs/caos/v2/conversations/$conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
