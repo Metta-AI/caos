@@ -16,6 +16,9 @@ conversation has its own durable history, multiline prompt, live activity,
 completed-turn hashes, and workspace diff.
 Turns continue running when another conversation is selected, so several agent
 workspaces can advance concurrently without touching the working checkout.
+Agents may use `spawn_agent` to create an indexed child conversation. It runs
+through `run_async`; applying its result is an ordinary `merge`. Child rows use
+their prompt title and appear beneath the parent conversation.
 
 ## Build and run
 

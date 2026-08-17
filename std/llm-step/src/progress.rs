@@ -61,9 +61,187 @@ pub struct ConversationLog {
     pub events: Vec<ConversationEvent>,
 }
 
+/// Publish an ordinary conversation, title, and owner membership in one exact
+/// ref transaction. `false` means another worker created the deterministic
+/// conversation first.
+pub fn create_agent_conversation(
+    conversation: &str,
+    owner: &str,
+    root: &str,
+    tree: &str,
+    request: &str,
+    title: &str,
+) -> Result<bool, String> {
+    let head_ref = conversation_ref(conversation)?;
+    validate_hash(root, "agent root")?;
+    validate_hash(tree, "agent workspace tree")?;
+    validate_hash(request, "agent request")?;
+    let base = server_base()?;
+    let admission = serde_json::json!({
+        "request": request,
+        "request_head": root,
+        "status": "queued",
+    });
+    let admission_message = serde_json::to_string(&admission)
+        .map_err(|error| format!("serializing agent admission: {error}"))?;
+    let head = store_commit(&base, tree, &[root], &admission_message)?;
+    let title = store_object(&base, "blob", title.as_bytes())?;
+    let user = utf8_ref_key("u-", owner);
+    let agent = utf8_ref_key("c-", conversation);
+    let active_ref = format!("refs/caos/v2/users/{user}/conversations/active/{agent}");
+    let archived_ref = format!("refs/caos/v2/users/{user}/conversations/archived/{agent}");
+    let title_ref = format!("refs/caos/v2/conversations/{conversation}/title");
+    let updates = [
+        (head_ref.as_str(), None, Some(head.as_str())),
+        (title_ref.as_str(), None, Some(title.as_str())),
+        (active_ref.as_str(), None, Some(head.as_str())),
+        (archived_ref.as_str(), None, None),
+    ];
+
+    match push_transaction(&base, &updates) {
+        Ok(TransactionResult::Updated) => Ok(true),
+        Ok(TransactionResult::Rejected) => Ok(false),
+        Err(error) => match read_ref(&base, &head_ref)? {
+            Some(_) => Ok(false),
+            None => Err(error),
+        },
+    }
+}
+
+/// Store the child prompt and readable parent link before deriving its request.
+#[allow(clippy::too_many_arguments)]
+pub fn store_agent_root(
+    base_commit: &str,
+    tree: &str,
+    prompt: &str,
+    owner: &str,
+    parent: &str,
+    run: &str,
+    round: u64,
+    call: &str,
+    title: &str,
+) -> Result<String, String> {
+    validate_hash(base_commit, "agent base commit")?;
+    validate_hash(tree, "agent workspace tree")?;
+    validate_hash(run, "parent request")?;
+    let base = server_base()?;
+    let root_event = serde_json::json!({
+        "base": base_commit,
+        "author": "user",
+        "username": owner,
+        "content": prompt,
+        "title": title,
+        "spawned_by": {
+            "conversation": parent,
+            "request": run,
+            "round": round,
+            "call": call,
+        },
+    });
+    let root_message = serde_json::to_string(&root_event)
+        .map_err(|error| format!("serializing agent root event: {error}"))?;
+    store_commit(&base, tree, &[base_commit], &root_message)
+}
+
+pub fn agent_title(prompt: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let compact = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        compact
+    } else {
+        compact
+            .chars()
+            .take(MAX_CHARS - 1)
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
+
+/// Return the queued request of an existing deterministic child. Later events
+/// may have advanced the child; its root and admission remain first.
+pub fn agent_request(conversation: &str, prompt: &str) -> Result<Option<String>, String> {
+    let refname = conversation_ref(conversation)?;
+    if read_ref(&server_base()?, &refname)?.is_none() {
+        return Ok(None);
+    }
+    let log = conversation_log(conversation)?;
+    let root = log
+        .events
+        .first()
+        .ok_or_else(|| format!("agent conversation {conversation:?} has no root event"))?;
+    if root.value.get("content").and_then(Value::as_str) != Some(prompt)
+        || root.value.get("author").and_then(Value::as_str) != Some("user")
+    {
+        return Err(format!(
+            "agent conversation {conversation:?} does not match its spawning call"
+        ));
+    }
+    let admission = log
+        .events
+        .get(1)
+        .ok_or_else(|| format!("agent conversation {conversation:?} has no admission event"))?;
+    if admission.value.get("request_head").and_then(Value::as_str) != Some(root.commit.as_str()) {
+        return Err(format!(
+            "agent conversation {conversation:?} has a malformed admission"
+        ));
+    }
+    let request = admission
+        .value
+        .get("request")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("agent conversation {conversation:?} has no request"))?;
+    validate_hash(request, "agent request")?;
+    Ok(Some(request.to_string()))
+}
+
 enum PushResult {
     Updated,
     Rejected(String),
+}
+
+enum TransactionResult {
+    Updated,
+    Rejected,
+}
+
+fn push_transaction(
+    base: &str,
+    updates: &[(&str, Option<&str>, Option<&str>)],
+) -> Result<TransactionResult, String> {
+    let updates = updates
+        .iter()
+        .map(|(refname, expected, new)| {
+            serde_json::json!({"ref": refname, "expected": expected, "new": new})
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::to_vec(&serde_json::json!({"updates": updates}))
+        .map_err(|error| format!("serializing ref transaction: {error}"))?;
+    let url = format!("{base}/ref/transaction");
+    let response = minreq::post(&url)
+        .with_header("content-type", "application/json")
+        .with_timeout(30)
+        .with_body(body)
+        .send()
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    match response.status_code {
+        200..=299 => Ok(TransactionResult::Updated),
+        409 => Ok(TransactionResult::Rejected),
+        _ => Err(format!(
+            "POST {url}: {} {}: {}",
+            response.status_code,
+            response.reason_phrase,
+            String::from_utf8_lossy(response.as_bytes()).trim()
+        )),
+    }
+}
+
+fn utf8_ref_key(prefix: &str, value: &str) -> String {
+    let hex = value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}{hex}")
 }
 
 /// Append only while `expected_head` is still the canonical tip. Unlike
@@ -148,7 +326,7 @@ fn append_event_at_head_inner(
         })
     };
 
-    match push_ref(base, refname, expected_head, &candidate) {
+    match push_ref(base, refname, Some(expected_head), &candidate) {
         Ok(PushResult::Updated) => Ok(appended()),
         Ok(PushResult::Rejected(report)) => {
             let observed = read_ref(base, refname)?
@@ -868,10 +1046,12 @@ fn object_status(url: &str, status: i32, reason: &str) -> Result<bool, String> {
 fn push_ref(
     base: &str,
     refname: &str,
-    expected: &str,
+    expected: Option<&str>,
     new_hash: &str,
 ) -> Result<PushResult, String> {
-    validate_hash(expected, "expected ref")?;
+    if let Some(expected) = expected {
+        validate_hash(expected, "expected ref")?;
+    }
     validate_hash(new_hash, "new ref")?;
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -966,8 +1146,18 @@ mod tests {
         assert!(conversation_ref(&"a".repeat(124)).is_ok());
         assert!(conversation_ref(&"a".repeat(125)).is_err());
         for invalid in [
-            "", "bad name", "a//b", "a/../b", ".hidden", "a.lock", "head", "a/head/b",
-            "title", "a/title/b", "a~b", "a@{b",
+            "",
+            "bad name",
+            "a//b",
+            "a/../b",
+            ".hidden",
+            "a.lock",
+            "head",
+            "a/head/b",
+            "title",
+            "a/title/b",
+            "a~b",
+            "a@{b",
         ] {
             assert!(
                 conversation_ref(invalid).is_err(),
@@ -985,10 +1175,7 @@ mod tests {
             validate_conversation_ref("refs/caos/v2/conversations/project/head/talk-1/head")
                 .is_err()
         );
-        assert!(validate_conversation_ref(
-            "refs/caos/conversations/project/talk-1/head"
-        )
-        .is_err());
+        assert!(validate_conversation_ref("refs/caos/conversations/project/talk-1/head").is_err());
     }
 
     #[test]
@@ -1202,11 +1389,9 @@ mod tests {
     #[test]
     fn fork_markers_inherit_instead_of_replacing_the_root_boundary() {
         assert!(validate_fork_marker(&serde_json::json!({"forked_from": A}), A).is_ok());
-        assert!(validate_fork_marker(
-            &serde_json::json!({"base": A, "forked_from": A}),
-            A
-        )
-        .is_err());
+        assert!(
+            validate_fork_marker(&serde_json::json!({"base": A, "forked_from": A}), A).is_err()
+        );
         assert!(validate_fork_marker(&serde_json::json!({"forked_from": B}), A).is_err());
     }
 

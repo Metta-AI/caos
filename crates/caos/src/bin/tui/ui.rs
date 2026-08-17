@@ -448,6 +448,12 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .conversations
         .iter()
         .map(|state| {
+            let is_child = state.parent.as_ref().is_some_and(|parent| {
+                app.conversations
+                    .iter()
+                    .any(|candidate| candidate.id == *parent)
+            });
+            let indent = if is_child { "  " } else { "" };
             let (mark, color) = if state.running {
                 ("*", Color::Yellow)
             } else if state.generating_title {
@@ -457,14 +463,17 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
             } else {
                 (" ", Color::DarkGray)
             };
-            let (title, detail) = state.sidebar_text(detail_width);
+            let (title, detail) = state.sidebar_text(
+                detail_width.saturating_sub(u16::try_from(indent.len()).unwrap_or(u16::MAX)),
+            );
             ListItem::new(vec![
                 Line::from(vec![
+                    Span::raw(indent),
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
                     Span::raw(title),
                 ]),
                 Line::from(vec![
-                    Span::raw("  "),
+                    Span::raw(format!("{indent}  ")),
                     Span::styled(
                         detail,
                         Style::default()
