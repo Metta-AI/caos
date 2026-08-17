@@ -421,13 +421,13 @@ tree4=$(git rev-parse "$head4^{tree}")
 user5=$(mkcommit "$tree4" \
   '{"author":"user","username":"Alice","content":"delegate a focused check"}' \
   "$head4")
-request5=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user5")
+request5=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user5")
 admitted5=$(mkcommit "$tree4" \
   "{\"request\":\"$request5\",\"request_head\":\"$user5\",\"status\":\"queued\"}" \
   "$user5")
 git push --quiet caos "$admitted5:$conversation_ref" \
   || fail "publishing subagent queued event"
-"$CAOS_CLI" run "$request5" -- >/tmp/llm-step-result-5 2>/tmp/llm-step-error-5 &
+"$CAOS_CLI" run --base:hash="$request5" >/tmp/llm-step-result-5 2>/tmp/llm-step-error-5 &
 spawn_pid=$!
 
 for request_number in 10 11; do
@@ -515,13 +515,13 @@ tree5=$(git rev-parse "$completion5^{tree}")
 user6=$(mkcommit "$tree5" \
   '{"author":"user","content":"inspect the delegated result"}' \
   "$completion5")
-request6=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user6")
+request6=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user6")
 admitted6=$(mkcommit "$tree5" \
   "{\"request\":\"$request6\",\"request_head\":\"$user6\",\"status\":\"queued\"}" \
   "$user6")
 git push --quiet caos "$admitted6:$conversation_ref" \
   || fail "publishing result-inspection queued event"
-"$CAOS_CLI" run "$request6" -- >/tmp/llm-step-result-6 \
+"$CAOS_CLI" run --base:hash="$request6" >/tmp/llm-step-result-6 \
   || fail "running result-inspection turn"
 
 head6=$(fetch_head)
@@ -539,13 +539,13 @@ tree6=$(git rev-parse "$head6^{tree}")
 user7=$(mkcommit "$tree6" \
   '{"author":"user","content":"this prompt was accidental"}' \
   "$head6")
-request7=$("$CAOS_CLI" prepare-request "$llm" -- --head:commit="$user7")
+request7=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user7")
 admitted7=$(mkcommit "$tree6" \
   "{\"request\":\"$request7\",\"request_head\":\"$user7\",\"status\":\"queued\"}" \
   "$user7")
 git push --quiet caos "$admitted7:$conversation_ref" \
   || fail "publishing Escape-test queued event"
-"$CAOS_CLI" run "$request7" -- >/tmp/llm-step-result-7 2>/tmp/llm-step-error-7 &
+"$CAOS_CLI" run --base:hash="$request7" >/tmp/llm-step-result-7 2>/tmp/llm-step-error-7 &
 interrupt_pid=$!
 
 request_seen=0

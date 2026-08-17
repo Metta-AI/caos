@@ -167,7 +167,7 @@ fn child_request(agent: &str, root: &str, system: &str) -> Result<String, String
         .filter(|name| Path::new(&arg(name)).exists())
         .collect::<Vec<_>>();
     let child = caos_recurry(
-        &own_args_tree()?,
+        Arg::Hash(&own_args_tree()?),
         &unbind,
         &[
             ("conversation", Arg::Lit(agent)),
@@ -175,7 +175,7 @@ fn child_request(agent: &str, root: &str, system: &str) -> Result<String, String
             ("system", Arg::Lit(&child_system)),
         ],
     )?;
-    prepare_request(&child, &[])
+    prepare_request(Arg::Hash(&child), &[])
 }
 
 fn add_agent_identity(block: &mut Value, agent: &str, request: &str) -> Result<(), String> {
