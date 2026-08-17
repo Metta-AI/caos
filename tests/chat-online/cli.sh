@@ -26,7 +26,8 @@ git config user.email chat-online-test@caos
 
 # Cheapest model that supports adaptive thinking (the worker always sends
 # thinking:{type:"adaptive"}; haiku-4-5 rejects it with a 400).
-conv="${CAOS_TEST_RUN_ID}-talk-online"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-talk-online"
 "$CAOS_CLI" talk --new -c "$conv" --model claude-sonnet-5 \
   "Use the bash tool to run \`echo pong\`, then reply with just its output."
 

@@ -157,7 +157,8 @@ done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
 
 echo "== dispatch first turn ==" >&2
-conv="${CAOS_TEST_RUN_ID}-llm-step"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-llm-step"
 conversation_ref="refs/caos/v2/conversations/$conv/head"
 llm=$("$CAOS_CLI" curry DEEP-DEPS/llm-step -- \
   --api-key=test-key --system:@=system.txt \

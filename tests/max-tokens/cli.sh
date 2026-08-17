@@ -68,7 +68,8 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== curry llm-step and run the turn ==" >&2
-conv="${CAOS_TEST_RUN_ID}-max-tokens"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-max-tokens"
 conversation_ref="refs/caos/v2/conversations/$conv/head"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).

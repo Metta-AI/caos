@@ -260,7 +260,6 @@ fanout)
     [ -e "/cas/args/ws/tests/$t/cli.sh" ] || continue
     mkdir -p "/tmp/sel/$t"
     ln -s "/cas/args/ws/tests/$t" "/tmp/sel/$t/test"
-    printf '%s' "$t" > "/tmp/sel/$t/name"
     if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
     # ONE SHARED STACK for the whole suite, instead of one per test
     # (design/faster-tests.md). Every test asks for it and the first to ask

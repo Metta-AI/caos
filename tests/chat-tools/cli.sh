@@ -127,7 +127,8 @@ done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-conv="${CAOS_TEST_RUN_ID}-tools"
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-tools"
 ref="refs/caos/v2/conversations/$conv/head"
 # Workers reach the stub as host.containers.internal from the outer engine's
 # container network; nested siblings share this job's netns (CAOS_STUB_HOST).

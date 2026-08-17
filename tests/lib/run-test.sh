@@ -71,7 +71,7 @@ fail() {
   exit 1
 }
 
-# The map child: {name, test, std, seed, workspace?, api-key?}, already materialized
+# The map child: {test, std, seed, workspace?, api-key?}, already materialized
 # by the interpreter. Everything else a test runs on is in the image, which IS
 # the tree under test.
 
@@ -79,15 +79,6 @@ TEST=/cas/args/in/test
 [ -d "$TEST" ] || fail "no test tree at $TEST
   /cas/args:    $(ls -A /cas/args 2>&1 | tr '\n' ' ')
   /cas/args/in: $(ls -A /cas/args/in 2>&1 | tr '\n' ' ')"
-
-TEST_NAME=$(cat /cas/args/in/name 2>/dev/null) \
-  || fail "no test name at /cas/args/in/name"
-case "$TEST_NAME" in
-  "" | *[!a-z0-9-]*) fail "invalid test name: $TEST_NAME" ;;
-esac
-
-CAOS_TEST_RUN_ID="$(date +%s%N)-$TEST_NAME-$$-$RANDOM"
-export CAOS_TEST_RUN_ID
 
 # The client repo the test's cli.sh snapshots from, staged exactly as
 # tests/run.sh does: the test tree's contents at ./test.
@@ -256,3 +247,4 @@ for log in server runnerd redis serve phases; do
   [ -e "/tmp/$log.log" ] || continue
   cp "/tmp/$log.log" "/tmp/out/$log.log"
 done
+

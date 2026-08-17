@@ -98,7 +98,7 @@ if [ -z "$stub_pid" ]; then
 fi
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
-test_id=$CAOS_TEST_RUN_ID
+test_id="$(date +%s%N)-$$-$RANDOM"
 conv="${test_id}-chat"
 ref="refs/caos/v2/conversations/$conv/head"
 queued_conv="${test_id}-queued-chat"

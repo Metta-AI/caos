@@ -34,7 +34,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # The object must be NEW, or the ref already exists and there is no create to
 # race over — the bug would sit right here and the test would pass.
-marker="$CAOS_TEST_RUN_ID"
+marker="$(date +%s%N)-$$-$RANDOM"
 printf 'push-race probe %s\n' "$marker" > probe
 git add probe
 git -c user.email=test@caos -c user.name=caos commit -qm "probe $marker"

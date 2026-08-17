@@ -93,7 +93,8 @@ EOF
 
 echo '.caos-secrets/' > .gitignore
 commit "secrets fixtures"
-git push -q caos "HEAD:refs/heads/${CAOS_TEST_RUN_ID}-secrets-test" \
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" \
   || fail "pushing workspace to caos"
 
 # --- the store (git-ignored, per-user, NOT committed) ------------------------
