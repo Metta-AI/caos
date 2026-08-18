@@ -184,6 +184,29 @@ body.is-resizing-inspector * {
 
 .task-item.is-selected { background: rgba(255, 255, 255, .095); }
 
+.task-item.is-child {
+  margin-left: 14px;
+  width: calc(100% - 14px);
+}
+
+.sidebar-identity {
+  border-top: 1px solid var(--line);
+  color: var(--faint);
+  display: grid;
+  flex: 0 0 auto;
+  font-size: 10px;
+  gap: 2px;
+  padding: 9px;
+}
+
+.sidebar-identity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#sidebar-user::before { content: "as "; }
+
 .task-skeleton {
   display: grid;
   gap: 8px;
@@ -492,9 +515,16 @@ body.is-control-held .shortcut-hint {
   width: 100%;
 }
 
-.message-human {
+.message-human,
+.message-peer {
   display: grid;
   justify-items: end;
+}
+
+.message-author {
+  color: var(--faint);
+  font-size: 10px;
+  margin: 0 3px 4px;
 }
 
 .message-bubble {
@@ -533,7 +563,8 @@ body.is-control-held .shortcut-hint {
   pointer-events: auto;
 }
 
-.message-human .message-actions {
+.message-human .message-actions,
+.message-peer .message-actions {
   justify-content: flex-end;
   max-width: min(76%, 100%);
   width: 100%;

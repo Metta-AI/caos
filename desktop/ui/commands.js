@@ -1,6 +1,9 @@
 const SLASH_COMMANDS = [
   { name: '/from', usage: '/from <commit>', description: 'Start a conversation from a completed turn' },
   { name: '/help', usage: '/help', description: 'Show keyboard shortcuts and slash commands' },
+  { name: '/invite', usage: '/invite <username>', description: "Add this conversation to a user's sidebar" },
+  { name: '/model', usage: '/model <name|default>', description: 'Select the model for future turns' },
+  { name: '/ref', usage: '/ref', description: 'Copy the durable conversation reference' },
   { name: '/title', usage: '/title <new title>', description: 'Rename the selected conversation' },
   { name: '/rename', usage: '/rename <new title>', description: 'Rename the selected conversation' },
   { name: '/update-tree', usage: '/update-tree <message>', description: 'Fold working-tree edits into the turn' },
@@ -8,13 +11,17 @@ const SLASH_COMMANDS = [
 ];
 
 const BASE_MODELS = [
-  { value: '', label: 'Auto', detail: 'CAOS default' },
+  { value: 'claude-opus-5', label: 'Opus 5', detail: 'Latest Opus' },
+  { value: 'claude-sonnet-5', label: 'Sonnet 5', detail: 'Latest Sonnet' },
+  { value: 'claude-fable-5', label: 'Fable 5', detail: 'Fastest' },
   { value: 'claude-opus-4-8', label: 'Opus 4.8', detail: 'Most capable' },
-  { value: 'claude-sonnet-5', label: 'Sonnet 5', detail: 'Faster' }
+  { value: 'claude-opus-4-7', label: 'Opus 4.7', detail: 'Previous Opus' },
+  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6', detail: 'Previous Sonnet' },
+  { value: 'claude-opus-4-6', label: 'Opus 4.6', detail: 'Legacy Opus' }
 ];
 
 function parseComposerCommand(text) {
-  const match = String(text || '').match(/^\/(commands|help|rename|title|from|update-tree)(?:\s+([\s\S]*))?$/u);
+  const match = String(text || '').match(/^\/(commands|help|invite|model|ref|rename|title|from|update-tree)(?:\s+([\s\S]*))?$/u);
   if (!match) return null;
   const kind = match[1] === 'title' ? 'rename' : match[1];
   return { kind, argument: (match[2] || '').trim() };
@@ -35,7 +42,7 @@ function modelChoices(initialModel) {
 
 function modelLabel(value, choices = BASE_MODELS) {
   const model = choices.find((choice) => choice.value === String(value || ''));
-  return model?.label || String(value || '') || 'Auto';
+  return model?.label || String(value || '') || 'Default';
 }
 
 export {

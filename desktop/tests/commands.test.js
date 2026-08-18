@@ -13,6 +13,12 @@ assert.deepEqual(parseComposerCommand('/update-tree include edits'), {
   argument: 'include edits'
 });
 assert.deepEqual(parseComposerCommand('/commands'), { kind: 'commands', argument: '' });
+assert.deepEqual(parseComposerCommand('/invite Malcolm Handley'), {
+  kind: 'invite',
+  argument: 'Malcolm Handley'
+});
+assert.deepEqual(parseComposerCommand('/model default'), { kind: 'model', argument: 'default' });
+assert.deepEqual(parseComposerCommand('/ref'), { kind: 'ref', argument: '' });
 assert.equal(parseComposerCommand('/unknown value'), null);
 
 assert.deepEqual(slashCommandMatches('/up').map((command) => command.name), ['/update-tree']);

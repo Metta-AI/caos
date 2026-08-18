@@ -11,7 +11,7 @@ remote and the ordinary CAOS environment (including `ANTHROPIC_API_KEY`).
 nix develop
 npm ci --prefix desktop
 npm run --prefix desktop dev
-npm run --prefix desktop dev -- --model claude-opus-4-8
+npm run --prefix desktop dev -- --username "Alice Smith" --model claude-opus-5
 ```
 
 The frontend build bundles the maintained Markdown, syntax-highlighting, and
@@ -26,7 +26,7 @@ core workspace and worker images:
 nix build .#caos-desktop
 ./result/bin/caos-desktop
 nix run .#caos-desktop
-nix run .#caos-desktop -- --model claude-opus-4-8
+nix run .#caos-desktop -- --username "Alice Smith" --model claude-opus-5
 ```
 
 The package build runs the desktop Rust and JavaScript tests. It is also exposed
@@ -35,8 +35,8 @@ derivation without maintaining a second build path. Bare `nix build` continues
 to build the CLI and daemon host tools; GUI dependencies remain opt-in.
 
 Set `CAOS_REPO` to launch against a different worktree without changing the
-shell's current directory. `CAOS_USER` overrides the active-conversation user;
-otherwise the app uses `$USER` (or `$USERNAME` on Windows).
+shell's current directory. The desktop uses `$USER` as its conversation
+identity; `--username <name>` overrides it explicitly.
 
 The desktop package is its own Cargo workspace. Tauri and WebView dependencies
 therefore do not enter the core CAOS workspace, its lockfile, or worker images.
@@ -48,14 +48,22 @@ therefore do not enter the core CAOS workspace, its lockfile, or worker images.
   with `/from <commit>` for starting from another completed turn
 - live chat turns using the existing harness
 - a per-conversation model selector in the composer, initialized by the sole
-  advanced launch option, `--model <model>`
+  model launch option, `--model <model>`, plus the TUI-compatible `/model`
+  command
+- durable multiplayer conversations with peer attribution, `/invite`, and
+  copyable `/ref` merge targets
+- materialized `/from` forks and automatically discovered, parent-indented
+  subagent conversations
+- interjections into active turns, durable activity polling after restarts,
+  and `Escape` interruption
 - generated conversation titles with the first-prompt fallback used by the TUI
 - inline, collapsible tool activity and intermediate responses reconstructed
   from durable conversation history after reloads and restarts
 - accumulated workspace diff in a conditional, resizable Changes inspector
 - clean-checkout loading with `Ctrl+L`, and working-tree updates through
   `/update-tree <message>`
-- clean snapshot branch publishing with the TUI's two-step `Ctrl+P` flow
+- pull-request publishing through the same ordinary merge-turn workflow as the
+  TUI
 - conversation archiving and restoration
 - the project tool-set inspector available with `Ctrl+Shift+T`
 - bottom-pinned composer with a separately scrolling transcript

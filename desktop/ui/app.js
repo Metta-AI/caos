@@ -3,6 +3,7 @@ import {
   activityGroupExpandable,
   activityGroupSummary,
   mergeReplayedHistory,
+  sameToolCall,
   scrollPositionIsNearBottom,
   toolDescription
 } from './activity.js';
@@ -43,6 +44,8 @@ const PALETTE_COMMANDS = [
   { id: 'changes', label: 'Toggle workspace changes', shortcut: 'Ctrl+Q', keywords: 'diff files pane', available: () => !elements.changesToggle.hidden, run: () => toggleChangesPane() },
   { id: 'tools', label: 'Show available tools', shortcut: 'Ctrl+Shift+T', keywords: 'commands agent project', run: () => toggleToolsPane() },
   { id: 'reload', label: 'Reload conversation', shortcut: 'Ctrl+R', keywords: 'refresh history', run: () => reloadSelectedConversation() },
+  { id: 'invite', label: 'Invite a user', shortcut: '/invite', keywords: 'share multiplayer', run: () => prefillCommand('/invite ') },
+  { id: 'reference', label: 'Copy conversation reference', shortcut: '/ref', keywords: 'hash merge target ref', run: () => copySelectedReference() },
   { id: 'rename', label: 'Rename conversation', shortcut: '/rename', keywords: 'title name', run: () => prefillCommand('/rename ') },
   { id: 'archive', label: 'Archive conversation', shortcut: 'Ctrl+E', keywords: 'close remove', run: () => archiveSelectedConversation() },
   { id: 'restore', label: 'Restore archived conversation', shortcut: '', keywords: 'unarchive reopen', run: () => openArchiveDialog() },
@@ -51,6 +54,7 @@ const PALETTE_COMMANDS = [
 
 const state = {
   repo: null,
+  user: '',
   conversations: [],
   selectedId: null,
   histories: new Map(),
@@ -58,8 +62,8 @@ const state = {
   selectedDiffFiles: new Map(),
   diffFileQueries: new Map(),
   pendingActivityGroups: new Map(),
-  turnStartIndexes: new Map(),
   running: new Set(),
+  interrupting: new Set(),
   composerDrafts: new Map(),
   conversationModels: new Map(),
   changesOpen: false,
@@ -68,6 +72,7 @@ const state = {
   commandPaletteOpen: false,
   commandPaletteSelection: 0,
   modelChoices: modelChoices(null),
+  defaultModel: '',
   initialModel: '',
   modelMenuOpen: false,
   slashCommandSelection: 0,
@@ -77,7 +82,8 @@ const state = {
   uiZoom: 1,
   sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
   inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
-  creatingConversation: false
+  creatingConversation: false,
+  polling: false
 };
 
 const elements = {
@@ -92,6 +98,8 @@ const elements = {
   actionPaneTitle: document.getElementById('action-pane-title'),
   actionResult: document.getElementById('action-result'),
   newTask: document.getElementById('new-task'),
+  sidebarRepo: document.getElementById('sidebar-repo'),
+  sidebarUser: document.getElementById('sidebar-user'),
   taskTitle: document.getElementById('task-title'),
   taskMeta: document.getElementById('task-meta'),
   commandPaletteButton: document.getElementById('command-palette-button'),
@@ -126,6 +134,11 @@ const elements = {
 
 function selectedConversation() {
   return state.conversations.find((item) => item.id === state.selectedId) || null;
+}
+
+function requestIsActiveConversation(id) {
+  const status = state.conversations.find((item) => item.id === id)?.status;
+  return status === 'queued' || status === 'running';
 }
 
 function automaticConversationTitle(message) {
@@ -481,6 +494,8 @@ function renderSidebar() {
     button.type = 'button';
     button.className = 'task-item';
     button.dataset.conversationId = conversation.id;
+    button.classList.toggle('is-child', Boolean(conversation.parent));
+    if (conversation.parent) button.title = `Subagent of ${conversation.parent}`;
     if (conversation.id === state.selectedId) button.classList.add('is-selected');
     const title = document.createElement('span');
     title.className = 'task-item-title';
@@ -640,7 +655,7 @@ function activityIcon(name) {
 function actionCallIsSelected(call) {
   if (state.selectedAction?.conversationId !== state.selectedId) return false;
   return state.selectedAction.call === call
-    || Boolean(call.toolUseId && state.selectedAction.call?.toolUseId === call.toolUseId);
+    || sameToolCall(call, state.selectedAction.call);
 }
 
 function activityGroupElement(entry) {
@@ -732,12 +747,24 @@ function messageElement(entry) {
   const article = document.createElement('article');
   article.className = `message message-${entry.role}`;
   if (entry.failed) article.classList.add('is-failed');
-  if (entry.role === 'human') {
+  if (entry.role === 'human' || entry.role === 'peer') {
+    if (entry.role === 'peer') {
+      const author = document.createElement('div');
+      author.className = 'message-author';
+      author.textContent = entry.author || 'Collaborator';
+      article.append(author);
+    }
     const bubble = document.createElement('div');
     bubble.className = 'message-bubble';
     renderMarkdown(bubble, entry.message);
     article.append(bubble, messageActionsElement(entry));
     return article;
+  }
+  if (entry.model) {
+    const model = document.createElement('div');
+    model.className = 'message-author';
+    model.textContent = modelLabel(entry.model, state.modelChoices);
+    article.append(model);
   }
   const text = document.createElement('div');
   text.className = 'message-text';
@@ -991,20 +1018,51 @@ async function selectConversation(id, focusPrompt = true) {
   renderChangeCount(null);
   if (!state.histories.has(id)) {
     renderTranscriptLoading();
-    await loadHistory(id);
+    await loadConversation(id);
   }
   if (state.selectedId !== id) return;
   renderTranscript({ scrollToBottom: true });
   loadDiff(id);
-  elements.sendButton.disabled = state.running.has(id);
+  elements.sendButton.disabled = false;
   if (focusPrompt) elements.prompt.focus({ preventScroll: true });
 }
 
-async function loadHistory(id, force = false) {
-  if (!id || (!force && state.histories.has(id))) return;
+function applyConversationLoad(id, load) {
+  if (!load) return;
+  const conversation = state.conversations.find((item) => item.id === id);
+  if (conversation) {
+    conversation.head = load.head;
+    conversation.shortHead = load.shortHead;
+    conversation.status = load.status;
+    conversation.request = load.request;
+    conversation.interrupted = load.interrupted;
+  }
+  if (load.status === 'queued' || load.status === 'running') {
+    state.running.add(id);
+  } else {
+    state.running.delete(id);
+    state.interrupting.delete(id);
+  }
+  const durableHistory = mergeReplayedHistory(load.history.turns, load.history.turnEvents);
+  const durableCommits = new Set(load.history.turns.map((turn) => turn.commit));
+  const pending = (state.histories.get(id) || []).filter(
+    (entry) => entry.pending && (!entry.commit || !durableCommits.has(entry.commit))
+  );
+  state.histories.set(id, [...durableHistory, ...pending]);
+  state.diffs.set(id, load.patch);
+  if (!state.conversationModels.has(id)) {
+    const lastModel = [...load.history.turns]
+      .reverse()
+      .find((turn) => turn.role === 'agent' && turn.model)?.model;
+    if (lastModel) state.conversationModels.set(id, lastModel);
+  }
+}
+
+async function loadConversation(id) {
+  if (!id) return;
   try {
-    const history = await tauri.invoke('get_history', { conversation: id });
-    state.histories.set(id, mergeReplayedHistory(history.turns, history.turnEvents));
+    const load = await tauri.invoke('get_conversation', { conversation: id });
+    applyConversationLoad(id, load);
   } catch (error) {
     setStatus(String(error));
   }
@@ -1012,12 +1070,14 @@ async function loadHistory(id, force = false) {
 
 async function reloadSelectedConversation() {
   const id = state.selectedId;
-  if (!id || state.running.has(id)) return;
+  if (!id) return;
   setStatus('Reloading…');
-  await loadHistory(id, true);
+  await loadConversation(id);
   if (state.selectedId !== id) return;
   renderTranscript();
-  await loadDiff(id, true);
+  loadDiff(id);
+  renderHeader();
+  renderSidebar();
   if (state.selectedId === id) setStatus('Reloaded');
 }
 
@@ -1038,6 +1098,60 @@ async function renameSelectedConversation(requestedTitle) {
     setStatus(String(error));
   } finally {
     elements.prompt.focus({ preventScroll: true });
+  }
+}
+
+async function inviteSelectedConversation(username) {
+  const conversation = selectedConversation();
+  if (!conversation || conversation.draft) {
+    setStatus('Send a first message before inviting another user');
+    return;
+  }
+  setStatus(`Inviting ${username}…`);
+  try {
+    const message = await tauri.invoke('invite_conversation', {
+      conversation: conversation.id,
+      username
+    });
+    setStatus(message);
+  } catch (error) {
+    setStatus(String(error));
+  }
+}
+
+async function copySelectedReference() {
+  const conversation = selectedConversation();
+  if (!conversation || conversation.draft) {
+    setStatus('This conversation has no durable reference yet');
+    return;
+  }
+  try {
+    const reference = await tauri.invoke('get_conversation_reference', {
+      conversation: conversation.id
+    });
+    if (!reference.head) {
+      setStatus('This conversation has no durable reference yet');
+      return;
+    }
+    await copyText(`${reference.refname}\n${reference.head}`);
+    setStatus(`Copied ${reference.refname} at ${reference.head}`);
+  } catch (error) {
+    setStatus(String(error));
+  }
+}
+
+async function interruptSelectedConversation() {
+  const conversation = selectedConversation();
+  if (!conversation || !state.running.has(conversation.id)
+    || state.interrupting.has(conversation.id)) return;
+  state.interrupting.add(conversation.id);
+  setStatus('Stopping agent…');
+  try {
+    await tauri.invoke('interrupt_conversation', { conversation: conversation.id });
+    await pollRemote();
+  } catch (error) {
+    state.interrupting.delete(conversation.id);
+    setStatus(String(error));
   }
 }
 
@@ -1107,18 +1221,31 @@ async function confirmPublish() {
   if (!conversation || elements.publishConfirm.disabled) return;
   elements.publishConfirm.disabled = true;
   const base = elements.publishBase.value.trim();
-  setStatus('Publishing a clean conversation branch…');
+  setStatus('Preparing publication in an ordinary merge turn…');
+  state.running.add(conversation.id);
+  renderSidebar();
+  const onEvent = new tauri.Channel();
+  onEvent.onmessage = (event) => handleTurnEvent(conversation.id, event);
   try {
     const url = await tauri.invoke('publish_conversation', {
       conversation: conversation.id,
-      base: base || null
+      base: base || null,
+      model: selectedModel(),
+      onEvent
     });
+    await loadConversation(conversation.id);
     setPublishDialog(false);
     setStatus(`Published ${url}`);
+    renderTranscript({ scrollToBottom: true });
+    renderDiff(state.diffs.get(conversation.id) || '');
   } catch (error) {
     setStatus(String(error));
     elements.publishConfirm.disabled = false;
     elements.publishBase.focus();
+    await loadConversation(conversation.id);
+  } finally {
+    if (!requestIsActiveConversation(conversation.id)) state.running.delete(conversation.id);
+    renderSidebar();
   }
 }
 
@@ -1449,9 +1576,9 @@ function renderDiff(value) {
   renderPatch(selectedFile);
 }
 
-async function loadDiff(id, force = false) {
+async function loadDiff(id) {
   if (!id) return;
-  if (!force && state.diffs.has(id)) {
+  if (state.diffs.has(id)) {
     if (state.selectedId === id) renderDiff(state.diffs.get(id));
     return;
   }
@@ -1462,22 +1589,19 @@ async function loadDiff(id, force = false) {
     elements.fileList.replaceChildren();
     elements.diff.textContent = 'Loading changes…';
   }
-  try {
-    const patch = await tauri.invoke('get_diff', { conversation: id });
-    state.diffs.set(id, patch);
-    if (state.selectedId === id) renderDiff(patch);
-  } catch (error) {
-    if (state.selectedId === id) {
-      elements.changesPane.classList.add('is-empty');
-      renderChangeCount(null);
-      elements.diff.textContent = String(error);
-    }
+  await loadConversation(id);
+  if (state.selectedId === id) {
+    renderDiff(state.diffs.get(id) || '');
   }
 }
 
-function handleTurnEvent(id, event) {
+function handleTurnEvent(id, event, pendingEntry = null) {
   let transcriptChanged = false;
-  if (event.kind === 'phaseStarted') {
+  if (event.kind === 'submitted' && pendingEntry) {
+    pendingEntry.commit = event.commit;
+    pendingEntry.shortCommit = String(event.commit || '').slice(0, 7);
+    transcriptChanged = true;
+  } else if (event.kind === 'phaseStarted') {
     const group = state.pendingActivityGroups.get(id);
     if (group && group.calls.length === 0) {
       group.status = event.phase === 'model' ? 'Thinking…' : 'Preparing…';
@@ -1504,11 +1628,11 @@ function handleTurnEvent(id, event) {
     const history = state.histories.get(id) || [];
     for (const entry of history) {
       if (entry.role !== 'activity') continue;
-      const call = entry.calls.find((item) => item.toolUseId === event.toolUseId);
+      const call = entry.calls.find((item) => sameToolCall(item, event));
       if (call) {
         call.result = event;
         if (state.selectedAction?.conversationId === id
-          && state.selectedAction.call?.toolUseId === call.toolUseId) {
+          && sameToolCall(state.selectedAction.call, call)) {
           state.selectedAction.call = call;
           renderActionResult();
         }
@@ -1525,21 +1649,89 @@ function handleTurnEvent(id, event) {
     history.push({
       role: 'agent',
       message: event.text,
-      shortCommit: '',
-      timestampUnix: Math.floor(Date.now() / 1000)
+      shortCommit: ''
     });
     state.histories.set(id, history);
     transcriptChanged = true;
+  } else if (event.kind === 'completed') {
+    state.running.delete(id);
+    state.interrupting.delete(id);
   }
   if (state.selectedId === id) {
     if (transcriptChanged) renderTranscript({ scrollToBottom: true });
   }
 }
 
-async function refreshConversations(selectedId) {
-  const persisted = await tauri.invoke('get_conversations');
-  const drafts = state.conversations.filter((item) => item.draft && item.id !== selectedId);
-  state.conversations = [...persisted, ...drafts];
+async function pollRemote() {
+  if (state.polling) return;
+  state.polling = true;
+  try {
+    const observed = state.conversations
+      .filter((conversation) => !conversation.draft)
+      .map((conversation) => ({
+        id: conversation.id,
+        head: conversation.head || '',
+        status: conversation.status || null,
+        request: conversation.request || null
+      }));
+    const observedHeads = new Map(observed.map((conversation) => [
+      conversation.id,
+      conversation.head
+    ]));
+    const payload = await tauri.invoke('poll_conversations', { observed });
+    const persistedIds = new Set(payload.conversations.map((conversation) => conversation.id));
+    const previous = new Map(state.conversations.map((conversation) => [conversation.id, conversation]));
+    const staleIds = new Set();
+    const persisted = payload.conversations.map((conversation) => {
+      const current = previous.get(conversation.id);
+      if (current && observedHeads.has(conversation.id)
+        && (current.head || '') !== observedHeads.get(conversation.id)) {
+        staleIds.add(conversation.id);
+        return current;
+      }
+      return { ...current, ...conversation };
+    });
+    const drafts = state.conversations.filter(
+      (conversation) => conversation.draft && !persistedIds.has(conversation.id)
+    );
+    state.conversations = [...persisted, ...drafts];
+    const changedIds = new Set(Object.keys(payload.loads || {}));
+    for (const [id, load] of Object.entries(payload.loads || {})) {
+      if (!staleIds.has(id)) applyConversationLoad(id, load);
+    }
+    renderSidebar();
+    if (state.selectedId && !state.conversations.some((item) => item.id === state.selectedId)) {
+      const next = state.conversations[0];
+      state.selectedId = null;
+      if (next) await selectConversation(next.id, false);
+      return;
+    }
+    if (state.selectedId) {
+      renderHeader();
+      renderModelControl();
+      if (changedIds.has(state.selectedId)) {
+        renderTranscript();
+        renderDiff(state.diffs.get(state.selectedId) || '');
+      }
+      if (state.running.has(state.selectedId)) {
+        setStatus(state.interrupting.has(state.selectedId)
+          ? 'Stopping agent…'
+          : 'Agent running · press Esc to stop');
+      } else if (selectedConversation()?.interrupted) {
+        setStatus('Turn interrupted');
+      } else if (selectedConversation()?.status === 'failed') {
+        setStatus('Turn failed');
+      }
+    }
+  } catch (_) {
+    // Remote polling is best effort; explicit actions surface their own errors.
+  } finally {
+    state.polling = false;
+  }
+}
+
+async function refreshConversations() {
+  await pollRemote();
 }
 
 async function sendCurrentMessage() {
@@ -1577,6 +1769,40 @@ async function sendCurrentMessage() {
       await createConversation(command.argument);
       return;
     }
+    if (command.kind === 'invite') {
+      clearComposer();
+      if (!command.argument) {
+        setStatus('Usage: /invite <username>');
+        elements.prompt.focus({ preventScroll: true });
+        return;
+      }
+      await inviteSelectedConversation(command.argument);
+      return;
+    }
+    if (command.kind === 'model') {
+      clearComposer();
+      if (!command.argument || command.argument.split(/\s+/u).length !== 1) {
+        setStatus('Usage: /model <name|default>');
+        elements.prompt.focus({ preventScroll: true });
+        return;
+      }
+      const model = command.argument === 'default' ? state.defaultModel : command.argument;
+      state.modelChoices = modelChoices(model);
+      for (const item of state.conversations) state.conversationModels.set(item.id, model);
+      renderModelControl();
+      setStatus(`Model for future turns: ${model}`);
+      return;
+    }
+    if (command.kind === 'ref') {
+      clearComposer();
+      if (command.argument) {
+        setStatus('Usage: /ref');
+        elements.prompt.focus({ preventScroll: true });
+        return;
+      }
+      await copySelectedReference();
+      return;
+    }
     if (command.kind === 'update-tree') {
       if (!command.argument) {
         setStatus('Usage: /update-tree <message>');
@@ -1587,8 +1813,9 @@ async function sendCurrentMessage() {
     }
   }
   const conversation = selectedConversation();
-  if (!conversation || !message || state.running.has(conversation.id)) return;
+  if (!conversation || !message) return;
   const id = conversation.id;
+  const interjecting = state.running.has(id);
   if (conversation.draft && !conversation.started) {
     conversation.started = true;
     if (conversation.title === 'New conversation') {
@@ -1597,24 +1824,24 @@ async function sendCurrentMessage() {
     renderHeader();
   }
   const history = state.histories.get(id) || [];
-  state.turnStartIndexes.set(id, history.length);
-  history.push({
+  const pendingEntry = {
     role: 'human',
+    author: state.user,
     message,
     shortCommit: '',
-    timestampUnix: Math.floor(Date.now() / 1000)
-  });
+    pending: true
+  };
+  history.push(pendingEntry);
   state.histories.set(id, history);
-  beginActivityGroup(id);
+  if (!interjecting) beginActivityGroup(id);
   clearComposer();
   state.running.add(id);
-  elements.sendButton.disabled = true;
   setStatus('');
   renderSidebar();
   renderTranscript({ scrollToBottom: true });
 
   const onEvent = new tauri.Channel();
-  onEvent.onmessage = (event) => handleTurnEvent(id, event);
+  onEvent.onmessage = (event) => handleTurnEvent(id, event, pendingEntry);
   try {
     const completion = await tauri.invoke('send_message', {
       conversation: id,
@@ -1625,38 +1852,41 @@ async function sendCurrentMessage() {
       onEvent
     });
     conversation.title = completion.title;
-    finishActivityGroup(id);
-    state.histories.delete(id);
-    state.diffs.delete(id);
-    await refreshConversations(id);
-    await loadHistory(id, true);
-    loadDiff(id, true);
+    if (!completion.interjected) finishActivityGroup(id);
+    await loadConversation(id);
+    if (!completion.interjected) {
+      conversation.draft = false;
+      conversation.started = true;
+    }
+    await refreshConversations();
     if (state.selectedId === id) {
       renderHeader();
       renderTranscript({ scrollToBottom: true });
-      setStatus('');
+      renderDiff(state.diffs.get(id) || '');
+      if (completion.interjected) {
+        setStatus('Message added to the active turn');
+      } else if (completion.interrupted) {
+        setStatus('Turn interrupted');
+      } else {
+        setStatus('');
+      }
     }
   } catch (error) {
-    finishActivityGroup(id);
-    const optimistic = state.histories.get(id) || [];
-    const turnStart = state.turnStartIndexes.get(id) ?? optimistic.length - 1;
-    const human = optimistic[turnStart];
-    if (human?.role === 'human' && human.message === message) human.failed = true;
-    optimistic.push({
-      role: 'agent',
-      message: String(error),
-      failed: true,
-      timestampUnix: Math.floor(Date.now() / 1000)
-    });
+    if (!interjecting) finishActivityGroup(id);
+    await loadConversation(id);
+    const currentHistory = state.histories.get(id) || [];
+    if (currentHistory.includes(pendingEntry)) {
+      pendingEntry.pending = false;
+      pendingEntry.failed = true;
+      currentHistory.push({ role: 'agent', message: String(error), failed: true });
+    }
     if (state.selectedId === id) {
       renderTranscript({ scrollToBottom: true });
-      setStatus('');
+      setStatus(String(error));
     }
   } finally {
-    state.pendingActivityGroups.delete(id);
-    state.turnStartIndexes.delete(id);
-    state.running.delete(id);
-    if (state.selectedId === id) elements.sendButton.disabled = false;
+    if (!interjecting) state.pendingActivityGroups.delete(id);
+    if (!requestIsActiveConversation(id)) state.running.delete(id);
     renderSidebar();
   }
 }
@@ -1677,7 +1907,7 @@ async function createConversation(base = null) {
     saveSelectedDraft();
     const conversation = await tauri.invoke('new_conversation', { base });
     state.conversations.unshift(conversation);
-    state.histories.set(conversation.id, []);
+    if (conversation.draft) state.histories.set(conversation.id, []);
     state.conversationModels.set(conversation.id, inheritedModel);
     await selectConversation(conversation.id);
     elements.prompt.focus();
@@ -1700,15 +1930,20 @@ async function initialize() {
       initializeHighlighting()
     ]);
     state.repo = payload;
-    state.initialModel = payload.initialModel || '';
+    state.user = payload.user;
+    state.defaultModel = payload.defaultModel;
+    state.initialModel = payload.initialModel;
     state.modelChoices = modelChoices(state.initialModel);
     state.conversations = payload.conversations;
+    elements.sidebarRepo.textContent = payload.repoName;
+    elements.sidebarUser.textContent = payload.user;
     clearStartupLoading();
     if (state.conversations.length === 0) {
       await createConversation();
     } else {
       await selectConversation(state.conversations[0].id);
     }
+    window.setInterval(pollRemote, 500);
   } catch (error) {
     showFatal(error);
   }
@@ -1782,6 +2017,7 @@ elements.prompt.addEventListener('keydown', (event) => {
     }
     if (event.key === 'Escape') {
       event.preventDefault();
+      event.stopPropagation();
       state.slashCommandDismissed = true;
       renderSlashCommandMenu();
       return;
@@ -1884,6 +2120,11 @@ document.addEventListener('keydown', (event) => {
       event.preventDefault();
       setShortcutHelp(false);
     }
+    return;
+  }
+  if (event.key === 'Escape' && state.selectedId && state.running.has(state.selectedId)) {
+    event.preventDefault();
+    interruptSelectedConversation();
     return;
   }
   if (event.ctrlKey && !event.shiftKey && /^[1-9]$/u.test(event.key)) {

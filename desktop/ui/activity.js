@@ -53,7 +53,13 @@ function scrollPositionIsNearBottom(position, threshold = 24) {
   return remaining <= threshold;
 }
 
-function replayedTurnEntries(events, timestampUnix) {
+function sameToolCall(left, right) {
+  return left?.toolUseId === right?.toolUseId
+    && left?.request === right?.request
+    && Number(left?.round || 0) === Number(right?.round || 0);
+}
+
+function replayedTurnEntries(events) {
   const entries = [];
   let group = null;
   const finishGroup = () => {
@@ -68,8 +74,7 @@ function replayedTurnEntries(events, timestampUnix) {
       entries.push({
         role: 'agent',
         message: event.text,
-        shortCommit: '',
-        timestampUnix
+        shortCommit: ''
       });
     } else if (event.kind === 'toolCall') {
       if (activityGroupComplete(group)) finishGroup();
@@ -82,7 +87,7 @@ function replayedTurnEntries(events, timestampUnix) {
       };
       group.calls.push({ ...event });
     } else if (event.kind === 'toolResult') {
-      let call = group?.calls.find((item) => item.toolUseId === event.toolUseId);
+      let call = group?.calls.find((item) => sameToolCall(item, event));
       if (!call) {
         group ||= {
           role: 'activity',
@@ -94,6 +99,8 @@ function replayedTurnEntries(events, timestampUnix) {
         call = {
           kind: 'toolCall',
           stepCommit: event.stepCommit,
+          request: event.request,
+          round: event.round,
           toolUseId: event.toolUseId,
           name: 'result',
           summary: `result ${event.toolUseId}`
@@ -111,15 +118,24 @@ function mergeReplayedHistory(turns, turnEvents) {
   const eventsByTurn = new Map(
     (turnEvents || []).map((turn) => [turn.turnCommit, turn.events])
   );
+  const consumed = new Set();
   const history = [];
   for (const turn of turns || []) {
-    if (turn.role === 'agent') {
-      history.push(...replayedTurnEntries(
-        eventsByTurn.get(turn.commit),
-        turn.timestampUnix
-      ));
+    if (turn.role === 'agent' && eventsByTurn.has(turn.commit)) {
+      consumed.add(turn.commit);
+      history.push(...replayedTurnEntries(eventsByTurn.get(turn.commit)));
     }
     history.push(turn);
+  }
+  const durableActivity = (turnEvents || [])
+    .filter((turn) => !consumed.has(turn.turnCommit))
+    .flatMap((turn) => replayedTurnEntries(turn.events));
+  if (durableActivity.length > 0) {
+    let finalAgent = -1;
+    history.forEach((entry, index) => {
+      if (entry.role === 'agent') finalAgent = index;
+    });
+    history.splice(finalAgent < 0 ? history.length : finalAgent, 0, ...durableActivity);
   }
   return history;
 }
@@ -130,6 +146,7 @@ export {
   activityGroupSummary,
   mergeReplayedHistory,
   replayedTurnEntries,
+  sameToolCall,
   scrollPositionIsNearBottom,
   toolDescription
 };
