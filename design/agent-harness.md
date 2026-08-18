@@ -193,7 +193,8 @@ Tool classes:
   result is not a workspace: the pre-grep workspace rides the continuation
   curry, and only bash results advance the tree. `tests/rgrep` drives the
   fold directly (sparse shape, binary skipping, file scope, empty tree,
-  cache hit); the LLM integration is covered in `tests/chat-tools`.
+  cache hit); the LLM integration is covered in the `tests/chat-tools*`
+  suites.
 - **ls/listing**: tree objects are names+oids — no content fetch at all.
 - **build/test**: the existing caos-native decompositions (rustc,
   deep-deps), not bash.
@@ -278,8 +279,8 @@ conversation content). Same best-effort contract as the progress ref.
 
 Two verbs and a full-screen client over one turn engine (implemented —
 `crates/caos/src/chat.rs`, tested end-to-end against the stub in
-`tests/chat-offline` for `chat`, `tests/chat-talk` for `talk`, and
-`tests/chat-tools` for the tool set):
+`tests/chat-offline` for `chat`, `tests/chat-talk` for `talk`, and the
+`tests/chat-tools*` suites for the tool set):
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one
@@ -410,10 +411,11 @@ deadlines are comfortable; the top-level pending timeout
    `tests/bash-tool`).
 4. llm-step worker (API call, step commits, run-then chaining, turn merge,
    progress ref push). **Done** (`crates/worker-llm-step`,
-   `tests/llm-step` — end-to-end against a scripted stub API).
+   `tests/llm-step` and the focused `tests/llm-{async,subagent,interrupt}`
+   suites — end-to-end against a scripted stub API).
 5. `caos-cli chat` (human commits, conversation ref, progress printing).
    **Done** (`crates/caos/src/chat.rs`, `tests/chat-offline` and its two
-   siblings `tests/chat-talk` / `tests/chat-tools`; real-API turn:
+   siblings `tests/chat-talk` / `tests/chat-tools*`; real-API turn:
    `tests/chat-online`).
 6. `caos talk` + std-published worker curries — prompt-first surface, sticky
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
