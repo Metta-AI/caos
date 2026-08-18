@@ -78,9 +78,9 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
     let mut paths = Vec::new();
     collect_files(&Path::new(git_dir).join("refs"), &mut paths);
     let mut removed = 0;
-    // Conversation and user-index refs commonly share most of their workspace
-    // closure. Validate each reachable object once per startup, not once per
-    // ref; failed subtrees are deliberately not memoized.
+    // Durable-log and index refs commonly share most of their workspace closure.
+    // Validate each reachable object once per startup, not once per ref; failed
+    // subtrees are deliberately not memoized.
     let mut memo = IntegrityMemo::default();
     for path in paths {
         let name = ref_name(git_dir, &path);
@@ -152,14 +152,14 @@ enum ClosureKind {
 enum IntegrityDepth {
     TargetOnly,
     WorkspaceClosure,
-    ConversationHead,
+    AppendOnlyHead,
 }
 
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/") || refname.starts_with("refs/caos/res/") {
         IntegrityDepth::TargetOnly
-    } else if refname.starts_with("refs/caos/v2/conversations/") && refname.ends_with("/head") {
-        IntegrityDepth::ConversationHead
+    } else if crate::refs::is_append_only_ref(refname) {
+        IntegrityDepth::AppendOnlyHead
     } else {
         IntegrityDepth::WorkspaceClosure
     }
@@ -171,13 +171,11 @@ struct IntegrityMemo {
     closure: HashSet<(gix::ObjectId, ClosureKind)>,
 }
 
-/// Validate a ref target. Durable conversation/index refs include a commit's
-/// workspace tree, but not its parents. This keeps generic startup repair from
-/// scanning unrelated ordinary history, but it also means a surviving tip with
-/// a missing earlier event is not detected here; chat-aware spine repair is
-/// tracked in the chat design. Content-addressed request/result refs only need
-/// their named object to be readable; traversing every request workspace would
-/// turn startup repair into a scan of unrelated immutable history.
+/// Validate a ref target. Durable log/index refs include a commit's workspace
+/// tree, but not its parents. This keeps startup repair from scanning unrelated
+/// ordinary history. Content-addressed request/result refs only need their named
+/// object to be readable; traversing every request workspace would turn startup
+/// repair into a scan of unrelated immutable history.
 fn intact_ref_target(
     repo: &gix::Repository,
     id: gix::ObjectId,
@@ -195,9 +193,9 @@ fn intact_ref_target(
         return Ok(());
     }
     if object.kind != gix::object::Kind::Commit {
-        if depth == IntegrityDepth::ConversationHead {
+        if depth == IntegrityDepth::AppendOnlyHead {
             return Err(format!(
-                "conversation head object {id} is a {}, not a commit",
+                "append-only head object {id} is a {}, not a commit",
                 object.kind
             ));
         }
@@ -549,18 +547,14 @@ mod tests {
         let damaged = git_stdin(&dir, &["commit-tree", &tree, "-m", "request"], b"");
         let request = plant_ref(&dir, "refs/caos/req/request", &format!("{damaged}\n"));
         let result = plant_ref(&dir, "refs/caos/res/result", &format!("{damaged}\n"));
-        let conversation = plant_ref(
-            &dir,
-            "refs/caos/v2/conversations/chat/head",
-            &format!("{damaged}\n"),
-        );
+        let log = plant_ref(&dir, "refs/caos/logs/chat/head", &format!("{damaged}\n"));
         let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
         std::fs::remove_file(blob_path).unwrap();
 
         assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
         assert!(request.exists());
         assert!(result.exists());
-        assert!(!conversation.exists());
+        assert!(!log.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -617,7 +611,7 @@ mod tests {
         let git_dir = dir.to_string_lossy().into_owned();
         let head = plant_ref(
             &dir,
-            "refs/caos/v2/conversations/c95/head",
+            "refs/caos/logs/c95/head",
             "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a\n",
         );
 
@@ -628,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_head_requires_a_commit_while_title_accepts_a_blob() {
+    fn append_only_head_requires_a_commit_while_sibling_accepts_a_blob() {
         let (repo, dir) = temp_repo();
         let git_dir = dir.to_string_lossy().into_owned();
         let repo = repo.to_thread_local();
@@ -638,19 +632,11 @@ mod tests {
             .unwrap()
             .detach()
             .to_string();
-        let head = plant_ref(
-            &dir,
-            "refs/caos/v2/conversations/chat/head",
-            &format!("{blob}\n"),
-        );
-        let title = plant_ref(
-            &dir,
-            "refs/caos/v2/conversations/chat/title",
-            &format!("{blob}\n"),
-        );
+        let head = plant_ref(&dir, "refs/caos/logs/chat/head", &format!("{blob}\n"));
+        let title = plant_ref(&dir, "refs/caos/logs/chat/title", &format!("{blob}\n"));
         plant_ref(
             &dir,
-            "logs/refs/caos/v2/conversations/chat/head",
+            "logs/refs/caos/logs/chat/head",
             &format!(
                 "0000000000000000000000000000000000000000 {intact} caos <caos@caos> 0 +0000\tcreated\n\
                  {intact} {blob} caos <caos@caos> 1 +0000\tinvalid update\n"
@@ -671,13 +657,17 @@ mod tests {
     }
 
     #[test]
-    fn only_v2_heads_receive_conversation_specific_repair() {
+    fn all_caos_heads_receive_append_only_repair() {
         assert!(matches!(
             integrity_depth("refs/caos/v2/conversations/chat/head"),
-            IntegrityDepth::ConversationHead
+            IntegrityDepth::AppendOnlyHead
         ));
         assert!(matches!(
             integrity_depth("refs/caos/conversations/chat/head"),
+            IntegrityDepth::AppendOnlyHead
+        ));
+        assert!(matches!(
+            integrity_depth("refs/caos/v2/conversations/chat/title"),
             IntegrityDepth::WorkspaceClosure
         ));
     }

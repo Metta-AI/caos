@@ -26,14 +26,15 @@ stops there. A fork instead first-parents its source event, records the same
 commit as `forked_from`, and inherits the source's root. It never creates a
 second `base`. Readers validate the event spine through that explicit boundary
 and reject a missing or inconsistent root rather than guessing where ordinary
-Git history begins; append validation prevents a later writer from introducing
-another boundary.
+Git history begins. Writers validate new events before appending them, and
+readers fail loudly if an invalid boundary reaches the log.
 
 Writers advance the head with an exact compare-and-swap (CAS). The server
 accepts an update only when the expected head is current and is on the new
 head's first-parent history; raw Git pushes and exact-ref appends share this
-validator. A losing writer reloads the canonical head and reconciles according
-to the event: text-only events can be rebuilt on the new tip, while independent
+storage-level validator. Commit messages and trees are opaque to the server.
+A losing writer reloads the canonical head and reconciles according to the
+event: text-only events can be rebuilt on the new tip, while independent
 workspace changes require a three-way merge. There is deliberately no generic
 "force the losing commit on top" rule.
 
@@ -71,10 +72,11 @@ refs/caos/v2/users/<user-key>/conversations/active/<conversation-key>
 refs/caos/v2/users/<user-key>/conversations/archived/<conversation-key>
 ```
 
-Only this namespace participates in discovery, following, and writes. Server
-append enforcement applies to its canonical conversation-head refs; clients
-coordinate title and membership refs with atomic leases. The reader does not
-parse, rename, import, or republish the old unversioned layout.
+Only this namespace participates in discovery, following, and writes. The
+server structurally treats every `refs/caos/<path>/head` as an append-only
+commit log; the agent client assigns conversation meaning to this particular
+one. Clients coordinate title and membership refs with atomic leases. The
+reader does not parse, rename, import, or republish the old unversioned layout.
 
 The head is durable execution state. Title and membership refs support the UI
 only. A single case-sensitive user identity is used for message attribution and
@@ -138,14 +140,15 @@ To append event `B` to canonical head `A` at ref `F`:
 1. Build `B` with first parent `A`.
 2. Upload its closed object graph.
 3. Request the exact update `(F, expected=A, new=B)`.
-4. The server validates the new suffix's JSON envelopes, connectivity, and
-   first-parent relationship, then advances `F` only if it is still `A`.
+4. The client validates the event envelopes. The server validates connectivity
+   and the first-parent relationship, then advances `F` only if it is still `A`.
 
 The remote ref is authoritative; a local ref is only a cache. The server rejects
-conversation-head deletion, reset, or an update that does not append along the
+append-only-head deletion, reset, or an update that does not append along the
 first-parent spine. Exact-ref updates and raw receive-pack use the same Rust
-validator, so there is one interpretation of the envelope and root boundary.
-An update to an existing head may introduce neither `base` nor `forked_from`.
+ancestry validator. Conversation writers enforce that an update to an existing
+head introduces neither `base` nor `forked_from`; replay validates that boundary
+again.
 If an append response is lost, finding the candidate at the observed tip or on
 its first-parent spine proves success and prevents a duplicate append.
 Transcript and run semantics remain client/worker validation, not server
