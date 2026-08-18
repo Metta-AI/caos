@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Generic interpreter for rustc-built workers that explicitly need Git. The
+# compiled binary is still the worker; this script only stages and execs it in
+# the Git-bearing image.
+set -euo pipefail
+
+bin=/cas/args/worker1
+caos get "$bin"
+if [ ! -f "$bin" ]; then
+  echo "git-runner: the worker1 arg is not a regular file" >&2
+  exit 1
+fi
+
+run_dir=$(mktemp -d /tmp/caos-git-runner.XXXXXX)
+cp "$bin" "$run_dir/worker"
+chmod 755 "$run_dir/worker"
+exec "$run_dir/worker"

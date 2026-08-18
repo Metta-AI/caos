@@ -135,10 +135,12 @@ pure orchestration — no toolchain in its image — published as
 worker-common=<crates/worker-common>)`. The bound args are its linker
 inputs: it lays the user source out as a cargo project linking
 `worker-common`, `run-then`s the compile into the `cargo` ref, and its
-output is `curry(<caller-supplied runner ref>, worker1=<built binary>)` — a
-worker returning a worker. The wiring is invisible at the call site by
-design (callers pass only `--src` and `--runner`); this section is where
-it's written down.
+output is `curry(<runtime>, worker1=<built binary>)` — a worker returning a
+worker. The runtime defaults to rustc's bound shared runner, so ordinary callers
+pass only `--src`. A tool that needs a richer userland may pass an
+`--output-runner` ArgTree; `std/llm-step` and `std/run-and-update-ref` use this
+to select the literal-flake `std/git-runner` without changing the shared seeded
+runner or the runtime on which rustc itself executes.
 
 ## Bootstrap
 

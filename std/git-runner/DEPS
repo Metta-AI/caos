@@ -1,0 +1,2 @@
+# The flake-builder builds this literal flake tree into the Git-bearing runtime.
+../flake-builder flake-builder

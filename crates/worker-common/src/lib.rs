@@ -33,6 +33,8 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+pub mod git;
+
 /// Where the `caos` runner materializes this run's arguments.
 pub const ARGS: &str = "/cas/args";
 
