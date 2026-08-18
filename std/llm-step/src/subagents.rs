@@ -42,7 +42,7 @@ pub fn spawn_call<S>(
     ensure_status: S,
 ) -> Result<Value, String>
 where
-    S: FnOnce(&str) -> Result<String, String>,
+    S: FnOnce(&str) -> Result<async_work::TaskState, String>,
 {
     let id = call
         .get("id")

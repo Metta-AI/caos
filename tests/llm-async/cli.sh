@@ -90,8 +90,6 @@ done
 [ "$gate_reached" -eq 1 ] || fail "independent worker never reached its barrier"
 [ "$(remote_tip "$conversation_ref")" = "$head1" ] \
   || fail "conversation advanced while independent work was blocked"
-[ -z "$(remote_exact_ref "refs/caos/res/$task" 2>/dev/null || true)" ] \
-  || fail "independent task published a result before release"
 
 stage "completion appends and is observed next turn"
 printf '%s\n' '{"content":[],"stop_reason":"end_turn"}' > async-gate/response-1.json
@@ -114,13 +112,11 @@ done
 [ "$(git rev-parse "$completion_head^{tree}")" = "$(git rev-parse "$head1^{tree}")" ] \
   || fail "completion changed the workspace"
 
-task_result=""
-for _ in $(seq 1 300); do
-  task_result=$(remote_exact_ref "refs/caos/res/$task" 2>/dev/null || true)
-  if [ -n "$task_result" ]; then break; fi
-  sleep 0.2
-done
-[ -n "$task_result" ] || fail "independent task has no result ref"
+completion_event=$(git show -s --format=%B "$completion_head")
+task_result=$(jq -r --arg task "$task" \
+  'select(.async.task == $task and .async.status == "complete") | .async.result // empty' \
+  <<<"$completion_event")
+assert_oid "$task_result" "independent task result"
 
 tree1=$(git rev-parse "$completion_head^{tree}")
 user2=$(mkcommit "$tree1" \
@@ -137,7 +133,7 @@ git push --quiet caos "$admitted2:$conversation_ref" \
 head2=$(fetch_head)
 grep -qF "$ASYNC_OBSERVED_TEXT" <<<"$(git show -s --format=%B "$head2")" \
   || fail "post-completion turn did not finish"
-notice="Independent task $task is complete. Its result is addressed by that task hash."
+notice="Independent task $task is complete. Its result is $task_result."
 grep -qF "$notice" stub/request-3.json \
   || fail "later model step did not observe independent completion"
 [ "$(git rev-parse "$head2^{tree}")" = "$tree1" ] \

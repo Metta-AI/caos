@@ -94,8 +94,6 @@ if git cat-file -e "$head1:interrupted.txt" 2>/dev/null; then
   fail "Escape allowed the pending write tool to run"
 fi
 [ ! -e stub/request-2.json ] || fail "Escape allowed another model round"
-[ -n "$(remote_exact_ref "refs/caos/res/$request1")" ] \
-  || fail "interrupted exact request has no result ref"
 
 stage "done"
 echo "llm-interrupt: ALL PASS" >&2
