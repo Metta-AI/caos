@@ -5,14 +5,20 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use caos::chat::{
-    archive_user_conversation, compare_and_set_conversation_title, conversation_load,
-    conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
-    first_available_conversation_name, fork_conversation, generate_conversation_title,
-    interrupt_request, invite_user_to_conversation, list_user_conversations,
-    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
-    ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
-    TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
+    archive_user_conversation, automatic_conversation_title, compare_and_set_conversation_title,
+    conversation_load, conversation_load_at, conversation_reference, conversation_snapshot,
+    describe_tool_set, first_available_conversation_name, fork_conversation, fresh_conversation_id,
+    generate_conversation_title, interrupt_request, invite_user_to_conversation,
+    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
+    ConversationRole, ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent,
+    TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary,
+    WorkspaceDiff, DEFAULT_MODEL,
+};
+use caos::workspace::{
+    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
+    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
+    publish_merge_target, remote_default_branch,
 };
 use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -22,12 +28,6 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{
-    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
-    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
-    publish_merge_target, remote_default_branch,
-};
-
 #[path = "ui.rs"]
 pub(crate) mod ui;
 
@@ -37,21 +37,6 @@ fn short_hash(hash: &str) -> &str {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn automatic_title(prompt: &str) -> String {
-    const MAX_CHARS: usize = 60;
-
-    let title = collapse_whitespace(prompt);
-    if title.chars().count() <= MAX_CHARS {
-        return title;
-    }
-
-    title
-        .chars()
-        .take(MAX_CHARS - 1)
-        .chain(std::iter::once('…'))
-        .collect()
 }
 
 fn message_preview(text: &str, max_cells: u16) -> String {
@@ -1327,7 +1312,7 @@ impl ConversationState {
 
     fn apply_automatic_title(&mut self, prompt: &str) {
         if !self.automatic_title_fallback_applied {
-            let fallback = automatic_title(prompt);
+            let fallback = automatic_conversation_title(prompt);
             if self.automatic_title {
                 self.title = fallback.clone();
             }
@@ -3771,19 +3756,6 @@ fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
     }
 }
 
-fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String> {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("reading the clock: {error}"))?
-        .as_nanos();
-    let descriptor = format!(
-        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
-        std::process::id()
-    );
-    t.put_object("blob", descriptor.as_bytes())
-        .map(|id| id.to_string())
-}
-
 fn new_conversation_options(
     mut options: TurnOptions,
     requested_base: Option<String>,
@@ -4279,12 +4251,15 @@ mod tests {
     #[test]
     fn automatic_titles_collapse_whitespace_and_limit_unicode_scalars() {
         assert_eq!(
-            automatic_title("  Review\t the\nλ parser  "),
+            automatic_conversation_title("  Review\t the\nλ parser  "),
             "Review the λ parser"
         );
-        assert_eq!(automatic_title(&"界".repeat(60)), "界".repeat(60));
         assert_eq!(
-            automatic_title(&"界".repeat(61)),
+            automatic_conversation_title(&"界".repeat(60)),
+            "界".repeat(60)
+        );
+        assert_eq!(
+            automatic_conversation_title(&"界".repeat(61)),
             format!("{}…", "界".repeat(59))
         );
     }

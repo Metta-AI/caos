@@ -1209,7 +1209,8 @@ fn remote_refs(
         .collect())
 }
 
-fn validate_conversation_title(title: &str) -> Result<&str, String> {
+/// Trim and validate a title before a client displays or persists it.
+pub fn normalize_conversation_title(title: &str) -> Result<&str, String> {
     if title.chars().any(char::is_control) {
         return Err("conversation title must contain no control characters".to_string());
     }
@@ -1241,7 +1242,7 @@ fn create_conversation_title_if_absent(
     id: &str,
     title: &str,
 ) -> Result<(), String> {
-    let title = validate_conversation_title(title)?;
+    let title = normalize_conversation_title(title)?;
     let title_ref = conversation_title_ref(id)?;
     if remote_ref(t, &title_ref)?.is_some() {
         return Ok(());
@@ -1345,7 +1346,7 @@ pub fn fork_conversation(
     from: &str,
 ) -> Result<String, String> {
     validate_hash(from, "fork source")?;
-    let title = validate_conversation_title(title)?;
+    let title = normalize_conversation_title(title)?;
     let refname = conversation_ref(id)?;
     let title_ref = conversation_title_ref(id)?;
     let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
@@ -1384,7 +1385,7 @@ pub fn fork_conversation(
 }
 
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
-    let title = validate_conversation_title(title)?;
+    let title = normalize_conversation_title(title)?;
     let hash = t.put_object("blob", title.as_bytes())?.to_string();
     let title_ref = conversation_title_ref(id)?;
     t.git_capture(
@@ -1407,8 +1408,8 @@ pub fn compare_and_set_conversation_title(
     expected: &str,
     title: &str,
 ) -> Result<bool, String> {
-    let expected = validate_conversation_title(expected)?;
-    let title = validate_conversation_title(title)?;
+    let expected = normalize_conversation_title(expected)?;
+    let title = normalize_conversation_title(title)?;
     let expected_hash = t.put_object("blob", expected.as_bytes())?.to_string();
     let candidate = t.put_object("blob", title.as_bytes())?.to_string();
     let title_ref = conversation_title_ref(id)?;
@@ -1615,7 +1616,7 @@ pub fn list_user_conversations(
                 }
                 let title = String::from_utf8(bytes)
                     .map_err(|_| format!("conversation {id:?} title is not UTF-8"))?;
-                validate_conversation_title(&title)?.to_string()
+                normalize_conversation_title(&title)?.to_string()
             } else {
                 id.clone()
             };
@@ -1692,6 +1693,38 @@ pub fn first_available_conversation_name<'a>(names: impl IntoIterator<Item = &'a
         }
     }
     unreachable!("the integer conversation-name space is not finite")
+}
+
+/// Create a presentation-independent id for a conversation before its first
+/// durable event exists.
+pub fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String> {
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("reading the clock: {error}"))?
+        .as_nanos();
+    let descriptor = format!(
+        "caos conversation\ncreator {user}\ncreated {created}\nprocess {}\n",
+        std::process::id()
+    );
+    t.put_object("blob", descriptor.as_bytes())
+        .map(|id| id.to_string())
+}
+
+/// Derive the immediate fallback title shown while best-effort title
+/// generation is still running.
+pub fn automatic_conversation_title(prompt: &str) -> String {
+    const MAX_CHARS: usize = 60;
+
+    let title = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.chars().count() <= MAX_CHARS {
+        return title;
+    }
+
+    title
+        .chars()
+        .take(MAX_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 fn value_text(value: &Value) -> String {
@@ -2096,7 +2129,7 @@ fn parse_generated_title(text: &str) -> Result<String, String> {
     if title.chars().count() > 60 {
         return Err("conversation title result exceeds 60 characters".to_string());
     }
-    validate_conversation_title(&title).map(str::to_string)
+    normalize_conversation_title(&title).map(str::to_string)
 }
 
 pub fn describe_tool_set(
@@ -3115,17 +3148,7 @@ fn waterfall_string(value: &Value, key: &str, target: &mut Option<String>) -> Re
 }
 
 fn default_title(message: &str) -> String {
-    const MAX_CHARS: usize = 60;
-    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_CHARS {
-        compact
-    } else {
-        compact
-            .chars()
-            .take(MAX_CHARS - 1)
-            .chain(std::iter::once('…'))
-            .collect()
-    }
+    automatic_conversation_title(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -3673,7 +3696,7 @@ mod tests {
     #[test]
     fn canonical_titles_reject_controls() {
         assert_eq!(
-            validate_conversation_title("  useful title  ").unwrap(),
+            normalize_conversation_title("  useful title  ").unwrap(),
             "useful title"
         );
         for title in [
@@ -3683,11 +3706,11 @@ mod tests {
             "nul\0byte",
         ] {
             assert!(
-                validate_conversation_title(title).is_err(),
+                normalize_conversation_title(title).is_err(),
                 "accepted {title:?}"
             );
         }
-        assert!(validate_conversation_title("   ").is_err());
+        assert!(normalize_conversation_title("   ").is_err());
     }
 
     #[test]
