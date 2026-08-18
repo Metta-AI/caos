@@ -1,5 +1,7 @@
 # Client-owned conversation refs
 
+**Status:** implemented.
+
 ## Motivation
 
 Conversation history is Git history. A conversation client or worker can read,
@@ -9,7 +11,7 @@ append-only policy. The server's job is to execute content-addressed work and
 serve a Git repository; conversation coordination belongs to the clients that
 define the protocol.
 
-Today that boundary is blurred in three ways:
+Before this cleanup, that boundary was blurred in three ways:
 
 1. `llm-step`, `run-and-update-ref`, and the host chat client call CAOS-specific
    `/ref/read`, `/ref/append`, and `/ref/transaction` endpoints.
@@ -18,9 +20,9 @@ Today that boundary is blurred in three ways:
 3. Async conversation reconciliation discovers a task result indirectly through
    the server-owned `refs/caos/res/<request>` pin.
 
-The cleanup moves all three responsibilities out of the server. We explicitly
+The cleanup moved all three responsibilities out of the server. We explicitly
 accept that a buggy or malicious worker with repository access can rewrite
-conversation refs; the server will provide transport, not policy.
+conversation refs; the server provides transport, not policy.
 
 ## Target boundary
 
@@ -41,7 +43,7 @@ Conversation clients and workers own:
 - event validation, append/retry policy, and conflict interpretation;
 - carrying the completed result hash in terminal async events.
 
-No conversation path will query `refs/caos/res/*`. Those refs remain an
+No conversation path queries `refs/caos/res/*`. Those refs remain an
 implementation detail of generic request execution rather than a conversation
 result API.
 
@@ -67,9 +69,11 @@ Each worker creates a throwaway local repository and points its `origin` at
 `CAOS_SERVER_URL`.
 
 - Read one ref by fetching that exact source ref into `FETCH_HEAD`. Protocol v2
-  communicates the exact prefix to upload-pack and downloads only the objects
-  needed by that history.
-- Create commits with ordinary Git object commands in the local repository.
+  communicates the exact prefix to upload-pack; shallow, tree-filtered fetches
+  avoid downloading the conversation workspace or its history.
+- Store event objects through the ordinary content-addressed object API, then
+  fetch the candidate object into the scratch Git repository so it can serve as
+  a push refspec source without downloading its workspace closure.
 - Append with `git push --force-with-lease=<ref>:<observed> <new>:<ref>`.
 - Create or modify several refs as one operation with `git push --atomic`, one
   explicit lease per ref, and one refspec per update.
@@ -83,14 +87,14 @@ because they consume the protocol.
 
 ## Async result ownership
 
-An async event currently records only:
+Before this cleanup, an async terminal event recorded only:
 
 ```json
 {"async":{"task":"<request>","status":"complete"}}
 ```
 
-and `llm-step` later asks `/ref/read` for `refs/caos/res/<request>`. The terminal
-event will instead record the result it announces:
+and `llm-step` later queried the request's result ref. A terminal event now
+records the result it announces:
 
 ```json
 {"async":{"task":"<request>","status":"complete","result":"<object>"}}
@@ -102,29 +106,26 @@ published only after its result object exists, making the conversation log
 self-contained for reconciliation. Compatibility with terminal events that lack
 `result` is intentionally not retained.
 
-Generic execution may continue to pin the same result under
-`refs/caos/res/<request>` for reachability and cache behavior. Conversations no
-longer read that ref and do not depend on its naming or timing.
+Generic execution continues to pin the same result under
+`refs/caos/res/<request>` for durability and Git negotiation. Conversations do
+not read that ref and do not depend on its naming or timing.
 
 ## Delivery stack
 
-1. **Opt-in Git runtime.** Add the flake-built `git-runner`, let `rustc` accept
-   an explicit output-runtime override, bind it only from `llm-step` and
-   `run-and-update-ref`, and add shared Git command helpers. Server behavior is
-   unchanged.
-2. **Client-owned conversation operations.** Replace all production uses of the
-   three `/ref/*` endpoints with Git fetch/push, and put result hashes in
-   terminal async events. The old endpoints remain temporarily so this layer can
-   be reviewed and rolled back independently.
-3. **Remove server specialization.** Delete the endpoints, request types,
+1. **Opt-in Git runtime — landed.** The flake-built `git-runner` is bound only
+   from `llm-step` and `run-and-update-ref`; shared Git command helpers do not
+   add Git to the ordinary runner image.
+2. **Client-owned conversation operations — landed.** Production conversation
+   ref operations use Git fetch/push, and terminal async events carry result
+   hashes.
+3. **Remove server specialization — landed.** The specialized ref API,
    conversation pre-receive validator and installed hook, and append-only repair
-   classification. Remove endpoint-specific tests and documentation; keep
-   generic Git transport, result pinning, and crash repair.
+   classification are gone. Generic Git transport, result pinning, and crash
+   repair remain.
 
-An upgrade must remove a hooks path previously installed by CAOS before the
-validator is deleted. Otherwise an existing repository would keep invoking a
-now-missing server subcommand and reject every push. Cleanup should be narrowly
-scoped to the hook configuration and files owned by CAOS.
+The server upgrade removes a hook previously installed by CAOS before the
+validator disappears. That cleanup is narrowly scoped to the hook file owned by
+CAOS; administrator-owned hooks are left untouched.
 
 ## Completion criteria
 

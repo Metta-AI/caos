@@ -164,12 +164,12 @@ Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
-| `POST /ref/read`, `POST /ref/append` | Exact ref lookup and first-parent compare-and-append, used by durable event logs without downloading every advertised ref. |
 
 The git transport is what makes the server a `caos` remote: `git http-backend`
-runs `upload-pack`/`receive-pack` over the same `/git` repo, with hooks intact
-(so a `post-receive` trigger is a natural future evolution). The dedicated repo
-is created with `http.receivepack=true` (to accept pushes) and
+runs `upload-pack`/`receive-pack` over the same `/git` repo. CAOS installs no
+ref-policy hooks: clients own any naming, ancestry, and update discipline above
+ordinary Git's atomic ref operations. The dedicated repo is created with
+`http.receivepack=true` (to accept pushes) and
 `uploadpack.allowAnySHA1InWant=true` (so a client can `git fetch` a result by
 its bare hash; `/object` itself never needs that flag).
 

@@ -78,7 +78,7 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
     let mut paths = Vec::new();
     collect_files(&Path::new(git_dir).join("refs"), &mut paths);
     let mut removed = 0;
-    // Durable-log and index refs commonly share most of their workspace closure.
+    // Mutable refs commonly share most of their workspace closure.
     // Validate each reachable object once per startup, not once per ref; failed
     // subtrees are deliberately not memoized.
     let mut memo = IntegrityMemo::default();
@@ -152,14 +152,11 @@ enum ClosureKind {
 enum IntegrityDepth {
     TargetOnly,
     WorkspaceClosure,
-    AppendOnlyHead,
 }
 
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/") || refname.starts_with("refs/caos/res/") {
         IntegrityDepth::TargetOnly
-    } else if crate::refs::is_append_only_ref(refname) {
-        IntegrityDepth::AppendOnlyHead
     } else {
         IntegrityDepth::WorkspaceClosure
     }
@@ -171,7 +168,7 @@ struct IntegrityMemo {
     closure: HashSet<(gix::ObjectId, ClosureKind)>,
 }
 
-/// Validate a ref target. Durable log/index refs include a commit's workspace
+/// Validate a ref target. Mutable commit refs include the commit's workspace
 /// tree, but not its parents. This keeps startup repair from scanning unrelated
 /// ordinary history. Content-addressed request/result refs only need their named
 /// object to be readable; traversing every request workspace would turn startup
@@ -193,12 +190,6 @@ fn intact_ref_target(
         return Ok(());
     }
     if object.kind != gix::object::Kind::Commit {
-        if depth == IntegrityDepth::AppendOnlyHead {
-            return Err(format!(
-                "append-only head object {id} is a {}, not a commit",
-                object.kind
-            ));
-        }
         memo.targets.insert((id, depth));
         return Ok(());
     }
@@ -547,14 +538,14 @@ mod tests {
         let damaged = git_stdin(&dir, &["commit-tree", &tree, "-m", "request"], b"");
         let request = plant_ref(&dir, "refs/caos/req/request", &format!("{damaged}\n"));
         let result = plant_ref(&dir, "refs/caos/res/result", &format!("{damaged}\n"));
-        let log = plant_ref(&dir, "refs/caos/logs/chat/head", &format!("{damaged}\n"));
+        let workspace = plant_ref(&dir, "refs/heads/work", &format!("{damaged}\n"));
         let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
         std::fs::remove_file(blob_path).unwrap();
 
         assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
         assert!(request.exists());
         assert!(result.exists());
-        assert!(!log.exists());
+        assert!(!workspace.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -619,57 +610,6 @@ mod tests {
         assert!(!head.exists());
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn append_only_head_requires_a_commit_while_sibling_accepts_a_blob() {
-        let (repo, dir) = temp_repo();
-        let git_dir = dir.to_string_lossy().into_owned();
-        let repo = repo.to_thread_local();
-        let intact = empty_commit(&dir, "intact event");
-        let blob = repo
-            .write_blob(b"Readable title")
-            .unwrap()
-            .detach()
-            .to_string();
-        let head = plant_ref(&dir, "refs/caos/logs/chat/head", &format!("{blob}\n"));
-        let title = plant_ref(&dir, "refs/caos/logs/chat/title", &format!("{blob}\n"));
-        plant_ref(
-            &dir,
-            "logs/refs/caos/logs/chat/head",
-            &format!(
-                "0000000000000000000000000000000000000000 {intact} caos <caos@caos> 0 +0000\tcreated\n\
-                 {intact} {blob} caos <caos@caos> 1 +0000\tinvalid update\n"
-            ),
-        );
-
-        assert_eq!(drop_broken_refs(&repo, &git_dir), 0);
-        assert_eq!(
-            std::fs::read_to_string(&head).unwrap(),
-            format!("{intact}\n")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&title).unwrap(),
-            format!("{blob}\n")
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn all_caos_heads_receive_append_only_repair() {
-        assert!(matches!(
-            integrity_depth("refs/caos/v2/conversations/chat/head"),
-            IntegrityDepth::AppendOnlyHead
-        ));
-        assert!(matches!(
-            integrity_depth("refs/caos/conversations/chat/head"),
-            IntegrityDepth::AppendOnlyHead
-        ));
-        assert!(matches!(
-            integrity_depth("refs/caos/v2/conversations/chat/title"),
-            IntegrityDepth::WorkspaceClosure
-        ));
     }
 
     #[test]

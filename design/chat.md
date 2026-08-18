@@ -1,6 +1,6 @@
 # Chat: durable conversation log
 
-**Status:** implemented by this stack except for the items under Deferred work.
+**Status:** implemented except for the items under Deferred work.
 
 Chat v2 is selected solely by the `refs/caos/v2/` namespace. Events contain no
 version field. Existing unversioned chat refs remain untouched and invisible to
@@ -292,10 +292,10 @@ content address.
 At `llm-step` entry and foreground terminal boundaries, recovery considers each
 task independently. A pending `Q` is reissued. A terminal event is already
 converged because it carries the exact result object ID and is appended only
-after that object exists. A different outcome from a retry is appended, and the
-newest terminal event for `Q` wins. Before any redispatch, `llm-step` opens `Q`,
-validates its subrequest, and proves its recorded `target-ref` is this
-conversation's `F`.
+after that object exists; it never needs a separate result-ref lookup. If
+concurrent executions publish different terminal outcomes, the newest terminal
+event for `Q` wins. Before any redispatch, `llm-step` opens `Q`, validates its
+subrequest, and proves its recorded `target-ref` is this conversation's `F`.
 
 `spawn_agent` atomically creates an owner-indexed child conversation on a clean
 snapshot descended from the parent workspace. Its transcript starts at its own

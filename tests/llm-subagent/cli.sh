@@ -99,10 +99,10 @@ git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$agent_head" \
 stage "child identity, ownership, and inherited workspace"
 agent_key=$(printf '%s' "$agent" | od -An -tx1 | tr -d ' \n')
 active_ref="refs/caos/v2/users/u-416c696365/conversations/active/c-$agent_key"
-[ -n "$(remote_exact_ref "$active_ref")" ] \
+[ -n "$(remote_tip "$active_ref")" ] \
   || fail "subagent is absent from its human owner's active index"
 title_ref="refs/caos/v2/conversations/$agent/title"
-title=$(remote_exact_ref "$title_ref")
+title=$(remote_tip "$title_ref")
 [ -n "$title" ] || fail "subagent has no title ref"
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$title" \
   || fail "fetching subagent title"

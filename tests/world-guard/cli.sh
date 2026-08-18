@@ -39,6 +39,16 @@ code=$(curl -s -o /tmp/bare.out -w '%{http_code}' "$URL")
 [ "$code" = "404" ] || fail "unheadered request got $code, want 404: $(cat /tmp/bare.out)"
 echo "  ok: 404 (unguarded, as before)" >&2
 
+echo "== removed ref APIs are not served ==" >&2
+for endpoint in read append transaction; do
+  code=$(curl -sS -o "/tmp/ref-$endpoint.out" -w '%{http_code}' \
+    -X POST -H 'content-type: application/json' --data '{}' \
+    "$CAOS_SERVER_URL/ref/$endpoint")
+  [ "$code" = "404" ] \
+    || fail "/ref/$endpoint got $code, want 404: $(cat "/tmp/ref-$endpoint.out")"
+done
+echo "  ok: all removed ref APIs return 404" >&2
+
 echo "== the tested client still works against its own stack ==" >&2
 # The positive case, through the real client rather than curl: if the guard
 # rejected same-world traffic, this would fail.
