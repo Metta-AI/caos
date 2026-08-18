@@ -21,3 +21,4 @@
 ../../std/bash bash
 ../../std/flake-builder flake-builder
 ../../std/llm-stub llm-stub
+../../std/llm-test llm-test

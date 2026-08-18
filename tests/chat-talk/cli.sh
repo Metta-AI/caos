@@ -68,7 +68,7 @@ T4_TEXT="fresh conversation reply"
 mkdir stub
 # All four rounds are toolless end_turns: this test is about which conversation
 # a `talk` lands in, not about what a turn can do — the tool set is
-# tests/chat-tools. A tool call here would cost a sub-run per turn and prove
+# `tests/chat-tools*`. A tool call here would cost a sub-run per turn and prove
 # nothing this file asserts.
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$S1_TEXT" > stub/response-1.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' "$S2_TEXT" > stub/response-2.json

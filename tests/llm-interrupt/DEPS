@@ -1,0 +1,7 @@
+../../std/bash-tool bash-tool
+../../std/bash bash
+../../std/llm-step llm-step
+../../std/cargo cargo
+../../std/flake-builder flake-builder
+../../std/llm-stub llm-stub
+../../std/llm-test llm-test

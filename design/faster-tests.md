@@ -20,6 +20,18 @@ moved the total by nothing, because by then the total was not the tail's to
 move. That is the section worth reading if you are about to optimise this
 suite again.
 
+A later split happened under different conditions: `llm-step` had grown from
+one conversation test into four serial scenarios (core replay/interjection,
+independent work, subagents, and Escape), while `chat-tools` still ran three
+tool scenarios serially. They were again 12–22s tails. The focused
+`llm-{step,async,subagent,interrupt}` and `chat-tools{,-mixed,-grep}` suites
+give each behavior its own fixture and fan them out. On the same warm shared
+stack, the seven selected tests take a 3s phase; with the image cache warm, a
+fresh-`CAOS_SALT` full run was 41/41 in 14.9s (5s build, 8s tests). None of the
+split shards took more than 2s under full-suite contention. This does not
+overturn the lesson below: the measurement justified the split only after the
+suite became tail-bound again.
+
 ## Read the timeline, not the total
 
 The phase clock records absolute timestamps, so a run can be laid out as one
@@ -212,7 +224,7 @@ when it binds in a few ms. Now a `/dev/tcp` probe, which also distinguishes
 
 ### The split, and the honest result
 
-The rest is fifteen serial jobs, irreducible in place, so chat-offline became
+At that point the rest was fifteen serial jobs, irreducible in place, so chat-offline became
 three tests the fan-out can run at once — `chat-offline` (the `chat` verb),
 `chat-talk` (the `talk` verb, seeding its own two-turn history), `chat-tools`
 (inline / mixed / grep, which chain onto each other's trees and so stay
@@ -460,7 +472,7 @@ one server it is routine, so it must be fixed FIRST.
 **`CAOS_STUB_HOST` breaks.** `run-test.sh` sets it to `127.0.0.1` because
 "siblings share this container's netns, so localhost is the stub's address".
 With a shared stack, A's runnerd launches workers into A's netns, not the test's,
-so every stub-server test (chat-offline, chat-talk, chat-tools, llm-step,
+so every stub-server test (chat-offline, chat-talk, chat-tools*, llm-*,
 caos-tools, merge-harness, llm-call, max-tokens) loses its stub. The test container has its own `caos-net` address, so
 the fix is for the stub to bind `0.0.0.0` and `CAOS_STUB_HOST` to be that
 address — but it is not free, and it will present as a mystery failure if it is
