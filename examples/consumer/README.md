@@ -20,11 +20,9 @@ nix develop
 # 1. Bring the stack up (redis + registry + caos server). Foreground; Ctrl-C
 #    stops it. Server state (the bare git repo) lives in ./.caos-data — override
 #    with CAOS_DATA. This also publishes the builtin stdlib on startup.
-caosd
+caosd up
 
 # 2. In another shell (also `nix develop`), add the server as the `caos` remote.
-#    That remote URL *is* the server — caos-cli reads it from there, so there's
-#    no CAOS_SERVER_URL to set. caos-cli must run inside a git working tree:
 git init                              # if this tree isn't a repo yet
 git remote add caos http://localhost:9090
 
