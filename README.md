@@ -615,7 +615,7 @@ caosd up      # bring the stack up + publish all of std, then return. Updates it
 caosd logs    # follow the running stack's logs (Ctrl-C returns; stack stays up)
 caosd down    # stop it (Redis + registry volumes and the server repo are kept)
 caosd reset   # stop and wipe those volumes + the server repo for a clean slate
-caosd image-cleanup # dry-run bounded registry LRU + disposable Docker cleanup
+caosd image-cleanup # report cache usage; after `down`, add --execute to clear it
 caosd version # the caos revision this command was built from
 ```
 
