@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! docker run --name caos-worker-<nonce> --label caos.runnerd.owner=<id> \
-//!     --network <net> -e CAOS_SERVER_URL=<url> \
+//!     --network <net> -e CAOS_SERVER_URL=<url> [-e CAOS_WORKER_REDIS_ADDR=<a>] \
 //!     --entrypoint /bin/caos <image_ref> runner --job=<json>
 //! ```
 //!
@@ -29,9 +29,16 @@
 //! server requires one), `CAOS_RUNNER_SLOTS` (default 8), `CAOS_DOCKER_NETWORK`
 //! (default `caos-net`), `CAOS_DOCKER_BIN` (default `docker`),
 //! `CAOS_DOCKER_ARGS` (global flags before `run`, e.g.
-//! `--remote --url unix://…` for the socket-delegation backend), and
+//! `--remote --url unix://…` for the socket-delegation backend),
 //! `CAOS_RUNNER_SOCKET` (an engine socket, granted only to images that declare
-//! `CAOS_GRANT_ENGINE_SOCKET=1` in their own config env).
+//! `CAOS_GRANT_ENGINE_SOCKET=1` in their own config env), and
+//! `CAOS_WORKER_REDIS_ADDR` (a redis a worker may use for its own caching,
+//! injected into the containers; unset means none is offered).
+//!
+//! The redis address is the same two-value shape as `CAOS_SERVER_URL`, for the
+//! same reason: where workers share the stack's netns it is loopback, and where
+//! they get their own netns on a bridge it has to be a name that resolves
+//! there. `stack/serve` supplies whichever the placement needs.
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -83,6 +90,12 @@ const POLL_RETRY: Duration = Duration::from_secs(2);
 
 struct Config {
     server_url: String,
+    /// Address (host:port) of a redis a worker may use for its OWN caching,
+    /// injected as `CAOS_WORKER_REDIS_ADDR` into every worker container. This
+    /// is a courtesy, not a contract: unset means no worker is offered one, so
+    /// a worker must treat its absence as "no cache available" and still do the
+    /// work, never as a reason to fail.
+    worker_redis_addr: Option<String>,
     token: Option<String>,
     slots: u32,
     network: String,
@@ -185,6 +198,9 @@ fn main() {
     install_termination_handlers();
     let config = Arc::new(Config {
         server_url: as_address(&env_or("CAOS_SERVER_URL", "http://caos-server")),
+        worker_redis_addr: std::env::var("CAOS_WORKER_REDIS_ADDR")
+            .ok()
+            .filter(|s| !s.is_empty()),
         token: std::env::var("CAOS_RUNNER_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
@@ -400,6 +416,12 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
                 .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")])
                 .args(["-e", &format!("CAOS_ENGINE_SOCKET_HOST={sock}")]);
         }
+    }
+    // A worker's own scratch cache, when this deployment offers one. Passed
+    // only when set, so an unset address reaches the worker as an ABSENT env
+    // var rather than an empty one it might dial.
+    if let Some(addr) = &config.worker_redis_addr {
+        command.args(["-e", &format!("CAOS_WORKER_REDIS_ADDR={addr}")]);
     }
     let out = command
         .args(["-e", &format!("CAOS_SERVER_URL={}", config.server_url)])

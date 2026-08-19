@@ -943,16 +943,20 @@
               fi
               if [ -z "$have" ]; then
                 echo "==> starting the stack (redis, registry, server, runnerd)" >&2
-                # Two aliases, one container: every name that resolved under
+                # Three aliases, one container: every name that resolved under
                 # compose still resolves — workers reach the server as
                 # `caos-server`, and the server pulls a delta's `base` as
                 # `caos-registry:5000` (design/one-stack-image.md, the netns
                 # section). Workers get their OWN netns on this bridge, which
-                # is what lets a test stack bind its own :80.
+                # is what lets a test stack bind its own :80 — and is also why
+                # `caos-redis` has to exist as a NAME: a worker here shares no
+                # loopback with the stack, so the address the server uses
+                # (127.0.0.1) is meaningless to it.
                 docker run -d --name "$NAME" \
                   --network "$NET" \
                   --network-alias caos-server \
                   --network-alias caos-registry \
+                  --network-alias caos-redis \
                   -p 9090:80 -p 5000:5000 \
                   -v "$CAOS_DATA/stack:/state" \
                   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -965,6 +969,7 @@
                   -e CAOS_STACK_RUNNERD=yes \
                   -e CAOS_STACK_SEEDER=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
+                  -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
                   -e CAOS_DOCKER_NETWORK="$NET" \
                   -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \
                   -e CAOS_PENDING_TIMEOUT_SECS=900 \

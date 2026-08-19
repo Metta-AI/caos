@@ -26,6 +26,13 @@
 #   CAOS_STACK_REDIS_PORT     redis port (required)
 #   CAOS_STACK_REDIS_PERSIST  "yes" for an appendonly cache, "no" to keep it
 #                             in memory and lose it with the process
+#   CAOS_STACK_REDIS_MAXMEM   redis memory cap (default 2gb). The cache is
+#                             allkeys-lru, so this is a cap on the SUM of the
+#                             server's results and whatever workers cache here.
+#                             With PERSIST=yes it also bounds the AOF, which
+#                             nothing else does — a worker's cache is written
+#                             there durably and no worker cleans up after
+#                             itself.
 #   CAOS_STACK_REGISTRY       "yes" to run a registry in the group, "no" to use
 #                             someone else's. The host placement runs one; the
 #                             test placement deliberately does not — a
@@ -122,8 +129,29 @@ start() { # <name> <command...>
   names+=("$name")
 }
 
-# --- redis: the result cache -------------------------------------------------
-redis_args=(--port "$CAOS_STACK_REDIS_PORT")
+# --- redis: the result cache, and workers' own scratch cache -----------------
+# `--protected-mode no` because this redis is no longer only the server's. A
+# worker may use it too (ccache's redis backend, say), and on the HOST a worker
+# has its own netns on the bridge — so it arrives from a non-loopback address,
+# which protected mode refuses. In the test placement workers share this netns
+# and already reached it on loopback, so the flag is inert there.
+#
+# Bounded, and `allkeys-lru` rather than `volatile-lru`, because the tenant that
+# forced the question cannot set a TTL: ccache's redis backend has no TTL and no
+# key prefix, and its own manual says it never cleans up and to configure LRU
+# eviction instead. `volatile-lru` would therefore evict NOTHING — neither
+# ccache's keys nor caos's, which are written with a bare SET and no expiry
+# (server/compute.rs `cache_set`) — and writes would start failing OOM at the
+# cap instead. So both tenants are evictable, which is safe but not free: an
+# evicted `caos:result:` key is a rebuild, so a ccache run big enough to fill
+# this cap costs caos memoization. Raise CAOS_STACK_REDIS_MAXMEM before blaming
+# the scheduler for work you thought was cached.
+redis_args=(
+  --port "$CAOS_STACK_REDIS_PORT"
+  --protected-mode no
+  --maxmemory "${CAOS_STACK_REDIS_MAXMEM:-2gb}"
+  --maxmemory-policy allkeys-lru
+)
 if [ "$CAOS_STACK_REDIS_PERSIST" = yes ]; then
   # appendonly keeps it durable to a hard kill, not just a clean shutdown-save.
   redis_args+=(--dir "$CAOS_STACK_STATE/redis" --appendonly yes)
@@ -196,9 +224,15 @@ done
 # placement, `container:<self>` — loopback is right for both. On the host they
 # get their own netns on a bridge, so runnerd must advertise a name that
 # resolves there; it also resolves from in here, via the stack's alias.
+#
+# CAOS_STACK_RUNNER_REDIS_ADDR is the same two-value shape for the same reason,
+# and defaults the same way: loopback is right wherever workers share this
+# netns, and the host placement overrides it with `caos-redis:<port>`. A worker
+# that finds it unset has no cache offered and must still do the work.
 if [ "$CAOS_STACK_RUNNERD" = yes ]; then
   start runnerd env \
     CAOS_SERVER_URL="${CAOS_STACK_RUNNER_SERVER_URL:-$SERVER_URL}" \
+    CAOS_WORKER_REDIS_ADDR="${CAOS_STACK_RUNNER_REDIS_ADDR:-$REDIS_ADDR}" \
     CAOS_DOCKER_BIN="${CAOS_DOCKER_BIN:-docker}" \
     CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-8}" \
     "$CAOS_STACK_BIN/runnerd"
