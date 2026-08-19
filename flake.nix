@@ -691,6 +691,10 @@
         #                working stack and not homework — so this is the strict
         #                gate for anything that runs against a stack it did not
         #                just bring up (design/one-stack-image.md).
+        #   caosd image-cleanup  dry-run bounded registry LRU and disposable
+        #                local-image cleanup; --execute briefly stops and
+        #                restores an idle stack. The current std seed is always
+        #                retained; see design/image-cleanup.md.
         #   caosd version  the caos revision THIS command was built from. Ask it
         #                before believing a bug report: a devShell that fails to
         #                build leaves direnv on the previous environment, so the
@@ -717,10 +721,10 @@
           # and runnerd actually changed (stage_bins).
           runtimeInputs = [
             pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.skopeo pkgs.gzip
-            pkgs.util-linux pkgs.diffutils
+            pkgs.util-linux pkgs.diffutils pkgs.gnugrep pkgs.findutils pkgs.jq
           ];
           text = ''
-            : "''${CAOS_DATA:=$PWD/.caos-data}"
+            : "''${CAOS_DATA:=''${XDG_CACHE_HOME:-$HOME/.cache}/caos}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
             export CAOS_DATA
             mkdir -p "$CAOS_DATA"
@@ -894,7 +898,7 @@
 
             usage() {
               echo "caosd ($CAOS_REV)"
-              echo "usage: caosd [up|down|reset|logs|std-build|std-check|version]"
+              echo "usage: caosd [up|down|reset|logs|std-build|std-check|image-cleanup|version]"
             }
 
             case "''${1:-up}" in
@@ -1010,6 +1014,10 @@
               ;;
             std-check)
               std_check
+              ;;
+            image-cleanup)
+              shift
+              bash ${./image-cleanup.sh} "$@"
               ;;
             *)
               echo "caosd: unknown command '$1'" >&2

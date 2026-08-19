@@ -178,6 +178,7 @@ caosd logs        tail the group's logs
 caosd reset       stop and wipe $CAOS_DATA
 caosd std-build   publish std to this stack's registry and git, then exit
 caosd std-check   verify what std references still exists; non-zero if not
+caosd image-cleanup  dry-run bounded registry LRU and local image cleanup
 ```
 
 **Die as a group.** Any member's death takes the group down, so a half-dead

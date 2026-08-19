@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -42,6 +42,16 @@ use crate::{Config, HttpError};
 /// Repository name converted images are pushed under. They're addressed by
 /// digest, so the name is arbitrary and fixed.
 const REGISTRY_REPO: &str = "caos";
+
+/// A stable tag whose link mtime is the manifest's durable last-used clock.
+/// Retagging the same immutable manifest changes no image bytes or digest, and
+/// works from nested test servers that share the host registry but not its
+/// filesystem or Redis.
+const IMAGE_USED_TAG_PREFIX: &str = "caos-used-";
+
+/// Avoid a registry write for every warm job while keeping a much tighter
+/// bound than image-cleanup's default multi-day retention window.
+const IMAGE_USED_REFRESH: Duration = Duration::from_secs(60 * 60);
 
 /// Prefix marking the `image` parameter as an ordinary docker reference rather
 /// than one of our git images (the default).
@@ -1379,32 +1389,37 @@ fn validate_docker_reference(reference: &str, allow_seeded: bool) -> Result<(), 
 /// git images (the default): convert it to a real image, push it to the registry,
 /// and return a digest reference into the registry.
 fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
-    if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
+    let reference = if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
         validate_docker_reference(reference, true).map_err(|e| HttpError::new(400, e))?;
-        return Ok(reference.to_string());
-    }
-    if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(HttpError::new(
-            400,
-            format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
-        ));
-    }
-    // The nested test stack (tests/lib/run-test.sh) runs on images the
-    // outer suite already built and pushed, so its server passes git images
-    // through unconverted: no OCI convert, no registry round-trip. The
-    // default keeps converting.
-    if std::env::var("CAOS_IMAGE_RESOLVE").as_deref() == Ok("none") {
-        return Ok(image.to_string());
-    }
-    // A git image tree, converted. NOT a flake: do not add a branch here that
-    // notices `flake.nix` + `flake.lock` and builds it. Doing so needs a builder
-    // resolved BY NAME out of an ambient library, which is the one thing the
-    // server must not have — it holds an arg tree, not a project tree, so it
-    // cannot resolve a dependency by descent the way a client can. A flake
-    // directory says `run --base:@=DEEP-DEPS/flake-builder --in:@=.` and the CLIENT
-    // evaluates it, so what arrives here is already an image (design/caos-expr.md).
-    convert_git_image(config, image)
-        .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))
+        reference.to_string()
+    } else {
+        if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(HttpError::new(
+                400,
+                format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
+            ));
+        }
+        // The nested test stack (tests/lib/run-test.sh) runs on images the
+        // outer suite already built and pushed, so its server passes git images
+        // through unconverted: no OCI convert, no registry round-trip. The
+        // default keeps converting.
+        if std::env::var("CAOS_IMAGE_RESOLVE").as_deref() == Ok("none") {
+            return Ok(image.to_string());
+        }
+        // A git image tree, converted. NOT a flake: do not add a branch here that
+        // notices `flake.nix` + `flake.lock` and builds it. Doing so needs a builder
+        // resolved BY NAME out of an ambient library, which is the one thing the
+        // server must not have — it holds an arg tree, not a project tree, so it
+        // cannot resolve a dependency by descent the way a client can. A flake
+        // directory says `run --base:@=DEEP-DEPS/flake-builder --in:@=.` and the CLIENT
+        // evaluates it, so what arrives here is already an image (design/caos-expr.md).
+        convert_git_image(config, image)
+            .map_err(|e| HttpError::new(500, format!("converting git image {image}: {e}")))?
+    };
+
+    mark_local_image_used(config, &reference)
+        .map_err(|e| HttpError::new(500, format!("recording image use for {reference}: {e}")))?;
+    Ok(reference)
 }
 
 /// The lock for one cache key, minted on first use. A redis cache read followed
@@ -1531,6 +1546,109 @@ fn image_ref(config: &Config, manifest_digest: &str) -> String {
     )
 }
 
+/// Return the digest when `reference` names this server's own registry repo.
+/// The push and pull names differ in the host placement (`caos-registry` from
+/// the server, `localhost` from Docker), so both spellings are local.
+fn local_registry_digest<'a>(
+    push_url: &str,
+    pull_host: &str,
+    reference: &'a str,
+) -> Option<&'a str> {
+    let (name, digest) = reference.rsplit_once('@')?;
+    let push = push_url.trim_end_matches('/');
+    let push_host = push
+        .strip_prefix("http://")
+        .or_else(|| push.strip_prefix("https://"))
+        .unwrap_or(push);
+    let push_name = format!("{push_host}/{REGISTRY_REPO}");
+    let pull_name = format!("{}/{REGISTRY_REPO}", pull_host.trim_end_matches('/'));
+    if name == push_name || name == pull_name {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
+fn image_used_tag(digest: &str) -> Result<String, String> {
+    let encoded = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("unsupported manifest digest {digest}"))?;
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err(format!("invalid manifest digest {digest}"));
+    }
+    Ok(format!("{IMAGE_USED_TAG_PREFIX}{encoded}"))
+}
+
+/// Retag a local immutable manifest under its stable usage tag. Distribution
+/// updates the tag link atomically, and its mtime is the cleanup clock. The
+/// memo is only a write throttle; the durable record remains in the registry.
+fn mark_local_image_used(config: &Config, reference: &str) -> Result<(), String> {
+    let Some(digest) = local_registry_digest(
+        &config.registry_push_url,
+        &config.registry_pull_host,
+        reference,
+    ) else {
+        return Ok(());
+    };
+    mark_manifest_used(config, digest)
+}
+
+fn mark_manifest_used(config: &Config, digest: &str) -> Result<(), String> {
+    static RECENT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let memo_key = format!("{} {digest}", config.registry_push_url);
+    let recent = RECENT.get_or_init(|| Mutex::new(HashMap::new()));
+    if recent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&memo_key)
+        .is_some_and(|at| at.elapsed() < IMAGE_USED_REFRESH)
+    {
+        return Ok(());
+    }
+
+    let tag = image_used_tag(digest)?;
+    let base = config.registry_push_url.trim_end_matches('/');
+    let source = format!("{base}/v2/{REGISTRY_REPO}/manifests/{digest}");
+    let accept = "application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.v2+json";
+    let response = minreq::get(&source)
+        .with_header("Accept", accept)
+        .send()
+        .map_err(|e| format!("GET {source}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "reading manifest {digest}: {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    let content_type = response
+        .headers
+        .get("content-type")
+        .cloned()
+        .ok_or_else(|| format!("manifest {digest} response has no Content-Type"))?;
+    let target = format!("{base}/v2/{REGISTRY_REPO}/manifests/{tag}");
+    let response = minreq::put(&target)
+        .with_header("Content-Type", content_type)
+        .with_body(response.as_bytes().to_vec())
+        .send()
+        .map_err(|e| format!("PUT {target}: {e}"))?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "tagging manifest {digest} as used: {} {}",
+            response.status_code, response.reason_phrase
+        ));
+    }
+    recent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(memo_key, Instant::now());
+    Ok(())
+}
+
 /// Copy a base image (`base_ref`, a bare docker reference) from its source
 /// registry into our own repo with skopeo, so its blobs are available for a
 /// converted git image to reference. Returns the base's manifest layers
@@ -1601,6 +1719,15 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
             resp.status_code, resp.reason_phrase
         ));
     }
+    let base_manifest_digest = resp
+        .headers
+        .get("docker-content-digest")
+        .cloned()
+        .unwrap_or_else(|| format!("sha256:{}", sha256_hex(resp.as_bytes())));
+    // A copied base is a registry artifact in its own right. Its functional
+    // `base-*` tag is a build memo, not a usage clock, so refresh the same
+    // stable usage tag as runnable images do.
+    mark_manifest_used(config, &base_manifest_digest)?;
     let manifest: serde_json::Value = serde_json::from_slice(resp.as_bytes())
         .map_err(|e| format!("parsing base manifest: {e}"))?;
     let layers = manifest["layers"]
@@ -2409,6 +2536,51 @@ mod single_flight_tests {
             second_outcome
         );
         drop(second_guard);
+    }
+}
+
+#[cfg(test)]
+mod image_usage_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_both_names_for_the_local_registry() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            local_registry_digest(
+                "http://caos-registry:5000",
+                "localhost:5000",
+                &format!("caos-registry:5000/caos@{digest}")
+            ),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            local_registry_digest(
+                "http://caos-registry:5000/",
+                "localhost:5000/",
+                &format!("localhost:5000/caos@{digest}")
+            ),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            local_registry_digest(
+                "http://caos-registry:5000",
+                "localhost:5000",
+                &format!("ghcr.io/example/caos@{digest}")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn usage_tag_is_stable_and_digest_specific() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(
+            image_used_tag(&digest).unwrap(),
+            format!("caos-used-{}", "b".repeat(64))
+        );
+        assert!(image_used_tag("sha256:short").is_err());
+        assert!(image_used_tag(&format!("sha512:{}", "b".repeat(64))).is_err());
     }
 }
 

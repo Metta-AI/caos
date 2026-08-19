@@ -18,8 +18,8 @@ of the relative path used here.
 nix develop
 
 # 1. Bring the stack up (redis + registry + caos server). Foreground; Ctrl-C
-#    stops it. Server state (the bare git repo) lives in ./.caos-data — override
-#    with CAOS_DATA. This also publishes the builtin stdlib on startup.
+#    stops it. Server state lives in $XDG_CACHE_HOME/caos (or ~/.cache/caos) —
+#    override with CAOS_DATA. This also publishes the builtin stdlib on startup.
 caosd up
 
 # 2. In another shell (also `nix develop`), add the server as the `caos` remote.

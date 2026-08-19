@@ -77,7 +77,7 @@ export CAOS_SERVER_URL=$SERVER_URL
 # shape a user has. `caos-cli` builds objects here (in-process via gix); `git
 # push` ships them to the server. Reused across runs (git init is idempotent).
 # CAOS_CLIENT_REPO relocates it off PROJECT (which is read-only when caosd runs
-# us from the store); caosd points it at $CAOS_DATA so it persists per-project.
+# us from the store); caosd points it at $CAOS_DATA so it persists across worktrees.
 CLIENT=${CAOS_CLIENT_REPO:-$PROJECT/.caos-dev/client-repo}
 git init -q "$CLIENT"
 # When the caller says this repo dies with the process (caos-tools/build.sh runs

@@ -86,9 +86,9 @@ reduce)
   caos put "$R" /cas/reduced
 
   # THE BUILD'S OWN INPUTS, and nothing else. `make` compiles the workspace,
-  # runs build-builtins.sh (which reads std/ and crates/worker-common), and
-  # installs stack/serve and test-stack/worker into the image. It reads
-  # nothing else in the tree.
+  # runs build-builtins.sh (which reads std/ and crates/worker-common), embeds
+  # image-cleanup.sh in caosd, and installs stack/serve and test-stack/worker
+  # into the image. It reads nothing else in the tree.
   #
   # It used to get the WHOLE tree, so a one-line edit to tests/<name>/cli.sh —
   # or to a design doc, or this comment — recompiled the workspace,
@@ -106,7 +106,7 @@ reduce)
   S=/tmp/src
   rm -rf "$S"; mkdir -p "$S"
   for e in Cargo.toml Cargo.lock rust-toolchain.toml \
-           crates std stack test-stack build-builtins.sh; do
+           crates std stack test-stack build-builtins.sh image-cleanup.sh; do
     if [ -e "$e" ]; then cp -RL --preserve=mode "$e" "$S/$e"; fi
   done
   caos put "$S" /cas/src
