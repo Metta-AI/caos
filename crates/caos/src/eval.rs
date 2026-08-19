@@ -179,6 +179,31 @@ pub(crate) fn eval_path(
     caos_eval::eval_path(&host, start_tree, path)
 }
 
+/// Assemble a `.caos-secrets` `reader=` value as a partial curry ArgTree.
+///
+/// A reader omits the `curry` verb because the key supplies it; everything on
+/// the physical line is otherwise parsed and resolved by the ordinary
+/// `.caos-expr` curry grammar. In particular, `:@=` paths are looked up in the
+/// pinned source tree, never in the host filesystem. The empty secret store is
+/// intentional: resolving a grant must not recursively mark that grant.
+pub(crate) fn assemble_reader(
+    t: &dyn Transport,
+    input_tree: &str,
+    reader: &str,
+) -> Result<String, String> {
+    // Apply the pinned tree's root expression first, exactly as the old
+    // path-only reader walk did. This exposes generated mounts such as
+    // `DEEP-DEPS/` while keeping every subsequent `:@=` inside that snapshot.
+    let (input_kind, input_tree) = eval_path(t, input_tree, "", &[])?;
+    if input_kind != "tree" {
+        return Err(format!(
+            "reader source evaluated to a {input_kind}, expected a tree"
+        ));
+    }
+    let host = ClientEvalHost { t, store: &[] };
+    caos_eval::assemble_curry(&host, &input_tree, reader)
+}
+
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
 /// tree and descend to `DEEP-DEPS/<name>`.
 ///

@@ -25,7 +25,7 @@ printf '%s\n' \
   'name=anthropic-api-key' \
   "value=$ANTHROPIC_API_KEY" \
   'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-step' \
+  'reader=--base:@=DEEP-DEPS/llm-step' \
   > .caos-secrets/anthropic-api-key
 
 # The human commit carries the client's git identity; pin one so the test

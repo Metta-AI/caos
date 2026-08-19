@@ -69,7 +69,7 @@ llm_test_setup() {
     'name=anthropic-api-key' \
     'value=test-key' \
     'entropy=0123456789abcdef0123456789abcdef' \
-    'reader=DEEP-DEPS/llm-step' \
+    'reader=--base:@=DEEP-DEPS/llm-step' \
     > .caos-secrets/anthropic-api-key
 }
 
