@@ -3,12 +3,13 @@
 //! A **WorkRequest** (`SPEC.md`) is an **ArgTree** to run plus runtime context
 //! (an ancestor `stack` for cycle detection and an optional trace id) that is
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
-//! hash *is* the cache key with nothing keyed alongside it: the worker image, the
-//! standard library `std`, and the cache-busting `salt` all ride inside it under
-//! reserved `base`/`std`/`salt` entries. `/run?req=<argTreeHash>`
-//! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
-//! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
-//! the registry) → dispatch through the runner rendezvous ([`crate::runner`]:
+//! hash *is* the cache key with nothing keyed alongside it: the worker image,
+//! standard library `std`, and cache-busting `salt` all ride inside it under
+//! reserved entries. `/run?req=<argTreeHash>`
+//! reads it, then: cache lookup (Redis) → run-cycle detection → image
+//! resolution (a digest-pinned `docker://` ref used as-is, or a git-docker image
+//! converted and pushed to the registry) → dispatch through the runner
+//! rendezvous ([`crate::runner`]:
 //! the job is matched to a long-polling runner, which posts back
 //! `"<type> <hash>"`) — or `"promise <hash>"`, a map-then continuation the
 //! worker left behind instead of a value, which [`resolve_promise`] resolves
@@ -103,14 +104,14 @@ struct WorkRequest<'a> {
 /// is the ArgTree hash.)
 ///
 /// The ArgTree being a content-addressed object means its hash *is* the cache key
-/// (it captures everything — image, std, salt and the rest) and the rendezvous
-/// id: an external run also pins `refs/caos/res/<argTreeHash>` at the result, so a
-/// client can fetch it by ref. Most worker sub-runs are promise resolutions the
-/// server performs itself ([`run_work_request`] recursion); `caos run-async` is
-/// the one worker command that sends this same endpoint and disconnects without
-/// waiting for the result. That dispatch is deliberately a new top-level run:
-/// it has an empty run stack, so stack-based cycle detection does not cross the
-/// detached-work boundary.
+/// (it captures everything — image, std, salt and the rest)
+/// and the rendezvous id: an external run also pins
+/// `refs/caos/res/<argTreeHash>` at the result, so a client can fetch it by ref.
+/// Most worker sub-runs are promise resolutions the server performs itself
+/// ([`run_work_request`] recursion); `caos run-async` is the one worker command
+/// that sends this same endpoint and disconnects without waiting for the result.
+/// That dispatch is deliberately a new top-level run: it has an empty run stack,
+/// so stack-based cycle detection does not cross the detached-work boundary.
 pub(crate) fn run(
     config: &Config,
     query: &str,
@@ -190,11 +191,10 @@ fn run_work_request_inner(
         trace_id,
         secrets: _,
     } = *request;
-    // Unpack the ArgTree's two reserved entries: the worker `base` (an embedded
-    // tree for a git image, a ref blob for `docker://`) and the cache-busting
-    // `salt`. Both are part of the ArgTree — hence part of the cache key —
-    // threaded into the worker and inherited by any promise sub-runs this request
-    // leaves behind.
+    // Unpack the ArgTree's reserved worker `base` (an embedded tree for a git
+    // image, a ref blob for `docker://`) and cache-busting `salt`. Both are part
+    // of the ArgTree — hence part of the cache key — and inherited by any
+    // promise sub-runs this request leaves behind.
     let (image, salt) = read_arg_tree(config, arg_tree)?;
     let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
         Some(args_entries(config, arg_tree)?)
@@ -1060,10 +1060,10 @@ fn continuation_result(
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
 /// any curry layers and build the ArgTree — worker image folded in under its
-/// reserved `base` entry, salt under `salt`, std under `std` — whose hash IS the
-/// request, built server-side byte-identically to what a client would build, so
-/// the ArgTree hash (and cache key) is the same no matter who assembles it — and
-/// send it through [`run_work_request`]. Returns `"<type> <hash>"`.
+/// reserved `base` entry, salt under `salt`, and std under `std` — whose hash IS
+/// the request, built server-side byte-identically to what a client would build,
+/// so the ArgTree hash (and cache key) is the same no matter who assembles it —
+/// and send it through [`run_work_request`]. Returns `"<type> <hash>"`.
 #[allow(clippy::too_many_arguments)] // the run context travels together
 fn run_image(
     config: &Config,
@@ -1337,19 +1337,50 @@ fn pin_result_in(git_dir: &str, refname: &str, hash: &str) -> Result<(), HttpErr
     ))
 }
 
+/// Require an immutable Docker distribution reference. `name:tag@digest` is
+/// accepted because Docker resolves by the digest; a bare tag or digest-like
+/// image id is not a registry locator pinned by the manifest digest required by
+/// the spec.
+fn validate_docker_reference(reference: &str, allow_seeded: bool) -> Result<(), String> {
+    if allow_seeded && (reference == "seeded" || reference.starts_with("seeded-")) {
+        return Ok(());
+    }
+    if reference.is_empty() || reference.starts_with('-') {
+        return Err(format!("invalid docker image: {reference:?}"));
+    }
+    let Some((name, digest)) = reference.rsplit_once('@') else {
+        return Err(format!(
+            "docker image {reference:?} is mutable; use <name>@sha256:<64 lowercase hex digits>"
+        ));
+    };
+    let Some(encoded) = digest.strip_prefix("sha256:") else {
+        return Err(format!(
+            "docker image {reference:?} is not pinned by a sha256 digest"
+        ));
+    };
+    if name.is_empty()
+        || encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "invalid docker digest reference {reference:?}; expected <name>@sha256:<64 lowercase hex digits>"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the `image` parameter to a reference the host docker daemon can run.
 ///
-/// `docker://<ref>` is an ordinary docker reference, used as-is. Anything else is
-/// one of our git images (the default): convert it to a real image, push it to
-/// the registry, and return a digest reference into the registry.
+/// `docker://<ref>` is a digest-pinned docker reference, used as-is. The only
+/// non-digest exceptions are the internal `seeded*` rendezvous sentinels, which
+/// are answered by seed runners and never pulled. Anything else is one of our
+/// git images (the default): convert it to a real image, push it to the registry,
+/// and return a digest reference into the registry.
 fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
-        if reference.is_empty() || reference.starts_with('-') {
-            return Err(HttpError::new(
-                400,
-                format!("invalid docker image: {reference:?}"),
-            ));
-        }
+        validate_docker_reference(reference, true).map_err(|e| HttpError::new(400, e))?;
         return Ok(reference.to_string());
     }
     if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1461,9 +1492,7 @@ fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> 
             .map_err(|e| format!("base ref not UTF-8: {e}"))?;
         let base_ref = base_ref.trim();
         let base_ref = base_ref.strip_prefix(DOCKER_SCHEME).unwrap_or(base_ref);
-        if base_ref.is_empty() {
-            return Err("base blob is empty".to_string());
-        }
+        validate_docker_reference(base_ref, false)?;
         let (base_layers, base_diff_ids) = fetch_base(config, base_ref)?;
         diff_ids.extend(base_diff_ids);
         manifest_layers.extend(base_layers);
