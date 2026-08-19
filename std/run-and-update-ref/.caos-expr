@@ -1,4 +1,5 @@
 # Build this worker from its Rust project. Its two stages share one binary:
 # start exact-request-tail-calls `subreq`; finish appends task status to the
-# target conversation ref and passes the result through.
-run --base:@=DEEP-DEPS/rustc --src:@=.
+# target conversation ref and passes the result through. It selects git-runner
+# because the finish stage updates that ref with ordinary Git.
+run --base:@=DEEP-DEPS/rustc --src:@=. --output-runner:@=DEEP-DEPS/git-runner

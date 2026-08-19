@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Spliced by rustc at `worker-common/` (its curried --worker-common arg).
-worker-common = { path = "worker-common" }
+worker-common = { path = "worker-common", features = ["git"] }
 # Spliced by rustc at `llm-client/` (the --dep0 mount, DEEP-DEPS/llm-client).
 llm-client = { path = "llm-client" }
 serde_json = "1"

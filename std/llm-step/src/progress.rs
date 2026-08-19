@@ -1,16 +1,17 @@
 //! Append durable events to a conversation's one authoritative ref.
 //!
-//! The worker image has no `git`, so this module uses the server's object API
-//! and exact-ref compare-and-append endpoint. Event objects are stored before
-//! the ref moves. A successful return therefore means the event is reachable
-//! from `refs/caos/v2/conversations/<id>/head`; failures are never downgraded
-//! to observability warnings.
+//! Event objects use the server's content-addressed object API; ref reads and
+//! compare-and-swap writes use ordinary Git smart HTTP from this worker's
+//! Git-bearing runtime. A successful return therefore means the event is
+//! reachable from `refs/caos/v2/conversations/<id>/head`; failures are never
+//! downgraded to observability warnings.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
+use worker_common::git::{RefUpdate, Repo};
 
 use crate::validate_hash;
 
@@ -45,6 +46,14 @@ type CommitCache = Mutex<HashMap<(String, String), RemoteCommit>>;
 // retaining each parsed commit for that process bounds repeat spine reads to
 // newly appended events instead of another HTTP GET for the entire history.
 static COMMIT_CACHE: OnceLock<CommitCache> = OnceLock::new();
+static GIT_REPO: OnceLock<Result<Repo, String>> = OnceLock::new();
+
+fn git_repo() -> Result<&'static Repo, String> {
+    GIT_REPO
+        .get_or_init(|| Repo::new("llm-step-git"))
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 /// One chat event on the canonical first-parent conversation spine.
 #[derive(Debug, Clone)]
@@ -98,10 +107,9 @@ pub fn create_agent_conversation(
         (archived_ref.as_str(), None, None),
     ];
 
-    match push_transaction(&base, &updates) {
-        Ok(TransactionResult::Updated) => Ok(true),
-        Ok(TransactionResult::Rejected) => Ok(false),
-        Err(error) => match read_ref(&base, &head_ref)? {
+    match push_transaction(&updates) {
+        Ok(()) => Ok(true),
+        Err(error) => match read_ref(&head_ref)? {
             Some(_) => Ok(false),
             None => Err(error),
         },
@@ -161,7 +169,7 @@ pub fn agent_title(prompt: &str) -> String {
 /// may have advanced the child; its root and admission remain first.
 pub fn agent_request(conversation: &str, prompt: &str) -> Result<Option<String>, String> {
     let refname = conversation_ref(conversation)?;
-    if read_ref(&server_base()?, &refname)?.is_none() {
+    if read_ref(&refname)?.is_none() {
         return Ok(None);
     }
     let log = conversation_log(conversation)?;
@@ -194,45 +202,16 @@ pub fn agent_request(conversation: &str, prompt: &str) -> Result<Option<String>,
     Ok(Some(request.to_string()))
 }
 
-enum PushResult {
-    Updated,
-    Rejected(String),
-}
-
-enum TransactionResult {
-    Updated,
-    Rejected,
-}
-
-fn push_transaction(
-    base: &str,
-    updates: &[(&str, Option<&str>, Option<&str>)],
-) -> Result<TransactionResult, String> {
+fn push_transaction(updates: &[(&str, Option<&str>, Option<&str>)]) -> Result<(), String> {
     let updates = updates
         .iter()
-        .map(|(refname, expected, new)| {
-            serde_json::json!({"ref": refname, "expected": expected, "new": new})
+        .map(|(refname, expected, new)| RefUpdate {
+            refname,
+            expected: *expected,
+            new: *new,
         })
         .collect::<Vec<_>>();
-    let body = serde_json::to_vec(&serde_json::json!({"updates": updates}))
-        .map_err(|error| format!("serializing ref transaction: {error}"))?;
-    let url = format!("{base}/ref/transaction");
-    let response = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|error| format!("POST {url}: {error}"))?;
-    match response.status_code {
-        200..=299 => Ok(TransactionResult::Updated),
-        409 => Ok(TransactionResult::Rejected),
-        _ => Err(format!(
-            "POST {url}: {} {}: {}",
-            response.status_code,
-            response.reason_phrase,
-            String::from_utf8_lossy(response.as_bytes()).trim()
-        )),
-    }
+    git_repo()?.push_atomic(&updates)
 }
 
 fn utf8_ref_key(prefix: &str, value: &str) -> String {
@@ -260,8 +239,8 @@ pub fn append_event_at_head(
     validate_hash(tree, "event tree")?;
     validate_event(event)?;
     let base = server_base()?;
-    let observed = read_ref(&base, &refname)?
-        .ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
+    let observed =
+        read_ref(&refname)?.ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
     if observed != expected_head {
         return Ok(ConditionalAppend::HeadChanged(observed));
     }
@@ -293,8 +272,8 @@ pub fn append_event_at_head_with_parent(
     }
     validate_event(event)?;
     let base = server_base()?;
-    let observed = read_ref(&base, &refname)?
-        .ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
+    let observed =
+        read_ref(&refname)?.ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
     if observed != expected_head {
         return Ok(ConditionalAppend::HeadChanged(observed));
     }
@@ -326,23 +305,10 @@ fn append_event_at_head_inner(
         })
     };
 
-    match push_ref(base, refname, Some(expected_head), &candidate) {
-        Ok(PushResult::Updated) => Ok(appended()),
-        Ok(PushResult::Rejected(report)) => {
-            let observed = read_ref(base, refname)?
-                .ok_or_else(|| format!("conversation ref {refname} disappeared during append"))?;
-            if observed == candidate || first_parent_contains(base, &observed, &candidate)? {
-                Ok(appended())
-            } else if observed != expected_head {
-                Ok(ConditionalAppend::HeadChanged(observed))
-            } else {
-                Err(format!(
-                    "server rejected update of {refname} without a CAS race: {report}"
-                ))
-            }
-        }
+    match push_ref(refname, Some(expected_head), &candidate) {
+        Ok(()) => Ok(appended()),
         Err(error) => {
-            let observed = read_ref(base, refname).map_err(|read_error| {
+            let observed = read_ref(refname).map_err(|read_error| {
                 format!(
                     "pushing {refname} failed ({error}); rereading it also failed: {read_error}"
                 )
@@ -428,8 +394,8 @@ fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, Strin
 pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
     let refname = conversation_ref(conversation)?;
     let base = server_base()?;
-    let head = read_ref(&base, &refname)?
-        .ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
+    let head =
+        read_ref(&refname)?.ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
     let mut newest_first = Vec::new();
     let mut current = head.clone();
 
@@ -531,11 +497,12 @@ pub enum RetryTree {
 }
 
 /// Reconcile a tool's proposed workspace tree with changes appended to the
-/// conversation after the tool started. Git itself is not present in the
-/// llm-step image, so this performs the tree-level part of a three-way merge
-/// directly against the server's object store. Changes to different paths
-/// merge recursively; two changes to the same entry become a durable conflict
-/// disposition so the caller can retain the proposal as an event parent.
+/// conversation after the tool started. This existing tree-level merge stays
+/// directly against the server's object store; Git in this worker is transport
+/// for mutable refs, not a second workspace implementation. Changes to
+/// different paths merge recursively; two changes to the same entry become a
+/// durable conflict disposition so the caller can retain the proposal as an
+/// event parent.
 pub fn retry_tree(base: &str, proposed: &str, current: &str) -> Result<RetryTree, String> {
     if current == base {
         return Ok(RetryTree::Merged(proposed.to_string()));
@@ -1043,83 +1010,18 @@ fn object_status(url: &str, status: i32, reason: &str) -> Result<bool, String> {
     }
 }
 
-fn push_ref(
-    base: &str,
-    refname: &str,
-    expected: Option<&str>,
-    new_hash: &str,
-) -> Result<PushResult, String> {
+fn push_ref(refname: &str, expected: Option<&str>, new_hash: &str) -> Result<(), String> {
     if let Some(expected) = expected {
         validate_hash(expected, "expected ref")?;
     }
     validate_hash(new_hash, "new ref")?;
 
-    let body = serde_json::to_vec(&serde_json::json!({
-        "ref": refname,
-        "expected": expected,
-        "new": new_hash,
-    }))
-    .map_err(|e| format!("serializing ref append: {e}"))?;
-    let url = format!("{base}/ref/append");
-    let resp = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    if (200..300).contains(&resp.status_code) {
-        Ok(PushResult::Updated)
-    } else if resp.status_code == 409 {
-        Ok(PushResult::Rejected(
-            String::from_utf8_lossy(resp.as_bytes()).trim().to_string(),
-        ))
-    } else {
-        Err(format!(
-            "POST {url}: {} {}: {}",
-            resp.status_code,
-            resp.reason_phrase,
-            String::from_utf8_lossy(resp.as_bytes()).trim()
-        ))
-    }
+    git_repo()?.push_ref(refname, expected, new_hash)
 }
 
-/// Read exactly `refname`, without downloading the repository-wide Git ref
-/// advertisement.
-fn read_ref(base: &str, refname: &str) -> Result<Option<String>, String> {
-    let body = serde_json::to_vec(&serde_json::json!({"ref": refname}))
-        .map_err(|e| format!("serializing ref read: {e}"))?;
-    let url = format!("{base}/ref/read");
-    let resp = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    if resp.status_code == 404 {
-        return Ok(None);
-    }
-    if !(200..300).contains(&resp.status_code) {
-        return Err(format!(
-            "POST {url}: {} {}: {}",
-            resp.status_code,
-            resp.reason_phrase,
-            String::from_utf8_lossy(resp.as_bytes()).trim()
-        ));
-    }
-    let hash = resp
-        .as_str()
-        .map_err(|e| format!("POST {url}: {e}"))?
-        .trim();
-    validate_hash(hash, "remote ref")?;
-    Ok(Some(hash.to_string()))
-}
-
-/// Read the exact result ref for a top-level request. Independent-work
-/// reconciliation uses absence as proof that a terminal status has not yet
-/// converged to an addressable result and must be dispatched again.
-pub(crate) fn result_ref(task: &str) -> Result<Option<String>, String> {
-    validate_hash(task, "async task")?;
-    read_ref(&server_base()?, &format!("refs/caos/res/{task}"))
+/// Read exactly one ref through ordinary Git protocol-v2 fetch.
+fn read_ref(refname: &str) -> Result<Option<String>, String> {
+    git_repo()?.read_ref(refname)
 }
 
 #[cfg(test)]

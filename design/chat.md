@@ -1,6 +1,6 @@
 # Chat: durable conversation log
 
-**Status:** implemented by this stack except for the items under Deferred work.
+**Status:** implemented except for the items under Deferred work.
 
 Chat v2 is selected solely by the `refs/caos/v2/` namespace. Events contain no
 version field. Existing unversioned chat refs remain untouched and invisible to
@@ -29,10 +29,9 @@ and reject a missing or inconsistent root rather than guessing where ordinary
 Git history begins. Writers validate new events before appending them, and
 readers fail loudly if an invalid boundary reaches the log.
 
-Writers advance the head with an exact compare-and-swap (CAS). The server
-accepts an update only when the expected head is current and is on the new
-head's first-parent history; raw Git pushes and exact-ref appends share this
-storage-level validator. Commit messages and trees are opaque to the server.
+Writers advance the head with an exact compare-and-swap (CAS): ordinary
+`git push --force-with-lease` names the head they observed. Commit messages,
+trees, and the append-only event discipline are opaque to the server.
 A losing writer reloads the canonical head and reconciles according to the
 event: text-only events can be rebuilt on the new tip, while independent
 workspace changes require a three-way merge. There is deliberately no generic
@@ -72,11 +71,11 @@ refs/caos/v2/users/<user-key>/conversations/active/<conversation-key>
 refs/caos/v2/users/<user-key>/conversations/archived/<conversation-key>
 ```
 
-Only this namespace participates in discovery, following, and writes. The
-server structurally treats every `refs/caos/<path>/head` as an append-only
-commit log; the agent client assigns conversation meaning to this particular
-one. Clients coordinate title and membership refs with atomic leases. The
-reader does not parse, rename, import, or republish the old unversioned layout.
+Only this namespace participates in discovery, following, and writes. Clients
+assign conversation meaning and append-only discipline to these ordinary Git
+refs; the server does not. Clients coordinate title and membership refs with
+atomic leases. The reader does not parse, rename, import, or republish the old
+unversioned layout.
 
 The head is durable execution state. Title and membership refs support the UI
 only. A single case-sensitive user identity is used for message attribution and
@@ -139,14 +138,14 @@ To append event `B` to canonical head `A` at ref `F`:
 
 1. Build `B` with first parent `A`.
 2. Upload its closed object graph.
-3. Request the exact update `(F, expected=A, new=B)`.
-4. The client validates the event envelopes. The server validates connectivity
-   and the first-parent relationship, then advances `F` only if it is still `A`.
+3. Run `git push --force-with-lease=F:A B:F`.
+4. The client validates the event envelopes and first-parent relationship; Git
+   advances `F` only if it is still `A`.
 
-The remote ref is authoritative; a local ref is only a cache. The server rejects
-append-only-head deletion, reset, or an update that does not append along the
-first-parent spine. Exact-ref updates and raw receive-pack use the same Rust
-ancestry validator. Conversation writers enforce that an update to an existing
+The remote ref is authoritative; a local ref is only a cache. The server accepts
+ordinary Git reset and deletion operations: append-only history is a client
+protocol invariant, not storage policy. Conversation writers enforce that an
+update extends the observed first-parent spine and that an update to an existing
 head introduces neither `base` nor `forked_from`; replay validates that boundary
 again.
 If an append response is lost, finding the candidate at the observed tip or on
@@ -282,19 +281,21 @@ no state exists for `Q`, `llm-step` first appends
 without waiting. Repeating the same tool request refolds `Q` and does not reset
 a terminal task to pending.
 
-`run-and-update-ref` executes the exact subrequest `R`. Its finish stage
-CAS-appends a tree-neutral `complete` or `failed` event for `Q`, retrying on a
-new canonical head. Success returns `R`'s ordinary result unchanged; a caught
-failure returns a small failure result after recording the event. The
-conversation stores neither the subrequest nor its output payload.
+`run-and-update-ref` executes the exact subrequest `R`. Its finish stage first
+makes the result addressable, then CAS-appends a tree-neutral `complete` or
+`failed` event containing both `Q` and that result object ID, retrying on a new
+canonical head. Success returns `R`'s ordinary result unchanged; a caught
+failure returns the same small failure result named by its event. The
+conversation stores neither the subrequest nor its output payload, only its
+content address.
 
 At `llm-step` entry and foreground terminal boundaries, recovery considers each
-task independently. A pending `Q` is reissued. A terminal `Q` is converged only
-when exact `refs/caos/res/Q` is addressable; otherwise it is reissued to close
-the crash window between the terminal chat event and result publication. A
-different outcome from a retry is appended, and the newest terminal event for
-`Q` wins. Before any redispatch, `llm-step` opens `Q`, validates its subrequest,
-and proves its recorded `target-ref` is this conversation's `F`.
+task independently. A pending `Q` is reissued. A terminal event is already
+converged because it carries the exact result object ID and is appended only
+after that object exists; it never needs a separate result-ref lookup. If
+concurrent executions publish different terminal outcomes, the newest terminal
+event for `Q` wins. Before any redispatch, `llm-step` opens `Q`, validates its
+subrequest, and proves its recorded `target-ref` is this conversation's `F`.
 
 `spawn_agent` atomically creates an owner-indexed child conversation on a clean
 snapshot descended from the parent workspace. Its transcript starts at its own
@@ -341,10 +342,8 @@ conversation list.
   choose a single membership policy for line-client appends. Move the remaining
   synchronous Git/network paths off the TUI thread and separate frequent
   exact-head following from broader sidebar discovery.
-- **Long histories and repair.** Cache validated event suffixes and folded
-  projections by canonical head instead of rebuilding the full spine after
-  every change. Extend startup repair to validate event history back to the
-  explicit root boundary without scanning unrelated Git history.
+- **Long histories.** Cache validated event suffixes and folded projections by
+  canonical head instead of rebuilding the full spine after every change.
 - **Retention and scale.** Define bounded retention for result refs and server
   reflogs without breaking request-object negotiation or the documented repair
   window. Shard presentation refs if aggregate advertisement size becomes

@@ -1461,14 +1461,13 @@ where
     Err("conversation kept changing while recording async task pending".to_string())
 }
 
-fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
+fn ensure_async_status(cfg: &Config, task: &str) -> Result<async_work::TaskState, String> {
     validate_run_hash(task)?;
     let conversation = conversation(cfg)?;
     let log = progress::conversation_log(conversation)?;
-    if let Some(status) =
-        async_work::task_status(log.events.iter().map(|event| &event.value), task)?
+    if let Some(state) = async_work::task_status(log.events.iter().map(|event| &event.value), task)?
     {
-        return Ok(status);
+        return Ok(state);
     }
     let tree = log
         .events
@@ -1476,17 +1475,16 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
         .map(|event| event.tree.clone())
         .ok_or("conversation has no events")?;
     let event = json!({"async": {"task": task, "status": "pending"}});
-    let mut observed_status = None;
+    let mut observed_state = None;
     retry_pending_append(
         &log.head,
         &tree,
         |head, workspace| progress::append_event_at_head(conversation, head, &event, workspace),
         || {
             let log = progress::conversation_log(conversation)?;
-            let status =
-                async_work::task_status(log.events.iter().map(|event| &event.value), task)?;
-            if let Some(status) = status {
-                observed_status = Some(status);
+            let state = async_work::task_status(log.events.iter().map(|event| &event.value), task)?;
+            if let Some(state) = state {
+                observed_state = Some(state);
                 return Ok(ReloadedPending {
                     head: log.head,
                     workspace: None,
@@ -1503,14 +1501,19 @@ fn ensure_async_status(cfg: &Config, task: &str) -> Result<String, String> {
             })
         },
     )?;
-    Ok(observed_status.unwrap_or_else(|| "pending".to_string()))
+    Ok(observed_state.unwrap_or_else(|| async_work::TaskState {
+        task: task.to_string(),
+        status: "pending".to_string(),
+        result: None,
+        event_index: log.events.len(),
+    }))
 }
 
-/// Re-admit pending Qs and terminal Qs whose exact result ref is still absent.
-/// The latter closes the crash window between recording `complete`/`failed`
-/// and the server pinning `refs/caos/res/Q`. Failures are warnings: the durable
-/// state remains on F and a later invocation retries the same Q. Validation
-/// inside `readmit_task` prevents a forged event from targeting another ref.
+/// Re-admit pending Qs. A terminal event already carries its addressable result
+/// object id, so it is complete without consulting a separate result ref.
+/// Failures are warnings: the durable pending state remains on F and a later
+/// invocation retries the same Q. Validation inside `readmit_task` prevents a
+/// forged event from targeting another ref.
 fn reconcile_async_tasks(cfg: &Config, log: &progress::ConversationLog) -> Result<(), String> {
     let tasks = async_work::tasks(log.events.iter().map(|event| &event.value));
     if tasks.is_empty() {
@@ -1518,7 +1521,7 @@ fn reconcile_async_tasks(cfg: &Config, log: &progress::ConversationLog) -> Resul
     }
     let conversation = conversation(cfg)?;
     for state in tasks {
-        if !async_work::task_needs_dispatch(&state.task, &state.status) {
+        if state.status != "pending" {
             continue;
         }
         if let Err(error) = async_work::readmit_task(&state.task, conversation) {
@@ -1632,9 +1635,13 @@ fn event_messages(
             .into_iter()
             .filter(|state| matches!(state.status.as_str(), "complete" | "failed"))
             .map(|state| {
+                let result = state
+                    .result
+                    .as_deref()
+                    .expect("validated terminal async state has a result");
                 let notice = user_text(&format!(
-                    "Independent task {} is {}. Its result is addressed by that task hash.",
-                    state.task, state.status
+                    "Independent task {} is {}. Its result is {}.",
+                    state.task, state.status, result
                 ));
                 (state.event_index, notice)
             })
@@ -2442,16 +2449,17 @@ mod tests {
     fn terminal_async_notice_stays_in_the_prompt_prefix_after_a_response() {
         let run = "b".repeat(40);
         let task = "c".repeat(40);
+        let result = "d".repeat(40);
         let mut events = vec![
             json!({"author":"user","content":"start"}),
             json!({"request":run,"round":0,"response":[{"type":"text","text":"working"}]}),
-            json!({"async":{"task":task,"status":"complete"}}),
+            json!({"async":{"task":task,"status":"complete","result":result}}),
         ];
         let before_response = event_messages(&log(events.clone()), true).unwrap();
         assert!(before_response.iter().any(|message| {
             message["content"]
                 .as_str()
-                .is_some_and(|text| text.contains("Independent task"))
+                .is_some_and(|text| text.contains("Independent task") && text.contains(&result))
         }));
 
         events.push(json!({

@@ -164,12 +164,12 @@ Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
-| `POST /ref/read`, `POST /ref/append` | Exact ref lookup and first-parent compare-and-append, used by durable event logs without downloading every advertised ref. |
 
 The git transport is what makes the server a `caos` remote: `git http-backend`
-runs `upload-pack`/`receive-pack` over the same `/git` repo, with hooks intact
-(so a `post-receive` trigger is a natural future evolution). The dedicated repo
-is created with `http.receivepack=true` (to accept pushes) and
+runs `upload-pack`/`receive-pack` over the same `/git` repo. CAOS installs no
+ref-policy hooks: clients own any naming, ancestry, and update discipline above
+ordinary Git's atomic ref operations. The dedicated repo is created with
+`http.receivepack=true` (to accept pushes) and
 `uploadpack.allowAnySHA1InWant=true` (so a client can `git fetch` a result by
 its bare hash; `/object` itself never needs that flag).
 
@@ -220,10 +220,11 @@ match on the worker alongside the rest, and a worker, seeing its args at
    the children in parallel, then `then` — through this same pipeline, so
    sub-runs are cached, cycle-checked, and may themselves promise;
 8. **cache** the resolved result, and for an **external** run (one that arrived
-   over HTTP) pin `refs/caos/res/<argTreeHash>` at it, for durability and as a
-   fetch/watch point. Result refs are hidden from upload-pack/fetch
-   advertisements, but receive-pack can negotiate them and exact
-   `POST /ref/read` lookup remains available. Sub-runs set no ref.
+   over HTTP) pin `refs/caos/res/<argTreeHash>` at it as a durability and Git
+   negotiation anchor. Result refs are hidden from upload-pack/fetch
+   advertisements but remain visible to receive-pack negotiation. They are not
+   a result-query API; callers already receive the result hash. Sub-runs set no
+   ref.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
@@ -677,6 +678,6 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   `buildInputs`/`nativeBuildInputs` in `flake.nix`.
 - **Cleanup (dev)**: transient `refs/caos/req/*` are pruned after ten minutes.
   Durable `refs/caos/res/*` are hidden from upload-pack/fetch advertisements but
-  remain visible to receive-pack negotiation and exact `/ref/read`; they still
-  accumulate (content-addressed, so they dedup). A deployment that does not need
-  indefinite result lookup should define a retention policy and run `git gc`.
+  remain visible to receive-pack negotiation; they still accumulate
+  (content-addressed, so they dedup). A deployment that does not need indefinite
+  result retention should define a policy and run `git gc`.

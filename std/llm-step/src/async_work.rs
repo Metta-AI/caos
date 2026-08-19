@@ -7,7 +7,7 @@
 //! ```
 //!
 //! record `{async: {task: Q, status: pending}}` on the conversation, then
-//! dispatch Q without waiting. Q itself names the eventual result.
+//! dispatch Q without waiting. Its terminal event records the result object id.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -49,7 +49,7 @@ pub fn queue_call<S>(
     ensure_status: S,
 ) -> Result<Value, String>
 where
-    S: FnOnce(&str) -> Result<String, String>,
+    S: FnOnce(&str) -> Result<TaskState, String>,
 {
     let id = call
         .get("id")
@@ -87,7 +87,7 @@ pub fn queue_request<S>(
     ensure_status: S,
 ) -> Result<Value, String>
 where
-    S: FnOnce(&str) -> Result<String, String>,
+    S: FnOnce(&str) -> Result<TaskState, String>,
 {
     if let Err(error) = validate_subrequest(subrequest) {
         return Ok(error_block(call_id, &error));
@@ -108,29 +108,25 @@ where
     )?;
     validate_hash(&task, "async task")?;
 
-    let status = ensure_status(&task)?;
-    validate_status(&status)?;
+    let state = ensure_status(&task)?;
+    validate_state(&state.task, &state.status, state.result.as_deref())?;
+    if state.task != task {
+        return Err(format!(
+            "async status belongs to task {}, expected {task}",
+            state.task
+        ));
+    }
 
-    let should_dispatch = task_needs_dispatch(&task, &status);
+    let should_dispatch = state.status == "pending";
     if let Some(error) = dispatch_error(&task, should_dispatch, dispatch) {
         eprintln!("llm-step: {error}; the durable task state will cause a later recovery to retry");
     }
 
-    let result = if matches!(status.as_str(), "complete" | "failed") {
-        progress::result_ref(&task)?
-    } else {
-        None
-    };
-    let visible_status = if status != "pending" && result.is_none() {
-        "finishing"
-    } else {
-        &status
-    };
     Ok(result_block(
         call_id,
         &task,
-        visible_status,
-        result.as_deref(),
+        &state.status,
+        state.result.as_deref(),
     ))
 }
 
@@ -191,6 +187,7 @@ fn error_block(call_id: &str, error: &str) -> Value {
 pub(crate) struct TaskState {
     pub task: String,
     pub status: String,
+    pub result: Option<String>,
     pub event_index: usize,
 }
 
@@ -213,11 +210,18 @@ pub(crate) fn tasks<'a>(events: impl IntoIterator<Item = &'a Value>) -> Vec<Task
                 .get("status")
                 .and_then(Value::as_str)
                 .ok_or("conversation async event has no string status")?;
-            validate_hash(task, "async task")?;
-            validate_status(status)?;
-            Ok::<_, String>((task, status))
+            let result = match state.get("result") {
+                Some(result) => Some(
+                    result
+                        .as_str()
+                        .ok_or("conversation async event result is not a string")?,
+                ),
+                None => None,
+            };
+            validate_state(task, status, result)?;
+            Ok::<_, String>((task, status, result))
         })();
-        let (task, status) = match parsed {
+        let (task, status, result) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 eprintln!(
@@ -231,6 +235,7 @@ pub(crate) fn tasks<'a>(events: impl IntoIterator<Item = &'a Value>) -> Vec<Task
             TaskState {
                 task: task.to_string(),
                 status: status.to_string(),
+                result: result.map(str::to_string),
                 event_index,
             },
         );
@@ -241,11 +246,9 @@ pub(crate) fn tasks<'a>(events: impl IntoIterator<Item = &'a Value>) -> Vec<Task
 pub(crate) fn task_status<'a>(
     events: impl IntoIterator<Item = &'a Value>,
     task: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<TaskState>, String> {
     validate_hash(task, "async task")?;
-    Ok(tasks(events)
-        .into_iter()
-        .find_map(|state| (state.task == task).then_some(state.status)))
+    Ok(tasks(events).into_iter().find(|state| state.task == task))
 }
 
 /// Re-admit Q only after verifying that its recorded target is this
@@ -312,6 +315,20 @@ fn validate_status(status: &str) -> Result<(), String> {
     }
 }
 
+fn validate_state(task: &str, status: &str, result: Option<&str>) -> Result<(), String> {
+    validate_hash(task, "async task")?;
+    validate_status(status)?;
+    match (status, result) {
+        ("pending", None) => Ok(()),
+        ("pending", Some(_)) => Err("a pending async event must not carry a result".to_string()),
+        ("complete" | "failed", Some(result)) => validate_hash(result, "async result"),
+        ("complete" | "failed", None) => Err(format!(
+            "a terminal async event with status {status:?} needs a result"
+        )),
+        _ => unreachable!("validate_status accepted only known statuses"),
+    }
+}
+
 fn validate_subrequest(subrequest: &str) -> Result<(), String> {
     validate_hash(subrequest, "async subrequest")
 }
@@ -338,25 +355,6 @@ fn dispatch(task: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-pub(crate) fn status_needs_dispatch(status: &str, result_is_addressable: bool) -> bool {
-    status == "pending" || (matches!(status, "complete" | "failed") && !result_is_addressable)
-}
-
-/// A result-ref probe is only a recovery hint. If it is temporarily unreadable,
-/// leave the durable task state alone and let a later recovery point retry.
-pub(crate) fn task_needs_dispatch(task: &str, status: &str) -> bool {
-    if status == "pending" {
-        return true;
-    }
-    match progress::result_ref(task) {
-        Ok(result) => status_needs_dispatch(status, result.is_some()),
-        Err(error) => {
-            eprintln!("llm-step: could not read result ref for async task {task}: {error}");
-            false
-        }
-    }
 }
 
 fn dispatch_error<F>(task: &str, needed: bool, dispatch: F) -> Option<String>
@@ -387,15 +385,15 @@ mod tests {
     #[test]
     fn task_status_is_folded_from_events() {
         let task = "a".repeat(40);
+        let result = "b".repeat(40);
         let events = [
             json!({"async": {"task": task, "status": "pending"}}),
             json!({"content": "unrelated"}),
-            json!({"async": {"task": task, "status": "complete"}}),
+            json!({"async": {"task": task, "status": "complete", "result": result}}),
         ];
-        assert_eq!(
-            task_status(events.iter(), &task).unwrap().as_deref(),
-            Some("complete")
-        );
+        let state = task_status(events.iter(), &task).unwrap().unwrap();
+        assert_eq!(state.status, "complete");
+        assert_eq!(state.result.as_deref(), Some(result.as_str()));
     }
 
     #[test]
@@ -403,13 +401,13 @@ mod tests {
         let task = "a".repeat(40);
         let events = [
             json!({"async": {"task": task, "status": "pending"}}),
+            json!({"async": {"task": task, "status": "complete"}}),
             json!({"async": {"task": "oops", "status": "pending"}}),
             json!({"async": {"task": task, "status": "future"}}),
         ];
-        assert_eq!(
-            task_status(events.iter(), &task).unwrap().as_deref(),
-            Some("pending")
-        );
+        let state = task_status(events.iter(), &task).unwrap().unwrap();
+        assert_eq!(state.status, "pending");
+        assert_eq!(state.result, None);
     }
 
     #[test]
@@ -454,22 +452,23 @@ mod tests {
     }
 
     #[test]
-    fn pending_and_terminal_without_a_result_are_dispatched() {
+    fn only_pending_state_is_dispatched() {
         let task = "a".repeat(40);
-        assert!(
-            dispatch_error(&task, status_needs_dispatch("complete", true), |_| {
-                Err("called".into())
-            })
-            .is_none()
-        );
+        assert!(dispatch_error(&task, false, |_| Err("called".into())).is_none());
         assert_eq!(
-            dispatch_error(&task, status_needs_dispatch("pending", false), |_| Err(
-                "temporarily unavailable".into()
-            ))
-            .as_deref(),
+            dispatch_error(&task, true, |_| Err("temporarily unavailable".into())).as_deref(),
             Some("temporarily unavailable")
         );
-        assert!(status_needs_dispatch("failed", false));
-        assert!(!status_needs_dispatch("failed", true));
+    }
+
+    #[test]
+    fn terminal_events_require_their_result_oid() {
+        let task = "a".repeat(40);
+        let result = "b".repeat(40);
+        assert!(validate_state(&task, "pending", None).is_ok());
+        assert!(validate_state(&task, "pending", Some(&result)).is_err());
+        assert!(validate_state(&task, "complete", None).is_err());
+        assert!(validate_state(&task, "failed", None).is_err());
+        assert!(validate_state(&task, "complete", Some(&result)).is_ok());
     }
 }

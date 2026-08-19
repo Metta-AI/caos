@@ -81,11 +81,15 @@ assert_oid "$agent_request" "subagent request"
 
 agent_result=""
 for _ in $(seq 1 300); do
-  agent_result=$(remote_exact_ref "refs/caos/res/$agent_task" 2>/dev/null || true)
+  head1=$(fetch_head)
+  events1=$(git log --first-parent --format=%B "$user1..$head1")
+  agent_result=$(jq -r --arg task "$agent_task" \
+    'select(.async.task == $task and (.async.status == "complete" or .async.status == "failed")) | .async.result // empty' \
+    <<<"$events1")
   if [ -n "$agent_result" ]; then break; fi
   sleep 0.2
 done
-[ -n "$agent_result" ] || fail "subagent task has no result ref"
+assert_oid "$agent_result" "subagent result"
 agent_ref="refs/caos/v2/conversations/$agent/head"
 agent_head=$(remote_tip "$agent_ref") || fail "subagent has no canonical head"
 [ "$agent_head" = "$agent_result" ] || fail "subagent result is not its canonical head"
@@ -95,10 +99,10 @@ git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$agent_head" \
 stage "child identity, ownership, and inherited workspace"
 agent_key=$(printf '%s' "$agent" | od -An -tx1 | tr -d ' \n')
 active_ref="refs/caos/v2/users/u-416c696365/conversations/active/c-$agent_key"
-[ -n "$(remote_exact_ref "$active_ref")" ] \
+[ -n "$(remote_tip "$active_ref")" ] \
   || fail "subagent is absent from its human owner's active index"
 title_ref="refs/caos/v2/conversations/$agent/title"
-title=$(remote_exact_ref "$title_ref")
+title=$(remote_tip "$title_ref")
 [ -n "$title" ] || fail "subagent has no title ref"
 git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$title" \
   || fail "fetching subagent title"

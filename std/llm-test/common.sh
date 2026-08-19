@@ -26,11 +26,6 @@ mkcommit() { # <tree> <message> [parent] -> commit
   gc commit-tree "$tree" "${parents[@]}" -m "$message"
 }
 
-remote_exact_ref() { # <ref>
-  curl -fsS -X POST -H 'content-type: application/json' \
-    --data "{\"ref\":\"$1\"}" "$CAOS_SERVER_URL/ref/read"
-}
-
 remote_tip() { # <ref>
   local lines
   lines=$(git ls-remote --refs caos "$1") || return 1

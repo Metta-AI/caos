@@ -12,10 +12,6 @@ mkcommit() { # <tree> <message> [parent...] -> commit
   for parent in "$@"; do parents+=(-p "$parent"); done
   gc commit-tree "$tree" "${parents[@]}" -m "$message"
 }
-remote_exact_ref() { # <ref>
-  curl -fsS -X POST -H 'content-type: application/json' \
-    --data "{\"ref\":\"$1\"}" "$CAOS_SERVER_URL/ref/read"
-}
 
 echo "== workspace, feature, and scripted model ==" >&2
 "$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry \
@@ -78,8 +74,6 @@ admitted=$(mkcommit "$base_tree" \
   "{\"request\":\"$request\",\"request_head\":\"$user\",\"status\":\"queued\"}" "$user")
 git push --quiet caos "$admitted:$conversation_ref" || fail "publishing request admission"
 "$CAOS_CLI" run --base:hash="$request" >/tmp/merge-result || fail "running merge turn"
-[ -n "$(remote_exact_ref "refs/caos/res/$request")" ] \
-  || fail "exact request Q has no result ref"
 
 advertised=$(git ls-remote --refs caos "$conversation_ref") \
   || fail "reading canonical conversation head"

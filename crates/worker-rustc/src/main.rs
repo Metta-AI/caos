@@ -10,11 +10,11 @@
 //! dependencies reuse the cargo image's seeded, precompiled `target/` (the
 //! bake) rather than recompiling. The `finish` continuation takes the built
 //! binary and emits at `/cas/out` a ready-to-run worker:
-//! `curry(runner, worker1=<the binary>)` — the shared, warm-pooled runner it
-//! DEPENDS on (std/rustc/DEPS) and binds itself, so no caller passes one —
-//! bound to this binary, so the worker needs no image of its own. Static musl
-//! means the binary runs on any base (the glibc runner today, scratch
-//! eventually).
+//! `curry(runner, worker1=<the binary>)` — normally the shared, warm-pooled
+//! runner it DEPENDS on (std/rustc/DEPS). A caller may bind `output-runner` to
+//! select a more capable runtime for the finished binary without changing the
+//! runner on which rustc itself executes. Static musl means the binary runs on
+//! any base (the glibc runner today, scratch eventually).
 //!
 //! So building a worker is itself a worker — memoized end to end: this run on
 //! `(src, cargo, runner, worker-common)` — the bound `cargo`, `runner` and
@@ -72,11 +72,11 @@ fn start() -> Result<(), String> {
     // content): rustc is a SEEDED core item, so bootstrap hand-builds its curry
     // binding `--cargo=<cargo image hash>` (design/caos-expr.md, Phase 3).
     let cargo = read_arg("cargo")?;
-    // The runner arrives the SAME way, and is NOT a caller's argument: rustc
-    // DEPENDS on the runner (std/rustc/DEPS) and curries onto it itself, so a
-    // caller says only what it is building. Do not add a `--runner` parameter
-    // back: it would make the pool base part of every tool's interface, and
-    // `runner` is a seeded sentinel entry, so a `:@=` path cannot name its image.
+    // The default runner arrives the SAME way and is not normally a caller's
+    // argument: rustc DEPENDS on it and curries onto it itself. A tool that
+    // needs extra runtime capabilities can pass the distinct `output-runner`
+    // arg; do not rebind `runner`, which is already part of the seeded rustc
+    // curry and also determines where this factory executes.
     let runner = read_arg("runner")?;
 
     let proj = scratch("proj")?;
@@ -139,8 +139,12 @@ fn start() -> Result<(), String> {
     // `worker-common` deliberately don't ride — finish's cache key is just
     // (bin, runner, result).
     let bin = arg("worker1");
+    let output_runner = arg("output-runner");
     let mut kvs: Vec<(&str, Arg)> =
         vec![("mode", Arg::Lit("finish")), ("runner", Arg::Lit(&runner))];
+    if Path::new(&output_runner).exists() {
+        kvs.push(("output-runner", Arg::Path(&output_runner)));
+    }
     if Path::new(&bin).exists() {
         kvs.insert(0, ("worker1", Arg::Path(&bin)));
     }
@@ -167,13 +171,17 @@ fn finish() -> Result<(), String> {
     if !Path::new(&bin).exists() {
         return Err("cargo result carries no bin/worker".to_string());
     }
-    // `read_arg`, not `arg`: the runner rides as a hash LITERAL (like `cargo`),
-    // so `Arg::Hash` curries onto the runner IMAGE itself — `Arg::Path` would
-    // curry onto the blob that merely names it.
-    let curried = caos_curry(
-        Arg::Hash(&read_arg("runner")?),
-        &[("worker1", Arg::Path(&bin))],
-    )?;
+    // The default runner rides as a hash LITERAL (like `cargo`), while an
+    // explicit output-runner is an already-resolved ArgTree at a CAS path.
+    let output_runner = arg("output-runner");
+    let default_runner;
+    let runtime = if Path::new(&output_runner).exists() {
+        Arg::Path(&output_runner)
+    } else {
+        default_runner = read_arg("runner")?;
+        Arg::Hash(&default_runner)
+    };
+    let curried = caos_curry(runtime, &[("worker1", Arg::Path(&bin))])?;
     caos(["get-hash", &curried, "/cas/out"])
 }
 
