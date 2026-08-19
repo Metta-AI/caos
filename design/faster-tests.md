@@ -253,6 +253,11 @@ a 12s phase" was wrong.** The next real win is per-job setup across 33 jobs,
 not any single test. Measure the span against the sum before splitting anything
 else: when they differ by 2x, the tail is not the problem.
 
+`chat-talk` was later removed: its four sequential turns repeated the `talk`
+and replay coverage retained in `chat-offline` and `llm-step`, while its cheap
+argument parsing assertions already lived in Rust unit tests. The split above
+is retained as measurement history, not as the current suite inventory.
+
 ## What it cost to get there
 
 Four changes in a row were made without a measurement between them, and two of
@@ -472,7 +477,7 @@ one server it is routine, so it must be fixed FIRST.
 **`CAOS_STUB_HOST` breaks.** `run-test.sh` sets it to `127.0.0.1` because
 "siblings share this container's netns, so localhost is the stub's address".
 With a shared stack, A's runnerd launches workers into A's netns, not the test's,
-so every stub-server test (chat-offline, chat-talk, chat-tools*, llm-*,
+so every stub-server test (chat-offline, chat-tools*, llm-*,
 caos-tools, merge-harness, llm-call, max-tokens) loses its stub. The test container has its own `caos-net` address, so
 the fix is for the stub to bind `0.0.0.0` and `CAOS_STUB_HOST` to be that
 address — but it is not free, and it will present as a mystery failure if it is
