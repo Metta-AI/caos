@@ -38,7 +38,7 @@ PROJECT=$PWD
 
 names=("$@")
 if [ ${#names[@]} -eq 0 ]; then
-  names=(runner cargo bash flake-builder merge rgrep bash-tool llm-client llm-call llm-step run-and-update-ref deep-deps rustc llm-stub)
+  names=(runner cargo bash flake-builder git-runner merge rgrep bash-tool llm-client llm-call llm-step run-and-update-ref deep-deps rustc llm-stub)
 fi
 
 # Which entries have a HOST-BUILT nix image behind them. This is the whole

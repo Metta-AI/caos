@@ -1,3 +1,5 @@
 # The rustc worker factory compiles this source and curries the result onto the
-# runner pool. rustc brings its own runner/cargo/worker-common dependencies.
+# opt-in Git runner. rustc brings its own default runner/cargo/worker-common;
+# this tool overrides only the runtime of the binary rustc produces.
 ../rustc rustc
+../git-runner git-runner

@@ -1,15 +1,16 @@
 # llm-step's dependencies (format `<path> <name>`, path relative to this dir):
-# the rustc worker factory that compiles it, the llm-client code crate it links,
-# and THE TOOLS IT DRIVES — bash-tool, rgrep, bash (the tree-tool shell) and
-# merge and run-and-update-ref. rustc DEPENDS on the runner pool itself and curries the built binary
-# onto it, so no tool names a runner. LOCAL deps (mounted under DEEP-DEPS/ by
-# deepening) rather than /std, so std has no ambient self-reference.
+# the rustc worker factory that compiles it, the opt-in Git runner it executes
+# on, the llm-client code crate it links, and THE TOOLS IT DRIVES — bash-tool,
+# rgrep, bash (the tree-tool shell), merge and run-and-update-ref. LOCAL deps
+# (mounted under DEEP-DEPS/ by deepening) rather than /std, so std has no
+# ambient self-reference.
 #
 # The tools are declared HERE, rather than by whoever calls llm-step, because
 # they are llm-step's dependencies: the caller should say what the turn is, not
 # which shell the agent greps with. `.caos-expr` binds them, so resolving
 # llm-step yields a step image with its tools already attached.
 ../rustc rustc
+../git-runner git-runner
 ../llm-client llm-client
 ../bash-tool bash-tool
 ../rgrep rgrep

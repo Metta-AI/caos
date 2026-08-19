@@ -1,0 +1,3 @@
+# Build the opt-in Git interpreter with the ordinary flake-builder. This is not
+# seeded core: only workers that declare git-runner as a dependency resolve it.
+run --base:@=DEEP-DEPS/flake-builder --in:@=.
