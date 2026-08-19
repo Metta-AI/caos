@@ -5250,7 +5250,7 @@ mod tests {
     }
 
     #[test]
-    fn line_clients_parse_explicit_usernames() {
+    fn line_clients_parse_arguments() {
         let parsed = parse_cli_args(
             &[
                 "--username".to_string(),
@@ -5270,6 +5270,11 @@ mod tests {
             Ok(_) => panic!("mixed positional and -m prompts were accepted"),
         };
         assert!(conflict.contains("positionally"));
+        let extra = match parse_cli_args(&["one".to_string(), "two".to_string()], true) {
+            Err(error) => error,
+            Ok(_) => panic!("two positional prompts were accepted"),
+        };
+        assert!(extra.contains("quote prompts"));
         assert_eq!(
             normalized_username("  Alice Smith  ").as_deref(),
             Some("Alice Smith")

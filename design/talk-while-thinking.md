@@ -173,7 +173,7 @@ Round boundaries: `start`, `drive`-drain (queue empty → next LLM round),
    (`migrate_server_conversation_head`, in `list_user_conversations`) migration.
    Tests: `legacy_bare_conversation_refs_migrate_to_from_user`,
    `legacy_server_conversation_head_migrates_on_list`, plus the updated
-   `chat-offline`/`chat-talk`/`chat-tools*`/`chat-online`/`llm-*`
+   `chat-offline`/`chat-tools*`/`chat-online`/`llm-*`
    integration suites.
 1. **Text steering — TODO.** Client interjection (stdin/composer → mint user
    commit → advance `from-user`); `from-user=H` at turn start; worker per-round
