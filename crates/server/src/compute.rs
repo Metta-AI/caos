@@ -4,11 +4,12 @@
 //! (an ancestor `stack` for cycle detection and an optional trace id) that is
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
 //! hash *is* the cache key with nothing keyed alongside it: the worker image, the
-//! standard library `std`, and the cache-busting `salt` all ride inside it under
-//! reserved `base`/`std`/`salt` entries. `/run?req=<argTreeHash>`
-//! reads it, then: cache lookup (Redis) → run-cycle detection → image resolution
-//! (a `docker://` ref used as-is, or a git-docker image converted and pushed to
-//! the registry) → dispatch through the runner rendezvous ([`crate::runner`]:
+//! execution policy, standard library `std`, and cache-busting `salt` all ride
+//! inside it under reserved entries. `/run?req=<argTreeHash>`
+//! reads and validates it, then: cache lookup (Redis) → run-cycle detection →
+//! image resolution (a digest-pinned `docker://` ref used as-is, or a git-docker
+//! image converted and pushed to the registry) → dispatch through the runner
+//! rendezvous ([`crate::runner`]:
 //! the job is matched to a long-polling runner, which posts back
 //! `"<type> <hash>"`) — or `"promise <hash>"`, a map-then continuation the
 //! worker left behind instead of a value, which [`resolve_promise`] resolves
@@ -81,8 +82,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// context that is deliberately NOT part of its cache key — the ancestor `stack`
 /// (run-cycle detection) and the optional trace id. Only `arg_tree` is hashed and
 /// cached; `stack` and `trace_id` ride alongside it. The ArgTree carries the
-/// worker image, std and salt under reserved entries, so its hash *is* the whole
-/// cache key (`SPEC.md`: "The ArgTree is the cache key").
+/// worker image, execution policy, std and salt under reserved entries, so its
+/// hash *is* the whole cache key (`SPEC.md`: "The ArgTree is the cache key").
 #[derive(Clone, Copy)]
 struct WorkRequest<'a> {
     /// The ArgTree hash — the request's identity and cache key.
@@ -98,19 +99,19 @@ struct WorkRequest<'a> {
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
-/// the worker image, std and salt under reserved entries) and return its result
-/// as `"<type> <hash>"`. (`req` is the query param's historical name; its value
-/// is the ArgTree hash.)
+/// the worker image, execution policy, std and salt under reserved entries) and
+/// return its result as `"<type> <hash>"`. (`req` is the query param's historical
+/// name; its value is the ArgTree hash.)
 ///
 /// The ArgTree being a content-addressed object means its hash *is* the cache key
-/// (it captures everything — image, std, salt and the rest) and the rendezvous
-/// id: an external run also pins `refs/caos/res/<argTreeHash>` at the result, so a
-/// client can fetch it by ref. Most worker sub-runs are promise resolutions the
-/// server performs itself ([`run_work_request`] recursion); `caos run-async` is
-/// the one worker command that sends this same endpoint and disconnects without
-/// waiting for the result. That dispatch is deliberately a new top-level run:
-/// it has an empty run stack, so stack-based cycle detection does not cross the
-/// detached-work boundary.
+/// (it captures everything — image, execution policy, std, salt and the rest)
+/// and the rendezvous id: an external run also pins
+/// `refs/caos/res/<argTreeHash>` at the result, so a client can fetch it by ref.
+/// Most worker sub-runs are promise resolutions the server performs itself
+/// ([`run_work_request`] recursion); `caos run-async` is the one worker command
+/// that sends this same endpoint and disconnects without waiting for the result.
+/// That dispatch is deliberately a new top-level run: it has an empty run stack,
+/// so stack-based cycle detection does not cross the detached-work boundary.
 pub(crate) fn run(
     config: &Config,
     query: &str,
@@ -190,12 +191,16 @@ fn run_work_request_inner(
         trace_id,
         secrets: _,
     } = *request;
-    // Unpack the ArgTree's two reserved entries: the worker `base` (an embedded
-    // tree for a git image, a ref blob for `docker://`) and the cache-busting
-    // `salt`. Both are part of the ArgTree — hence part of the cache key —
-    // threaded into the worker and inherited by any promise sub-runs this request
-    // leaves behind.
+    // Unpack the ArgTree's reserved worker `base` (an embedded tree for a git
+    // image, a ref blob for `docker://`), execution policy, and cache-busting
+    // `salt`. All are part of the ArgTree — hence part of the cache key — and
+    // inherited by any promise sub-runs this request leaves behind.
     let (image, salt) = read_arg_tree(config, arg_tree)?;
+    // Validate every external image locator before the cache lookup. A cached
+    // result must not make a tag-based request acceptable: that would retain
+    // the identity bug after the first execution. Git-image bases need the same
+    // check because they are pulled while converting an otherwise hashed tree.
+    validate_image_identity(config, &image)?;
     let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
         Some(args_entries(config, arg_tree)?)
     } else {
@@ -210,8 +215,8 @@ fn run_work_request_inner(
         return Err(HttpError::new(400, "request has empty image"));
     }
 
-    // The ArgTree hash is the cache key (it captures image, std, salt and every
-    // other arg); the value is
+    // The ArgTree hash is the cache key (it captures image, execution policy,
+    // std, salt and every other arg); the value is
     // the final result "<type> <hash>" — a promise is resolved before it's cached,
     // so a hit never re-resolves. A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
@@ -1060,10 +1065,11 @@ fn continuation_result(
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
 /// any curry layers and build the ArgTree — worker image folded in under its
-/// reserved `base` entry, salt under `salt`, std under `std` — whose hash IS the
-/// request, built server-side byte-identically to what a client would build, so
-/// the ArgTree hash (and cache key) is the same no matter who assembles it — and
-/// send it through [`run_work_request`]. Returns `"<type> <hash>"`.
+/// reserved `base` entry, policy under `execution-policy`, salt under `salt`,
+/// and std under `std` — whose hash IS the request, built server-side
+/// byte-identically to what a client would build, so the ArgTree hash (and cache
+/// key) is the same no matter who assembles it — and send it through
+/// [`run_work_request`]. Returns `"<type> <hash>"`.
 #[allow(clippy::too_many_arguments)] // the run context travels together
 fn run_image(
     config: &Config,
@@ -1094,7 +1100,15 @@ fn run_image(
             store_git_blob(config, image.as_bytes()).map_err(store_err)?,
         )
     };
-    let mut args = merge_entries(merge_entries(bound, call_args), vec![image_entry]);
+    let policy_entry = named_entry(
+        caos_world::EXECUTION_POLICY_ARG,
+        EntryKind::Blob.into(),
+        store_git_blob(config, caos_world::EXECUTION_POLICY.as_bytes()).map_err(store_err)?,
+    );
+    let mut args = merge_entries(
+        merge_entries(bound, call_args),
+        vec![image_entry, policy_entry],
+    );
     // The salt also rides in the ArgTree, under its reserved entry — added (only
     // when non-empty) exactly as the client does, so the ArgTree, and hence the
     // request, is byte-identical. It is threaded down from the parent run.
@@ -1248,9 +1262,9 @@ fn args_entries(
 }
 
 /// Unpack an ArgTree into the reserved entries the server needs: the image ref
-/// (its `base` entry), the std-tree hash (its `std` entry, empty if none), and
-/// the salt (its `salt` entry, empty if none). `base`/`std`/`salt` are all
-/// entries of this one tree, so the ArgTree's hash *is* the cache key with
+/// (its `base` entry), the execution-policy contract, and the salt (its `salt`
+/// entry, empty if none). They are all entries of this one tree, so the
+/// ArgTree's hash *is* the cache key with
 /// nothing keyed alongside it — the ArgTree hash itself is the request identity,
 /// so it is not returned here.
 fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), HttpError> {
@@ -1258,6 +1272,7 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
         .map_err(|e| HttpError::new(400, format!("reading arg tree: {e}")))?;
     let mut image = None;
     let mut salt = String::new();
+    let mut execution_policy = None;
     for entry in entries {
         match entry.name.as_str() {
             // A git-docker image *is* a git tree, so it rides embedded (the entry
@@ -1271,10 +1286,31 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
                     blob_string(config, &entry.oid.to_string())?
                 });
             }
+            caos_world::EXECUTION_POLICY_ARG => {
+                execution_policy = Some(blob_string(config, &entry.oid.to_string())?);
+            }
             // std and salt are plain blobs (std NAMES the std tree; salt is opaque).
             "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }
+    }
+    let execution_policy = execution_policy.ok_or_else(|| {
+        HttpError::new(
+            400,
+            format!(
+                "arg tree missing reserved {:?} entry",
+                caos_world::EXECUTION_POLICY_ARG
+            ),
+        )
+    })?;
+    if execution_policy != caos_world::EXECUTION_POLICY {
+        return Err(HttpError::new(
+            400,
+            format!(
+                "unsupported execution policy {execution_policy:?}; expected {:?}",
+                caos_world::EXECUTION_POLICY
+            ),
+        ));
     }
     let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'base'"))?;
     Ok((image, salt))
@@ -1337,22 +1373,90 @@ fn pin_result_in(git_dir: &str, refname: &str, hash: &str) -> Result<(), HttpErr
     ))
 }
 
+/// Validate the execution-affecting image locators reachable from one ArgTree.
+/// This runs before result-cache lookup. A git image is content-addressed, but
+/// its optional Docker base is still an external locator and therefore needs
+/// the same digest rule as a top-level Docker worker.
+fn validate_image_identity(config: &Config, image: &str) -> Result<(), HttpError> {
+    if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
+        return validate_docker_reference(reference, true).map_err(|e| HttpError::new(400, e));
+    }
+    if image.len() != 40
+        || !image
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err(HttpError::new(
+            400,
+            format!("git image must be a lowercase 40-character hash: {image:?}"),
+        ));
+    }
+
+    let entries = fetch_tree(config, image)
+        .map_err(|e| HttpError::new(400, format!("reading git image {image}: {e}")))?;
+    let Some(base) = entries.into_iter().find(|entry| entry.name == "base") else {
+        return Ok(());
+    };
+    if !base.mode.is_blob() {
+        return Err(HttpError::new(400, "git image 'base' entry is not a blob"));
+    }
+    let base_ref = blob_string(config, &base.oid.to_string())?;
+    let reference = base_ref.strip_prefix(DOCKER_SCHEME).unwrap_or(&base_ref);
+    validate_docker_reference(reference, false)
+        .map_err(|e| HttpError::new(400, format!("git image base: {e}")))
+}
+
+/// Require an immutable Docker distribution reference. `name:tag@digest` is
+/// accepted because Docker resolves by the digest; a bare tag or digest-like
+/// image id is not a registry locator pinned by the manifest digest required by
+/// the spec.
+fn validate_docker_reference(reference: &str, allow_seeded: bool) -> Result<(), String> {
+    if allow_seeded && (reference == "seeded" || reference.starts_with("seeded-")) {
+        return Ok(());
+    }
+    if reference.is_empty() || reference.starts_with('-') {
+        return Err(format!("invalid docker image: {reference:?}"));
+    }
+    let Some((name, digest)) = reference.rsplit_once('@') else {
+        return Err(format!(
+            "docker image {reference:?} is mutable; use <name>@sha256:<64 lowercase hex digits>"
+        ));
+    };
+    let Some(encoded) = digest.strip_prefix("sha256:") else {
+        return Err(format!(
+            "docker image {reference:?} is not pinned by a sha256 digest"
+        ));
+    };
+    if name.is_empty()
+        || encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "invalid docker digest reference {reference:?}; expected <name>@sha256:<64 lowercase hex digits>"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the `image` parameter to a reference the host docker daemon can run.
 ///
-/// `docker://<ref>` is an ordinary docker reference, used as-is. Anything else is
-/// one of our git images (the default): convert it to a real image, push it to
-/// the registry, and return a digest reference into the registry.
+/// `docker://<ref>` is a digest-pinned docker reference, used as-is. The only
+/// non-digest exceptions are the internal `seeded*` rendezvous sentinels, which
+/// are answered by seed runners and never pulled. Anything else is one of our
+/// git images (the default): convert it to a real image, push it to the registry,
+/// and return a digest reference into the registry.
 fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
     if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
-        if reference.is_empty() || reference.starts_with('-') {
-            return Err(HttpError::new(
-                400,
-                format!("invalid docker image: {reference:?}"),
-            ));
-        }
+        validate_docker_reference(reference, true).map_err(|e| HttpError::new(400, e))?;
         return Ok(reference.to_string());
     }
-    if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if image.len() != 40
+        || !image
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
         return Err(HttpError::new(
             400,
             format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
@@ -1407,7 +1511,10 @@ fn key_lock(key: &str) -> std::sync::Arc<Mutex<()>> {
 /// SINGLE-FLIGHTED behind [`key_lock`] — see there for why the cache alone is
 /// not enough.
 fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> {
-    let image_key = format!("caos:image:{git_hash}");
+    // A git image may stack on a multi-platform Docker index. Its selected base
+    // manifest follows the execution policy, so conversion cache identity must
+    // include that policy just like result-cache identity does.
+    let image_key = format!("caos:image:{}:{git_hash}", caos_world::EXECUTION_POLICY);
     if let Ok(Some(manifest_digest)) = cache_get(&config.redis_addr, &image_key) {
         eprintln!("image cache hit: {git_hash} -> {manifest_digest}");
         return Ok(image_ref(config, &manifest_digest));
@@ -1461,9 +1568,7 @@ fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> 
             .map_err(|e| format!("base ref not UTF-8: {e}"))?;
         let base_ref = base_ref.trim();
         let base_ref = base_ref.strip_prefix(DOCKER_SCHEME).unwrap_or(base_ref);
-        if base_ref.is_empty() {
-            return Err("base blob is empty".to_string());
-        }
+        validate_docker_reference(base_ref, false)?;
         let (base_layers, base_diff_ids) = fetch_base(config, base_ref)?;
         diff_ids.extend(base_diff_ids);
         manifest_layers.extend(base_layers);
@@ -1515,17 +1620,20 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
         .strip_prefix("http://")
         .or_else(|| push.strip_prefix("https://"))
         .unwrap_or(push);
-    // A deterministic tag per base ref: re-converting reuses the same copy.
-    let tag = format!("base-{}", sha256_hex(base_ref.as_bytes()));
+    // A deterministic tag per base ref AND selected platform: one manifest-list
+    // digest can resolve to different manifests on ARM64 and AMD64.
+    let base_identity = format!("{base_ref}\0{}", caos_world::EXECUTION_PLATFORM);
+    let tag = format!("base-{}", sha256_hex(base_identity.as_bytes()));
     let dest = format!("docker://{host}/{REGISTRY_REPO}:{tag}");
     let man_url = format!("{push}/v2/{REGISTRY_REPO}/manifests/{tag}");
     let accept = "application/vnd.oci.image.manifest.v1+json, \
                   application/vnd.docker.distribution.manifest.v2+json";
 
     // Skip the (slow, network-bound) skopeo pull if this base is already in the
-    // registry from an earlier convert — the tag is deterministic per ref, so a
-    // resolvable manifest means the blobs are present. This makes the stock base a
-    // once-per-registry cost, not once-per-convert.
+    // registry from an earlier convert — the tag is deterministic per ref and
+    // platform, so a resolvable manifest means the right blobs are present. This
+    // makes the stock base a once-per-registry-and-platform cost, not
+    // once-per-convert.
     let cached = minreq::get(&man_url)
         .with_header("Accept", accept)
         .send()
@@ -1541,9 +1649,9 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
                 "--src-tls-verify=false",
                 "--dest-tls-verify=false",
                 "--override-os",
-                "linux",
+                caos_world::EXECUTION_OS,
                 "--override-arch",
-                "amd64",
+                caos_world::EXECUTION_ARCH,
             ])
             .arg(format!("docker://{base_ref}"))
             .arg(&dest)
@@ -2054,6 +2162,48 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod image_identity_tests {
+    use super::*;
+
+    fn digest(hex: char) -> String {
+        format!(
+            "example.invalid/worker@sha256:{}",
+            hex.to_string().repeat(64)
+        )
+    }
+
+    #[test]
+    fn docker_images_require_a_sha256_manifest_digest() {
+        assert!(validate_docker_reference(&digest('a'), false).is_ok());
+        assert!(validate_docker_reference(
+            &format!("example.invalid/worker:stable@sha256:{}", "0".repeat(64)),
+            false,
+        )
+        .is_ok());
+
+        for mutable_or_malformed in [
+            "example.invalid/worker:latest".to_string(),
+            format!("example.invalid/worker@sha512:{}", "a".repeat(128)),
+            format!("example.invalid/worker@sha256:{}", "a".repeat(63)),
+            format!("example.invalid/worker@sha256:{}", "A".repeat(64)),
+            format!("@sha256:{}", "a".repeat(64)),
+        ] {
+            assert!(
+                validate_docker_reference(&mutable_or_malformed, false).is_err(),
+                "accepted {mutable_or_malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_top_level_seeded_sentinels_bypass_digest_validation() {
+        assert!(validate_docker_reference("seeded", true).is_ok());
+        assert!(validate_docker_reference("seeded-rustc", true).is_ok());
+        assert!(validate_docker_reference("seeded", false).is_err());
     }
 }
 

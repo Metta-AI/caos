@@ -24,7 +24,7 @@
 //!
 //! Compute results are cached in Redis (`CAOS_REDIS_ADDR`, default
 //! `caos-redis:6379`): the key is the arg-tree hash — the ArgTree itself, which
-//! carries the worker image, std and salt — the value the
+//! carries the worker image, execution policy, std and salt — the value the
 //! result hash. A hit skips the worker entirely. Redis is best-effort — if
 //! it's unreachable we log and run uncached.
 //!

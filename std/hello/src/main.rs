@@ -18,11 +18,11 @@
 //! experience for the one command whose whole job is to say "this works".
 //!
 //! Two kinds of entry are skipped, both SELF-REFERENCE rather than input.
-//! `base`/`salt`/`secret-hash` are caos' own reserved entries. And `workerN` is
-//! how a compiled worker rides the shared runner pool — a rustc-built entry
-//! resolves to `curry(runner, worker1=<binary>)`, so without this hello reports
-//! its own 5 MB binary as one of "its arguments", having fetched it to do so.
-//! What is left is exactly what the caller wrote.
+//! `base`/`execution-policy`/`salt`/`secret-hash` are caos' own reserved
+//! entries. And `workerN` is how a compiled worker rides the shared runner pool
+//! — a rustc-built entry resolves to `curry(runner, worker1=<binary>)`, so
+//! without this hello reports its own 5 MB binary as one of "its arguments",
+//! having fetched it to do so. What is left is exactly what the caller wrote.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
 /// ArgTree entries that are caos' own, not the caller's (SPEC, "ArgTree").
 /// Listing them here rather than importing: a std tool gets `worker-common`,
 /// not the crate these names are defined in.
-const RESERVED: [&str; 3] = ["base", "salt", "secret-hash"];
+const RESERVED: [&str; 4] = ["base", "execution-policy", "salt", "secret-hash"];
 
 /// Is `name` this worker's own plumbing rather than something the caller passed?
 ///

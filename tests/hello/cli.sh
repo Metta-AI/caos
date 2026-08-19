@@ -27,7 +27,7 @@ echo "== self-reference is not mirrored as an argument ==" >&2
 # is the worker's own binary, bound by the curry that makes it runnable. The
 # first draft of this worker reported `worker1 = blob … (5055368 bytes)` —
 # having fetched all 5 MB to say so.
-for leaked in base salt secret-hash worker1; do
+for leaked in base execution-policy salt secret-hash worker1; do
   printf '%s\n' "$out" | grep -q "  $leaked = " \
     && fail "$leaked leaked into the report as an argument: $out"
 done

@@ -188,13 +188,19 @@ whose hash, `argTreeHash`, *is* the cache key and the rendezvous id — with
 nothing keyed alongside it. The worker image rides *inside* the ArgTree, under a
 reserved `base` entry — as do the standard library `std` (a reserved `std`
 entry naming the std tree) and the cache-busting `salt` (a reserved `salt`
-entry) — so a computation is identified entirely by its args (an executor can
+entry). A reserved `execution-policy` entry versions the fixed container
+contract, including the explicitly selected Linux target platform, so changing
+behavior outside the image also changes the ArgTree. Thus a computation is
+identified entirely by its args (an executor can
 match on the worker alongside the rest, and a worker, seeing its args at
 `/cas/args`, can read its own image to call itself). `GET /run?req=<argTreeHash>`
 (`req` is the query param's historical name; its value is the ArgTree hash):
 
-1. **read** the ArgTree, whose `base` entry is the worker ref, `std` entry
-   names the standard library, and `salt` entry is the cache-buster;
+1. **read and validate** the ArgTree, whose `base` entry is the worker ref,
+   `execution-policy` fixes the container contract, `std` names the standard
+   library, and `salt` is the cache-buster. Direct Docker refs and Docker bases
+   inside git images must be digest-pinned; this check happens even when a
+   cached result exists;
 2. **cache** lookup in Redis keyed on `argTreeHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
 3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es
@@ -204,9 +210,9 @@ match on the worker alongside the rest, and a worker, seeing its args at
    the owner; concurrent arrivals wait for its exact outcome. An arrival runs
    independently only when waiting would close a cross-thread dependency cycle,
    allowing the ordinary stack check to report that cycle instead of deadlocking;
-5. **resolve the image** — a `docker://<ref>` is used directly; one of our git
-   images is converted to a real image, pushed to the registry, and run by
-   digest (see [git images](#git-images));
+5. **resolve the image** — a digest-pinned `docker://<name>@sha256:<digest>` is
+   used directly; one of our git images is converted to a real image, pushed to
+   the registry, and run by digest (see [git images](#git-images));
 6. **dispatch to a runner** — the job is matched against the hanging
    `/runner/poll`s (a runner's required args are name → oid pairs the
    ArgTree's top level must equal; most specific match wins, so a warm runner
@@ -353,8 +359,9 @@ setuid `caos`.
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — the **ArgTree** — including the
-   `--base` image under the reserved `base` entry and (when set) the cache-busting
-   salt under a reserved `salt` entry (see
+   `--base` image under the reserved `base` entry, the fixed container contract
+   under `execution-policy`, and (when set) the cache-busting salt under a
+   reserved `salt` entry (see
    [arguments](#arguments-literals-paths-and-pinned-refs));
 2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —
    nothing wraps it, so the ArgTree is the whole cache key;
@@ -409,8 +416,8 @@ there is no positional image anywhere, and nothing sniffs a bare token:
   EVALUATED (a tree carrying a `.caos-expr` resolves to what that expression
   builds, one without it to itself); inside a worker any `/cas` path, resolved to
   the hash recorded on it;
-- `:docker=<ref>` — an **ordinary docker image**, stored as the blob
-  `docker://<ref>`;
+- `:docker=<ref>` — a **digest-pinned docker image** (`<name>@sha256:<digest>`),
+  stored as the blob `docker://<ref>`;
 - `:@@=<git ref>` — a worker that lives in **another repo**, pinned by commit
   sha and fetched by the client (see the arg types below). This is how a project
   depends on caos without vendoring it.
@@ -447,7 +454,8 @@ so a value is never misread and may contain anything (no escaping):
   `design/commits.md`.
 - `--name:hash=<oid>` → an object the server already holds — a tree or a blob,
   typically an earlier run's result — referenced by oid with no round-trip;
-- `--name:docker=<ref>` → the blob `docker://<ref>`;
+- `--name:docker=<ref>` → the blob `docker://<ref>` (when used as an image,
+  `<ref>` must contain `@sha256:<digest>`);
 - `--name:@@=<git ref>` → a tree in **another repo**, named by a nix-style
   flake-reference (`git+https://host/repo?rev=<40-hex>&dir=sub`, `git+ssh://…`,
   `git+file://…`, `github:owner/repo`, or a local `path:./dir`). **A URL is a
@@ -495,8 +503,8 @@ parse arm and a case in each resolver. The worker `caos` has no host filesystem
 passes (see `design/runner-protocol.md`). Per job:
 
 1. **unpack** — fetch the request tree named by the job's `req` (it IS the
-   ArgTree) and read its reserved `salt` entry (image and salt both ride inside
-   it);
+   ArgTree) and read its reserved `salt` entry (image, execution policy, and
+   salt all ride inside it);
 2. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
    materialize the args at `/cas/args`;
 3. **run `/worker`** — dropped to the unprivileged `worker` user so it can't
