@@ -737,7 +737,7 @@
             # multi-second `docker load`; a changed build has a new store path,
             # hence a new tag, and loads.
             load_once() {
-              local name="$1" image="$2" src_tag
+              local name="$1" image="$2" src_tag old_tag
               src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
               if docker image inspect "$src_tag" >/dev/null 2>&1; then
                 echo "==> $name image already loaded — skipping docker load" >&2
@@ -755,6 +755,14 @@
               # the core-seeder-runner existed, so every seeded key fell through
               # to the generic runner and died pulling `seeded:latest`.
               docker tag "$src_tag" "$name:latest"
+
+              # This function owns the content-addressed source tags. Retire
+              # superseded ones here instead of rediscovering them at cleanup.
+              while IFS= read -r old_tag; do
+                if [ "$old_tag" != "$src_tag" ]; then
+                  docker image rm "$old_tag" >/dev/null 2>&1 || true
+                fi
+              done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' "$name-src")
             }
 
             die() { # <message>
@@ -896,7 +904,7 @@
             # Require an idle stack instead of hiding stop/restart orchestration
             # and recovery inside a cleanup command.
             image_cleanup() {
-              local execute=no arg registry_size=0 image_id current_stack tag running
+              local execute=no arg registry_size=0 image_id running
 
               for arg in "$@"; do
                 case "$arg" in
@@ -918,19 +926,17 @@
               echo "caosd image-cleanup: registry $registry_size"
               docker image ls --format '  local image {{.ID}}  {{.Size}}' \
                 localhost:5000/caos | sort -u
-              docker image ls --format '  stack image {{.Repository}}:{{.Tag}}  {{.Size}}' \
-                caos-stack-src
               if [ "$execute" != yes ]; then
                 echo "caosd image-cleanup: dry run; run 'caosd down' then pass --execute"
                 return
               fi
 
               running=$(
-                while IFS= read -r tag; do
-                  case "$tag" in
-                    caos-stack|caos-worker-*|caos-test-stack-*) echo "$tag" ;;
-                  esac
-                done < <(docker ps --format '{{.Names}}')
+                if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
+                  echo "$NAME"
+                fi
+                docker ps --filter label=caos.runnerd.owner --format '{{.Names}}'
+                docker ps --filter label=caos.test-stack --format '{{.Names}}'
               )
               if [ -n "$running" ]; then
                 echo "caosd image-cleanup: CAOS is still running:" >&2
@@ -951,14 +957,6 @@
                 [ -n "$image_id" ] || continue
                 docker image rm "$image_id" >/dev/null 2>&1 || true
               done < <(docker image ls -q localhost:5000/caos | sort -u)
-
-              current_stack=$(docker image inspect -f '{{.Id}}' caos-stack:latest 2>/dev/null || true)
-              while read -r tag image_id; do
-                if [ "$image_id" != "$current_stack" ]; then
-                  docker image rm "$tag" >/dev/null 2>&1 || true
-                fi
-              done < <(docker image ls --no-trunc \
-                --format '{{.Repository}}:{{.Tag}} {{.ID}}' caos-stack-src)
 
               echo "caosd image-cleanup: cleared the registry, Redis, and unused local CAOS images"
               echo "caosd image-cleanup: run 'caosd up' to republish std"
