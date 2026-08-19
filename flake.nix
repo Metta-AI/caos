@@ -179,7 +179,7 @@
           inherit src;
           strictDeps = true;
 
-          # Shared across deps + both crates so crane keys the dep cache the
+          # Shared across deps + every crate so crane keys the dep cache the
           # same way every time.
           pname = "caos-workspace";
           version = "0.1.0";
@@ -249,9 +249,9 @@
         );
 
         # Every crate's binary is selected (by name, at copy time) from the one
-        # build above, so these are all the same derivation. `caos` carries two
-        # binaries — `caos` (worker-side, baked into images) and `caos-cli`
-        # (user-facing) — both in /bin; consumers pick the one they need.
+        # build above, so these are all the same derivation. The generic `caos`
+        # worker and the user-facing `caos-cli` are separate Cargo
+        # packages; consumers copy only the named binary they need.
         caos = workspaceBins;
         server = workspaceBins;
         runnerd = workspaceBins;
@@ -558,8 +558,8 @@
         # Just the user-facing CLI (a consumer wants only `caos-cli`, not the
         # worker-side `caos`, in its devShell) — and it runs on the *host*. On
         # Linux the musl `caos-cli` already runs on the host, so copy it straight
-        # out of the `caos` package; on macOS that's a Linux binary, so build a
-        # native `caos-cli` for the host instead.
+        # out of the caos-cli package; on macOS that's a Linux
+        # binary, so build a native `caos-cli` for the host instead.
         nativeArgs = {
           inherit src;
           strictDeps = true;
@@ -572,7 +572,7 @@
         };
         nativeCliArtifacts = craneLib.buildDepsOnly (
           nativeArgs
-          // { cargoExtraArgs = "--package caos --bin caos-cli"; }
+          // { cargoExtraArgs = "--package caos-cli --bin caos-cli"; }
         );
         # Installed under both names: `caos` is what a person types (`caos talk`),
         # `caos-cli` stays for scripts and docs that spell it out. (No collision
@@ -582,14 +582,14 @@
           if pkgs.stdenv.hostPlatform.isLinux then
             pkgs.runCommand "caos-cli-bin" { } ''
               mkdir -p $out/bin
-              cp ${caos}/bin/caos-cli $out/bin/caos-cli
+              cp ${workspaceBins}/bin/caos-cli $out/bin/caos-cli
             ''
           else
             craneLib.buildPackage (
               nativeArgs
               // {
                 cargoArtifacts = nativeCliArtifacts;
-                cargoExtraArgs = "--package caos --bin caos-cli";
+                cargoExtraArgs = "--package caos-cli --bin caos-cli";
                 pname = "caos-cli-bin";
                 doCheck = false;
               }

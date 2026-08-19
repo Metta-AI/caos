@@ -3,8 +3,8 @@ use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use caos::chat::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
 use caos::GitTransport;
+use caos_cli::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
 use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{

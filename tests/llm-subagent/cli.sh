@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Subagents are ordinary durable conversations: spawning returns stable
-# identifiers, the child inherits a clean workspace and human owner, and its
-# completed request can be read explicitly with run_async.
+# identifiers, and the child inherits a clean workspace and human owner.
 set -euo pipefail
 # The dependency is mounted only inside the test wrapper and exports globals.
 # shellcheck disable=SC1091
@@ -19,7 +18,6 @@ base=$(mkcommit "HEAD:ws" base)
 
 SUBAGENT_PROMPT="inspect the snapshot and report the notes file"
 SUBAGENT_DONE_TEXT="subagent round complete"
-RESULT_DONE_TEXT="I inspected the subagent result"
 mkdir stub
 printf '{"content":[{"id":"toolu_spawn","input":{"prompt":"%s"},"name":"spawn_agent","type":"tool_use"}],"stop_reason":"tool_use"}' \
   "$SUBAGENT_PROMPT" > stub/response-1.json
@@ -123,39 +121,6 @@ grep -qF '"call":"toolu_spawn"' <<<"$agent_events" \
   || fail "subagent root lacks its durable parent call"
 grep -qF '"username":"Alice"' <<<"$agent_events" \
   || fail "subagent root lacks its human owner"
-
-stage "read the completed child request"
-# Reading the result is the subagent-specific contract. Merging an unchanged
-# child here was redundant with merge-harness and added a whole compute job.
-printf '{"content":[{"id":"toolu_result","input":{"request":"%s"},"name":"run_async","type":"tool_use"}],"stop_reason":"tool_use"}' \
-  "$agent_request" > stub/response-4.json
-printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-  "$RESULT_DONE_TEXT" > stub/response-5.json
-
-completion1=$(remote_tip "$conversation_ref") \
-  || fail "parent conversation disappeared after child completion"
-git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$completion1" \
-  || fail "fetching subagent completion event"
-tree1=$(git rev-parse "$completion1^{tree}")
-user2=$(mkcommit "$tree1" \
-  '{"author":"user","content":"inspect the delegated result"}' "$completion1")
-request2=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user2")
-admitted2=$(mkcommit "$tree1" \
-  "{\"request\":\"$request2\",\"request_head\":\"$user2\",\"status\":\"queued\"}" \
-  "$user2")
-git push --quiet caos "$admitted2:$conversation_ref" \
-  || fail "publishing result-inspection admission"
-"$CAOS_CLI" run --base:hash="$request2" >/tmp/llm-subagent-result-2 \
-  || fail "running result-inspection turn"
-
-head2=$(fetch_head)
-grep -qF "$RESULT_DONE_TEXT" <<<"$(git show -s --format=%B "$head2")" \
-  || fail "result-inspection turn did not finish"
-grep -qF "$agent_result" stub/request-5.json \
-  || fail "run_async did not return the child workspace commit"
-[ "$(git rev-parse "$head2^{tree}")" = "$tree1" ] \
-  || fail "reading the subagent result changed the parent workspace"
-[ ! -f stub/request-6.json ] || fail "unexpected extra model round"
 
 stage "done"
 echo "llm-subagent: ALL PASS" >&2

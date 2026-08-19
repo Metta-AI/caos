@@ -30,19 +30,6 @@ mkdir ws
 git -C "$CAOS_PROJECT" archive HEAD | tar -x -C ws
 commit "caos workspace snapshot"
 
-echo "== cargo check of the caos workspace, in a caos worker ==" >&2
-t0=$(ms)
-"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=ws --cmd=check "--target=$tgt"
-t1=$(ms)
-[ "$(cat r1/exit)" = "0" ] || fail "self-check failed: $(tail -c 2000 r1/stderr)"
-took=$((t1 - t0))
-echo "  ok: workspace checks clean (${took}ms)" >&2
-
-# The deps-reuse tripwire: with the baked artifacts valid, a check compiles
-# only the ~15 workspace crates (tens of seconds); a fingerprint regression
-# recompiles ~170 deps and blows well past this. Generous for slow machines.
-[ "$took" -lt 300000 ] || fail "self-check took ${took}ms — baked deps likely not reused"
-
 # A GENUINELY cold run needs a salt. `ws` is a snapshot of $CAOS_PROJECT HEAD,
 # which does not change between suite runs, so without one the "cold" run is
 # served from the PREVIOUS suite's cache and both numbers below are fixed
@@ -64,6 +51,12 @@ t3=$(ms)
 cold=$((t3 - t2))
 cold_hits=$(grep -c '"cache_hit":true' cold.trace || true)
 echo "  ok: per-crate check clean (${cold}ms cold, ${cold_hits} cache hits)" >&2
+# The cold mode=all run checks every workspace crate, so it is also the
+# deps-reuse tripwire. A fingerprint regression recompiles ~170 dependencies
+# and blows well past this generous bound; a separate whole-workspace check
+# tested the same property and only added another cargo job.
+[ "$cold" -lt 300000 ] \
+  || fail "per-crate self-check took ${cold}ms — baked deps likely not reused"
 # NB: cold_hits is NOT asserted to be 0. The workspace DAG has diamonds
 # (worker-common is a dependency of many members), so its single `job` is
 # computed once and re-requested by every dependent. Whether a re-request lands

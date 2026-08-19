@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use caos::chat::{
+use caos::{GitTransport, Transport};
+use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
     first_available_conversation_name, fork_conversation, generate_conversation_title,
@@ -14,7 +15,6 @@ use caos::chat::{
     ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
     TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
-use caos::{GitTransport, Transport};
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
 use ratatui_crossterm::crossterm::event::{
@@ -3847,7 +3847,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos::chat::{
+    use caos_cli::{
         conversation_head, conversation_ref, ConversationReplay, ConversationTurnEvents,
     };
     use ratatui_core::backend::TestBackend;
@@ -5282,11 +5282,11 @@ mod tests {
     fn live_activity_uses_tool_specific_verbs_and_concise_summaries() {
         let mut activity = activity(1);
         activity.name = "read".to_string();
-        activity.summary = "read crates/caos/src/chat.rs".to_string();
+        activity.summary = "read crates/caos-cli/src/lib.rs".to_string();
         activity.state = ActivityState::Running;
 
         assert_eq!(activity.running_verb(), "Reading");
-        assert_eq!(activity.running_summary(), "crates/caos/src/chat.rs");
+        assert_eq!(activity.running_summary(), "crates/caos-cli/src/lib.rs");
 
         activity.name = "bash".to_string();
         activity.summary = "$ cargo test".to_string();
@@ -6973,7 +6973,7 @@ mod tests {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
             source: "refs/caos/v2/conversations/talk-1/head:caos-tools".to_string(),
-            tools: vec![caos::chat::ToolDescription {
+            tools: vec![caos_cli::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),
                 image: "docker://caos-std-bash".to_string(),

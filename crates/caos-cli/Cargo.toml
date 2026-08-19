@@ -1,0 +1,25 @@
+[package]
+name = "caos-cli"
+version = "0.1.0"
+edition = "2021"
+
+# The complete user-facing host CLI. The library owns the durable conversation
+# protocol; the binary combines it and the TUI with generic host commands
+# implemented by `caos`.
+[lib]
+name = "caos_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "caos-cli"
+path = "src/bin/caos-cli.rs"
+
+[dependencies]
+caos = { path = "../caos" }
+serde_json = "1"
+ratatui-core = { version = "0.1.2", features = ["std"] }
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-widgets = { version = "0.3.2", default-features = false, features = ["std", "unstable-rendered-line-info"] }
+# Display-width measurement for laying out markdown tables in the transcript
+# (same crate ratatui measures cells with, so our column math matches the render).
+unicode-width = "0.2"

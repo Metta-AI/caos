@@ -1,22 +1,16 @@
-//! caos client library: the engine shared by the worker, line-oriented CLI,
-//! and richer clients such as `caos tui`.
-//!
-//! The package provides two binaries (see the crate's `bin/`):
+//! Generic CAOS client library shared by workers and host-side clients.
 //!
 //! * **`caos`** — the worker-side client baked setuid-root into worker images.
 //!   It talks to the server over HTTP (`/object`) and runs the container
 //!   `runner` (jobs arrive by long-poll; see `design/runner-protocol.md`). It
 //!   normally records continuations for the server to resolve after the job;
 //!   `run-async` is the one command that directly dispatches `/run`.
-//! * **`caos-cli`** — the user-facing client. It uses the server as a `caos` git
-//!   remote, building objects in the local working repo and exchanging them with
-//!   the server by negotiated push/fetch.
 //!
 //! Everything that doesn't depend on *how* objects move — the object model,
 //! currying, args-tree assembly, CAS materialization, image import — lives here,
-//! written against the [`Transport`] trait. Each binary picks a transport
-//! ([`HttpTransport`] for the worker; the git remote for the CLI) and calls the
-//! command functions below.
+//! written against the [`Transport`] trait. The worker picks [`HttpTransport`];
+//! host clients use [`GitTransport`]. Conversation semantics and presentation
+//! live in the separate `caos-cli` crate.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
 //! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
@@ -37,11 +31,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
-pub mod chat;
-pub use chat::{cli_chat, cli_talk};
-
 mod eval;
-pub use eval::cli_eval_path;
+pub use eval::{cli_eval_path, eval_workspace_dep};
 
 /// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool script as a caos job over this repo's tree, exactly what an
@@ -501,11 +492,8 @@ impl GitTransport {
             })
     }
 
-    pub(crate) fn git_capture(
-        &self,
-        args: &[&str],
-        index: Option<&Path>,
-    ) -> Result<String, String> {
+    /// Run Git in this transport's bound working tree and return stdout.
+    pub fn git_capture(&self, args: &[&str], index: Option<&Path>) -> Result<String, String> {
         git_capture_in(args, index, &self.work_dir)
     }
 }
@@ -1115,7 +1103,7 @@ impl GitTransport {
     /// avoids the one shared worktree file otherwise touched by concurrent
     /// raw-object fetches; fetched objects still land in the shared object
     /// database.
-    pub(crate) fn fetch_object(&self, hash: &str) -> Result<(), String> {
+    pub fn fetch_object(&self, hash: &str) -> Result<(), String> {
         self.run_git(&[
             "-c",
             "fetch.negotiationAlgorithm=noop",
@@ -3110,6 +3098,17 @@ fn prepare_request(
     assemble_arg_tree(t, image, call, store)
 }
 
+/// Build and push a host-side request with scalar/commit arguments and no
+/// secret store. Higher-level clients can durably record the returned request
+/// id before dispatching it.
+pub fn prepare_client_request(
+    t: &dyn Transport,
+    image: &str,
+    kvs: &[String],
+) -> Result<String, String> {
+    prepare_request(t, image, None, kvs, &[])
+}
+
 /// `prepare-request --base:<type>=<image-or-arg-tree> [--name=value | --name:@=path ...]`
 /// — construct the exact flat runnable ArgTree and print its hash without
 /// executing it. This is the worker-side half: CAS paths use `/cas` semantics.
@@ -3804,6 +3803,15 @@ fn curry_object(
     curry_from_entries(t, arg_tree, unbind, new)
 }
 
+/// Bind host-side scalar/commit arguments to an existing ArgTree.
+pub fn curry_client_object(
+    t: &dyn Transport,
+    arg_tree: &str,
+    kvs: &[String],
+) -> Result<gix::ObjectId, String> {
+    curry_object(t, arg_tree, None, &[], kvs)
+}
+
 /// The body of [`curry_object`] once the new args are resolved into `new`
 /// entries: decompose `arg_tree` into `(base, bound)`, drop the `unbind` names,
 /// refuse any rebind, add `new`, and store the curry node. Shared with the
@@ -4391,6 +4399,11 @@ fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<S
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
     let url = run_url(base, arg_tree, None);
     request_compute_url(&url, secrets)
+}
+
+/// Run an already-prepared request without a secret-store header.
+pub fn compute_client_request(base: &str, arg_tree: &str) -> Result<(String, String), String> {
+    request_compute(base, arg_tree, "")
 }
 
 fn request_compute_traced(

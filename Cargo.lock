@@ -115,13 +115,21 @@ dependencies = [
  "flate2",
  "gix",
  "minreq",
+ "serde_json",
+ "tar",
+ "xattr",
+]
+
+[[package]]
+name = "caos-cli"
+version = "0.1.0"
+dependencies = [
+ "caos",
  "ratatui-core",
  "ratatui-crossterm",
  "ratatui-widgets",
  "serde_json",
- "tar",
  "unicode-width",
- "xattr",
 ]
 
 [[package]]

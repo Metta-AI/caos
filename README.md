@@ -34,7 +34,8 @@ Caos runs well-defined binaries with well-defined inputs and well-defined enviro
 
 | Crate | Binaries / image | What it is |
 |---|---|---|
-| `caos` | `caos`, `caos-cli` | One library, two clients. `caos` is the worker-side client (baked setuid into worker images at `/bin/caos`); `caos-cli` is the user-facing client. See [clients](#the-two-clients). |
+| `caos` | `caos` | Generic object, ArgTree, transport, and worker-side client machinery. The binary is baked setuid into worker images at `/bin/caos`. |
+| `caos-cli` | `caos-cli` | User-facing generic commands plus the conversation protocol, line client, and TUI. Also installed as plain `caos` on the host. See [clients](#the-two-clients). |
 | `caos-world` | — | The build's world tag, shared by the three crates that speak the server protocol (`caos`, `server`, `runnerd`) so they cannot disagree about their world. |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `runnerd` | `caos-runnerd` | The generic host agent: long-polls the server for jobs and runs worker containers. The server itself runs nothing. See `design/runner-protocol.md`. |
@@ -59,7 +60,8 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `flake.nix` | Dev shell, binary packages, and Docker images — all from one pinned toolchain |
 | `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
 | `Cargo.toml` | Workspace root (members + shared release profile) |
-| `crates/caos/` | The `caos` crate: shared `lib.rs` + `caos` and `caos-cli` binaries |
+| `crates/caos/` | Generic CAOS client library and worker-side `caos` binary |
+| `crates/caos-cli/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
 | `build-builtins.sh` | Bootstraps the seeded core and publishes `refs/caos/seed` |
@@ -90,7 +92,8 @@ the signal to trust before committing.
 ## Building
 
 ```bash
-nix build .#caos              # ./result/bin/{caos,caos-cli}
+nix build .#caos              # generic client library + worker-side binary
+nix build .#caos-cli            # user-facing caos-cli binary
 nix build .#server            # ./result/bin/server
 ```
 
@@ -193,8 +196,8 @@ match on the worker alongside the rest, and a worker, seeing its args at
 `/cas/args`, can read its own image to call itself). `GET /run?req=<argTreeHash>`
 (`req` is the query param's historical name; its value is the ArgTree hash):
 
-1. **read** the ArgTree, whose `base` entry is the worker ref, `std` entry
-   names the standard library, and `salt` entry is the cache-buster;
+1. **read** the ArgTree, whose `base` entry is the worker ref, `std` names the
+   standard library, and `salt` is the cache-buster;
 2. **cache** lookup in Redis keyed on `argTreeHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
 3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es
@@ -204,9 +207,9 @@ match on the worker alongside the rest, and a worker, seeing its args at
    the owner; concurrent arrivals wait for its exact outcome. An arrival runs
    independently only when waiting would close a cross-thread dependency cycle,
    allowing the ordinary stack check to report that cycle instead of deadlocking;
-5. **resolve the image** — a `docker://<ref>` is used directly; one of our git
-   images is converted to a real image, pushed to the registry, and run by
-   digest (see [git images](#git-images));
+5. **resolve the image** — a digest-pinned `docker://<name>@sha256:<digest>` is
+   used directly; one of our git images is converted to a real image, pushed to
+   the registry, and run by digest (see [git images](#git-images));
 6. **dispatch to a runner** — the job is matched against the hanging
    `/runner/poll`s (a runner's required args are name → oid pairs the
    ArgTree's top level must equal; most specific match wins, so a warm runner
@@ -287,8 +290,9 @@ published port (`CAOS_REGISTRY_PULL_HOST`, insecure, no TLS).
 
 ## The two clients
 
-`crates/caos` is one library with two binaries. They share all the object
-logic — the difference is the **transport** and the privilege model.
+The generic `caos` crate and the higher-level `caos-cli` crate share
+the object machinery through a one-way dependency. Their difference is the
+**transport**, privilege model, and whether conversation policy is present.
 
 - **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
   provides the container `runner`. It's installed **setuid-root** in
@@ -299,7 +303,8 @@ logic — the difference is the **transport** and the privilege model.
   continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
-- **`caos-cli`** (user-facing; also installed as plain `caos`) uses the server
+- **`caos-cli`** (also installed as plain `caos`)
+  uses the server
   as a **`caos` git remote**: it builds objects in the local working repo and
   exchanges them by negotiated push/fetch. It has no `/cas` and no
   object-level commands:
@@ -409,8 +414,8 @@ there is no positional image anywhere, and nothing sniffs a bare token:
   EVALUATED (a tree carrying a `.caos-expr` resolves to what that expression
   builds, one without it to itself); inside a worker any `/cas` path, resolved to
   the hash recorded on it;
-- `:docker=<ref>` — an **ordinary docker image**, stored as the blob
-  `docker://<ref>`;
+- `:docker=<ref>` — a **digest-pinned docker image** (`<name>@sha256:<digest>`),
+  stored as the blob `docker://<ref>`;
 - `:@@=<git ref>` — a worker that lives in **another repo**, pinned by commit
   sha and fetched by the client (see the arg types below). This is how a project
   depends on caos without vendoring it.
@@ -447,7 +452,8 @@ so a value is never misread and may contain anything (no escaping):
   `design/commits.md`.
 - `--name:hash=<oid>` → an object the server already holds — a tree or a blob,
   typically an earlier run's result — referenced by oid with no round-trip;
-- `--name:docker=<ref>` → the blob `docker://<ref>`;
+- `--name:docker=<ref>` → the blob `docker://<ref>` (when used as an image,
+  `<ref>` must contain `@sha256:<digest>`);
 - `--name:@@=<git ref>` → a tree in **another repo**, named by a nix-style
   flake-reference (`git+https://host/repo?rev=<40-hex>&dir=sub`, `git+ssh://…`,
   `git+file://…`, `github:owner/repo`, or a local `path:./dir`). **A URL is a
