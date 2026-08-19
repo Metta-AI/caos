@@ -28,8 +28,8 @@ The simplest ArgTree is one that only specifies an image
 ## Docker digest
 
 image = "docker://<docker url>" (a string), using an `@sha256:<digest>`, not a
-tag. The server rejects tag-based refs before consulting the result cache. The
-same rule applies to the Docker base embedded in a git-tree image.
+tag. The server rejects tag-based refs before pulling or running them. The same
+rule applies to the Docker base embedded in a git-tree image.
 
 ## A flake
 

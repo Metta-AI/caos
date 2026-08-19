@@ -193,10 +193,8 @@ match on the worker alongside the rest, and a worker, seeing its args at
 `/cas/args`, can read its own image to call itself). `GET /run?req=<argTreeHash>`
 (`req` is the query param's historical name; its value is the ArgTree hash):
 
-1. **read and validate** the ArgTree, whose `base` entry is the worker ref,
-   `std` names the standard library, and `salt` is the cache-buster. Direct
-   Docker refs and Docker bases inside git images must be digest-pinned; this
-   check happens even when a cached result exists;
+1. **read** the ArgTree, whose `base` entry is the worker ref, `std` names the
+   standard library, and `salt` is the cache-buster;
 2. **cache** lookup in Redis keyed on `argTreeHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
 3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es

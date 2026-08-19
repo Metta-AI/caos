@@ -6,9 +6,9 @@
 //! hash *is* the cache key with nothing keyed alongside it: the worker image,
 //! standard library `std`, and cache-busting `salt` all ride inside it under
 //! reserved entries. `/run?req=<argTreeHash>`
-//! reads and validates it, then: cache lookup (Redis) → run-cycle detection →
-//! image resolution (a digest-pinned `docker://` ref used as-is, or a git-docker
-//! image converted and pushed to the registry) → dispatch through the runner
+//! reads it, then: cache lookup (Redis) → run-cycle detection → image
+//! resolution (a digest-pinned `docker://` ref used as-is, or a git-docker image
+//! converted and pushed to the registry) → dispatch through the runner
 //! rendezvous ([`crate::runner`]:
 //! the job is matched to a long-polling runner, which posts back
 //! `"<type> <hash>"`) — or `"promise <hash>"`, a map-then continuation the
@@ -196,11 +196,6 @@ fn run_work_request_inner(
     // of the ArgTree — hence part of the cache key — and inherited by any
     // promise sub-runs this request leaves behind.
     let (image, salt) = read_arg_tree(config, arg_tree)?;
-    // Validate every external image locator before the cache lookup. A cached
-    // result must not make a tag-based request acceptable: that would retain
-    // the identity bug after the first execution. Git-image bases need the same
-    // check because they are pulled while converting an otherwise hashed tree.
-    validate_image_identity(config, &image)?;
     let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
         Some(args_entries(config, arg_tree)?)
     } else {
@@ -1342,39 +1337,6 @@ fn pin_result_in(git_dir: &str, refname: &str, hash: &str) -> Result<(), HttpErr
     ))
 }
 
-/// Validate the execution-affecting image locators reachable from one ArgTree.
-/// This runs before result-cache lookup. A git image is content-addressed, but
-/// its optional Docker base is still an external locator and therefore needs
-/// the same digest rule as a top-level Docker worker.
-fn validate_image_identity(config: &Config, image: &str) -> Result<(), HttpError> {
-    if let Some(reference) = image.strip_prefix(DOCKER_SCHEME) {
-        return validate_docker_reference(reference, true).map_err(|e| HttpError::new(400, e));
-    }
-    if image.len() != 40
-        || !image
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-    {
-        return Err(HttpError::new(
-            400,
-            format!("git image must be a lowercase 40-character hash: {image:?}"),
-        ));
-    }
-
-    let entries = fetch_tree(config, image)
-        .map_err(|e| HttpError::new(400, format!("reading git image {image}: {e}")))?;
-    let Some(base) = entries.into_iter().find(|entry| entry.name == "base") else {
-        return Ok(());
-    };
-    if !base.mode.is_blob() {
-        return Err(HttpError::new(400, "git image 'base' entry is not a blob"));
-    }
-    let base_ref = blob_string(config, &base.oid.to_string())?;
-    let reference = base_ref.strip_prefix(DOCKER_SCHEME).unwrap_or(&base_ref);
-    validate_docker_reference(reference, false)
-        .map_err(|e| HttpError::new(400, format!("git image base: {e}")))
-}
-
 /// Require an immutable Docker distribution reference. `name:tag@digest` is
 /// accepted because Docker resolves by the digest; a bare tag or digest-like
 /// image id is not a registry locator pinned by the manifest digest required by
@@ -1421,11 +1383,7 @@ fn resolve_image(config: &Config, image: &str) -> Result<String, HttpError> {
         validate_docker_reference(reference, true).map_err(|e| HttpError::new(400, e))?;
         return Ok(reference.to_string());
     }
-    if image.len() != 40
-        || !image
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-    {
+    if !image.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(
             400,
             format!("git image must be a hex hash (or use {DOCKER_SCHEME}<ref>): {image:?}"),
