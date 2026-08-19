@@ -26,10 +26,6 @@ mkcommit() { # <tree> <message> [parent] -> commit
   gc commit-tree "$tree" "${parents[@]}" -m "$message"
 }
 
-remote_exact_ref() { # <ref>
-  remote_tip "$1"
-}
-
 remote_tip() { # <ref>
   local lines
   lines=$(git ls-remote --refs caos "$1") || return 1
