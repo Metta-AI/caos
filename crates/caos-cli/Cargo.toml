@@ -1,13 +1,13 @@
 [package]
-name = "conversation-client"
+name = "caos-cli"
 version = "0.1.0"
 edition = "2021"
 
-# Conversation policy and presentation live above the generic CAOS client.
-# The library owns the durable chat protocol; the binary combines it with the
-# generic host commands exposed by `caos`.
+# The complete user-facing host CLI. The library owns the durable conversation
+# protocol; the binary combines it and the TUI with generic host commands
+# implemented by `caos`.
 [lib]
-name = "conversation_client"
+name = "caos_cli"
 path = "src/lib.rs"
 
 [[bin]]

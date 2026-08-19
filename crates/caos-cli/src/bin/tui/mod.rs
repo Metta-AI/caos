@@ -4,9 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use caos::GitTransport;
-use conversation_client::{
-    list_user_conversations, unarchive_user_conversation, UserConversationStatus,
-};
+use caos_cli::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
 use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{

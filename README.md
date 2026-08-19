@@ -35,7 +35,7 @@ Caos runs well-defined binaries with well-defined inputs and well-defined enviro
 | Crate | Binaries / image | What it is |
 |---|---|---|
 | `caos` | `caos` | Generic object, ArgTree, transport, and worker-side client machinery. The binary is baked setuid into worker images at `/bin/caos`. |
-| `conversation-client` | `caos-cli` | User-facing generic commands plus the conversation protocol, line client, and TUI. Also installed as plain `caos` on the host. See [clients](#the-two-clients). |
+| `caos-cli` | `caos-cli` | User-facing generic commands plus the conversation protocol, line client, and TUI. Also installed as plain `caos` on the host. See [clients](#the-two-clients). |
 | `caos-world` | — | The build's world tag, shared by the three crates that speak the server protocol (`caos`, `server`, `runnerd`) so they cannot disagree about their world. |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `runnerd` | `caos-runnerd` | The generic host agent: long-polls the server for jobs and runs worker containers. The server itself runs nothing. See `design/runner-protocol.md`. |
@@ -61,7 +61,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
 | `Cargo.toml` | Workspace root (members + shared release profile) |
 | `crates/caos/` | Generic CAOS client library and worker-side `caos` binary |
-| `crates/conversation-client/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
+| `crates/caos-cli/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
 | `crates/server/` | The `server` crate → `caos-server` |
 | `crates/worker-*/` | The worker crates |
 | `build-builtins.sh` | Bootstraps the seeded core and publishes `refs/caos/seed` |
@@ -93,7 +93,7 @@ the signal to trust before committing.
 
 ```bash
 nix build .#caos              # generic client library + worker-side binary
-nix build .#conversation-client # user-facing caos-cli binary
+nix build .#caos-cli            # user-facing caos-cli binary
 nix build .#server            # ./result/bin/server
 ```
 
@@ -290,7 +290,7 @@ published port (`CAOS_REGISTRY_PULL_HOST`, insecure, no TLS).
 
 ## The two clients
 
-The generic `caos` crate and the higher-level `conversation-client` crate share
+The generic `caos` crate and the higher-level `caos-cli` crate share
 the object machinery through a one-way dependency. Their difference is the
 **transport**, privilege model, and whether conversation policy is present.
 
@@ -303,7 +303,7 @@ the object machinery through a one-way dependency. Their difference is the
   continuation
   as the worker's result (see [map-then](#map-then-sub-computations-without-blocking));
   it never triggers compute itself.
-- **`caos-cli`** (from `conversation-client`; also installed as plain `caos`)
+- **`caos-cli`** (also installed as plain `caos`)
   uses the server
   as a **`caos` git remote**: it builds objects in the local working repo and
   exchanges them by negotiated push/fetch. It has no `/cas` and no

@@ -278,7 +278,7 @@ conversation content). Same best-effort contract as the progress ref.
 ### Current surface inventory
 
 Two verbs and a full-screen client over one turn engine (implemented —
-`crates/conversation-client/src/lib.rs`, tested end-to-end against the stub in
+`crates/caos-cli/src/lib.rs`, tested end-to-end against the stub in
 `tests/chat-offline` for `chat` and `talk`, and the `tests/chat-tools*`
 suites for the tool set):
 
@@ -414,7 +414,7 @@ deadlines are comfortable; the top-level pending timeout
    `tests/llm-step` and the focused `tests/llm-{async,subagent,interrupt}`
    suites — end-to-end against a scripted stub API).
 5. `caos-cli chat` (human commits, conversation ref, progress printing).
-   **Done** (`crates/conversation-client/src/lib.rs`, `tests/chat-offline` and its
+   **Done** (`crates/caos-cli/src/lib.rs`, `tests/chat-offline` and its
    `tests/chat-tools*` siblings; real-API turn: `tests/chat-online`).
 6. `caos talk` + std-published worker curries — prompt-first surface, sticky
    conversation, interactive loop; `std/bash-tool` and `std/llm-step`
@@ -423,7 +423,7 @@ deadlines are comfortable; the top-level pending timeout
 7. Structured client events + `caos tui` — presentation-independent turn
    events, durable history/diff readers, multiline composer, task switching,
    live activity, workspace review, and confirmed clean-checkout apply. **Done**
-   (`crates/conversation-client/src/bin/tui`; unit tests plus the existing chat integration suite).
+   (`crates/caos-cli/src/bin/tui`; unit tests plus the existing chat integration suite).
 8. **Talk while thinking** — interjections as a second commit branch that the
    turn merge reconciles: steer a running turn at round boundaries via a
    client→worker `-inject` ref, mirror of the progress ref. **Design**

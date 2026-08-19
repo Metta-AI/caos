@@ -17,7 +17,7 @@ use super::{
     short_hash, ActivityState, App, Command, ConfirmAction, ConversationState, EntryRole, Focus,
     ScrollState, TranscriptPoint, View, COMMANDS,
 };
-use conversation_client::TurnPhase;
+use caos_cli::TurnPhase;
 
 pub(super) const ACTIVITY_INDICATORS: [&str; 4] = ["·", "✦", "✽", "✦"];
 
