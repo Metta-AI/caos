@@ -385,6 +385,8 @@ const MANAGED_HOOK_MARKERS: [&str; 2] = [
     "# managed by caos-server: append-only conversation heads",
 ];
 
+// TODO: Remove this one-time migration after every supported repository has
+// been started by a server version that no longer installs the hook.
 /// Remove the pre-receive hook installed by older CAOS servers.
 ///
 /// The old hook execs this binary with a validator mode that no longer exists,
