@@ -14,7 +14,6 @@ echo "fixture" > ws/original.txt
 commit "workspace"
 git config user.name tester
 git config user.email tester@example.com
-export ANTHROPIC_API_KEY=test-key
 base=$(mkcommit "HEAD:ws" base)
 
 MIXED_CALLS='[

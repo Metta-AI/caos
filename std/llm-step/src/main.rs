@@ -24,7 +24,8 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, forward, link, own_args_tree, path, read_arg,
-    read_arg_opt, read_commit, run_then_catching, run_worker, scratch, write_commit_as, Arg,
+    read_arg_opt, read_commit, run_then_catching, run_worker, scratch, secret, write_commit_as,
+    Arg,
 };
 
 const AGENT_AUTHOR: &str = "caos-agent";
@@ -86,7 +87,7 @@ fn image_arg(name: &str) -> Result<Option<String>, String> {
 impl Config {
     fn read() -> Result<Config, String> {
         Ok(Config {
-            api_key: read_arg("api-key")?,
+            api_key: secret("anthropic-api-key")?,
             system: read_arg("system")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
@@ -924,7 +925,7 @@ fn launch_githist(
 }
 
 /// Rebuild ourselves as the callback for one compute tool. We carry our WHOLE current ArgTree
-/// forward with [`own_args_tree`] (so the static config — `api-key`, `system`,
+/// forward with [`own_args_tree`] (so the static config — `system`,
 /// `bash-image`, `head`, `worker1`, and the optional
 /// `model`/`base-url`/`conversation`/`grep-image`/`tools-image`/`merge-image`/`merge-refs`
 /// — rides along and a NEW config arg needs no edit here) and manage only the

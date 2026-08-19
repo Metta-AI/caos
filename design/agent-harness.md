@@ -97,7 +97,8 @@ already contains one.
 own image):
 
 - `head:commit=` — the human-turn commit to answer (the conversation head);
-- curried config: `api-key`, `system` (the system prompt), `bash-image` (the
+- secret: `anthropic-api-key`, injected at `/secret/anthropic-api-key`;
+- curried config: `system` (the system prompt), `bash-image` (the
   tool registry — just bash for now, an image ref), `model`, `base-url` (default
   `https://api.anthropic.com`; tests point it at a stub), `conversation`
   (names the progress ref);
@@ -237,8 +238,11 @@ commit). Hand-rolled retry on 429/5xx honoring `retry-after`. Top-level
 `cache_control: {"type": "ephemeral"}` on every request — each step replays
 an identical prefix, so steps after the first read the prompt cache.
 
-Secrets: API key curried into the llm-step worker's args. It lives in CAS
-and rides in job payloads; the runner-token auth is the fence.
+Secrets: the client reads its git-ignored `.caos-secrets` store when preparing
+and dispatching a turn. `llm-step` reads `anthropic-api-key` from
+`/secret/anthropic-api-key`; the value never enters its args or CAS. Reader
+expressions and `secret-hash` give the request its per-secret cache identity,
+and the server carries the store to entitled tool sub-runs.
 
 ## Progress
 

@@ -16,15 +16,16 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use caos::{
-    compute_client_request, curry_client_object, eval_workspace_dep, prepare_client_request,
-    GitTransport, Transport, CAOS_REMOTE,
+    build_secret_store, compute_client_request_with_store, curry_client_object,
+    eval_workspace_dep_with_store, prepare_client_request_with_store, ClientSecret, GitTransport,
+    Transport, CAOS_REMOTE,
 };
 
 const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
 const HEAD_SUFFIX: &str = "/head";
 const MAX_CONVERSATION_ID_BYTES: usize = 124;
 const MAX_APPEND_ATTEMPTS: usize = 32;
-const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const MODEL_API_SECRET: &str = "anthropic-api-key";
 const AUTO_NAME_PREFIX: &str = "talk-";
 const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin/master"];
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -983,8 +984,10 @@ pub fn prepare_queued_request(
     queued_head: &str,
 ) -> Result<String, String> {
     validate_hash(queued_head, "queued conversation head")?;
-    let llm = resolve_llm(t, options, id)?;
-    prepare_client_request(t, &llm, &[format!("--head:commit={queued_head}")])
+    let store = build_secret_store(t)?;
+    require_model_secret(&store)?;
+    let llm = resolve_llm(t, options, id, &store)?;
+    prepare_client_request_with_store(t, &llm, &[format!("--head:commit={queued_head}")], &store)
 }
 
 /// Resolve the human-facing identity once per client. `author` remains
@@ -1065,9 +1068,12 @@ fn unsafe_username_character(character: char) -> bool {
         )
 }
 
-fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<String, String> {
-    let api_key = std::env::var(API_KEY_ENV)
-        .map_err(|_| format!("{API_KEY_ENV} must be set to start a conversation request"))?;
+fn resolve_llm(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
     let system = match (&options.system, &options.system_file) {
         (Some(system), None) => system.clone(),
         (None, Some(path)) => std::fs::read_to_string(path)
@@ -1078,11 +1084,7 @@ fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<Stri
         }
     };
     let merge_refs = snapshot_merge_refs(t)?;
-    let mut config = vec![
-        format!("--api-key={api_key}"),
-        format!("--system={system}"),
-        format!("--conversation={id}"),
-    ];
+    let mut config = vec![format!("--system={system}"), format!("--conversation={id}")];
     if !merge_refs.is_empty() {
         config.push(format!("--merge-refs={merge_refs}"));
     }
@@ -1093,8 +1095,17 @@ fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<Stri
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
-    let llm_base = eval_workspace_dep(t, "llm-step")?;
+    let llm_base = eval_workspace_dep_with_store(t, "llm-step", store)?;
     curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
+}
+
+fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
+    if store.iter().any(|secret| secret.name() == MODEL_API_SECRET) {
+        return Ok(());
+    }
+    Err(format!(
+        "conversation needs a {MODEL_API_SECRET:?} secret in .caos-secrets"
+    ))
 }
 
 fn request_is_active(status: &str) -> bool {
@@ -1105,8 +1116,9 @@ fn request_is_active(status: &str) -> bool {
 /// conversation state; `llm-step` advances the canonical head itself.
 pub fn resume_request(t: &GitTransport, request: &str) -> Result<(), String> {
     validate_hash(request, "request")?;
+    let store = build_secret_store(t)?;
     let server = t.server_url()?;
-    compute_client_request(&server, request).map(|_| ())
+    compute_client_request_with_store(&server, request, &store).map(|_| ())
 }
 
 /// Reissue the exact request recorded by a nonterminal conversation. Repeated
@@ -1984,10 +1996,11 @@ pub fn run_chat_turn(
     if let Some(request) = request {
         emit(TurnEvent::PhaseStarted(TurnPhase::Model));
         emit(TurnEvent::Status("waiting for agent".to_string()));
+        let store = build_secret_store(t)?;
         let server = t.server_url()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = compute_client_request(&server, &request).map(|_| ());
+            let result = compute_client_request_with_store(&server, &request, &store).map(|_| ());
             let _ = tx.send(result);
         });
         request_result = Some(rx);
@@ -2047,14 +2060,13 @@ pub fn generate_conversation_title(
     options: &TurnOptions,
     first_message: &str,
 ) -> Result<String, String> {
-    let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
-        format!("{API_KEY_ENV} must be set (it rides, curried, into the title run)")
-    })?;
-    let mut kvs = vec![format!("--api-key={api_key}")];
+    let store = build_secret_store(t)?;
+    require_model_secret(&store)?;
+    let mut kvs = Vec::new();
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = eval_workspace_dep(t, "llm-call")?;
+    let llm_base = eval_workspace_dep_with_store(t, "llm-call", &store)?;
     let llm = curry_client_object(t, &llm_base, &kvs)?.to_string();
     let messages = serde_json::to_string(&title_messages(first_message))
         .map_err(|error| format!("encoding title context: {error}"))?;
@@ -2067,8 +2079,8 @@ pub fn generate_conversation_title(
         "--model={}",
         options.model.as_deref().unwrap_or(DEFAULT_MODEL)
     ));
-    let arg_tree = prepare_client_request(t, &llm, &call)?;
-    let (kind, hash) = compute_client_request(&t.server_url()?, &arg_tree)?;
+    let arg_tree = prepare_client_request_with_store(t, &llm, &call, &store)?;
+    let (kind, hash) = compute_client_request_with_store(&t.server_url()?, &arg_tree, &store)?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"

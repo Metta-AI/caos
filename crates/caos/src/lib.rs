@@ -31,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::objs::WriteTo;
 
 mod eval;
-pub use eval::{cli_eval_path, eval_workspace_dep};
+pub use eval::{cli_eval_path, eval_workspace_dep, eval_workspace_dep_with_store};
 
 /// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool script as a caos job over this repo's tree, exactly what an
@@ -3113,6 +3113,17 @@ pub fn prepare_client_request(
     prepare_request(t, image, None, kvs, &[])
 }
 
+/// Build and push a host-side request while folding the supplied local secret
+/// store's identities into the ArgTree. Secret values remain out of band.
+pub fn prepare_client_request_with_store(
+    t: &dyn Transport,
+    image: &str,
+    kvs: &[String],
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    prepare_request(t, image, None, kvs, store)
+}
+
 /// `prepare-request --base:<type>=<image-or-arg-tree> [--name=value | --name:@=path ...]`
 /// — construct the exact flat runnable ArgTree and print its hash without
 /// executing it. This is the worker-side half: CAS paths use `/cas` semantics.
@@ -4111,18 +4122,25 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
 
 /// A resolved secret from the caller's store: its value, its entropy (the
 /// cache-isolation capability), and each reader resolved to a partial arg tree.
-pub(crate) struct ClientSecret {
+pub struct ClientSecret {
     name: String,
     value: String,
     entropy: String,
     readers: Vec<std::collections::BTreeMap<String, String>>,
 }
 
+impl ClientSecret {
+    /// Worker-visible name used for `/secret/<name>`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
 /// each reader resolved HERE (via eval-path, against the store's pinned tree)
 /// to a partial arg tree of name → oid — so the server only subset-matches,
 /// never evals. Empty when there is no store.
-pub(crate) fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
+pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
     let dir = Path::new(SECRETS_DIR);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -4404,6 +4422,16 @@ fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String,
 /// Run an already-prepared request without a secret-store header.
 pub fn compute_client_request(base: &str, arg_tree: &str) -> Result<(String, String), String> {
     request_compute(base, arg_tree, "")
+}
+
+/// Run an already-prepared request with the supplied local secret store carried
+/// in ephemeral request context.
+pub fn compute_client_request_with_store(
+    base: &str,
+    arg_tree: &str,
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
+    request_compute(base, arg_tree, &secret_store_header(store))
 }
 
 fn request_compute_traced(

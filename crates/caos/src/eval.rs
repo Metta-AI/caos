@@ -132,12 +132,22 @@ static EVAL_NODE_MEMO: Memo<(String, String)> = Memo::new();
 /// the DEEPENED tree — so resolving the raw `std/llm-step` directory out of the
 /// worktree cannot work, whatever the path is spelled.
 pub fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String, String> {
+    eval_workspace_dep_with_store(t, name, &[])
+}
+
+/// Resolve a workspace entry point while carrying the caller's secret store
+/// through expression evaluation. Conversation setup uses this form so a tool
+/// embedded by the llm-step expression keeps its secret-dependent identity in
+/// the enclosing turn request.
+pub fn eval_workspace_dep_with_store(
+    t: &dyn Transport,
+    name: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
     let (_, oid) = t
         .ingest_path(".")?
         .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
-    // Entry-point resolution feeds `assemble_arg_tree` (which marks the run) or
-    // a reader match, so it carries no store of its own — no marking here.
-    eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"), &[])
+    eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"), store)
         .map(|(_kind, hash)| hash)
         .map_err(|error| workspace_dep_error(name, &error))
 }
