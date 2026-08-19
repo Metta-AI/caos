@@ -25,7 +25,7 @@
       #   caosd      — bring the stack up (foreground; Ctrl-C stops it). It also
       #                (re)publishes the builtin worker library on each startup.
       #   caos-cli   — drive workers (run/get/curry/…)
-      # caosd honors CAOS_DATA (default $XDG_CACHE_HOME/caos) for the server's repo;
+      # caosd honors CAOS_DATA (default ./.caos-data) for the server's repo;
       # caos-cli must run inside a git working tree (this one) that has the
       # server as its `caos` remote — that remote URL *is* the server, so
       # there's no CAOS_SERVER_URL to set:

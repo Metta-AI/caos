@@ -603,8 +603,6 @@ spawning no container.
 
 - Build the stack with `nix build`
 - Run the dev stack with `result/bin/caosd up`
-- Stack state is shared across worktrees under
-  `${XDG_CACHE_HOME:-$HOME/.cache}/caos`; set `CAOS_DATA` to override it.
 - **Check `caosd version` before believing a bug report.** A devShell that fails
   to build leaves direnv on the *previous* environment, so the `caosd` on PATH
   can be far older than the `flake.lock` that names it — and the symptom is an

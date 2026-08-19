@@ -724,7 +724,7 @@
             pkgs.util-linux pkgs.diffutils pkgs.gnugrep pkgs.findutils pkgs.jq
           ];
           text = ''
-            : "''${CAOS_DATA:=''${XDG_CACHE_HOME:-$HOME/.cache}/caos}"
+            : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
             export CAOS_DATA
             mkdir -p "$CAOS_DATA"
