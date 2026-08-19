@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 
 use caos::{
     build_secret_store, compute_client_request_with_store, curry_client_object,
-    eval_workspace_dep_with_store, prepare_client_request_with_store, ClientSecret, GitTransport,
-    Transport, CAOS_REMOTE,
+    eval_workspace_dep_with_store, prepare_client_request_with_store,
+    run_client_request_with_store, ClientSecret, GitTransport, Transport, CAOS_REMOTE,
 };
 
 const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
@@ -2079,8 +2079,7 @@ pub fn generate_conversation_title(
         "--model={}",
         options.model.as_deref().unwrap_or(DEFAULT_MODEL)
     ));
-    let arg_tree = prepare_client_request_with_store(t, &llm, &call, &store)?;
-    let (kind, hash) = compute_client_request_with_store(&t.server_url()?, &arg_tree, &store)?;
+    let (kind, hash) = run_client_request_with_store(t, &llm, &call, &store)?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"

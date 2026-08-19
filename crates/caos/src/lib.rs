@@ -3124,6 +3124,20 @@ pub fn prepare_client_request_with_store(
     prepare_request(t, image, None, kvs, store)
 }
 
+/// Prepare and synchronously run one host-side request with an already-resolved
+/// local secret store. This is the non-streaming client equivalent of
+/// [`cli_run`], for callers that need the result identity rather than CLI output
+/// handling. Durable conversation turns deliberately use the split prepare and
+/// compute APIs instead so they can record the request before dispatching it.
+pub fn run_client_request_with_store(
+    t: &dyn Transport,
+    image: &str,
+    kvs: &[String],
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
+    run_request(t, image, None, None, kvs, store)
+}
+
 /// `prepare-request --base:<type>=<image-or-arg-tree> [--name=value | --name:@=path ...]`
 /// — construct the exact flat runnable ArgTree and print its hash without
 /// executing it. This is the worker-side half: CAS paths use `/cas` semantics.
@@ -4062,28 +4076,12 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
         println!("no {SECRETS_DIR} directory — nothing to do");
         return Ok(());
     }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect();
-    paths.sort();
 
     let mut issues = 0;
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if name.starts_with('.') || !path.is_file() {
-            continue;
-        }
+    for (name, path) in local_secret_files(dir)? {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {name}: {e}"))?;
-        let entropy = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("entropy=").map(str::trim));
-        match entropy {
+        let spec = parse_local_secret_spec(&name, &text)?;
+        match spec.entropy.as_deref() {
             None => {
                 if check {
                     eprintln!("{name}: missing entropy");
@@ -4146,32 +4144,21 @@ pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String
         return Ok(Vec::new());
     }
     let pinned = secrets_pinned_tree(t, dir)?;
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect();
-    paths.sort();
     let mut store = Vec::new();
-    for path in paths {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        // Skip dotfiles (`.tree`, editor backups) and non-files.
-        if file_name.starts_with('.') || !path.is_file() {
-            continue;
-        }
-        let (name, value, entropy, readers) = parse_local_secret(&file_name, &path)?;
-        let readers = readers
+    for (file_name, path) in local_secret_files(dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
+        let spec = parse_local_secret_spec(&file_name, &text)?;
+        let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
+        let readers = spec
+            .readers
             .iter()
             .map(|r| resolve_reader_client(t, &pinned, r))
             .collect::<Result<_, _>>()?;
         store.push(ClientSecret {
-            name,
+            name: spec.name,
             value,
-            entropy,
+            entropy: spec.entropy.unwrap_or_default(),
             readers,
         });
     }
@@ -4320,19 +4307,47 @@ fn secrets_pinned_tree(t: &dyn Transport, dir: &Path) -> Result<String, String> 
     Ok(oid.to_string())
 }
 
-/// Parse one `.caos-secrets` file (repeated-key form) into `(name, value,
-/// entropy, readers)`. `name` defaults to the filename; `value=`/`value:@=` set
-/// the value; `reader=` accumulates; `entropy=` keys cache isolation (empty if
-/// absent — the `caos secrets` tool fills it).
-fn parse_local_secret(
-    file_name: &str,
-    path: &Path,
-) -> Result<(String, String, String, Vec<String>), String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("reading secret {file_name}: {e}"))?;
+/// Sorted, visible secret files shared by the offline `secrets` command and the
+/// runtime loader. Dotfiles (`.tree`, editor backups) and non-files are metadata,
+/// not secrets.
+fn local_secret_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("reading {SECRETS_DIR}: {e}"))? {
+        let path = entry
+            .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
+            .path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !name.starts_with('.') && path.is_file() {
+            files.push((name, path));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+enum LocalSecretValue {
+    Inline(String),
+    File(String),
+}
+
+struct LocalSecretSpec {
+    name: String,
+    value: Option<LocalSecretValue>,
+    entropy: Option<String>,
+    readers: Vec<String>,
+}
+
+/// Parse the repeated-key secret-file format once for both `caos-cli secrets`
+/// and runtime loading. Value files remain unresolved here so the offline
+/// entropy command does not need to read secret material.
+fn parse_local_secret_spec(file_name: &str, text: &str) -> Result<LocalSecretSpec, String> {
     let mut name = file_name.to_string();
-    let mut value: Option<String> = None;
-    let mut entropy = String::new();
+    let mut value = None;
+    let mut entropy = None;
     let mut readers = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
@@ -4344,23 +4359,38 @@ fn parse_local_secret(
             .ok_or_else(|| format!("secret {file_name}: line {line:?} is not key=value"))?;
         match key {
             "name" => name = val.trim().to_string(),
-            "entropy" => entropy = val.trim().to_string(),
-            "value" => value = Some(val.to_string()),
-            "value:@" => {
-                let file = path.parent().unwrap_or_else(|| Path::new(".")).join(val);
-                let bytes = std::fs::read(&file)
-                    .map_err(|e| format!("secret {file_name} value:@={val}: {e}"))?;
-                value = Some(
-                    String::from_utf8(bytes)
-                        .map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))?,
-                );
-            }
+            "entropy" => entropy = Some(val.trim().to_string()),
+            "value" => value = Some(LocalSecretValue::Inline(val.to_string())),
+            "value:@" => value = Some(LocalSecretValue::File(val.to_string())),
             "reader" => readers.push(val.trim().to_string()),
             other => return Err(format!("secret {file_name}: unknown key {other:?}")),
         }
     }
-    let value = value.ok_or_else(|| format!("secret {file_name}: no value= line"))?;
-    Ok((name, value, entropy, readers))
+    Ok(LocalSecretSpec {
+        name,
+        value,
+        entropy,
+        readers,
+    })
+}
+
+fn resolve_local_secret_value(
+    file_name: &str,
+    path: &Path,
+    value: Option<LocalSecretValue>,
+) -> Result<String, String> {
+    match value.ok_or_else(|| format!("secret {file_name}: no value= line"))? {
+        LocalSecretValue::Inline(value) => Ok(value),
+        LocalSecretValue::File(value_path) => {
+            let file = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&value_path);
+            let bytes = std::fs::read(&file)
+                .map_err(|e| format!("secret {file_name} value:@={value_path}: {e}"))?;
+            String::from_utf8(bytes).map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))
+        }
+    }
 }
 
 /// Resolve a reader — a single path/expression, no argument pins
@@ -4806,6 +4836,42 @@ mod git_transport_tests {
             &client,
             &["cat-file", "-e", &format!("{target}^{{commit}}")],
         );
+    }
+}
+
+#[cfg(test)]
+mod local_secret_tests {
+    use super::{parse_local_secret_spec, LocalSecretValue};
+
+    #[test]
+    fn one_parser_serves_entropy_maintenance_and_runtime_loading() {
+        let spec = parse_local_secret_spec(
+            "token",
+            "name=api-key\nvalue:@=../key\nentropy=abc123\nreader=DEEP-DEPS/tool\n",
+        )
+        .unwrap();
+        assert_eq!(spec.name, "api-key");
+        assert_eq!(spec.entropy.as_deref(), Some("abc123"));
+        assert_eq!(spec.readers, ["DEEP-DEPS/tool"]);
+        match spec.value {
+            Some(LocalSecretValue::File(path)) => assert_eq!(path, "../key"),
+            _ => panic!("value:@ was not preserved as an unresolved file value"),
+        }
+    }
+
+    #[test]
+    fn entropy_maintenance_can_parse_a_spec_before_its_value_is_complete() {
+        let spec = parse_local_secret_spec("token", "reader=DEEP-DEPS/tool\n").unwrap();
+        assert!(spec.value.is_none());
+        assert!(spec.entropy.is_none());
+    }
+
+    #[test]
+    fn shared_parser_rejects_unknown_fields() {
+        let error = parse_local_secret_spec("token", "wat=nope\n")
+            .err()
+            .expect("unknown field was accepted");
+        assert!(error.contains("unknown key \"wat\""), "{error}");
     }
 }
 
