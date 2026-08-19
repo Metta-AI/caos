@@ -8,6 +8,10 @@ edition = "2021"
 # still build to tiny static binaries. Its optional direct-Git module is used
 # only by workers whose selected runtime explicitly provides `git`.
 
+[features]
+default = []
+git = []
+
 [lib]
 name = "worker_common"
 path = "src/lib.rs"
