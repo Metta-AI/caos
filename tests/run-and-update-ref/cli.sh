@@ -11,10 +11,6 @@ remote_head() {
   [ -n "$line" ] || fail "remote ref $ref is absent"
   printf '%s\n' "${line%%[[:space:]]*}"
 }
-remote_exact_ref() { # <ref>
-  curl -fsS -X POST -H 'content-type: application/json' \
-    --data "{\"ref\":\"$1\"}" "$CAOS_SERVER_URL/ref/read"
-}
 marker() {
   local prefix=$1 file=$2 found=
   while IFS= read -r line; do
@@ -27,12 +23,13 @@ marker() {
   printf '%s\n' "$found"
 }
 only_status_event() {
-  local before=$1 after=$2 task=$3 status=$4
+  local before=$1 after=$2 task=$3 status=$4 result=$5
   [ "$(git rev-parse "$before^{tree}")" = "$(git rev-parse "$after^{tree}")" ] \
     || fail "status event changed the workspace"
   [ "$(git show -s --format=%B "$after" | jq -r --arg task "$task" \
-      'select((has("v") | not) and (has("base") | not) and .async.task == $task) | .async.status')" = "$status" ] \
-    || fail "status event did not record $task as $status"
+      'select((has("v") | not) and (has("base") | not) and .async.task == $task) | [.async.status, .async.result] | @tsv')" \
+      = "$status"$'\t'"$result" ] \
+    || fail "status event did not record $task as $status with result $result"
 }
 
 echo "== build exact successful and failing subrequests R ==" >&2
@@ -82,9 +79,8 @@ git -c fetch.negotiationAlgorithm=noop fetch -q caos "$success_head"
   || fail "complete event is not based on the conversation head"
 [ "$(git show "$success_head:workspace.txt")" = "workspace survives" ] \
   || fail "status append lost the workspace"
-only_status_event "$initial_head" "$success_head" "$success_task" complete
-[ -n "$(remote_exact_ref "refs/caos/res/$success_task")" ] \
-  || fail "status event is not named by Q"
+success_result=${actual_identity#* }
+only_status_event "$initial_head" "$success_head" "$success_task" complete "$success_result"
 
 again_identity=$("$CAOS_CLI" run actual-again --base:hash="$success_task")
 [ "$again_identity" = "$success_identity" ] || fail "cached Q result changed"
@@ -107,9 +103,8 @@ failure_head=$(remote_head "$failure_ref")
 git -c fetch.negotiationAlgorithm=noop fetch -q caos "$failure_head"
 [ "$(git rev-parse "$failure_head^")" = "$initial_head" ] \
   || fail "failed event is not based on the conversation head"
-only_status_event "$initial_head" "$failure_head" "$failure_task" failed
-[ -n "$(remote_exact_ref "refs/caos/res/$failure_task")" ] \
-  || fail "structured failure is not available through Q"
+failure_result=${failed_identity#* }
+only_status_event "$initial_head" "$failure_head" "$failure_task" failed "$failure_result"
 
 "$CAOS_CLI" run failed-again --base:hash="$failure_task" >/dev/null
 [ "$(remote_head "$failure_ref")" = "$failure_head" ] \

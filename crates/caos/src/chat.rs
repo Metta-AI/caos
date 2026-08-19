@@ -2242,72 +2242,6 @@ fn push_head_cas(
     if let Some(expected) = expected {
         validate_hash(expected, "expected head")?;
     }
-    let server = t.server_url()?;
-    // Unit tests and local debugging may use a filesystem Git remote, which has
-    // no HTTP endpoint. Receive-pack is still protected by the server-owned hook
-    // in a real stack; retain the old transport for this non-server case.
-    if !server.starts_with("http://") && !server.starts_with("https://") {
-        return push_head_cas_git(t, refname, expected, candidate);
-    }
-    // The endpoint moves only objects already in the server ODB. Keep the
-    // negotiated Git push for the closure, but make the authoritative ref move
-    // an exact, first-parent-checked operation that never downloads the whole
-    // ref advertisement.
-    t.ensure_pushed(candidate)?;
-    let body = serde_json::to_vec(&json!({
-        "ref": refname,
-        "expected": expected,
-        "new": candidate,
-    }))
-    .map_err(|error| format!("serializing ref append: {error}"))?;
-    let url = format!("{}/ref/append", server.trim_end_matches('/'));
-    let pushed = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|error| format!("POST {url}: {error}"));
-    if pushed
-        .as_ref()
-        .is_ok_and(|response| (200..300).contains(&response.status_code))
-    {
-        return Ok(true);
-    }
-    let observed = remote_ref(t, refname)?;
-    if observed.as_deref() == Some(candidate) {
-        return Ok(true);
-    }
-    if let Some(observed) = observed.as_deref() {
-        // The server may have accepted this update even when the client lost
-        // the push response. A different writer can then advance the ref before
-        // this confirmation read. The event is already durable when it is on
-        // the authoritative first-parent spine; appending it again would
-        // duplicate a submitted message.
-        fetch_commit_after(t, observed, expected)?;
-        if first_parent_contains(t, observed, candidate)? {
-            return Ok(true);
-        }
-    }
-    if observed.as_deref() != expected {
-        return Ok(false);
-    }
-    match pushed {
-        Err(error) => Err(error),
-        Ok(response) => Err(format!(
-            "POST {url}: {} {}: {}",
-            response.status_code,
-            response.reason_phrase,
-            String::from_utf8_lossy(response.as_bytes()).trim()
-        )),
-    }
-}
-
-fn push_head_cas_git(
-    t: &GitTransport,
-    refname: &str,
-    expected: Option<&str>,
-    candidate: &str,
-) -> Result<bool, String> {
     let lease = match expected {
         Some(expected) => format!("--force-with-lease={refname}:{expected}"),
         None => format!("--force-with-lease={refname}:"),
@@ -2606,47 +2540,18 @@ pub fn conversation_ref(id: &str) -> Result<String, String> {
 }
 
 fn remote_ref(t: &GitTransport, refname: &str) -> Result<Option<String>, String> {
-    let server = t.server_url()?;
-    if !server.starts_with("http://") && !server.starts_with("https://") {
-        let output = t.git_capture(&["ls-remote", "--refs", CAOS_REMOTE, refname], None)?;
-        let mut lines = output.lines();
-        let result = lines.next().and_then(|line| line.split_whitespace().next());
-        if lines.next().is_some() {
-            return Err(format!("server advertised {refname} more than once"));
-        }
-        return result
-            .map(|hash| {
-                validate_hash(hash, "remote ref")?;
-                Ok(hash.to_string())
-            })
-            .transpose();
+    let output = t.git_capture(&["ls-remote", "--refs", CAOS_REMOTE, refname], None)?;
+    let mut lines = output.lines();
+    let result = lines.next().and_then(|line| line.split_whitespace().next());
+    if lines.next().is_some() {
+        return Err(format!("server advertised {refname} more than once"));
     }
-    let body = serde_json::to_vec(&json!({"ref": refname}))
-        .map_err(|error| format!("serializing ref read: {error}"))?;
-    let url = format!("{}/ref/read", server.trim_end_matches('/'));
-    let response = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|error| format!("POST {url}: {error}"))?;
-    if response.status_code == 404 {
-        return Ok(None);
-    }
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "POST {url}: {} {}: {}",
-            response.status_code,
-            response.reason_phrase,
-            String::from_utf8_lossy(response.as_bytes()).trim()
-        ));
-    }
-    let hash = response
-        .as_str()
-        .map_err(|error| format!("POST {url}: {error}"))?
-        .trim();
-    validate_hash(hash, "remote ref")?;
-    Ok(Some(hash.to_string()))
+    result
+        .map(|hash| {
+            validate_hash(hash, "remote ref")?;
+            Ok(hash.to_string())
+        })
+        .transpose()
 }
 
 fn remote_conversations(t: &GitTransport) -> Result<Vec<(String, String)>, String> {

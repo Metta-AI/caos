@@ -81,11 +81,15 @@ assert_oid "$agent_request" "subagent request"
 
 agent_result=""
 for _ in $(seq 1 300); do
-  agent_result=$(remote_exact_ref "refs/caos/res/$agent_task" 2>/dev/null || true)
+  head1=$(fetch_head)
+  events1=$(git log --first-parent --format=%B "$user1..$head1")
+  agent_result=$(jq -r --arg task "$agent_task" \
+    'select(.async.task == $task and (.async.status == "complete" or .async.status == "failed")) | .async.result // empty' \
+    <<<"$events1")
   if [ -n "$agent_result" ]; then break; fi
   sleep 0.2
 done
-[ -n "$agent_result" ] || fail "subagent task has no result ref"
+assert_oid "$agent_result" "subagent result"
 agent_ref="refs/caos/v2/conversations/$agent/head"
 agent_head=$(remote_tip "$agent_ref") || fail "subagent has no canonical head"
 [ "$agent_head" = "$agent_result" ] || fail "subagent result is not its canonical head"

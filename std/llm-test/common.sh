@@ -27,8 +27,7 @@ mkcommit() { # <tree> <message> [parent] -> commit
 }
 
 remote_exact_ref() { # <ref>
-  curl -fsS -X POST -H 'content-type: application/json' \
-    --data "{\"ref\":\"$1\"}" "$CAOS_SERVER_URL/ref/read"
+  remote_tip "$1"
 }
 
 remote_tip() { # <ref>

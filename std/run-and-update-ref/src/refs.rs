@@ -1,20 +1,14 @@
-//! Minimal status-only event append protocol for the finish stage.
+//! Minimal terminal-event append protocol for the finish stage.
 //!
-//! This intentionally mirrors llm-step's exact-ref client locally: std workers
-//! are built as standalone projects and cannot import a module from another std
-//! binary. Status appends are tree-neutral, so a CAS loser simply retries from
-//! the latest head with that head's tree.
+//! Ref coordination uses ordinary Git directly. Event appends are tree-neutral,
+//! so a CAS loser simply retries from the latest head with that head's tree.
 
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
+use worker_common::git::Repo;
 
 const MAX_CAS_ATTEMPTS: usize = 32;
-
-enum PushResult {
-    Updated,
-    Rejected(String),
-}
 
 pub fn validate_target_ref(refname: &str) -> Result<(), String> {
     let Some(rest) = refname.strip_prefix("refs/caos/v2/conversations/") else {
@@ -51,50 +45,46 @@ pub fn validate_target_ref(refname: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), String> {
+pub fn append_status(refname: &str, task: &str, status: &str, result: &str) -> Result<(), String> {
     validate_target_ref(refname)?;
     validate_hash(task, "task")?;
+    validate_hash(result, "result")?;
     if !matches!(status, "complete" | "failed") {
         return Err(format!("invalid async status {status:?}"));
     }
     let base = server_base()?;
+    let repo = Repo::new("run-and-update-ref-git")?;
     let mut commits = HashMap::new();
 
     for _ in 0..MAX_CAS_ATTEMPTS {
-        let head = read_ref(&base, refname)?
+        let head = repo
+            .read_ref(refname)?
             .ok_or_else(|| format!("target conversation ref {refname} does not exist"))?;
         let remote = fetch_commit_cached(&base, &head, &mut commits)?;
         // A retry after a caught failure can legitimately succeed: caught
         // failures are not cached, so rerunning the same Q may produce the
-        // other terminal outcome. Only the same outcome is idempotent. A
-        // different one must become the latest durable state so F agrees with
-        // the result this execution of Q will return and pin.
-        if terminal_status_is_current(
-            task_status(&base, &head, task, &mut commits)?.as_deref(),
-            status,
+        // other terminal outcome. Only the same status and result are
+        // idempotent. A different outcome must become the latest durable state
+        // so F agrees with the result this execution of Q will return and pin.
+        let next = TerminalOutcome {
+            status: status.to_string(),
+            result: result.to_string(),
+        };
+        if matches!(
+            task_state(&base, &head, task, &mut commits)?.as_ref(),
+            Some(TaskState::Terminal(current)) if current == &next
         ) {
             return Ok(());
         }
 
-        let message = json!({"async": {"task": task, "status": status}});
+        let message = json!({"async": {"task": task, "status": status, "result": result}});
         let message = serde_json::to_string(&message)
             .map_err(|error| format!("serializing async status event: {error}"))?;
         let commit = store_commit(&base, &remote.tree, &head, &message)?;
-        match push_ref(&base, refname, &head, &commit) {
-            Ok(PushResult::Updated) => return Ok(()),
-            Ok(PushResult::Rejected(report)) => {
-                let observed = read_ref(&base, refname)?;
-                if observed.as_deref() == Some(commit.as_str()) {
-                    return Ok(());
-                }
-                if observed.as_deref() == Some(head.as_str()) {
-                    return Err(format!(
-                        "server rejected update of {refname} without a CAS race: {report}"
-                    ));
-                }
-            }
+        match repo.push_ref(refname, Some(&head), &commit) {
+            Ok(()) => return Ok(()),
             Err(error) => {
-                let observed = read_ref(&base, refname).map_err(|read_error| {
+                let observed = repo.read_ref(refname).map_err(|read_error| {
                     format!(
                         "pushing {refname} failed ({error}); rereading it also failed: {read_error}"
                     )
@@ -113,8 +103,16 @@ pub fn append_status(refname: &str, task: &str, status: &str) -> Result<(), Stri
     ))
 }
 
-fn terminal_status_is_current(current: Option<&str>, next: &str) -> bool {
-    current == Some(next)
+#[derive(Debug, Eq, PartialEq)]
+struct TerminalOutcome {
+    status: String,
+    result: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TaskState {
+    Pending,
+    Terminal(TerminalOutcome),
 }
 
 #[derive(Clone)]
@@ -174,14 +172,14 @@ fn cached_commit(
     Ok(commit)
 }
 
-fn task_status(
+fn task_state(
     base: &str,
     head: &str,
     task: &str,
     cache: &mut HashMap<String, RemoteCommit>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<TaskState>, String> {
     let mut current = head.to_string();
-    let mut newest_status = None;
+    let mut newest_state = None;
     loop {
         let hash = current;
         let commit = fetch_commit_cached(base, &hash, cache)?;
@@ -189,20 +187,17 @@ fn task_status(
         let parent = required_event_parent(commit.parent.as_deref(), &hash)?;
         let is_root = validate_event_base(&event, &parent)?;
         validate_fork_marker(&event, &parent)?;
-        if newest_status.is_none() {
-            newest_status = event_task_status(&event, task);
+        if newest_state.is_none() {
+            newest_state = event_task_state(&event, task);
         }
         if is_root {
-            return Ok(newest_status);
+            return Ok(newest_state);
         }
         current = parent;
     }
 }
 
-fn parse_spine_event(
-    message: &str,
-    commit: &str,
-) -> Result<Value, String> {
+fn parse_spine_event(message: &str, commit: &str) -> Result<Value, String> {
     let event = serde_json::from_str::<Value>(message.trim())
         .map_err(|error| format!("conversation history commit {commit} is not JSON: {error}"))?;
     let object = event
@@ -260,7 +255,7 @@ fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, St
 /// Read one event defensively. Conversation history is append-only, so a
 /// malformed or future async payload must not prevent a valid finish event
 /// from being appended after it.
-fn event_task_status(event: &Value, wanted: &str) -> Option<String> {
+fn event_task_state(event: &Value, wanted: &str) -> Option<TaskState> {
     let state = event.get("async")?;
     let parsed = (|| {
         let task = state
@@ -275,10 +270,24 @@ fn event_task_status(event: &Value, wanted: &str) -> Option<String> {
         if !matches!(status, "pending" | "complete" | "failed") {
             return Err(format!("invalid async status {status:?}"));
         }
-        Ok::<_, String>((task, status))
+        if status == "pending" {
+            return Ok::<_, String>((task, TaskState::Pending));
+        }
+        let result = state
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or("terminal conversation async event has no string result")?;
+        validate_hash(result, "async result")?;
+        Ok((
+            task,
+            TaskState::Terminal(TerminalOutcome {
+                status: status.to_string(),
+                result: result.to_string(),
+            }),
+        ))
     })();
     match parsed {
-        Ok((task, status)) if task == wanted => Some(status.to_string()),
+        Ok((task, state)) if task == wanted => Some(state),
         Ok(_) => None,
         Err(error) => {
             eprintln!("run-and-update-ref: ignoring malformed async event: {error}");
@@ -363,70 +372,6 @@ fn server_base() -> Result<String, String> {
         .map_err(|_| "CAOS_SERVER_URL not set".to_string())
 }
 
-fn push_ref(base: &str, refname: &str, old: &str, new: &str) -> Result<PushResult, String> {
-    validate_hash(old, "expected ref")?;
-    validate_hash(new, "new ref")?;
-
-    let body = serde_json::to_vec(&json!({
-        "ref": refname,
-        "expected": old,
-        "new": new,
-    }))
-    .map_err(|error| format!("serializing ref append: {error}"))?;
-    let url = format!("{base}/ref/append");
-    let response = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    if (200..300).contains(&response.status_code) {
-        Ok(PushResult::Updated)
-    } else if response.status_code == 409 {
-        Ok(PushResult::Rejected(
-            String::from_utf8_lossy(response.as_bytes())
-                .trim()
-                .to_string(),
-        ))
-    } else {
-        Err(format!(
-            "POST {url}: {} {}: {}",
-            response.status_code,
-            response.reason_phrase,
-            String::from_utf8_lossy(response.as_bytes()).trim()
-        ))
-    }
-}
-
-fn read_ref(base: &str, refname: &str) -> Result<Option<String>, String> {
-    let body = serde_json::to_vec(&json!({"ref": refname}))
-        .map_err(|error| format!("serializing ref read: {error}"))?;
-    let url = format!("{base}/ref/read");
-    let response = minreq::post(&url)
-        .with_header("content-type", "application/json")
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    if response.status_code == 404 {
-        return Ok(None);
-    }
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "POST {url}: {} {}: {}",
-            response.status_code,
-            response.reason_phrase,
-            String::from_utf8_lossy(response.as_bytes()).trim()
-        ));
-    }
-    let hash = response
-        .as_str()
-        .map_err(|error| format!("POST {url}: {error}"))?
-        .trim();
-    validate_hash(hash, "remote ref")?;
-    Ok(Some(hash.to_string()))
-}
-
 pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
     if hash.len() != 40
         || !hash
@@ -474,17 +419,10 @@ mod tests {
     fn explicit_base_must_match_the_first_parent() {
         let base = "a".repeat(40);
         assert_eq!(validate_event_base(&json!({}), &base), Ok(false));
-        assert_eq!(
-            validate_event_base(&json!({"base": base}), &base),
-            Ok(true)
-        );
+        assert_eq!(validate_event_base(&json!({"base": base}), &base), Ok(true));
         assert!(validate_event_base(&json!({"base": "b".repeat(40)}), &base).is_err());
         assert!(validate_fork_marker(&json!({"forked_from": base}), &base).is_ok());
-        assert!(validate_fork_marker(
-            &json!({"base": base, "forked_from": base}),
-            &base
-        )
-        .is_err());
+        assert!(validate_fork_marker(&json!({"base": base, "forked_from": base}), &base).is_err());
     }
 
     #[test]
@@ -498,8 +436,7 @@ mod tests {
                 RemoteCommit {
                     tree: "d".repeat(40),
                     parent: Some(parent.clone()),
-                    message: json!({"async": {"task": task, "status": "complete"}})
-                        .to_string(),
+                    message: json!({"async": {"task": task, "status": "complete"}}).to_string(),
                 },
             ),
             (
@@ -512,7 +449,7 @@ mod tests {
             ),
         ]);
 
-        let error = task_status("unused", &head, &task, &mut cache).unwrap_err();
+        let error = task_state("unused", &head, &task, &mut cache).unwrap_err();
         assert!(error.contains("no first parent"), "{error}");
     }
 
@@ -540,30 +477,93 @@ mod tests {
     fn malformed_async_state_is_not_a_terminal_verdict() {
         let task = "a".repeat(40);
         assert_eq!(
-            event_task_status(
+            event_task_state(
                 &json!({"async": {"task": "oops", "status": "complete"}}),
                 &task
             ),
             None
         );
         assert_eq!(
-            event_task_status(
-                &json!({"async": {"task": task, "status": "failed"}}),
+            event_task_state(
+                &json!({"async": {
+                    "task": task,
+                    "status": "failed",
+                    "result": "b".repeat(40)
+                }}),
                 &task
             )
-            .as_deref(),
-            Some("failed")
+            .as_ref(),
+            Some(&TaskState::Terminal(TerminalOutcome {
+                status: "failed".to_string(),
+                result: "b".repeat(40),
+            }))
         );
     }
 
     #[test]
-    fn only_the_same_terminal_outcome_is_idempotent() {
-        assert!(terminal_status_is_current(Some("failed"), "failed"));
-        assert!(terminal_status_is_current(Some("complete"), "complete"));
-        assert!(!terminal_status_is_current(Some("failed"), "complete"));
-        assert!(!terminal_status_is_current(Some("complete"), "failed"));
-        assert!(!terminal_status_is_current(Some("pending"), "complete"));
-        assert!(!terminal_status_is_current(None, "failed"));
+    fn newest_pending_shadows_an_older_terminal_outcome() {
+        let head = "a".repeat(40);
+        let root = "b".repeat(40);
+        let base = "c".repeat(40);
+        let task = "d".repeat(40);
+        let result = "e".repeat(40);
+        let mut cache = HashMap::from([
+            (
+                head.clone(),
+                RemoteCommit {
+                    tree: "f".repeat(40),
+                    parent: Some(root.clone()),
+                    message: json!({"async": {"task": task, "status": "pending"}}).to_string(),
+                },
+            ),
+            (
+                root,
+                RemoteCommit {
+                    tree: "f".repeat(40),
+                    parent: Some(base.clone()),
+                    message: json!({
+                        "base": base,
+                        "async": {"task": task, "status": "complete", "result": result}
+                    })
+                    .to_string(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            task_state("unused", &head, &task, &mut cache),
+            Ok(Some(TaskState::Pending))
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_identity_includes_status_and_result() {
+        let result = "a".repeat(40);
+        let failed = TerminalOutcome {
+            status: "failed".to_string(),
+            result: result.clone(),
+        };
+        assert_eq!(
+            failed,
+            TerminalOutcome {
+                status: "failed".to_string(),
+                result,
+            }
+        );
+        assert_ne!(
+            failed,
+            TerminalOutcome {
+                status: "complete".to_string(),
+                result: "a".repeat(40),
+            }
+        );
+        assert_ne!(
+            failed,
+            TerminalOutcome {
+                status: "failed".to_string(),
+                result: "b".repeat(40),
+            }
+        );
     }
 
     #[test]

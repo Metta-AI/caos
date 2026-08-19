@@ -86,8 +86,6 @@ git push --quiet caos "$early_interjection:$conversation_ref" \
   || fail "publishing queued event and pre-start interjection"
 "$CAOS_CLI" run --base:hash="$request1" >/tmp/llm-step-result \
   || fail "running first turn"
-[ -n "$(remote_exact_ref "refs/caos/res/$request1")" ] \
-  || fail "first exact request has no result ref"
 
 head1=$(fetch_head)
 assert_event_spine "$head1" "$base"

@@ -220,10 +220,11 @@ match on the worker alongside the rest, and a worker, seeing its args at
    the children in parallel, then `then` — through this same pipeline, so
    sub-runs are cached, cycle-checked, and may themselves promise;
 8. **cache** the resolved result, and for an **external** run (one that arrived
-   over HTTP) pin `refs/caos/res/<argTreeHash>` at it, for durability and as a
-   fetch/watch point. Result refs are hidden from upload-pack/fetch
-   advertisements, but receive-pack can negotiate them and exact
-   `POST /ref/read` lookup remains available. Sub-runs set no ref.
+   over HTTP) pin `refs/caos/res/<argTreeHash>` at it as a durability and Git
+   negotiation anchor. Result refs are hidden from upload-pack/fetch
+   advertisements but remain visible to receive-pack negotiation. They are not
+   a result-query API; callers already receive the result hash. Sub-runs set no
+   ref.
 
 Results stay on the server. The caller gets back the hash and a type; it does
 **not** receive the bytes unless it asks (see [result handling](#requests-and-results)).
@@ -677,6 +678,6 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   `buildInputs`/`nativeBuildInputs` in `flake.nix`.
 - **Cleanup (dev)**: transient `refs/caos/req/*` are pruned after ten minutes.
   Durable `refs/caos/res/*` are hidden from upload-pack/fetch advertisements but
-  remain visible to receive-pack negotiation and exact `/ref/read`; they still
-  accumulate (content-addressed, so they dedup). A deployment that does not need
-  indefinite result lookup should define a retention policy and run `git gc`.
+  remain visible to receive-pack negotiation; they still accumulate
+  (content-addressed, so they dedup). A deployment that does not need indefinite
+  result retention should define a policy and run `git gc`.
