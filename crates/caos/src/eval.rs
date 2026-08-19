@@ -55,6 +55,7 @@
 //! came from makes no difference to what naming it means.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 
@@ -66,6 +67,56 @@ use super::{
 
 /// The reserved variable naming a `.caos-expr`'s OWN blob (see [`eval_expr`]).
 pub(crate) const EXPR_VAR: &str = "CAOS_EXPR";
+
+/// A process-wide memo whose keys are CONTENT.
+///
+/// Every key stored through this is built from object hashes — a tree and a path
+/// within it, a commit sha — so an entry cannot go stale: the same key names the
+/// same bytes for the life of the world. That is the whole licence for a global
+/// here. A cache keyed on a NAME would need invalidation; this one has nothing
+/// to invalidate, and a long-lived process (the TUI) accumulates one small entry
+/// per distinct object it evaluated.
+///
+/// The lock is held across the map access and never across the work, so two
+/// threads racing on a cold key both compute and both insert — the same answer,
+/// because the key is the content. That costs a duplicated round trip once;
+/// holding it across the evaluation would serialize every evaluation in the
+/// process behind whichever one is dispatching a run.
+pub(crate) struct Memo<V>(OnceLock<Mutex<HashMap<String, V>>>);
+
+impl<V: Clone> Memo<V> {
+    pub(crate) const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    fn map(&self) -> &Mutex<HashMap<String, V>> {
+        self.0.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<V> {
+        // A poisoned lock means some OTHER thread panicked; the map is still
+        // consistent, because nothing fallible runs while it is held. Taking the
+        // inner map is therefore recovery, not a swallowed error.
+        self.map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn put(&self, key: String, value: V) {
+        self.map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, value);
+    }
+}
+
+/// [`eval_path`]'s memo: `<store>\0<tree>\0<path>` → `(kind, oid)`.
+static EVAL_MEMO: Memo<(String, String)> = Memo::new();
+
+/// [`eval_node`]'s memo: `<store>\0<tree>` → `(kind, oid)`.
+static EVAL_NODE_MEMO: Memo<(String, String)> = Memo::new();
 
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
 /// tree and descend to `DEEP-DEPS/<name>`.
@@ -146,7 +197,32 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
 /// **An expression is evaluated against its directory MINUS the `.caos-expr`
 /// itself** ([`strip_caos_expr`]) — the directive is not part of the input it
 /// describes. See [`resolve_expr_path`] for what that buys.
+///
+/// **Memoized per process** ([`Memo`]) — here for a repeat of the WHOLE
+/// question, and in [`eval_node`] for each transform along the way, which is
+/// where two different paths under one root share their work.
+///
+/// Sound because the key is content: `(store, start_tree, path)` where
+/// `start_tree` is an object hash. `CAOS_SALT` is not in the key because
+/// [`crate::run_salt`] reads the environment, which is fixed for the process —
+/// two different salts never meet in one memo.
 pub(crate) fn eval_path(
+    t: &dyn Transport,
+    start_tree: &str,
+    path: &str,
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
+    let key = format!("{}\0{start_tree}\0{path}", crate::store_key(store));
+    if let Some(hit) = EVAL_MEMO.get(&key) {
+        return Ok(hit);
+    }
+    let result = eval_path_uncached(t, start_tree, path, store)?;
+    EVAL_MEMO.put(key, result.clone());
+    Ok(result)
+}
+
+/// [`eval_path`]'s body — the actual walk, run once per distinct question.
+fn eval_path_uncached(
     t: &dyn Transport,
     start_tree: &str,
     path: &str,
@@ -163,13 +239,9 @@ pub(crate) fn eval_path(
         // A `.caos-expr` at the root of this tree node transforms the node — from
         // the node's contents WITHOUT the directive (see `strip_caos_expr`).
         if node_kind == "tree" {
-            if let Some((mode, oid)) = lookup_in_tree(t, &node_oid, ".caos-expr")? {
-                if !mode.is_tree() {
-                    let input = strip_caos_expr(t, &node_oid)?;
-                    let (k, o) = eval_expr(t, &input, &oid.to_string(), store)?;
-                    node_kind = k;
-                    node_oid = o;
-                }
+            if let Some((k, o)) = eval_node(t, &node_oid, store)? {
+                node_kind = k;
+                node_oid = o;
             }
         }
         if i == comps.len() {
@@ -188,6 +260,54 @@ pub(crate) fn eval_path(
         i += 1;
     }
     Ok((node_kind, node_oid))
+}
+
+/// What the tree `tree` evaluates to: the value of the `.caos-expr` at its root,
+/// or `None` when it carries none (a tree without a directive is its own value).
+///
+/// **This is the memo that pays**, and the granularity is the reason. One
+/// expression asks many questions that share a PREFIX, and each shared step is a
+/// chain of client↔server round trips even when every answer is a cache hit. A
+/// consumer that mounts caos writes two locators over one pin:
+///
+/// ```text
+/// run --base:@@=…&dir=std/flake-input-loader --input-tree:@@=…&dir=std …
+/// ```
+///
+/// Both descend THROUGH EVALUATION ([`crate::resolve_remote_arg`]), so both
+/// apply caos' root `.caos-expr` — a deep-deps run over the whole repo, itself
+/// preceded by the seeded-sentinel run that resolves the deep-deps worker — and
+/// then `std/.caos-expr`, another such pair.
+///
+/// Those two descents are DIFFERENT questions (`dir=std` and
+/// `dir=std/flake-input-loader`), so [`eval_path`]'s own memo cannot join them —
+/// it was measured doing exactly nothing before this one existed, 52 `git push`
+/// invocations against 55. What the two have in common is the node transforms,
+/// and this is where they meet: 55 pushes → 38, 213 git processes → 149, on a
+/// resolution where every answer was already cached.
+///
+/// Keyed on the tree alone (plus the store) because a transform is a function of
+/// its input and nothing else — a `.caos-expr` reaches only what its own tree
+/// holds, by construction.
+fn eval_node(
+    t: &dyn Transport,
+    tree: &str,
+    store: &[ClientSecret],
+) -> Result<Option<(String, String)>, String> {
+    let Some((mode, expr)) = lookup_in_tree(t, tree, ".caos-expr")? else {
+        return Ok(None);
+    };
+    if mode.is_tree() {
+        return Ok(None);
+    }
+    let key = format!("{}\0{tree}", crate::store_key(store));
+    if let Some(hit) = EVAL_NODE_MEMO.get(&key) {
+        return Ok(Some(hit));
+    }
+    let input = strip_caos_expr(t, tree)?;
+    let result = eval_expr(t, &input, &expr.to_string(), store)?;
+    EVAL_NODE_MEMO.put(key, result.clone());
+    Ok(Some(result))
 }
 
 /// `tree` without its own `.caos-expr` entry — the input an expression is

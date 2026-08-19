@@ -2752,6 +2752,22 @@ fn resolve_remote_arg(
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
     let git_ref = parse_git_ref(value)?;
 
+    // MEMOIZED FOR THE FETCH SCHEMES ONLY, and the split is the pin: a `git+` /
+    // `github:` locator carries a mandatory full commit sha, so the whole
+    // resolution — fetch, peel, descend — is immutable and the locator string is
+    // a content key like any other. A `path:` locator reads a LIVE directory,
+    // whose bytes change under an editor, so it is re-ingested every time.
+    //
+    // Worth its own memo on top of `eval_path`'s: a repeat here also skips the
+    // `git cat-file` that `fetch_git_ref` probes with and the commit peel, so a
+    // consumer naming one pin twice touches git once.
+    let memo_key = (!git_ref.is_plain_dir()).then(|| format!("{}\u{0}{value}", store_key(store)));
+    if let Some(key) = &memo_key {
+        if let Some(hit) = REMOTE_ARG_MEMO.get(key) {
+            return Ok(hit);
+        }
+    }
+
     // `path:` — a live local directory, hashed now, exactly like a `:@=` path
     // (so "only what git tracks is visible" still holds). No rev: there is
     // nothing to pin, because there is no fetch.
@@ -2804,8 +2820,16 @@ fn resolve_remote_arg(
     let dir = git_ref.dir.as_deref().unwrap_or("");
     let (kind, hash) = eval::eval_path(t, &root.to_string(), dir, store)
         .map_err(|e| format!("git ref {value:?}: {e}"))?;
-    Ok((eval::mode_of_kind(&kind), parse_oid(&hash)?))
+    let resolved = (eval::mode_of_kind(&kind), parse_oid(&hash)?);
+    if let Some(key) = memo_key {
+        REMOTE_ARG_MEMO.put(key, resolved);
+    }
+    Ok(resolved)
 }
+
+/// [`resolve_remote_arg`]'s memo: `<store>\0<locator>` → `(mode, oid)`, for the
+/// pinned schemes only. See the split at the top of that function.
+static REMOTE_ARG_MEMO: eval::Memo<(gix::objs::tree::EntryMode, gix::ObjectId)> = eval::Memo::new();
 
 /// Parse a `:@@=` locator value into a [`GitRef`], validating the
 /// content-addressing invariant: a git fetch MUST pin a commit (`rev=<40-hex>`),
@@ -4116,6 +4140,37 @@ fn client_secret_hash(
     Ok(Some(hash_bytes("blob", &material)?.to_string()))
 }
 
+/// A stable in-process identity for a secret store: everything about it that can
+/// change an evaluation's answer, and nothing else.
+///
+/// Used to key the evaluation memos ([`eval::Memo`]), which must not let a run
+/// resolved under one store answer for another. What a store contributes to a
+/// result is exactly what [`client_secret_hash`] reads — each secret's `name`,
+/// its `entropy`, and the readers deciding whether it matches — so those are the
+/// key. **The `value` is deliberately absent**: it is not in the arg tree the
+/// server caches on either (only the digest is), so including it would key on
+/// something that cannot change the answer while putting secret material into a
+/// long-lived map.
+pub(crate) fn store_key(store: &[ClientSecret]) -> String {
+    let mut key = String::new();
+    for secret in store {
+        key.push_str(&secret.name);
+        key.push('\u{1}');
+        key.push_str(&secret.entropy);
+        for reader in &secret.readers {
+            key.push('\u{2}');
+            for (name, oid) in reader {
+                key.push_str(name);
+                key.push('=');
+                key.push_str(oid);
+                key.push('\u{3}');
+            }
+        }
+        key.push('\u{4}');
+    }
+    key
+}
+
 /// Is `reader` (a partial arg tree) a subset of `base`? (The client-side twin of
 /// the server's match — kept identical so both compute the same `secret-hash`.)
 fn reader_subset(
@@ -4709,5 +4764,60 @@ mod git_transport_tests {
             &client,
             &["cat-file", "-e", &format!("{target}^{{commit}}")],
         );
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::{eval::Memo, store_key, ClientSecret};
+
+    fn secret(name: &str, value: &str, entropy: &str, reader: &[(&str, &str)]) -> ClientSecret {
+        ClientSecret {
+            name: name.to_string(),
+            value: value.to_string(),
+            entropy: entropy.to_string(),
+            readers: vec![reader
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()],
+        }
+    }
+
+    /// The claim `store_key`'s doc comment makes: a store keys an evaluation by
+    /// what decides the answer, and a secret's VALUE is not that. Two callers
+    /// holding the same grant with different values form the same arg tree, so
+    /// they must share a memo entry rather than each paying the round trips.
+    #[test]
+    fn a_secrets_value_does_not_key_an_evaluation() {
+        let one = [secret("token", "hunter2", "e", &[("base", "abc")])];
+        let two = [secret("token", "correct-horse", "e", &[("base", "abc")])];
+        assert_eq!(store_key(&one), store_key(&two));
+    }
+
+    /// …and everything that DOES decide it separates the keys, so a run
+    /// resolved under one grant can never answer for another.
+    #[test]
+    fn name_entropy_and_readers_each_key_an_evaluation() {
+        let base = [secret("token", "v", "e", &[("base", "abc")])];
+        let key = store_key(&base);
+        for other in [
+            [secret("other", "v", "e", &[("base", "abc")])],
+            [secret("token", "v", "rotated", &[("base", "abc")])],
+            [secret("token", "v", "e", &[("base", "def")])],
+        ] {
+            assert_ne!(key, store_key(&other));
+        }
+        assert_ne!(key, store_key(&[]));
+    }
+
+    /// Distinct keys are distinct answers, and a stored one comes back — the
+    /// whole contract `eval_path` leans on.
+    #[test]
+    fn memo_answers_only_the_key_it_stored() {
+        static M: Memo<String> = Memo::new();
+        assert_eq!(M.get("a"), None);
+        M.put("a".to_string(), "one".to_string());
+        assert_eq!(M.get("a"), Some("one".to_string()));
+        assert_eq!(M.get("b"), None);
     }
 }
