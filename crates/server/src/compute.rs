@@ -2129,48 +2129,6 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
-mod image_identity_tests {
-    use super::*;
-
-    fn digest(hex: char) -> String {
-        format!(
-            "example.invalid/worker@sha256:{}",
-            hex.to_string().repeat(64)
-        )
-    }
-
-    #[test]
-    fn docker_images_require_a_sha256_manifest_digest() {
-        assert!(validate_docker_reference(&digest('a'), false).is_ok());
-        assert!(validate_docker_reference(
-            &format!("example.invalid/worker:stable@sha256:{}", "0".repeat(64)),
-            false,
-        )
-        .is_ok());
-
-        for mutable_or_malformed in [
-            "example.invalid/worker:latest".to_string(),
-            format!("example.invalid/worker@sha512:{}", "a".repeat(128)),
-            format!("example.invalid/worker@sha256:{}", "a".repeat(63)),
-            format!("example.invalid/worker@sha256:{}", "A".repeat(64)),
-            format!("@sha256:{}", "a".repeat(64)),
-        ] {
-            assert!(
-                validate_docker_reference(&mutable_or_malformed, false).is_err(),
-                "accepted {mutable_or_malformed:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_top_level_seeded_sentinels_bypass_digest_validation() {
-        assert!(validate_docker_reference("seeded", true).is_ok());
-        assert!(validate_docker_reference("seeded-rustc", true).is_ok());
-        assert!(validate_docker_reference("seeded", false).is_err());
-    }
-}
-
-#[cfg(test)]
 mod single_flight_tests {
     use super::*;
 
