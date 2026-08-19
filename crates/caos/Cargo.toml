@@ -3,14 +3,12 @@ name = "caos"
 version = "0.1.0"
 edition = "2021"
 
-# Two binaries plus external clients over one shared library:
-#   * `caos`     — the worker-side client: talks HTTP `/object`, runs the
-#                  container `entrypoint`, is installed setuid-root in worker
-#                  images so an unprivileged worker reaches the root-owned /cas.
-#   * `caos-cli` — the user-facing client: uses the server as a `caos` git remote
-#                  (negotiated push/fetch over the local working repo).
-# The shared logic — object model, currying, args trees, CAS materialization,
-# and the presentation-independent chat engine — lives in the library.
+# The generic client library plus its worker-side binary. `caos` talks HTTP
+# `/object`, runs the container `entrypoint`, and is installed setuid-root in
+# worker images so an unprivileged worker reaches the root-owned /cas. Host
+# clients depend on the library for the object model, currying, args trees,
+# CAS materialization, and Git transport; conversation policy lives in the
+# separate `conversation-client` crate.
 
 [lib]
 name = "caos"
@@ -19,10 +17,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "caos"
 path = "src/bin/caos.rs"
-
-[[bin]]
-name = "caos-cli"
-path = "src/bin/caos-cli.rs"
 
 [dependencies]
 # Read/write git objects (blobs/trees) in the local repo and parse those the
@@ -42,15 +36,6 @@ xattr = "1"
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
-# Full-screen terminal client used only by the `caos-cli` binary.
-ratatui-core = { version = "0.1.2", features = ["std"] }
-ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
-ratatui-widgets = { version = "0.3.2", default-features = false, features = ["std", "unstable-rendered-line-info"] }
-# Display-width measurement for laying out markdown tables in the transcript
-# (same crate ratatui measures cells with, so our column math matches the render).
-unicode-width = "0.2"
-# Minimal HTTP *server* for `caos serve` (the warm-pool worker mode): the same
-# pure-Rust, static-friendly lib the caos server uses.
 
 [dependencies.caos-world]
 path = "../caos-world"

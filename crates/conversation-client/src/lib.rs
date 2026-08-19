@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{curry_object, prepare_request, request_compute, GitTransport, Transport, CAOS_REMOTE};
+use caos::{
+    compute_client_request, curry_client_object, eval_workspace_dep, prepare_client_request,
+    GitTransport, Transport, CAOS_REMOTE,
+};
 
 const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
 const HEAD_SUFFIX: &str = "/head";
@@ -960,13 +963,7 @@ pub fn prepare_queued_request(
 ) -> Result<String, String> {
     validate_hash(queued_head, "queued conversation head")?;
     let llm = resolve_llm(t, options, id)?;
-    prepare_request(
-        t,
-        &llm,
-        None,
-        &[format!("--head:commit={queued_head}")],
-        &[],
-    )
+    prepare_client_request(t, &llm, &[format!("--head:commit={queued_head}")])
 }
 
 /// Resolve the human-facing identity once per client. `author` remains
@@ -1075,8 +1072,8 @@ fn resolve_llm(t: &GitTransport, options: &TurnOptions, id: &str) -> Result<Stri
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
-    let llm_base = crate::eval::eval_workspace_dep(t, "llm-step")?;
-    curry_object(t, &llm_base, None, &[], &config).map(|hash| hash.to_string())
+    let llm_base = eval_workspace_dep(t, "llm-step")?;
+    curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
 }
 
 fn request_is_active(status: &str) -> bool {
@@ -1088,7 +1085,7 @@ fn request_is_active(status: &str) -> bool {
 pub fn resume_request(t: &GitTransport, request: &str) -> Result<(), String> {
     validate_hash(request, "request")?;
     let server = t.server_url()?;
-    request_compute(&server, request, "").map(|_| ())
+    compute_client_request(&server, request).map(|_| ())
 }
 
 /// Reissue the exact request recorded by a nonterminal conversation. Repeated
@@ -1965,7 +1962,7 @@ pub fn run_chat_turn(
         let server = t.server_url()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = request_compute(&server, &request, "").map(|_| ());
+            let result = compute_client_request(&server, &request).map(|_| ());
             let _ = tx.send(result);
         });
         request_result = Some(rx);
@@ -2032,8 +2029,8 @@ pub fn generate_conversation_title(
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = crate::eval::eval_workspace_dep(t, "llm-call")?;
-    let llm = curry_object(t, &llm_base, None, &[], &kvs)?.to_string();
+    let llm_base = eval_workspace_dep(t, "llm-call")?;
+    let llm = curry_client_object(t, &llm_base, &kvs)?.to_string();
     let messages = serde_json::to_string(&title_messages(first_message))
         .map_err(|error| format!("encoding title context: {error}"))?;
     let mut call = vec![
@@ -2045,8 +2042,8 @@ pub fn generate_conversation_title(
         "--model={}",
         options.model.as_deref().unwrap_or(DEFAULT_MODEL)
     ));
-    let arg_tree = prepare_request(t, &llm, None, &call, &[])?;
-    let (kind, hash) = request_compute(&t.server_url()?, &arg_tree, "")?;
+    let arg_tree = prepare_client_request(t, &llm, &call)?;
+    let (kind, hash) = compute_client_request(&t.server_url()?, &arg_tree)?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"

@@ -1,0 +1,25 @@
+[package]
+name = "conversation-client"
+version = "0.1.0"
+edition = "2021"
+
+# Conversation policy and presentation live above the generic CAOS client.
+# The library owns the durable chat protocol; the binary combines it with the
+# generic host commands exposed by `caos`.
+[lib]
+name = "conversation_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "caos-cli"
+path = "src/bin/caos-cli.rs"
+
+[dependencies]
+caos = { path = "../caos" }
+serde_json = "1"
+ratatui-core = { version = "0.1.2", features = ["std"] }
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-widgets = { version = "0.3.2", default-features = false, features = ["std", "unstable-rendered-line-info"] }
+# Display-width measurement for laying out markdown tables in the transcript
+# (same crate ratatui measures cells with, so our column math matches the render).
+unicode-width = "0.2"

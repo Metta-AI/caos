@@ -115,12 +115,8 @@ dependencies = [
  "flate2",
  "gix",
  "minreq",
- "ratatui-core",
- "ratatui-crossterm",
- "ratatui-widgets",
  "serde_json",
  "tar",
- "unicode-width",
  "xattr",
 ]
 
@@ -180,6 +176,18 @@ dependencies = [
  "rustversion",
  "ryu",
  "static_assertions",
+]
+
+[[package]]
+name = "conversation-client"
+version = "0.1.0"
+dependencies = [
+ "caos",
+ "ratatui-core",
+ "ratatui-crossterm",
+ "ratatui-widgets",
+ "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

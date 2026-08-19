@@ -1,3 +1,5 @@
+//! Local-checkout and publication policy for the conversation TUI.
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

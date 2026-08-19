@@ -131,7 +131,7 @@ static EVAL_NODE_MEMO: Memo<(String, String)> = Memo::new();
 /// dependencies by mount (`run --base:@=DEEP-DEPS/rustc …`), and those exist only in
 /// the DEEPENED tree — so resolving the raw `std/llm-step` directory out of the
 /// worktree cannot work, whatever the path is spelled.
-pub(crate) fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String, String> {
+pub fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String, String> {
     let (_, oid) = t
         .ingest_path(".")?
         .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
