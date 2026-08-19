@@ -592,6 +592,30 @@ impl Transport for GitTransport {
     }
 
     fn ensure_pushed(&self, hash: &str) -> Result<(), String> {
+        // ASK BEFORE PUSHING. A push is idempotent but not free: it forks git,
+        // and its first act is `POST /info/refs?service=git-receive-pack`, which
+        // downloads the server's ENTIRE ref advertisement — one
+        // `refs/caos/req/<oid>` per request anyone has ever made, a set that only
+        // grows. A `HEAD /object/<hash>` is a status line. Every `run` an
+        // expression dispatches lands here, so a resolution that is nothing but
+        // cache hits was paying that advertisement a dozen times over.
+        //
+        // Sound because the server holding `hash` means it holds everything
+        // under it. An object reaches it in exactly two ways, and both establish
+        // the closure: a `git push`, which packs and connectivity-checks the
+        // whole reachable graph, or `hand_over_graph`, which posts a tree's
+        // children before the tree itself. And the failure mode if that were
+        // ever false is loud, not silent — `/run` names the object it cannot
+        // read.
+        //
+        // What is given up is the REF, which `hand_over_graph`'s raw posts do
+        // not create either: an object the server got that way stops being a
+        // negotiation base for a later delta push. It was never one — the
+        // client could not read its graph, which is why it went that route.
+        if self.server_holds(hash) {
+            return Ok(());
+        }
+
         // Content-addressed ref: clobber-free across clients, idempotent (a
         // re-push of the same content is a no-op), and it persists as the
         // negotiation base for the next push, so an edited tree ships only its
@@ -913,6 +937,36 @@ impl GitTransport {
     fn push_req_ref(&self, hash: &str) -> Result<(), String> {
         let refspec = format!("{hash}:refs/caos/req/{hash}");
         self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
+    }
+
+    /// Does the server already hold `hash`? One `HEAD /object/<hash>` — a status
+    /// line, no body, no subprocess, no ref advertisement. The probe
+    /// [`Transport::ensure_pushed`] skips a push on.
+    ///
+    /// Returns a bool rather than a `Result` because the answer is only ever
+    /// used to SKIP work, so every uncertainty must resolve to "push anyway":
+    ///
+    /// - a `caos` remote that is a plain git URL has no `/object` endpoint at
+    ///   all (`post_object_http` says so at length) but pushes perfectly well,
+    ///   so a non-HTTP remote is not an error here, it is simply not probeable;
+    /// - a transient HTTP failure is the push's to report. Failing here would
+    ///   replace the push's own diagnosis with this probe's.
+    ///
+    /// Note this is not [`Transport::has_object`], which for this transport is
+    /// deliberately LOCAL presence — the two questions have different answers
+    /// and different callers.
+    fn server_holds(&self, hash: &str) -> bool {
+        let Ok(server) = self.server_url() else {
+            return false;
+        };
+        if !server.starts_with("http://") && !server.starts_with("https://") {
+            return false;
+        }
+        let url = format!("{}/object/{hash}", server.trim_end_matches('/'));
+        minreq::head(&url)
+            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+            .send()
+            .is_ok_and(|response| (200..300).contains(&response.status_code))
     }
 
     /// Can git walk everything reachable from `hash` in THIS repo?

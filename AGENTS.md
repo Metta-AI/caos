@@ -101,10 +101,12 @@ Every script here runs with it, and two constructs quietly break under it.
   legitimately part of the history you are completing.
 
 - **An unsalted `run-tool test` does not prove a push works.** `ensure_pushed`
-  pushes `<argtree>:refs/caos/req/<argtree>`, so re-running with an unchanged
-  tree pushes a hash the server already has at that ref: git sends nothing,
-  traverses nothing, and any defect in packing the request is invisible. Only a
-  NEW ArgTree builds a real pack — which is why the primary gate is
+  asks before pushing — a `HEAD /object/<argtree>`, and on a hit it returns
+  without running git at all — so re-running with an unchanged tree does not
+  push, pack or traverse anything, and any defect in forming or packing the
+  request is invisible. (It was invisible before that probe too: the push was a
+  no-op update of a ref already at that hash.) Only a NEW ArgTree builds a real
+  pack — which is why the primary gate is
   `CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool test` (SPEC.md) and
   why a green unsalted suite once sat next to a hard-failing salted one for a
   whole session. Run the salted form before believing a push-path change.
