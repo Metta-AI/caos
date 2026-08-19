@@ -126,12 +126,12 @@ fn run(args: &[String]) -> Result<(), String> {
         // continues the repo's most recent conversation (`-c` picks one,
         // `--new` starts another); with no prompt on a terminal it loops, one
         // turn per line. Flag parsing and usage live in the conversation client.
-        Some("talk") => conversation_client::cli_talk(&transport()?, &args[2..]),
+        Some("talk") => caos_cli::cli_talk(&transport()?, &args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation on its shared canonical head. Flag parsing (and the
         // chat-specific usage) lives in the conversation client.
-        Some("chat") => conversation_client::cli_chat(&transport()?, &args[2..]),
+        Some("chat") => caos_cli::cli_chat(&transport()?, &args[2..]),
         // `run-tool <script | name> [--name=value ...]` — run a caos-tool (a
         // worker script, `caos-tools/<name>.sh` for a bare name) as a caos
         // job over this repo's tree: what an agent's tool invocation does,

@@ -1,6 +1,6 @@
 //! TUI command-line arguments.
 
-use conversation_client::{normalized_username, TurnOptions};
+use caos_cli::{normalized_username, TurnOptions};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Args {

@@ -8,7 +8,7 @@ edition = "2021"
 # worker images so an unprivileged worker reaches the root-owned /cas. Host
 # clients depend on the library for the object model, currying, args trees,
 # CAS materialization, and Git transport; conversation policy lives in the
-# separate `conversation-client` crate.
+# separate `caos-cli` crate.
 
 [lib]
 name = "caos"

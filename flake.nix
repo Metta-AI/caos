@@ -250,10 +250,9 @@
 
         # Every crate's binary is selected (by name, at copy time) from the one
         # build above, so these are all the same derivation. The generic `caos`
-        # worker and the user-facing `conversation-client` are separate Cargo
+        # worker and the user-facing `caos-cli` are separate Cargo
         # packages; consumers copy only the named binary they need.
         caos = workspaceBins;
-        conversation-client = workspaceBins;
         server = workspaceBins;
         runnerd = workspaceBins;
         worker-rustc = workspaceBins;
@@ -559,7 +558,7 @@
         # Just the user-facing CLI (a consumer wants only `caos-cli`, not the
         # worker-side `caos`, in its devShell) — and it runs on the *host*. On
         # Linux the musl `caos-cli` already runs on the host, so copy it straight
-        # out of the conversation-client package; on macOS that's a Linux
+        # out of the caos-cli package; on macOS that's a Linux
         # binary, so build a native `caos-cli` for the host instead.
         nativeArgs = {
           inherit src;
@@ -573,7 +572,7 @@
         };
         nativeCliArtifacts = craneLib.buildDepsOnly (
           nativeArgs
-          // { cargoExtraArgs = "--package conversation-client --bin caos-cli"; }
+          // { cargoExtraArgs = "--package caos-cli --bin caos-cli"; }
         );
         # Installed under both names: `caos` is what a person types (`caos talk`),
         # `caos-cli` stays for scripts and docs that spell it out. (No collision
@@ -583,14 +582,14 @@
           if pkgs.stdenv.hostPlatform.isLinux then
             pkgs.runCommand "caos-cli-bin" { } ''
               mkdir -p $out/bin
-              cp ${conversation-client}/bin/caos-cli $out/bin/caos-cli
+              cp ${workspaceBins}/bin/caos-cli $out/bin/caos-cli
             ''
           else
             craneLib.buildPackage (
               nativeArgs
               // {
                 cargoArtifacts = nativeCliArtifacts;
-                cargoExtraArgs = "--package conversation-client --bin caos-cli";
+                cargoExtraArgs = "--package caos-cli --bin caos-cli";
                 pname = "caos-cli-bin";
                 doCheck = false;
               }
@@ -1031,7 +1030,7 @@
           # (another `nix build`) is the only thing that moves it. The workspace
           # binaries stay available as `.#caos`.
           default = caos-tools;
-          inherit caos conversation-client server runnerd caos-cli caosd caos-tools;
+          inherit caos server runnerd caos-cli caosd caos-tools;
           # Agent-harness worker binaries (run as curry(runner, bin)).
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc

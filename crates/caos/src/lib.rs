@@ -10,7 +10,7 @@
 //! currying, args-tree assembly, CAS materialization, image import — lives here,
 //! written against the [`Transport`] trait. The worker picks [`HttpTransport`];
 //! host clients use [`GitTransport`]. Conversation semantics and presentation
-//! live in the separate `conversation-client` crate.
+//! live in the separate `caos-cli` crate.
 //!
 //! Every materialized path is tagged with the git hash it came from in the
 //! `user.caos.hash` extended attribute — the top-level path with `<hash>`, and
