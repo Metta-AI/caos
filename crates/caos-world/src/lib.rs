@@ -33,42 +33,6 @@ pub const WORLD: &str = match option_env!("CAOS_WORLD") {
 /// CGI delegate before this check) and health probes are plain curl.
 pub const WORLD_HEADER: &str = "X-Caos-World";
 
-/// The reserved ArgTree entry carrying the execution contract that is not part
-/// of the worker image itself. The server rejects a request without the exact
-/// value below before consulting the result cache, so changing container
-/// semantics cannot reuse results produced under the old semantics.
-pub const EXECUTION_POLICY_ARG: &str = "execution-policy";
-
-/// The platform all worker and git-image base containers execute as. Caos
-/// builds its host client and Linux stack binaries for the same architecture,
-/// so this compile-target mapping is byte-identical on both sides while staying
-/// explicit at the container engine.
-///
-/// This is explicit at the engine boundary rather than inherited from the
-/// runner host: a digest may name a multi-platform index, whose selected image
-/// would otherwise vary while the ArgTree stayed unchanged.
-pub const EXECUTION_OS: &str = "linux";
-#[cfg(target_arch = "aarch64")]
-pub const EXECUTION_ARCH: &str = "arm64";
-#[cfg(target_arch = "aarch64")]
-pub const EXECUTION_PLATFORM: &str = "linux/arm64";
-#[cfg(target_arch = "x86_64")]
-pub const EXECUTION_ARCH: &str = "amd64";
-#[cfg(target_arch = "x86_64")]
-pub const EXECUTION_PLATFORM: &str = "linux/amd64";
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-compile_error!("caos execution policy has no Docker platform for this architecture");
-
-/// Canonical bytes stored in [`EXECUTION_POLICY_ARG`]. Bump the version and
-/// describe the new contract here whenever runner behavior that can affect a
-/// worker changes. Client- and server-assembled ArgTrees both use these exact
-/// bytes.
-#[cfg(target_arch = "aarch64")]
-pub const EXECUTION_POLICY: &str = "container-v1;platform=linux/arm64;network=enabled;entrypoint=/bin/caos;engine-socket=image-opt-in";
-#[cfg(target_arch = "x86_64")]
-pub const EXECUTION_POLICY: &str = "container-v1;platform=linux/amd64;network=enabled;entrypoint=/bin/caos;engine-socket=image-opt-in";
-
 /// The rejection message, so client and server describe a mismatch the same way.
 pub fn mismatch(server: &str, client: &str) -> String {
     format!(
@@ -117,10 +81,5 @@ mod tests {
         assert_ne!(a, secret_hash_material(&[("gh", "E9"), ("npm", "E2")]));
         // The name is part of it (same secret at a different mount is distinct).
         assert_ne!(a, secret_hash_material(&[("GH", "E1"), ("npm", "E2")]));
-    }
-
-    #[test]
-    fn execution_policy_names_the_pinned_platform() {
-        assert!(EXECUTION_POLICY.contains(&format!("platform={EXECUTION_PLATFORM}")));
     }
 }

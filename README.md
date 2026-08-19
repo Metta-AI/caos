@@ -188,19 +188,15 @@ whose hash, `argTreeHash`, *is* the cache key and the rendezvous id — with
 nothing keyed alongside it. The worker image rides *inside* the ArgTree, under a
 reserved `base` entry — as do the standard library `std` (a reserved `std`
 entry naming the std tree) and the cache-busting `salt` (a reserved `salt`
-entry). A reserved `execution-policy` entry versions the fixed container
-contract, including the explicitly selected Linux target platform, so changing
-behavior outside the image also changes the ArgTree. Thus a computation is
-identified entirely by its args (an executor can
+entry) — so a computation is identified entirely by its args (an executor can
 match on the worker alongside the rest, and a worker, seeing its args at
 `/cas/args`, can read its own image to call itself). `GET /run?req=<argTreeHash>`
 (`req` is the query param's historical name; its value is the ArgTree hash):
 
 1. **read and validate** the ArgTree, whose `base` entry is the worker ref,
-   `execution-policy` fixes the container contract, `std` names the standard
-   library, and `salt` is the cache-buster. Direct Docker refs and Docker bases
-   inside git images must be digest-pinned; this check happens even when a
-   cached result exists;
+   `std` names the standard library, and `salt` is the cache-buster. Direct
+   Docker refs and Docker bases inside git images must be digest-pinned; this
+   check happens even when a cached result exists;
 2. **cache** lookup in Redis keyed on `argTreeHash` — a hit returns the cached
    `"<type> <hash>"` and skips everything below;
 3. **cycle check** — the server threads the chain of in-progress `argTreeHash`es
@@ -359,9 +355,8 @@ setuid `caos`.
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — the **ArgTree** — including the
-   `--base` image under the reserved `base` entry, the fixed container contract
-   under `execution-policy`, and (when set) the cache-busting salt under a
-   reserved `salt` entry (see
+   `--base` image under the reserved `base` entry and (when set) the cache-busting
+   salt under a reserved `salt` entry (see
    [arguments](#arguments-literals-paths-and-pinned-refs));
 2. the ArgTree's hash *is* the content-addressed request id (`argTreeHash`) —
    nothing wraps it, so the ArgTree is the whole cache key;
@@ -503,8 +498,8 @@ parse arm and a case in each resolver. The worker `caos` has no host filesystem
 passes (see `design/runner-protocol.md`). Per job:
 
 1. **unpack** — fetch the request tree named by the job's `req` (it IS the
-   ArgTree) and read its reserved `salt` entry (image, execution policy, and
-   salt all ride inside it);
+   ArgTree) and read its reserved `salt` entry (image and salt both ride inside
+   it);
 2. **set up** — wipe and recreate `/cas`, root-owned, and verify xattrs;
    materialize the args at `/cas/args`;
 3. **run `/worker`** — dropped to the unprivileged `worker` user so it can't

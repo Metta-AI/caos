@@ -3059,8 +3059,7 @@ pub fn cli_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), Stri
 }
 
 /// Assemble a runnable ArgTree from a base image ref and the caller's already
-/// resolved `call` args, folding in the reserved execution-policy, `base`,
-/// `salt`, and `std` entries,
+/// resolved `call` args, folding in the reserved `base`/`salt`/`std` entries,
 /// storing it, and getting it onto the server. Returns the ArgTree hash (the
 /// request id and cache key). Shared by [`prepare_request`] (which resolves
 /// `call` from kvs) and the `.caos-expr` evaluator (which resolves `call`
@@ -3090,9 +3089,7 @@ fn assemble_arg_tree(
     // that path straight to `caos run`. A `docker://` ref has no git object to
     // embed, so it rides as a blob naming the registry ref.
     let image_entry = base_arg_entry(t, &image)?;
-    let policy_entry = execution_policy_arg_entry(t)?;
-    let mut arg_entries =
-        merge_entries(merge_entries(bound, call), vec![image_entry, policy_entry]);
+    let mut arg_entries = merge_entries(merge_entries(bound, call), vec![image_entry]);
 
     // The cache-busting salt (empty by default) rides *in* the args tree under the
     // reserved `salt` entry, exactly like `base` — per SPEC an ArgTree is a git
@@ -3515,20 +3512,6 @@ fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entr
         mode: EntryKind::Blob.into(),
         filename: b"salt".to_vec().into(),
         oid: post_object(t, "blob", salt.as_bytes())?,
-    })
-}
-
-/// Build the reserved execution-policy entry shared by every runnable ArgTree.
-/// Unlike a salt this is always present: it names platform and container
-/// semantics outside the image whose changes would otherwise reuse one cache
-/// key for different executions. The server assembles the same entry for
-/// promise sub-runs and verifies it before reading the cache.
-fn execution_policy_arg_entry(t: &dyn Transport) -> Result<gix::objs::tree::Entry, String> {
-    use gix::objs::tree::{Entry, EntryKind};
-    Ok(Entry {
-        mode: EntryKind::Blob.into(),
-        filename: caos_world::EXECUTION_POLICY_ARG.as_bytes().to_vec().into(),
-        oid: post_object(t, "blob", caos_world::EXECUTION_POLICY.as_bytes())?,
     })
 }
 
@@ -4160,7 +4143,6 @@ pub(crate) fn mark_arg_tree(
     }
     let (image_ref, bound) = unwrap_curry(t, oid)?;
     let image_entry = base_arg_entry(t, &image_ref)?;
-    let policy_entry = execution_policy_arg_entry(t)?;
     let mut base: std::collections::BTreeMap<String, String> = bound
         .iter()
         .map(|e| {
@@ -4171,10 +4153,6 @@ pub(crate) fn mark_arg_tree(
         })
         .collect();
     base.insert("base".to_string(), image_entry.oid.to_string());
-    base.insert(
-        caos_world::EXECUTION_POLICY_ARG.to_string(),
-        policy_entry.oid.to_string(),
-    );
     let Some(digest) = client_secret_hash(store, &base)? else {
         return Ok(oid.to_string());
     };
@@ -4183,10 +4161,7 @@ pub(crate) fn mark_arg_tree(
         filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
         oid: post_object(t, "blob", digest.as_bytes())?,
     };
-    let entries = merge_entries(
-        merge_entries(bound, vec![image_entry, policy_entry]),
-        vec![secret_hash],
-    );
+    let entries = merge_entries(merge_entries(bound, vec![image_entry]), vec![secret_hash]);
     Ok(post_tree(t, entries)?.to_string())
 }
 

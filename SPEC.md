@@ -3,9 +3,6 @@
 A WorkRequest is:
 - an ArgTree: a git tree containing named args:
     - image: See below
-    - execution-policy: a reserved, versioned description of execution behavior
-      outside the image (including platform); verified by the server before cache
-      lookup
     - other args, by agreement between the caller and the worker, all as git files/trees/commits
     - std (optional, but very common)
     - salt (optional): a string that is used to invalidate the cache
@@ -18,16 +15,15 @@ WorkRequest contains ArgTree, stack, trace id, etc #todo
 - The ArgTree is the cache key
 
 We generally talk about ArgTrees, not images. An image is just one arg (see
-below), so one simple ArgTree contains only an image and the reserved execution
-policy; richer ArgTrees carry other args alongside them. Passing around ArgTrees
-rather than images is what makes currying (below) a uniform operation.
+below), so one simple ArgTree is one that only contains an image; richer
+ArgTrees carry other args alongside it. Passing around ArgTrees rather than
+images is what makes currying (below) a uniform operation.
 
 Also note in calling that rebinding existing args is an error #todo
 
 # Forming an ArgTree
 
-The simplest ArgTree has no caller arguments: only its image and the reserved
-execution-policy entry.
+The simplest ArgTree is one that only specifies an image
 
 ## Docker digest
 
@@ -282,10 +278,10 @@ Marker lines in the script's header comment:
 - `#@arg <name> <description>` — a REQUIRED parameter
 - `#@arg [<name>] <description>` — an OPTIONAL parameter
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `execution-policy`,
-`std` and `salt` are refused: the interpreter binds those itself and currying
-SHALL fail on a rebind. A malformed `#@arg` line is skipped with a message,
-never silently turned into an arg the model cannot use.
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `std` and `salt`
+are refused: the interpreter binds those itself and currying SHALL fail on a
+rebind. A malformed `#@arg` line is skipped with a message, never silently
+turned into an arg the model cannot use.
 
 Every parameter is declared to the model as a string, because every arg
 reaches the script as a blob whatever JSON type it left the model as. A tool

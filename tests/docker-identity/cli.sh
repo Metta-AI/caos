@@ -22,19 +22,4 @@ fi
 grep -q "git image base" base.err || fail "embedded-base rejection lost its context"
 grep -q "is mutable" base.err || fail "embedded-base rejection did not explain mutability"
 
-echo "== runnable ArgTrees carry the execution policy ==" >&2
-digest=$(printf '0%.0s' {1..64})
-request=$("$CAOS_CLI" prepare-request \
-  "--base:docker=example.invalid/worker@sha256:$digest" --probe=identity)
-policy_oid=$(git ls-tree "$request" execution-policy | while read -r _ _ oid _; do printf '%s' "$oid"; done)
-[ -n "$policy_oid" ] || fail "prepared request has no execution-policy entry"
-case $(uname -m) in
-  aarch64 | arm64) platform=linux/arm64 ;;
-  x86_64 | amd64) platform=linux/amd64 ;;
-  *) fail "test has no expected Docker platform for $(uname -m)" ;;
-esac
-expected="container-v1;platform=$platform;network=enabled;entrypoint=/bin/caos;engine-socket=image-opt-in"
-[ "$(git cat-file blob "$policy_oid")" = "$expected" ] \
-  || fail "prepared request carries the wrong execution policy"
-
 echo "docker-identity: ALL PASS" >&2

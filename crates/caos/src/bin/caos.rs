@@ -289,9 +289,8 @@ fn remove_secrets() {
 }
 
 /// Unpack an ArgTree: its hash (returned back for `/cas/args`) and the salt
-/// (its reserved `salt` entry, empty if absent). The reserved `base`,
-/// `execution-policy`, and `salt` are entries of this one tree, per SPEC's
-/// ArgTree.
+/// (its reserved `salt` entry, empty if absent). `base`/`salt` are entries of
+/// this one tree, per SPEC's ArgTree.
 fn read_arg_tree(t: &dyn Transport, arg_tree: &str) -> Result<(String, String), String> {
     let (kind, content) = t.get_object(arg_tree)?;
     if kind != "tree" {

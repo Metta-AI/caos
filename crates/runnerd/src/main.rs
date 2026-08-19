@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! docker run --name caos-worker-<nonce> --label caos.runnerd.owner=<id> \
-//!     --platform <linux platform> --network <net> -e CAOS_SERVER_URL=<url> \
+//!     --network <net> -e CAOS_SERVER_URL=<url> \
 //!     --entrypoint /bin/caos <image_ref> runner --job=<json>
 //! ```
 //!
@@ -375,11 +375,6 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         // (`--remote --url …`) shares a container namespace with the outer one,
         // and must not sweep its siblings' containers.
         .args(["--label", &format!("{OWNER_LABEL}={}", owner_id())])
-        // A digest may name a multi-platform index. Host-default selection would
-        // let the same ArgTree execute different manifests on different runners;
-        // the selected platform is therefore fixed and carried in the request's
-        // reserved execution-policy entry.
-        .args(["--platform", caos_world::EXECUTION_PLATFORM])
         .args(["--network", &config.network]);
     if let Some(sock) = &config.socket {
         if image_wants_socket(config, &job.image_ref) {

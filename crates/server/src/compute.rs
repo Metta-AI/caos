@@ -3,9 +3,9 @@
 //! A **WorkRequest** (`SPEC.md`) is an **ArgTree** to run plus runtime context
 //! (an ancestor `stack` for cycle detection and an optional trace id) that is
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
-//! hash *is* the cache key with nothing keyed alongside it: the worker image, the
-//! execution policy, standard library `std`, and cache-busting `salt` all ride
-//! inside it under reserved entries. `/run?req=<argTreeHash>`
+//! hash *is* the cache key with nothing keyed alongside it: the worker image,
+//! standard library `std`, and cache-busting `salt` all ride inside it under
+//! reserved entries. `/run?req=<argTreeHash>`
 //! reads and validates it, then: cache lookup (Redis) → run-cycle detection →
 //! image resolution (a digest-pinned `docker://` ref used as-is, or a git-docker
 //! image converted and pushed to the registry) → dispatch through the runner
@@ -82,8 +82,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// context that is deliberately NOT part of its cache key — the ancestor `stack`
 /// (run-cycle detection) and the optional trace id. Only `arg_tree` is hashed and
 /// cached; `stack` and `trace_id` ride alongside it. The ArgTree carries the
-/// worker image, execution policy, std and salt under reserved entries, so its
-/// hash *is* the whole cache key (`SPEC.md`: "The ArgTree is the cache key").
+/// worker image, std and salt under reserved entries, so its hash *is* the whole
+/// cache key (`SPEC.md`: "The ArgTree is the cache key").
 #[derive(Clone, Copy)]
 struct WorkRequest<'a> {
     /// The ArgTree hash — the request's identity and cache key.
@@ -99,12 +99,12 @@ struct WorkRequest<'a> {
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
-/// the worker image, execution policy, std and salt under reserved entries) and
-/// return its result as `"<type> <hash>"`. (`req` is the query param's historical
-/// name; its value is the ArgTree hash.)
+/// the worker image, std and salt under reserved entries) and return its result
+/// as `"<type> <hash>"`. (`req` is the query param's historical name; its value
+/// is the ArgTree hash.)
 ///
 /// The ArgTree being a content-addressed object means its hash *is* the cache key
-/// (it captures everything — image, execution policy, std, salt and the rest)
+/// (it captures everything — image, std, salt and the rest)
 /// and the rendezvous id: an external run also pins
 /// `refs/caos/res/<argTreeHash>` at the result, so a client can fetch it by ref.
 /// Most worker sub-runs are promise resolutions the server performs itself
@@ -192,9 +192,9 @@ fn run_work_request_inner(
         secrets: _,
     } = *request;
     // Unpack the ArgTree's reserved worker `base` (an embedded tree for a git
-    // image, a ref blob for `docker://`), execution policy, and cache-busting
-    // `salt`. All are part of the ArgTree — hence part of the cache key — and
-    // inherited by any promise sub-runs this request leaves behind.
+    // image, a ref blob for `docker://`) and cache-busting `salt`. Both are part
+    // of the ArgTree — hence part of the cache key — and inherited by any
+    // promise sub-runs this request leaves behind.
     let (image, salt) = read_arg_tree(config, arg_tree)?;
     // Validate every external image locator before the cache lookup. A cached
     // result must not make a tag-based request acceptable: that would retain
@@ -215,8 +215,8 @@ fn run_work_request_inner(
         return Err(HttpError::new(400, "request has empty image"));
     }
 
-    // The ArgTree hash is the cache key (it captures image, execution policy,
-    // std, salt and every other arg); the value is
+    // The ArgTree hash is the cache key (it captures image, std, salt and every
+    // other arg); the value is
     // the final result "<type> <hash>" — a promise is resolved before it's cached,
     // so a hit never re-resolves. A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
@@ -1065,11 +1065,10 @@ fn continuation_result(
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
 /// any curry layers and build the ArgTree — worker image folded in under its
-/// reserved `base` entry, policy under `execution-policy`, salt under `salt`,
-/// and std under `std` — whose hash IS the request, built server-side
-/// byte-identically to what a client would build, so the ArgTree hash (and cache
-/// key) is the same no matter who assembles it — and send it through
-/// [`run_work_request`]. Returns `"<type> <hash>"`.
+/// reserved `base` entry, salt under `salt`, and std under `std` — whose hash IS
+/// the request, built server-side byte-identically to what a client would build,
+/// so the ArgTree hash (and cache key) is the same no matter who assembles it —
+/// and send it through [`run_work_request`]. Returns `"<type> <hash>"`.
 #[allow(clippy::too_many_arguments)] // the run context travels together
 fn run_image(
     config: &Config,
@@ -1100,15 +1099,7 @@ fn run_image(
             store_git_blob(config, image.as_bytes()).map_err(store_err)?,
         )
     };
-    let policy_entry = named_entry(
-        caos_world::EXECUTION_POLICY_ARG,
-        EntryKind::Blob.into(),
-        store_git_blob(config, caos_world::EXECUTION_POLICY.as_bytes()).map_err(store_err)?,
-    );
-    let mut args = merge_entries(
-        merge_entries(bound, call_args),
-        vec![image_entry, policy_entry],
-    );
+    let mut args = merge_entries(merge_entries(bound, call_args), vec![image_entry]);
     // The salt also rides in the ArgTree, under its reserved entry — added (only
     // when non-empty) exactly as the client does, so the ArgTree, and hence the
     // request, is byte-identical. It is threaded down from the parent run.
@@ -1262,9 +1253,9 @@ fn args_entries(
 }
 
 /// Unpack an ArgTree into the reserved entries the server needs: the image ref
-/// (its `base` entry), the execution-policy contract, and the salt (its `salt`
-/// entry, empty if none). They are all entries of this one tree, so the
-/// ArgTree's hash *is* the cache key with
+/// (its `base` entry), the std-tree hash (its `std` entry, empty if none), and
+/// the salt (its `salt` entry, empty if none). `base`/`std`/`salt` are all
+/// entries of this one tree, so the ArgTree's hash *is* the cache key with
 /// nothing keyed alongside it — the ArgTree hash itself is the request identity,
 /// so it is not returned here.
 fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), HttpError> {
@@ -1272,7 +1263,6 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
         .map_err(|e| HttpError::new(400, format!("reading arg tree: {e}")))?;
     let mut image = None;
     let mut salt = String::new();
-    let mut execution_policy = None;
     for entry in entries {
         match entry.name.as_str() {
             // A git-docker image *is* a git tree, so it rides embedded (the entry
@@ -1286,31 +1276,10 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
                     blob_string(config, &entry.oid.to_string())?
                 });
             }
-            caos_world::EXECUTION_POLICY_ARG => {
-                execution_policy = Some(blob_string(config, &entry.oid.to_string())?);
-            }
             // std and salt are plain blobs (std NAMES the std tree; salt is opaque).
             "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }
-    }
-    let execution_policy = execution_policy.ok_or_else(|| {
-        HttpError::new(
-            400,
-            format!(
-                "arg tree missing reserved {:?} entry",
-                caos_world::EXECUTION_POLICY_ARG
-            ),
-        )
-    })?;
-    if execution_policy != caos_world::EXECUTION_POLICY {
-        return Err(HttpError::new(
-            400,
-            format!(
-                "unsupported execution policy {execution_policy:?}; expected {:?}",
-                caos_world::EXECUTION_POLICY
-            ),
-        ));
     }
     let image = image.ok_or_else(|| HttpError::new(400, "arg tree missing 'base'"))?;
     Ok((image, salt))
@@ -1511,10 +1480,7 @@ fn key_lock(key: &str) -> std::sync::Arc<Mutex<()>> {
 /// SINGLE-FLIGHTED behind [`key_lock`] — see there for why the cache alone is
 /// not enough.
 fn convert_git_image(config: &Config, git_hash: &str) -> Result<String, String> {
-    // A git image may stack on a multi-platform Docker index. Its selected base
-    // manifest follows the execution policy, so conversion cache identity must
-    // include that policy just like result-cache identity does.
-    let image_key = format!("caos:image:{}:{git_hash}", caos_world::EXECUTION_POLICY);
+    let image_key = format!("caos:image:{git_hash}");
     if let Ok(Some(manifest_digest)) = cache_get(&config.redis_addr, &image_key) {
         eprintln!("image cache hit: {git_hash} -> {manifest_digest}");
         return Ok(image_ref(config, &manifest_digest));
@@ -1620,20 +1586,17 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
         .strip_prefix("http://")
         .or_else(|| push.strip_prefix("https://"))
         .unwrap_or(push);
-    // A deterministic tag per base ref AND selected platform: one manifest-list
-    // digest can resolve to different manifests on ARM64 and AMD64.
-    let base_identity = format!("{base_ref}\0{}", caos_world::EXECUTION_PLATFORM);
-    let tag = format!("base-{}", sha256_hex(base_identity.as_bytes()));
+    // A deterministic tag per base ref: re-converting reuses the same copy.
+    let tag = format!("base-{}", sha256_hex(base_ref.as_bytes()));
     let dest = format!("docker://{host}/{REGISTRY_REPO}:{tag}");
     let man_url = format!("{push}/v2/{REGISTRY_REPO}/manifests/{tag}");
     let accept = "application/vnd.oci.image.manifest.v1+json, \
                   application/vnd.docker.distribution.manifest.v2+json";
 
     // Skip the (slow, network-bound) skopeo pull if this base is already in the
-    // registry from an earlier convert — the tag is deterministic per ref and
-    // platform, so a resolvable manifest means the right blobs are present. This
-    // makes the stock base a once-per-registry-and-platform cost, not
-    // once-per-convert.
+    // registry from an earlier convert — the tag is deterministic per ref, so a
+    // resolvable manifest means the blobs are present. This makes the stock base a
+    // once-per-registry cost, not once-per-convert.
     let cached = minreq::get(&man_url)
         .with_header("Accept", accept)
         .send()
@@ -1649,9 +1612,9 @@ fn fetch_base(config: &Config, base_ref: &str) -> Result<BaseLayers, String> {
                 "--src-tls-verify=false",
                 "--dest-tls-verify=false",
                 "--override-os",
-                caos_world::EXECUTION_OS,
+                "linux",
                 "--override-arch",
-                caos_world::EXECUTION_ARCH,
+                "amd64",
             ])
             .arg(format!("docker://{base_ref}"))
             .arg(&dest)

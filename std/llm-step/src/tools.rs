@@ -161,16 +161,7 @@ fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
 /// `wc`/`refs` are bound only for `#@git` tools, but reserved unconditionally
 /// so a tool can't declare a model arg the interpreter would then clobber.
-const RESERVED_ARGS: &[&str] = &[
-    "in",
-    "worker1",
-    "base",
-    "execution-policy",
-    "std",
-    "salt",
-    "wc",
-    "refs",
-];
+const RESERVED_ARGS: &[&str] = &["in", "worker1", "base", "std", "salt", "wc", "refs"];
 
 /// One tree tool as the registry sees it: its name, its `#@doc` description,
 /// and the `#@arg` parameters it accepts.
@@ -997,7 +988,6 @@ mod tests {
         // rebind), and anything that isn't a plain lower-case flag name.
         assert!(parse_arg("in The workspace.").is_none());
         assert!(parse_arg("worker1 The script.").is_none());
-        assert!(parse_arg("execution-policy The container contract.").is_none());
         assert!(parse_arg("Hash The record hash.").is_none());
         assert!(parse_arg("--hash The record hash.").is_none());
         assert!(parse_arg("").is_none());
