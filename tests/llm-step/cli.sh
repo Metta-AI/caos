@@ -43,7 +43,7 @@ gc commit -qm fixtures
 base=$(mkcommit "HEAD:ws" base)
 
 R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"cmd":"echo hi > out.txt","paths":[]},"name":"bash","type":"tool_use"}]'
-R2='[{"id":"toolu_02","input":{"cmd":"cat out.txt","paths":["out.txt"]},"name":"bash","type":"tool_use"},{"id":"toolu_03","input":{"cmd":"echo boom >&2; exit 3","paths":[]},"name":"bash","type":"tool_use"}]'
+R2='[{"id":"toolu_03","input":{"cmd":"echo boom >&2; exit 3","paths":[]},"name":"bash","type":"tool_use"}]'
 EARLY_INTERJECTION_TEXT="also keep the notes subtree"
 INTERJECTION_TEXT="one more thing before you finish"
 STALE_T2_TEXT="the workspace still holds out.txt"
