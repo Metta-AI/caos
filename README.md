@@ -85,6 +85,18 @@ suite. That is the only place the unit tests can pass — several spawn `git`,
 which the cargo worker's PATH carries and a nix builder's does not — so it is
 the signal to trust before committing.
 
+Consider adding a fresh full-suite run as a personal pre-push hook, excluding
+caos's own internal pushes:
+
+```bash
+if [ "${1:-}" != caos ]; then
+  time CAOS_SALT=$(date +%s) result/bin/caos-cli run-tool test
+fi
+```
+
+Check the elapsed time too: a passing suite can still reveal a test timing
+regression.
+
 > Nix flakes only see files **tracked by git** (uncommitted edits to tracked
 > files are included, but new files are not). After adding a new source file,
 > `git add` it before building.
