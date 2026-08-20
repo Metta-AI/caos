@@ -546,8 +546,11 @@ fn submit_message_detailed(
         options,
         id,
         message,
-        require_absent,
-        proposal,
+        SubmitMessagePolicy {
+            require_absent,
+            proposal,
+            admit_when_idle: true,
+        },
         prepare_queued_request,
         on_preparing,
     )
@@ -558,8 +561,7 @@ fn submit_message_detailed_with<F, P>(
     options: &TurnOptions,
     id: &str,
     message: &str,
-    require_absent: bool,
-    proposal: Option<&str>,
+    policy: SubmitMessagePolicy<'_>,
     mut prepare: F,
     mut on_preparing: P,
 ) -> Result<SubmittedMessage, String>
@@ -567,21 +569,10 @@ where
     F: FnMut(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
     P: FnMut(),
 {
-    submit_message_inner_detailed_with(
-        t,
-        options,
-        id,
-        message,
-        SubmitMessagePolicy {
-            require_absent,
-            proposal,
-            admit_when_idle: true,
-        },
-        |t, options, id, head| {
-            on_preparing();
-            prepare(t, options, id, head)
-        },
-    )
+    submit_message_inner_detailed_with(t, options, id, message, policy, |t, options, id, head| {
+        on_preparing();
+        prepare(t, options, id, head)
+    })
 }
 
 fn submit_message_inner_with<F>(
@@ -3790,8 +3781,11 @@ mod tests {
             },
             "prepare-progress",
             "Start a turn",
-            false,
-            None,
+            SubmitMessagePolicy {
+                require_absent: false,
+                proposal: None,
+                admit_when_idle: true,
+            },
             |_, _, _, _| {
                 order.borrow_mut().push("prepare");
                 Ok(request.clone())
@@ -3812,8 +3806,11 @@ mod tests {
             },
             "prepare-progress",
             "Join the active turn",
-            false,
-            None,
+            SubmitMessagePolicy {
+                require_absent: false,
+                proposal: None,
+                admit_when_idle: true,
+            },
             |_, _, _, _| {
                 prepare_calls.set(prepare_calls.get() + 1);
                 Ok("c".repeat(40))
