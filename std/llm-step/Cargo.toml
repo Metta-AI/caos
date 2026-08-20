@@ -18,6 +18,8 @@ path = "src/main.rs"
 worker-common = { path = "worker-common", features = ["git"] }
 # Spliced by rustc at `llm-client/` (the --dep0 mount, DEEP-DEPS/llm-client).
 llm-client = { path = "llm-client" }
+# Spliced by rustc at `conversation-protocol/` (the --dep1 mount).
+conversation-protocol = { path = "conversation-protocol" }
 serde_json = "1"
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
 regex = "1"

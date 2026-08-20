@@ -3,9 +3,9 @@
 #
 # `--src:@=.` hands rustc the tool (Cargo.toml + src/, including the
 # src/githist/*.sh embeds; rustc skips the caos metadata — .caos-expr, DEPS,
-# DEEP-DEPS/); `--dep0:@=…` hands it the llm-client code crate, spliced at
-# `llm-client/`. `--output-runner` selects the opt-in Git runtime for the
-# finished binary without changing rustc's own seeded runner.
+# DEEP-DEPS/); `--dep0:@=…` and `--dep1:@=…` hand it the llm-client and shared
+# conversation-protocol crates. `--output-runner` selects the opt-in Git
+# runtime for the finished binary without changing rustc's own seeded runner.
 #
 # THE TOOL IMAGES ARE BOUND HERE, not by the caller. Each `curry --base:@=x`
 # resolves that mount through its own `.caos-expr` to the image it builds (a
@@ -18,5 +18,5 @@ GREP=curry --base:@=DEEP-DEPS/rgrep
 TOOLS=curry --base:@=DEEP-DEPS/bash
 MERGE=curry --base:@=DEEP-DEPS/merge
 ASYNC_WORKER=curry --base:@=DEEP-DEPS/run-and-update-ref
-STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --output-runner:@=DEEP-DEPS/git-runner
+STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --dep1:@=DEEP-DEPS/conversation-protocol --output-runner:@=DEEP-DEPS/git-runner
 curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE --run-and-update-ref-image=$ASYNC_WORKER

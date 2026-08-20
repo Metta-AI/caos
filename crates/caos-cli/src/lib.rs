@@ -20,10 +20,13 @@ use caos::{
     eval_workspace_dep_with_store, prepare_client_request_with_store,
     run_client_request_with_store, ClientSecret, GitTransport, Transport, CAOS_REMOTE,
 };
+#[cfg(test)]
+use conversation_protocol::MAX_CONVERSATION_ID_BYTES;
+use conversation_protocol::{
+    conversation_ref as protocol_conversation_ref, ConversationEvent, EventBoundary, ObjectId,
+    CONVERSATION_HEAD_SUFFIX as HEAD_SUFFIX, CONVERSATION_PREFIX,
+};
 
-const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
-const HEAD_SUFFIX: &str = "/head";
-const MAX_CONVERSATION_ID_BYTES: usize = 124;
 const MAX_APPEND_ATTEMPTS: usize = 32;
 const MODEL_API_SECRET: &str = "anthropic-api-key";
 const AUTO_NAME_PREFIX: &str = "talk-";
@@ -337,7 +340,7 @@ fn durable_conversation_from_local(
         let value = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
             format!("conversation history commit {current} is not a JSON event: {error}")
         })?;
-        validate_conversation_event(&value)
+        let event = ConversationEvent::parse(&value)
             .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
         let parent = t
             .git_capture(
@@ -348,9 +351,8 @@ fn durable_conversation_from_local(
             .trim()
             .to_string();
         validate_hash(&parent, "conversation event parent")?;
-        let is_root = validate_event_base(&value, &parent)?;
-        let is_fork = validate_fork_marker(&value, &parent)?;
-        if fork_base.is_none() && is_fork {
+        let boundary = event.boundary(&parent)?;
+        if fork_base.is_none() && boundary == EventBoundary::Fork {
             // The commit graph is authoritative. `forked_from` is retained as
             // readable metadata, but it may never choose a Git argument.
             fork_base = Some(parent.clone());
@@ -360,7 +362,7 @@ fn durable_conversation_from_local(
             value,
         });
         current = parent;
-        if is_root {
+        if boundary == EventBoundary::Root {
             break;
         }
     }
@@ -2334,9 +2336,7 @@ fn create_event_commit_with_parents(
     for parent in parents {
         validate_hash(parent, "parent")?;
     }
-    validate_conversation_event(event)?;
-    validate_event_base(event, parents[0])?;
-    validate_fork_marker(event, parents[0])?;
+    ConversationEvent::parse(event)?.boundary(parents[0])?;
     let message = serde_json::to_string(event)
         .map_err(|error| format!("serializing conversation event: {error}"))?;
     let mut args = vec!["commit-tree", tree];
@@ -2642,22 +2642,7 @@ fn equivalent_event_ancestor(
 
 /// Return the canonical append-only head ref for a validated conversation ID.
 pub fn conversation_ref(id: &str) -> Result<String, String> {
-    if id.is_empty()
-        || id.len() > MAX_CONVERSATION_ID_BYTES
-        || id.ends_with('.')
-        || id.split('/').any(|part| matches!(part, "head" | "title"))
-    {
-        return Err(format!("invalid conversation id {id:?}"));
-    }
-    let refname = format!("{CONVERSATION_PREFIX}{id}{HEAD_SUFFIX}");
-    let status = std::process::Command::new("git")
-        .args(["check-ref-format", &refname])
-        .status()
-        .map_err(|error| format!("validating conversation id {id:?}: {error}"))?;
-    if !status.success() {
-        return Err(format!("invalid conversation id {id:?}"));
-    }
-    Ok(refname)
+    protocol_conversation_ref(id)
 }
 
 fn remote_ref(t: &GitTransport, refname: &str) -> Result<Option<String>, String> {
@@ -2742,19 +2727,19 @@ fn remote_conversation_metadata(
         let event = serde_json::from_str::<Value>(message.trim()).map_err(|error| {
             format!("conversation history commit {current} is not a JSON event: {error}")
         })?;
-        validate_conversation_event(&event)
+        let validated = ConversationEvent::parse(&event)
             .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
         let parent = first_parent_header(headers)
             .ok_or_else(|| format!("conversation event {current} has no first parent"))?;
         validate_hash(parent, "conversation event parent")?;
-        let is_root = validate_event_base(&event, parent)?;
-        let is_fork = validate_fork_marker(&event, parent)?;
+        let boundary = validated.boundary(parent)?;
         if newest_activity_timestamp.is_none()
-            && (is_fork || event.get("author").and_then(Value::as_str) == Some("user"))
+            && (boundary == EventBoundary::Fork
+                || event.get("author").and_then(Value::as_str) == Some("user"))
         {
             newest_activity_timestamp = Some(commit_timestamp(headers, &current)?);
         }
-        if is_root {
+        if boundary == EventBoundary::Root {
             let updated_unix = match newest_activity_timestamp {
                 Some(timestamp) => timestamp,
                 None => commit_timestamp(headers, &current)?,
@@ -2929,65 +2914,11 @@ fn update_local_cache(t: &GitTransport, refname: &str, hash: &str) -> Result<(),
 }
 
 fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(format!("invalid {what} hash {hash:?}"));
-    }
-    Ok(())
+    ObjectId::parse(hash, what).map(|_| ())
 }
 
 fn validate_conversation_event(value: &Value) -> Result<(), String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "conversation event must be a JSON object".to_string())?;
-    if object.contains_key("v") {
-        return Err(
-            "conversation event must not carry a version; refs/caos/v2 selects the protocol"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// Return true only for the absolute root of the inherited event spine.
-/// `base` is data rather than a heuristic: it must name the root's first
-/// parent exactly, so ordinary JSON commit messages cannot extend the log.
-fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
-    let Some(base) = event.get("base") else {
-        return Ok(false);
-    };
-    let base = base
-        .as_str()
-        .ok_or_else(|| "conversation event base is not a string".to_string())?;
-    validate_hash(base, "conversation base")?;
-    if base != first_parent {
-        return Err(format!(
-            "conversation root declares base {base}, but its first parent is {first_parent}"
-        ));
-    }
-    Ok(true)
-}
-
-fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
-    let Some(declared) = event.get("forked_from") else {
-        return Ok(false);
-    };
-    if event.get("base").is_some() {
-        return Err("a conversation fork marker must not introduce a new base".to_string());
-    }
-    let declared = declared
-        .as_str()
-        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
-    validate_hash(declared, "forked_from")?;
-    if declared != first_parent {
-        return Err(format!(
-            "conversation fork marker declares {declared}, but its first parent is {first_parent}"
-        ));
-    }
-    Ok(true)
+    ConversationEvent::parse(value).map(|_| ())
 }
 
 fn fold_events(
@@ -3728,11 +3659,32 @@ mod tests {
     #[test]
     fn explicit_base_must_match_the_first_parent() {
         let base = "a".repeat(40);
-        assert_eq!(validate_event_base(&json!({}), &base), Ok(false));
-        assert_eq!(validate_event_base(&json!({"base": base}), &base), Ok(true));
-        assert!(validate_event_base(&json!({"base": "b".repeat(40)}), &base).is_err());
-        assert!(validate_event_base(&json!({"base": 7}), &base).is_err());
-        assert!(validate_fork_marker(&json!({"base": base, "forked_from": base}), &base).is_err());
+        assert_eq!(
+            ConversationEvent::parse(&json!({}))
+                .unwrap()
+                .boundary(&base),
+            Ok(EventBoundary::Ordinary)
+        );
+        assert_eq!(
+            ConversationEvent::parse(&json!({"base": base}))
+                .unwrap()
+                .boundary(&base),
+            Ok(EventBoundary::Root)
+        );
+        assert!(ConversationEvent::parse(&json!({"base": "b".repeat(40)}))
+            .unwrap()
+            .boundary(&base)
+            .is_err());
+        assert!(ConversationEvent::parse(&json!({"base": 7}))
+            .unwrap()
+            .boundary(&base)
+            .is_err());
+        assert!(
+            ConversationEvent::parse(&json!({"base": base, "forked_from": base}))
+                .unwrap()
+                .boundary(&base)
+                .is_err()
+        );
     }
 
     #[test]

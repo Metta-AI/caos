@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/caos",
     "crates/caos-cli",
+    "crates/conversation-protocol",
     "crates/caos-world",
     "crates/caos-eval",
     "crates/bake-anchor",

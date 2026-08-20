@@ -20,6 +20,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use conversation_protocol::ObjectId;
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
@@ -1302,16 +1303,7 @@ fn validate_run_hash(run: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(format!(
-            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
-        ));
-    }
-    Ok(())
+    ObjectId::parse(hash, what).map(|_| ())
 }
 
 #[derive(Clone)]

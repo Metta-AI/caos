@@ -5,44 +5,17 @@
 
 use std::collections::HashMap;
 
+use conversation_protocol::{
+    validate_conversation_ref, ConversationEvent, EventBoundary, ObjectId,
+};
 use serde_json::{json, Value};
 use worker_common::git::Repo;
 
 const MAX_CAS_ATTEMPTS: usize = 32;
 
 pub fn validate_target_ref(refname: &str) -> Result<(), String> {
-    let Some(rest) = refname.strip_prefix("refs/caos/v2/conversations/") else {
-        return Err(format!(
-            "target-ref is not a conversation head: {refname:?}"
-        ));
-    };
-    let Some(conversation) = rest.strip_suffix("/head") else {
-        return Err(format!(
-            "target-ref is not a conversation head: {refname:?}"
-        ));
-    };
-    if conversation.is_empty()
-        || conversation.len() > 124
-        || conversation.starts_with('/')
-        || conversation.ends_with('/')
-        || conversation.contains("//")
-        || conversation.contains("..")
-        || conversation.contains("@{")
-        || conversation.ends_with('.')
-        || conversation.bytes().any(|b| {
-            b <= b' ' || b == 0x7f || matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-        })
-        || conversation.split('/').any(|component| {
-            component.is_empty()
-                || component == "."
-                || matches!(component, "head" | "title")
-                || component.starts_with('.')
-                || component.ends_with(".lock")
-        })
-    {
-        return Err(format!("invalid target conversation ref {refname:?}"));
-    }
-    Ok(())
+    validate_conversation_ref(refname)
+        .map_err(|_| format!("target-ref is not a conversation head: {refname:?}"))
 }
 
 pub fn append_status(refname: &str, task: &str, status: &str, result: &str) -> Result<(), String> {
@@ -185,12 +158,11 @@ fn task_state(
         let commit = fetch_commit_cached(base, &hash, cache)?;
         let event = parse_spine_event(&commit.message, &hash)?;
         let parent = required_event_parent(commit.parent.as_deref(), &hash)?;
-        let is_root = validate_event_base(&event, &parent)?;
-        validate_fork_marker(&event, &parent)?;
+        let boundary = ConversationEvent::parse(&event)?.boundary(&parent)?;
         if newest_state.is_none() {
             newest_state = event_task_state(&event, task);
         }
-        if is_root {
+        if boundary == EventBoundary::Root {
             return Ok(newest_state);
         }
         current = parent;
@@ -200,50 +172,9 @@ fn task_state(
 fn parse_spine_event(message: &str, commit: &str) -> Result<Value, String> {
     let event = serde_json::from_str::<Value>(message.trim())
         .map_err(|error| format!("conversation history commit {commit} is not JSON: {error}"))?;
-    let object = event
-        .as_object()
-        .ok_or_else(|| format!("conversation event {commit} must be a JSON object"))?;
-    if object.contains_key("v") {
-        return Err(format!(
-            "conversation event {commit} must not carry a version; refs/caos/v2 selects the protocol"
-        ));
-    }
+    ConversationEvent::parse(&event)
+        .map_err(|error| format!("invalid conversation event {commit}: {error}"))?;
     Ok(event)
-}
-
-fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
-    let Some(base) = event.get("base") else {
-        return Ok(false);
-    };
-    let base = base
-        .as_str()
-        .ok_or_else(|| "conversation event base is not a string".to_string())?;
-    validate_hash(base, "conversation base")?;
-    if base != first_parent {
-        return Err(format!(
-            "conversation root declares base {base}, but its first parent is {first_parent}"
-        ));
-    }
-    Ok(true)
-}
-
-fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
-    let Some(forked_from) = event.get("forked_from") else {
-        return Ok(false);
-    };
-    if event.get("base").is_some() {
-        return Err("a conversation fork marker must not introduce a new base".to_string());
-    }
-    let forked_from = forked_from
-        .as_str()
-        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
-    validate_hash(forked_from, "forked_from")?;
-    if forked_from != first_parent {
-        return Err(format!(
-            "conversation fork marker declares {forked_from}, but its first parent is {first_parent}"
-        ));
-    }
-    Ok(true)
 }
 
 fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
@@ -373,16 +304,7 @@ fn server_base() -> Result<String, String> {
 }
 
 pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    if hash.len() != 40
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(format!(
-            "{what} must be a lowercase 40-character hexadecimal hash, got {hash:?}"
-        ));
-    }
-    Ok(())
+    ObjectId::parse(hash, what).map(|_| ())
 }
 
 #[cfg(test)]
@@ -418,11 +340,34 @@ mod tests {
     #[test]
     fn explicit_base_must_match_the_first_parent() {
         let base = "a".repeat(40);
-        assert_eq!(validate_event_base(&json!({}), &base), Ok(false));
-        assert_eq!(validate_event_base(&json!({"base": base}), &base), Ok(true));
-        assert!(validate_event_base(&json!({"base": "b".repeat(40)}), &base).is_err());
-        assert!(validate_fork_marker(&json!({"forked_from": base}), &base).is_ok());
-        assert!(validate_fork_marker(&json!({"base": base, "forked_from": base}), &base).is_err());
+        assert_eq!(
+            ConversationEvent::parse(&json!({}))
+                .unwrap()
+                .boundary(&base),
+            Ok(EventBoundary::Ordinary)
+        );
+        assert_eq!(
+            ConversationEvent::parse(&json!({"base": base}))
+                .unwrap()
+                .boundary(&base),
+            Ok(EventBoundary::Root)
+        );
+        assert!(ConversationEvent::parse(&json!({"base": "b".repeat(40)}))
+            .unwrap()
+            .boundary(&base)
+            .is_err());
+        assert_eq!(
+            ConversationEvent::parse(&json!({"forked_from": base}))
+                .unwrap()
+                .boundary(&base),
+            Ok(EventBoundary::Fork)
+        );
+        assert!(
+            ConversationEvent::parse(&json!({"base": base, "forked_from": base}))
+                .unwrap()
+                .boundary(&base)
+                .is_err()
+        );
     }
 
     #[test]

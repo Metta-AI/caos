@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 # The complete user-facing host CLI. The library owns the durable conversation
-# protocol; the binary combines it and the TUI with generic host commands
-# implemented by `caos`.
+# API; conversation-protocol owns the rules shared with workers, while the
+# binary combines this crate and the TUI with generic host commands from `caos`.
 [lib]
 name = "caos_cli"
 path = "src/lib.rs"
@@ -16,6 +16,7 @@ path = "src/bin/caos-cli.rs"
 
 [dependencies]
 caos = { path = "../caos" }
+conversation-protocol = { path = "../conversation-protocol" }
 serde_json = "1"
 ratatui-core = { version = "0.1.2", features = ["std"] }
 ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }

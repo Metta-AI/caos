@@ -359,17 +359,40 @@ if [ -n "$runner_delta" ]; then
   done
 fi
 
-declare -A undeepened
+declare -A undeepened staged_sources
 
-# Stage a checked-in std/<name> source dir into CLIENT and record its tree.
+# Stage a checked-in source dir into CLIENT and record its tree by dependency
+# name. Most are std/<name>; a DEPS path may point at source elsewhere.
 # `cp -RL`: PROJECT may be an image layout of SYMLINKS into the nix store (the
 # test stack); dereference so what is published is the content.
-stage_source() { # <name>
-  rm -rf "${CLIENT:?}/$1"
-  cp -RL "$PROJECT/std/$1" "$CLIENT/$1"
-  chmod -R u+w "$CLIENT/$1" # PROJECT may be a read-only store copy (caosd)
-  git -C "$CLIENT" add "$1"
-  undeepened[$1]=$(git -C "$CLIENT" write-tree --prefix="$1/")
+stage_source() { # <name> <source-dir>
+  local name=$1 source_dir=$2
+  rm -rf "${CLIENT:?}/$name"
+  cp -RL "$source_dir" "$CLIENT/$name"
+  chmod -R u+w "$CLIENT/$name" # PROJECT may be a read-only store copy (caosd)
+  git -C "$CLIENT" add "$name"
+  undeepened[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
+  staged_sources[$name]=1
+}
+
+# DEPS may also name source that is not itself a builtin. Its tree still
+# participates in the caller's deepened cache key, so bootstrap must stage it
+# before deepen_entry recurses into it. Follow paths from the declaring source
+# directory, like deep-deps, instead of maintaining a second name list.
+stage_source_closure() { # <name> <source-dir>
+  local name=$1 source_dir=$2 dep_path mount
+  if [ -n "${staged_sources[$name]:-}" ]; then return; fi
+  stage_source "$name" "$source_dir"
+  if [ -f "$source_dir/DEPS" ]; then
+    while read -r dep_path mount; do
+      if [ -n "$dep_path" ]; then
+        case "$dep_path" in
+          \#*) ;;
+          *) stage_source_closure "$(basename "$dep_path")" "$source_dir/$dep_path" ;;
+        esac
+      fi
+    done < "$source_dir/DEPS"
+  fi
 }
 
 for name in "${names[@]}"; do
@@ -378,15 +401,15 @@ for name in "${names[@]}"; do
   # dependency is not IN it. Publishing runner as a bare delta would leave
   # `std/runner` a name with no directory behind it; it is a `{.caos-expr}`
   # sentinel, seeded like flake-builder (below).
-  stage_source "$name"
+  stage_source_closure "$name" "$PROJECT/std/$name"
 done
-bts "staged ${#names[@]} std sources"
+bts "staged ${#staged_sources[@]} local sources"
 
 # The hand-deepen — SEED KEYS ONLY, never published (see the block header).
 # deepen_entry(name) replaces the entry's top-level DEPS with a DEEP-DEPS/
-# subtree of its deepened dependencies (each a sibling std entry named
-# `../<name>`), recursively and memoized — so a dep reached twice is ONE shared
-# tree (git dedups the identical hash, matching the deep-deps worker's
+# subtree of its deepened local dependencies, recursively and memoized — so a
+# dep reached twice is ONE shared tree (git dedups the identical hash, matching
+# the deep-deps worker's
 # absolute-path sharing). An entry with no DEPS is identity (its subtrees are
 # DEPS-free, which the worker reproduces unchanged — so this matches byte for
 # byte). Divergence from the worker is not silent: the seeded key stops matching
@@ -405,8 +428,8 @@ deepen_entry() { # <name> -> deepened tree hash (stdout)
   if [ -z "$deps_oid" ]; then
     result=$tree
   else
-    # DEEP-DEPS/<mount> = deepened(sibling entry). DEPS lines are `<path> <name>`
-    # (path `../<sibling>`); comments/blank lines skipped. mktree sorts.
+    # DEEP-DEPS/<mount> = deepened(declared path). DEPS lines are
+    # `<path> <name>`; comments/blank lines skipped. mktree sorts.
     local dd_lines="" dep_path mount
     while read -r dep_path mount; do
       if [ -n "$dep_path" ]; then
