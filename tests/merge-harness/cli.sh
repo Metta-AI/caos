@@ -46,8 +46,17 @@ for _ in 1 2 3 4 5; do
   port=$((20000 + RANDOM % 20000))
   "$stub_bin" "0.0.0.0:$port" "$PWD/stub" 2>stub/log &
   stub_pid=$!
-  sleep 0.5
-  if kill -0 "$stub_pid" 2>/dev/null; then break; fi
+  # The stub normally binds in a few milliseconds. Wait for the listener
+  # instead of adding a fixed half-second delay to every test run.
+  ready=0
+  for _ in {1..400}; do
+    if ! kill -0 "$stub_pid" 2>/dev/null; then break; fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=1; break; fi
+    sleep 0.005
+  done
+  if [ "$ready" = 1 ]; then break; fi
+  kill "$stub_pid" 2>/dev/null || true
+  wait "$stub_pid" 2>/dev/null || true
   stub_pid=""
 done
 [ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
