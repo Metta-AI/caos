@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     short_hash, ActivityState, App, Command, ConfirmAction, ConversationState, EntryRole, Focus,
-    ScrollState, TranscriptPoint, View, COMMANDS,
+    ScrollState, TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
 };
 use caos_cli::TurnPhase;
 
@@ -97,7 +97,10 @@ fn render_command_palette(app: &App, frame: &mut Frame<'_>) {
             .map(|command| {
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{:<label_width$}", command.label)),
-                    Span::styled(command.shortcut, Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        command.shortcut.label(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]))
             })
             .collect::<Vec<_>>();
@@ -1394,24 +1397,24 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::raw("  Ctrl+H          toggle this help"),
         Line::raw("  Ctrl+Shift+P    open the command palette"),
         Line::raw(format!("  {send_shortcut:<16}send the prompt")),
         Line::raw("  Enter/Ctrl+J    insert a newline"),
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
-        Line::raw("  Ctrl+L          check out the conversation commit locally"),
-        Line::raw("  Ctrl+P twice    publish the conversation and open a PR"),
-        Line::raw("  Ctrl+N          start a new conversation"),
         Line::raw("  Esc             stop a running agent or dismiss the current layer"),
-        Line::raw("  Ctrl+E          archive from the conversation list"),
         Line::raw("  Ctrl+Up/Down    switch conversations"),
-        Line::raw("  Ctrl+T          toggle activity details"),
-        Line::raw("  Ctrl+Shift+T    toggle available tools"),
-        Line::raw("  Ctrl+Q          toggle the workspace diff"),
-        Line::raw("  Ctrl+Y          pause redraws for native terminal selection"),
         Line::raw("  Ctrl+C          clear the prompt, then quit"),
+    ];
+    lines.extend(PALETTE_COMMANDS.iter().map(|command| {
+        Line::raw(format!(
+            "  {:<16}{}",
+            command.shortcut.label(),
+            command.label
+        ))
+    }));
+    lines.extend([
         Line::raw(""),
         Line::styled(
             "Slash commands",
@@ -1419,7 +1422,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
     lines.extend(
         COMMANDS
             .iter()
