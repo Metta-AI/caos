@@ -691,6 +691,9 @@
         #                working stack and not homework — so this is the strict
         #                gate for anything that runs against a stack it did not
         #                just bring up (design/one-stack-image.md).
+        #   caosd image-cleanup  report rebuildable image-cache usage; with
+        #                --execute, clear it while the stack is stopped. The
+        #                next `up` republishes std and warms images on demand.
         #   caosd version  the caos revision THIS command was built from. Ask it
         #                before believing a bug report: a devShell that fails to
         #                build leaves direnv on the previous environment, so the
@@ -727,6 +730,9 @@
 
             NET=caos-net
             NAME=caos-stack
+            REGISTRY_PORT=5000
+            REGISTRY=localhost:$REGISTRY_PORT
+            REGISTRY_REPO=$REGISTRY/caos
 
             # Load the stack image only when this exact build isn't already in
             # docker. The tag is content-addressed (sha1 of the image's
@@ -734,7 +740,7 @@
             # multi-second `docker load`; a changed build has a new store path,
             # hence a new tag, and loads.
             load_once() {
-              local name="$1" image="$2" src_tag
+              local name="$1" image="$2" src_tag old_tag
               src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
               if docker image inspect "$src_tag" >/dev/null 2>&1; then
                 echo "==> $name image already loaded — skipping docker load" >&2
@@ -752,6 +758,14 @@
               # the core-seeder-runner existed, so every seeded key fell through
               # to the generic runner and died pulling `seeded:latest`.
               docker tag "$src_tag" "$name:latest"
+
+              # This function owns the content-addressed source tags. Retire
+              # superseded ones here instead of rediscovering them at cleanup.
+              while IFS= read -r old_tag; do
+                if [ "$old_tag" != "$src_tag" ]; then
+                  docker image rm "$old_tag" >/dev/null 2>&1 || true
+                fi
+              done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' "$name-src")
             }
 
             die() { # <message>
@@ -815,6 +829,7 @@
             std_build() {
               echo "==> publishing stdlib (build-builtins.sh)" >&2
               CAOS_SERVER_URL=http://localhost:9090 \
+              CAOS_REGISTRY_HTTP="$REGISTRY" \
               CAOS_CLI=${caos-cli}/bin/caos-cli \
               CAOS_CLIENT_REPO="$CLIENT" \
               CAOS_BUILTIN_IMAGES="${
@@ -837,7 +852,7 @@
             # source directory carrying a `.caos-expr`, so it names no digest at
             # all and a walk over entries would verify nothing.
             #
-            # Checked through localhost:5000 — the name the DOCKER DAEMON pulls
+            # Checked through $REGISTRY — the name the DOCKER DAEMON pulls
             # with. The seed's refs spell the same registry caos-registry:5000,
             # which is how the SERVER reaches it; one registry, two names, so the
             # check says which one it used.
@@ -845,7 +860,7 @@
             # `checked` must stay: a guard that silently verifies nothing is worse
             # than no guard, so finding no digests is itself an error.
             std_check() {
-              local reg=localhost:5000 tree missing=0 checked=0 oid name base digest code
+              local reg="$REGISTRY" tree missing=0 checked=0 oid name base digest code
               [ -d "$CLIENT" ] \
                 || { echo "caosd: no client repo at $CLIENT — run 'caosd std-build'" >&2; exit 1; }
               tree=$(git -C "$CLIENT" rev-parse --verify -q refs/caos/seed) \
@@ -887,6 +902,70 @@
               echo "==> the seeded core is intact ($checked images)" >&2
             }
 
+            # The registry and Redis are caches: git holds the image inputs and
+            # `up` republishes the irreducible std images. Clearing both avoids
+            # retaining a cached result that names a registry digest just removed.
+            # Require an idle stack instead of hiding stop/restart orchestration
+            # and recovery inside a cleanup command.
+            image_cleanup() {
+              local execute=no arg registry_size=0 image_id running
+
+              for arg in "$@"; do
+                case "$arg" in
+                  --execute) execute=yes ;;
+                  -h|--help)
+                    echo "usage: caosd image-cleanup [--execute]"
+                    return
+                    ;;
+                  *)
+                    echo "caosd image-cleanup: unknown argument '$arg'" >&2
+                    return 2
+                    ;;
+                esac
+              done
+
+              if [ -d "$CAOS_DATA/stack/registry" ]; then
+                registry_size=$(du -sh "$CAOS_DATA/stack/registry" | cut -f1)
+              fi
+              echo "caosd image-cleanup: registry $registry_size"
+              docker image ls --format '  local image {{.ID}}  {{.Size}}' \
+                "$REGISTRY_REPO" | sort -u
+              if [ "$execute" != yes ]; then
+                echo "caosd image-cleanup: dry run; run 'caosd down' then pass --execute"
+                return
+              fi
+
+              running=$(
+                if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
+                  echo "$NAME"
+                fi
+                docker ps --filter label=caos.runnerd.owner --format '{{.Names}}'
+                docker ps --filter label=caos.test-stack --format '{{.Names}}'
+              )
+              if [ -n "$running" ]; then
+                echo "caosd image-cleanup: CAOS is still running:" >&2
+                while IFS= read -r tag; do echo "  $tag" >&2; done <<< "$running"
+                echo "run 'caosd down' and wait for active workers before cleanup" >&2
+                return 1
+              fi
+
+              case "$CAOS_DATA" in
+                /|"")
+                  echo "caosd image-cleanup: refusing unsafe CAOS_DATA '$CAOS_DATA'" >&2
+                  return 1
+                  ;;
+              esac
+              rm -rf "$CAOS_DATA/stack/registry" "$CAOS_DATA/stack/redis"
+
+              while IFS= read -r image_id; do
+                [ -n "$image_id" ] || continue
+                docker image rm "$image_id" >/dev/null 2>&1 || true
+              done < <(docker image ls -q "$REGISTRY_REPO" | sort -u)
+
+              echo "caosd image-cleanup: cleared the registry, Redis, and unused local CAOS images"
+              echo "caosd image-cleanup: run 'caosd up' to republish std"
+            }
+
             # The revision this caosd was built from, printed by `version` and
             # by every usage banner. A stale binary on PATH is otherwise
             # indistinguishable from a caos bug (see `caosRev`).
@@ -894,7 +973,7 @@
 
             usage() {
               echo "caosd ($CAOS_REV)"
-              echo "usage: caosd [up|down|reset|logs|std-build|std-check|version]"
+              echo "usage: caosd [up|down|reset|logs|std-build|std-check|image-cleanup|version]"
             }
 
             case "''${1:-up}" in
@@ -957,7 +1036,7 @@
                   --network-alias caos-server \
                   --network-alias caos-registry \
                   --network-alias caos-redis \
-                  -p 9090:80 -p 5000:5000 \
+                  -p 9090:80 -p "$REGISTRY_PORT:5000" \
                   -v "$CAOS_DATA/stack:/state" \
                   -v /var/run/docker.sock:/var/run/docker.sock \
                   -e CAOS_STACK_STATE=/state \
@@ -970,6 +1049,7 @@
                   -e CAOS_STACK_SEEDER=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                   -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
+                  -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
                   -e CAOS_DOCKER_NETWORK="$NET" \
                   -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \
                   -e CAOS_PENDING_TIMEOUT_SECS=900 \
@@ -1015,6 +1095,10 @@
               ;;
             std-check)
               std_check
+              ;;
+            image-cleanup)
+              shift
+              image_cleanup "$@"
               ;;
             *)
               echo "caosd: unknown command '$1'" >&2
