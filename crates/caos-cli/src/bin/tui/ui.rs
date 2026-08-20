@@ -1402,7 +1402,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
         Line::raw("  Ctrl+L          check out the conversation commit locally"),
-        Line::raw("  Ctrl+P twice    publish a replaceable snapshot and open a PR"),
+        Line::raw("  Ctrl+P twice    publish the conversation and open a PR"),
         Line::raw("  Ctrl+N          start a new conversation"),
         Line::raw("  Esc             stop a running agent or dismiss the current layer"),
         Line::raw("  Ctrl+E          archive from the conversation list"),

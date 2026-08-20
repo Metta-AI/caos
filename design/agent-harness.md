@@ -325,15 +325,14 @@ suites for the tool set):
   the selected conversation commit as a detached HEAD after requiring a clean
   host checkout. `Ctrl+H` opens the keyboard and slash-command reference.
   `Ctrl+P` opens a PR-base prompt and a second press publishes the selected
-  workspace without checking it out. It replaces the clean
-  `caos/<conversation>` snapshot commit directly above the fetched tip of that
-  base. The default base receives the complete conversation workspace; another
-  base receives only this conversation's delta, allowing a child conversation
-  to stack on its parent's clean snapshot without re-merging the parent layer.
-  Conflicts stop publication and are reported in the command-error panel. CAOS
-  pushes the snapshot with an exact remote lease and opens or finds its open PR
-  through `gh` against the same branch. This preserves non-conflicting upstream
-  work while excluding all prior conversation history. Merely
+  conversation without checking it out. It points `caos/<conversation>` at the
+  validated conversation head after merging the fetched tip of the selected
+  base. This lets a child conversation stack on its parent's published history,
+  while subsequent publications fast-forward the same branch. Conflicts and
+  reserved `.caos` state at the tip stop publication and are reported in the
+  command-error panel. CAOS uses ordinary fast-forward pushes after a one-time
+  exact-lease migration of a legacy snapshot branch, and opens or finds its open
+  PR through `gh` against the same branch. Merely
   opening, running, switching, or publishing conversations never mutates the
   checkout. Progress remains one completed API round at a time, and a running
   turn is not cancellable until the server/runner protocol grows cancellation.
