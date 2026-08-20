@@ -859,6 +859,12 @@ enum CommandAction {
     UpdateTree,
 }
 
+impl CommandAction {
+    fn submits_message(self) -> bool {
+        matches!(self, Self::UpdateTree)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Command {
     name: &'static str,
@@ -2033,82 +2039,28 @@ impl App {
         if state.status == "loading conversation reference" {
             state.status.clear();
         }
-        // Resolve the prompt into the turn's message and, for `/update-tree`,
-        // the tree the human commit should carry. Configuration and UI
-        // commands return here; everything else falls through to run one.
+        // Recognized local commands stop here as one class. Unrecognized slash
+        // text and message-submitting commands continue through the ordinary
+        // turn path.
         let mut human_tree = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
-            if command.takes_argument && arguments.is_empty() {
+            if command.takes_argument == arguments.is_empty() {
                 self.selected_mut()
                     .show_command_error(format!("usage: {}", command.usage));
                 return;
             }
-            match command.action {
-                CommandAction::Help => {
-                    if arguments.is_empty() {
-                        self.view = View::Help;
-                    } else {
-                        self.selected_mut().status = format!("usage: {}", command.usage);
-                    }
+            if !command.action.submits_message() {
+                self.run_local_command(command, arguments);
+                return;
+            }
+            match commit_working_tree(arguments, &self.repo_dir) {
+                Ok(tree) => human_tree = Some(tree),
+                Err(error) => {
+                    self.selected_mut().show_command_error(error);
                     return;
-                }
-                CommandAction::Palette => {
-                    if arguments.is_empty() {
-                        self.palette = Some(CommandPalette::default());
-                    } else {
-                        self.selected_mut().status = format!("usage: {}", command.usage);
-                    }
-                    return;
-                }
-                CommandAction::Reference => {
-                    if arguments.is_empty() {
-                        self.show_selected_ref();
-                    } else {
-                        self.selected_mut().status = format!("usage: {}", command.usage);
-                    }
-                    return;
-                }
-                CommandAction::Invite => {
-                    self.invite_selected(arguments);
-                    return;
-                }
-                CommandAction::Model => {
-                    if arguments.split_whitespace().count() != 1 {
-                        self.selected_mut()
-                            .show_command_error(format!("usage: {}", command.usage));
-                        return;
-                    }
-                    let model = if arguments == "default" {
-                        DEFAULT_MODEL.to_string()
-                    } else {
-                        arguments.to_string()
-                    };
-                    for state in &mut self.conversations {
-                        state.turn_options.model = Some(model.clone());
-                    }
-                    self.selected_mut()
-                        .push_info(format!("Model for future turns: {model}"));
-                    return;
-                }
-                CommandAction::From => {
-                    self.start_from_hash(arguments);
-                    return;
-                }
-                CommandAction::Title => {
-                    self.rename_selected(arguments);
-                    return;
-                }
-                CommandAction::UpdateTree => {
-                    match commit_working_tree(arguments, &self.repo_dir) {
-                        Ok(tree) => human_tree = Some(tree),
-                        Err(error) => {
-                            self.selected_mut().show_command_error(error);
-                            return;
-                        }
-                    }
-                    arguments.to_string()
                 }
             }
+            arguments.to_string()
         } else {
             raw
         };
@@ -2260,6 +2212,36 @@ impl App {
 
     fn show_selected_ref(&mut self) {
         self.start_reference_lookup(self.selected);
+    }
+
+    fn run_local_command(&mut self, command: &Command, arguments: &str) {
+        debug_assert!(!command.action.submits_message());
+        match command.action {
+            CommandAction::Help => self.view = View::Help,
+            CommandAction::Palette => self.palette = Some(CommandPalette::default()),
+            CommandAction::Reference => self.show_selected_ref(),
+            CommandAction::Invite => self.invite_selected(arguments),
+            CommandAction::Model => {
+                if arguments.split_whitespace().count() != 1 {
+                    self.selected_mut()
+                        .show_command_error(format!("usage: {}", command.usage));
+                    return;
+                }
+                let model = if arguments == "default" {
+                    DEFAULT_MODEL.to_string()
+                } else {
+                    arguments.to_string()
+                };
+                for state in &mut self.conversations {
+                    state.turn_options.model = Some(model.clone());
+                }
+                self.selected_mut()
+                    .push_info(format!("Model for future turns: {model}"));
+            }
+            CommandAction::From => self.start_from_hash(arguments),
+            CommandAction::Title => self.rename_selected(arguments),
+            CommandAction::UpdateTree => unreachable!("message command reached local dispatch"),
+        }
     }
 
     fn publish_automatic_title_fallback(&mut self) {
@@ -4592,6 +4574,15 @@ mod tests {
 
     #[test]
     fn command_parser_only_claims_catalog_commands() {
+        assert_eq!(
+            COMMANDS
+                .iter()
+                .filter(|command| command.action.submits_message())
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/update-tree"]
+        );
+
         let (command, arguments) = parse_command("/title A useful title").unwrap();
         assert_eq!(command.action, CommandAction::Title);
         assert_eq!(arguments, "A useful title");
