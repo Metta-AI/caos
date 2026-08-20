@@ -14,7 +14,9 @@
 //!   compute the member's workspace-dep closure, PRUNE the workspace to what
 //!   the member's build reads (root manifest + lockfile + every member
 //!   manifest + the closure's sources — all by CAS links), and map-then over
-//!   the direct deps with itself (cmd=dep) into a `job`.
+//!   each check directly into a `job` (Cargo's primary-package artifacts are
+//!   not reusable by a dependent), and map-then over direct deps with itself
+//!   (`cmd=dep`) for commands that need build artifacts.
 //! * **job** — the compile, keyed on (pruned tree, children, name, cmd): the
 //!   narrow key that buys incrementality. Assembles the pruned workspace at
 //!   the baked root — the member's own sources at fresh mtimes, everything
@@ -162,8 +164,13 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
     job_kvs.extend(flag_extras(&flags));
     let job = self_curry(&job_kvs)?;
 
-    if member.deps.is_empty() {
-        // No workspace deps: a plain tail call into the job (no children).
+    if member.deps.is_empty() || !needs_dependency_artifacts(cmd) {
+        // A check compiles its full dependency closure in this member's Cargo
+        // invocation. Cargo assigns a different unit hash when a package is
+        // selected with `-p` than when the same package is a dependency, so a
+        // separately checked dep cannot satisfy this job; waiting for it only
+        // serializes a duplicate compile. Commands that consume rlibs still
+        // use the artifact DAG below.
         return map_then(&arg("in"), None, Some(Arg::Hash(&job)));
     }
     // Recurse on each direct dep with ourselves; deps always build as
@@ -182,6 +189,12 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
     dep_kvs.extend(flag_extras(&flags));
     let map = self_curry(&dep_kvs)?;
     map_then("/cas/deps", Some(Arg::Hash(&map)), Some(Arg::Hash(&job)))
+}
+
+/// Cargo check's primary-package unit is not reusable as a dependency unit;
+/// commands that consume rlibs still benefit from the artifact DAG.
+fn needs_dependency_artifacts(cmd: &str) -> bool {
+    cmd != "check"
 }
 
 /// Prune the workspace to what `member`'s build reads: root manifest +
@@ -747,4 +760,17 @@ fn normalize(base: &str, rel: &str) -> Result<String, String> {
         }
     }
     Ok(parts.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_dependency_artifacts;
+
+    #[test]
+    fn checks_compile_their_closure_in_the_member_job() {
+        assert!(!needs_dependency_artifacts("check"));
+        for cmd in ["build", "test", "clippy", "doc", "dep"] {
+            assert!(needs_dependency_artifacts(cmd), "{cmd}");
+        }
+    }
 }
