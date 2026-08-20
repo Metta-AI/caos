@@ -740,7 +740,7 @@
             # multi-second `docker load`; a changed build has a new store path,
             # hence a new tag, and loads.
             load_once() {
-              local name="$1" image="$2" src_tag old_tag
+              local name="$1" image="$2" src_tag old_tag repo_tag
               src_tag="$name-src:$(printf '%s' "$image" | sha1sum | cut -c1-12)"
               if docker image inspect "$src_tag" >/dev/null 2>&1; then
                 echo "==> $name image already loaded — skipping docker load" >&2
@@ -761,11 +761,26 @@
 
               # This function owns the content-addressed source tags. Retire
               # superseded ones here instead of rediscovering them at cleanup.
+              #
+              # SELECT THE REPO IN BASH, NOT IN THE ENGINE. `image ls <repo>`
+              # matches IMAGES, and podman then prints every NAME of a matched
+              # image — so asking for `<name>-src` also lists `<name>:latest`,
+              # which is the SAME image under a second tag. This loop then
+              # deleted the tag `docker run` names, and the very next command
+              # (`docker image inspect <name>:latest`) died with "image not
+              # known". Podman also spells a local repository `localhost/<name>`,
+              # so a raw compare against $src_tag never matches even its own
+              # tag — every run untagged everything it had just loaded.
               while IFS= read -r old_tag; do
-                if [ "$old_tag" != "$src_tag" ]; then
+                repo_tag=''${old_tag#localhost/}
+                case "$repo_tag" in
+                  "$name-src:"*) ;;
+                  *) continue ;;
+                esac
+                if [ "$repo_tag" != "$src_tag" ]; then
                   docker image rm "$old_tag" >/dev/null 2>&1 || true
                 fi
-              done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' "$name-src")
+              done < <(docker image ls --format '{{.Repository}}:{{.Tag}}')
             }
 
             die() { # <message>
