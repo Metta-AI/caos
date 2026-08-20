@@ -984,8 +984,7 @@ pub fn prepare_queued_request(
     queued_head: &str,
 ) -> Result<String, String> {
     validate_hash(queued_head, "queued conversation head")?;
-    let store = build_secret_store(t)?;
-    require_model_secret(&store)?;
+    let store = conversation_secret_store(t)?;
     let llm = resolve_llm(t, options, id, &store)?;
     prepare_client_request_with_store(t, &llm, &[format!("--head:commit={queued_head}")], &store)
 }
@@ -1103,9 +1102,38 @@ fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
     if store.iter().any(|secret| secret.name() == MODEL_API_SECRET) {
         return Ok(());
     }
+    // The shipped `caos`/`caos-cli` wrapper records its runtime $0 before
+    // replacing argv[0] with the stable name used by usage diagnostics. That
+    // keeps this recovery command bound to the checkout or profile binary the
+    // person actually invoked. Direct cargo-built binaries fall back to their
+    // own argv[0].
+    let invoked_as = std::env::var_os("CAOS_INVOKED_AS")
+        .or_else(|| std::env::args_os().next())
+        .filter(|command| !command.is_empty())
+        .map(|command| command.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "caos-cli".to_string());
     Err(format!(
-        "conversation needs a {MODEL_API_SECRET:?} secret in .caos-secrets"
+        "conversations need an Anthropic API key. Create the git-ignored file \
+         `.caos-secrets/{MODEL_API_SECRET}` with:\n\n\
+         name={MODEL_API_SECRET}\n\
+         value:@=/absolute/path/to/your/anthropic-api-key\n\
+         reader=DEEP-DEPS/llm-step\n\
+         reader=DEEP-DEPS/llm-call\n\n\
+         Then run `{invoked_as} secrets` to add cache-isolation entropy. \
+         See the README's Secrets section for details."
     ))
+}
+
+fn conversation_secret_store(t: &GitTransport) -> Result<Vec<ClientSecret>, String> {
+    let store = build_secret_store(t)?;
+    require_model_secret(&store)?;
+    Ok(store)
+}
+
+/// Check the model credential before an interactive client takes over the
+/// terminal, so setup failures remain readable at the shell prompt.
+pub fn ensure_conversation_secret(t: &GitTransport) -> Result<(), String> {
+    conversation_secret_store(t).map(drop)
 }
 
 fn request_is_active(status: &str) -> bool {
@@ -1116,7 +1144,7 @@ fn request_is_active(status: &str) -> bool {
 /// conversation state; `llm-step` advances the canonical head itself.
 pub fn resume_request(t: &GitTransport, request: &str) -> Result<(), String> {
     validate_hash(request, "request")?;
-    let store = build_secret_store(t)?;
+    let store = conversation_secret_store(t)?;
     let server = t.server_url()?;
     compute_client_request_with_store(&server, request, &store).map(|_| ())
 }
@@ -1996,7 +2024,7 @@ pub fn run_chat_turn(
     if let Some(request) = request {
         emit(TurnEvent::PhaseStarted(TurnPhase::Model));
         emit(TurnEvent::Status("waiting for agent".to_string()));
-        let store = build_secret_store(t)?;
+        let store = conversation_secret_store(t)?;
         let server = t.server_url()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -2060,8 +2088,7 @@ pub fn generate_conversation_title(
     options: &TurnOptions,
     first_message: &str,
 ) -> Result<String, String> {
-    let store = build_secret_store(t)?;
-    require_model_secret(&store)?;
+    let store = conversation_secret_store(t)?;
     let mut kvs = Vec::new();
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
