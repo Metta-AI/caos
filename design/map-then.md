@@ -189,12 +189,11 @@ It is an internal argument of the server's run pipeline: promise sub-runs carry
 listing the cycle, exactly as before. An HTTP `/run` is always top-level (empty
 stack).
 
-`caos run-async` is the deliberate exception to workers normally describing
-sub-runs as continuations: it sends a new HTTP `/run` for detached, independent
-work. The new run does not inherit the caller's stack, so cycle detection does
-not cross that boundary. A request must therefore not use `run-async` as a
-recursive edge; independently dispatched work must be acyclic without relying
-on ancestors from the dispatching run.
+`caos sub-run` is the deliberate exception to workers normally describing
+sub-runs as continuations. It asks the server to start detached work under the
+launching job's existing run context. The child therefore sees the same
+ancestor stack as a `run-then` or `map-then` child, and recursive edges are
+detected even though nobody waits for the detached result.
 
 ## Parallelism
 

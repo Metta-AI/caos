@@ -163,7 +163,7 @@ pub fn caos_curry(base: Arg, args: &[(&str, Arg)]) -> Result<String, String> {
 
 /// Construct the exact flat runnable ArgTree for `base` plus `args`, without
 /// executing it. The returned hash is suitable for durable recording and later
-/// `run-async`/`run-request-then` calls; unlike [`caos_curry`], it is not a
+/// `sub-run`/`run-request-then` calls; unlike [`caos_curry`], it is not a
 /// partial curry node.
 pub fn prepare_request(base: Arg, args: &[(&str, Arg)]) -> Result<String, String> {
     let mut argv = vec!["prepare-request".to_string(), base.token("base")];

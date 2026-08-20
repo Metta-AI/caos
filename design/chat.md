@@ -277,7 +277,7 @@ task ID = hash(Q)
 
 `Q` contains both the work and its destination, and is the task identity. When
 no state exists for `Q`, `llm-step` first appends
-`{"async":{"task":"<Q>","status":"pending"}}`, then calls `caos run-async Q`
+`{"async":{"task":"<Q>","status":"pending"}}`, then calls `caos sub-run Q`
 without waiting. Repeating the same tool request refolds `Q` and does not reset
 a terminal task to pending.
 

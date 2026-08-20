@@ -12,6 +12,8 @@
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result, optionally emitting this invocation to an open
 //!   trace stream.
+//! * `POST /sub-run` — admit an exact detached child under an in-flight job's
+//!   existing server-side run stack and secret store.
 //! * `GET /trace/<id>/stream` — follow one live invocation as chunked NDJSON.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
@@ -74,7 +76,10 @@ const DEFAULT_REGISTRY_PULL_HOST: &str = "localhost:5000";
 /// Redis (host:port) used to cache results. Override with `CAOS_REDIS_ADDR`.
 const DEFAULT_REDIS_ADDR: &str = "caos-redis:6379";
 
-/// Runtime configuration, read once from the environment at startup.
+/// Runtime configuration, read once from the environment at startup. Cloning
+/// is cheap and lets admitted sub-runs outlive the request thread that launched
+/// them while sharing the same repository and trace hub handles.
+#[derive(Clone)]
 struct Config {
     registry_push_url: String,
     registry_pull_host: String,
@@ -526,8 +531,8 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
 }
 
 /// Match the request to a handler and produce the response body. Serves the
-/// storage endpoints (`/object*`), compute (`/run`), and the runner protocol
-/// (`/runner/poll`, `/runner/result`).
+/// storage endpoints (`/object*`), compute (`/run`, `/sub-run`), and the runner
+/// protocol (`/runner/poll`, `/runner/result`).
 fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpError> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
@@ -559,6 +564,11 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             let mut body = Vec::new();
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
+        }
+        Method::Post if path == "/sub-run" => {
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)?;
+            runner::sub_run(&body)
         }
         Method::Post if path == "/runner/poll" || path == "/runner/result" => {
             let authorization = request

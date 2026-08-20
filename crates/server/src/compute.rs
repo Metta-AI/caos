@@ -108,10 +108,9 @@ struct WorkRequest<'a> {
 /// and the rendezvous id: an external run also pins
 /// `refs/caos/res/<argTreeHash>` at the result, so a client can fetch it by ref.
 /// Most worker sub-runs are promise resolutions the server performs itself
-/// ([`run_work_request`] recursion); `caos run-async` is the one worker command
-/// that sends this same endpoint and disconnects without waiting for the result.
-/// That dispatch is deliberately a new top-level run: it has an empty run stack,
-/// so stack-based cycle detection does not cross the detached-work boundary.
+/// ([`run_work_request`] recursion). Detached worker work enters through
+/// `POST /sub-run`, which starts this same pipeline with the launching job's
+/// existing stack and secret store.
 pub(crate) fn run(
     config: &Config,
     query: &str,
@@ -351,7 +350,15 @@ fn run_dispatch(
         // cache key — and the container runner drops them at `/secret/<name>`.
         // Read from `arg_entries` before dispatch takes ownership of it.
         let granted = crate::secrets::grant(secrets, &arg_entries);
-        crate::runner::dispatch(arg_tree, arg_entries, &image_ref, seeded, granted).map_err(fail)?
+        crate::runner::dispatch(
+            arg_tree,
+            arg_entries,
+            &image_ref,
+            seeded,
+            granted,
+            |sub_request| start_sub_run(config, sub_request, &child_stack, trace_id, secrets),
+        )
+        .map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
@@ -385,6 +392,46 @@ fn run_dispatch(
     }
 
     Ok(result)
+}
+
+/// Admit an exact detached child request while the parent job is still in
+/// flight. Ownership crosses the thread boundary here: the server clones the
+/// current unhashed context, while the worker sends only the child hash and its
+/// job-scoped nonce. Validation happens before acknowledgement so a missing or
+/// malformed request is not reported as queued.
+fn start_sub_run(
+    config: &Config,
+    arg_tree: &str,
+    stack: &[String],
+    trace_id: Option<&str>,
+    secrets: &[crate::secrets::Grant],
+) -> Result<(), HttpError> {
+    let (image, _) = read_arg_tree(config, arg_tree)?;
+    if image.is_empty() {
+        return Err(HttpError::new(400, "sub-run request has empty image"));
+    }
+
+    let config = config.clone();
+    let arg_tree = arg_tree.to_string();
+    let stack = stack.to_vec();
+    let trace_id = trace_id.map(str::to_string);
+    let secrets = secrets.to_vec();
+    std::thread::spawn(move || {
+        let result = run_work_request(
+            &config,
+            &WorkRequest {
+                arg_tree: &arg_tree,
+                stack: &stack,
+                trace_id: trace_id.as_deref(),
+                secrets: &secrets,
+            },
+        );
+        match result {
+            Ok(result) => eprintln!("sub-run completed: arg_tree={arg_tree} -> {result}"),
+            Err(error) => eprintln!("sub-run failed: arg_tree={arg_tree}: {}", error.message()),
+        }
+    });
+    Ok(())
 }
 
 // ---- Single-flight -----------------------------------------------------------

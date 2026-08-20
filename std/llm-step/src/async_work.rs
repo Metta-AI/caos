@@ -335,7 +335,7 @@ fn validate_subrequest(subrequest: &str) -> Result<(), String> {
 
 fn dispatch(task: &str) -> Result<(), String> {
     let output = Command::new("caos")
-        .args(["run-async", task])
+        .args(["sub-run", task])
         .output()
         .map_err(|error| format!("launching async task {task}: {error}"))?;
     if !output.status.success() {
@@ -346,11 +346,11 @@ fn dispatch(task: &str) -> Result<(), String> {
         ));
     }
     let reply = String::from_utf8(output.stdout)
-        .map_err(|error| format!("run-async reply for {task} is not UTF-8: {error}"))?;
+        .map_err(|error| format!("sub-run reply for {task} is not UTF-8: {error}"))?;
     let expected = format!("request {task}");
     if reply.trim() != expected {
         return Err(format!(
-            "run-async dispatched the wrong task: expected {expected:?}, got {:?}",
+            "sub-run dispatched the wrong task: expected {expected:?}, got {:?}",
             reply.trim()
         ));
     }

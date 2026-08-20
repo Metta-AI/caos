@@ -7,13 +7,13 @@
 //! post the kind + hash recorded at `/cas/out` back to the server), then
 //! long-polls for more work for its image until an idle TTL passes (see
 //! `design/runner-protocol.md`). It normally records continuations that the
-//! server resolves after the worker's job finishes; `run-async` is the
-//! deliberate exception that starts a detached top-level computation. The
+//! server resolves after the worker's job finishes; `sub-run` starts detached
+//! work while retaining the current server-side run context. The
 //! shared command logic lives in the `caos` library; this binary is the worker's
 //! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-request-then`, `run-async`, `prepare-request`, `curry`, and `runner`.
+//! `run-then`, `run-request-then`, `sub-run`, `prepare-request`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::fs::PermissionsExt;
@@ -104,15 +104,15 @@ fn run(args: &[String]) -> Result<(), String> {
             [request, kvs @ ..] => caos::caos_run_request_then(&http()?, request, kvs),
             _ => Err(usage(args)),
         },
-        // Send an ordinary /run request for an already-stored ArgTree without
-        // waiting for its result.
-        Some("run-async") => match &args[2..] {
-            [arg_tree] => caos::caos_run_async(&http()?, arg_tree),
+        // Start an already-stored ArgTree without waiting, preserving this
+        // job's server-side run stack and secret store.
+        Some("sub-run") => match &args[2..] {
+            [arg_tree] => caos::caos_sub_run(&http()?, arg_tree),
             _ => Err(usage(args)),
         },
         // `prepare-request --base:<type>=<image> [...]` — construct and store the
         // exact flat runnable ArgTree without executing it. This is the durable
-        // identity accepted by run-async.
+        // identity accepted by sub-run.
         Some("prepare-request") => caos::caos_prepare_request(&http()?, &args[2..]),
         // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
         // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
@@ -237,7 +237,10 @@ fn run_runner_job(
     if image_oid.is_none() {
         *image_oid = caos::read_hash(&cas.join("args").join("base")).ok();
     }
-    let envs = [(caos::SALT_ENV, salt.as_str())];
+    let envs = [
+        (caos::SALT_ENV, salt.as_str()),
+        (caos::JOB_NONCE_ENV, job.nonce.as_str()),
+    ];
     // Drop the granted secrets at `/secret/<name>` just before the worker runs
     // (design/secrets.md). `write_secrets` wipes any prior job's `/secret`
     // first, so a warm runner never leaks a secret into a later job that wasn't
@@ -480,7 +483,7 @@ fn usage(args: &[String]) -> String {
          {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n  \
          {prog} run-then <in-cas-path> --run:<type>=<image> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
-         {prog} run-async <arg-tree-hash>\n  \
+         {prog} sub-run <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is :@=<cas path>, :docker=<ref> or :hash=<oid>)\n  \
