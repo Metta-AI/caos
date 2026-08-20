@@ -63,12 +63,20 @@ done
 trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
 
 echo "== dispatch merge turn ==" >&2
+mkdir -p .caos-secrets
+printf '.caos-secrets/\n' >> .git/info/exclude
+printf '%s\n' \
+  'name=anthropic-api-key' \
+  'value=test-key' \
+  'entropy=0123456789abcdef0123456789abcdef' \
+  'reader=DEEP-DEPS/llm-step' \
+  > .caos-secrets/anthropic-api-key
 test_run_id="$(date +%s%N)-$$-$RANDOM"
 conv="${test_run_id}-merge"
 conversation_ref="refs/caos/v2/conversations/$conv/head"
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
-  --api-key=test-key --system:@=system.txt \
+  --system:@=system.txt \
   --merge-refs="feature $feature" \
   --model=test-model --base-url="http://$stub_host:$port" \
   --conversation="$conv")

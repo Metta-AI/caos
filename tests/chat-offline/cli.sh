@@ -103,18 +103,24 @@ stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 opts=(--model test-model --base-url "http://$stub_host:$port")
 
 echo "== request preparation fails before admission ==" >&2
-if env -u ANTHROPIC_API_KEY \
-    "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>key.err; then
-  fail "chat succeeded without ANTHROPIC_API_KEY"
+if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>key.err; then
+  fail "chat succeeded without its model secret"
 fi
-grep -q "ANTHROPIC_API_KEY" key.err || fail "missing-key error is unclear"
+grep -q "anthropic-api-key" key.err || fail "missing-key error is unclear"
 if remote_tip "$queued_ref" >/dev/null; then
   fail "request-preparation failure partially admitted a conversation"
 fi
 [ ! -e stub/request-1.json ] || fail "missing-key failure reached the LLM"
 
 echo "== invalid bases publish no conversation ==" >&2
-export ANTHROPIC_API_KEY=test-key
+mkdir -p .caos-secrets
+printf '.caos-secrets/\n' >> .git/info/exclude
+printf '%s\n' \
+  'name=anthropic-api-key' \
+  'value=test-key' \
+  'entropy=0123456789abcdef0123456789abcdef' \
+  'reader=DEEP-DEPS/llm-step' \
+  > .caos-secrets/anthropic-api-key
 mkdir -p bad/.caos
 echo reserved > bad/.caos/marker
 git add bad
@@ -176,6 +182,27 @@ grep -q '"request":"[0-9a-f]\{40\}"' talk.events || fail "exact request was not 
 grep -qF "$TALK_TEXT" talk.events || fail "post-disconnect assistant event is missing"
 [ "$(git show "$tip:notes/todo.txt")" = "hello notes" ] \
   || fail "completed conversation lost its base workspace"
+
+admission=""
+current=$tip
+while [ "$current" != "$base" ]; do
+  event=$(git show -s --format=%B "$current" | tr -d '\n')
+  if jq -e '.status == "queued" and (.request | type == "string") and (.request_head | type == "string")' \
+      <<<"$event" >/dev/null; then
+    admission=$current
+    break
+  fi
+  current=$(git rev-parse "$current^1")
+done
+[ -n "$admission" ] || fail "atomic request admission event is missing"
+admission_event=$(git show -s --format=%B "$admission" | tr -d '\n')
+request=$(jq -r '.request' <<<"$admission_event")
+request_args=$(git ls-tree --name-only "$request")
+grep -qx 'secret-hash' <<<"$request_args" \
+  || fail "conversation request is not isolated by its model secret"
+if grep -qx 'api-key' <<<"$request_args"; then
+  fail "conversation request still contains a curried API key"
+fi
 
 title_ref="refs/caos/v2/conversations/$conv/title"
 title=$(remote_tip "$title_ref") || fail "conversation has no title ref"

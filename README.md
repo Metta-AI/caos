@@ -333,6 +333,24 @@ the object machinery through a one-way dependency. Their difference is the
     missing `entropy=`, warn on a weak one (`--check` reports only and exits
     non-zero, for CI). Offline — no server (design/secrets.md).
 
+Conversations read their model credential from that local store rather than
+putting it in a curried worker. A minimal per-device setup is:
+
+```text
+# .gitignore
+.caos-secrets/
+
+# .caos-secrets/anthropic-api-key
+name=anthropic-api-key
+value:@=/absolute/path/to/anthropic-api-key
+reader=DEEP-DEPS/llm-step
+reader=DEEP-DEPS/llm-call
+```
+
+Run `caos-cli secrets` once to add the random `entropy=` used for cache
+isolation. The file and value path stay local; only the entropy-derived identity
+enters an ArgTree, while the value is carried out of band for the run.
+
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are
 fetched, so there is nothing else to configure:

@@ -148,7 +148,6 @@ fn child_request(agent: &str, root: &str, system: &str) -> Result<String, String
         "head",
         "system",
         "merge-refs",
-        "run-and-update-ref-image",
         "wc",
         "run",
         "round",
@@ -172,6 +171,7 @@ fn child_request(agent: &str, root: &str, system: &str) -> Result<String, String
         &[
             ("conversation", Arg::Lit(agent)),
             ("head", Arg::Path(&root_path)),
+            ("subagent", Arg::Lit("true")),
             ("system", Arg::Lit(&child_system)),
         ],
     )?;

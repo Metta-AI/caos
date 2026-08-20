@@ -15,7 +15,6 @@ echo "hello notes" > ws/notes/todo.txt
 commit "workspace"
 git config user.name tester
 git config user.email tester@example.com
-export ANTHROPIC_API_KEY=test-key
 base=$(mkcommit "HEAD:ws" base)
 
 INLINE_CALLS='[

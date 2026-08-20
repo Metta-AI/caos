@@ -19,6 +19,15 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   exit 0
 fi
 
+mkdir -p .caos-secrets
+printf '.caos-secrets/\n' >> .git/info/exclude
+printf '%s\n' \
+  'name=anthropic-api-key' \
+  "value=$ANTHROPIC_API_KEY" \
+  'entropy=0123456789abcdef0123456789abcdef' \
+  'reader=DEEP-DEPS/llm-step' \
+  > .caos-secrets/anthropic-api-key
+
 # The human commit carries the client's git identity; pin one so the test
 # doesn't depend on host-global config.
 git config user.name chat-online-test
