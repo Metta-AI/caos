@@ -553,10 +553,6 @@ fn submit_message_detailed(
     )
 }
 
-// One submission plus its two injection points: `prepare` builds the request,
-// `on_preparing` reports that it started. Splitting them off would only move the
-// noise to the three call sites.
-#[allow(clippy::too_many_arguments)]
 fn submit_message_detailed_with<F, P>(
     t: &GitTransport,
     options: &TurnOptions,
