@@ -90,6 +90,20 @@ other scheduling metadata:
 a runner learns the oids for its next `required` set from its own
 materialization of the job's args (see "container runner" below).
 
+### `POST /sub-run`
+
+An in-flight worker may start one already-prepared request without waiting:
+
+```json
+{ "req": "<childArgTree>", "nonce": "<currentJobNonce>" }
+```
+
+The nonce selects only the server-side context of the currently claimed job.
+The compute thread starts the child with `parent stack + parent request`, the
+same trace id, and the same secret store. None of those values enter this body
+or the runner payload. The nonce stops authorizing sub-runs as soon as the
+parent job reports its result.
+
 ### `POST /runner/result`
 
 ```json

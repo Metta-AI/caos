@@ -100,6 +100,17 @@ enum Outcome {
     Failed(String),
 }
 
+/// Messages delivered to the compute thread that owns an in-flight job. A
+/// sub-run request is handled there because that thread owns the unhashed run
+/// context; the rendezvous table retains only this channel, never the context.
+enum DispatchEvent {
+    Outcome(Outcome),
+    SubRun {
+        arg_tree: String,
+        reply: mpsc::Sender<Result<(), (u16, String)>>,
+    },
+}
+
 /// A hanging `POST /runner/poll`, parked until matched, kicked, or expired.
 struct ParkedPoll {
     /// Monotone arrival id — ties between equally specific polls go to the
@@ -147,7 +158,7 @@ struct Job {
     nonce: String,
     phase: Phase,
     enqueued: Instant,
-    outcome: mpsc::Sender<Outcome>,
+    events: mpsc::Sender<DispatchEvent>,
 }
 
 /// The rendezvous state: parked polls and dispatched jobs, one lock.
@@ -313,8 +324,9 @@ pub(crate) fn dispatch(
     image_ref: &str,
     seeded: bool,
     secrets: Vec<(String, String)>,
+    mut start_sub_run: impl FnMut(&str) -> Result<(), HttpError>,
 ) -> Result<String, HttpError> {
-    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
     let id = {
         let mut st = lock();
         let id = st.next_id;
@@ -350,7 +362,7 @@ pub(crate) fn dispatch(
                     defer_generic_until,
                 },
                 enqueued: Instant::now(),
-                outcome: outcome_tx,
+                events: event_tx,
             },
         );
         offer_job(&mut st, id);
@@ -391,9 +403,16 @@ pub(crate) fn dispatch(
             Some(at) => wait.min(at.saturating_duration_since(Instant::now())),
             None => wait,
         };
-        match outcome_rx.recv_timeout(wait.max(Duration::from_millis(10))) {
-            Ok(Outcome::Done(result)) => return Ok(result),
-            Ok(Outcome::Failed(message)) => return Err(HttpError::new(500, message)),
+        match event_rx.recv_timeout(wait.max(Duration::from_millis(10))) {
+            Ok(DispatchEvent::Outcome(Outcome::Done(result))) => return Ok(result),
+            Ok(DispatchEvent::Outcome(Outcome::Failed(message))) => {
+                return Err(HttpError::new(500, message))
+            }
+            Ok(DispatchEvent::SubRun { arg_tree, reply }) => {
+                let outcome = start_sub_run(&arg_tree)
+                    .map_err(|error| (error.status(), error.message().to_string()));
+                let _ = reply.send(outcome);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let mut st = lock();
                 // A bool, not a borrow of the job: the grace block below needs
@@ -485,6 +504,56 @@ pub(crate) fn dispatch(
             }
         }
     }
+}
+
+/// `POST /sub-run` — ask the compute thread that owns an in-flight job to
+/// start one exact child request. The nonce is the entire authority: it is
+/// unpredictable, scoped to one claimed job, and removed with that job.
+pub(crate) fn sub_run(body: &str) -> Result<Vec<u8>, HttpError> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| HttpError::new(400, format!("invalid sub-run json: {error}")))?;
+    let arg_tree = value["req"].as_str().unwrap_or_default();
+    let nonce = value["nonce"].as_str().unwrap_or_default();
+    if !valid_hex(arg_tree, 40) {
+        return Err(HttpError::new(
+            400,
+            "sub-run needs a lowercase request hash",
+        ));
+    }
+    if !valid_hex(nonce, 32) {
+        return Err(HttpError::new(400, "sub-run needs a lowercase job nonce"));
+    }
+
+    let events = {
+        let st = lock();
+        let Some(id) = st.by_nonce.get(nonce) else {
+            return Err(HttpError::new(410, "unknown or consumed job nonce"));
+        };
+        let job = &st.jobs[id];
+        if !matches!(job.phase, Phase::Inflight) {
+            return Err(HttpError::new(409, "job is not in flight"));
+        }
+        job.events.clone()
+    };
+    let (reply_tx, reply_rx) = mpsc::channel();
+    events
+        .send(DispatchEvent::SubRun {
+            arg_tree: arg_tree.to_string(),
+            reply: reply_tx,
+        })
+        .map_err(|_| HttpError::new(410, "job finished before sub-run admission"))?;
+    match reply_rx.recv() {
+        Ok(Ok(())) => Ok(b"{}".to_vec()),
+        Ok(Err((status, message))) => Err(HttpError::new(status, message)),
+        Err(_) => Err(HttpError::new(410, "job finished before sub-run admission")),
+    }
+}
+
+fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Remove job `id` (and its nonce mapping), returning it.
@@ -717,7 +786,7 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
         };
         Outcome::Failed(message)
     };
-    let _ = job.outcome.send(outcome);
+    let _ = job.events.send(DispatchEvent::Outcome(outcome));
     Ok(b"{}".to_vec())
 }
 

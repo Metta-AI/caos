@@ -11,6 +11,9 @@ set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
+object_status() { # <oid>
+  curl -sS -o /dev/null -w '%{http_code}' -I "$CAOS_SERVER_URL/object/$1"
+}
 
 # --- fixtures (committed) ----------------------------------------------------
 # A worker that reads the granted secret and reports a leak-free verdict.
@@ -68,6 +71,34 @@ cat > mytool/.caos-expr <<'EOF'
 curry --base:@=bash --worker1:@=run.sh
 EOF
 
+# A child-only reader used to prove that sub-run preserves the whole carried
+# store, not merely the values granted to its launching worker.
+mkdir -p subtool
+cp -r DEEP-DEPS/bash subtool/bash
+cat > subtool/run.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+caos get /cas/args/marker
+if [ -r /secret/deploytok ] && [ "$(cat /secret/deploytok)" = "DEPLOY-xyz-789" ]; then
+  verdict=sub-run-secret-ok
+else
+  verdict=sub-run-secret-missing
+fi
+printf '%s:%s\n' "$verdict" "$(cat /cas/args/marker)" > /tmp/sub-run-result
+caos put /tmp/sub-run-result /cas/out
+EOF
+cat > subtool/.caos-expr <<'EOF'
+curry --base:@=bash --worker1:@=run.sh
+EOF
+
+cat > launch-sub-run.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+caos get /cas/args/request
+caos sub-run "$(cat /cas/args/request)" > /tmp/sub-run-admission
+caos put /tmp/sub-run-admission /cas/out
+EOF
+
 # An EMBEDDER: it binds mytool as a `:@=` arg rather than running it. Since a
 # `:@=` target carrying a `.caos-expr` is evaluated (design/caos-expr.md), the
 # arg binds mytool's MARKED curry — so the embedder's own arg tree turns over
@@ -110,6 +141,7 @@ cat > .caos-secrets/deploytok <<'EOF'
 value=DEPLOY-xyz-789
 entropy=aa11bb22cc33dd44ee55ff6677889900
 reader=mytool
+reader=subtool
 EOF
 
 echo "== a granted secret is injected; a non-matching one is not ==" >&2
@@ -145,6 +177,40 @@ verdict=$(cat tgot/verdict)
 [ "$verdict" = "deploytok-ok" ] \
   || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
 echo "  ok: a reader naming a repo path grants the secret" >&2
+
+echo "== sub-run preserves the server-held secret store ==" >&2
+# The launcher is an ordinary bash worker and cannot read deploytok. Its child
+# is the independently authorized subtool request; the child succeeds only if
+# the server carries the original store through the detached edge.
+subtool=$("$CAOS_CLI" eval-path subtool) || fail "eval-path subtool failed: $subtool"
+marker="detached-$(date +%s%N)-$$-$RANDOM"
+expected="sub-run-secret-ok:$marker"
+expected_oid=$(printf '%s\n' "$expected" | git hash-object --stdin)
+request=$("$CAOS_CLI" prepare-request --base:hash="${subtool##* }" --marker="$marker") \
+  || fail "preparing subtool request failed"
+launcher=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
+  --worker1:@=launch-sub-run.sh --request="$request") \
+  || fail "currying sub-run launcher failed"
+admitted=$("$CAOS_CLI" run --base:hash="$launcher") || fail "sub-run launcher failed"
+[ "$admitted" = "request $request" ] \
+  || fail "sub-run launcher admitted the wrong request: $admitted"
+
+complete=0
+for _ in $(seq 1 150); do
+  status=$(object_status "$expected_oid") || fail "server unreachable while waiting for sub-run"
+  case "$status" in
+    200) complete=1; break ;;
+    404) ;;
+    *) fail "server returned HTTP $status while waiting for sub-run" ;;
+  esac
+  sleep 0.1
+done
+[ "$complete" -eq 1 ] || fail "sub-run never produced its secret-backed result"
+"$CAOS_CLI" run sub-run-result --base:hash="$request" >/dev/null \
+  || fail "reading completed sub-run failed"
+[ "$(cat sub-run-result)" = "$expected" ] \
+  || fail "sub-run result was wrong: $(cat sub-run-result)"
+echo "  ok: a child received its reader-matched secret through server context" >&2
 
 echo "== eval-path folds secret-hash, so a worker's callers become per-user ==" >&2
 # mytool matches the deploytok reader, so eval-path marks its returned arg tree.

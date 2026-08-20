@@ -153,9 +153,10 @@ It serves requests **concurrently — one thread per request** — so a worker c
 fetch objects while its own `/run` is in flight, and several top-level runs can
 proceed at once. Ordinary dependent sub-computations use a **map-then
 continuation**: the worker records the continuation as its result and finishes
-its job before the server resolves it (see [compute](#compute)). `run-async` is
-the deliberate exception: it starts a detached `/run` request from a worker and
-returns the request hash immediately, without waiting for that subrequest.
+its job before the server resolves it (see [compute](#compute)). `sub-run` is
+the deliberate exception: it starts detached work from a worker and returns the
+request hash immediately. The server recovers the launching job's run stack and
+secret store from its job nonce; neither is sent back into the worker.
 Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 
 | Request | Behaviour |
@@ -163,6 +164,7 @@ Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
 | `GET /run?req=<argTreeHash>&trace=<traceId>` | Run the ArgTree `<argTreeHash>` (`req` is the query param's historical name; its value is the ArgTree hash) and return `"<type> <hash>"` (the fully-resolved result), optionally emitting trace events. See [compute](#compute). |
+| `POST /sub-run` | Start one exact request without waiting, inheriting the in-flight launching job's server-side run context. |
 | `GET /trace/<traceId>/stream` | Stream one live trace as Chrome `B`/`E` events in JSONL. |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |

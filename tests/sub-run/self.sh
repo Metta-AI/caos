@@ -4,10 +4,10 @@ set -euo pipefail
 q=$(caos hash /cas/args)
 # A blocking implementation would wait on this worker's own result. Bound the
 # regression so a broken test fails promptly instead of hanging the suite.
-reply=$(timeout 5 caos run-async "$q")
+reply=$(timeout 5 caos sub-run "$q")
 
 [ "$reply" = "request $q" ] || {
-  echo "run-async returned $reply, expected request $q" >&2
+  echo "sub-run returned $reply, expected request $q" >&2
   exit 1
 }
 

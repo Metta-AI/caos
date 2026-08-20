@@ -4,7 +4,7 @@
 //!   It talks to the server over HTTP (`/object`) and runs the container
 //!   `runner` (jobs arrive by long-poll; see `design/runner-protocol.md`). It
 //!   normally records continuations for the server to resolve after the job;
-//!   `run-async` is the one command that directly dispatches `/run`.
+//!   `sub-run` starts detached work inside the current server-side run context.
 //!
 //! Everything that doesn't depend on *how* objects move — the object model,
 //! currying, args-tree assembly, CAS materialization, image import — lives here,
@@ -21,13 +21,12 @@
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
 
@@ -190,6 +189,11 @@ const SECRETS_HEADER: &str = "X-Caos-Secrets";
 /// it to a per-run random value, making their cache entries collision-free across
 /// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
+
+/// The current runner job's short-lived capability. A worker presents it to
+/// `POST /sub-run`; the server accepts it only while that exact job is in
+/// flight, and uses it to recover the job's server-held run context.
+pub const JOB_NONCE_ENV: &str = "CAOS_JOB_NONCE";
 
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
@@ -3055,8 +3059,8 @@ mod git_ref_tests {
 
 /// Resolve curry layers, build the args tree, bundle + push the request, and run
 /// it — the CLI's blocking run. Ordinary worker sub-runs are continuations the
-/// server resolves; deliberately independent work may start a new top-level run
-/// with `run-async`. Returns the server's
+/// server resolves; detached worker work uses `sub-run` to retain the current
+/// server-side run context. Returns the server's
 /// `(kind, result-hash)`. `cas` is `None` here: every path arg is a host path to
 /// ingest.
 fn run_request(
@@ -3115,7 +3119,7 @@ pub fn prepare_client_request(
 ///
 /// Unlike [`caos_curry`], the result is not a partial curry node. It is the same
 /// request `run_request` would send to `/run`, so it can be recorded durably
-/// and later handed unchanged to `run-async` or `run-request-then`.
+/// and later handed unchanged to `sub-run` or `run-request-then`.
 pub fn caos_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let (bty, bval, kvs) = split_base_arg("prepare-request", kvs)?;
@@ -3319,45 +3323,41 @@ pub fn caos_run_request_then(
     )
 }
 
-/// Start an already-stored ArgTree through the ordinary `/run` endpoint without
-/// waiting for its result. The server handles each HTTP request on its own
-/// thread, so closing our side after sending the request does not cancel it.
-///
-/// This starts a new top-level run: it does not inherit the caller's run stack,
-/// secrets, credentials, model settings, or other ephemeral execution context.
-/// Callers must use it only for independent work whose complete context is in
-/// the ArgTree.
-pub fn caos_run_async(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
+/// Start an already-stored ArgTree in the current job's server-side run context
+/// without waiting for its result. The job nonce identifies that context; the
+/// worker never receives the carried stack or secret store.
+pub fn caos_sub_run(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
     if !is_hex_hash(arg_tree) || arg_tree.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(format!(
-            "run-async needs a lowercase 40-character ArgTree hash, got {arg_tree:?}"
+            "sub-run needs a lowercase 40-character ArgTree hash, got {arg_tree:?}"
         ));
     }
     if !t.has_object(arg_tree)? {
         return Err(format!(
-            "run-async needs an already-stored ArgTree, and {arg_tree} is absent"
+            "sub-run needs an already-stored ArgTree, and {arg_tree} is absent"
         ));
     }
     let (kind, content) = t.get_object(arg_tree)?;
     if kind != "tree" {
         return Err(format!(
-            "run-async needs an ArgTree, but {arg_tree} is a {kind}"
+            "sub-run needs an ArgTree, but {arg_tree} is a {kind}"
         ));
     }
     let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
-        .map_err(|error| format!("run-async ArgTree {arg_tree} is malformed: {error}"))?;
+        .map_err(|error| format!("sub-run ArgTree {arg_tree} is malformed: {error}"))?;
     if !tree
         .entries
         .iter()
         .any(|entry| entry.filename.to_vec().as_slice() == b"base")
     {
         return Err(format!(
-            "run-async needs a runnable ArgTree, but {arg_tree} has no 'base' entry"
+            "sub-run needs a runnable ArgTree, but {arg_tree} has no 'base' entry"
         ));
     }
     t.ensure_pushed(arg_tree)?;
-    let url = run_url(&t.server_url()?, arg_tree, None);
-    dispatch_compute_url(&url)?;
+    let nonce = std::env::var(JOB_NONCE_ENV)
+        .map_err(|_| "sub-run is available only inside a running worker".to_string())?;
+    request_sub_run(&t.server_url()?, arg_tree, &nonce)?;
     println!("request {arg_tree}");
     Ok(())
 }
@@ -4425,83 +4425,30 @@ fn run_url(base: &str, arg_tree: &str, trace_id: Option<&str>) -> String {
     url
 }
 
-/// Send a plain-HTTP compute request and deliberately do not read its response.
-/// This is the small worker-side primitive behind `caos run-async`: `/run`
-/// already outlives a disconnected caller, while the conversation's durable
-/// `pending` entry makes a dispatch that dies before reaching the server safe to
-/// retry. Waiting for response headers here would wait for the run itself.
-fn dispatch_compute_url(url: &str) -> Result<(), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("run-async only supports plain HTTP server URLs: {url}"))?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{path}")),
-        None => (rest, "/".to_string()),
-    };
-    if authority.is_empty() {
-        return Err(format!("run-async server URL has no host: {url}"));
+/// Ask the server to start `arg_tree` with the current in-flight job's
+/// un-hashed context. The response acknowledges admission only; the sub-run
+/// continues on a server thread after this call returns.
+fn request_sub_run(base: &str, arg_tree: &str, nonce: &str) -> Result<(), String> {
+    let url = format!("{}/sub-run", base.trim_end_matches('/'));
+    let body = serde_json::json!({"req": arg_tree, "nonce": nonce}).to_string();
+    let response = minreq::post(&url)
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+        .with_header("content-type", "application/json")
+        .with_timeout(5)
+        .with_body(body)
+        .send()
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let detail = response.as_str().unwrap_or("").trim();
+        return Err(if detail.is_empty() {
+            format!("POST {url}: server returned {}", response.status_code)
+        } else {
+            format!(
+                "POST {url}: server returned {}: {detail}",
+                response.status_code
+            )
+        });
     }
-
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let close = bracketed
-            .find(']')
-            .ok_or_else(|| format!("invalid IPv6 server URL: {url}"))?;
-        let host = &bracketed[..close];
-        let suffix = &bracketed[close + 1..];
-        let port = match suffix.strip_prefix(':') {
-            Some(port) => port
-                .parse::<u16>()
-                .map_err(|_| format!("invalid port in server URL: {url}"))?,
-            None if suffix.is_empty() => 80,
-            None => return Err(format!("invalid server URL: {url}")),
-        };
-        (host, port)
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) if !host.contains(':') => (
-                host,
-                port.parse::<u16>()
-                    .map_err(|_| format!("invalid port in server URL: {url}"))?,
-            ),
-            _ => (authority, 80),
-        }
-    };
-
-    const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("resolving {authority}: {error}"))?;
-    let mut last_error = None;
-    let mut stream = None;
-    for address in addresses {
-        match TcpStream::connect_timeout(&address, DISPATCH_TIMEOUT) {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let mut stream = stream.ok_or_else(|| match last_error {
-        Some(error) => format!("connecting to {authority}: {error}"),
-        None => format!("resolving {authority}: no socket addresses"),
-    })?;
-    stream
-        .set_write_timeout(Some(DISPATCH_TIMEOUT))
-        .map_err(|error| format!("setting write timeout for {authority}: {error}"))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\n{}: {}\r\nConnection: close\r\n\r\n",
-        caos_world::WORLD_HEADER,
-        caos_world::WORLD,
-    )
-    .map_err(|error| format!("sending GET {url}: {error}"))?;
-    stream
-        .flush()
-        .map_err(|error| format!("sending GET {url}: {error}"))?;
-    stream
-        .shutdown(Shutdown::Write)
-        .map_err(|error| format!("finishing GET {url}: {error}"))?;
     Ok(())
 }
 
@@ -4683,29 +4630,29 @@ mod git_transport_tests {
     }
 
     #[test]
-    fn run_async_rejects_noncanonical_and_nonrunnable_requests_before_dispatch() {
+    fn sub_run_rejects_noncanonical_and_nonrunnable_requests_before_dispatch() {
         let request = "a".repeat(40);
         let missing = ObjectTransport { object: None };
-        assert!(caos_run_async(&missing, &request)
+        assert!(caos_sub_run(&missing, &request)
             .unwrap_err()
             .contains("already-stored ArgTree"));
 
         let blob = ObjectTransport {
             object: Some(("blob", b"not a request".to_vec())),
         };
-        assert!(caos_run_async(&blob, &request)
+        assert!(caos_sub_run(&blob, &request)
             .unwrap_err()
             .contains("is a blob"));
 
         let curry_or_plain_tree = ObjectTransport {
             object: Some(("tree", Vec::new())),
         };
-        assert!(caos_run_async(&curry_or_plain_tree, &request)
+        assert!(caos_sub_run(&curry_or_plain_tree, &request)
             .unwrap_err()
             .contains("has no 'base' entry"));
 
         let uppercase = request.to_ascii_uppercase();
-        assert!(caos_run_async(&missing, &uppercase)
+        assert!(caos_sub_run(&missing, &uppercase)
             .unwrap_err()
             .contains("lowercase 40-character"));
     }

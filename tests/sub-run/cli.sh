@@ -2,9 +2,9 @@
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack (tests/lib/run-test.sh).
 #
-# The worker schedules its own in-flight ArgTree. If run-async waited for the
-# result, the request would deadlock on itself. The eventual result below proves
-# that the ordinary /run request continues after the worker disconnects.
+# The worker schedules its own in-flight ArgTree. If sub-run waited for the
+# result, the request would deadlock on itself. The server instead admits it
+# under the current stack, where the recursive edge fails independently.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -12,7 +12,7 @@ object_status() { # <oid>
   curl -sS -o /dev/null -w '%{http_code}' -I "$CAOS_SERVER_URL/object/$1"
 }
 
-echo "== run-async dispatches an in-flight request without waiting ==" >&2
+echo "== sub-run dispatches an in-flight request without waiting ==" >&2
 self=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/self.sh)
 reply=$("$CAOS_CLI" run --base:hash="$self")
 
@@ -38,7 +38,7 @@ dispatched=$("$CAOS_CLI" run --base:hash="$launcher")
 [ "$dispatched" = "request $q" ] \
   || fail "launcher dispatched the wrong request: $dispatched"
 
-# There is no blocking /run Q here: the launcher container is already gone.
+# There is no blocking caller for Q here: the launcher container is already gone.
 # The result content is unique to this run, so only the disconnected request
 # can make its known object id addressable through the core object API.
 complete=0
@@ -50,7 +50,7 @@ for _ in $(seq 1 150); do
   case "$status" in
     200) complete=1; break ;;
     404) ;;
-    *) infra "server returned HTTP $status while waiting for dispatched request $q" ;;
+    *) fail "server returned HTTP $status while waiting for dispatched request $q" ;;
   esac
   sleep 0.1
 done
@@ -61,4 +61,4 @@ done
   || fail "background result contents were wrong: $(cat actual)"
 echo "  ok: result became addressable with no foreground Q caller" >&2
 
-echo "run-async: ALL PASS" >&2
+echo "sub-run: ALL PASS" >&2
