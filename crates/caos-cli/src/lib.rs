@@ -539,7 +539,34 @@ fn submit_message_detailed(
     message: &str,
     require_absent: bool,
     proposal: Option<&str>,
+    on_preparing: impl FnMut(),
 ) -> Result<SubmittedMessage, String> {
+    submit_message_detailed_with(
+        t,
+        options,
+        id,
+        message,
+        require_absent,
+        proposal,
+        prepare_queued_request,
+        on_preparing,
+    )
+}
+
+fn submit_message_detailed_with<F, P>(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    message: &str,
+    require_absent: bool,
+    proposal: Option<&str>,
+    mut prepare: F,
+    mut on_preparing: P,
+) -> Result<SubmittedMessage, String>
+where
+    F: FnMut(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
+    P: FnMut(),
+{
     submit_message_inner_detailed_with(
         t,
         options,
@@ -550,7 +577,10 @@ fn submit_message_detailed(
             proposal,
             admit_when_idle: true,
         },
-        prepare_queued_request,
+        |t, options, id, head| {
+            on_preparing();
+            prepare(t, options, id, head)
+        },
     )
 }
 
@@ -564,7 +594,7 @@ fn submit_message_inner_with<F>(
     prepare: F,
 ) -> Result<Option<String>, String>
 where
-    F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
+    F: FnMut(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
 {
     submit_message_inner_detailed_with(
         t,
@@ -587,10 +617,10 @@ fn submit_message_inner_detailed_with<F>(
     id: &str,
     message: &str,
     policy: SubmitMessagePolicy<'_>,
-    prepare: F,
+    mut prepare: F,
 ) -> Result<SubmittedMessage, String>
 where
-    F: Fn(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
+    F: FnMut(&GitTransport, &TurnOptions, &str, &str) -> Result<String, String>,
 {
     let SubmitMessagePolicy {
         require_absent,
@@ -1929,17 +1959,25 @@ pub fn run_chat_turn(
 ) -> Result<TurnOutcome, String> {
     emit(TurnEvent::PhaseStarted(TurnPhase::System));
     emit(TurnEvent::Status("saving message".to_string()));
-    let submitted = match human_tree {
-        Some(tree) => {
-            validate_hash(tree, "submitted workspace commit")?;
-            t.git_capture(&["cat-file", "-e", &format!("{tree}^{{commit}}")], None)?;
-            reject_reserved_caos(t, tree, "submitted workspace")?;
-            submit_message_detailed(t, options, id, message, false, Some(tree))?
+    if let Some(tree) = human_tree {
+        validate_hash(tree, "submitted workspace commit")?;
+        t.git_capture(&["cat-file", "-e", &format!("{tree}^{{commit}}")], None)?;
+        reject_reserved_caos(t, tree, "submitted workspace")?;
+    }
+    let mut preparation_started = None;
+    let submitted = submit_message_detailed(t, options, id, message, false, human_tree, || {
+        if preparation_started.is_none() {
+            preparation_started = Some(Instant::now());
+            emit(TurnEvent::Status("preparing agent".to_string()));
         }
-        None => submit_message_detailed(t, options, id, message, false, None)?,
-    };
+    })?;
     on_submitted(&submitted.commit);
-    let started = Instant::now();
+    if let Some(started) = preparation_started {
+        emit(TurnEvent::PhaseComplete {
+            label: "Prepared".to_string(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+        });
+    }
     let mut request_result = None;
     let request = match submitted.request {
         Some(request) => Some(request),
@@ -1953,10 +1991,6 @@ pub fn run_chat_turn(
             .transpose()?,
     };
     if let Some(request) = request {
-        emit(TurnEvent::PhaseComplete {
-            label: "Prepared".to_string(),
-            elapsed_secs: started.elapsed().as_secs_f64(),
-        });
         emit(TurnEvent::PhaseStarted(TurnPhase::Model));
         emit(TurnEvent::Status("waiting for agent".to_string()));
         let server = t.server_url()?;
@@ -3801,6 +3835,58 @@ mod tests {
         assert!(request_is_active("running"));
         assert!(!request_is_active("idle"));
         assert!(!request_is_active("failed"));
+    }
+
+    #[test]
+    fn preparing_callback_only_wraps_new_request_resolution() {
+        let (root, _repo, transport, base) = conversation_index_fixture("prepare-progress");
+        let request = "b".repeat(40);
+        let order = std::cell::RefCell::new(Vec::new());
+        let submitted = submit_message_detailed_with(
+            &transport,
+            &TurnOptions {
+                base: Some(base),
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "prepare-progress",
+            "Start a turn",
+            false,
+            None,
+            |_, _, _, _| {
+                order.borrow_mut().push("prepare");
+                Ok(request.clone())
+            },
+            || order.borrow_mut().push("preparing"),
+        )
+        .unwrap();
+        assert_eq!(&*order.borrow(), &["preparing", "prepare"]);
+        assert_eq!(submitted.request.as_deref(), Some(request.as_str()));
+
+        let prepare_calls = std::cell::Cell::new(0);
+        let preparing_calls = std::cell::Cell::new(0);
+        let joined = submit_message_detailed_with(
+            &transport,
+            &TurnOptions {
+                username: Some("Alice".to_string()),
+                ..TurnOptions::default()
+            },
+            "prepare-progress",
+            "Join the active turn",
+            false,
+            None,
+            |_, _, _, _| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                Ok("c".repeat(40))
+            },
+            || preparing_calls.set(preparing_calls.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(prepare_calls.get(), 0);
+        assert_eq!(preparing_calls.get(), 0);
+        assert_eq!(joined.request.as_deref(), Some(request.as_str()));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
