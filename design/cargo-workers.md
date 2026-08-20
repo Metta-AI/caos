@@ -114,8 +114,8 @@ implemented (`worker-cargo/src/decompose.rs`, `mode=all` + internal
   re-runs on any edit, compiles nothing): parse manifests, compute the
   member's dep closure, **prune** the workspace to what its build reads —
   root manifest + lockfile + every member manifest + the closure's sources,
-  all CAS links — and map-then over the direct deps with itself (`cmd=dep`)
-  into a `job`.
+  all CAS links — then tail directly into a `job` for checks, or map-then over
+  the direct deps with itself (`cmd=dep`) for commands that consume rlibs.
 - **`job`** is the compile, keyed on (pruned tree, children, name, cmd) —
   the narrow key that buys incrementality. Own sources fresh-mtimed,
   everything else epoch (sound *because* content-addressing guarantees the
@@ -126,6 +126,14 @@ implemented (`worker-cargo/src/decompose.rs`, `mode=all` + internal
   only direct deps; a **failed dep propagates as a value** — its
   `{exit, stdout, stderr}` becomes the dependent's result uncompiled, so
   diagnostics bubble to the top attributed to the crate that broke.
+
+Checks deliberately do not use the artifact DAG. Cargo gives a package
+selected with `-p` a different unit hash from the same package compiled as a
+dependency: for example, the `caos` dep job emitted `c66f…`, while the
+`caos-cli` check requested `46a5…`. The parent therefore cannot consume the
+separate check artifact and recompiles it. Running the already-pruned closure
+once in the member job removes that serialized duplicate; member jobs still
+fan out in parallel, and unchanged jobs remain content-addressed cache hits.
 
 Edit `worker-rgrep` → recompile one crate. Edit `worker-common` → it plus
 dependents, siblings in parallel as map children. Untouched members: cache
