@@ -86,6 +86,14 @@ fn image_arg(name: &str) -> Result<Option<String>, String> {
 
 impl Config {
     fn read() -> Result<Config, String> {
+        // Keep run-and-update-ref-image in a child request so the request stays
+        // a superset of the configured llm-step secret reader. The marker, not
+        // removal of that identity-bearing argument, disables nested agents.
+        let run_and_update_ref_image = if read_arg_opt("subagent")?.is_some() {
+            None
+        } else {
+            image_arg("run-and-update-ref-image")?
+        };
         Ok(Config {
             api_key: secret("anthropic-api-key")?,
             system: read_arg("system")?,
@@ -93,7 +101,7 @@ impl Config {
             grep_image: image_arg("grep-image")?,
             tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
-            run_and_update_ref_image: image_arg("run-and-update-ref-image")?,
+            run_and_update_ref_image,
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg("model")?,
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
