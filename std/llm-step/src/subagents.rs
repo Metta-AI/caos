@@ -9,7 +9,7 @@ use worker_common::{
     prepare_request, scratch, write_commit_as, Arg,
 };
 
-use crate::{async_work, fresh, progress};
+use crate::{async_work, fresh, progress, read_commit_timestamp};
 
 pub const SPAWN_TOOL: &str = "spawn_agent";
 const STEP_DIR: &str = ".caos";
@@ -125,13 +125,14 @@ fn clean_agent_base(ws: &str, wc: &str) -> Result<(String, String), String> {
     let clean_tree = fresh("agent-workspace");
     caos(["put", path(&clean), &clean_tree])?;
     let tree = cas_hash(&clean_tree)?;
+    let timestamp = read_commit_timestamp(wc)?;
     let parent = cas_hash(wc)?;
     let base_path = fresh("agent-base");
     let base = write_commit_as(
         &tree,
         &[&parent],
         "isolated subagent workspace",
-        Some(("caos-agent", 0)),
+        Some(("caos-agent", timestamp)),
         &base_path,
     )?;
     Ok((base, tree))

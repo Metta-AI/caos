@@ -37,6 +37,7 @@ pub enum ConditionalAppend {
 struct RemoteCommit {
     tree: String,
     parents: Vec<String>,
+    timestamp: i64,
     message: String,
 }
 
@@ -809,11 +810,20 @@ fn hex_oid(bytes: &[u8]) -> String {
 }
 
 fn store_commit(base: &str, tree: &str, parents: &[&str], message: &str) -> Result<String, String> {
-    let content = commit_content(tree, parents, message)?;
+    if parents.is_empty() {
+        return Err("conversation event commit requires a parent".to_string());
+    }
+    let timestamp = inherited_timestamp(base, parents[0])?;
+    let content = commit_content(tree, parents, timestamp, message)?;
     store_object(base, "commit", content.as_bytes())
 }
 
-fn commit_content(tree: &str, parents: &[&str], message: &str) -> Result<String, String> {
+fn commit_content(
+    tree: &str,
+    parents: &[&str],
+    timestamp: i64,
+    message: &str,
+) -> Result<String, String> {
     validate_hash(tree, "commit tree")?;
     if parents.is_empty() {
         return Err("conversation event commit requires a parent".to_string());
@@ -823,18 +833,35 @@ fn commit_content(tree: &str, parents: &[&str], message: &str) -> Result<String,
         validate_hash(parent, "commit parent")?;
         content.push_str(&format!("parent {parent}\n"));
     }
-    // A fixed identity makes a proposal stable for a given event, tree, and
-    // observed head. The event itself may carry a wall-clock timestamp when it
-    // is useful to the transcript.
-    content.push_str(
-        "author caos-agent <caos@caos> 0 +0000\n\
-         committer caos-agent <caos@caos> 0 +0000\n\n",
-    );
+    // Inheriting the first parent's timestamp keeps a proposal stable for a
+    // given event, tree, and observed head while giving published conversation
+    // commits the real date of the user turn that caused them.
+    content.push_str(&format!(
+        "author caos-agent <caos@caos> {timestamp} +0000\n\
+         committer caos-agent <caos@caos> {timestamp} +0000\n\n"
+    ));
     content.push_str(message);
     if !message.ends_with('\n') {
         content.push('\n');
     }
     Ok(content)
+}
+
+fn inherited_timestamp(base: &str, parent: &str) -> Result<i64, String> {
+    let mut current = parent.to_string();
+    for _ in 0..4096 {
+        let commit = fetch_commit(base, &current)?;
+        if commit.timestamp > 0 {
+            return Ok(commit.timestamp);
+        }
+        let Some(parent) = commit.parents.first() else {
+            return Ok(commit.timestamp);
+        };
+        current = parent.clone();
+    }
+    Err(format!(
+        "timestamp inheritance walk from {parent} exceeded 4096 commits"
+    ))
 }
 
 fn store_object(base: &str, kind: &str, content: &[u8]) -> Result<String, String> {
@@ -947,9 +974,17 @@ fn parse_serialized_commit(serialized: &[u8]) -> Result<RemoteCommit, String> {
             parents.push(parent.to_string());
         }
     }
+    let timestamp = headers
+        .lines()
+        .find(|line| line.starts_with("committer "))
+        .and_then(|line| line.split_whitespace().rev().nth(1))
+        .ok_or("commit has no committer timestamp")?
+        .parse::<i64>()
+        .map_err(|error| format!("commit has an invalid committer timestamp: {error}"))?;
     Ok(RemoteCommit {
         tree,
         parents,
+        timestamp,
         message: message.to_string(),
     })
 }
@@ -1306,6 +1341,7 @@ mod tests {
         object.extend_from_slice(content.as_bytes());
         let parsed = parse_serialized_commit(&object).unwrap();
         assert_eq!(parsed.tree, A);
+        assert_eq!(parsed.timestamp, 0);
     }
 
     #[test]
@@ -1342,12 +1378,17 @@ mod tests {
 
     #[test]
     fn event_commit_has_ordered_parents_and_stable_identity() {
-        let content =
-            commit_content(A, &[B, C], r#"{"author":"assistant","content":"hi"}"#).unwrap();
+        let content = commit_content(
+            A,
+            &[B, C],
+            1_700_000_000,
+            r#"{"author":"assistant","content":"hi"}"#,
+        )
+        .unwrap();
         assert_eq!(
             content,
             format!(
-                "tree {A}\nparent {B}\nparent {C}\nauthor caos-agent <caos@caos> 0 +0000\ncommitter caos-agent <caos@caos> 0 +0000\n\n{{\"author\":\"assistant\",\"content\":\"hi\"}}\n"
+                "tree {A}\nparent {B}\nparent {C}\nauthor caos-agent <caos@caos> 1700000000 +0000\ncommitter caos-agent <caos@caos> 1700000000 +0000\n\n{{\"author\":\"assistant\",\"content\":\"hi\"}}\n"
             )
         );
     }
