@@ -3705,6 +3705,7 @@ impl App {
             };
             self.selected_mut().publish_prompt = false;
             let name = self.selected().id.clone();
+            let title = self.selected().title.clone();
             self.selected_mut().publishing = true;
             self.selected_mut().status = "fetching the selected PR base".to_string();
             let tx = self.tx.clone();
@@ -3742,7 +3743,7 @@ impl App {
                         conversation: name.clone(),
                         outcome,
                     });
-                    publish_conversation_pr(&name, &conversation, &pr_base, &repo_dir)
+                    publish_conversation_pr(&name, &title, &conversation, &pr_base, &repo_dir)
                 })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,

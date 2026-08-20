@@ -127,11 +127,13 @@ pub(crate) fn prepare_publish_workspace(
 /// Publish the validated conversation history without checking it out.
 pub(crate) fn publish_conversation_pr(
     name: &str,
+    title: &str,
     conversation: &PreparedPublishConversation,
     pr_base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
     let branch = format!("caos/{name}");
+    let title = conversation_pr_title(title);
     prepare_publish_branch(name, conversation, cwd)?;
     push_publish_branch(&branch, cwd)?;
 
@@ -154,6 +156,7 @@ pub(crate) fn publish_conversation_pr(
         cwd,
     )?;
     if !existing_url.is_empty() {
+        capture_required("gh", &["pr", "edit", &existing_url, "--title", &title], cwd)?;
         return Ok(existing_url);
     }
     let body = format!(
@@ -163,15 +166,7 @@ pub(crate) fn publish_conversation_pr(
     capture_required(
         "gh",
         &[
-            "pr",
-            "create",
-            "--head",
-            &branch,
-            "--base",
-            pr_base,
-            "--title",
-            &format!("CAOS conversation {name}"),
-            "--body",
+            "pr", "create", "--head", &branch, "--base", pr_base, "--title", &title, "--body",
             &body,
         ],
         cwd,
@@ -391,6 +386,10 @@ fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
 }
 
+fn conversation_pr_title(title: &str) -> String {
+    format!("caos conversation: {title}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +408,14 @@ mod tests {
         capture_required("git", &["config", "user.name", "Test User"], &dir).unwrap();
         capture_required("git", &["config", "user.email", "test@example.com"], &dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn published_pr_title_uses_the_conversation_title() {
+        assert_eq!(
+            conversation_pr_title("Simplify README wording"),
+            "caos conversation: Simplify README wording"
+        );
     }
 
     fn commit_file(dir: &Path, content: &str, message: &str) -> String {
