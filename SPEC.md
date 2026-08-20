@@ -116,8 +116,11 @@ caller-propagation gap: eval-path used to mark a `/std/<name>` `:@=` target, and
 that was the only `:@=` marking there was. Closing it properly covers all of
 `:@=` and needs no `/std` special case at all.
 
-What remains is not about the eval path: the agent harness carries no store,
-and `value:@=` is UTF-8 only. See "Remaining work".
+The agent harness carries the same store: conversation preparation resolves
+`llm-step` with it, the admitted request includes the resulting isolation
+identity, and foreground or recovery dispatches send the store out of band.
+Both conversation LLM workers read `anthropic-api-key` from `/secret`, never
+from a curried arg. `value:@=` remains UTF-8 only; see "Remaining work".
 
 ## Problem
 
@@ -182,18 +185,6 @@ Server behavior:
 Note that this means that the server sees all secrets. We can revisit if this becomes a problem
 
 ## Remaining work
-
-- **The agent harness carries no store.** `caos talk`/`chat` (`chat.rs`'s
-  `turn` and `generate_conversation_title`) pass an empty store and an empty
-  header, so an agent turn — and every tool it invokes as a sub-run — is granted
-  nothing. This is where the note's own motivating example lives (an agent
-  reaching for github-push), so it is a hole, not a boundary. It was never
-  decided: the `&[]` is what the parameter-threading left behind. Filling it is
-  one call (`build_secret_store` before `prepare_request`, its header on
-  `request_compute`), but it is a **policy** choice first: a store-carrying turn
-  is per-user keyed via `secret-hash`, so every chat that matches a reader stops
-  sharing cache with other users. Worth deciding explicitly rather than by
-  default.
 
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
 

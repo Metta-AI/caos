@@ -1,6 +1,7 @@
 //! A stateless, tool-free LLM call for small auxiliary jobs.
 //!
-//! Curried configuration: `api-key`, and optionally `base-url`. Call inputs:
+//! The API key is injected as the `anthropic-api-key` secret. Optional curried
+//! configuration: `base-url`. Call inputs:
 //! `system`, a JSON `messages` array, and optionally `model` and `max-tokens`.
 //! The result is the response's text blocks as a plain blob. This worker owns
 //! no conversation commits, tools, status refs, or presentation-specific
@@ -10,14 +11,14 @@ use std::fs;
 
 use llm_client::{post_messages, DEFAULT_BASE_URL, DEFAULT_MODEL};
 use serde_json::{json, Value};
-use worker_common::{caos, path, read_arg, read_arg_opt, run_worker, scratch};
+use worker_common::{caos, path, read_arg, read_arg_opt, run_worker, scratch, secret};
 
 fn main() -> std::process::ExitCode {
     run_worker("llm-call", run)
 }
 
 fn run() -> Result<(), String> {
-    let api_key = read_arg("api-key")?;
+    let api_key = secret("anthropic-api-key")?;
     let base_url = read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let model = read_arg_opt("model")?.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let system = read_arg("system")?;
