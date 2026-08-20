@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-#@doc Build the test stack image from the tree and run the whole test suite —
-#@doc the unit tests and every tests/<name> integration suite — as cached
-#@doc jobs: an unchanged test never re-runs. Returns the report: a line per
-#@doc test with its time and the hash of its record, the last few lines of
-#@doc every failing test, and a pass/fail banner. Pass a record's hash to
-#@doc `test-result` for that test's full output or its inner-stack logs.
-#@doc Nothing is handed in from the host: the stack under test is compiled
-#@doc from these sources, inside workers
-#@arg [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys the tests and nothing else.
+# The `test` tool's worker. Its DOCS — the description and `@param` tags an
+# agent registers it by — live in the sibling `.caos-expr` here-string, not in
+# this header (SPEC, "Tools"): a doc edit then re-keys the tool's arg tree
+# without re-running a single test.
 #
 # THE test suite, as a caos worker (design/test-stack-image.md). Its interface
 # is a TOOL's interface: the workspace tree as --in, and optionally an API key
@@ -16,16 +11,21 @@
 # full-suite cache hit means literally nothing changed; salt to force. The
 # result is {report, results/<test>/...}.
 #
-# FIVE STAGES, one script, selected by a curried --stage (the
-# caos-tools/build.sh pattern). Each stage exists because the thing it needs is
+# SIX STAGES, one script, selected by a curried --stage (the
+# caos-tools/build pattern). Each stage exists because the thing it needs is
 # only knowable once the previous run finished — a worker delegates its
 # continuation rather than blocking on a run (design/map-then.md).
 #
-#   suite      (default) run-then THE BUILD TOOL (caos-tools/build.sh — the
-#              same job an agent's `build` call fires, sharing its cache),
-#              whose result is the TEST STACK IMAGE
+#   suite      (default) ask the SERVER to evaluate `caos-tools/build` — a
+#              worker may not block on the runs an evaluation dispatches, so it
+#              tail-calls `eval-path-then` (design/map-then.md)
+#   suite-run  the `then` of that: --result is the build tool's ArgTree, the
+#              SAME one an agent's `build` call and `run-tool build` form, so
+#              this run shares their cache entry. run-then it; its result is
+#              the TEST STACK IMAGE
 #   deepener   resolve the deep-deps image by running its sentinel (a worker
-#              cannot eval a `.caos-expr`)
+#              cannot evaluate in-process; it asks the server, or — here —
+#              runs a sentinel whose key it already knows)
 #   deepen     run it over the WORKSPACE, whose root `.caos-expr` is exactly
 #              this transform — every test's DEPS resolve in the real tree
 #   fanout     the `then` of that: --result is the deepened tree, so the
@@ -54,23 +54,17 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 case "$stage" in
 
 suite)
-  caos get /cas/args/in
-  caos get /cas/args/in/caos-tools
-
-  # The pruned tree — just what cargo reads — feeds the wrapper tests
-  # (cargo-self, unit), whose jobs must not re-key on non-Rust edits.
-  mkdir /tmp/build-ws
-  for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
-    if [ -e "/cas/args/in/$e" ]; then ln -s "/cas/args/in/$e" "/tmp/build-ws/$e"; fi
-  done
-  caos put /tmp/build-ws /cas/build-ws
-
-  build=$(caos curry --base:@=/cas/args/base \
-    "--worker1:@=/cas/args/in/caos-tools/build.sh") || fail "currying the build tool"
-
-  # `deepener` reads the workspace as /cas/args/in: run-then hands its `then` the
-  # same --in it ran over, so the tree needs no second binding.
-  fwd=("--worker1:@=/cas/args/worker1" --stage=deepener "--build-ws:@=/cas/build-ws")
+  # The build tool is a DIRECTORY with a `.caos-expr` (SPEC, "Tools"), so
+  # reaching it means EVALUATING it — which dispatches runs and blocks on them,
+  # and a worker may not block. So this stage's whole body is the tail call that
+  # asks the server to do it (design/caos-expr.md, "Who runs the walk").
+  #
+  # Hand-currying `--base:@=/cas/args/base --worker1:@=…/build/worker.sh` instead
+  # would run the same SCRIPT under a DIFFERENT ArgTree — the tool's own carries
+  # its `help` — so the suite would build the stack a second time under a key no
+  # agent call ever hits. The point of asking for the expression is that both
+  # callers land on one cache entry.
+  fwd=("--worker1:@=/cas/args/worker1" --stage=suite-run)
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   # --test-salt: re-run the TESTS without re-running anything else. CAOS_SALT
@@ -82,6 +76,33 @@ suite)
   # It exists because the alternative people reach for is editing a tracked file
   # to bust the key — which is how `# rekey <timestamp>` once ended up committed
   # to tests/lib/run-test.sh.
+  if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
+
+  next=$(caos curry --base:@=/cas/args/base "${fwd[@]}") || fail "currying the suite-run stage"
+  caos eval-path-then /cas/args/in --eval=caos-tools/build --then:hash="$next"
+  ;;
+
+suite-run)
+  # --result is the build tool's ARG TREE, straight from its `.caos-expr`.
+  # `caos hash` reads the recorded hash without fetching the tree: an ArgTree is
+  # a name here, not something to materialize.
+  build=$(caos hash /cas/args/result) || fail "reading the build tool's arg tree"
+
+  caos get /cas/args/in
+
+  # The pruned tree — just what cargo reads — feeds the wrapper tests
+  # (cargo-self, unit), whose jobs must not re-key on non-Rust edits.
+  mkdir /tmp/build-ws
+  for e in Cargo.toml Cargo.lock rust-toolchain.toml crates; do
+    if [ -e "/cas/args/in/$e" ]; then ln -s "/cas/args/in/$e" "/tmp/build-ws/$e"; fi
+  done
+  caos put /tmp/build-ws /cas/build-ws
+
+  # `deepener` reads the workspace as /cas/args/in: run-then hands its `then` the
+  # same --in it ran over, so the tree needs no second binding.
+  fwd=("--worker1:@=/cas/args/worker1" --stage=deepener "--build-ws:@=/cas/build-ws")
+  if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
+  if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
 
   deepener=$(caos curry --base:@=/cas/args/base "${fwd[@]}") || fail "currying the deepener stage"
@@ -127,11 +148,15 @@ deepener)
   # Two things stand in the way of just naming the entry as an image, and both
   # are load-bearing rules rather than accidents:
   #
-  #   - A WORKER CANNOT EVALUATE. `resolve_cas_image` reads a /cas path as the
-  #     object it was made from, so the sentinel entry arrives as its own
-  #     one-file tree ("image tree has no config.json"). Evaluation is a CLIENT
-  #     capability, and it must stay one: `eval_path` on a `run` BLOCKS on the
-  #     result, which is exactly what a worker may not do (design/map-then.md).
+  #   - A WORKER CANNOT EVALUATE IN-PROCESS. `resolve_cas_image` reads a /cas
+  #     path as the object it was made from, so the sentinel entry arrives as
+  #     its own one-file tree ("image tree has no config.json"), and evaluating
+  #     it here would BLOCK on a run — which a worker may not do
+  #     (design/map-then.md). It CAN ask the server to evaluate, and the `suite`
+  #     stage above does exactly that (`eval-path-then`); that costs a
+  #     continuation hop, which is worth it there — the build tool's ArgTree is
+  #     an answer only evaluation has — and not here, where the answer is one
+  #     sentinel run whose key this stage already knows.
   #   - THE WORLD MUST MATCH. The build's own seed record holds a ready-made
   #     deep-deps image, but it is built from the TREE UNDER TEST — a `test`
   #     world binary, which the outer `host` server refuses to serve (measured:
@@ -150,7 +175,7 @@ deepener)
   caos get /cas/args/in/std
   caos get /cas/args/in/std/deep-deps
 
-  # MINUS THE `.caos-expr` — the same strip as caos-tools/build.sh, for the same
+  # MINUS THE `.caos-expr` — the same strip as caos-tools/build/worker.sh, for the same
   # reason. An expression is evaluated against its directory WITHOUT the
   # directive (crates/caos/src/eval.rs `strip_caos_expr`), so the `in` the
   # expression forms — and the one build-builtins.sh records as the seed key —

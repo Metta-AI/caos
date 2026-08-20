@@ -1,0 +1,13 @@
+# caos-eval — the `.caos-expr` walk, factored behind an `EvalHost` trait so it
+# runs identically on the CLIENT (crates/caos, blocking at top level) and on the
+# SERVER (crates/server, blocking a request thread to resolve an `eval`
+# continuation). One walk, two backends, no divergence — the byte-identity the
+# seeded-key design rests on (design/caos-expr.md, design/map-then.md).
+[package]
+name = "caos-eval"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Read/write git objects; same pure-Rust, static-musl config as the rest.
+gix = { version = "0.84", default-features = false, features = ["sha1"] }

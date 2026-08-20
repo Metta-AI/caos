@@ -2096,6 +2096,67 @@ fn parse_generated_title(text: &str) -> Result<String, String> {
     validate_conversation_title(&title).map(str::to_string)
 }
 
+/// The DESCRIPTION a tool's `.caos-expr` binds as `--help`: the free text
+/// before the first `@` block tag of the here-string the value line names.
+///
+/// Read from the expression's text, not from evaluating it — the same rule
+/// llm-step's `expr_help`/`parse_help` follow, and for the same reason: this
+/// listing is a lightweight preview, and evaluating a tool would build it. The
+/// harness needs the full parameter schema; a client listing needs only this
+/// line.
+fn tool_help_description(expr: &str) -> String {
+    let lines: Vec<&str> = expr.lines().collect();
+    let mut here: Vec<(String, String)> = Vec::new();
+    let mut commands: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        i += 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, term)) = line.split_once("=<<") {
+            if !term.is_empty() && !term.contains(char::is_whitespace) {
+                let mut body: Vec<&str> = Vec::new();
+                while i < lines.len() && lines[i].trim() != term {
+                    body.push(lines[i].trim());
+                    i += 1;
+                }
+                i += 1;
+                // Keep the body's LINES: the description ends at the first
+                // line that opens a block tag, exactly as llm-step's
+                // `parse_help` reads it.
+                here.push((name.to_string(), body.join("\n")));
+                continue;
+            }
+        }
+        commands.push(lines[i - 1]);
+    }
+    let help = commands.iter().find_map(|line| {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix("--help="))
+    });
+    let text = match help {
+        Some(value) => match value.strip_prefix('$') {
+            Some(var) => here
+                .iter()
+                .find(|(name, _)| name == var)
+                .map(|(_, body)| body.clone())
+                .unwrap_or_default(),
+            None => value.to_string(),
+        },
+        None => String::new(),
+    };
+    // Everything before the first block tag is the description.
+    text.lines()
+        .take_while(|line| !line.trim_start().starts_with('@'))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
 pub fn describe_tool_set(
     t: &GitTransport,
     id: &str,
@@ -2116,28 +2177,28 @@ pub fn describe_tool_set(
     };
     let mut tools = Vec::new();
     for line in listing.lines() {
-        let Some((metadata, filename)) = line.split_once('\t') else {
+        // A tool is a DIRECTORY carrying a `.caos-expr` (SPEC, "Tools"), so the
+        // listing entry to follow is a tree; the help comes from the expression
+        // inside it.
+        let Some((metadata, name)) = line.split_once('\t') else {
             continue;
         };
-        let Some(name) = filename.strip_suffix(".sh") else {
+        let mut fields = metadata.split_whitespace();
+        let (Some(_mode), Some(kind), Some(hash)) = (fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
-        if ["bash", "grep", "read", "ls", "write", "edit"].contains(&name) {
+        if kind != "tree" || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name) {
             continue;
         }
-        let Some(hash) = metadata.split_whitespace().nth(2) else {
-            continue;
+        let Ok(expr) = t.git_capture(&["show", &format!("{hash}:.caos-expr")], None) else {
+            continue; // a directory that is not a tool
         };
-        let script = t.git_capture(&["show", hash], None)?;
-        let docs = script
-            .lines()
-            .filter_map(|line| line.strip_prefix("#@doc").map(str::trim))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let docs = tool_help_description(&expr);
         tools.push(ToolDescription {
             name: name.to_string(),
             docs: if docs.is_empty() {
-                format!("Project tool caos-tools/{filename}")
+                format!("Project tool caos-tools/{name} (no description).")
             } else {
                 docs
             },

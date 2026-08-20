@@ -23,8 +23,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
-    arg, caos, caos_curry, caos_recurry, cas_hash, forward, link, own_args_tree, path, read_arg,
-    read_arg_opt, read_commit, run_then_catching, run_worker, scratch, write_commit_as, Arg,
+    arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, forward, link,
+    own_args_tree, path, read_arg, read_arg_opt, read_commit, run_then_catching, run_worker,
+    scratch, write_commit_as, Arg,
 };
 
 const AGENT_AUTHOR: &str = "caos-agent";
@@ -53,9 +54,9 @@ struct Config {
     /// The rgrep fold worker's image; the `grep` tool is registered only when
     /// present (older curries without it keep working).
     grep_image: Option<String>,
-    /// The script-worker image (std/bash) TREE TOOLS run on: the workspace's
-    /// caos-tools/*.sh, discovered per round and resolved at invocation time
-    /// (design/cargo-workers.md). Registered only when present.
+    /// The script-worker image (std/bash) the BUILT-IN HISTORY TOOLS run on
+    /// (log/show/diff). A tree tool names its own image in its `.caos-expr`
+    /// (SPEC, "Tools"), so it needs nothing from here. Registered when present.
     tools_image: Option<String>,
     /// The git-bearing merge worker (std/merge). The `merge` tool is registered
     /// only when present.
@@ -241,6 +242,25 @@ fn callback(cfg: &Config) -> Result<(), String> {
         );
     }
 
+    // STAGE TWO of a tree-tool call: this `--result` is not a tool's answer but
+    // the tool's ARG TREE, from evaluating its `.caos-expr` (see
+    // `launch_tree_tool`). Curry the model's args onto it and run it; the tool's
+    // real result comes back to the arm below on the next hop. The failure case
+    // is already handled above — a broken expression reaches the model as an
+    // is_error tool_result like any other tool failure.
+    if let Some(tool) = read_arg_opt("tool-eval")? {
+        return launch_evaluated_tool(
+            cfg,
+            &tool,
+            &arg("ws"),
+            &arg("wc"),
+            &run,
+            round,
+            &base_head,
+            &current_id,
+        );
+    }
+
     match current_tool.as_str() {
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -275,7 +295,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
                 Some(&cas_hash(&m)?),
             )?;
         }
-        // A tree tool's result (caos-tools/<name>.sh) is a VALUE — a report,
+        // A tree tool's result (caos-tools/<name>/) is a VALUE — a report,
         // a bin tree, diagnostics — never a workspace: the pre-run workspace
         // and its commit rode our curry, exactly like grep.
         name if name != "bash" => {
@@ -432,7 +452,7 @@ fn drive(
             }
         }
         // A built-in history tool (log/show/diff)? Like a tree tool, but the
-        // script ships with the harness and it always gets the `#@git` context.
+        // script ships with the harness and it always gets the `@git` context.
         if githist::is_builtin(name) && cfg.tools_image.is_some() {
             let tool = githist::tool(name).expect("is_builtin implies tool");
             match tools::tree_tool_args(&call, &tool) {
@@ -452,10 +472,10 @@ fn drive(
             }
         }
         // A tree tool? Resolved in the CURRENT workspace at invocation time,
-        // so a call made right after an edit runs the edited script.
-        if !tools::is_inline(name) && cfg.tools_image.is_some() {
-            if let Some((script, tool)) = tools::tree_tool_script(&ws, name)? {
-                // Bind the declared `#@arg`s before launching: a bad call is
+        // so a call made right after an edit runs the edited tool.
+        if !tools::is_inline(name) {
+            if let Some(tool) = tools::tree_tool(&ws, name)? {
+                // Bind the declared `@param`s before launching: a bad call is
                 // an is_error result and the queue continues, exactly as a
                 // bad grep is — only a valid one exits into the sub-run.
                 match tools::tree_tool_args(&call, &tool) {
@@ -477,8 +497,7 @@ fn drive(
                     }
                     Ok(bound) => {
                         return launch_tree_tool(
-                            cfg, &call, name, &script, &bound, tool.git, &ws, &wc, run, round,
-                            &base_head,
+                            &call, name, &bound, tool.git, &ws, &wc, run, round, &base_head,
                         )
                     }
                 }
@@ -488,7 +507,7 @@ fn drive(
             return Err(format!(
                 "model called unknown tool {name:?} (built-ins: bash, grep, read, \
                  ls, write, edit, merge, spawn_agent; plus this \
-                 workspace's caos-tools/*.sh)"
+                 workspace's caos-tools/<name>/ tools)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -835,24 +854,28 @@ fn launch_grep(
     run_then_catching(scope, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
-/// Launch a tree tool (`caos-tools/<name>.sh`, already resolved in the current
-/// workspace) as a run-then sub-run: the input is the workspace tree and the
-/// SCRIPT BLOB rides curried on the script-worker image, so the run caches
-/// on exactly (workspace tree, script content, the bound `#@arg`s) — and an
-/// edited tool is a new key automatically. The result is a value, not a
-/// workspace — the current `ws` rides the continuation, unchanged by the run.
+/// Launch a tree tool (`caos-tools/<name>/`, already resolved in the current
+/// workspace) — STAGE ONE of two, because a tool is now a directory carrying a
+/// `.caos-expr` and reaching it means EVALUATING that expression.
 ///
-/// A `#@git` tool additionally gets the workspace commit (`wc`, a gitlink it
-/// reads as the raw commit object — history's entry point via `caos get-hash`)
-/// and the turn's ref snapshot (`refs`, the same `name <hash>` lines the merge
-/// tool resolves `--theirs` against). Only `#@git` tools get them: `wc` moves
-/// every step, so binding it into build/test would sink their caches.
+/// Evaluating dispatches the runs the expression names (a compiled tool builds)
+/// and blocks on them, which a worker may not do. So this stage's whole body is
+/// the tail call that asks the server: `eval-path-then` over the workspace with
+/// `caos-tools/<name>` as the path, and ourselves as the `then`
+/// (design/caos-expr.md, "Who runs the walk"). [`launch_evaluated_tool`] is the
+/// other side, where `--result` is the tool's ArgTree.
+///
+/// `--catch`: an expression that fails to evaluate — a tool whose build is
+/// broken, most likely, since evaluating it is what builds it — comes back to
+/// the model as an `is_error` tool_result like any other tool failure, rather
+/// than taking the turn down.
+///
+/// The model's args ride across as `tool-args` (a JSON object of the bound
+/// `@param`s) because the curry cannot happen until the ArgTree exists.
 #[allow(clippy::too_many_arguments)]
 fn launch_tree_tool(
-    cfg: &Config,
     call: &Value,
     name: &str,
-    script: &str,
     bound: &[(String, String)],
     git: bool,
     ws: &str,
@@ -864,17 +887,76 @@ fn launch_tree_tool(
     let id = call["id"]
         .as_str()
         .ok_or("tool_use block has no string id")?;
-    let image = cfg
-        .tools_image
-        .as_ref()
-        .ok_or("launch_tree_tool without a tools_image (drive guards this)")?;
+    let args: serde_json::Map<String, Value> = bound
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    let args = Value::Object(args).to_string();
+    let me = self_curry(
+        wc,
+        run,
+        round,
+        base_head,
+        id,
+        &[
+            ("current-tool", Arg::Lit(name)),
+            ("ws", Arg::Path(ws)),
+            // The marker that tells the callback this `--result` is an ArgTree
+            // to run, not a tool's answer to render.
+            ("tool-eval", Arg::Lit(name)),
+            ("tool-args", Arg::Lit(&args)),
+            ("tool-git", Arg::Lit(if git { "1" } else { "" })),
+        ],
+    )?;
+    eval_then_catching(ws, &format!("caos-tools/{name}"), Arg::Hash(&me))
+}
+
+/// STAGE TWO of a tree-tool call: `--result` is the tool's ArgTree, straight
+/// from its `.caos-expr` — its worker image, its script and its `help`. Curry
+/// the model's args onto it and run it over the workspace.
+///
+/// **This is the same ArgTree `caos-cli run-tool <name>` builds** (SPEC,
+/// "Tools": two callers, one contract), so an agent's call and a hand-run share
+/// one cache entry. `--in` is not curried here: `run-then` passes the input it
+/// ran over, which is the workspace.
+///
+/// A `@git` tool additionally gets the workspace commit (`wc`, a gitlink it
+/// reads as the raw commit object — history's entry point via `caos get-hash`)
+/// and the turn's ref snapshot (`refs`, the same `name <hash>` lines the merge
+/// tool resolves `--theirs` against). Only `@git` tools get them: `wc` moves
+/// every step, so binding it into build/test would sink their caches.
+fn launch_evaluated_tool(
+    cfg: &Config,
+    name: &str,
+    ws: &str,
+    wc: &str,
+    run: &str,
+    round: u64,
+    base_head: &str,
+    id: &str,
+) -> Result<(), String> {
+    let tool_tree = cas_hash(&arg("result"))?;
+    let raw = read_arg("tool-args")?;
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("re-reading the tool's args: {e}"))?;
+    let bound: Vec<(String, String)> = parsed
+        .as_object()
+        .ok_or("tool-args is not a JSON object")?
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+        .collect();
+    let git = read_arg_opt("tool-git")?.is_some_and(|v| v == "1");
+
     // The model's arg values bind as LITERALS, so they land at
     // /cas/args/<name> for the script to read and — being part of the args
     // tree — key the run: the same tool called with a different hash is a
     // different job, not a cache hit.
-    let mut kvs: Vec<(&str, Arg)> = vec![("worker1", Arg::Path(script))];
-    kvs.extend(bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))));
-    // History context, for `#@git` tools only. `wc` is commit-kinded, so it
+    let mut kvs: Vec<(&str, Arg)> = bound
+        .iter()
+        .map(|(k, v)| (k.as_str(), Arg::Lit(v)))
+        .collect();
+
+    // History context, for `@git` tools only. `wc` is commit-kinded, so it
     // curries as a gitlink (`:commit=`) and the tool reads it as the raw commit
     // object — exactly how the merge tool receives `ours`.
     if git {
@@ -883,7 +965,7 @@ fn launch_tree_tool(
             kvs.push(("refs", Arg::Lit(refs)));
         }
     }
-    let curried = caos_curry(Arg::Hash(image), &kvs)?;
+    let curried = caos_curry(Arg::Hash(&tool_tree), &kvs)?;
     let me = self_curry(
         wc,
         run,
@@ -896,10 +978,15 @@ fn launch_tree_tool(
 }
 
 /// Launch a built-in history tool (`log`/`show`/`diff`): assemble its embedded
-/// script (`githist::script`), `caos put` it into CAS, and hand it to
-/// [`launch_tree_tool`] with `git = true`. So it runs on the tree-tool image
-/// with the `#@git` context and its result is rendered by the same callback
-/// arm — the only difference from a project tool is where the script comes from.
+/// script (`githist::script`), `caos put` it into CAS, and curry it onto the
+/// tools image with the `@git` context. Its result is rendered by the same
+/// callback arm a project tool's is.
+///
+/// It does NOT go through [`launch_tree_tool`], and the difference is real: a
+/// project tool is a directory in the workspace whose `.caos-expr` says what it
+/// runs on, so reaching it means evaluating. This script ships with the harness
+/// and has no expression — the image is `tools_image`, handed in as config —
+/// so there is nothing to evaluate and no reason to spend a continuation.
 #[allow(clippy::too_many_arguments)]
 fn launch_githist(
     cfg: &Config,
@@ -912,15 +999,39 @@ fn launch_githist(
     round: u64,
     base_head: &str,
 ) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let image = cfg
+        .tools_image
+        .as_ref()
+        .ok_or("launch_githist without a tools_image (drive guards this)")?;
     let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
     let dir = scratch(&format!("githist-{name}"))?;
     let file = dir.join("worker.sh");
     fs::write(&file, body).map_err(|e| format!("writing {name} script: {e}"))?;
     let script = fresh("githist-script");
     caos(["put", path(&file), &script])?;
-    launch_tree_tool(
-        cfg, call, name, &script, bound, true, ws, wc, run, round, base_head,
-    )
+
+    let mut kvs: Vec<(&str, Arg)> = vec![("worker1", Arg::Path(&script))];
+    kvs.extend(bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))));
+    // History context: `wc` is commit-kinded, so it curries as a gitlink
+    // (`:commit=`) and the tool reads it as the raw commit object — exactly how
+    // the merge tool receives `ours`.
+    kvs.push(("wc", Arg::Path(wc)));
+    if let Some(refs) = cfg.merge_refs.as_deref() {
+        kvs.push(("refs", Arg::Lit(refs)));
+    }
+    let curried = caos_curry(Arg::Hash(image), &kvs)?;
+    let me = self_curry(
+        wc,
+        run,
+        round,
+        base_head,
+        id,
+        &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
+    )?;
+    run_then_catching(ws, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
 /// Rebuild ourselves as the callback for one compute tool. We carry our WHOLE current ArgTree
@@ -960,6 +1071,12 @@ fn self_curry(
         "current-tool",
         "ws",
         "scope",
+        // The two-stage tree-tool call: `tool-eval` marks the eval callback,
+        // `tool-args`/`tool-git` carry what stage two needs to curry. Unbound
+        // each hop like the rest, so stage two does not leak into the next call.
+        "tool-eval",
+        "tool-args",
+        "tool-git",
         "in",
         "result",
         // run-then's other call arg: bound instead of `result` when `--catch`
@@ -1981,15 +2098,17 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     if cfg.merge_image.is_some() {
         tools.push(merge_tool());
     }
-    // Tree tools: whatever caos-tools/*.sh the CURRENT workspace carries —
-    // re-discovered every round, so the set tracks the agent's own edits.
+    // The built-in history tools (log/show/diff) ship with the harness and run
+    // on the handed-in tools image, so they keep its gate.
     if cfg.tools_image.is_some() {
-        // The built-in history tools (log/show/diff) run on the same std/bash
-        // image as tree tools, so they share its gate.
         tools.extend(githist::declarations());
-        for tool in tools::tree_tools(ws)? {
-            tools.push(tools::tree_tool_declaration(&tool));
-        }
+    }
+    // Tree tools: whatever `caos-tools/<name>/` directories the CURRENT
+    // workspace carries — re-discovered every round, so the set tracks the
+    // agent's own edits. No gate: a tool's `.caos-expr` names the image it runs
+    // on, so the harness needs no image of its own to offer one.
+    for tool in tools::tree_tools(ws)? {
+        tools.push(tools::tree_tool_declaration(&tool));
     }
     Ok(tools)
 }

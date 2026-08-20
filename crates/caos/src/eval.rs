@@ -1,72 +1,45 @@
-//! `.caos-expr`: evaluable trees (design/caos-expr.md).
+//! `.caos-expr` evaluation, client side (design/caos-expr.md).
 //!
 //! A `.caos-expr` file makes the directory it sits in *evaluable*: instead of
 //! being taken verbatim, the directory's contents are computed by running the
-//! expression the file holds. `caos-cli eval-path <path>` walks a tree from the
-//! root down to `<path>`, and wherever a `.caos-expr` sits along the way it
-//! evaluates that expression — with the directory's own subtree as the input —
-//! and continues descending into the *result*. The final object at `<path>` is
-//! returned. Evaluation reuses the ordinary ArgTree/curry/run pipeline, so a
-//! `run` expression caches exactly like a hand-written `caos-cli run`.
+//! expression the file holds. The WALK itself lives in the shared `caos-eval`
+//! crate, generic over a `caos_eval::EvalHost` so it runs identically here
+//! (blocking at top level — a client holds no worker slot) and in the server
+//! (blocking a request thread to resolve an `eval` continuation). One walk, two
+//! backends: that is what makes a worker's server-side `eval-path-then` return
+//! the byte-identical object a client `eval-path` would build.
 //!
-//! ## Grammar
+//! This module is the CLIENT backend — [`ClientEvalHost`], which dispatches a
+//! `run` through `request_compute`, marks curries with the caller's secret store
+//! (design/secrets.md), and fetches `:@@=` locators — plus the CLI and
+//! resolution entry points that used to hold the walk.
 //!
-//! One `.caos-expr` is a sequence of lines. Blank lines and `#` comments are
-//! ignored. Any line but the last may bind a variable; the last line is the
-//! file's *value*:
+//! **`:@@=` is client-only, and not because of a sandbox.** A locator carries a
+//! mandatory commit sha, so it is perfectly deterministic; the point is that the
+//! ArgTree IS the cache key, so a locator must become an oid *before* the
+//! request is formed — otherwise the URL sits inside the key and two consumers
+//! pinning the same rev through different URLs (a fork, a mirror, ssh vs https)
+//! key identical content differently. `caos_eval::EvalHost::resolve_remote`
+//! therefore refuses by default, and only this host overrides it.
 //!
-//! ```text
-//! NAME=run   --base:<type>=<image> [--k=v | --k:@=path]
-//! NAME=curry --base:<type>=<image> [--k=v | --k:@=path]
-//! curry --base:@=path --worker1:@=path    # the value (a run/curry, or a bare $NAME)
-//! ```
-//!
-//! Variable names are `[A-Z][A-Z0-9_]*`; the verbs (`run`, `curry`) are
-//! lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`.
-//! A `run` value evaluates to the run's result; a `curry` value to the curried
-//! ArgTree. `$NAME` is the object a prior line produced.
-//!
-//! One variable is pre-bound and reserved: **`$CAOS_EXPR` is this file's own
-//! blob**. Stripping (below) removes the directive from the tree the expression
-//! sees, so this is the only way to hand a worker the text that launched it —
-//! which a worker that VERIFIES its caller's expression needs. Passing it opts
-//! that expression's own bytes into the cache key.
-//!
-//! There is no positional image and no `--`: the worker to run (or curry onto)
-//! is the reserved `--base` arg, typed like any other (`:@=` a path, `:docker=`
-//! a registry ref, `:hash=` an object in the store, or `=$NAME`). Every other
-//! `--k` is an ordinary arg.
-//!
-//! ## Argument resolution
-//!
-//! Paths in args are relative to the directory containing the `.caos-expr`
-//! (i.e. resolved against the input subtree), NOT the host or `/cas`:
-//! - `--k=value` — a literal blob, unless `value` is exactly `$NAME`, which
-//!   binds the object that variable holds (by reference, at its own kind).
-//! - `--k:@=path` — the object at `path` within the input subtree.
-//! - `--k:@@=<git ref>` — a tree from ANOTHER repo, pinned by commit sha and
-//!   fetched by the client at eval time; only the resulting oid enters the arg
-//!   tree, so the URL is never part of a cache key (design/flake-inputs.md).
-//! - `--k:docker=ref` — the blob `docker://ref`; `--k:hash=oid` — an object the
-//!   store already holds, by oid.
-//!
-//! A `:@=` or `:@@=` target that carries a `.caos-expr` is itself an EXPRESSION
-//! and is evaluated; one that does not is DATA, referenced raw. Where the tree
-//! came from makes no difference to what naming it means.
+//! The grammar, the here-string form, the `$CAOS_EXPR` binding and the
+//! worker-vs-data rule are documented on `caos_eval` itself.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use gix::objs::tree::{Entry, EntryKind, EntryMode};
+use caos_eval::MemoKind;
+use gix::objs::tree::Entry;
 
 use super::{
-    assemble_arg_tree, build_secret_store, curry_from_entries, entry_name, fetch_tree_entries,
-    is_hex_hash, mark_arg_tree, parse_oid, post_object, post_tree, request_compute,
-    secret_store_header, ClientSecret, Transport, DOCKER_SCHEME,
+    assemble_arg_tree, build_secret_store, fetch_tree_entries, mark_arg_tree, post_object,
+    post_tree, request_compute, resolve_remote_arg, secret_store_header, store_key, ClientSecret,
+    Transport,
 };
 
-/// The reserved variable naming a `.caos-expr`'s OWN blob (see [`eval_expr`]).
-pub(crate) const EXPR_VAR: &str = "CAOS_EXPR";
+/// The shared walk's kind/mode helper, re-exported so the rest of the client
+/// keeps naming it through `eval::` — the same function the server uses.
+pub(crate) use caos_eval::mode_of_kind;
 
 /// A process-wide memo whose keys are CONTENT.
 ///
@@ -112,11 +85,99 @@ impl<V: Clone> Memo<V> {
     }
 }
 
-/// [`eval_path`]'s memo: `<store>\0<tree>\0<path>` → `(kind, oid)`.
-static EVAL_MEMO: Memo<(String, String)> = Memo::new();
+/// The walk's memos, one per [`MemoKind`], scoped by the caller's secret store:
+/// `<store>\0<content key>` → `(kind, oid)`.
+///
+/// The SCOPE is this host's contribution and the reason the memo lives here
+/// rather than in `caos-eval`: a store's readers change what a `curry`
+/// evaluates to (`mark_curry`), and the client is the only host that has one.
+/// `CAOS_SALT` is not in the key because [`crate::run_salt`] reads the
+/// environment, which is fixed for the process — two different salts never meet
+/// in one memo. The server keeps no memo here at all: its salt and stack vary
+/// per request, so it opts out (the trait default) until it has a key that says
+/// so.
+static NODE_MEMO: Memo<(String, String)> = Memo::new();
+static PATH_MEMO: Memo<(String, String)> = Memo::new();
 
-/// [`eval_node`]'s memo: `<store>\0<tree>` → `(kind, oid)`.
-static EVAL_NODE_MEMO: Memo<(String, String)> = Memo::new();
+fn memo_for(kind: MemoKind) -> &'static Memo<(String, String)> {
+    match kind {
+        MemoKind::Node => &NODE_MEMO,
+        MemoKind::Path => &PATH_MEMO,
+    }
+}
+
+/// The CLIENT `caos_eval::EvalHost`: CAS over a `Transport`, a `run` dispatched
+/// by `request_compute` (blocking, at top level), curries marked with the
+/// caller's secret store (a no-op without secrets, so the common path is
+/// byte-identical to the server's), and `:@@=` locators fetched — the one
+/// capability no other host has.
+struct ClientEvalHost<'a> {
+    t: &'a dyn Transport,
+    store: &'a [ClientSecret],
+}
+
+impl caos_eval::EvalHost for ClientEvalHost<'_> {
+    fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
+        self.t.get_object(oid)
+    }
+    fn post_object(&self, kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
+        post_object(self.t, kind, bytes)
+    }
+    fn fetch_tree_entries(&self, tree: &str) -> Result<Option<Vec<Entry>>, String> {
+        fetch_tree_entries(self.t, tree)
+    }
+    fn post_tree(&self, entries: Vec<Entry>) -> Result<gix::ObjectId, String> {
+        post_tree(self.t, entries)
+    }
+    fn dispatch(&self, image: &str, entries: Vec<Entry>) -> Result<(String, String), String> {
+        // A `run` marks via `assemble_arg_tree` and must carry the store to the
+        // server (to inject and pass the double-check), exactly like `caos-cli
+        // run`.
+        let arg_tree = assemble_arg_tree(self.t, image, entries, self.store)?;
+        let server = self.t.server_url()?;
+        request_compute(&server, &arg_tree, &secret_store_header(self.store))
+    }
+    fn mark_curry(&self, oid: &str) -> Result<String, String> {
+        mark_arg_tree(self.t, self.store, oid)
+    }
+    fn resolve_remote(
+        &self,
+        value: &str,
+    ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+        // `dir=` descends through EVALUATION (see `resolve_remote_arg`), so a
+        // pinned consumer reaches `dir=std/<x>` exactly as caos reaches its own
+        // entries. It carries its own memo, on the locator.
+        resolve_remote_arg(self.t, value, self.store)
+    }
+    fn memo_get(&self, kind: MemoKind, key: &str) -> Option<(String, String)> {
+        memo_for(kind).get(&self.memo_key(key))
+    }
+    fn memo_put(&self, kind: MemoKind, key: &str, value: &(String, String)) {
+        memo_for(kind).put(self.memo_key(key), value.clone());
+    }
+}
+
+impl ClientEvalHost<'_> {
+    /// The walk's content key, scoped by the caller's store — see [`NODE_MEMO`].
+    fn memo_key(&self, key: &str) -> String {
+        format!("{}\0{key}", store_key(self.store))
+    }
+}
+
+/// Walk `start_tree` from its root down to `path`, evaluating every `.caos-expr`
+/// encountered (each in the tree its parent produced) and returning the final
+/// object's `(kind, oid)` — the client entry to `caos_eval::eval_path`. `store`
+/// is the caller's secret store, threaded into the host for `run` dispatch and
+/// curry marking.
+pub(crate) fn eval_path(
+    t: &dyn Transport,
+    start_tree: &str,
+    path: &str,
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
+    let host = ClientEvalHost { t, store };
+    caos_eval::eval_path(&host, start_tree, path)
+}
 
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
 /// tree and descend to `DEEP-DEPS/<name>`.
@@ -181,583 +242,11 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
     // The caller's secret store, resolved once — so eval-path marks the `curry`
     // arg trees it returns, giving their callers per-user isolation, and carries
     // the store to any `run` it dispatches (design/secrets.md). A `:@=` target is
-    // NOT marked; see `resolve_expr_path`.
+    // NOT marked; see `caos_eval`'s `resolve_expr_path`.
     let store = build_secret_store(t)?;
     let (kind, hash) = eval_path(t, &start, path, &store)?;
     println!("{kind} {hash}");
     Ok(())
-}
-
-/// Walk `start_tree` from its root down to `path`, evaluating every `.caos-expr`
-/// encountered (each in the tree its parent produced) and returning the final
-/// object's `(kind, oid)`. `node` is the object at the prefix walked so far: a
-/// `.caos-expr` at the root of a tree node replaces the node with its result
-/// before the next segment is resolved within it.
-///
-/// **An expression is evaluated against its directory MINUS the `.caos-expr`
-/// itself** ([`strip_caos_expr`]) — the directive is not part of the input it
-/// describes. See [`resolve_expr_path`] for what that buys.
-///
-/// **Memoized per process** ([`Memo`]) — here for a repeat of the WHOLE
-/// question, and in [`eval_node`] for each transform along the way, which is
-/// where two different paths under one root share their work.
-///
-/// Sound because the key is content: `(store, start_tree, path)` where
-/// `start_tree` is an object hash. `CAOS_SALT` is not in the key because
-/// [`crate::run_salt`] reads the environment, which is fixed for the process —
-/// two different salts never meet in one memo.
-pub(crate) fn eval_path(
-    t: &dyn Transport,
-    start_tree: &str,
-    path: &str,
-    store: &[ClientSecret],
-) -> Result<(String, String), String> {
-    let key = format!("{}\0{start_tree}\0{path}", crate::store_key(store));
-    if let Some(hit) = EVAL_MEMO.get(&key) {
-        return Ok(hit);
-    }
-    let result = eval_path_uncached(t, start_tree, path, store)?;
-    EVAL_MEMO.put(key, result.clone());
-    Ok(result)
-}
-
-/// [`eval_path`]'s body — the actual walk, run once per distinct question.
-fn eval_path_uncached(
-    t: &dyn Transport,
-    start_tree: &str,
-    path: &str,
-    store: &[ClientSecret],
-) -> Result<(String, String), String> {
-    let comps: Vec<&str> = path
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    let mut node_kind = String::from("tree");
-    let mut node_oid = start_tree.to_string();
-    let mut i = 0usize;
-    loop {
-        // A `.caos-expr` at the root of this tree node transforms the node — from
-        // the node's contents WITHOUT the directive (see `strip_caos_expr`).
-        if node_kind == "tree" {
-            if let Some((k, o)) = eval_node(t, &node_oid, store)? {
-                node_kind = k;
-                node_oid = o;
-            }
-        }
-        if i == comps.len() {
-            break;
-        }
-        if node_kind != "tree" {
-            return Err(format!(
-                "eval-path: cannot descend into {:?}: the prefix evaluated to a {node_kind}",
-                comps[i]
-            ));
-        }
-        let (mode, oid) = lookup_in_tree(t, &node_oid, comps[i])?
-            .ok_or_else(|| format!("eval-path: {:?} not found in {node_oid}", comps[i]))?;
-        node_kind = kind_of_mode(mode).to_string();
-        node_oid = oid.to_string();
-        i += 1;
-    }
-    Ok((node_kind, node_oid))
-}
-
-/// What the tree `tree` evaluates to: the value of the `.caos-expr` at its root,
-/// or `None` when it carries none (a tree without a directive is its own value).
-///
-/// **This is the memo that pays**, and the granularity is the reason. One
-/// expression asks many questions that share a PREFIX, and each shared step is a
-/// chain of client↔server round trips even when every answer is a cache hit. A
-/// consumer that mounts caos writes two locators over one pin:
-///
-/// ```text
-/// run --base:@@=…&dir=std/flake-input-loader --input-tree:@@=…&dir=std …
-/// ```
-///
-/// Both descend THROUGH EVALUATION ([`crate::resolve_remote_arg`]), so both
-/// apply caos' root `.caos-expr` — a deep-deps run over the whole repo, itself
-/// preceded by the seeded-sentinel run that resolves the deep-deps worker — and
-/// then `std/.caos-expr`, another such pair.
-///
-/// Those two descents are DIFFERENT questions (`dir=std` and
-/// `dir=std/flake-input-loader`), so [`eval_path`]'s own memo cannot join them —
-/// it was measured doing exactly nothing before this one existed, 52 `git push`
-/// invocations against 55. What the two have in common is the node transforms,
-/// and this is where they meet: 55 pushes → 38, 213 git processes → 149, on a
-/// resolution where every answer was already cached.
-///
-/// Keyed on the tree alone (plus the store) because a transform is a function of
-/// its input and nothing else — a `.caos-expr` reaches only what its own tree
-/// holds, by construction.
-fn eval_node(
-    t: &dyn Transport,
-    tree: &str,
-    store: &[ClientSecret],
-) -> Result<Option<(String, String)>, String> {
-    let Some((mode, expr)) = lookup_in_tree(t, tree, ".caos-expr")? else {
-        return Ok(None);
-    };
-    if mode.is_tree() {
-        return Ok(None);
-    }
-    let key = format!("{}\0{tree}", crate::store_key(store));
-    if let Some(hit) = EVAL_NODE_MEMO.get(&key) {
-        return Ok(Some(hit));
-    }
-    let input = strip_caos_expr(t, tree)?;
-    let result = eval_expr(t, &input, &expr.to_string(), store)?;
-    EVAL_NODE_MEMO.put(key, result.clone());
-    Ok(Some(result))
-}
-
-/// `tree` without its own `.caos-expr` entry — the input an expression is
-/// evaluated against.
-///
-/// **A `.caos-expr` computes a replacement for its directory from the
-/// directory's contents excluding the directive itself.** That is the
-/// definition, not an optimization, and three things fall out of it:
-///
-/// - **A self-reference is inert.** `--in:@=.` resolves to the stripped tree,
-///   which carries no `.caos-expr`, so evaluating it is the identity. Without
-///   this, evaluating a `:@=` target re-runs the very expression doing the
-///   evaluating — unbounded recursion, at every nesting level. This is what
-///   makes [`resolve_expr_path`] able to evaluate at all.
-/// - **Worker-vs-data becomes a real signal.** A `:@=` target *with* a
-///   `.caos-expr` is an expression; one *without* evaluates to itself. The
-///   distinction is structural, so nothing has to guess.
-/// - **The directive stops keying its own input.** Editing a comment in
-///   `std/bash/.caos-expr` no longer re-keys the flake build it describes.
-///
-/// A tree with no `.caos-expr` is returned unchanged, so this costs nothing on
-/// the common path.
-fn strip_caos_expr(t: &dyn Transport, tree: &str) -> Result<String, String> {
-    let entries =
-        fetch_tree_entries(t, tree)?.ok_or_else(|| format!("eval-path: {tree} is not a tree"))?;
-    let kept: Vec<Entry> = entries
-        .into_iter()
-        .filter(|e| entry_name(e) != b".caos-expr")
-        .collect();
-    Ok(post_tree(t, kept)?.to_string())
-}
-
-/// Evaluate one `.caos-expr` blob against `input_tree` (the subtree the file
-/// sits at the root of, minus the file — see [`strip_caos_expr`]), returning
-/// the value's `(kind, oid)`.
-fn eval_expr(
-    t: &dyn Transport,
-    input_tree: &str,
-    expr_oid: &str,
-    store: &[ClientSecret],
-) -> Result<(String, String), String> {
-    let (kind, content) = t.get_object(expr_oid)?;
-    if kind != "blob" {
-        return Err(format!(".caos-expr {expr_oid} is a {kind}, not a blob"));
-    }
-    let text =
-        String::from_utf8(content).map_err(|e| format!(".caos-expr {expr_oid} not UTF-8: {e}"))?;
-
-    let mut env: HashMap<String, (String, String)> = HashMap::new();
-    // `$CAOS_EXPR` — THIS `.caos-expr`'s own blob, pre-bound so it reads like any
-    // other variable. It exists because [`strip_caos_expr`] removes the
-    // directive from the tree the expression is evaluated against, so an
-    // expression cannot reach its own text by path: `--in:@=.` is deliberately
-    // inert. A worker that must VERIFY the expression that launched it — the
-    // consumer-input expander checking that its locators agree with
-    // `flake.lock` (design/flake-inputs.md) — therefore has no other way to see
-    // it.
-    //
-    // Hermetic, unlike passing `:@@=path:.caos-expr`: this blob comes from the
-    // tree being evaluated, so it is still the right file under
-    // `eval-path --tree=<oid>` and when a THIRD repo pins this one by locator,
-    // where a host path would read whatever the working directory happened to
-    // hold.
-    //
-    // The cost is opt-in and worth stating: an expression that passes `$CAOS_EXPR`
-    // puts its own bytes in the arg tree, so editing a COMMENT in it re-keys
-    // that run — exactly what stripping otherwise buys. That is correct for a
-    // caller whose worker inspects the text: then the text is an input.
-    env.insert(
-        EXPR_VAR.to_string(),
-        ("blob".to_string(), expr_oid.to_string()),
-    );
-    let mut value: Option<(String, String)> = None;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if value.is_some() {
-            return Err("eval-path: .caos-expr has content after its final expression".to_string());
-        }
-        if let Some((name, cmd)) = parse_assignment(line) {
-            // Reserved, like `base` and `unbind` on the verbs: a binding that
-            // shadowed it would silently change what a verifier sees.
-            if name == EXPR_VAR {
-                return Err(format!(
-                    "eval-path: ${EXPR_VAR} is reserved (this .caos-expr's own blob) \
-                     and cannot be assigned"
-                ));
-            }
-            let v = eval_command(t, input_tree, cmd, &env, store)?;
-            env.insert(name.to_string(), v);
-        } else {
-            value = Some(eval_value(t, input_tree, line, &env, store)?);
-        }
-    }
-    value.ok_or_else(|| "eval-path: .caos-expr has no final expression".to_string())
-}
-
-/// An assignment line `NAME=<run|curry …>` → `(NAME, "<run|curry …>")`. Any
-/// other line (a bare command or `$NAME`) → `None`. The verbs are lowercase and
-/// var names uppercase, so the two never blur (a bare `run …` has no leading
-/// `NAME=`).
-fn parse_assignment(line: &str) -> Option<(&str, &str)> {
-    let eq = line.find('=')?;
-    let (name, rest) = (&line[..eq], &line[eq + 1..]);
-    let mut chars = name.chars();
-    let first = chars.next()?;
-    if !first.is_ascii_uppercase() {
-        return None;
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-    {
-        return None;
-    }
-    match rest.split_whitespace().next() {
-        Some("run") | Some("curry") => Some((name, rest)),
-        _ => None,
-    }
-}
-
-/// Evaluate the file's value line: a `run`/`curry` command, or a bare `$NAME`
-/// that names a previously bound variable.
-fn eval_value(
-    t: &dyn Transport,
-    input_tree: &str,
-    line: &str,
-    env: &HashMap<String, (String, String)>,
-    store: &[ClientSecret],
-) -> Result<(String, String), String> {
-    if let Some(var) = line.strip_prefix('$') {
-        if var.is_empty() || var.split_whitespace().count() != 1 {
-            return Err(format!("eval-path: malformed variable reference {line:?}"));
-        }
-        return env
-            .get(var)
-            .cloned()
-            .ok_or_else(|| format!("eval-path: undefined variable ${var}"));
-    }
-    eval_command(t, input_tree, line, env, store)
-}
-
-/// Evaluate a single `run --base:<t>=<image> …` or `curry --base:<t>=<image> …` command against
-/// `input_tree`, returning the result's `(kind, oid)`. A `curry` yields the
-/// curried ArgTree (a tree); a `run` triggers compute and yields its result.
-fn eval_command(
-    t: &dyn Transport,
-    input_tree: &str,
-    cmd: &str,
-    env: &HashMap<String, (String, String)>,
-    store: &[ClientSecret],
-) -> Result<(String, String), String> {
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let verb = tokens.first().copied().unwrap_or("");
-    if verb != "run" && verb != "curry" {
-        return Err(format!(
-            "eval-path: expected `run` or `curry`, got {verb:?}"
-        ));
-    }
-    // No positional image and no `--`: every token after the verb is a
-    // `--name[:type]=value` arg. Exactly one names the reserved `base` — the
-    // worker to run (or curry onto); the rest are its args.
-    let mut base: Option<(crate::ArgType, &str)> = None;
-    let mut arg_toks: Vec<&str> = Vec::new();
-    for &tok in &tokens[1..] {
-        let (name, ty, value) = crate::parse_arg(tok)?;
-        if name == crate::BASE_ARG {
-            if base.replace((ty, value)).is_some() {
-                return Err(format!("eval-path: `{verb}` given --base twice"));
-            }
-        } else {
-            arg_toks.push(tok);
-        }
-    }
-    let (bty, bval) =
-        base.ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
-    let image_ref = resolve_expr_base(t, input_tree, bty, bval, env, store)?;
-    let entries = resolve_expr_args(t, input_tree, &arg_toks, env, store)?;
-
-    if verb == "curry" {
-        // Mark the returned arg tree, so a caller that embeds it is per-user too
-        // (design/secrets.md, caller-propagation).
-        let oid = curry_from_entries(t, &image_ref, &[], entries)?;
-        let marked = mark_arg_tree(t, store, &oid.to_string())?;
-        return Ok(("tree".to_string(), marked));
-    }
-    // A `run` marks via `assemble_arg_tree` and must carry the store to the
-    // server (to inject and pass the double-check), exactly like `caos-cli run`.
-    let arg_tree = assemble_arg_tree(t, &image_ref, entries, store)?;
-    let server = t.server_url()?;
-    request_compute(&server, &arg_tree, &secret_store_header(store))
-}
-
-/// Resolve a command's `--base` arg to an image ref string, dispatched on its
-/// explicit type (never sniffed from the value's shape): `$VAR` (an object a
-/// prior line produced), `:@=<path>` (a path naming an image tree in
-/// `input_tree` — a flake dir, a git-docker image, or an evaluable dir, resolved
-/// through its own `.caos-expr`), `:docker=<ref>` (a registry image), or
-/// `:hash=<oid>` (an object already in the store). A path is the only way to
-/// name another tree — there is no by-name lookup, so an expression reaches only
-/// what its own tree holds.
-fn resolve_expr_base(
-    t: &dyn Transport,
-    input_tree: &str,
-    ty: crate::ArgType,
-    value: &str,
-    env: &HashMap<String, (String, String)>,
-    store: &[ClientSecret],
-) -> Result<String, String> {
-    // A `$VAR` base names an object a prior assignment produced, whatever its
-    // declared type — matched first, exactly as `resolve_expr_args` does.
-    if let Some(var) = value.strip_prefix('$') {
-        let (_, oid) = env
-            .get(var)
-            .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
-        return Ok(oid.clone());
-    }
-    match ty {
-        // `:docker=<ref>` — a registry image, carried as the blob
-        // `docker://<ref>` (base_arg_entry stores those bytes). This is how a
-        // core item breaks a resolution-time cycle: `flake-builder`'s
-        // `.caos-expr` names its own image as the sentinel `--base:docker=seeded`,
-        // so evaluating it never re-enters flake-builder's own entry
-        // (design/caos-expr.md, "Breaking the cycles"). The formed arg-tree
-        // carries the ref as a blob, exactly what the seeder registers.
-        crate::ArgType::Docker => Ok(format!("{DOCKER_SCHEME}{value}")),
-        // `:hash=<oid>` — an object already in the store (a git image or a curry
-        // node), referenced as-is. Location-independent.
-        crate::ArgType::Hash => {
-            if !is_hex_hash(value) {
-                return Err(format!(
-                    "eval-path: --base:hash= wants an object hash, got {value:?}"
-                ));
-            }
-            Ok(value.to_string())
-        }
-        // `:@=<path>` — a path naming an image tree within `input_tree`.
-        crate::ArgType::Path => {
-            let (mode, oid) = lookup_in_tree(t, input_tree, value)?
-                .ok_or_else(|| format!("eval-path: base path {value:?} not found in tree"))?;
-            if !mode.is_tree() {
-                return Err(format!("eval-path: base path {value:?} is not a directory"));
-            }
-            // Evaluate the subtree's own `.caos-expr` (if any) to the image it
-            // builds — so a path to an EVALUABLE dependency (a `DEEP-DEPS/<name>`
-            // mount) resolves to its image, not its raw source; a subtree with no
-            // `.caos-expr` (a plain flake dir, a git-docker image) evaluates to
-            // itself. For a seeded worker this dispatches its build — which is
-            // why forming a `run` expr's key needs that worker already seeded
-            // (design/caos-expr.md). Carries the secret store, like any `run`
-            // eval-path performs (design/secrets.md).
-            let (_kind, hash) = eval_path(t, &oid.to_string(), "", store)?;
-            Ok(hash)
-        }
-        // `:@@=<ref>` — the base lives in ANOTHER repo. Fetched by the client
-        // (never a worker) and resolved by DESCENT THROUGH EVALUATION, so a
-        // pinned consumer reaches `dir=std/<x>` exactly as caos reaches its own
-        // entries: the root expression deepens the tree, then the entry's own
-        // expression builds it (design/flake-inputs.md).
-        crate::ArgType::Remote => {
-            let (mode, oid) = crate::resolve_remote_arg(t, value, store)?;
-            if !mode.is_tree() {
-                return Err(format!(
-                    "eval-path: git ref {value:?} names a file, not an image tree"
-                ));
-            }
-            Ok(oid.to_string())
-        }
-        crate::ArgType::Literal => Err(
-            "eval-path: --base needs a type: use :@= (path), :@@= (a git ref), :docker=, \
-             :hash=, or =$VAR"
-                .to_string(),
-        ),
-        crate::ArgType::Commit => Err("eval-path: a commit is not an image base".to_string()),
-    }
-}
-
-/// Resolve a command's `--name:type=value` args to tree entries, against
-/// `input_tree`. Shares the [`crate::parse_arg`] vocabulary: `$VAR`, a literal
-/// blob (`=`), a `:@=` path (within the tree, relative to the `.caos-expr`'s
-/// directory), a `:docker=` ref, or a `:hash=` object already in the store.
-/// (The reserved `base` arg is pulled out by [`eval_command`] before this.)
-fn resolve_expr_args(
-    t: &dyn Transport,
-    input_tree: &str,
-    toks: &[&str],
-    env: &HashMap<String, (String, String)>,
-    store: &[ClientSecret],
-) -> Result<Vec<Entry>, String> {
-    let mut entries = Vec::new();
-    for &tok in toks {
-        let (name, ty, value) = crate::parse_arg(tok)?;
-        let (mode, oid) = if let Some(var) = value.strip_prefix('$') {
-            // `$VAR` names an object a prior assignment produced, whatever the
-            // declared type — matched first.
-            let (kind, oid) = env
-                .get(var)
-                .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
-            (mode_of_kind(kind), parse_oid(oid)?)
-        } else {
-            match ty {
-                crate::ArgType::Literal => (
-                    EntryKind::Blob.into(),
-                    post_object(t, "blob", value.as_bytes())?,
-                ),
-                crate::ArgType::Path => resolve_expr_path(t, input_tree, value, store)?,
-                // `:@@=<ref>` — a tree from ANOTHER repo. `resolve_remote_arg`
-                // descends `dir=` through evaluation, so this is already the
-                // same rule `:@=` applies (an expression is evaluated, data is
-                // referenced raw) — just to a tree that arrived from elsewhere.
-                crate::ArgType::Remote => crate::resolve_remote_arg(t, value, store)?,
-                // `:docker=<ref>` — the blob `docker://<ref>`.
-                crate::ArgType::Docker => (
-                    EntryKind::Blob.into(),
-                    post_object(t, "blob", format!("{DOCKER_SCHEME}{value}").as_bytes())?,
-                ),
-                // `:hash=<oid>` — an object already in the store, by oid (tree
-                // or blob).
-                crate::ArgType::Hash => {
-                    let (kind, _) = t.get_object(value)?;
-                    (mode_of_kind(&kind), parse_oid(value)?)
-                }
-                crate::ArgType::Commit => {
-                    return Err(format!(
-                        "eval-path: :commit= is not supported in .caos-expr yet: {tok:?}"
-                    ))
-                }
-            }
-        };
-        entries.push(Entry {
-            mode,
-            filename: name.as_bytes().to_vec().into(),
-            oid,
-        });
-    }
-    Ok(entries)
-}
-
-/// Resolve a `:@=` path value: a path within `input_tree`, relative to the
-/// `.caos-expr`'s directory. Paths only — a `:@=` value cannot name anything
-/// outside the tree being evaluated.
-///
-/// **A target carrying a `.caos-expr` is an EXPRESSION and is evaluated; one
-/// without is DATA and is referenced raw.** The two cases are told apart
-/// structurally, not guessed, because [`strip_caos_expr`] has already removed
-/// the directive from `input_tree` — so a self-reference like `--in:@=.` lands
-/// on a tree with no `.caos-expr` and evaluates to itself. Nothing recurses.
-///
-/// Evaluating is what closes caller-propagation (design/secrets.md): an
-/// embedded worker is no longer referenced raw, so `--pusher:@=github-push`
-/// binds whatever eval produced — a `curry` result already marked with
-/// `secret-hash`, or a `run` result computed under a marked arg tree. Either
-/// way the embedder's own tree turns over per-user, without this function
-/// marking anything itself. Marking here would be wrong: an expression may be
-/// `run`-valued, and folding a `secret-hash` entry into a *data* tree would
-/// corrupt it.
-fn resolve_expr_path(
-    t: &dyn Transport,
-    input_tree: &str,
-    value: &str,
-    store: &[ClientSecret],
-) -> Result<(EntryMode, gix::ObjectId), String> {
-    let (mode, oid) = lookup_in_tree(t, input_tree, value)?
-        .ok_or_else(|| format!("eval-path: path {value:?} not found in tree"))?;
-    eval_if_evaluable(t, mode, oid, store)
-}
-
-/// The worker-vs-data rule, applied to an object an arg resolved to: a TREE
-/// carrying a `.caos-expr` is an expression and is evaluated; anything else — a
-/// blob, or a tree without one — is data and is referenced raw.
-///
-/// Shared by `:@=` ([`resolve_expr_path`]) and `:@@=`
-/// ([`crate::resolve_remote_arg`]), so where the tree CAME FROM makes no
-/// difference to what naming it means. See [`resolve_expr_path`] for why
-/// evaluating here is what closes caller-propagation, and why nothing recurses.
-fn eval_if_evaluable(
-    t: &dyn Transport,
-    mode: EntryMode,
-    oid: gix::ObjectId,
-    store: &[ClientSecret],
-) -> Result<(EntryMode, gix::ObjectId), String> {
-    if !mode.is_tree() {
-        return Ok((mode, oid));
-    }
-    let tree = oid.to_string();
-    match lookup_in_tree(t, &tree, ".caos-expr")? {
-        Some((m, _)) if !m.is_tree() => {
-            let (kind, hash) = eval_path(t, &tree, "", store)?;
-            Ok((mode_of_kind(&kind), parse_oid(&hash)?))
-        }
-        _ => Ok((mode, oid)),
-    }
-}
-
-/// Look up `rel` (a `/`-separated path) within the tree `tree_oid`, returning
-/// the entry's `(mode, oid)` — `None` if any component is missing or a
-/// non-final component isn't a directory. An empty `rel` (or `.`) is the tree
-/// itself.
-pub(crate) fn lookup_in_tree(
-    t: &dyn Transport,
-    tree_oid: &str,
-    rel: &str,
-) -> Result<Option<(EntryMode, gix::ObjectId)>, String> {
-    let comps: Vec<&str> = rel
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    if comps.is_empty() {
-        return Ok(Some((EntryKind::Tree.into(), parse_oid(tree_oid)?)));
-    }
-    let mut current = tree_oid.to_string();
-    for (idx, comp) in comps.iter().enumerate() {
-        let entries = fetch_tree_entries(t, &current)?
-            .ok_or_else(|| format!("{current} is not a tree while resolving {rel}"))?;
-        let Some(e) = entries
-            .into_iter()
-            .find(|e| entry_name(e) == comp.as_bytes())
-        else {
-            return Ok(None);
-        };
-        if idx == comps.len() - 1 {
-            return Ok(Some((e.mode, e.oid)));
-        }
-        if !e.mode.is_tree() {
-            return Ok(None);
-        }
-        current = e.oid.to_string();
-    }
-    unreachable!("loop returns on the last component")
-}
-
-/// The result-kind string for a tree-entry mode (as `run`/`eval-path` print it).
-fn kind_of_mode(mode: EntryMode) -> &'static str {
-    match mode.kind() {
-        EntryKind::Tree => "tree",
-        EntryKind::Commit => "commit",
-        _ => "blob",
-    }
-}
-
-/// The tree-entry mode for a result kind — the inverse of [`kind_of_mode`], used
-/// to place a `$NAME` variable's object into an args tree at its own kind.
-pub(crate) fn mode_of_kind(kind: &str) -> EntryMode {
-    match kind {
-        "tree" => EntryKind::Tree.into(),
-        "commit" => EntryKind::Commit.into(),
-        _ => EntryKind::Blob.into(),
-    }
 }
 
 #[cfg(test)]

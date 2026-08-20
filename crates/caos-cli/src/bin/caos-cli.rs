@@ -133,7 +133,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // chat-specific usage) lives in the conversation client.
         Some("chat") => caos_cli::cli_chat(&transport()?, &args[2..]),
         // `run-tool <script | name> [--name=value ...]` — run a caos-tool (a
-        // worker script, `caos-tools/<name>.sh` for a bare name) as a caos
+        // directory with a `.caos-expr`, `caos-tools/<name>` for a bare name) as a caos
         // job over this repo's tree: what an agent's tool invocation does,
         // callable by hand. See `caos::cli_run_tool` for the result conventions.
         Some("run-tool") => caos::cli_run_tool(&transport()?, &args[2..]),

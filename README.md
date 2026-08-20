@@ -650,9 +650,12 @@ tree under test, inside caos, by `std/cargo` and `std/rustc`; no host binary
 is handed in. (After a Rust edit: `nix build && caosd up`, then test. After
 editing anything under `std/`, the same — a std tree is part of the seed keys.)
 
-The test tool (`caos-tools/test.sh`, carried by this tree) is the suite
-worker, in five stages of one script: `suite` builds the worker images via
-`caos-tools/build.sh`, `deepener` and `deepen` expand every test's `DEPS`
+The test tool is `caos-tools/test/` — a DIRECTORY whose `.caos-expr` names the
+image it runs on and carries its `help` (SPEC, "Tools"), with `worker.sh` as
+the suite worker, in six stages of one script: `suite` asks the server to
+evaluate `caos-tools/build` (a worker may not block on an evaluation's runs),
+`suite-run` runs the ArgTree that yields — the same one `run-tool build` and an
+agent's `build` call form — `deepener` and `deepen` expand every test's `DEPS`
 into `DEEP-DEPS/` mounts, `fanout` runs one job per `tests/<name>/cli.sh`,
 and `summarize` assembles the report. A test is a directory `tests/<name>/`
 with a `cli.sh`, which runs inside a test-stack worker, cwd'd into a client

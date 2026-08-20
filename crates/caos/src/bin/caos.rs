@@ -97,6 +97,15 @@ fn run(args: &[String]) -> Result<(), String> {
             [input, kvs @ ..] => caos::caos_run_then(&http()?, input, kvs),
             _ => Err(usage(args)),
         },
+        // `eval-path-then <in> --eval=<path> [--then:<type>=<image>] [--catch]` — the
+        // evaluation sibling of run-then: the server walks `.caos-expr` from
+        // `<in>`'s root down to `<path>` (blocking a request thread, not a worker
+        // slot), then (optionally) `then(--in=<in>, --result=<R>)`. How a worker
+        // gets a `.caos-expr` evaluated without blocking (design/caos-expr.md).
+        Some("eval-path-then") => match &args[2..] {
+            [input, kvs @ ..] => caos::caos_eval_then(&http()?, input, kvs),
+            _ => Err(usage(args)),
+        },
         // `run-request-then <R> [--then:<type>=<image>] [--catch]` — tail-call
         // the exact, already-complete ArgTree R, optionally delivering its
         // result (or caught error) to a callback image.
@@ -482,6 +491,7 @@ fn usage(args: &[String]) -> String {
          {prog} forward <src-cas-path> <dst-cas-path>\n  \
          {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n  \
          {prog} run-then <in-cas-path> --run:<type>=<image> [--then:<type>=<image>] [--catch]\n  \
+         {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \

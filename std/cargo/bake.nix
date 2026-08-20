@@ -61,7 +61,7 @@ let
   # against crane's dummy workspace sources — keyed on manifests + lockfile
   # only, so source edits never re-bake. This one bake serves everything:
   # `build` and `test` both compile with `--target=<musl>` at the default
-  # (dev) profile (caos-tools/build.sh), so a per-edit build recompiles only
+  # (dev) profile (caos-tools/build/worker.sh), so a per-edit build recompiles only
   # the workspace crates, never the dep graph. musl still links static
   # regardless of profile, so the produced binaries run on any base. There is
   # deliberately no second (host, release) bake — a second bake gets a

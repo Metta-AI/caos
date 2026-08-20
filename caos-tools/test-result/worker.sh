@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-#@doc Print one test's COMPLETE record from a `test` run: the test's whole
-#@doc output — the report only carries its last few lines — or, with `log`,
-#@doc one of the inner stack's logs. Takes the hash the test report prints
-#@doc beside each test's name; that hash is stable, so the record of a run
-#@doc stays readable long after the run.
-#@arg hash The hash the `test` report prints beside a test's name.
-#@arg [log] Print this inner-stack log instead of the test's output: server, runnerd, redis or serve.
+# The `test-result` tool's worker. Its DOCS — the description and `@param`
+# tags an agent registers it by — live in the sibling `.caos-expr` here-string,
+# not in this header: that is what keeps a doc edit out of anything that reads
+# this file (SPEC, "Tools").
 #
-# The counterpart to caos-tools/test.sh's report. A test's record —
+# The counterpart to caos-tools/test/worker.sh's report. A test's record —
 # {verdict, seconds, output, server.log, runnerd.log, ...} — already rides in
 # the suite result (tests/lib/run-test.sh writes it), so nothing here re-runs
 # anything: this is a READ, addressed by hash, of a tree the suite already

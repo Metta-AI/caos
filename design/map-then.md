@@ -16,7 +16,9 @@ Since extended with the **single-valued form**, `caos run-then` (the
 continuation gained a `run` entry, mutually exclusive with `map`; see
 [Run-then](#run-then-the-single-valued-form)), and the **exact-request form**,
 `caos run-request-then` (see
-[Run-request-then](#run-request-then-the-exact-request-form)).
+[Run-request-then](#run-request-then-the-exact-request-form)), and the
+**evaluation form**, `caos eval-path-then` (see
+[Eval-path-then](#eval-path-then-the-evaluation-form)).
 
 ## Problem
 
@@ -117,6 +119,35 @@ The shape is intentionally exclusive: `request` cannot coexist with `in`,
 only `--error=<blob>` instead of `--result`. This is the durable-work primitive:
 the exact recorded request can be reissued after recovery without reconstructing
 its arguments.
+
+## Eval-path-then: the evaluation form
+
+`caos eval-path-then <in> --eval=<path> [--then:<t>=<img>] [--catch]` (helpers
+`worker_common::eval_then` and `eval_then_catching`) records
+`{in, eval, then?, catch?}`. The middle step is not a sub-run but a WALK: the
+server evaluates the `.caos-expr` files from `in`'s root down to `<path>`
+(design/caos-expr.md) and R is the object that walk produces. With `then`, the
+callback receives `--in=<in>` and `--result=<R>`, exactly like `run-then`;
+without one, R is the request's result. `--catch` delivers a failed walk as
+`--error=<blob>` and requires `then`.
+
+`eval` is the one middle step whose entry is a **literal**: the path is recorded
+verbatim as a blob, not resolved as an image ref, so it never needs a type tag.
+
+**Why the server evaluates.** A `.caos-expr` may be `run`-valued, so evaluating
+it dispatches runs and blocks on their results — which a worker may not do (it
+holds a runner slot; see [Why this cannot deadlock](#why-this-cannot-deadlock)).
+The server may: it already blocks a request thread on `run`'s sub-run in exactly
+this position. So a worker that needs an expression evaluated asks for it as a
+continuation and exits, and the walk happens where blocking is already legal.
+
+The object it returns is byte-identical to what a client `eval-path` would
+build, because both drive the SAME walk — the `caos-eval` crate, behind an
+`EvalHost` whose only difference is where a `run` is dispatched (the client's
+`request_compute`, the server's `run_image`). `tests/eval-then` asserts that
+identity on a `run`-valued expression rather than trusting it. The one thing the
+server host cannot do is resolve a `:@@=` locator: that stays client-side, so
+the URL never enters a cache key (design/flake-inputs.md).
 
 ## Catch: a failing single-valued step as a value
 

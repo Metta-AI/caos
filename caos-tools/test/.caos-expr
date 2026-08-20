@@ -1,0 +1,19 @@
+# The `test` tool (SPEC, "Tools"): the bash worker image with this directory's
+# script curried onto it, plus the `help` an agent registers it by.
+#
+# The docs are a HERE-STRING, so they live here rather than in the script — and
+# a `.caos-expr` is STRIPPED from the tree it is evaluated against, so editing
+# them re-keys this tool's arg tree and nothing it builds. That split is why
+# `@param [test-salt]` can be reworded without re-running a single test.
+HELP=<<END
+Build the test stack image from the tree and run the whole test suite — the
+unit tests and every tests/<name> integration suite — as cached jobs: an
+unchanged test never re-runs. Returns the report: a line per test with its
+time and the hash of its record, the last few lines of every failing test,
+and a pass/fail banner. Pass a record's hash to `test-result` for that test's
+full output or its inner-stack logs. Nothing is handed in from the host: the
+stack under test is compiled from these sources, inside workers.
+@param [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys the tests and nothing else.
+@param [only] Run only these tests — a space-separated list of tests/<name> directories.
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP

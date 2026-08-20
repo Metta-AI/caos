@@ -31,7 +31,7 @@ Every script here runs with it, and two constructs quietly break under it.
   `X="${VAR:?message}"` — inside double quotes the message is literal.
 - **A worker script only has what its image's flake lists.** `std/bash` is
   bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
-  `sed`**, and no awk. `sed 's/^/  /'` in `caos-tools/test.sh` passed two
+  `sed`**, and no awk. `sed 's/^/  /'` in `caos-tools/test/worker.sh` passed two
   green suites before it fired, because it only ran on the failing-test path:
   the report that exists to explain a failure was the thing that broke. Prefer
   a bash loop (`while IFS= read -r line`), and when reaching for a binary,
@@ -157,7 +157,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   names the differing args. **Read that message rather than re-deriving it** —
   it prints both oids, and the fix is always one of the two sides being stale.
   Anything you hand-roll that forms a seeded key (a `caos run-then` against a
-  sentinel, in `caos-tools/*.sh`) must match `build-builtins.sh`'s record
+  sentinel, in `caos-tools/*/worker.sh`) must match `build-builtins.sh`'s record
   exactly, `strip_caos_expr` included; nothing else checks that agreement.
 
 # Before committing
@@ -173,5 +173,21 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   passing run and broke `nix build` on arrival. `tests/std-lint` now runs
   `./lint-flake-src.sh` for the embedded-file case; for anything else the
   filter touches, run `nix build` yourself before committing.
+- **`caosd up` does NOT get a new `caos` binary into worker images —
+  `caosd reset` does.** A worker image's `/bin/caos` is copied in by the
+  flake-builder at IMAGE-BUILD time (`std/flake-builder/worker`:
+  `cp /bin/caos "$l/usr/bin/caos"`), and the flake-builder is reached through a
+  seeded sentinel whose ArgTree is `{base: docker://seeded-…, in: <std entry
+  tree>}` — the binary is nowhere in that key. So a rebuilt binary leaves every
+  key unmoved, redis answers from the memo, and the OLD image is handed out
+  however many times you re-run `caosd up`. Reproduced deliberately: a marker
+  compiled into the worker's usage banner, `nix build && caosd up`, and the
+  bash image came back at the same oid with no marker, while `server.log`
+  showed `cache hit: arg_tree=… -> tree …` naming the previous deploy's image
+  and the fresh seed record naming a different one.
+  This bites only when something calls a NEW VERB on the DEPLOYED (outer)
+  stack — `caos-tools/*` do, the suite does not, because it compiles its own
+  binaries inside the test stack. The symptom is a worker dying with a plain
+  `caos: usage:` listing that is missing the verb you just added.
 - If this doesn't catch everything, we need to add it to the above step
 

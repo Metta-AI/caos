@@ -342,7 +342,7 @@ pub(crate) fn dispatch(
         // happens is a seeder that has not parked its polls yet. That window is
         // real: a stack whose seed ref is published after boot answers nothing
         // until the seeder's next rescan, and the caller sees a docker error
-        // pointing nowhere near the cause (observed, from caos-tools/build.sh
+        // pointing nowhere near the cause (observed, from caos-tools/build/worker.sh
         // publishing std and resolving it moments later).
         //
         // Deferring generic polls for the WHOLE pending window makes the sentinel

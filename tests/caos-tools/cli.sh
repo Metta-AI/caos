@@ -3,14 +3,16 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
-# Tree-defined agent tools (caos-tools/*.sh, design/cargo-workers.md):
-# llm-step discovers them per round from the CURRENT workspace (#@doc lines
-# as the descriptions, #@arg lines as the parameters), resolves them at
-# INVOCATION time, and runs each as curry(tools_image, script, args) over the
-# tree. Asserts, against the scripted stub LLM: registration (name + doc in
-# the request; a reserved name is NOT shadowed), invocation (the script's
-# output returns as the tool_result), same-turn dynamism — a bash edit to the
-# tool changes what the very next call runs — the #@arg contract: a
+# Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
+# discovers them per round from the CURRENT workspace — each is a DIRECTORY
+# whose `.caos-expr` binds the javadoc `help` (description as free text,
+# `@param` tags as the parameters) — and at INVOCATION time asks the server to
+# EVALUATE that expression, then curries the model's args onto the ArgTree it
+# yields and runs it over the tree. Asserts, against the scripted stub LLM:
+# registration (name + doc in the request; a reserved name is NOT shadowed),
+# invocation (the script's output returns as the tool_result), same-turn
+# dynamism — a bash edit to the tool changes what the very next call runs —
+# the `@param` contract: a
 # declared arg reaches the script at /cas/args/<name>, while a missing
 # required arg or an undeclared one comes back as an is_error tool_result
 # WITHOUT a sub-run — and, at the other end of that spectrum, a tool whose
@@ -34,25 +36,38 @@ echo "== stage the worker binaries and the tooled workspace ==" >&2
 stub_bin=/tmp/llm-stub-bin
 install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
 
+# The tool image the fixture tools name. A tool is a DIRECTORY carrying a
+# `.caos-expr` (SPEC, "Tools"), and that expression names the image it runs on
+# — here by `:hash=`, because this fixture workspace holds no std to name by
+# path. `DEEP-DEPS/bash` is this TEST's mount, resolved once for all of them.
+bash_img=$("$CAOS_CLI" eval-path DEEP-DEPS/bash) || fail "resolving the bash image"
+bash_img=${bash_img##* }
+
+# Write tool `$1` from the script on stdin, with `$2` as its javadoc help.
+tool() {
+  mkdir -p "ws/caos-tools/$1"
+  cat > "ws/caos-tools/$1/worker.sh"
+  { printf 'HELP=<<END\n%s\nEND\n' "$2"
+    printf 'curry --base:hash=%s --worker1:@=worker.sh --help=$HELP\n' "$bash_img"
+  } > "ws/caos-tools/$1/.caos-expr"
+}
+
 mkdir -p ws/caos-tools
-cat > ws/caos-tools/hello.sh <<'EOF'
+tool hello 'Say hello from the tree.' <<'EOF'
 #!/usr/bin/env bash
-#@doc Say hello from the tree.
 set -euo pipefail
 printf 'hello-from-tree-v1' > /tmp/o
 caos put /tmp/o /cas/out
 EOF
 # A reserved-name shadow attempt: must be ignored, never registered.
-cat > ws/caos-tools/bash.sh <<'EOF'
+tool bash 'An impostor bash.' <<'EOF'
 #!/usr/bin/env bash
-#@doc An impostor bash.
 EOF
 # A tool whose SUB-RUN dies: the script exits non-zero, so the worker exits
 # non-zero and the job errors. Not a non-zero exit reported inside a result —
 # no result exists at all. Before `run-then --catch` this killed the turn.
-cat > ws/caos-tools/boom.sh <<'EOF'
+tool boom 'A tool that dies without producing a result.' <<'EOF'
 #!/usr/bin/env bash
-#@doc A tool that dies without producing a result.
 set -euo pipefail
 echo "boom: this tool never writes /cas/out" >&2
 exit 1
@@ -60,11 +75,10 @@ EOF
 # A tool with parameters: one required, one optional. Reads them where every
 # curried arg lands — /cas/args/<name> — so the assertion below is on the
 # whole path from the model's JSON to the script's stdin.
-cat > ws/caos-tools/echo-arg.sh <<'EOF'
+tool echo-arg 'Echo the word it is given.
+@param word The word to echo.
+@param [suffix] An optional suffix.' <<'EOF'
 #!/usr/bin/env bash
-#@doc Echo the word it is given.
-#@arg word The word to echo.
-#@arg [suffix] An optional suffix.
 set -euo pipefail
 caos get /cas/args/word
 out="word=$(cat /cas/args/word)"
@@ -75,6 +89,15 @@ fi
 printf '%s' "$out" > /tmp/o
 caos put /tmp/o /cas/out
 EOF
+
+# A directory that is NOT a tool: its expression binds no `--help`. Registering
+# it would advertise a tool the model has no contract for, so discovery skips it
+# (loudly, on stderr).
+mkdir -p ws/caos-tools/undocumented
+cp ws/caos-tools/hello/worker.sh ws/caos-tools/undocumented/worker.sh
+printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
+  > ws/caos-tools/undocumented/.caos-expr
+
 echo "You are a coding agent." > system.txt
 commit "workspace + tools"
 base=$(mkcommit "HEAD:ws" "base")
@@ -84,7 +107,7 @@ human1=$(mkcommit "HEAD:ws" \
 
 echo "== script the stub LLM (call; edit-then-call; arg calls; end) ==" >&2
 R1='[{"id":"toolu_01","input":{},"name":"hello","type":"tool_use"}]'
-R2='[{"id":"toolu_02","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello.sh","paths":["caos-tools/hello.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_03","input":{},"name":"hello","type":"tool_use"}]'
+R2='[{"id":"toolu_02","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_03","input":{},"name":"hello","type":"tool_use"}]'
 # Two bad calls then a good one, in ONE response: the bad ones must be
 # answered in place and the queue continue, so the good one still runs.
 R3='[{"id":"toolu_04","input":{},"name":"echo-arg","type":"tool_use"},{"id":"toolu_05","input":{"word":"x","colour":"red"},"name":"echo-arg","type":"tool_use"},{"id":"toolu_06","input":{"word":"banana","suffix":"-split"},"name":"echo-arg","type":"tool_use"}]'
@@ -132,13 +155,15 @@ git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
 git show -s --format=%B "$turn" | grep -qF '"content":"tools done"' \
   || fail "terminal assistant event"
 
-echo "== registration: hello advertised with its #@doc; bash not shadowed ==" >&2
+echo "== registration: hello advertised with its description; bash not shadowed ==" >&2
 grep -qF '"name":"hello"' stub/request-1.json || fail "hello not registered"
-grep -qF 'Say hello from the tree.' stub/request-1.json || fail "#@doc not used as description"
+grep -qF 'Say hello from the tree.' stub/request-1.json || fail "description not used"
 [ "$(grep -oF '"name":"bash"' stub/request-1.json | wc -l)" = 1 ] \
   || fail "reserved bash shadowed (or missing)"
 grep -qF 'impostor' stub/request-1.json && fail "shadow tool's doc leaked into the registry"
-echo "  ok: hello registered from the tree, impostor bash.sh ignored" >&2
+grep -qF '"name":"undocumented"' stub/request-1.json \
+  && fail "a directory whose expression binds no --help was registered as a tool"
+echo "  ok: hello registered; impostor bash and the no-help directory ignored" >&2
 
 echo "== invocation: the tool's output came back as the tool_result ==" >&2
 grep -qF 'hello-from-tree-v1' stub/request-2.json || fail "round-1 tool result missing"
@@ -152,25 +177,25 @@ echo "  ok: same-turn edit changed the tool's behavior" >&2
 # serde_json's Map is a BTreeMap, so a request's object keys come out sorted —
 # that is what these literal fragments are matching, not the order the json!
 # macro writes them in.
-echo "== #@arg: declared as a schema, required marked, doc carried ==" >&2
+echo "== @param: declared as a schema, required marked, doc carried ==" >&2
 grep -qF '"word":{"description":"The word to echo.","type":"string"}' stub/request-1.json \
-  || fail "#@arg word not declared as a string property"
+  || fail "@param word not declared as a string property"
 grep -qF '"suffix":{"description":"An optional suffix.","type":"string"}' stub/request-1.json \
-  || fail "#@arg [suffix] not declared"
+  || fail "@param [suffix] not declared"
 grep -qF '"required":["word"]' stub/request-1.json \
   || fail "required args wrong: [name] must be optional, a bare name required"
-# A tool with no #@arg lines still advertises an empty object schema — and no
+# A tool with no @param tags still advertises an empty object schema — and no
 # `required` key, which the API rejects as an empty array.
 grep -qF '"description":"Say hello from the tree.","input_schema":{"properties":{},"type":"object"},"name":"hello"' \
   stub/request-1.json || fail "an argument-less tool's schema changed shape"
 echo "  ok: word required, suffix optional, hello unchanged" >&2
 
-echo "== #@arg: the values reach the script at /cas/args/<name> ==" >&2
+echo "== @param: the values reach the script at /cas/args/<name> ==" >&2
 grep -qF 'word=banana-split' stub/request-4.json \
   || fail "the bound args did not reach the tool script"
 echo "  ok: word=banana-split came back as the tool_result" >&2
 
-echo "== #@arg: bad calls are is_error results, not worker errors ==" >&2
+echo "== @param: bad calls are is_error results, not worker errors ==" >&2
 grep -qF 'echo-arg needs a' stub/request-4.json \
   || fail "a missing required arg was not reported back to the model"
 grep -qF 'takes no' stub/request-4.json \
@@ -193,7 +218,7 @@ grep -qF '"is_error":true' stub/request-5.json \
 # cannot have advanced it. Asserted on the TURN TREE, not on the request — the
 # request replays the transcript, so an earlier round's text would match there
 # whatever happened to the tree.
-hello_after=$(git show "$turn:caos-tools/hello.sh")
+hello_after=$(git show "$turn:caos-tools/hello/worker.sh")
 case "$hello_after" in
   *hello-from-tree-v2*) ;;
   *) fail "the round-4 failure lost the workspace edit from round 2" ;;

@@ -125,7 +125,8 @@ pub fn grep_declaration() -> Value {
     })
 }
 
-// ---- Tree tools (caos-tools/*.sh — design/cargo-workers.md) -----------------
+// ---- Tree tools (caos-tools/<name>/, SPEC "Tools") -------------------------
+
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
 /// the file tools) must stay stable whatever the tree carries, and the
@@ -159,24 +160,30 @@ fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
 
 /// Arg names a tree tool may not declare: the interpreter binds these itself
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
-/// `wc`/`refs` are bound only for `#@git` tools, but reserved unconditionally
+/// `wc`/`refs` are bound only for `@git` tools, but reserved unconditionally
 /// so a tool can't declare a model arg the interpreter would then clobber.
-const RESERVED_ARGS: &[&str] = &["in", "worker1", "base", "std", "salt", "wc", "refs"];
+const RESERVED_ARGS: &[&str] = &[
+    "in", "worker1", "base", "std", "salt", "wc", "refs",
+    // The tool's own ArgTree binds `help` (SPEC, "Tools"), and `caos curry`
+    // refuses to rebind — so a tool declaring `@param help` would fail at
+    // invocation rather than here, where the model can be told why.
+    "help",
+];
 
-/// One tree tool as the registry sees it: its name, its `#@doc` description,
-/// and the `#@arg` parameters it accepts.
+/// One tree tool as the registry sees it: its name, its description, and the
+/// parameters it accepts — parsed from its javadoc `help` (SPEC, "Tools").
 pub struct TreeTool {
     pub name: String,
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// The tool declared `#@git`: bind the workspace commit (`wc`) and the
+    /// The tool declared `@git`: bind the workspace commit (`wc`) and the
     /// turn's ref snapshot (`refs`) so it can walk history. Off by default —
     /// `wc` changes every step, so binding it into a tool that doesn't need it
     /// (build/test) would turn every cache hit into a miss.
     pub git: bool,
 }
 
-/// One `#@arg` line: `#@arg <name> <description>` is required, `#@arg
+/// One `@param` tag: `@param <name> <description>` is required, `@param
 /// [<name>] <description>` optional. The name becomes the script's `--<name>`
 /// arg, readable at `/cas/args/<name>`.
 pub struct TreeArg {
@@ -185,7 +192,7 @@ pub struct TreeArg {
     pub required: bool,
 }
 
-/// Parse one `#@arg` line's payload (everything after the marker) into a
+/// Parse one `@param` tag's payload (everything after the tag) into a
 /// parameter. `None` — reported by the caller — for a malformed name, so a
 /// typo costs a visible skip rather than an arg the model can't use.
 fn parse_arg(payload: &str) -> Option<TreeArg> {
@@ -210,44 +217,135 @@ fn parse_arg(payload: &str) -> Option<TreeArg> {
     })
 }
 
-/// Read one tool script into its registry shape: the `#@doc` lines joined as
-/// the description, the `#@arg` lines as parameters.
-fn read_tool(name: &str, path: &str) -> Result<TreeTool, String> {
-    caos(["get", path])?;
-    let text = fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+/// Parse a tool's `help` string as a JAVADOC comment (SPEC, "Tools"): the free
+/// text before the first block tag is the description; `@param <name>` /
+/// `@param [<name>]` tags declare the parameters; a bare `@git` tag asks for the
+/// history context. Returns `(description, params, git)` — an empty description
+/// for the caller to placeholder. A malformed `@param` is skipped with a
+/// message. This is the DURABLE parser: Phase 4 feeds it the isolated `--help`
+/// here-string; today it is fed text lifted from the script header (below).
+fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
     let mut git = false;
+    let mut in_tags = false;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("#@doc") {
-            doc.push(rest.trim());
-        } else if line.trim_end() == "#@git" {
-            git = true;
-        } else if let Some(rest) = line.strip_prefix("#@arg") {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("@param") {
+            in_tags = true;
             match parse_arg(rest.trim()) {
                 Some(a) => args.push(a),
-                None => eprintln!("caos-tools/{name}.sh: unusable #@arg line: {line}"),
+                None => eprintln!("{ctx}: unusable @param tag: {line}"),
             }
+        } else if trimmed == "@git" {
+            in_tags = true;
+            git = true;
+        } else if !in_tags {
+            // Description text — everything before the first block tag.
+            doc.push(trimmed);
         }
     }
-    let doc = if doc.is_empty() {
-        format!("Project tool caos-tools/{name}.sh (no #@doc description).")
-    } else {
-        doc.join(" ")
+    (doc.join(" ").trim().to_string(), args, git)
+}
+
+/// The `help` string a tool's `.caos-expr` binds, read from the EXPRESSION'S
+/// OWN TEXT: a `HELP=<<END … END` here-string whose variable the value line
+/// passes as `--help=$HELP`, or a one-line `--help=<literal>`.
+///
+/// **Read, not evaluated, and that is the point.** Evaluating a tool would
+/// dispatch the runs its expression names (a compiled tool builds), and a
+/// worker may not block on a run — discovery happens mid-turn, in the middle of
+/// this worker's function, where there is no continuation to tail-call into. So
+/// listing reads the bytes the expression authors, and INVOCATION evaluates
+/// (`eval-path-then`). The two agree because they read the same here-string:
+/// the arg tree's `--help` is this text.
+///
+/// `None` when the expression binds no `help` — a directory that is not a tool,
+/// or a tool whose docs went missing; the caller says which and skips it.
+fn expr_help(expr: &str) -> Option<String> {
+    let mut here: Vec<(String, String)> = Vec::new();
+    let mut value_lines: Vec<&str> = Vec::new();
+    let lines: Vec<&str> = expr.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        i += 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `NAME=<<TERM` opens a here-string: the body runs to a line equal to
+        // TERM, exactly as the evaluator reads it (design/caos-expr.md).
+        if let Some((name, term)) = line.split_once("=<<") {
+            if !term.is_empty() && !term.contains(char::is_whitespace) {
+                let mut body: Vec<&str> = Vec::new();
+                while i < lines.len() && lines[i].trim() != term {
+                    body.push(lines[i]);
+                    i += 1;
+                }
+                i += 1; // the terminator
+                here.push((name.to_string(), body.join("\n")));
+                continue;
+            }
+        }
+        value_lines.push(lines[i - 1]);
+    }
+    // `--help=…` on any command line: a `$VAR` names a here-string above, and
+    // anything else is the literal itself.
+    for line in value_lines {
+        for tok in line.split_whitespace() {
+            let Some(value) = tok.strip_prefix("--help=") else {
+                continue;
+            };
+            return match value.strip_prefix('$') {
+                Some(var) => here
+                    .iter()
+                    .find(|(name, _)| name == var)
+                    .map(|(_, body)| body.clone()),
+                None => Some(value.to_string()),
+            };
+        }
+    }
+    None
+}
+
+/// Read one tool directory into its registry shape: the `help` its
+/// `.caos-expr` binds, parsed into a description and parameters.
+fn read_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
+    // Materialize the directory's own entries first. A `caos get` is SHALLOW:
+    // the parent fetch made this directory exist, but nothing inside it —
+    // without this, every tool looks like a directory with no `.caos-expr` and
+    // the whole registry comes back empty (it did).
+    caos(["get", dir])?;
+    let path = format!("{dir}/.caos-expr");
+    if !Path::new(&path).is_file() {
+        return Ok(None);
+    }
+    caos(["get", &path])?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
+    let Some(help) = expr_help(&text) else {
+        eprintln!("caos-tools/{name}/.caos-expr binds no --help — not registered as a tool");
+        return Ok(None);
     };
-    Ok(TreeTool {
+    let (doc, args, git) = parse_help(&format!("caos-tools/{name}/.caos-expr"), &help);
+    let doc = if doc.is_empty() {
+        format!("Project tool caos-tools/{name} (no description).")
+    } else {
+        doc
+    };
+    Ok(Some(TreeTool {
         name: name.to_string(),
         doc,
         args,
         git,
-    })
+    }))
 }
 
-/// Discover the tree-defined tools: `caos-tools/*.sh`, each with the
-/// description from its `#@doc ` lines and the parameters from its `#@arg`
-/// lines. Resolved fresh from the CURRENT workspace every round, so an agent
-/// that adds, edits, or removes a tool sees the change on its next request.
-/// Reserved names are skipped loudly; subdirectories are helpers, not tools.
+/// Discover the tree-defined tools: each CHILD DIRECTORY of `caos-tools/` that
+/// carries a `.caos-expr`, described by the `help` that expression binds.
+/// Resolved fresh from the CURRENT workspace every round, so an agent that
+/// adds, edits, or removes a tool sees the change on its next request.
+/// Reserved names are skipped loudly; a directory with no `.caos-expr`, or one
+/// whose expression binds no `--help`, is not a tool.
 pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
     let Some(dir) = tree_tools_dir(ws)? else {
         return Ok(Vec::new());
@@ -260,24 +358,23 @@ pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
     names.sort();
 
     let mut out = Vec::new();
-    for fname in names {
-        let Some(name) = fname.strip_suffix(".sh") else {
-            continue;
-        };
-        let p = format!("{dir}/{fname}");
-        if !Path::new(&p).is_file() {
+    for name in names {
+        let p = format!("{dir}/{name}");
+        if !Path::new(&p).is_dir() {
             continue;
         }
-        if RESERVED_TOOLS.contains(&name) {
-            eprintln!("caos-tools/{fname} shadows the built-in {name:?} tool — ignored");
+        if RESERVED_TOOLS.contains(&name.as_str()) {
+            eprintln!("caos-tools/{name} shadows the built-in {name:?} tool — ignored");
             continue;
         }
-        out.push(read_tool(name, &p)?);
+        if let Some(tool) = read_tool(&name, &p)? {
+            out.push(tool);
+        }
     }
     Ok(out)
 }
 
-/// One discovered tool's registry entry. A tool with no `#@arg` lines takes
+/// One discovered tool's registry entry. A tool with no `@param` tags takes
 /// no parameters — the workspace tree IS its input — and one with them takes
 /// them as strings, since every arg reaches the script as a `/cas/args/<name>`
 /// blob whatever JSON type it left the model as.
@@ -304,22 +401,23 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
     })
 }
 
-/// Resolve tool `name` in the CURRENT workspace — invocation-time lookup, so
-/// a call made right after an edit runs the edited script. `None` when the
-/// tree doesn't define it (or the name is reserved / not a clean filename).
-pub fn tree_tool_script(ws: &str, name: &str) -> Result<Option<(String, TreeTool)>, String> {
+/// Resolve tool `name` in the CURRENT workspace — invocation-time lookup, so a
+/// call made right after an edit runs the edited tool. Returns the tool's
+/// registry entry; its ArgTree comes from EVALUATING `caos-tools/<name>`, which
+/// only the server can do for a worker (see `launch_tree_tool`). `None` when
+/// the tree doesn't define it (or the name is reserved / not a clean name).
+pub fn tree_tool(ws: &str, name: &str) -> Result<Option<TreeTool>, String> {
     if RESERVED_TOOLS.contains(&name) || name.contains('/') || name.contains("..") {
         return Ok(None);
     }
     let Some(dir) = tree_tools_dir(ws)? else {
         return Ok(None);
     };
-    let p = format!("{dir}/{name}.sh");
-    if !Path::new(&p).is_file() {
+    let p = format!("{dir}/{name}");
+    if !Path::new(&p).is_dir() {
         return Ok(None);
     }
-    let tool = read_tool(name, &p)?;
-    Ok(Some((p, tool)))
+    read_tool(name, &p)
 }
 
 /// Bind a tree-tool call's inputs to the parameters the script declared,
@@ -923,6 +1021,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_help_splits_description_and_params() {
+        let help = "Print one test's record.\n\
+                    A second description line.\n\
+                    @param hash The record hash.\n\
+                    @param [log] Which inner-stack log.";
+        let (doc, args, git) = parse_help("t", help);
+        assert_eq!(doc, "Print one test's record. A second description line.");
+        assert!(!git);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].name, "hash");
+        assert!(args[0].required);
+        assert_eq!(args[0].doc, "The record hash.");
+        assert_eq!(args[1].name, "log");
+        assert!(!args[1].required);
+    }
+
+    #[test]
+    fn parse_help_git_tag_and_no_params() {
+        let (doc, args, git) = parse_help("t", "Just a description.\n@git");
+        assert_eq!(doc, "Just a description.");
+        assert!(git);
+        assert!(args.is_empty());
+
+        // Empty help → empty description (the caller placeholders it) and no args.
+        let (doc, args, git) = parse_help("t", "");
+        assert!(doc.is_empty());
+        assert!(args.is_empty());
+        assert!(!git);
+    }
+
+    #[test]
+    fn parse_help_skips_reserved_and_malformed_params() {
+        // `in` is reserved; `Bad` is not a lowercase name → both skipped, the
+        // good one survives.
+        let (_doc, args, _git) =
+            parse_help("t", "d\n@param in nope\n@param Bad nope\n@param ok yes");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "ok");
+    }
+
+    #[test]
+    fn expr_help_reads_the_here_string_the_value_line_names() {
+        let expr = "# a comment\n\
+                    HELP=<<END\n\
+                    A tool.\n\
+                    @param x The x.\n\
+                    END\n\
+                    curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP\n";
+        assert_eq!(expr_help(expr).as_deref(), Some("A tool.\n@param x The x."));
+    }
+
+    #[test]
+    fn expr_help_takes_a_literal_and_reports_none() {
+        assert_eq!(
+            expr_help("curry --base:@=DEEP-DEPS/bash --help=terse\n").as_deref(),
+            Some("terse")
+        );
+        // A directory whose expression binds no help is not a tool.
+        assert_eq!(expr_help("run --base:@=DEEP-DEPS/bash --in:@=.\n"), None);
+        // A `$VAR` naming no here-string is not help either.
+        assert_eq!(expr_help("curry --base:@=x --help=$NOPE\n"), None);
+    }
     fn oid_shape() {
         assert!(valid_oid(&"a".repeat(40))); // sha1
         assert!(valid_oid(&"0".repeat(64))); // sha256
@@ -1021,7 +1181,7 @@ mod tests {
         // Only the required ones are listed, so an optional arg can be omitted.
         assert_eq!(d["input_schema"]["required"], json!(["hash"]));
 
-        // No #@arg lines: an empty properties object and NO `required` key —
+        // No @param tags: an empty properties object and NO `required` key —
         // an empty required array is not valid JSON Schema for the API.
         let bare = TreeTool {
             name: "build".to_string(),

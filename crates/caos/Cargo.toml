@@ -39,3 +39,6 @@ serde_json = "1"
 
 [dependencies.caos-world]
 path = "../caos-world"
+
+[dependencies.caos-eval]
+path = "../caos-eval"

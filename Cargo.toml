@@ -4,6 +4,7 @@ members = [
     "crates/caos",
     "crates/caos-cli",
     "crates/caos-world",
+    "crates/caos-eval",
     "crates/bake-anchor",
     "crates/runnerd",
     "crates/server",

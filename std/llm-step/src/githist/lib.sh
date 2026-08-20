@@ -4,7 +4,7 @@
 # `caos put`s the result as the worker script). NOT read from the workspace —
 # these tools ship with the harness.
 #
-# A `#@git`-style launch gives the worker `/cas/args/wc` (the workspace commit,
+# A `@git`-style launch gives the worker `/cas/args/wc` (the workspace commit,
 # materialized as the raw commit object) and `/cas/args/refs` (the turn's
 # `name <hash>` snapshot). From those two entry points every reachable object is
 # one `caos get-hash` away — a commit checks out as its raw bytes, a tree as a

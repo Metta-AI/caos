@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # std/bash/worker is this script's only copy; the suite's image jobs
-# (caos-tools/build.sh) read it here.
+# (caos-tools/build/worker.sh) read it here.
 # (env shebang: the flake image this defines (std/bash) has
 # bash at /bin/bash, but the nix-builder images have only the nix profile's —
 # /usr/bin/env, which the flake-builder's caos delta guarantees, is the

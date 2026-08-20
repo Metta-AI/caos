@@ -143,6 +143,33 @@ cat > pkg-self/.caos-expr <<'EOF'
 run --base:@=bash --worker1:@=show.sh --in:@=. --expr=$CAOS_EXPR
 EOF
 
+# A HERE-STRING binds a literal blob inline (design/caos-expr.md). `--name=$NAME`
+# where NAME's body is `world` is byte-identical to pkg-direct's `--name:@=name`
+# (the `name` file is `echo world` = "world\n"), so the whole arg tree — and its
+# result hash — must match pkg-direct. This asserts a here-string is exactly the
+# `--k=value`/`:@=file` blob, only authored inline.
+mkdir -p pkg-here
+cp pkg-direct/build.sh pkg-here/build.sh
+cp -r "$BASH" pkg-here/bash
+cat > pkg-here/.caos-expr <<'EOF'
+NAME=<<END
+world
+END
+run --base:@=bash --worker1:@=build.sh --name=$NAME
+EOF
+
+# A here-string in IMAGE position is an error: a blob is not an image.
+mkdir -p pkg-here-bad
+cp pkg-direct/build.sh pkg-here-bad/build.sh
+cp pkg-direct/name pkg-here-bad/name
+cp -r "$BASH" pkg-here-bad/bash
+cat > pkg-here-bad/.caos-expr <<'EOF'
+IMG=<<END
+not-an-image
+END
+run --base=$IMG --name:@=name
+EOF
+
 commit "eval-path fixtures"
 
 echo "== eval-path evaluates a directory's .caos-expr ==" >&2
@@ -204,5 +231,19 @@ echo "== a repeated eval is a cache hit (same hash) ==" >&2
 out3=$("$CAOS_CLI" eval-path pkg-direct)
 [ "${out3##* }" = "$hash" ] || fail "rerun differs: $out3 vs $hash"
 echo "  ok: identical eval -> identical result" >&2
+
+echo "== a here-string --k=\$NAME is the byte-identical blob to :@=file ==" >&2
+out_here=$("$CAOS_CLI" eval-path pkg-here) || fail "eval-path pkg-here failed"
+[ "${out_here##* }" = "$hash" ] \
+  || fail "here-string form differs: $out_here vs tree $hash"
+echo "  ok: --name=\$NAME (here-string 'world') converged on pkg-direct's result" >&2
+
+echo "== a here-string in image position is rejected ==" >&2
+if "$CAOS_CLI" eval-path pkg-here-bad 2>here-bad.err; then
+  fail "eval-path pkg-here-bad should have failed"
+fi
+grep -qF 'here-string' here-bad.err \
+  || fail "expected a here-string/image error, got: $(cat here-bad.err)"
+echo "  ok: \$IMG (a blob) rejected as an image" >&2
 
 echo "eval-path: ALL PASS" >&2

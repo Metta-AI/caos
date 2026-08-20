@@ -286,6 +286,41 @@ fn run_then_inner(input: &str, run: Arg, then: Option<Arg>, catch: bool) -> Resu
     caos_argv(&str_refs(&argv))
 }
 
+/// Eval-then: the evaluation sibling of [`run_then`]. Record a continuation
+/// `{in, eval, then?}` over `input` (a CAS path) as this worker's result — the
+/// SERVER walks `.caos-expr` from `input`'s root down to `path` (blocking a
+/// request thread, not this worker) and threads the result R into
+/// `then(--in=<input>, --result=<R>)`, or returns R with no `then`. This is how
+/// a worker gets a `.caos-expr` evaluated: it may not block on a run, so it asks
+/// the server to (design/caos-expr.md). Like [`run_then`], a worker's final act.
+pub fn eval_then(input: &str, path: &str, then: Option<Arg>) -> Result<(), String> {
+    eval_then_inner(input, path, then, false)
+}
+
+/// [`eval_then`] with `--catch`: a FAILED walk reaches `then` as `--error=<blob>`
+/// instead of failing the request. `then` is required.
+pub fn eval_then_catching(input: &str, path: &str, then: Arg) -> Result<(), String> {
+    eval_then_inner(input, path, Some(then), true)
+}
+
+fn eval_then_inner(input: &str, path: &str, then: Option<Arg>, catch: bool) -> Result<(), String> {
+    // `--eval` is the one non-image entry in a continuation: the PATH is
+    // recorded verbatim, so it stays a plain literal while `then` is typed like
+    // every other image ref.
+    let mut argv: Vec<String> = vec![
+        "eval-path-then".into(),
+        input.into(),
+        format!("--eval={path}"),
+    ];
+    if let Some(then) = then {
+        argv.push(then.token("then"));
+    }
+    if catch {
+        argv.push("--catch".into());
+    }
+    caos_argv(&str_refs(&argv))
+}
+
 fn str_refs(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }

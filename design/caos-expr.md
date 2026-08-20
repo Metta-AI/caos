@@ -19,6 +19,33 @@ Examples:
     curry --base:hash=<runner-oid> --worker1=$FOO
   ```
   Variable names are `[A-Z][A-Z0-9_]*`; the verbs are lowercase, so a line is an assignment iff it starts `NAME=run`/`NAME=curry`. `--base=$NAME` names the object that variable produced; `--k=$NAME` binds that object by reference (at its own kind); `--k=value` is a literal blob. (This replaces an earlier `$( ... )` command-substitution sketch — the variable form is easier to write, read and parse.)
+- A variable may instead be bound to a **here-string**: a literal blob whose
+  bytes are written inline rather than named as a path. `NAME=<<TERM` opens one;
+  every following line up to a line equal to `TERM` is the content (the
+  terminator line itself excluded), and the value is the bytes between the
+  opener's newline and the terminator — i.e. a blob that ends in a trailing
+  newline:
+  ```
+    HELP=<<END
+    Build the stack image from the tree.
+    @param [stage] which phase to run
+    END
+    W=run --base:@=<builder> --in:@=.
+    curry --base=$W --help=$HELP
+  ```
+  A here-string binds a BLOB-valued variable (unlike `NAME=run`/`NAME=curry`,
+  which bind an object). In arg position `--k=$NAME` is then exactly the literal
+  `--k=value` would be, only multi-line and free of the whitespace-token limit;
+  in `--base` position a blob variable is an error. `--k=$HELP` and
+  `--k:@=help.txt` produce the byte-identical blob — a here-string changes only
+  WHERE the bytes are authored, not the resulting arg tree.
+- This is what lets a tool carry its `--help` docs (SPEC, "Tools") as a literal
+  on the OUTER curry without the bytes landing in the tree the build sees. The
+  text lives in the `.caos-expr`, which is stripped from the directory before
+  evaluation (below), so a `--in:@=.` builder never sees it and editing the docs
+  leaves the build a cache hit while re-keying only the tool's own arg tree —
+  the identity split the docs need, expressed by structure rather than by a
+  special rule.
 - **`$CAOS_EXPR` is pre-bound and reserved: this `.caos-expr`'s own blob.** Assigning it is an error. It exists because the stripping rule below removes the directive from the tree the expression is evaluated against, so `--k:@=.caos-expr` names a file that is not there — measured, not assumed: `eval-path: path ".caos-expr" not found in tree`. A worker that must VERIFY the expression which launched it therefore has no other route; the consumer-input expander (design/flake-inputs.md) checks its own locators against the consumer's `flake.lock` this way. Hermetic, unlike reaching for the host with `:@@=path:.caos-expr`: the blob comes from the tree being evaluated, so it stays right under `eval-path --tree=<oid>` and when a third repo pins this one by locator. Passing it opts the expression's own bytes into the cache key — a comment edit then re-keys that run, which is the price of making the text an input.
 - A `run` expression evaluates to the run's result; a `curry` expression to the curried ArgTree. In practice we dig into `run` results, not through `curry`.
 
@@ -41,12 +68,27 @@ Examples:
   source directory. Nothing recurses, because the stripping rule above has
   already made a self-reference land on a tree with no directive. (This is also
   what propagates secret isolation to a caller — design/secrets.md.)
+- **Who runs the walk.** Evaluating a `run`-valued expression dispatches runs and
+  BLOCKS on them, so the walk runs where blocking is legal: the CLIENT (top
+  level, holds no runner slot) or the SERVER (a request thread). A worker may
+  not block, so it asks the server instead — `caos eval-path-then <in>
+  --eval=<path> [--then:<t>=<img>]`, the evaluation sibling of `run-then`
+  (design/map-then.md). Both drive the same walk (the `caos-eval` crate, behind
+  an `EvalHost` that differs only in how a `run` is dispatched), so the object
+  the server builds is byte-identical to the client's — `tests/eval-then`
+  asserts it. The exception is `:@@=`: a locator is resolved by the CLIENT only,
+  because it must become an oid before the request is formed, or the URL would
+  sit inside the cache key (design/flake-inputs.md).
 - There is no lazy evaluation here
 - `eval-path` converts the expression into an arg tree and then requests that the arg tree is run, providing normal caching
 
-Coas use `eval-path` in several places:
-- To find tools to register with an agent: `eval-path caos-tools`
-- When an agent requests a tool: `eval-path caos-tools/<tool>` to generate the tool
+Caos uses `eval-path` in several places:
+- When an agent requests a tool: `eval-path caos-tools/<tool>` yields the
+  tool's ArgTree — reached by the agent's worker as `eval-path-then`, and by
+  `caos-cli run-tool` directly. REGISTERING the tools does not evaluate: the
+  listing reads each `caos-tools/<name>/.caos-expr` for its `--help`
+  here-string, because a worker assembling the round's registry cannot block,
+  and listing a compiled tool should not build it (SPEC, "Tools")
 - When running an image: `eval-path <image>`
 
 This replaces many other mechanisms:
@@ -426,8 +468,11 @@ founding note), so the harness now runs the real worker instead:
 - **Getting the transform's own image took two rules seriously.** A worker
   cannot name `/cas/std/deep-deps` and get an image: `resolve_run_image` reads a
   /cas path as the object it was made from, so the sentinel entry arrives as its
-  own one-file tree. Evaluation is a CLIENT capability and must stay one —
-  `eval_path` on a `run` blocks, which is exactly what a worker may not do. And
+  own one-file tree. Evaluating it IN THE WORKER is what cannot happen —
+  `eval_path` on a `run` blocks, which is exactly what a worker may not do.
+  (Since Phase 3 a worker can hand the walk to the SERVER instead, with
+  `eval-path-then`; that was not available when this was written, and where the
+  answer is a single known sentinel run it is still the longer way round.) And
   the build's own seed record can't stand in: that image is built from the tree
   under test, a `test`-world binary the outer `host` server refuses to serve
   ("caos world mismatch", measured). Both dissolve at once, because

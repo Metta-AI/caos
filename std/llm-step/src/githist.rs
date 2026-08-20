@@ -1,10 +1,10 @@
 //! The built-in git-history tools — `log`, `show`, `diff`. Standard tools
-//! shipped with the harness (not project `caos-tools/*.sh`), so every stack
+//! shipped with the harness (not project `caos-tools/<name>/`), so every stack
 //! that can run tree tools gets them.
 //!
 //! They are ordinary sub-run tools, launched exactly like a tree tool: the
 //! script (this module's embedded shell) rides curried on the std/bash image,
-//! with the `#@git` context — the workspace commit `wc` and the ref snapshot
+//! with the `@git` context — the workspace commit `wc` and the ref snapshot
 //! `refs` — bound alongside the model's args. From `wc` the shell walks the
 //! commit graph by hash and shells out to `diff`; no git binary, no new image.
 //! The result is a VALUE (a text report), rendered by the same callback arm as

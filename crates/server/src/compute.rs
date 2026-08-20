@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::storage::{fetch_blob, fetch_tree, store_git_blob, store_git_tree};
+use crate::storage::{fetch_blob, fetch_object, fetch_tree, store_git_blob, store_git_tree};
 use crate::{Config, HttpError};
 
 /// Repository name converted images are pushed under. They're addressed by
@@ -811,10 +811,85 @@ fn broadcast(waiters: Vec<mpsc::Sender<Outcome>>, outcome: &Outcome) {
 
 // ---- Promise resolution ------------------------------------------------------
 
+/// The SERVER backend for the shared `.caos-expr` walk (crate `caos-eval`): CAS
+/// over the in-process object database, and a `run` dispatched by [`run_image`]
+/// — which blocks THIS request thread (never a worker slot), exactly as
+/// [`resolve_promise`]'s own `run` step does. This is what lets a worker request
+/// evaluation server-side, via an `eval` continuation, and get the byte-identical
+/// object a client `eval-path` would build. Marking is a no-op: server-side
+/// secret marking through eval is deferred (tools use no secrets).
+struct ServerEvalHost<'a> {
+    config: &'a Config,
+    salt: &'a str,
+    stack: &'a [String],
+    trace_id: Option<&'a str>,
+    secrets: &'a [crate::secrets::Grant],
+}
+
+impl caos_eval::EvalHost for ServerEvalHost<'_> {
+    fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
+        fetch_object(self.config, oid)
+    }
+    fn post_object(&self, kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
+        if kind != "blob" {
+            return Err(format!("eval host can only post blobs, got {kind}"));
+        }
+        store_git_blob(self.config, bytes)
+    }
+    fn fetch_tree_entries(
+        &self,
+        tree: &str,
+    ) -> Result<Option<Vec<gix::objs::tree::Entry>>, String> {
+        // Match the client's fetch_tree_entries exactly: `None` for a non-tree,
+        // parsed straight from the object bytes (one fetch).
+        let (kind, content) = fetch_object(self.config, tree)?;
+        if kind != "tree" {
+            return Ok(None);
+        }
+        let parsed = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+            .map_err(|e| format!("malformed tree {tree}: {e}"))?;
+        Ok(Some(
+            parsed
+                .entries
+                .iter()
+                .map(|e| gix::objs::tree::Entry {
+                    mode: e.mode,
+                    filename: e.filename.to_vec().into(),
+                    oid: e.oid.to_owned(),
+                })
+                .collect(),
+        ))
+    }
+    fn post_tree(&self, entries: Vec<gix::objs::tree::Entry>) -> Result<gix::ObjectId, String> {
+        store_git_tree(self.config, entries)
+    }
+    fn dispatch(
+        &self,
+        image: &str,
+        entries: Vec<gix::objs::tree::Entry>,
+    ) -> Result<(String, String), String> {
+        let result = run_image(
+            self.config,
+            image,
+            entries,
+            self.salt,
+            self.stack,
+            self.trace_id,
+            self.secrets,
+        )
+        .map_err(|e| e.message().to_string())?;
+        // run_image returns "<kind> <hash>".
+        let (kind, hash) = result
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed run result {result:?}"))?;
+        Ok((kind.to_string(), hash.to_string()))
+    }
+}
+
 /// Resolve a continuation — either `{in, map?|run?|then?, catch?}` or
 /// `{request, then?, catch?}`. `request` is a tree entry naming an already
 /// complete ArgTree, executed unchanged; `map`/`run`/`then` are blobs naming
-/// images. The three middle forms `map`/`run`/`request` are mutually exclusive
+/// images. The four middle forms `map`/`run`/`request`/`eval` are mutually exclusive
 /// (the client already refuses to record both; this is defense in depth). One
 /// resolution path covers both forms — a *middle step*, then `then`:
 ///
@@ -824,21 +899,23 @@ fn broadcast(waiters: Vec<mpsc::Sender<Outcome>>, outcome: &Outcome) {
 /// 2. if `run` is given: one sub-run, `run(--in=<in>)` — the single-valued
 ///    form. Its result R may be any kind (a commit as much as a blob/tree);
 /// 3. if `request` is given: run exactly that ArgTree, adding no args;
-/// 4. `then` receives the available args: `--in` for the image forms, plus
+/// 4. if `eval` is given: walk `.caos-expr` from `in`'s root down to that path,
+///    server-side, and its result R is the value (see `ServerEvalHost`);
+/// 5. `then` receives the available args: `--in` for the image forms, plus
 ///    `--children`/`--result`; the exact-request form passes only `--result`.
 ///
 /// Every sub-run goes through [`run_work_request`], so promises nest arbitrarily (a map
 /// child, a `run`, or a `then` may itself promise) and each sub-run gets its
 /// own memoization and cycle detection (via `stack`).
 ///
-/// **`catch`** (a marker blob, `run` or `request`) makes a failing middle step a
+/// **`catch`** (a marker blob, `run`, `request` or `eval`) makes a failing middle step a
 /// value `then` receives as `--error=<blob>`, exactly where `--result` would
 /// have been. Without it a failed sub-run fails the whole
 /// request, which is the right default for a pipeline — but wrong for a driver
 /// that must survive its callee, the agent loop being the case that forced it
 /// (`design/agent-harness.md`, "Tool failures are values"). A caught `map`
 /// would have to say WHICH child failed and what the surviving siblings'
-/// results mean, so catch remains single-valued (`run` or `request`).
+/// results mean, so catch remains single-valued (`run`, `request` or `eval`).
 ///
 /// The bool in the return says a catch fired. It rides out to [`run_dispatch`]
 /// so the enclosing request is NOT memoized: sub-run failures are uncached by
@@ -859,6 +936,7 @@ fn resolve_promise(
     let mut input: Option<gix::objs::tree::Entry> = None;
     let mut request: Option<String> = None;
     let (mut map, mut run, mut then) = (None, None, None);
+    let mut eval = None;
     let mut catch = false;
     for entry in fetch_tree(config, cont)
         .map_err(|e| HttpError::new(500, format!("reading continuation {cont}: {e}")))?
@@ -875,6 +953,9 @@ fn resolve_promise(
             "map" => map = Some(blob_string(config, &entry.oid.to_string())?),
             "run" => run = Some(blob_string(config, &entry.oid.to_string())?),
             "then" => then = Some(blob_string(config, &entry.oid.to_string())?),
+            // The PATH to evaluate (a blob, not an image): the middle step walks
+            // `.caos-expr` from `in`'s root down to it. See `ServerEvalHost`.
+            "eval" => eval = Some(blob_string(config, &entry.oid.to_string())?),
             // Presence is the whole signal; the content is unread.
             "catch" => catch = true,
             other => {
@@ -891,6 +972,7 @@ fn resolve_promise(
         map.is_some(),
         run.is_some(),
         request.is_some(),
+        eval.is_some(),
         then.is_some(),
         catch,
     )?;
@@ -984,6 +1066,29 @@ fn resolve_promise(
             ),
             catch,
         )?)
+    } else if let Some(path) = &eval {
+        let input = input.as_ref().expect("validated input");
+        // Walk `.caos-expr` from `in`'s root down to `path`, on THIS request
+        // thread — its own `run`s dispatch through `run_image`, so cycle
+        // detection, memoization and secret grants all ride the same `stack`/
+        // `secrets`, and the object built is byte-identical to a client
+        // `eval-path`. `catch` turns a failed walk into `--error`, like `run`.
+        let host = ServerEvalHost {
+            config,
+            salt,
+            stack,
+            trace_id,
+            secrets,
+        };
+        let evaluated = caos_eval::eval_path(&host, &input.oid.to_string(), path)
+            .map(|(kind, hash)| format!("{kind} {hash}"))
+            .map_err(|e| {
+                HttpError::new(
+                    500,
+                    format!("eval-path {path:?} in continuation {cont}: {e}"),
+                )
+            });
+        Some(continuation_result(config, cont, evaluated, catch)?)
     } else {
         None
     };
@@ -1025,15 +1130,19 @@ fn validate_continuation_shape(
     has_map: bool,
     has_run: bool,
     has_request: bool,
+    has_eval: bool,
     has_then: bool,
     catch: bool,
 ) -> Result<(), HttpError> {
-    let middle_count = usize::from(has_map) + usize::from(has_run) + usize::from(has_request);
+    let middle_count = usize::from(has_map)
+        + usize::from(has_run)
+        + usize::from(has_request)
+        + usize::from(has_eval);
     if middle_count > 1 {
         return Err(HttpError::new(
             500,
             format!(
-                "continuation {cont} has more than one of 'map', 'run', and 'request' (they are mutually exclusive)"
+                "continuation {cont} has more than one of 'map', 'run', 'request', and 'eval' (they are mutually exclusive)"
             ),
         ));
     }
@@ -1052,16 +1161,16 @@ fn validate_continuation_shape(
     if middle_count == 0 && !has_then {
         return Err(HttpError::new(
             500,
-            format!("continuation {cont} has none of 'map', 'run', 'request', or 'then'"),
+            format!("continuation {cont} has none of 'map', 'run', 'request', 'eval', or 'then'"),
         ));
     }
     // Both checked here rather than client-side only: a continuation is a tree
     // any worker can hand us, so the interpreter states its own contract.
-    if catch && !has_run && !has_request {
+    if catch && !has_run && !has_request && !has_eval {
         return Err(HttpError::new(
             500,
             format!(
-                "continuation {cont} has 'catch' without 'run' or 'request' (catch covers one exact step)"
+                "continuation {cont} has 'catch' without 'run', 'request' or 'eval' (catch covers one fallible step)"
             ),
         ));
     }
@@ -2479,9 +2588,57 @@ mod continuation_shape_tests {
             has_map,
             has_run,
             has_request,
+            false,
             has_then,
             catch,
         )
+    }
+
+    /// The `eval` middle step obeys the same shape rules as `run`: exclusive
+    /// with the other middle forms, needs `in`, and a `catch` needs a `then`.
+    fn eval_shape(
+        has_input: bool,
+        has_other_middle: bool,
+        has_then: bool,
+        catch: bool,
+    ) -> Result<(), HttpError> {
+        validate_continuation_shape(
+            "test-continuation",
+            has_input,
+            has_other_middle,
+            false,
+            false,
+            true,
+            has_then,
+            catch,
+        )
+    }
+
+    #[test]
+    fn eval_is_exclusive_with_the_other_middle_steps() {
+        let error = eval_shape(true, true, false, false).unwrap_err();
+        assert!(
+            error.message().contains("mutually exclusive"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn eval_runs_alone_or_with_a_callback() {
+        assert!(eval_shape(true, false, false, false).is_ok());
+        assert!(eval_shape(true, false, true, false).is_ok());
+    }
+
+    #[test]
+    fn eval_catch_requires_a_callback() {
+        let error = eval_shape(true, false, false, true).unwrap_err();
+        assert!(
+            error.message().contains("without 'then'"),
+            "{}",
+            error.message()
+        );
+        assert!(eval_shape(true, false, true, true).is_ok());
     }
 
     #[test]

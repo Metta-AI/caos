@@ -75,7 +75,7 @@ Caos is reliable because:
 Caos is fast because:
 - It caches work based on the ArgTree. The same work is never run a second time
 - It takes pains to narrow trees before using them as keys, to avoid cache misses
-    - For example, caos-tools/build.sh narrows the tree to just what the flake needs to build the stackbuilder image. Then it passes just the source files when running the stack-builder to build a stack
+    - For example, caos-tools/build narrows the tree to just what the flake needs to build the stackbuilder image. Then it passes just the source files when running the stack-builder to build a stack
     - Compare with calculating custom keys based on a subset of the data: this causes stale values when it goes wrong
     - Compare with
 - It calculates keys quickly:
@@ -250,42 +250,71 @@ Agents, add more notes here
 
 # Tools
 
-A tool is a worker script at `caos-tools/<name>.sh`, run as an ordinary caos
-job over the workspace tree. It has TWO callers and one contract: an agent's
-tool call (`worker-llm-step`), and `caos-cli run-tool <name> [--k=v ...]` by
-hand. Both build the same ArgTree, so a tool cannot behave differently
-depending on who invoked it.
-
-## Invocation
-
-- The job is `curry(<tools image>, worker1=<the script>, <declared args>)` run
-  with the workspace tree as `--in`
-- Tools are discovered fresh from the CURRENT workspace on every LLM round and
-  resolved again at INVOCATION time, so an agent that edits a tool sees the
-  change on its next call, within the same turn
-- `bash`, `grep`, `read`, `ls`, `write` and `edit` are reserved. A
-  `caos-tools/bash.sh` is ignored, not registered — the model's primitives,
-  including the repair path for a broken tool edit, stay stable whatever the
-  tree carries
-- Subdirectories of `caos-tools/` are helpers, not tools
+Tools are workers that the llm can call directly
 
 ## Declaring a tool
 
-Marker lines in the script's header comment:
+A tool is a directory in `caos-tools` with a `.caos-expr` that returns an arg tree that includes a `help` that has a string value. The string describes how the tool should be called. The tool is run an ordinary caos job over the workspace tree. It has TWO callers and one contract: an agent's tool call (`worker-llm-step`), and `caos-cli run-tool <name> [--k=v ...]` by hand. Both build the same ArgTree, so a tool cannot behave differently depending on who invoked it
 
-- `#@doc <text>` — one or more lines, joined, become the tool's description.
-  A tool with none gets a placeholder
-- `#@arg <name> <description>` — a REQUIRED parameter
-- `#@arg [<name>] <description>` — an OPTIONAL parameter
+The `help` string is a JAVADOC comment, and it is authored as a HERE-STRING in
+the expression itself (design/caos-expr.md):
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `std` and `salt`
-are refused: the interpreter binds those itself and currying SHALL fail on a
-rebind. A malformed `#@arg` line is skipped with a message, never silently
+```
+HELP=<<END
+Print one test's complete record from a `test` run.
+@param hash The hash the `test` report prints beside a test's name.
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
+```
+
+Authoring it there rather than in the script is what SPLITS the two
+identities: a `.caos-expr` is stripped from the tree its own expression is
+evaluated against, so editing the docs re-keys the tool's ArgTree — the thing
+a caller runs — and re-keys NOTHING the tool builds from.
+
+**Listing READS the expression; invoking EVALUATES it.** An agent's tool
+registry is assembled mid-turn, inside a worker, which may not block on the
+runs an evaluation dispatches — and evaluating a compiled tool would build it
+just to list it. So discovery takes the `help` bytes straight out of the
+`.caos-expr` text, and invocation evaluates. The two agree because they name
+the same here-string. A directory whose expression binds no `--help` is not a
+tool; it is skipped, loudly.
+
+The free text before the first block tag is the tool's description (a tool
+with none gets a placeholder); `@param` tags declare the parameters:
+- `@param <name> <description>` — a REQUIRED parameter
+- `@param [<name>] <description>` — an OPTIONAL parameter
+
+The bracketed name is the one extension over stock javadoc, which has no
+notion of an optional parameter.
+
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `std`, `salt` and
+`help` are refused: the interpreter, or the tool's own expression, binds those
+itself and currying SHALL fail on a rebind. A malformed `@param` tag is skipped
+with a message, never silently
 turned into an arg the model cannot use.
 
 Every parameter is declared to the model as a string, because every arg
 reaches the script as a blob whatever JSON type it left the model as. A tool
-with no `#@arg` lines takes no parameters: the workspace tree IS its input.
+with no `@param` tags takes no parameters: the workspace tree IS its input.
+
+## Invocation
+
+- The job is `curry(<tool arg tree>, <declared args>)` run with the workspace
+  tree as `--in`, where `<tool arg tree>` is what evaluating
+  `caos-tools/<name>` yields
+- The two callers reach that evaluation differently, and must land on the same
+  ArgTree: `caos-cli run-tool` evaluates directly (a client may block), while
+  an agent's worker tail-calls `eval-path-then` and curries in the callback
+  (design/map-then.md). A hand-run and an agent call are then one cache entry
+- Tools are discovered fresh from the CURRENT workspace on every LLM round and
+  resolved again at INVOCATION time, so an agent that edits a tool sees the
+  change on its next call, within the same turn
+- `bash`, `grep`, `read`, `ls`, `write` and `edit` are reserved. A
+  `caos-tools/bash/` is ignored, not registered — the model's primitives,
+  including the repair path for a broken tool edit, stay stable whatever the
+  tree carries
+- A directory under `caos-tools/` with no `.caos-expr` is not a tool
 
 ## Receiving args
 

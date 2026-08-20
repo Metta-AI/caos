@@ -33,12 +33,20 @@ use gix::objs::WriteTo;
 mod eval;
 pub use eval::{cli_eval_path, eval_workspace_dep};
 
-/// `run-tool <script | name> [--name=value ...]` — run a caos-tool by hand: fire
-/// the tool script as a caos job over this repo's tree, exactly what an
-/// agent's tool invocation does. The bash worker gets the tracked worktree
-/// (dirty edits included) as `--in`, plus the extra args verbatim. A bare
-/// name resolves to `caos-tools/<name>.sh` — the project's tree-defined
-/// tool directory.
+/// `run-tool <name | script> [--name=value ...]` — run a caos-tool by hand: fire
+/// the tool as a caos job over this repo's tree, exactly what an agent's tool
+/// invocation does. The tool gets the tracked worktree (dirty edits included)
+/// as `--in`, plus the extra args verbatim.
+///
+/// A bare name is `caos-tools/<name>`, a DIRECTORY carrying a `.caos-expr`
+/// (SPEC, "Tools"): evaluating it yields the tool's ArgTree — its worker image,
+/// its script, and the `help` an agent registers it by — and the caller's args
+/// curry onto that. **This is the same ArgTree the agent builds**, and it has to
+/// be: the two callers share one cache entry, so a tool cannot behave
+/// differently (or re-run) depending on who invoked it. The agent reaches the
+/// same expression through `eval-path-then` because a worker may not block on
+/// the runs an evaluation dispatches; here, at top level, it is a plain
+/// `eval_path`.
 ///
 /// NOTHING IS MATERIALIZED. The result stays on the server and only its hash
 /// comes back, plus whatever the report conventions below print — a handful of
@@ -59,29 +67,43 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
         [tool, kvs @ ..] => (tool, kvs),
         _ => return Err("usage: run-tool <script | name> [--name=value ...]".to_string()),
     };
-    let script = if tool.contains('/') || tool.ends_with(".sh") {
-        tool.clone()
+    let dir = if tool.contains('/') {
+        tool.trim_end_matches('/').to_string()
     } else {
-        format!("caos-tools/{tool}.sh")
+        format!("caos-tools/{tool}")
     };
-    if !Path::new(&script).is_file() {
-        return Err(format!("no such tool script: {script}"));
+    if !Path::new(&format!("{dir}/.caos-expr")).is_file() {
+        return Err(format!(
+            "no such tool: {dir} is not a directory carrying a `.caos-expr`"
+        ));
     }
-    let name = Path::new(&script)
-        .file_stem()
+    let name = Path::new(&dir)
+        .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("tool")
         .to_string();
 
-    let mut all: Vec<String> = vec![format!("--worker1:@={script}"), "--in:@=.".to_string()];
+    // The tool's ArgTree, from its own expression: the worker image it names,
+    // its script, and its `help` — evaluated in the tracked worktree (dirty
+    // edits included), so an edited tool runs edited.
+    let (_, ws) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+    let store = build_secret_store(t)?;
+    let (kind, arg_tree) = eval::eval_path(t, &ws.to_string(), &dir, &store)?;
+    if kind != "tree" {
+        return Err(format!(
+            "{dir}/.caos-expr evaluates to a {kind}, not an ArgTree"
+        ));
+    }
+
     // Do not add a `--bins` carrying the deploy's nix-built binaries. A tool
     // gets the tree under test and builds from source; handing it prebuilt host
     // binaries would couple every invocation to the deploy and let the suite
     // pass against something other than the tree it was given.
+    let mut all: Vec<String> = vec!["--in:@=.".to_string()];
     all.extend(kvs.iter().cloned());
-    // The workspace declares the image its tool scripts run on (./DEPS: `bash`).
-    let image = eval::eval_workspace_dep(t, "bash")?;
-    let (kind, result) = run_request(t, &image, None, None, &all, &[])?;
+    let (kind, result) = run_request(t, &arg_tree, None, None, &all, &store)?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
     println!("{kind} {result}");
@@ -1890,7 +1912,7 @@ pub fn forward(src: &str, dst: &str) -> Result<(), String> {
 /// means it has everything below it too. So re-storing a tree that moved by one
 /// file sends one blob and the trees on its path, not the tree.
 ///
-/// The old single pass posted every object as it hashed it. `caos-tools/build.sh`
+/// The old single pass posted every object as it hashed it. `caos-tools/build/worker.sh`
 /// puts a ~218 MB stack image on every run of which ~206 MB is byte-identical to
 /// the last one (1 of 11 binaries actually changes on a one-line worker edit),
 /// and it sent all of it, every time.
@@ -2552,89 +2574,13 @@ fn resolve_commit_arg(
     Ok(oid)
 }
 
-/// The **type tag** of a `--name[:type]=value` argument — the operator's
-/// explicit choice of how the value is read (never sniffed from the value's
-/// shape, so a value may start with anything, no escaping). Bare `=` is a
-/// literal; `:@=` a path; `:commit=` a commit; `:hash=` an object by oid;
-/// `:docker=` a docker ref.
-///
-/// This is the ONE arg-type vocabulary, shared by the CLI/worker arg builder
-/// ([`build_arg_entries`]), the map-then image args, and the `.caos-expr`
-/// evaluator (`resolve_expr_args`), so all of them accept exactly the same types
-/// and emit the same errors. A resolver may still support only a subset — the
-/// evaluator resolves literals and paths today — but they all *parse* through
-/// [`parse_arg`]. The grammar is extensible: a new type adds a variant here, a
-/// case in [`parse_arg`], and an arm in each resolver.
-pub(crate) enum ArgType {
-    /// `--name=value` — the value verbatim, stored as a blob.
-    Literal,
-    /// `--name:@=path` — the value names a path to resolve/ingest (a host path
-    /// on the CLI, a `/cas` path in a worker, a tree path in the evaluator).
-    Path,
-    /// `--name:commit=value` — the value names a *commit*, passed **unpeeled**
-    /// as a gitlink entry: a commit hash, a `/cas` path recorded as a commit
-    /// (worker), or a revspec like `HEAD` (CLI). The explicit opt-in exists
-    /// because the default forms peel commits to trees (which image refs rely
-    /// on); see [`resolve_commit_arg`].
-    Commit,
-    /// `--name:hash=oid` — the value is the hash of an object the *server*
-    /// already holds (typically an earlier run's result), referenced directly
-    /// by oid with no content round-trip: a **tree** or a **blob**. This is how
-    /// results compose into new requests: e.g. a workspace-build job's `bin`
-    /// tree feeding a downstream job as `--bins:hash=<oid>`. (Generalizes the
-    /// former `:tree=`, which was tree-only.)
-    Hash,
-    /// `--name:docker=ref` — a docker image ref, stored as the blob
-    /// `docker://<ref>` (the representation the server and [`base_arg_entry`]
-    /// expect). The typed form is how a docker image is named without sniffing
-    /// a bare token for a `docker://` prefix.
-    Docker,
-    /// `--name:@@=ref` — a tree in ANOTHER repo, named by a nix-style locator
-    /// ([`GitRef`]) and pinned by a commit sha. The CLIENT fetches it at eval
-    /// time and the arg entry is the resulting oid, byte-for-byte as if it had
-    /// come from a local `:@=` — so the URL is a fetch coordinate and never
-    /// enters an ArgTree or a cache key (design/flake-inputs.md).
-    ///
-    /// The sibling of [`ArgType::Path`], not a replacement: `:@=` stays a bare
-    /// path because that is the common case, and `:@@=` carries the full ref
-    /// grammar for the rare one.
-    Remote,
-}
-
-/// Split a `--name[:type]=value` argument into its name, [`ArgType`] and raw
-/// value, validating that the name is a single path component (it becomes a
-/// tree-entry filename). Shared by every arg resolver so the type vocabulary and
-/// its errors are defined exactly once.
-pub(crate) fn parse_arg(kv: &str) -> Result<(&str, ArgType, &str), String> {
-    let body = kv
-        .strip_prefix("--")
-        .ok_or_else(|| format!("argument must look like --name=value, got: {kv}"))?;
-    let (key, value) = body
-        .split_once('=')
-        .ok_or_else(|| format!("argument must look like --name[:type]=value, got: {kv}"))?;
-    // The key is `name` (literal) or `name:type` (typed); the type sits before `=`.
-    let (name, ty) = match key.split_once(':') {
-        None => (key, ArgType::Literal),
-        Some((name, "@")) => (name, ArgType::Path),
-        Some((name, "@@")) => (name, ArgType::Remote),
-        Some((name, "commit")) => (name, ArgType::Commit),
-        Some((name, "hash")) => (name, ArgType::Hash),
-        Some((name, "docker")) => (name, ArgType::Docker),
-        Some((_, ty)) => {
-            return Err(format!(
-                "unknown argument type {ty:?} in {kv:?}; use --name=value (literal), \
-                 --name:@=path, --name:@@=<git ref>, --name:commit=rev, --name:hash=oid \
-                 (a tree/blob the server holds), or --name:docker=ref"
-            ))
-        }
-    };
-    if name.is_empty() || name.contains('/') {
-        return Err(format!(
-            "argument name must be a single path component, got: {name:?}"
-        ));
-    }
-    Ok((name, ty, value))
-}
+/// The one arg-type vocabulary and its parser now live in the shared
+/// `caos-eval` crate, because the `.caos-expr` walk moved there and the walk is
+/// the strictest consumer of the grammar: the CLI/worker arg builder
+/// ([`build_arg_entries`]), the continuation image args and the evaluator all
+/// parse through the SAME [`parse_arg`], so a new type lands in one place and
+/// every resolver sees it.
+pub(crate) use caos_eval::{parse_arg, ArgType};
 
 /// Pull the reserved `--base:<type>=<image>` out of a verb's arg list, returning
 /// its type and value plus everything else, in order. There is no positional
@@ -3240,6 +3186,7 @@ pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
         kvs,
         &["map", "then"],
         &[],
+        &[],
         |given| {
             if given.is_empty() {
                 return Err("`map-then` needs --map and/or --then".to_string());
@@ -3273,6 +3220,7 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
         ContinuationSubject::Input(input),
         kvs,
         &["run", "then"],
+        &[],
         &["catch"],
         |given| {
             if !given.contains(&"run") {
@@ -3281,6 +3229,39 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
             if given.contains(&"catch") && !given.contains(&"then") {
                 return Err(
                     "`run-then --catch` needs --then: the error has to be delivered somewhere"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+/// `eval-path-then <in> --eval=<path> [--then:<type>=<image>] [--catch]` — the
+/// evaluation sibling of [`caos_run_then`]: record a continuation `{in, eval,
+/// then?, catch?}` and exit. The SERVER walks `.caos-expr` from `in`'s root down
+/// to `<path>` (blocking a request thread, its own `run`s dispatched normally —
+/// design/caos-expr.md), yielding R; with `--then` the result is
+/// `then(--in=<in>, --result=<R>)`, else R itself. `--eval` names a PATH within
+/// `in` (recorded verbatim, not an image); `--catch` turns a failed walk into
+/// `--error` (and needs `--then`), like run-then's. This is how a WORKER — which
+/// may not block on a run — gets a `.caos-expr` evaluated: it asks the server to.
+pub fn caos_eval_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
+    record_continuation(
+        t,
+        "eval-path-then",
+        ContinuationSubject::Input(input),
+        kvs,
+        &["then"],
+        &["eval"],
+        &["catch"],
+        |given| {
+            if !given.contains(&"eval") {
+                return Err("`eval-path-then` needs --eval=<path>".to_string());
+            }
+            if given.contains(&"catch") && !given.contains(&"then") {
+                return Err(
+                    "`eval-path-then --catch` needs --then: the error has to be delivered somewhere"
                         .to_string(),
                 );
             }
@@ -3310,6 +3291,7 @@ pub fn caos_run_request_then(
         ContinuationSubject::Request(request),
         kvs,
         &["then"],
+        &[],
         &["catch"],
         |given| {
             if given.contains(&"catch") && !given.contains(&"then") {
@@ -3367,15 +3349,27 @@ enum ContinuationSubject<'a> {
     Request(&'a str),
 }
 
-/// Shared continuation recorder. `subject` supplies either the ordinary `in`
-/// data entry or an exact `request` ArgTree; `allowed` names image-valued
-/// entries and `markers` names bare presence flags.
+/// Shared body of [`caos_map_then`] / [`caos_run_then`] / [`caos_eval_then`] /
+/// [`caos_run_request_then`]: record a continuation over `subject` — either the
+/// ordinary `in` data entry or an exact `request` ArgTree — as this worker's
+/// result at `/cas/out` (a `promise` placeholder the server resolves once the
+/// job is posted). `allowed` names the image-valued entries this verb accepts
+/// (each resolved to a hash), `literals` names entries whose value is recorded
+/// VERBATIM as a blob (e.g. `eval`'s path — a string, not an image), `markers`
+/// names its bare flags (recorded as one-byte blobs; the interpreter reads only
+/// their presence), and `check` validates the set actually given, before
+/// anything is sealed.
+// Three kinds of key (image / literal / marker) plus the fixed t/verb/subject/kvs
+// and the validator — one over clippy's arg limit, and splitting the key kinds
+// into a struct would only move the noise to the call sites.
+#[allow(clippy::too_many_arguments)]
 fn record_continuation(
     t: &dyn Transport,
     verb: &str,
     subject: ContinuationSubject<'_>,
     kvs: &[String],
     allowed: &[&'static str],
+    literals: &[&'static str],
     markers: &[&'static str],
     check: impl FnOnce(&[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -3454,6 +3448,23 @@ fn record_continuation(
             continue;
         }
         let (name, ty, value) = parse_arg(kv)?;
+        // A LITERAL entry (e.g. `eval`'s path): its value is recorded verbatim as
+        // a blob, not resolved as an image.
+        if let Some(&name) = literals.iter().find(|&&l| l == name) {
+            if given.contains(&name) {
+                return Err(format!("--{name} given twice"));
+            }
+            if matches!(ty, ArgType::Commit) {
+                return Err(format!("--{name} is a path/value, not a commit"));
+            }
+            entries.push(Entry {
+                mode: EntryKind::Blob.into(),
+                filename: name.as_bytes().to_vec().into(),
+                oid: post_object(t, "blob", value.as_bytes())?,
+            });
+            given.push(name);
+            continue;
+        }
         let Some(&name) = allowed.iter().find(|&&a| a == name) else {
             let mut flags = allowed
                 .iter()

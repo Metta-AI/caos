@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-#@doc Build the test stack image from the tree. The flake-builder builds only
-#@doc the BUILD ENVIRONMENT (#caosImage) from a REDUCED tree; this tool then
-#@doc compiles the live sources in it and assembles the stack image.
+# The `build` tool's worker. Its DOCS — the description an agent registers it
+# by — live in the sibling `.caos-expr` here-string, not in this header (SPEC,
+# "Tools"): a doc edit then re-keys the tool's arg tree without touching the
+# tree this script builds from.
 #
 # FOUR STAGES, one script, selected by a curried --stage (the std/flake-builder
 # pattern).
@@ -373,7 +374,7 @@ make)
   OUT=/tmp/out
   rm -rf "$OUT"; mkdir -p "$OUT"
   # The seed records, when bootstrap published them (a symlink put, recorded-hash
-  # reuse — no bytes move). Consumed by caos-tools/test.sh deepener → each test
+  # reuse — no bytes move). Consumed by caos-tools/test/worker.sh deepener → each test
   # wrapper → test-stack/worker, which seeds refs/caos/seed into the inner stack.
   if [ -n "$SEED" ]; then ln -s /cas/seed-built "$OUT/seed"; fi
 

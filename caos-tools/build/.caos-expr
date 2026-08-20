@@ -1,0 +1,12 @@
+# The `build` tool (SPEC, "Tools"): the bash worker image with this directory's
+# script curried onto it, plus the `help` an agent registers it by.
+#
+# The docs are a HERE-STRING, so they live here rather than in the script — and
+# a `.caos-expr` is STRIPPED from the tree it is evaluated against, so editing
+# them re-keys this tool's arg tree and nothing it builds.
+HELP=<<END
+Build the test stack image from the tree. The flake-builder builds only the
+BUILD ENVIRONMENT (#caosImage) from a REDUCED tree; this tool then compiles
+the live sources in it and assembles the stack image.
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP

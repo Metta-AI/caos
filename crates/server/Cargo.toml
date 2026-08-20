@@ -29,3 +29,9 @@ serde = { version = "1", features = ["derive"] }
 
 [dependencies.caos-world]
 path = "../caos-world"
+
+# The shared `.caos-expr` walk, so the server can resolve an `eval` continuation
+# (design/caos-expr.md, design/map-then.md) with the same byte-identical result
+# a client `eval-path` builds.
+[dependencies.caos-eval]
+path = "../caos-eval"
