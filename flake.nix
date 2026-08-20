@@ -613,7 +613,9 @@
           mkdir -p $out/bin
           for name in caos-cli caos; do
             makeWrapper ${caos-cli-bin}/bin/caos-cli $out/bin/$name \
-              --argv0 $name --set-default CAOS_REV ${caosRev}
+              --argv0 $name \
+              --set-default CAOS_REV ${caosRev} \
+              --run 'export CAOS_INVOKED_AS="$0"'
           done
         '';
 

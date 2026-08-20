@@ -4,7 +4,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use caos::GitTransport;
-use caos_cli::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
+use caos_cli::{
+    ensure_conversation_secret, list_user_conversations, unarchive_user_conversation,
+    UserConversationStatus,
+};
 use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
@@ -246,7 +249,9 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("requires an interactive terminal; use `caos talk` for pipes".to_string());
     }
-    GitTransport::from_cwd()?.ensure_server_reachable()?;
+    let transport = GitTransport::from_cwd()?;
+    transport.ensure_server_reachable()?;
+    ensure_conversation_secret(&transport)?;
     let mut app = App::new(args)?;
 
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;

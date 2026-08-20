@@ -107,6 +107,14 @@ if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>key.
   fail "chat succeeded without its model secret"
 fi
 grep -q "anthropic-api-key" key.err || fail "missing-key error is unclear"
+grep -qF '.caos-secrets/anthropic-api-key' key.err \
+  || fail "missing-key error does not name the setup file"
+grep -qF 'reader=DEEP-DEPS/llm-step' key.err \
+  || fail "missing-key error does not explain the llm-step grant"
+grep -qF 'reader=DEEP-DEPS/llm-call' key.err \
+  || fail "missing-key error does not explain the title grant"
+grep -qF "$CAOS_CLI secrets" key.err \
+  || fail "missing-key error does not explain entropy setup"
 if remote_tip "$queued_ref" >/dev/null; then
   fail "request-preparation failure partially admitted a conversation"
 fi
