@@ -730,6 +730,9 @@
 
             NET=caos-net
             NAME=caos-stack
+            REGISTRY_PORT=5000
+            REGISTRY=localhost:$REGISTRY_PORT
+            REGISTRY_REPO=$REGISTRY/caos
 
             # Load the stack image only when this exact build isn't already in
             # docker. The tag is content-addressed (sha1 of the image's
@@ -826,6 +829,7 @@
             std_build() {
               echo "==> publishing stdlib (build-builtins.sh)" >&2
               CAOS_SERVER_URL=http://localhost:9090 \
+              CAOS_REGISTRY_HTTP="$REGISTRY" \
               CAOS_CLI=${caos-cli}/bin/caos-cli \
               CAOS_CLIENT_REPO="$CLIENT" \
               CAOS_BUILTIN_IMAGES="${
@@ -848,7 +852,7 @@
             # source directory carrying a `.caos-expr`, so it names no digest at
             # all and a walk over entries would verify nothing.
             #
-            # Checked through localhost:5000 — the name the DOCKER DAEMON pulls
+            # Checked through $REGISTRY — the name the DOCKER DAEMON pulls
             # with. The seed's refs spell the same registry caos-registry:5000,
             # which is how the SERVER reaches it; one registry, two names, so the
             # check says which one it used.
@@ -856,7 +860,7 @@
             # `checked` must stay: a guard that silently verifies nothing is worse
             # than no guard, so finding no digests is itself an error.
             std_check() {
-              local reg=localhost:5000 tree missing=0 checked=0 oid name base digest code
+              local reg="$REGISTRY" tree missing=0 checked=0 oid name base digest code
               [ -d "$CLIENT" ] \
                 || { echo "caosd: no client repo at $CLIENT — run 'caosd std-build'" >&2; exit 1; }
               tree=$(git -C "$CLIENT" rev-parse --verify -q refs/caos/seed) \
@@ -925,7 +929,7 @@
               fi
               echo "caosd image-cleanup: registry $registry_size"
               docker image ls --format '  local image {{.ID}}  {{.Size}}' \
-                localhost:5000/caos | sort -u
+                "$REGISTRY_REPO" | sort -u
               if [ "$execute" != yes ]; then
                 echo "caosd image-cleanup: dry run; run 'caosd down' then pass --execute"
                 return
@@ -956,7 +960,7 @@
               while IFS= read -r image_id; do
                 [ -n "$image_id" ] || continue
                 docker image rm "$image_id" >/dev/null 2>&1 || true
-              done < <(docker image ls -q localhost:5000/caos | sort -u)
+              done < <(docker image ls -q "$REGISTRY_REPO" | sort -u)
 
               echo "caosd image-cleanup: cleared the registry, Redis, and unused local CAOS images"
               echo "caosd image-cleanup: run 'caosd up' to republish std"
@@ -1032,7 +1036,7 @@
                   --network-alias caos-server \
                   --network-alias caos-registry \
                   --network-alias caos-redis \
-                  -p 9090:80 -p 5000:5000 \
+                  -p 9090:80 -p "$REGISTRY_PORT:5000" \
                   -v "$CAOS_DATA/stack:/state" \
                   -v /var/run/docker.sock:/var/run/docker.sock \
                   -e CAOS_STACK_STATE=/state \
@@ -1045,6 +1049,7 @@
                   -e CAOS_STACK_SEEDER=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                   -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
+                  -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
                   -e CAOS_DOCKER_NETWORK="$NET" \
                   -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \
                   -e CAOS_PENDING_TIMEOUT_SECS=900 \
