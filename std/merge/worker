@@ -43,6 +43,7 @@ git -C "$repo" config extensions.partialClone origin
 git -C "$repo" config remote.origin.promisor true
 git -C "$repo" config remote.origin.partialclonefilter tree:0
 git -C "$repo" fetch -q --filter=tree:0 origin "$ours" "$theirs"
+timestamp=$(git -C "$repo" show -s --format=%ct "$ours")
 
 # `merge-tree --write-tree`: writes the merged tree to the odb and prints its
 # oid on line 1; on conflict, exits 1 and prints the unmerged-file notation and
@@ -80,16 +81,16 @@ fi
 caos put "$work" /cas/merged
 mtree=$(caos hash /cas/merged)
 
-# Mint M = (merged tree, parents [ours, theirs]). Fixed identity / zero time:
-# a merge of the same two commits is a pure value. put-commit at /cas/out makes
-# `commit <hash>` the run's result.
+# Mint M = (merged tree, parents [ours, theirs]). Inheriting ours' timestamp
+# keeps a merge of the same two commits a pure value while giving conversation
+# merges a useful date. put-commit at /cas/out makes `commit <hash>` the result.
 commit=/tmp/merge-commit
 {
   printf 'tree %s\n' "$mtree"
   printf 'parent %s\n' "$ours"
   printf 'parent %s\n' "$theirs"
-  printf 'author caos <caos@caos> 0 +0000\n'
-  printf 'committer caos <caos@caos> 0 +0000\n'
+  printf 'author caos <caos@caos> %s +0000\n' "$timestamp"
+  printf 'committer caos <caos@caos> %s +0000\n' "$timestamp"
   printf '\nmerge %s into %s\n' "$theirs" "$ours"
 } > "$commit"
 caos put-commit "$commit" /cas/out

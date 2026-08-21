@@ -32,6 +32,18 @@ assert_event_spine() { # <head> <stop>
   [ "$count" -ge 2 ] || fail "event spine is unexpectedly short"
 }
 
+assert_caos_dates() { # <revision range>
+  local range=$1 commit author timestamp
+  for commit in $(git rev-list "$range"); do
+    author=$(git show -s --format=%an "$commit")
+    if [ "$author" = caos-agent ]; then
+      timestamp=$(git show -s --format=%ct "$commit")
+      [ "$timestamp" -gt 0 ] \
+        || fail "caos-agent commit $commit still has an epoch-zero date"
+    fi
+  done
+}
+
 stage "workspace and scripted model"
 llm_test_setup
 stub_host="${stub_host:?llm_test_setup did not set stub_host}"
@@ -89,6 +101,7 @@ git push --quiet caos "$early_interjection:$conversation_ref" \
 
 head1=$(fetch_head)
 assert_event_spine "$head1" "$base"
+assert_caos_dates "$base..$head1"
 events1=$(git log --first-parent --format=%B "$base..$head1")
 grep -qF "\"request\":\"$request1\"" <<<"$events1" \
   || fail "worker did not record the running request"

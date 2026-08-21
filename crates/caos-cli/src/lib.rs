@@ -2722,10 +2722,10 @@ fn remote_conversation_metadata(
     validate_hash(hash, "conversation tip")?;
     let mut current = hash.to_string();
     let mut newest_activity_timestamp = None;
-    // Worker events deliberately use epoch-zero commit identities so recovery
-    // recreates the same proposal. Follow raw commit objects (not their trees)
-    // to the newest user event or locally-created fork marker, whose ordinary
-    // client timestamp is the useful measure of recent activity.
+    // Worker events inherit their causal user's timestamp so recovery recreates
+    // the same proposal. Follow raw commit objects (not their trees) to the
+    // newest user event or locally-created fork marker, whose ordinary client
+    // timestamp remains the useful measure of recent activity.
     loop {
         let (kind, content) = t.get_object(&current)?;
         if kind != "commit" {

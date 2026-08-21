@@ -55,6 +55,9 @@ echo "== a conflicting merge: two parents, markers, .caos/conflicts ==" >&2
 m=$(run_merge "$ours" "$theirs")
 [ "$(git rev-parse "$m^")" = "$ours" ] || fail "M's first parent is not ours"
 [ "$(git rev-parse "$m^2")" = "$theirs" ] || fail "M's second parent is not theirs"
+[ "$(git show -s --format=%ct "$m")" = "$(git show -s --format=%ct "$ours")" ] \
+  || fail "M did not inherit ours' timestamp"
+[ "$(git show -s --format=%ct "$m")" -gt 0 ] || fail "M still has an epoch-zero date"
 
 # The conflicted file carries git's inline markers and BOTH sides' text.
 f=$(git show "$m:f.txt")
