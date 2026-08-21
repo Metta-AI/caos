@@ -8,14 +8,14 @@
 //! `path:linenum:line` output is the *caller's* presentation choice
 //! (llm-step renders it at the transcript boundary).
 //!
-//! Three positions, told apart by the arguments present:
+//! Two stages, named by `--stage` (SPEC, "Worker scripts"):
 //!
-//! * `--in` a tree, no `--children` — grep the files at THIS level (they stay
-//!   local to this job), then map-then over a synthetic tree holding just the
-//!   subdirectories, currying the local matches into `then`.
-//! * `--children` present (the `then` position) — combine: local match files
-//!   plus each non-empty child result tree, linked into one tree.
-//! * `--in` a file (a file-scoped grep) — the match blob itself.
+//! * absent — grep the files at THIS level (they stay local to this job), then
+//!   map-then over a synthetic tree holding just the subdirectories, currying
+//!   the local matches into `then`. An `--in` that is a FILE is the same stage
+//!   and needs no name of its own: the match blob is the whole result.
+//! * `combine` (the `then` position) — local match files plus each non-empty
+//!   child result tree, linked into one tree.
 //!
 //! The pattern is a curried arg, so the recursion ArgTree — this request's own
 //! image curried with the pattern — carries it, and a child's cache key is
@@ -28,7 +28,7 @@ use std::process::ExitCode;
 
 use worker_common::{
     arg, caos, caos_curry, cas_hash, entries, file_name, link, map_then, own_image, path, read_arg,
-    run_worker, scratch, Arg,
+    read_arg_opt, run_worker, scratch, Arg,
 };
 
 /// git's well-known empty tree — a child result with no matches, skipped so
@@ -39,11 +39,24 @@ fn main() -> ExitCode {
     run_worker("rgrep", run)
 }
 
+/// `stage` rather than the presence of `--children`, which is what this used to
+/// branch on. Two reasons, and neither is tidiness: SPEC ("Worker scripts")
+/// reserves `stage` for a single-file worker's position, and a node that SAYS
+/// which stage it is can be named by it in a trace (SPEC, "Tracing") — where
+/// structural discrimination named nothing at all, because there is no arg to
+/// read. Unknown values are an error rather than a fall-through to the grep, so
+/// a typo in a curry cannot quietly re-grep instead of combining.
 fn run() -> Result<(), String> {
-    if Path::new(&arg("children")).exists() {
-        return combine();
+    match read_arg_opt("stage")?.as_deref() {
+        None | Some("") => grep(),
+        Some("combine") => combine(),
+        Some(other) => Err(format!("unknown stage {other:?}")),
     }
+}
 
+/// The default stage: match this level and, for a directory with
+/// subdirectories, fan out over them.
+fn grep() -> Result<(), String> {
     let pattern = read_arg("pattern")?;
     let re = regex::Regex::new(&pattern)
         .map_err(|e| format!("invalid pattern {pattern:?}: {e} (the caller validates)"))?;
@@ -106,7 +119,8 @@ fn run() -> Result<(), String> {
     let me = own_image();
     let bin = arg("worker1");
     let mut map_kvs: Vec<(&str, Arg)> = vec![("pattern", Arg::Lit(&pattern))];
-    let mut then_kvs: Vec<(&str, Arg)> = vec![("own", Arg::Path(own_cas))];
+    let mut then_kvs: Vec<(&str, Arg)> =
+        vec![("stage", Arg::Lit("combine")), ("own", Arg::Path(own_cas))];
     if Path::new(&bin).exists() {
         map_kvs.push(("worker1", Arg::Path(&bin)));
         then_kvs.push(("worker1", Arg::Path(&bin)));

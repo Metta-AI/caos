@@ -337,14 +337,20 @@ pub(crate) fn serve(config: &Config, arg_tree: &str) -> Result<Vec<u8>, crate::H
 
 /// Render `arg_tree`'s subtree, or None if it has nothing to show.
 ///
-/// `label` is the name the PARENT gave this child, prepended when the child came
-/// through a map-then — that name is the map entry's own (a test name, for the
-/// suite), and it is the only thing that makes a wide fan-out readable.
+/// `prefix` qualifies the node's own name, and comes from one of two places:
+///
+/// - descending into a CHILD, it is the name the parent gave it — a map entry's
+///   name (a test name, for the suite) or an eval's expression path;
+/// - following a COMPLETION, it is the name of the node we came from, because a
+///   continuation handler is the same logical work one stage on.
+///
+/// It is set once and carried, not accumulated: a five-hop promise chain reads
+/// `<the tool>: fanout`, not the whole chain concatenated.
 ///
 /// `budget` bounds the whole walk. The tree is read from records that a
 /// concurrent run is still appending to, so a malformed or circular set of
 /// child edges must not turn a status request into an unbounded traversal.
-fn walk(config: &Config, arg_tree: &str, label: Option<&str>, budget: &mut usize) -> Option<Node> {
+fn walk(config: &Config, arg_tree: &str, prefix: Option<&str>, budget: &mut usize) -> Option<Node> {
     const MAX_NODES: usize = 10_000;
     if *budget >= MAX_NODES {
         return None;
@@ -382,27 +388,42 @@ fn walk(config: &Config, arg_tree: &str, label: Option<&str>, budget: &mut usize
     // exactly as long as it was running, which for `run-tool test` is the whole
     // summarising phase.
     if let Some(completion) = record.completion() {
-        return walk(config, &completion, label, budget);
+        // Carry the qualifier we already have, else adopt this node's own name.
+        // The root of a tool chain is the only node with `help` — every curry
+        // after it rebuilds the ArgTree from `base` plus a chosen few args
+        // (`caos-tools/test/worker.sh`), so `help` is a sibling that is dropped
+        // at the first hop and can never be found by descending `base`. Handing
+        // it down the chain is what keeps the later stages attributable.
+        let carried = prefix
+            .map(str::to_string)
+            .or_else(|| name_of(config, arg_tree));
+        return walk(config, &completion, carried.as_deref(), budget);
     }
 
     let children: Vec<Node> = record
         .children()
         .into_iter()
         .filter_map(|(via, name, child)| {
-            let label = (via == "map").then_some(name);
+            // A child's own name REPLACES the parent's qualifier: it is a
+            // separate piece of work, not a later stage of this one. `run` and
+            // `request` are excluded because those names are the child's
+            // position in the continuation, not a description of it — and such
+            // a child usually names itself (a `run` step is often another
+            // tool's ArgTree, `help` and all).
+            let label = matches!(via.as_str(), "map" | "eval").then_some(name);
             walk(config, &child, label.as_deref(), budget)
         })
         .collect();
 
-    // The label alone, when the node has no `help` of its own. Appending the
+    // The prefix alone, when the node has no name of its own. Appending the
     // image to a named map child gives every line of a fan-out the SAME sixty
     // characters of docker ref after its one distinguishing word, which pushes
     // the useful part off the terminal — measured on a live suite run, where
     // all 46 lines read `<test>: docker://caos-registry:5000/caos@sha256:…`.
-    let name = match (label, name_of(config, arg_tree)) {
-        (Some(label), Some(help)) => format!("{label}: {help}"),
-        (Some(label), None) => label.to_string(),
-        (None, Some(help)) => help,
+    let name = match (prefix, name_of(config, arg_tree)) {
+        (Some(prefix), Some(own)) => format!("{prefix}: {own}"),
+        (Some(prefix), None) => prefix.to_string(),
+        (None, Some(own)) => own,
         (None, None) => image_of(config, arg_tree),
     };
     Some(Node {
@@ -415,23 +436,33 @@ fn walk(config: &Config, arg_tree: &str, label: Option<&str>, budget: &mut usize
     })
 }
 
-/// The first line of a node's `help`, searching `base` recursively — or None
-/// when there is none to find.
+/// The arg a multi-stage worker uses to say which stage it is up to.
 ///
-/// `help` exists only on a tool's own ArgTree (SPEC.md "Declaring a tool"), and
-/// the `base` descent is what carries it to things curried from one. Most nodes
-/// still have none: a tool's map children are curried from `base`, not from the
-/// tool's tree, and a continuation handler is built from the `then` IMAGE — so
-/// the moment the walk follows a promise, the tool's help is behind it.
+/// One name, because SPEC.md ("Worker scripts") mandates one. The Rust workers
+/// used to spell it `mode`, which also had to carry `worker-cargo`'s CALLER-
+/// facing `--mode=all` — so a display reading it could not tell a request from
+/// a position. They are now two args, and this reads only the position.
+const STAGE_ARG: &str = "stage";
+
+/// What a node calls itself: the first line of its `help`, else the stage it
+/// says it is up to — or None when it says neither.
 ///
-/// Optional rather than falling back internally, so the caller can tell "this
-/// is what the node is" from "this is only what it runs" and decide which is
-/// worth a line of terminal.
+/// The two rungs cover different nodes, and between them almost everything. A
+/// tool's ArgTree carries `help` and nothing else does: every curry after it
+/// rebuilds from `base` plus a chosen few args, so `help` is dropped at the
+/// first hop. What those later stages DO carry is the discriminator they switch
+/// on, which is exactly the name of what they are doing (`fanout`, `summarize`,
+/// `combine`).
+///
+/// Optional rather than falling back internally, so the caller can tell "this is
+/// what the node is" from "this is only what it runs" and decide which is worth
+/// a line of terminal.
 fn name_of(config: &Config, arg_tree: &str) -> Option<String> {
     describe(config, arg_tree).0
 }
 
-/// A short identifier for the image a node runs, for a node with no `help`.
+/// A short identifier for the image a node runs, for a node that names itself
+/// no other way.
 ///
 /// Abbreviated deliberately. The full `docker://caos-registry:5000/caos@sha256:…`
 /// is sixty characters, and it is the SAME sixty for every node of a fan-out —
@@ -440,11 +471,11 @@ fn image_of(config: &Config, arg_tree: &str) -> String {
     describe(config, arg_tree).1
 }
 
-/// What a node is (its `help`, if it has one) and what it runs (a short image
-/// id) — the two halves of a display name, kept apart so the caller can choose.
+/// What a node is (if it says) and what it runs (a short image id) — the two
+/// halves of a display name, kept apart so the caller can choose.
 type Description = (Option<String>, String);
 
-/// `(help, short image id)` for an ArgTree.
+/// `(name, short image id)` for an ArgTree.
 ///
 /// Memoized, because both are pure functions of a CONTENT-ADDRESSED hash and so
 /// can never go stale. Without this, a live display of a 46-way fan-out re-walks
@@ -474,6 +505,14 @@ fn describe(config: &Config, arg_tree: &str) -> Description {
 }
 
 fn describe_uncached(config: &Config, arg_tree: &str) -> Description {
+    // The stage is read from the node's OWN args and nowhere else. A `base` is
+    // an image, and a stage it happened to carry would name the run that built
+    // it rather than this one.
+    let stage = arg_line(config, arg_tree, STAGE_ARG);
+
+    // `help` and the image come out of one descent: `help` can sit on a curried
+    // layer above the image, and the image is whatever the chain bottoms out at.
+    let mut help = None;
     let mut current = arg_tree.to_string();
     for _ in 0..NAME_SEARCH_DEPTH {
         let Ok(entries) = crate::storage::fetch_tree(config, &current) else {
@@ -483,23 +522,35 @@ fn describe_uncached(config: &Config, arg_tree: &str) -> Description {
                 Ok(bytes) => abbreviate_ref(&first_line(&bytes)),
                 Err(_) => short_hash(&current),
             };
-            return (None, image);
+            return (help.or(stage), image);
         };
-        if let Some(help) = entries.iter().find(|e| e.name == "help") {
-            if let Ok(bytes) = crate::storage::fetch_blob(config, &help.oid.to_string()) {
-                let line = first_line(&bytes);
-                if !line.is_empty() {
-                    return (Some(line), short_hash(&current));
-                }
-            }
+        if help.is_none() {
+            help = entries
+                .iter()
+                .find(|e| e.name == "help")
+                .and_then(|e| blob_line(config, &e.oid.to_string()));
         }
         let Some(base) = entries.iter().find(|e| e.name == "base") else {
             // A git image bottoms out at a tree with no `base` of its own.
-            return (None, short_hash(&current));
+            return (help.or(stage), short_hash(&current));
         };
         current = base.oid.to_string();
     }
-    (None, short_hash(&current))
+    (help.or(stage), short_hash(&current))
+}
+
+/// The first line of a named blob arg of `arg_tree`, if it has one.
+fn arg_line(config: &Config, arg_tree: &str, name: &str) -> Option<String> {
+    let entries = crate::storage::fetch_tree(config, arg_tree).ok()?;
+    let entry = entries.iter().find(|e| e.name == name)?;
+    blob_line(config, &entry.oid.to_string())
+}
+
+/// The first line of a blob, or None when it is unreadable or says nothing.
+fn blob_line(config: &Config, oid: &str) -> Option<String> {
+    let bytes = crate::storage::fetch_blob(config, oid).ok()?;
+    let line = first_line(&bytes);
+    (!line.is_empty()).then_some(line)
 }
 
 /// `docker://host/repo@sha256:abcd…` → `repo@abcd1234`. Anything that is not

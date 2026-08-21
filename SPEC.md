@@ -218,6 +218,8 @@ Run `time result/bin/caos-cli run-tool test`
 ## Worker scripts
 
 - Workers shall be written in a single file that covers all the stages of the worker. That is, when a worker calls map-then or run-then, the next next stage should be in the same file. The worker shall use a `stage` argument to track which stage it is up to
+- `stage` is the worker's own POSITION, set only by its own curries, and never a caller's choice of what to do. Keep the two apart even when one arg could carry both: the cargo worker takes a `mode` for that (`all` selects the per-crate decomposition), and `all` is not a stage anything is up to. Tracing names a node by its `stage`, so an arg that mixes the two names a node after a request rather than after what it is doing
+- A worker shall not tell its stages apart by which args happen to be present. There is nothing to read, so the node cannot be named -- and a curry that forgets an arg silently runs the wrong stage instead of failing
 
 # Server
 
@@ -251,10 +253,16 @@ The server supports pulling current trace data for a run: `GET /status/<arg tree
 - If there are child arg trees, render the parent, with an array of rendered children. (The finished ones will be ignored)
 - Otherwise, render this node
 
-Rendering a node:
-- A node's name is the first line of the arg tree's help argument. Base args are searched recursively until one is found
-- When a child came through a map-then, prepend the map-then name for the child to the child's name
-- When no help is found, a map-then child is named by its map-then name alone and anything else by a short form of the image the base names. The full docker ref is the same sixty characters for every node of a fan-out, so appending it only displaces the part that differs
+Rendering a node. A node's name is the first of these that it has:
+- The first line of its help argument. Base args are searched recursively until one is found
+- Its `stage` argument -- the arg a multi-stage worker already uses to say which stage it is up to (see "Worker scripts") is also the name of what it is doing. `help` cannot reach these: a stage curries from `base` and forwards a chosen few args, so the tool's `help` is a sibling that is dropped at the first hop
+- A short form of the image the base names. The full docker ref is the same sixty characters for every node of a fan-out, so it only displaces the part that differs
+
+A name is qualified by a prefix, `<prefix>: <name>`:
+- Following a completion, the prefix is the name of the node we came from -- a continuation handler is the same work one stage on. Set once and carried, not accumulated, so a long promise chain reads `<the tool>: fanout` rather than every stage concatenated
+- Descending into a map-then or eval child, the child's own name from the parent replaces the prefix: it is separate work, not a later stage. A run-then or exact-request child takes no prefix, because the name there is the child's position in the continuation rather than a description of it, and such a child usually names itself
+
+Names are for display and may be truncated to fit; the arg trees are what forensics reads
 
 While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
 

@@ -6,6 +6,8 @@
 # them re-keys this tool's arg tree and nothing it builds. That split is why
 # `@param [test-salt]` can be reworded without re-running a single test.
 HELP=<<END
+caos-tools/test
+
 Build the test stack image from the tree and run the whole test suite — the
 unit tests and every tests/<name> integration suite — as cached jobs: an
 unchanged test never re-runs. Returns the report: a line per test with its

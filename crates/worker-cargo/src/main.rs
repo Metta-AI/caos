@@ -67,17 +67,32 @@ fn main() -> ExitCode {
     run_worker("cargo", run)
 }
 
-/// `mode` selects flat (absent — today's whole-workspace behavior) or the
-/// per-crate decomposition (`all`, plus its internal `crate`/`job`/`combine`
-/// positions — see `decompose.rs`).
+/// Two args, because they answer different questions.
+///
+/// `mode` is the CALLER's choice of strategy: flat (absent — today's
+/// whole-workspace behavior) or the per-crate decomposition (`all`). `stage` is
+/// this worker's own position within that decomposition (`crate`/`job`/
+/// `combine` — see `decompose.rs`), set only by its own curries, and it is the
+/// arg SPEC ("Worker scripts") reserves for saying which stage a single-file
+/// worker is up to.
+///
+/// They used to be one `mode`, which read as if `all` were a stage. It is not:
+/// nothing is "up to all". Splitting them also means the tracing display can
+/// name a node by its stage without ever mistaking a caller's request for a
+/// position in the pipeline.
 fn run() -> Result<(), String> {
     let cmd = read_arg("cmd")?;
+    if let Some(stage) = read_arg_opt("stage")?.as_deref().filter(|s| !s.is_empty()) {
+        return match stage {
+            "crate" => decompose::crate_mode(&cmd),
+            "job" => decompose::job(&cmd),
+            "combine" => decompose::combine(),
+            other => Err(format!("unknown stage {other:?}")),
+        };
+    }
     match read_arg_opt("mode")?.as_deref() {
         None | Some("") => flat(&cmd),
         Some("all") => decompose::all(&cmd),
-        Some("crate") => decompose::crate_mode(&cmd),
-        Some("job") => decompose::job(&cmd),
-        Some("combine") => decompose::combine(),
         Some(other) => Err(format!("unknown mode {other:?}")),
     }
 }

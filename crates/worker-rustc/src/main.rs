@@ -43,11 +43,14 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    // `finish` is reached only via our own curry in the run-then continuation.
-    match read_arg_opt("mode")?.as_deref() {
+    // `stage` is the arg SPEC ("Worker scripts") reserves for exactly this: a
+    // single-file worker saying which of its stages it is up to. Nothing else
+    // sets it — `finish` is reached only via our own curry in the run-then
+    // continuation — so a caller never passes one.
+    match read_arg_opt("stage")?.as_deref() {
         None | Some("") => start(),
         Some("finish") => finish(),
-        Some(other) => Err(format!("unknown mode {other:?}")),
+        Some(other) => Err(format!("unknown stage {other:?}")),
     }
 }
 
@@ -141,7 +144,7 @@ fn start() -> Result<(), String> {
     let bin = arg("worker1");
     let output_runner = arg("output-runner");
     let mut kvs: Vec<(&str, Arg)> =
-        vec![("mode", Arg::Lit("finish")), ("runner", Arg::Lit(&runner))];
+        vec![("stage", Arg::Lit("finish")), ("runner", Arg::Lit(&runner))];
     if Path::new(&output_runner).exists() {
         kvs.push(("output-runner", Arg::Path(&output_runner)));
     }

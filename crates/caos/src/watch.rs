@@ -24,6 +24,16 @@ const POLL: Duration = Duration::from_millis(400);
 /// makes it worse than no display.
 const MAX_LINES: usize = 16;
 
+/// How much of a node's name a line will show. Names are as long as they need
+/// to be — the server's job is to identify a node, not to fit it — so the
+/// shortening happens here, where the terminal is.
+///
+/// Sized to leave an 80-column line intact after the state and elapsed columns
+/// and a couple of levels of indent. Fixed rather than measured: reading the
+/// real width needs an ioctl, and being occasionally narrower than the terminal
+/// costs nothing next to a wrapped line, which breaks the redraw.
+const MAX_NAME: usize = 58;
+
 /// One node of the server's `/status` JSON.
 ///
 /// Read out of a `serde_json::Value` rather than derived: this crate carries
@@ -153,12 +163,52 @@ fn render(node: &Node, depth: usize, out: &mut Vec<String>) {
     out.push(format!(
         "{state:>5} {secs:>4}s  {:indent$}{}",
         "",
-        node.name,
+        elide(&node.name),
         indent = depth * 2
     ));
     for child in &node.children {
         render(child, depth + 1, out);
     }
+}
+
+/// Shorten a name to fit a line, dropping from the MIDDLE.
+///
+/// Both ends carry meaning and neither end alone does. A composed name is
+/// `<what this is part of>: <which stage it is>` — the head says which tool, the
+/// tail says which step — so cutting the tail leaves forty characters of a
+/// javadoc sentence and no idea what is running, and cutting the head leaves a
+/// bare `fanout` belonging to nothing.
+fn elide(name: &str) -> String {
+    // Character counts, not bytes: a `…` from a previous elision, or any
+    // non-ASCII in a tool's help, would otherwise be cut mid-character.
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= MAX_NAME {
+        return name.to_string();
+    }
+    // A composed name is `<qualifier>: <what this node is>`, and the QUALIFIER
+    // gives up the room. It repeats on every line of a promise chain — a tool's
+    // `help` is a sentence, so five stages all began with the same thirty-eight
+    // characters and differed only past the colon, which is the one part a
+    // fixed head-and-tail split was squeezing.
+    if let Some((qualifier, own)) = name.rsplit_once(": ") {
+        let own_len = own.chars().count();
+        // Only when a useful amount of qualifier survives; otherwise the line
+        // would be `…: <own>`, which says less than plain elision.
+        if own_len + 8 <= MAX_NAME {
+            let budget = MAX_NAME - own_len - 3; // the `…`, the `:` and the space
+            let head: String = qualifier.chars().take(budget).collect();
+            return format!("{head}…: {own}");
+        }
+    }
+    // No structure to exploit: keep both ends of the string itself.
+    let keep = MAX_NAME - 1;
+    let head = keep * 2 / 3;
+    let tail = keep - head;
+    chars[..head]
+        .iter()
+        .chain(['…'].iter())
+        .chain(chars[chars.len() - tail..].iter())
+        .collect()
 }
 
 /// Redraw, replacing the `previous` lines already on screen. Returns how many
@@ -244,6 +294,44 @@ mod tests {
             lines[0],
             lines[1]
         );
+    }
+
+    #[test]
+    fn a_composed_name_keeps_its_stage_whole() {
+        // The stages of one tool differ only past the colon, so that is the
+        // part a line must not lose.
+        let help = "Build the test stack image from the tree".repeat(3);
+        for stage in ["fanout", "summarize", "suite-run"] {
+            let short = elide(&format!("{help}: {stage}"));
+            assert_eq!(short.chars().count(), MAX_NAME, "got: {short}");
+            assert!(short.starts_with("Build the test stack"), "got: {short}");
+            assert!(short.ends_with(&format!(": {stage}")), "got: {short}");
+        }
+    }
+
+    #[test]
+    fn an_unstructured_name_keeps_both_ends() {
+        let short = elide(&"x".repeat(200));
+        assert_eq!(short.chars().count(), MAX_NAME);
+        assert!(short.contains('…'));
+    }
+
+    #[test]
+    fn a_qualifier_with_no_room_left_falls_back_to_plain_elision() {
+        // The part after the colon is itself longer than a line, so there is no
+        // qualifier worth keeping and `…: <own>` would say less than nothing.
+        let short = elide(&format!("tool: {}", "y".repeat(200)));
+        assert_eq!(short.chars().count(), MAX_NAME);
+        assert!(!short.starts_with('…'), "got: {short}");
+    }
+
+    #[test]
+    fn a_name_that_fits_is_left_exactly_alone() {
+        assert_eq!(elide("chat-offline"), "chat-offline");
+        // Elision is by CHARACTER: a multi-byte name at the boundary must not
+        // be cut mid-character, which would panic on a byte slice.
+        let wide: String = std::iter::repeat_n('é', MAX_NAME + 10).collect();
+        assert_eq!(elide(&wide).chars().count(), MAX_NAME);
     }
 
     #[test]

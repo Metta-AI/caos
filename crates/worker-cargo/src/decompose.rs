@@ -102,13 +102,13 @@ pub fn all(cmd: &str) -> Result<(), String> {
 
     let flags = build_flags()?;
     let mut map_kvs = vec![
-        ("mode", Arg::Lit("crate")),
+        ("stage", Arg::Lit("crate")),
         ("tree", Arg::Path(&tree)),
         ("cmd", Arg::Lit(cmd)),
     ];
     map_kvs.extend(flag_extras(&flags));
     let map = self_curry(&map_kvs)?;
-    let mut then_kvs = vec![("mode", Arg::Lit("combine")), ("cmd", Arg::Lit(cmd))];
+    let mut then_kvs = vec![("stage", Arg::Lit("combine")), ("cmd", Arg::Lit(cmd))];
     then_kvs.extend(flag_extras(&flags));
     let then = self_curry(&then_kvs)?;
     map_then(
@@ -155,7 +155,7 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
     let pruned = prune(&tree, &ws, member)?;
     let flags = build_flags()?;
     let mut job_kvs = vec![
-        ("mode", Arg::Lit("job")),
+        ("stage", Arg::Lit("job")),
         ("ws", Arg::Path(&pruned)),
         ("name", Arg::Lit(&member.name)),
         ("dir", Arg::Lit(&member.dir)),
@@ -182,7 +182,7 @@ pub fn crate_mode(cmd: &str) -> Result<(), String> {
     }
     caos(["put", path(&deps_dir), "/cas/deps"])?;
     let mut dep_kvs = vec![
-        ("mode", Arg::Lit("crate")),
+        ("stage", Arg::Lit("crate")),
         ("tree", Arg::Path(&tree)),
         ("cmd", Arg::Lit("dep")),
     ];
