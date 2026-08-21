@@ -237,8 +237,9 @@ histories differ. This applies only the user's `P..U` delta instead of treating
 all changes since `P` as user edits.
 
 PR publication is an ordinary turn: the agent calls `merge` with the exact
-fetched base, resolves and tests. A clean tree without `.caos` becomes the PR
-snapshot.
+fetched base, resolves and tests. A clean conversation head without `.caos`
+becomes the PR branch tip, preserving the conversation history so later
+publications are fast-forwards.
 
 `/from` materializes a new conversation before its first new message. Its
 source must be a recognized conversation event whose complete inherited event
