@@ -205,9 +205,11 @@ Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
 branch prompt with `origin`'s advertised default selected; type another branch
 to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn that
 merges the exact fetched base with the standard `merge` tool, then resolves and
-tests the result. For another base, only this conversation's delta is applied,
-so child conversations form clean PR stacks. Unresolved conflicts stop before
-the branch moves. The checkout and index remain untouched.
+tests the result. When that fetched base is already an ancestor of the current
+conversation head, the preparation turn runs without asking the agent to merge
+it again. For another base, only this conversation's delta is applied, so child
+conversations form clean PR stacks. Unresolved conflicts stop before the branch
+moves. The checkout and index remain untouched.
 
 CAOS points `caos/<conversation>` directly at the validated conversation head,
 pushes it, and uses the authenticated `gh` CLI to find or open its pull
