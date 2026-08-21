@@ -336,7 +336,8 @@ suites for the tool set):
   exact-lease migration of a legacy snapshot branch, and opens or finds its open
   PR through `gh` against the same branch. Merely
   opening, running, switching, or publishing conversations never mutates the
-  checkout. Progress remains one completed API round at a time, and a running
+  checkout. `/publish-branch` pushes the same full-history branch without PR
+  creation. Progress remains one completed API round at a time, and a running
   turn is not cancellable until the server/runner protocol grows cancellation.
 
 ### Superseded protocol detail

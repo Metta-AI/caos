@@ -123,6 +123,9 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
+Enter `/publish-branch` to push the selected conversation's complete event
+history to `origin/caos/<conversation-id>` without opening a PR.
+
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
@@ -217,6 +220,13 @@ request. The first publication carries the conversation history; later
 publications advance the branch by fast-forward. The selected PR base is an
 ancestor of the published head, and the final tree must contain no reserved
 `.caos` state.
+
+`/publish-branch` is the sharing-only form of publication: it does not run the
+agent merge-and-test preparation turn and does not create a PR. It still checks
+the current tip for unresolved conflict records, conflict markers, and reserved
+`.caos` state before moving the branch. It can publish a completed conversation
+whose workspace diff is empty, since the transcript history itself is useful
+to another client.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git

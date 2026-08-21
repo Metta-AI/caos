@@ -152,10 +152,8 @@ pub(crate) fn publish_conversation_pr(
     pr_base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
-    let branch = format!("caos/{name}");
     let title = conversation_pr_title(title);
-    prepare_publish_branch(name, conversation, cwd)?;
-    push_publish_branch(&branch, cwd)?;
+    let branch = publish_conversation_branch(name, conversation, cwd)?;
 
     let existing_url = capture_required(
         "gh",
@@ -191,6 +189,17 @@ pub(crate) fn publish_conversation_pr(
         ],
         cwd,
     )
+}
+
+/// Push a complete conversation branch without opening or updating a PR.
+pub(crate) fn publish_conversation_branch(
+    name: &str,
+    conversation: &PreparedPublishConversation,
+    cwd: &Path,
+) -> Result<String, String> {
+    let branch = prepare_publish_branch(name, conversation, cwd)?;
+    push_publish_branch(&branch, cwd)?;
+    Ok(branch)
 }
 
 /// Resolve the default branch and its tip from the LOCAL branch, without
@@ -685,7 +694,8 @@ mod tests {
         let first_conversation =
             prepare_publish_workspace(&first_publish, &main_tip, &dir).unwrap();
 
-        let branch = prepare_publish_branch("publish-test", &first_conversation, &dir).unwrap();
+        let branch =
+            publish_conversation_branch("publish-test", &first_conversation, &dir).unwrap();
         assert_eq!(branch, "caos/publish-test");
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
@@ -695,7 +705,6 @@ mod tests {
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
             first_publish
         );
-        push_publish_branch(&branch, &dir).unwrap();
         let branch_ref = "refs/heads/caos/publish-test";
         assert_eq!(
             remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
