@@ -227,6 +227,36 @@ Run `time result/bin/caos-cli run-tool test`
     - Git push/pull requests are routed to git to handle against the repo
     - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack and trace id travel alongside it, not inside the hashed tree). The result is the hash of the WorkResult
 
+# Tracing
+
+For any run, the server records the following in redis, in a single entry that is keyed off the hash of the ArgTree and is an append-only array of typed json fields:
+- requested: with a time
+- started: with a time
+- ended: with a time and result (not the value, just success or failure)
+- child: a named child arg tree that was requested (one for a run-then, 0 or more for map-then, etc)
+- continuation: the continuation promise type (run, map, eval, etc) the arg tree of the continuation handler
+- out-trace: any perf data that the worker chooses to leave behind in /cas/out-trace
+
+These fields are enough to fully express what happened:
+- If a parent arg tree depends on something that ended before its work started, then it was a cache hit
+- If it depends on something that started before and finished after, then it requested something that someone else had already started
+- If the child starts after the parent, it probably started because the parent requested it -- but the parent definitely waited for it
+- If the child started after the parent finished (including its continuation), then the child was evicted and later rerun
+
+To determine how two runs differed, we can diff their traces and see where the keys differ and how long each work took
+
+The server supports pulling current trace data for a run: `GET /status/<arg tree hash>` returns a json tree. For any arg tree:
+- If the work is done and there's no promise, the entry is skipped
+- If the work is done and there's a promise with a completion arg tree, use the completion arg tree
+- If there are child arg trees, render the parent, with an array of rendered children. (The finished ones will be ignored)
+- Otherwise, render this node
+
+Rendering a node:
+- A node's name is the first line of the arg tree's help argument. Base args are searched resursively until one is found, falling back to the hash of the docker image
+- When a child came through a map-then, prepend the map-then name for the child to the child's name
+
+While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
+
 # Misc
 
 - `run-tool` does not fetch the output of the tool that it runs. It just prints the hash and the stdout part
