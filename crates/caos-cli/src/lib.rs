@@ -1117,8 +1117,8 @@ fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
          `.caos-secrets/{MODEL_API_SECRET}` with:\n\n\
          name={MODEL_API_SECRET}\n\
          value:@=/absolute/path/to/your/anthropic-api-key\n\
-         reader=DEEP-DEPS/llm-step\n\
-         reader=DEEP-DEPS/llm-call\n\n\
+         reader=--base:@=DEEP-DEPS/llm-step\n\
+         reader=--base:@=DEEP-DEPS/llm-call\n\n\
          Then run `{invoked_as} secrets` to add cache-isolation entropy. \
          See the README's Secrets section for details."
     ))

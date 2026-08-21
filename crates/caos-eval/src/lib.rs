@@ -514,6 +514,21 @@ fn eval_value(
     eval_command(host, input_tree, line, env)
 }
 
+/// Assemble `args` as one `curry` command against `input_tree`, without
+/// dispatching the resulting request. Callers that already supply the
+/// operation (such as a `.caos-secrets` `reader=` field) use this entry point
+/// so they share the expression grammar without accepting a verb of their own.
+pub fn assemble_curry(host: &dyn EvalHost, input_tree: &str, args: &str) -> Result<String, String> {
+    let command = format!("curry {args}");
+    let (kind, oid) = eval_command(host, input_tree, &command, &HashMap::new())?;
+    if kind != "tree" {
+        return Err(format!(
+            "curry assembly returned a {kind}, expected a partial ArgTree"
+        ));
+    }
+    Ok(oid)
+}
+
 /// Evaluate a single `run --base:<t>=<image> …` or `curry --base:<t>=<image> …`
 /// command against `input_tree`, returning the result's `(kind, oid)`. A `curry`
 /// yields the curried ArgTree (a tree); a `run` triggers compute and yields its
@@ -809,6 +824,20 @@ fn build_curry(
     new: Vec<Entry>,
 ) -> Result<gix::ObjectId, String> {
     let (base, bound) = unwrap_curry(host, image_ref)?;
+
+    // Keep expression curries as strict as ordinary client curries. The merge
+    // helper is deliberately last-wins for overlays, but repeating one name on
+    // a curry command line is a malformed binding, not an override.
+    let mut new_names = std::collections::BTreeSet::new();
+    for entry in &new {
+        if !new_names.insert(entry.filename.to_vec()) {
+            return Err(format!(
+                "curry: arg {:?} was provided more than once",
+                String::from_utf8_lossy(&entry.filename)
+            ));
+        }
+    }
+
     for e in &new {
         if bound.iter().any(|b| b.filename == e.filename) {
             return Err(format!(

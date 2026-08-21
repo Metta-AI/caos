@@ -3557,8 +3557,9 @@ pub fn cli_run(
     let (bty, bval, kvs) = split_base_arg("run", kvs)?;
     let image = resolve_base(t, None, bty, bval)?;
     // Build the ephemeral secrets store from the caller's `.caos-secrets`
-    // (design/secrets.md), resolving each reader here — where eval-path is
-    // available — so the server never evals. Empty when there's no store.
+    // (SPEC.md, Secrets), assembling each constrained reader here — where the
+    // pinned-tree expression grammar is available — so the server never evals.
+    // Empty when there's no store.
     let store = build_secret_store(t)?;
     let (kind, result) = run_request(t, &image, None, trace, &kvs, &store)?;
 
@@ -3863,6 +3864,20 @@ fn curry_from_entries(
 
     let (base, mut bound) = unwrap_curry(t, arg_tree)?;
 
+    // Reject duplicate new bindings before merging them. `merge_entries` is
+    // deliberately last-wins for run-time overlays, but curry is strict: two
+    // occurrences on one command line are as much a typo as rebinding an arg
+    // already present in the base ArgTree.
+    let mut new_names = std::collections::BTreeSet::new();
+    for entry in &new {
+        if !new_names.insert(entry.filename.to_vec()) {
+            return Err(format!(
+                "curry: arg {:?} was provided more than once",
+                String::from_utf8_lossy(&entry.filename)
+            ));
+        }
+    }
+
     // UNBIND first: drop the named args so they can be rebound. Currying is
     // otherwise strict (below), so carrying a whole ArgTree forward and changing
     // a few of its args — the self-recurry case — needs an explicit release. An
@@ -4145,10 +4160,10 @@ impl ClientSecret {
     }
 }
 
-/// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
-/// each reader resolved HERE (via eval-path, against the store's pinned tree)
-/// to a partial arg tree of name → oid — so the server only subset-matches,
-/// never evals. Empty when there is no store.
+/// Read and resolve the caller's `.caos-secrets` store (SPEC.md, Secrets): each
+/// constrained reader is assembled HERE through the curry/expression grammar,
+/// against the store's pinned tree, into a partial name → oid ArgTree. The
+/// server only subset-matches and never evals. Empty when there is no store.
 pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
     let dir = Path::new(SECRETS_DIR);
     if !dir.is_dir() {
@@ -4164,7 +4179,10 @@ pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String
         let readers = spec
             .readers
             .iter()
-            .map(|r| resolve_reader_client(t, &pinned, r))
+            .map(|reader| {
+                resolve_reader_client(t, &pinned, reader)
+                    .map_err(|error| format!("secret {file_name}: reader={reader}: {error}"))
+            })
             .collect::<Result<_, _>>()?;
         store.push(ClientSecret {
             name: spec.name,
@@ -4404,26 +4422,29 @@ fn resolve_local_secret_value(
     }
 }
 
-/// Resolve a reader — a single path/expression, no argument pins
-/// (design/secrets.md: a reader names an *expression*; narrow by pointing at a
-/// narrower one, not by pinning args here) — to the partial arg tree it stands
-/// for: eval-path the path (so a flake/`.caos-expr` tool resolves to the same
-/// arg tree the run uses), unwrap any curry layers, and take its entries. That
-/// tree already carries whatever the expression bakes in (e.g. a curried
-/// `worker1` script), so it is as specific as the expression is.
+/// Assemble one `reader=` line into the partial name -> oid ArgTree used by the
+/// existing subset matcher. The line is the ordinary curry argument list with
+/// an explicit typed `--base`; `reader=` itself supplies the curry operation.
+/// Resolution happens against the store's pinned source tree and never runs the
+/// assembled request. Curry layers are unwrapped only after assembly, so an arg
+/// already bound by the base is rejected by the shared strict-curry checks.
 fn resolve_reader_client(
     t: &dyn Transport,
     pinned: &str,
     reader: &str,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    if reader.split_whitespace().count() != 1 {
+    let partial = eval::assemble_reader(t, pinned, reader)?;
+    let (base, bound) = unwrap_curry(t, &partial)?;
+    if is_hex_hash(&base) {
+        let (kind, _) = t.get_object(&base)?;
+        if kind != "tree" {
+            return Err(format!("reader base {base} is a {kind}, not an image tree"));
+        }
+    } else if !base.starts_with(DOCKER_SCHEME) {
         return Err(format!(
-            "reader {reader:?} must be a single path (argument pins are not supported — \
-             point at a narrower expression instead)"
+            "reader base {base:?} is not a git image or docker reference"
         ));
     }
-    let image = resolve_reader_image(t, pinned, reader.trim())?;
-    let (base, bound) = unwrap_curry(t, &image)?;
     let mut entries = std::collections::BTreeMap::new();
     for entry in bound {
         entries.insert(
@@ -4431,28 +4452,14 @@ fn resolve_reader_client(
             entry.oid.to_string(),
         );
     }
-    // The image entry wins over any like-named bound arg, mirroring assembly.
-    entries.insert("base".to_string(), base);
+    // Store the base entry's object id, like every other partial entry. Docker
+    // refs therefore match their blob oid rather than leaking a representation
+    // exception into the server's pure oid-equality matcher.
+    entries.insert(
+        "base".to_string(),
+        base_arg_entry(t, &base)?.oid.to_string(),
+    );
     Ok(entries)
-}
-
-/// Resolve a reader's image token: a bare hash, or a path in the pinned tree
-/// (via eval-path — so a flake/`.caos-expr` tool resolves to the same oid the
-/// run uses).
-///
-/// A path only: there is no ambient library to name, so a reader says
-/// `std/github-push` and it is read out of the tree, exactly as an expression
-/// reaches a dependency. That is also why it converges with the run's own
-/// resolution — the root `.caos-expr` deepens the tree, and the entry a reader
-/// descends to is the same node a `DEEP-DEPS/<name>` mount points at.
-fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<String, String> {
-    if is_hex_hash(expr) {
-        return Ok(expr.to_string());
-    }
-    // Empty store: a reader's own resolution must not be marked (its arg tree is
-    // what the match compares against; marking it would be circular).
-    let (_, oid) = eval::eval_path(t, pinned, expr, &[])?;
-    Ok(oid)
 }
 
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {

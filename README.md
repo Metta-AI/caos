@@ -343,13 +343,18 @@ putting it in a curried worker. A minimal per-device setup is:
 # .caos-secrets/anthropic-api-key
 name=anthropic-api-key
 value:@=/absolute/path/to/anthropic-api-key
-reader=DEEP-DEPS/llm-step
-reader=DEEP-DEPS/llm-call
+reader=--base:@=DEEP-DEPS/llm-step
+reader=--base:@=DEEP-DEPS/llm-call
 ```
 
 Run `caos-cli secrets` once to add the random `entropy=` used for cache
 isolation. The file and value path stay local; only the entropy-derived identity
-enters an ArgTree, while the value is carried out of band for the run.
+enters an ArgTree, while the value is carried out of band for the run. Each
+`reader=` is one physical line using the typed arguments accepted after
+`curry`, with an explicit `--base`; the field itself denotes assembly, so it
+has no `curry` token. Additional args constrain the grant, and separate reader
+lines are independent. `:@=` paths resolve against the store's pinned source
+tree.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are

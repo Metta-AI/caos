@@ -49,7 +49,7 @@ printf '%s\n' \
   'name=anthropic-api-key' \
   'value=test-key' \
   'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-call' \
+  'reader=--base:@=DEEP-DEPS/llm-call' \
   > .caos-secrets/anthropic-api-key
 call=$(
   "$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-call \

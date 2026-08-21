@@ -7,10 +7,11 @@
 //!
 //! The store is **carried with the run as ephemeral context** (like the run
 //! stack), not sourced on the server: the client reads its own git-ignored
-//! `.caos-secrets`, resolves each reader with eval-path (the same evaluator the
-//! run uses, so the resolved image oids match what the job carries — the server
-//! must never eval), and sends the result in the `X-Caos-Secrets` header on
-//! `GET /run`. The server parses it into [`Grant`]s, threads them through
+//! `.caos-secrets`, assembles each constrained reader with the normal curry and
+//! expression grammar against the store's pinned source tree, and sends the
+//! resulting partial name → oid map in the `X-Caos-Secrets` header on `GET
+//! /run`. The assembled reader is never executed and the server never evals.
+//! The server parses the maps into [`Grant`]s, threads them through
 //! promise resolution to every sub-run's dispatch, and at each dispatch does
 //! the cheap subset-match + injection. So a sub-worker is entitled by matching
 //! *its own* arg tree, never by inheritance (the no-delegation invariant).
@@ -198,27 +199,36 @@ mod tests {
     fn grant_requires_the_matching_secret_hash() {
         let grants = parse_header(
             r#"[{"name":"tok","value":"s3cr3t","entropy":"E","readers":[
-                 {"base":"aa"},
+                 {"base":"aa","endpoint":"trusted"},
                  {"base":"bb","repo":"cc"}
                ]}]"#,
         );
         // A worker that matches a reader but carries NO secret-hash is refused
         // (it wasn't produced by eval with this store).
-        assert!(grant(&grants, &map(&[("base", "aa")])).is_empty());
+        assert!(grant(&grants, &map(&[("base", "aa"), ("endpoint", "trusted")])).is_empty());
         // With the matching secret-hash present, the value is injected. The
-        // entry is the blob-oid of the digest (how it rides in a real tree).
-        let mut job = map(&[("base", "aa"), ("salt", "z")]);
+        // entry is the blob-oid of the digest (how it rides in a real tree), and
+        // unpinned args do not interfere with the subset match.
+        let mut job = map(&[
+            ("base", "aa"),
+            ("endpoint", "trusted"),
+            ("head", "conversation"),
+        ]);
         let digest = secret_hash(&grants, &job).unwrap();
-        job.insert(
-            caos_world::SECRET_HASH_ARG.to_string(),
-            blob_oid(digest.as_bytes()),
-        );
+        let copied_hash = blob_oid(digest.as_bytes());
+        job.insert(caos_world::SECRET_HASH_ARG.to_string(), copied_hash.clone());
         assert_eq!(
             grant(&grants, &job),
             vec![("tok".to_string(), "s3cr3t".to_string())]
         );
+        // Copying the valid hash to the same worker with a different pinned
+        // destination cannot manufacture a grant: the reader no longer
+        // matches, so the server expects no isolation hash at all.
+        let mut copied = map(&[("base", "aa"), ("endpoint", "attacker")]);
+        copied.insert(caos_world::SECRET_HASH_ARG.to_string(), copied_hash);
+        assert!(grant(&grants, &copied).is_empty());
         // A wrong secret-hash is refused.
-        let mut forged = map(&[("base", "aa")]);
+        let mut forged = map(&[("base", "aa"), ("endpoint", "trusted")]);
         forged.insert(
             caos_world::SECRET_HASH_ARG.to_string(),
             "deadbeef".to_string(),

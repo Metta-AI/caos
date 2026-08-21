@@ -109,9 +109,9 @@ fi
 grep -q "anthropic-api-key" key.err || fail "missing-key error is unclear"
 grep -qF '.caos-secrets/anthropic-api-key' key.err \
   || fail "missing-key error does not name the setup file"
-grep -qF 'reader=DEEP-DEPS/llm-step' key.err \
+grep -qF 'reader=--base:@=DEEP-DEPS/llm-step' key.err \
   || fail "missing-key error does not explain the llm-step grant"
-grep -qF 'reader=DEEP-DEPS/llm-call' key.err \
+grep -qF 'reader=--base:@=DEEP-DEPS/llm-call' key.err \
   || fail "missing-key error does not explain the title grant"
 grep -qF "$CAOS_CLI secrets" key.err \
   || fail "missing-key error does not explain entropy setup"
@@ -127,7 +127,7 @@ printf '%s\n' \
   'name=anthropic-api-key' \
   'value=test-key' \
   'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-step' \
+  'reader=--base:@=DEEP-DEPS/llm-step' \
   > .caos-secrets/anthropic-api-key
 mkdir -p bad/.caos
 echo reserved > bad/.caos/marker

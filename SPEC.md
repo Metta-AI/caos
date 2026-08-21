@@ -99,22 +99,30 @@ If these become slow:
 # Secrets
 
 **Status:** partly built. The store is carried as ephemeral run context and
-resolved client-side; injection (gated by the double-check below), superset
-matching over path-only readers, the entropy/`secret-hash` cache-isolation tag,
-the output-scrub assertion, log masking, and the `caos secrets` entropy tooling
-all exist. **Cache isolation is now complete for the eval path**: the running
+resolved client-side; constrained partial-ArgTree readers, injection (gated by
+the double-check below), the entropy/`secret-hash` cache-isolation tag, the
+output-scrub assertion, log masking, and the `caos secrets` entropy tooling all
+exist. **Cache isolation is now complete for the eval path**: the running
 worker, eval-path's `curry` returns, and — via the eval-path stripping rule —
 a worker embedded through a `:@=` arg, which makes its embedder per-user too.
 Builds on `.caos-expr` (eval-path, deep-deps) and map-then (server-mediated
 worker starts).
 
-**Since the ambient-`std` removal landed** (design/caos-expr.md, "Landed:
-ambient `/std` is gone"), a reader is a **tree path and nothing else** — there
-is no `/std/<name>` to name, so the two reader forms collapsed into one, which
-is what this note always wanted. It also briefly *widened* the
-caller-propagation gap: eval-path used to mark a `/std/<name>` `:@=` target, and
-that was the only `:@=` marking there was. Closing it properly covers all of
-`:@=` and needs no `/std` special case at all.
+Every `reader=` is one physical line containing the arguments that assemble a
+partial/curry ArgTree. It has no `curry` verb because `reader=` supplies that
+operation, and it must contain an explicit typed `--base`. The rest uses the
+same argument parser and resolution rules as `.caos-expr` curry commands;
+notably, `:@=` paths resolve against the secret store's pinned source tree.
+The assembled reader is never run. It is unwrapped to the existing name → oid
+map and sent to the server, whose authorization remains a pure subset match.
+
+This restores the inline pins removed in commit `91866bd94`. Moving constraints
+into narrower expression wrappers conflated two policies: content-addressed
+worker identity belongs in the source tree, while the secret owner's local
+grant constraints belong on that device. Security-sensitive values such as a
+credential destination belong beside the credential; requiring a wrapper would
+make that policy repository-owned and needlessly proliferate expression
+directories.
 
 The agent harness carries the same store: conversation preparation resolves
 `llm-step` with it, the admitted request includes the resulting isolation
@@ -133,26 +141,32 @@ Some tools need secrets: the github-push tool needs an auth token, and there wil
 
 `.caos-secrets`:
 - Secrets live in a git-ignored .caos-secrets directory
-- Each secret file contains the secret's value and a list of workers that can read the secret. This is formatted as a repeated-key file. For example:
+- Each secret file contains the secret's value and one or more independent
+  partial ArgTrees that may read it. This is formatted as a repeated-key file.
+  For example:
 ```
-# Optional name. Defalts to the name of the file. This is the name that is used in the worker for /secret/<name>
+# Optional name. Defaults to the filename. This is used at /secret/<name>.
 name=<name>
 entropy=...
 # Inline secret
 value=<secret key>
 # External key
 value:@=<file containing key>
-# A reader is a PATH to an expression, without arguments. It is eval-path'd to
-# an arg tree
-reader=std/github-push
-reader=tools/deploy
+# Each reader is a curry argument list with its own explicit typed base.
+reader=--base:@=DEEP-DEPS/github-push --repo=github.com/me/proj
+reader=--base:@=tools/deploy --environment=production
 ```
-- When a call stack is started, such as `caos-cli run`, we read the current source tree and the list of secrets. Readers in secrets are matched against the tree. Any worker named as a reader is granted access to the secret. These workers have a hash of the names and entropy of all exposed secrets injected into them as /cas/args/secret-hash
-- Something is considered to be the same worker (ie, to have access to the secret) if it its arg tree is a superset of the reader's arg tree and secret-hash matches the set of secrets that the server computes for it
+- When a call stack is started, such as `caos-cli run`, the client reads the
+  pinned source tree and the secret files. Each reader is assembled through the
+  normal argument/expression code, without executing the assembled request.
+- A worker has access when its ArgTree is a superset of any one independently
+  assembled reader and its `secret-hash` matches the exact set of secrets the
+  server computes for that ArgTree. Arguments omitted from a reader remain
+  unconstrained.
 - Each granted secret contributes its (worker-visible name, entropy) to a
   `secret-hash` entry folded into the worker's arg tree (visible at
   `/cas/args/secret-hash`). This makes two users with different secrets see
-  different cache keys — but keps the secret's *value* out (so rotating a value
+  different cache keys — but keeps the secret's *value* out (so rotating a value
   doesn't bust the cache), and stores the *digest* of the entropy, never the
   entropy itself (the entropy is a bearer capability for the cache: knowing it
   reconstructs the key of any run that used it). The name is included because a
@@ -187,9 +201,6 @@ Note that this means that the server sees all secrets. We can revisit if this be
 ## Remaining work
 
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
-
-- **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
-  never trigger compute); likely permanent.
 
 - **Shared-server exposure.** Carrying the whole store means a shared server
   sees values it never injects (sub-runs aren't known ahead of time, so the
