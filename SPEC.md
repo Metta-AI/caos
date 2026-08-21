@@ -269,6 +269,24 @@ Names are for display and may be truncated to fit; the arg trees are what forens
 
 While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
 
+# Building and testing caos, including inside caos
+
+Caos can be built and tested on a host with just what's defined in flake.nix with ordinary commands like:
+- `nix build`
+- `result/bin/caosd up`
+- `result/bin/caos-cli run dev/run-tests` (`dev/run-tests` is a caos expr that depends on /tests and runs them all)
+
+The build and test tools use `dev/run-in-test-container <command>` to run the build steps in a container to enable more caching than they could get in a normal worker container:
+- Uses `nix eval --raw .#<x>.outPath` to determine the name of the stack that we are building. `x` is a new derivation that includes all of the workspace bins and anything else needed to run the stack
+- Uses flock to make sure that only one instance of the command runs at a time
+- Mounts the nix store and socket (to cache build products), the docker socket (to cache images) and a volume for git and redis data. The volume is a directory on the host that shares the stack name
+- Runs the provided command in the container and exists with the exit code of the command
+- Uses --rm to remove the container after it exits
+
+The build and tools are:
+- `caos-tools/build`: `run-in-test-container "nix build"`
+- `caos-tools/test`: `run-in-test-container "nix build && .../caosd up && .../caos-cli run dev/run-tests"`
+
 # Misc
 
 - `run-tool` does not fetch the output of the tool that it runs. It just prints the hash and the stdout part
