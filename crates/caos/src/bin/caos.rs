@@ -123,6 +123,9 @@ fn run(args: &[String]) -> Result<(), String> {
         // exact flat runnable ArgTree without executing it. This is the durable
         // identity accepted by sub-run.
         Some("prepare-request") => caos::caos_prepare_request(&http()?, &args[2..]),
+        // `resolve-image <hash|docker://ref>` — the reference a runner would
+        // pull. Converts (and caches) a git-docker tree exactly as a run would.
+        Some("resolve-image") => caos::caos_resolve_image(&args[2..]),
         // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
         // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
         // args tree like `own_args_tree`), printing a ref to the resulting curried
@@ -511,6 +514,7 @@ fn usage(args: &[String]) -> String {
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
+         {prog} resolve-image <hex hash | docker://<ref>>\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is :@=<cas path>, :docker=<ref> or :hash=<oid>)\n  \
          {prog} runner --job=<json>"

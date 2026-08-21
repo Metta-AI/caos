@@ -522,6 +522,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
         Method::Get if path.starts_with("/status/") => {
             status::serve(config, path.trim_start_matches("/status/"), &query)
         }
+        Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),
