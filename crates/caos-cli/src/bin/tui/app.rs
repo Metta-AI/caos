@@ -24,8 +24,8 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::workspace::{
     commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
-    local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
-    remote_base_is_ancestor, remote_default_branch,
+    local_default_branch_tip, prepare_publish_workspace, publish_conversation_branch,
+    publish_conversation_pr, remote_base_is_ancestor, remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -854,6 +854,7 @@ enum AppAction {
     Invite,
     Model,
     Commands,
+    PublishBranch,
     Reference,
     Title,
     UpdateTree,
@@ -897,7 +898,7 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 8] = [
+const COMMANDS: [Command; 9] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -931,6 +932,13 @@ const COMMANDS: [Command; 8] = [
         usage: "/commands",
         description: "open the searchable command palette",
         action: AppAction::Commands,
+        takes_argument: false,
+    },
+    Command {
+        name: "/publish-branch",
+        usage: "/publish-branch",
+        description: "push the complete conversation branch without a PR",
+        action: AppAction::PublishBranch,
         takes_argument: false,
     },
     Command {
@@ -1441,6 +1449,10 @@ enum UiMessage {
         result: Result<String, String>,
     },
     Published {
+        conversation: String,
+        result: Result<String, String>,
+    },
+    BranchPublished {
         conversation: String,
         result: Result<String, String>,
     },
@@ -2250,6 +2262,7 @@ impl App {
                     .push_info(format!("Model for future turns: {model}"));
             }
             AppAction::From => self.start_from_hash(arguments),
+            AppAction::PublishBranch => self.publish_branch_selected(),
             AppAction::Title => self.rename_selected(arguments),
             AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
             AppAction::NewConversation
@@ -2519,6 +2532,26 @@ impl App {
                                 state.sidebar_attention =
                                     Some("PR failed — open for details".to_string());
                                 state.show_command_error(format!("PR failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                UiMessage::BranchPublished {
+                    conversation,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.publishing = false;
+                        match result {
+                            Ok(branch) => state
+                                .push_info(format!("Conversation branch ready: origin/{branch}")),
+                            Err(error) => {
+                                state.sidebar_attention =
+                                    Some("Branch publish failed — open for details".to_string());
+                                state.show_command_error(format!(
+                                    "publishing conversation branch failed: {error}"
+                                ));
                             }
                         }
                     }
@@ -3348,6 +3381,7 @@ impl App {
             AppAction::From
             | AppAction::Invite
             | AppAction::Model
+            | AppAction::PublishBranch
             | AppAction::Reference
             | AppAction::Title
             | AppAction::UpdateTree => unreachable!("slash action needs arguments"),
@@ -3667,6 +3701,35 @@ impl App {
             self.selected_mut()
                 .show_command_error("this conversation has no commit to check out");
         }
+    }
+
+    fn publish_branch_selected(&mut self) {
+        if self.selected().is_busy() {
+            self.selected_mut().show_command_error(
+                "finish this conversation's operation before publishing its branch",
+            );
+            return;
+        }
+        let Some(diff) = self.selected().diff.clone() else {
+            self.selected_mut()
+                .show_command_error("this conversation has no completed turn to publish");
+            return;
+        };
+        let conversation = self.selected().id.clone();
+        self.selected_mut().publishing = true;
+        self.selected_mut().status = "publishing the complete conversation branch".to_string();
+        let repo_dir = self.repo_dir.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let prepared = prepare_publish_workspace(&diff.head, &diff.base_commit, &repo_dir)?;
+                publish_conversation_branch(&conversation, &prepared, &repo_dir)
+            })();
+            let _ = tx.send(UiMessage::BranchPublished {
+                conversation,
+                result,
+            });
+        });
     }
 
     fn publish_selected(&mut self) {
@@ -4557,6 +4620,7 @@ mod tests {
                 "/title",
                 "/update-tree",
                 "/commands",
+                "/publish-branch",
                 "/ref",
                 "/invite",
                 "/model"
@@ -4607,6 +4671,10 @@ mod tests {
         let (command, arguments) = parse_command("/from\nabc123").unwrap();
         assert_eq!(command.action, AppAction::From);
         assert_eq!(arguments, "abc123");
+
+        let (command, arguments) = parse_command("/publish-branch").unwrap();
+        assert_eq!(command.action, AppAction::PublishBranch);
+        assert!(arguments.is_empty());
 
         let (command, arguments) = parse_command("/ref").unwrap();
         assert_eq!(command.action, AppAction::Reference);

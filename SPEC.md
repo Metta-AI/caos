@@ -567,8 +567,15 @@ revision (and made the history tools' hashes readable the same way).
   resolution turn (a leftover marker does not compile) — not by a marker
   re-scan, which cannot tell a real marker from a bad resolution.
 - The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
-  remaining marker is PUBLISH (the tui's PR flow) — the moment work actually
-  leaves the conversation.
+  remaining marker is PUBLISH (the tui's PR or branch flow) — the moment work
+  actually leaves the conversation.
+
+## Conversation branch publication
+
+The TUI publishes a complete conversation by pointing
+`refs/heads/caos/<conversation-id>` directly at its validated event head. A
+branch-only publication does not open a PR or run PR-base preparation; it is a
+sharing mechanism for the transcript and workspace history already present.
 
 ## Caveat
 
