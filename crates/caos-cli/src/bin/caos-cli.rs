@@ -16,9 +16,7 @@
 //! explicit one-turn form). The object-level commands (`get`/`put`/…) live
 //! only in the worker `caos`, which runs inside a sandbox with a real `/cas`.
 
-use std::io::Write;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use caos::{prog_name, GitTransport};
 
@@ -37,70 +35,18 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
-        // `run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [...]`.
-        // The trace id is invocation metadata, and `[output]` is a host path to
-        // check the result out to — the run's only positional, and the only
+        // `run [output] --base:<type>=<image> [...]`. `[output]` is a host path
+        // to check the result out to — the run's only positional, and the only
         // token that isn't a `--flag`. Every `--name[:type]=value` after it is a
         // computation argument and therefore part of the ArgTree (the cache
         // key), including the reserved `--base`, which names the worker to run.
         Some("run") => {
-            let mut trace_id = None;
-            let mut trace_path = None;
-            let mut index = 2;
-            while let Some(arg) = args.get(index) {
-                if let Some(id) = arg.strip_prefix("--trace-id=") {
-                    if trace_id.replace(id).is_some() {
-                        return Err("--trace-id given twice".to_string());
-                    }
-                } else if arg == "--trace" {
-                    if trace_path.replace("-").is_some() {
-                        return Err("--trace given twice".to_string());
-                    }
-                } else if let Some(path) = arg.strip_prefix("--trace=") {
-                    if trace_path.replace(path).is_some() {
-                        return Err("--trace given twice".to_string());
-                    }
-                } else {
-                    break;
-                }
-                index += 1;
-            }
-            let (output, kvs) = match &args[index..] {
+            let (output, kvs) = match &args[2..] {
                 [] => return Err(usage(args)),
                 [output, kvs @ ..] if !output.starts_with("--") => (Some(output.as_str()), kvs),
                 kvs => (None, kvs),
             };
-            if trace_path == Some("") {
-                return Err("--trace needs a file path or '-' for stdout".to_string());
-            }
-            if trace_id.is_some() && trace_path.is_none() {
-                return Err("--trace-id is only an override for --trace".to_string());
-            }
-            if trace_path == Some("-") && output.is_none() {
-                return Err("stdout tracing requires a computation output path".to_string());
-            }
-            if trace_path.is_some_and(|path| output == Some(path)) {
-                return Err("trace and computation output paths must differ".to_string());
-            }
-            let generated_id = (trace_path.is_some() && trace_id.is_none()).then(fresh_trace_id);
-            let trace_id = trace_id.or(generated_id.as_deref());
-            let mut trace_output: Option<Box<dyn Write + Send>> = match trace_path {
-                Some("-") => Some(Box::new(std::io::stdout())),
-                Some(path) => Some(Box::new(
-                    std::fs::File::create(path)
-                        .map_err(|e| format!("creating trace file {path}: {e}"))?,
-                )),
-                None => None,
-            };
-            let transport = transport()?;
-            let run = |trace| caos::cli_run(&transport, output, trace, kvs);
-            match trace_output.as_mut() {
-                Some(writer) => run(Some((
-                    trace_id.expect("trace output always has an id"),
-                    writer.as_mut(),
-                ))),
-                None => run(None),
-            }
+            caos::cli_run(&transport()?, output, kvs)
         }
         // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
         // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
@@ -161,11 +107,13 @@ fn run(args: &[String]) -> Result<(), String> {
             [hash, path] => caos::cli_get(&transport()?, hash, path),
             _ => Err(usage(args)),
         },
-        // `status <arg tree hash>` — what is running under an ArgTree, as JSON
+        // `status [--all] <arg tree hash>` — what is running under an ArgTree,
+        // or (with --all) what happened, as JSON
         // (SPEC.md "Tracing"). The same view `run`/`run-tool` show live, for a
         // run happening elsewhere or one you want to look at after the fact.
         Some("status") => match &args[2..] {
-            [arg_tree] => caos::cli_status(&transport()?, arg_tree),
+            [arg_tree] => caos::cli_status(&transport()?, arg_tree, false),
+            [flag, arg_tree] if flag == "--all" => caos::cli_status(&transport()?, arg_tree, true),
             _ => Err(usage(args)),
         },
         // `secrets [--check]` — tend the local `.caos-secrets` store: fill a
@@ -187,14 +135,6 @@ fn transport() -> Result<GitTransport, String> {
     GitTransport::from_cwd()
 }
 
-fn fresh_trace_id() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("cli-{}-{now}", std::process::id())
-}
-
 /// The caos revision this build came from, injected by the flake's wrapper
 /// (`CAOS_REV`) rather than compiled in — a compile-time rev would re-key the
 /// Rust workspace on every commit. `unknown` when run straight out of `cargo
@@ -211,7 +151,7 @@ fn usage(args: &[String]) -> String {
     format!(
         "{prog} ({rev})\n\
          usage:\n  \
-         {prog} run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [--name=value | --name:@=path ...]\n  \
+         {prog} run [output] --base:<type>=<image> [--name=value | --name:@=path ...]\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is --base:@=<dir>, --base:docker=<ref> or --base:hash=<oid>)\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
@@ -222,7 +162,7 @@ fn usage(args: &[String]) -> String {
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \
-         {prog} status <arg tree hash>\n  \
+         {prog} status [--all] <arg tree hash>\n  \
          {prog} secrets [--check]"
     )
 }

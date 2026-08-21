@@ -99,10 +99,9 @@ An in-flight worker may start one already-prepared request without waiting:
 ```
 
 The nonce selects only the server-side context of the currently claimed job.
-The compute thread starts the child with `parent stack + parent request`, the
-same trace id, and the same secret store. None of those values enter this body
-or the runner payload. The nonce stops authorizing sub-runs as soon as the
-parent job reports its result.
+The compute thread starts the child with `parent stack + parent request` and the
+same secret store. Neither value enters this body or the runner payload. The
+nonce stops authorizing sub-runs as soon as the parent job reports its result.
 
 ### `POST /runner/result`
 

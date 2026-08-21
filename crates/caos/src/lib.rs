@@ -104,7 +104,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // pass against something other than the tree it was given.
     let mut all: Vec<String> = vec!["--in:@=.".to_string()];
     all.extend(kvs.iter().cloned());
-    let (kind, result) = run_request(t, &arg_tree, None, None, &all, &store)?;
+    let (kind, result) = run_request(t, &arg_tree, None, &all, &store)?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
     println!("{kind} {result}");
@@ -201,22 +201,34 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
 /// Fetch `GET /status/<arg_tree>` — the server's view of the work under an
 /// ArgTree (SPEC.md "Tracing"). Returns the raw JSON, or None when the server
 /// has nothing to show (a `null` body: the work is finished, or never ran here).
-pub fn fetch_status(t: &dyn Transport, arg_tree: &str) -> Result<Option<String>, String> {
+pub fn fetch_status(
+    t: &dyn Transport,
+    arg_tree: &str,
+    all: bool,
+) -> Result<Option<String>, String> {
     let base = t.server_url()?;
-    let body = http_get(&format!("{}/status/{arg_tree}", base.trim_end_matches('/')))?;
+    let query = if all { "?all=1" } else { "" };
+    let body = http_get(&format!(
+        "{}/status/{arg_tree}{query}",
+        base.trim_end_matches('/')
+    ))?;
     let text = String::from_utf8_lossy(&body).trim().to_string();
     Ok((text != "null" && !text.is_empty()).then_some(text))
 }
 
-/// `status <arg tree hash>` — print the work tree under an ArgTree.
+/// `status [--all] <arg tree hash>` — print the work tree under an ArgTree.
 ///
 /// The one-shot form of what a run shows live. Useful on its own for a run
 /// happening in another terminal, and it is how the live display gets its data.
-pub fn cli_status(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
-    match fetch_status(t, arg_tree)? {
+/// `--all` asks what HAPPENED instead: finished nodes are kept, a continuation
+/// handler hangs off the node that promised it, and work this run REUSED rather
+/// than performed is marked.
+pub fn cli_status(t: &dyn Transport, arg_tree: &str, all: bool) -> Result<(), String> {
+    match fetch_status(t, arg_tree, all)? {
         Some(json) => println!("{json}"),
-        // Not an error: "nothing is running under this key" is a real answer,
-        // and the commonest one — a finished run has no current work.
+        // Not an error: "nothing here" is a real answer, and for the live view
+        // the commonest one — a finished run has no current work.
+        None if all => eprintln!("nothing recorded under {arg_tree}"),
         None => eprintln!("no current work under {arg_tree}"),
     }
     Ok(())
@@ -3038,7 +3050,6 @@ fn run_request(
     t: &dyn Transport,
     image: &str,
     cas: Option<&Path>,
-    trace: Option<(&str, &mut (dyn Write + Send))>,
     kvs: &[String],
     store: &[ClientSecret],
 ) -> Result<(String, String), String> {
@@ -3053,10 +3064,7 @@ fn run_request(
     // than two, and a caller that is not a person (the suite, a worker) gets
     // nothing started on its behalf — see `watch::Watch::start`.
     let _watch = watch::Watch::start(&server, &arg_tree);
-    match trace {
-        Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, &header),
-        None => request_compute(&server, &arg_tree, &header),
-    }
+    request_compute(&server, &arg_tree, &header)
 }
 
 /// Everything in [`run_request`] up to (and including) getting the ArgTree onto
@@ -3111,7 +3119,7 @@ pub fn run_client_request_with_store(
     kvs: &[String],
     store: &[ClientSecret],
 ) -> Result<(String, String), String> {
-    run_request(t, image, None, None, kvs, store)
+    run_request(t, image, None, kvs, store)
 }
 
 /// `prepare-request --base:<type>=<image-or-arg-tree> [--name=value | --name:@=path ...]`
@@ -3575,22 +3583,14 @@ fn record_continuation(
 /// the worker is the reserved [`BASE_ARG`] — `--base:@=<host dir>` (ingested, and
 /// evaluated if it carries a `.caos-expr`; see [`resolve_cli_image`]),
 /// `--base:docker=<ref>`, or `--base:hash=<oid>`.
-pub fn cli_run(
-    t: &dyn Transport,
-    output: Option<&str>,
-    trace: Option<(&str, &mut (dyn Write + Send))>,
-    kvs: &[String],
-) -> Result<(), String> {
-    if trace.as_ref().is_some_and(|(id, _)| !valid_trace_id(id)) {
-        return Err("trace id must be 1-128 ASCII letters, digits, '-' or '_'".to_string());
-    }
+pub fn cli_run(t: &dyn Transport, output: Option<&str>, kvs: &[String]) -> Result<(), String> {
     let (bty, bval, kvs) = split_base_arg("run", kvs)?;
     let image = resolve_base(t, None, bty, bval)?;
     // Build the ephemeral secrets store from the caller's `.caos-secrets`
     // (design/secrets.md), resolving each reader here — where eval-path is
     // available — so the server never evals. Empty when there's no store.
     let store = build_secret_store(t)?;
-    let (kind, result) = run_request(t, &image, None, trace, &kvs, &store)?;
+    let (kind, result) = run_request(t, &image, None, &kvs, &store)?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -4486,7 +4486,7 @@ fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<S
 }
 
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
-    let url = run_url(base, arg_tree, None);
+    let url = run_url(base, arg_tree);
     request_compute_url(&url, secrets)
 }
 
@@ -4505,23 +4505,10 @@ pub fn compute_client_request_with_store(
     request_compute(base, arg_tree, &secret_store_header(store))
 }
 
-fn request_compute_traced(
-    base: &str,
-    arg_tree: &str,
-    trace_id: &str,
-    secrets: &str,
-) -> Result<(String, String), String> {
-    let url = run_url(base, arg_tree, Some(trace_id));
-    request_compute_url(&url, secrets)
-}
-
-fn run_url(base: &str, arg_tree: &str, trace_id: Option<&str>) -> String {
-    let mut url = format!("{}/run?req={arg_tree}", base.trim_end_matches('/'));
-    if let Some(trace_id) = trace_id {
-        url.push_str("&trace=");
-        url.push_str(trace_id);
-    }
-    url
+/// The one shape every compute path uses. `req` is the query param's historical
+/// name; its value is the ArgTree hash.
+fn run_url(base: &str, arg_tree: &str) -> String {
+    format!("{}/run?req={arg_tree}", base.trim_end_matches('/'))
 }
 
 /// Ask the server to start `arg_tree` with the current in-flight job's
@@ -4584,64 +4571,6 @@ fn request_compute_url(url: &str, secrets: &str) -> Result<(String, String), Str
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
-}
-
-fn request_compute_streamed(
-    base: &str,
-    arg_tree: &str,
-    trace_id: &str,
-    output: &mut (dyn Write + Send),
-    secrets: &str,
-) -> Result<(String, String), String> {
-    let stream_url = format!("{}/trace/{trace_id}/stream", base.trim_end_matches('/'));
-    let mut response = minreq::get(&stream_url)
-        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-        .send_lazy()
-        .map_err(|e| format!("GET {stream_url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        let status = response.status_code;
-        let reason = response.reason_phrase.clone();
-        let mut body = String::new();
-        let _ = response.read_to_string(&mut body);
-        return Err(format!(
-            "GET {stream_url}: server returned {status} {reason}: {}",
-            body.trim()
-        ));
-    }
-
-    std::thread::scope(|scope| {
-        let trace = scope.spawn(|| -> Result<(), String> {
-            let mut buffer = [0; 8192];
-            loop {
-                let read = response
-                    .read(&mut buffer)
-                    .map_err(|e| format!("reading trace: {e}"))?;
-                if read == 0 {
-                    break;
-                }
-                output
-                    .write_all(&buffer[..read])
-                    .and_then(|()| output.flush())
-                    .map_err(|e| format!("writing trace: {e}"))?;
-            }
-            Ok(())
-        });
-        let result = request_compute_traced(base, arg_tree, trace_id, secrets);
-        let trace_result = trace
-            .join()
-            .map_err(|_| "the trace stream thread panicked".to_string())?;
-        let result = result?;
-        trace_result?;
-        Ok(result)
-    })
-}
-
-fn valid_trace_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),
@@ -4718,13 +4647,14 @@ mod git_transport_tests {
 
     #[test]
     fn all_compute_paths_share_one_url_shape() {
+        // A trailing slash on the base must not double up in the path.
         assert_eq!(
-            run_url("http://caos/", &"a".repeat(40), None),
+            run_url("http://caos/", &"a".repeat(40)),
             format!("http://caos/run?req={}", "a".repeat(40))
         );
         assert_eq!(
-            run_url("http://caos", &"a".repeat(40), Some("turn-7")),
-            format!("http://caos/run?req={}&trace=turn-7", "a".repeat(40))
+            run_url("http://caos", &"a".repeat(40)),
+            run_url("http://caos/", &"a".repeat(40))
         );
     }
 

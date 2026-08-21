@@ -8,13 +8,11 @@
 //!
 //! Compute:
 //!
-//! * `GET /run?req=<hash>&trace=<id>` — run the ArgTree `<hash>` (`req` is the
+//! * `GET /run?req=<hash>` — run the ArgTree `<hash>` (`req` is the
 //!   query param's historical name; its value is the ArgTree hash) and return
-//!   the hash of its result, optionally emitting this invocation to an open
-//!   trace stream.
+//!   the hash of its result.
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
 //!   existing server-side run stack and secret store.
-//! * `GET /trace/<id>/stream` — follow one live invocation as chunked NDJSON.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
 //! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
@@ -48,7 +46,6 @@ mod runner;
 mod secrets;
 mod status;
 mod storage;
-mod trace;
 
 use std::sync::Arc;
 
@@ -79,7 +76,7 @@ const DEFAULT_REDIS_ADDR: &str = "caos-redis:6379";
 
 /// Runtime configuration, read once from the environment at startup. Cloning
 /// is cheap and lets admitted sub-runs outlive the request thread that launched
-/// them while sharing the same repository and trace hub handles.
+/// them while sharing the same repository handle.
 #[derive(Clone)]
 struct Config {
     registry_push_url: String,
@@ -91,7 +88,6 @@ struct Config {
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
-    trace: trace::Hub,
 }
 
 /// Install handlers so the process terminates on `SIGINT`/`SIGTERM`. This matters
@@ -262,7 +258,6 @@ fn main() {
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         git_dir,
         repo,
-        trace: trace::Hub::default(),
     });
 
     let server = match Server::http(addr.as_str()) {
@@ -493,35 +488,6 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
             );
         }
     }
-    if request.method() == &Method::Get {
-        if let Some(id) = path
-            .strip_prefix("/trace/")
-            .and_then(|rest| rest.strip_suffix("/stream"))
-        {
-            if !trace::valid_id(id) {
-                return request.respond(
-                    Response::from_string("invalid trace id\n").with_status_code(StatusCode(400)),
-                );
-            }
-            if request.url().contains('?') {
-                return request.respond(
-                    Response::from_string("trace streams do not accept query parameters\n")
-                        .with_status_code(StatusCode(400)),
-                );
-            }
-            let stream = match config.trace.stream(id) {
-                Ok(stream) => stream,
-                Err(message) => {
-                    return request.respond(
-                        Response::from_string(format!("{message}\n"))
-                            .with_status_code(StatusCode(409)),
-                    )
-                }
-            };
-            return stream.respond(request);
-        }
-    }
-
     match route(&config, &mut request) {
         Ok(body) => request.respond(Response::from_data(body)),
         Err(err) => request.respond(
@@ -554,7 +520,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             compute::run(config, &query, &secrets_header)
         }
         Method::Get if path.starts_with("/status/") => {
-            status::serve(config, path.trim_start_matches("/status/"))
+            status::serve(config, path.trim_start_matches("/status/"), &query)
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),

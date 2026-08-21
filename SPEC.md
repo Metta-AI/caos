@@ -7,11 +7,10 @@ A WorkRequest is:
     - std (optional, but very common)
     - salt (optional): a string that is used to invalidate the cache
 - stack
-- trace id
 
 A WorkResult is a git object, containing whatever the worker chose to return
 
-WorkRequest contains ArgTree, stack, trace id, etc #todo
+WorkRequest contains ArgTree, stack, etc #todo
 - The ArgTree is the cache key
 
 We generally talk about ArgTrees, not images. An image is just one arg (see
@@ -227,7 +226,7 @@ Run `time result/bin/caos-cli run-tool test`
     - GC is disabled
 - shall listen on port 80 and respond to requests:
     - Git push/pull requests are routed to git to handle against the repo
-    - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack and trace id travel alongside it, not inside the hashed tree). The result is the hash of the WorkResult
+    - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack travels alongside it, not inside the hashed tree). The result is the hash of the WorkResult
 
 # Tracing
 
@@ -263,6 +262,10 @@ A name is qualified by a prefix, `<prefix>: <name>`:
 - Descending into a map-then or eval child, the child's own name from the parent replaces the prefix: it is separate work, not a later stage. A run-then or exact-request child takes no prefix, because the name there is the child's position in the continuation rather than a description of it, and such a child usually names itself
 
 Names are for display and may be truncated to fit; the arg trees are what forensics reads
+
+`GET /status/<arg tree hash>?all=1` asks what HAPPENED rather than what is happening:
+- Nothing is skipped for being finished, and a completion arg tree is rendered as a CHILD of the node that promised it rather than replacing it. The shape is then the run's actual structure, which is what one run is diffed against another
+- A node whose record ended before its parent started was REUSED by this run rather than performed by it. It is marked and not descended into: its children belong to the run that did the work, and following them would splice another invocation's tree into this one
 
 While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
 

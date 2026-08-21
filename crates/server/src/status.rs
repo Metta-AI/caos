@@ -312,8 +312,26 @@ pub(crate) struct Node {
     /// as its fan-out is running — which is when you would be looking.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     out_trace: Vec<String>,
+    /// This node's work was REUSED by the run being read, not performed by it:
+    /// its record ended before its parent started (SPEC.md "Tracing", the first
+    /// inference rule). Only the completed view says anything here — while work
+    /// is live, nothing under it has been reused yet.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reused: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<Node>,
+}
+
+/// Which question `/status` is being asked.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    /// What is happening NOW. Finished work is skipped and a promise resolves
+    /// to the handler it moved to, so the tree is the live frontier.
+    Live,
+    /// What happened. Nothing is skipped and a continuation handler hangs off
+    /// the node that promised it rather than replacing it, so the shape is the
+    /// run's actual structure — which is what you diff against another run.
+    Complete,
 }
 
 /// How deep the `base` search for a name may go before giving up. A malformed
@@ -321,16 +339,28 @@ pub(crate) struct Node {
 /// never worth hanging a status request over.
 const NAME_SEARCH_DEPTH: usize = 32;
 
-/// `GET /status/<arg tree hash>` — the current work under `arg_tree`, as a JSON
+/// `GET /status/<arg tree hash>[?all=1]` — the work under `arg_tree`, as a JSON
 /// tree (SPEC.md "Tracing"). An ArgTree with nothing to show renders as `null`.
-pub(crate) fn serve(config: &Config, arg_tree: &str) -> Result<Vec<u8>, crate::HttpError> {
+///
+/// `all=1` asks what HAPPENED rather than what is happening: the completed view
+/// keeps finished nodes and marks the ones whose work was reused.
+pub(crate) fn serve(
+    config: &Config,
+    arg_tree: &str,
+    query: &str,
+) -> Result<Vec<u8>, crate::HttpError> {
     if arg_tree.len() != 40 || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(crate::HttpError::new(
             400,
             "status needs a lowercase 40-character ArgTree hash",
         ));
     }
-    let node = walk(config, arg_tree, None, &mut 0);
+    let view = if query.split('&').any(|p| p == "all=1" || p == "all") {
+        View::Complete
+    } else {
+        View::Live
+    };
+    let node = walk(config, arg_tree, None, view, None, &mut 0);
     serde_json::to_vec(&node)
         .map_err(|e| crate::HttpError::new(500, format!("encoding status: {e}")))
 }
@@ -347,10 +377,22 @@ pub(crate) fn serve(config: &Config, arg_tree: &str) -> Result<Vec<u8>, crate::H
 /// It is set once and carried, not accumulated: a five-hop promise chain reads
 /// `<the tool>: fanout`, not the whole chain concatenated.
 ///
+/// `parent_started` is when the node ABOVE began, and is what decides whether
+/// this one was reused: a record that ended before its parent started belongs to
+/// an earlier run (SPEC.md "Tracing"). None at the root, which by definition is
+/// the run being read.
+///
 /// `budget` bounds the whole walk. The tree is read from records that a
 /// concurrent run is still appending to, so a malformed or circular set of
 /// child edges must not turn a status request into an unbounded traversal.
-fn walk(config: &Config, arg_tree: &str, prefix: Option<&str>, budget: &mut usize) -> Option<Node> {
+fn walk(
+    config: &Config,
+    arg_tree: &str,
+    prefix: Option<&str>,
+    view: View,
+    parent_started: Option<u64>,
+    budget: &mut usize,
+) -> Option<Node> {
     const MAX_NODES: usize = 10_000;
     if *budget >= MAX_NODES {
         return None;
@@ -366,16 +408,28 @@ fn walk(config: &Config, arg_tree: &str, prefix: Option<&str>, budget: &mut usiz
     if record.events.is_empty() {
         return None;
     }
-    // Finished work with nothing left to point at has nothing left to say: this
-    // is the live view, and a completed leaf is not current work.
+    // Finished work with nothing left to point at has nothing left to say —
+    // in the LIVE view, where a completed leaf is not current work. The
+    // completed view is asking the opposite question and keeps it.
     //
     // The test is "no completion", not "no promise". A continuation with no
     // `then` (a bare `map`, whose children's results ARE the request's result)
     // has a promise and no handler, so a promise test would keep rendering it
     // as a leaf long after everything under it had finished.
-    if record.done() && record.completion().is_none() {
+    if view == View::Live && record.done() && record.completion().is_none() {
         return None;
     }
+
+    // Reused work is a LEAF here, marked and not descended into. Its children
+    // belong to the run that performed it, and following them would silently
+    // splice another invocation's tree into this one — which is exactly the
+    // confusion the reuse mark exists to prevent.
+    let reused = parent_started
+        .is_some_and(|started| record.ended().is_some_and(|(ended, _)| ended < started));
+    if reused {
+        return Some(leaf(config, arg_tree, prefix, &record, true));
+    }
+
     // A promise that produced a handler HAS MOVED to that handler: the
     // continuation's ArgTree is only formed once the middle step is over, so
     // its existence is itself the proof that the children are finished.
@@ -387,20 +441,39 @@ fn walk(config: &Config, arg_tree: &str, prefix: Option<&str>, budget: &mut usiz
     // is finished too and gets skipped. The `then` stage would be invisible for
     // exactly as long as it was running, which for `run-tool test` is the whole
     // summarising phase.
-    if let Some(completion) = record.completion() {
-        // Carry the qualifier we already have, else adopt this node's own name.
-        // The root of a tool chain is the only node with `help` — every curry
-        // after it rebuilds the ArgTree from `base` plus a chosen few args
-        // (`caos-tools/test/worker.sh`), so `help` is a sibling that is dropped
-        // at the first hop and can never be found by descending `base`. Handing
-        // it down the chain is what keeps the later stages attributable.
-        let carried = prefix
-            .map(str::to_string)
-            .or_else(|| name_of(config, arg_tree));
-        return walk(config, &completion, carried.as_deref(), budget);
+    //
+    // The LIVE view replaces the node with its handler, because only the
+    // frontier is interesting. The completed view hangs the handler off it as a
+    // child instead: the shape of what happened is what gets diffed, and a
+    // chain that ate its own links is not that shape.
+    let carried = prefix
+        .map(str::to_string)
+        .or_else(|| name_of(config, arg_tree));
+    if view == View::Live {
+        if let Some(completion) = record.completion() {
+            // Carry the qualifier we already have, else adopt this node's own
+            // name. The root of a tool chain is the only node with `help` —
+            // every curry after it rebuilds the ArgTree from `base` plus a
+            // chosen few args (`caos-tools/test/worker.sh`), so `help` is a
+            // sibling that is dropped at the first hop and can never be found
+            // by descending `base`. Handing it down the chain is what keeps the
+            // later stages attributable.
+            return walk(
+                config,
+                &completion,
+                carried.as_deref(),
+                view,
+                parent_started,
+                budget,
+            );
+        }
     }
 
-    let children: Vec<Node> = record
+    // Every child is measured against THIS node's start, which is what makes
+    // the reuse mark a statement about the run being read rather than about
+    // wall-clock age.
+    let started = record.started_at();
+    let mut children: Vec<Node> = record
         .children()
         .into_iter()
         .filter_map(|(via, name, child)| {
@@ -411,10 +484,35 @@ fn walk(config: &Config, arg_tree: &str, prefix: Option<&str>, budget: &mut usiz
             // a child usually names itself (a `run` step is often another
             // tool's ArgTree, `help` and all).
             let label = matches!(via.as_str(), "map" | "eval").then_some(name);
-            walk(config, &child, label.as_deref(), budget)
+            walk(config, &child, label.as_deref(), view, started, budget)
         })
         .collect();
+    if view == View::Complete {
+        if let Some(completion) = record.completion() {
+            children.extend(walk(
+                config,
+                &completion,
+                carried.as_deref(),
+                view,
+                started,
+                budget,
+            ));
+        }
+    }
 
+    let mut node = leaf(config, arg_tree, prefix, &record, false);
+    node.children = children;
+    Some(node)
+}
+
+/// A node with no children yet, named and timed from its record.
+fn leaf(
+    config: &Config,
+    arg_tree: &str,
+    prefix: Option<&str>,
+    record: &Record,
+    reused: bool,
+) -> Node {
     // The prefix alone, when the node has no name of its own. Appending the
     // image to a named map child gives every line of a fan-out the SAME sixty
     // characters of docker ref after its one distinguishing word, which pushes
@@ -426,14 +524,15 @@ fn walk(config: &Config, arg_tree: &str, prefix: Option<&str>, budget: &mut usiz
         (None, Some(own)) => own,
         (None, None) => image_of(config, arg_tree),
     };
-    Some(Node {
+    Node {
         arg_tree: arg_tree.to_string(),
         name,
         requested: record.requested_at(),
         started: record.started_at(),
         out_trace: record.out_traces(),
-        children,
-    })
+        reused,
+        children: Vec::new(),
+    }
 }
 
 /// The arg a multi-stage worker uses to say which stage it is up to.

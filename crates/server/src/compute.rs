@@ -1,7 +1,7 @@
 //! Compute: the `/run` pipeline.
 //!
 //! A **WorkRequest** (`SPEC.md`) is an **ArgTree** to run plus runtime context
-//! (an ancestor `stack` for cycle detection and an optional trace id) that is
+//! (an ancestor `stack` for cycle detection) that is
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
 //! hash *is* the cache key with nothing keyed alongside it: the worker image,
 //! standard library `std`, and cache-busting `salt` all ride inside it under
@@ -80,8 +80,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A **WorkRequest** (per `SPEC.md`): an `ArgTree` to run, plus the runtime
 /// context that is deliberately NOT part of its cache key — the ancestor `stack`
-/// (run-cycle detection) and the optional trace id. Only `arg_tree` is hashed and
-/// cached; `stack` and `trace_id` ride alongside it. The ArgTree carries the
+/// (run-cycle detection). Only `arg_tree` is hashed and
+/// cached; `stack` rides alongside it. The ArgTree carries the
 /// worker image, std and salt under reserved entries, so its hash *is* the whole
 /// cache key (`SPEC.md`: "The ArgTree is the cache key").
 #[derive(Clone, Copy)]
@@ -90,8 +90,6 @@ struct WorkRequest<'a> {
     arg_tree: &'a str,
     /// Ancestor ArgTree hashes (empty = top-level), for run-cycle detection.
     stack: &'a [String],
-    /// Trace id for observability, if this run is being traced.
-    trace_id: Option<&'a str>,
     /// The secrets the run carries as ephemeral context (design/secrets.md):
     /// matched + injected at every dispatch, threaded into promise sub-runs.
     /// NOT part of the ArgTree or the cache key.
@@ -117,13 +115,6 @@ pub(crate) fn run(
     secrets_header: &str,
 ) -> Result<Vec<u8>, HttpError> {
     let arg_tree = parse_arg_tree(query)?;
-    let trace_id = query_param(query, "trace");
-    if let Some(id) = &trace_id {
-        if !crate::trace::valid_id(id) {
-            return Err(HttpError::new(400, "invalid trace id"));
-        }
-        config.trace.begin(id).map_err(|e| HttpError::new(409, e))?;
-    }
     // The carried secrets store (design/secrets.md): parsed from the request
     // header, held for this run and threaded through every sub-run's dispatch.
     let secrets = crate::secrets::parse_header(secrets_header);
@@ -134,13 +125,9 @@ pub(crate) fn run(
         &WorkRequest {
             arg_tree: &arg_tree,
             stack: &[],
-            trace_id: trace_id.as_deref(),
             secrets: &secrets,
         },
     );
-    if let Some(id) = &trace_id {
-        config.trace.end(id);
-    }
     // Top-level publication is part of `run_work_request`: a flight owner pins
     // before releasing its ownership, and waiters receive that combined
     // compute-and-publication outcome.
@@ -171,23 +158,9 @@ fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
 /// sub-runs: cache lookup → run-cycle detection → the container run → promise
 /// resolution → cache store → top-level result publication.
 fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, HttpError> {
-    let span_id = request.trace_id.and_then(|id| config.trace.start(id));
-    let result = run_work_request_inner(config, request, span_id);
-    if let (Some(trace_id), Some(span_id)) = (request.trace_id, span_id) {
-        config.trace.finish(trace_id, span_id);
-    }
-    result
-}
-
-fn run_work_request_inner(
-    config: &Config,
-    request: &WorkRequest,
-    span_id: Option<u64>,
-) -> Result<String, HttpError> {
     let WorkRequest {
         arg_tree,
         stack,
-        trace_id,
         secrets: _,
     } = *request;
     // Unpack the ArgTree's reserved worker `base` (an embedded tree for a git
@@ -195,16 +168,6 @@ fn run_work_request_inner(
     // of the ArgTree — hence part of the cache key — and inherited by any
     // promise sub-runs this request leaves behind.
     let (image, salt) = read_arg_tree(config, arg_tree)?;
-    let traced_arg_entries = if trace_id.is_some() && span_id.is_some() {
-        Some(args_entries(config, arg_tree)?)
-    } else {
-        None
-    };
-    if let (Some(trace_id), Some(span_id), Some(entries)) =
-        (trace_id, span_id, traced_arg_entries.as_ref())
-    {
-        config.trace.inputs(trace_id, span_id, entries);
-    }
     if image.is_empty() {
         return Err(HttpError::new(400, "request has empty image"));
     }
@@ -217,21 +180,13 @@ fn run_work_request_inner(
     let key = format!("caos:result:{arg_tree}");
     match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
-            if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-                config.trace.cache(trace_id, span_id, true);
-            }
             eprintln!("cache hit: arg_tree={arg_tree} -> {result}");
             let outcome = complete_cache_hit(arg_tree, stack, result, |result| {
                 pin_result(config, arg_tree, result)
             });
             return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
         }
-        Ok(None) => {
-            if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-                config.trace.cache(trace_id, span_id, false);
-            }
-            eprintln!("cache miss: arg_tree={arg_tree} (image={image}); running worker")
-        }
+        Ok(None) => eprintln!("cache miss: arg_tree={arg_tree} (image={image}); running worker"),
         Err(e) => eprintln!("cache lookup failed ({e}); running worker: arg_tree={arg_tree}"),
     }
 
@@ -269,19 +224,22 @@ fn run_work_request_inner(
     // slow, since duplicate execution may repeat external side effects.
     let (outcome, owner) =
         match claim_flight_after_miss(arg_tree, stack, || cache_get(&config.redis_addr, &key)) {
-            FlightDisposition::Run(owner) => (
-                run_dispatch(config, request, &image, &salt, &key, traced_arg_entries),
-                owner,
-            ),
+            FlightDisposition::Run(owner) => {
+                (run_dispatch(config, request, &image, &salt, &key), owner)
+            }
             FlightDisposition::Complete {
                 outcome,
                 cache_hit,
                 owner,
             } => {
+                // A hit HERE is the post-claim re-read catching a result that
+                // landed while this arrival was between its own miss and the
+                // flight — the near-duplicate the re-read exists to prevent.
+                // Logged beside the ordinary hit/miss lines because it is the
+                // only place that saving is visible; the trace records nothing
+                // for it, since this arrival performed no work.
                 if cache_hit {
-                    if let (Some(trace_id), Some(span_id)) = (trace_id, span_id) {
-                        config.trace.cache(trace_id, span_id, true);
-                    }
+                    eprintln!("cache hit after claiming the flight: arg_tree={arg_tree}");
                 }
                 (outcome, owner)
             }
@@ -315,7 +273,6 @@ fn run_dispatch(
     image: &str,
     salt: &str,
     key: &str,
-    traced_arg_entries: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<String, (u16, String)> {
     // `requested` before anything else, `ended` however we leave — including
     // the continuation resolution inside, which is why this wraps the whole
@@ -324,23 +281,21 @@ fn run_dispatch(
     // the container would place every child after its parent's end and make
     // the reader call all of them evicted-and-rerun.
     crate::status::requested(config, request.arg_tree);
-    let outcome = run_dispatch_traced(config, request, image, salt, key, traced_arg_entries);
+    let outcome = run_dispatch_inner(config, request, image, salt, key);
     crate::status::ended(config, request.arg_tree, outcome.is_ok());
     outcome
 }
 
-fn run_dispatch_traced(
+fn run_dispatch_inner(
     config: &Config,
     request: &WorkRequest,
     image: &str,
     salt: &str,
     key: &str,
-    traced_arg_entries: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<String, (u16, String)> {
     let WorkRequest {
         arg_tree,
         stack,
-        trace_id,
         secrets,
     } = *request;
     let fail = |e: HttpError| (e.status(), e.message().to_string());
@@ -358,11 +313,7 @@ fn run_dispatch_traced(
     // (the set of parked polls), so there's no server-side slot to hold.
     let result = {
         let image_ref = resolve_image(config, image).map_err(fail)?;
-        // Reuse the ArgTree's entries the tracer already read, else read them now.
-        let arg_entries = match traced_arg_entries {
-            Some(entries) => entries,
-            None => args_entries(config, arg_tree).map_err(fail)?,
-        };
+        let arg_entries = args_entries(config, arg_tree).map_err(fail)?;
         // Whether this job's image is a SEEDED SENTINEL, decided on the raw arg
         // (`docker://seeded…`) rather than on the resolved ref: resolution
         // strips the scheme, and "an image called seeded-rustc" and "the
@@ -382,7 +333,7 @@ fn run_dispatch_traced(
             &image_ref,
             seeded,
             granted,
-            |sub_request| start_sub_run(config, sub_request, &child_stack, trace_id, secrets),
+            |sub_request| start_sub_run(config, sub_request, &child_stack, secrets),
             |note| match note {
                 crate::runner::Note::Started => crate::status::started(config, arg_tree),
                 crate::runner::Note::OutTrace(oid) => {
@@ -403,16 +354,7 @@ fn run_dispatch_traced(
     let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(
-                config,
-                arg_tree,
-                cont,
-                salt,
-                &child_stack,
-                trace_id,
-                secrets,
-            )
-            .map_err(fail)?
+            resolve_promise(config, arg_tree, cont, salt, &child_stack, secrets).map_err(fail)?
         }
         _ => (result, false),
     };
@@ -444,7 +386,6 @@ fn start_sub_run(
     config: &Config,
     arg_tree: &str,
     stack: &[String],
-    trace_id: Option<&str>,
     secrets: &[crate::secrets::Grant],
 ) -> Result<(), HttpError> {
     let (image, _) = read_arg_tree(config, arg_tree)?;
@@ -455,7 +396,6 @@ fn start_sub_run(
     let config = config.clone();
     let arg_tree = arg_tree.to_string();
     let stack = stack.to_vec();
-    let trace_id = trace_id.map(str::to_string);
     let secrets = secrets.to_vec();
     std::thread::spawn(move || {
         let result = run_work_request(
@@ -463,7 +403,6 @@ fn start_sub_run(
             &WorkRequest {
                 arg_tree: &arg_tree,
                 stack: &stack,
-                trace_id: trace_id.as_deref(),
                 secrets: &secrets,
             },
         );
@@ -863,7 +802,6 @@ struct ServerEvalHost<'a> {
     config: &'a Config,
     salt: &'a str,
     stack: &'a [String],
-    trace_id: Option<&'a str>,
     secrets: &'a [crate::secrets::Grant],
     /// The promising ArgTree whose continuation this walk is, and the path it
     /// was asked to evaluate — together the name under which each dispatch is
@@ -930,7 +868,6 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
             entries,
             self.salt,
             self.stack,
-            self.trace_id,
             self.secrets,
             |arg_tree| {
                 crate::status::child(
@@ -994,7 +931,6 @@ fn resolve_promise(
     cont: &str,
     salt: &str,
     stack: &[String],
-    trace_id: Option<&str>,
     secrets: &[crate::secrets::Grant],
 ) -> Result<(String, bool), HttpError> {
     use gix::objs::tree::EntryKind;
@@ -1069,7 +1005,6 @@ fn resolve_promise(
                                     vec![arg],
                                     salt,
                                     stack,
-                                    trace_id,
                                     secrets,
                                     // The map entry's own name — which for the
                                     // test suite is the test name, and is the
@@ -1124,7 +1059,6 @@ fn resolve_promise(
                 vec![input.clone()],
                 salt,
                 stack,
-                trace_id,
                 secrets,
                 |arg_tree| crate::status::child(config, parent, "run", "run", arg_tree),
             ),
@@ -1142,7 +1076,6 @@ fn resolve_promise(
                 &WorkRequest {
                     arg_tree,
                     stack,
-                    trace_id,
                     secrets,
                 },
             ),
@@ -1159,7 +1092,6 @@ fn resolve_promise(
             config,
             salt,
             stack,
-            trace_id,
             secrets,
             parent,
             eval_path: path,
@@ -1211,7 +1143,6 @@ fn resolve_promise(
                     args,
                     salt,
                     stack,
-                    trace_id,
                     secrets,
                     // The handler's ArgTree is the one thing in a continuation
                     // that is NOT derivable: its extra arg is the middle step's
@@ -1349,7 +1280,6 @@ fn run_image(
     call_args: Vec<gix::objs::tree::Entry>,
     salt: &str,
     stack: &[String],
-    trace_id: Option<&str>,
     secrets: &[crate::secrets::Grant],
     record: impl FnOnce(&str),
 ) -> Result<String, HttpError> {
@@ -1416,7 +1346,6 @@ fn run_image(
         &WorkRequest {
             arg_tree: &arg_tree,
             stack,
-            trace_id,
             secrets,
         },
     )

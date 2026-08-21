@@ -175,10 +175,9 @@ Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |
-| `GET /run?req=<argTreeHash>&trace=<traceId>` | Run the ArgTree `<argTreeHash>` (`req` is the query param's historical name; its value is the ArgTree hash) and return `"<type> <hash>"` (the fully-resolved result), optionally emitting trace events. See [compute](#compute). |
+| `GET /run?req=<argTreeHash>` | Run the ArgTree `<argTreeHash>` (`req` is the query param's historical name; its value is the ArgTree hash) and return `"<type> <hash>"` (the fully-resolved result). See [compute](#compute). |
 | `POST /sub-run` | Start one exact request without waiting, inheriting the in-flight launching job's server-side run context. |
-| `GET /trace/<traceId>/stream` | Stream one live trace as Chrome `B`/`E` events in JSONL. |
-| `GET /status/<argTreeHash>` | The work currently running under an ArgTree, as a JSON tree — or `null` when nothing is. See [tracing](#tracing). |
+| `GET /status/<argTreeHash>[?all=1]` | The work currently running under an ArgTree, as a JSON tree — or, with `all=1`, what happened. `null` when there is nothing to show. See [tracing](#tracing). |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
@@ -200,7 +199,7 @@ Worker-running knobs (network, docker binary, slots) live on `caos-runnerd`.
 ### Compute
 
 A run **request** is a **WorkRequest**: an **ArgTree** to run, plus runtime
-context (an ancestor stack for cycle detection and an optional trace id) that is
+context (an ancestor stack for cycle detection) that is
 NOT part of the cache key. The ArgTree is itself a content-addressed git object,
 whose hash, `argTreeHash`, *is* the cache key and the rendezvous id — with
 nothing keyed alongside it. The worker image rides *inside* the ArgTree, under a
@@ -324,15 +323,28 @@ normative; the shape follows from three constraints:
   express. One key per node also makes eviction atomic under `allkeys-lru`.
 
 `GET /status/<argTreeHash>` renders the **live** view over those records: work
-that is wholly finished is skipped, a finished promise resolves to its handler,
-and anything with children renders as a parent with its children beneath it.
-Node names come from the first line of the ArgTree's `help`, searching `base`
-recursively and falling back to the image the base names; a map-then child gets
-its map entry's name prepended — which is what turns a 29-way fan-out from a
-column of hashes into a list of test names.
+that is wholly finished is skipped, a promise resolves to the handler it moved
+to, and anything with children renders as a parent with its children beneath it.
+`?all=1` asks the other question — what *happened* — and answers it differently:
+nothing is skipped, a handler hangs off the node that promised it rather than
+replacing it, so the shape is the run's actual structure, and a node whose work
+this run REUSED rather than performed is marked `reused` and not descended into
+(its children belong to the run that performed it). That mark is the first
+inference rule above, applied: a record that ended before its parent started
+belongs to an earlier run.
 
-`caos-cli run` and `run-tool` poll this while they wait and draw it, on a
-terminal only. `caos-cli status <argTreeHash>` is the same view on demand.
+Node names are for display and may be truncated; the arg trees are what
+forensics reads. A node is named by the first of: the name its parent gave it
+(a map entry's name, an eval's expression path), the first line of its `help`,
+its `stage`, a short form of its image — with a qualifier carried down a promise
+chain, since `help` lives only on a tool's own ArgTree and is dropped at the
+first curry.
+
+`caos-cli run` and `run-tool` poll the live view while they wait and draw it, on
+a terminal only. `caos-cli status [--all] <argTreeHash>` is either view on
+demand — `tests/cargo-self` uses `--all` to count the jobs a one-crate edit
+reused, which is how it asserts that per-crate caching works without a
+stopwatch.
 
 Workers may leave perf data (ccache statistics, phase timings) at
 `/cas/out-trace`. It rides *alongside* the result, never inside it: a result is
@@ -424,7 +436,7 @@ setuid `caos`.
 
 ### Requests and results
 
-`caos-cli run [--trace[=<file|->]] [--trace-id=<id>] [output] --base:<type>=<image> [--name=value | --name:@=path …]` (the
+`caos-cli run [output] --base:<type>=<image> [--name=value | --name:@=path …]` (the
 blocking, user-facing run):
 
 1. assembles the args into a git **tree** — the **ArgTree** — including the
@@ -444,19 +456,6 @@ blocking, user-facing run):
    editable on the host directly. `<output>` is optional: with it omitted, a
    **file** result is streamed to **stdout** (handy for `| less` or `> file`);
    a **tree** result has no single stream, so it still needs an `<output>` path.
-
-Pass `--trace=<file>` to write Chrome Trace Events as JSONL. `--trace` and
-`--trace=-` write to stdout and require a separate computation output path.
-`--trace-id=<id>` optionally overrides the generated invocation id.
-
-```sh
-caos-cli run --trace=trace.jsonl <result-path> --base:<type>=<image> --input=value
-caos-cli run --trace <result-path> --base:<type>=<image> --input=value
-```
-
-Traces are live-only and discarded when the run ends. Trace ids do not affect
-request or cache identity. This is a different mechanism from the per-ArgTree
-trace records behind `/status` ([tracing](#tracing)), which outlive the run.
 
 On a terminal, `run` and `run-tool` also draw the work tree while they wait,
 polling `/status` on a second connection. Off a terminal they draw nothing and
