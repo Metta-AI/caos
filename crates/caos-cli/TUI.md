@@ -7,8 +7,10 @@ dependencies out of the worker-side `caos` binary.
 The interface keeps independent virtual conversations in a left sidebar. Each
 entry has a stable task title and a second row reserved for live operation or
 attention status. Idle conversations do not show a stripped message preview.
-Submitting the first message of a fresh conversation runs one separate,
-stateless `llm-call` title job concurrently with the agent turn. The result uses
+`Ctrl+N` only allocates local state; the first submitted message atomically
+publishes the conversation head, fallback title, and active membership. The
+first message also runs one separate, stateless `llm-call` title job concurrently
+with the agent turn. The result uses
 the existing durable title metadata, so reopening the TUI does not regenerate
 it or require any additional refs. Text ends with a visible ellipsis instead of
 hard terminal clipping, and internal conversation IDs stay hidden. Each

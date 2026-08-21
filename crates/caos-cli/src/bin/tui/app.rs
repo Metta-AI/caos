@@ -967,6 +967,7 @@ struct ConversationState {
     automatic_title_fallback_applied: bool,
     automatic_title_fallback: Option<String>,
     generating_title: bool,
+    virtual_conversation: bool,
     turn_options: TurnOptions,
     transcript: Vec<TranscriptEntry>,
     pending_submissions: Vec<PendingSubmission>,
@@ -1011,6 +1012,7 @@ impl ConversationState {
             automatic_title_fallback_applied: false,
             automatic_title_fallback: None,
             generating_title: false,
+            virtual_conversation: false,
             turn_options,
             transcript: Vec::new(),
             pending_submissions: Vec::new(),
@@ -1046,11 +1048,13 @@ impl ConversationState {
     fn new_virtual(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         let mut state = Self::new(id, title, turn_options, status);
         state.automatic_title = true;
+        state.virtual_conversation = true;
         state.remote_title = None;
         state
     }
 
     fn apply_load(&mut self, load: ConversationLoad, current_user: &str) {
+        self.virtual_conversation = false;
         if self
             .reference_notice
             .as_ref()
@@ -2137,6 +2141,10 @@ impl App {
             pending_id
         };
 
+        if should_generate_title {
+            self.publish_automatic_title_fallback();
+        }
+
         let tx = self.tx.clone();
         let options = self.selected().turn_options.clone();
         let conversation = self.selected().id.clone();
@@ -2254,6 +2262,30 @@ impl App {
         self.start_reference_lookup(self.selected);
     }
 
+    fn publish_automatic_title_fallback(&mut self) {
+        let state = self.selected();
+        let Some(fallback) = state.automatic_title_fallback.clone() else {
+            return;
+        };
+        let Some(expected) = state.remote_title.clone() else {
+            return;
+        };
+        if expected == fallback {
+            return;
+        }
+        let id = state.id.clone();
+        match self.transport().and_then(|transport| {
+            compare_and_set_conversation_title(&transport, &id, &expected, &fallback)
+        }) {
+            Ok(true) => self.selected_mut().remote_title = Some(fallback),
+            Ok(false) => {}
+            Err(error) => {
+                self.selected_mut().sidebar_attention =
+                    Some(format!("Failed to save conversation title: {error}"));
+            }
+        }
+    }
+
     fn interrupt_selected(&mut self) {
         if !self.selected().running || self.selected().interrupting {
             return;
@@ -2314,6 +2346,12 @@ impl App {
     }
 
     fn invite_selected(&mut self, user: &str) {
+        if self.selected().virtual_conversation {
+            self.selected_mut().push_info(format!(
+                "Send the first message before inviting username {user:?}."
+            ));
+            return;
+        }
         let id = self.selected().id.clone();
         match self
             .transport()
@@ -2418,7 +2456,9 @@ impl App {
                     commit,
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
-                        self.conversations[index].mark_pending_submission(pending_id, commit);
+                        let state = &mut self.conversations[index];
+                        state.virtual_conversation = false;
+                        state.mark_pending_submission(pending_id, commit);
                     }
                 }
                 UiMessage::InterjectionRefreshed {
@@ -6242,6 +6282,28 @@ mod tests {
     }
 
     #[test]
+    fn first_committed_submission_materializes_virtual_state() {
+        let mut conversation = ConversationState::new_virtual(
+            "new-talk".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        let pending_id = conversation.queue_pending_submission("hello".to_string());
+        let (mut app, tx) = app_with(vec![conversation]);
+
+        tx.send(UiMessage::SubmissionCommitted {
+            conversation: "new-talk".to_string(),
+            pending_id,
+            commit: "a".repeat(40),
+        })
+        .unwrap();
+
+        assert!(app.drain_messages());
+        assert!(!app.selected().virtual_conversation);
+    }
+
+    #[test]
     fn failed_submission_restores_text_without_replacing_a_newer_draft() {
         let mut conversation = state("talk-1");
         let pending_id = conversation.queue_pending_submission("failed message".to_string());
@@ -6425,6 +6487,7 @@ mod tests {
             app.selected().turn_options.base.as_deref(),
             Some(tip.as_str())
         );
+        assert!(app.selected().remote_head.is_none());
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(remote).unwrap();
     }
@@ -6530,8 +6593,7 @@ mod tests {
     fn ctrl_n_focuses_the_new_conversation() {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         // Pressing Ctrl+N from the list moves focus into the conversation so
-        // the composer is ready for the first prompt, regardless of whether
-        // minting the conversation reaches a remote.
+        // the composer is ready for the first prompt.
         app.focus = Focus::List;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
@@ -6747,8 +6809,56 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_n_stays_virtual_and_local_commands_do_not_submit() {
+        let (repo, remote, _) = repo_with_default_branch("new-command-ref", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let (mut app, _) = app_with(vec![state("existing")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+
+        app.start_new_conversation(None);
+        let id = app.selected().id.clone();
+        assert!(app.selected().remote_head.is_none());
+        assert!(conversation_head(&transport, &id).unwrap().is_none());
+        assert!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active,)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.selected().transcript.is_empty());
+
+        app.selected_mut()
+            .composer
+            .insert_str("/title Named before prompting");
+        app.start_turn();
+        assert!(app.selected().command_error.is_none());
+        assert_eq!(app.selected().title, "Named before prompting");
+        assert!(conversation_head(&transport, &id).unwrap().is_none());
+
+        app.selected_mut().composer.insert_str("/invite Bob");
+        app.start_turn();
+        assert!(app.selected().command_error.is_none());
+        assert!(app
+            .selected()
+            .transcript
+            .last()
+            .is_some_and(|entry| entry.text.contains("Send the first message")));
+        assert!(
+            list_user_conversations(&transport, "Bob", UserConversationStatus::Active)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(conversation_head(&transport, &id).unwrap().is_none());
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
     fn failed_last_conversation_fork_keeps_a_safe_app_state() {
         let (repo, remote, tip) = repo_with_default_branch("last-fork-failure", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let mut fork = state("forked");
         fork.forking = true;
         fork.composer.insert_str("preserve this draft");
@@ -6771,6 +6881,7 @@ mod tests {
         );
         assert_eq!(app.selected().composer.text, "preserve this draft");
         assert!(app.selected().remote_title.is_none());
+        assert!(app.selected().remote_head.is_none());
         assert!(app
             .selected()
             .command_error
@@ -6784,6 +6895,7 @@ mod tests {
     #[test]
     fn failed_fork_preserves_its_draft_with_other_conversations_open() {
         let (repo, remote, tip) = repo_with_default_branch("multi-fork-failure", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let mut fork = state("forked");
         fork.forking = true;
         fork.composer.insert_str("preserve this draft");
