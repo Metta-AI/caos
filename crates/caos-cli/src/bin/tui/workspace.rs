@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+const REPO_AGENT_PATH: &str = ".caos/agent.json";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedPublishConversation {
     pub(crate) head: String,
@@ -33,6 +35,75 @@ pub(crate) struct PublishedConversationSource {
     pub(crate) id: String,
     pub(crate) title: Option<String>,
     pub(crate) head: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RepoAgentConfig {
+    pub(crate) pr_publish_instructions: Option<String>,
+}
+
+/// Read the checked-in repository agent configuration.
+///
+/// Read the blob from Git rather than following the working-tree path: this is
+/// explicitly a versioned policy file, and a committed symlink must not be able
+/// to copy an arbitrary host file into an agent request.
+pub(crate) fn load_repo_agent_config(cwd: &Path) -> Result<RepoAgentConfig, String> {
+    let entry = capture_required(
+        "git",
+        &[
+            "ls-tree",
+            "--format=%(objectmode) %(objecttype) %(objectname) %(path)",
+            "HEAD",
+            "--",
+            REPO_AGENT_PATH,
+        ],
+        cwd,
+    )?;
+    if entry.is_empty() {
+        return Ok(RepoAgentConfig::default());
+    }
+    let fields = entry.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 4
+        || !matches!(fields[0], "100644" | "100755")
+        || fields[1] != "blob"
+        || fields[3] != REPO_AGENT_PATH
+    {
+        return Err(format!(
+            "{REPO_AGENT_PATH} must be a checked-in regular file"
+        ));
+    }
+    let contents = capture_required("git", &["cat-file", "blob", fields[2]], cwd)?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("parsing {REPO_AGENT_PATH}: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{REPO_AGENT_PATH} must contain a JSON object"))?;
+    let unknown = object
+        .keys()
+        .filter(|key| key.as_str() != "pr_publish_instructions")
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{REPO_AGENT_PATH} contains unknown field(s): {}",
+            unknown.join(", ")
+        ));
+    }
+    let pr_publish_instructions = match object.get("pr_publish_instructions") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(instructions)) => {
+            let instructions = instructions.trim();
+            (!instructions.is_empty()).then(|| instructions.to_string())
+        }
+        Some(_) => {
+            return Err(format!(
+                "{REPO_AGENT_PATH} field `pr_publish_instructions` must be a string"
+            ))
+        }
+    };
+    Ok(RepoAgentConfig {
+        pr_publish_instructions,
+    })
 }
 
 /// Check out a conversation's head commit in the local working tree.
@@ -138,12 +209,20 @@ pub(crate) fn prepare_publish_workspace(
         require_success("git grep", markers)?;
     }
 
-    let reserved = capture_required("git", &["ls-tree", "--name-only", head, ".caos"], cwd)?;
+    let reserved = capture_required(
+        "git",
+        &["ls-tree", "-r", "--name-only", head, "--", ".caos"],
+        cwd,
+    )?
+    .lines()
+    .filter(|path| *path != REPO_AGENT_PATH)
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     if !reserved.is_empty() {
-        return Err(
-            "the publish head still contains reserved .caos state; remove .caos/conflicts after resolving it"
-                .to_string(),
-        );
+        return Err(format!(
+            "the publish head still contains reserved .caos state: {}",
+            reserved.join(", ")
+        ));
     }
 
     Ok(PreparedPublishConversation {
@@ -628,6 +707,77 @@ mod tests {
         assert_eq!(parse_github_pull_url("origin/caos/talk-1").unwrap(), None);
     }
 
+    #[test]
+    fn checked_in_repo_agent_config_loads_pr_publish_instructions() {
+        let dir = temp_repo("agent-config");
+        commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(
+            dir.join(REPO_AGENT_PATH),
+            r#"{"pr_publish_instructions":"Use the repository publication checklist."}"#,
+        )
+        .unwrap();
+        capture_required("git", &["add", REPO_AGENT_PATH], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "config"], &dir).unwrap();
+
+        assert_eq!(
+            load_repo_agent_config(&dir).unwrap(),
+            RepoAgentConfig {
+                pr_publish_instructions: Some(
+                    "Use the repository publication checklist.".to_string()
+                )
+            }
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repo_agent_config_must_be_a_regular_json_blob_with_known_fields() {
+        let dir = temp_repo("agent-symlink");
+        commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::os::unix::fs::symlink("../file.txt", dir.join(REPO_AGENT_PATH)).unwrap();
+        capture_required("git", &["add", REPO_AGENT_PATH], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "symlink"], &dir).unwrap();
+
+        let error = load_repo_agent_config(&dir).unwrap_err();
+        assert!(error.contains("checked-in regular file"), "{error}");
+
+        capture_required("git", &["reset", "--hard", "HEAD^"], &dir).unwrap();
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(dir.join(REPO_AGENT_PATH), r#"{"publish":true}"#).unwrap();
+        capture_required("git", &["add", REPO_AGENT_PATH], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "unknown field"], &dir).unwrap();
+        let error = load_repo_agent_config(&dir).unwrap_err();
+        assert!(error.contains("unknown field(s): publish"), "{error}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repo_agent_config_rejects_invalid_json_and_non_string_instructions() {
+        let dir = temp_repo("agent-invalid-json");
+        commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(dir.join(REPO_AGENT_PATH), "not json").unwrap();
+        capture_required("git", &["add", REPO_AGENT_PATH], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "invalid json"], &dir).unwrap();
+        let error = load_repo_agent_config(&dir).unwrap_err();
+        assert!(error.contains("parsing .caos/agent.json"), "{error}");
+
+        std::fs::write(
+            dir.join(REPO_AGENT_PATH),
+            r#"{"pr_publish_instructions":true}"#,
+        )
+        .unwrap();
+        capture_required("git", &["commit", "-qam", "invalid field"], &dir).unwrap();
+        let error = load_repo_agent_config(&dir).unwrap_err();
+        assert!(error.contains("must be a string"), "{error}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn commit_file(dir: &Path, content: &str, message: &str) -> String {
         std::fs::write(dir.join("file.txt"), content).unwrap();
         capture_required("git", &["add", "file.txt"], dir).unwrap();
@@ -772,6 +922,35 @@ mod tests {
         assert!(!remote_base_is_ancestor(&head, &base, &dir).unwrap());
         assert!(remote_base_is_ancestor("not-a-commit", &head, &dir).is_err());
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prepared_publish_head_allows_repo_agent_instructions() {
+        let dir = temp_repo("publish-agent-instructions");
+        let base = commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(
+            dir.join(REPO_AGENT_PATH),
+            r#"{"pr_publish_instructions":"Build before publishing."}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("publish.txt"), "ready\n").unwrap();
+        capture_required("git", &["add", REPO_AGENT_PATH, "publish.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "ready"], &dir).unwrap();
+        let head = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+
+        let prepared = prepare_publish_workspace(&head, &base, &dir).unwrap();
+
+        assert_eq!(
+            capture_required(
+                "git",
+                &["show", &format!("{}:{REPO_AGENT_PATH}", prepared.head)],
+                &dir
+            )
+            .unwrap(),
+            r#"{"pr_publish_instructions":"Build before publishing."}"#
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

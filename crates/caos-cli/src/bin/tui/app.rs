@@ -25,9 +25,9 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::workspace::{
     commit_working_tree, fetch_published_conversation, fetch_remote_branch_tip,
-    load_conversation_workspace, local_default_branch_tip, prepare_publish_workspace,
-    publish_conversation_branch, publish_conversation_pr, remote_base_is_ancestor,
-    remote_default_branch, PublishedConversationSource,
+    load_conversation_workspace, load_repo_agent_config, local_default_branch_tip,
+    prepare_publish_workspace, publish_conversation_branch, publish_conversation_pr,
+    remote_base_is_ancestor, remote_default_branch, PublishedConversationSource,
 };
 
 #[path = "ui.rs"]
@@ -3950,6 +3950,7 @@ impl App {
             let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
                 let result = (|| {
+                    let agent_config = load_repo_agent_config(&repo_dir)?;
                     let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
                     let target = base_commit;
                     let base_is_ancestor = remote_base_is_ancestor(&target, &head, &repo_dir)?;
@@ -3957,7 +3958,11 @@ impl App {
                     if !base_is_ancestor {
                         transport.ensure_pushed(&target)?;
                     }
-                    let message = publish_turn_message(&target, base_is_ancestor);
+                    let message = publish_turn_message(
+                        &target,
+                        base_is_ancestor,
+                        agent_config.pr_publish_instructions.as_deref(),
+                    );
                     let outcome = run_chat_turn(
                         &transport,
                         &options,
@@ -3989,21 +3994,29 @@ impl App {
     }
 }
 
-fn publish_turn_message(target: &str, base_is_ancestor: bool) -> String {
-    if base_is_ancestor {
+fn publish_turn_message(
+    target: &str,
+    base_is_ancestor: bool,
+    pr_publish_instructions: Option<&str>,
+) -> String {
+    let mut message = if base_is_ancestor {
         format!(
             "Prepare this conversation for publication. The selected PR base `{target}` is \
              already an ancestor of this conversation, so do not call `merge` for it again. \
-             Build and test, then finish only when the workspace is ready to publish."
+             Finish only when the workspace is ready to publish."
         )
     } else {
         format!(
             "Prepare this conversation for publication. First call the existing `merge` tool \
              with `theirs` exactly `{target}`. Resolve every entry in `.caos/conflicts`, remove \
-             `.caos/conflicts`, then build and test. Finish only when the workspace is ready to \
-             publish."
+             `.caos/conflicts`, and finish only when the workspace is ready to publish."
         )
+    };
+    if let Some(instructions) = pr_publish_instructions {
+        message.push_str("\n\nRepository publication instructions:\n");
+        message.push_str(instructions);
     }
+    message
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -4101,14 +4114,20 @@ mod tests {
     };
 
     #[test]
-    fn publish_prompt_only_requests_a_merge_when_the_base_is_not_an_ancestor() {
-        let already_merged = publish_turn_message("abc123", true);
+    fn publish_prompt_only_requests_relevant_merge_and_repository_instructions() {
+        let already_merged = publish_turn_message("abc123", true, None);
         assert!(already_merged.contains("do not call `merge`"));
         assert!(!already_merged.contains("First call the existing `merge` tool"));
+        assert!(!already_merged.contains("Build and test"));
+        assert!(!already_merged.contains("Repository publication instructions"));
 
-        let needs_merge = publish_turn_message("abc123", false);
+        let needs_merge =
+            publish_turn_message("abc123", false, Some("Build and test the final workspace."));
         assert!(needs_merge.contains("First call the existing `merge` tool"));
         assert!(needs_merge.contains("`theirs` exactly `abc123`"));
+        assert!(needs_merge.ends_with(
+            "Repository publication instructions:\nBuild and test the final workspace."
+        ));
     }
 
     fn summary(id: &str) -> UserConversationSummary {

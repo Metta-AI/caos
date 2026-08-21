@@ -31,6 +31,7 @@ use worker_common::{
 
 const AGENT_AUTHOR: &str = "caos-agent";
 const STEP_DIR: &str = ".caos";
+const REPO_AGENT_FILE: &str = "agent.json";
 
 /// The per-round output-token cap sent to the API. A single response is
 /// unlikely to need this much; when one does, `stop_reason: "max_tokens"`
@@ -148,12 +149,41 @@ fn start(cfg: &Config) -> Result<(), String> {
         ));
     }
     let (ws, _) = canonical_workspace(&log)?;
-    if log.events.len() <= 2 && Path::new(&ws).join(STEP_DIR).exists() {
-        return Err(format!(
-            "the conversation's base tree already contains the reserved {STEP_DIR:?} entry"
-        ));
+    if log.events.len() <= 2 {
+        validate_base_caos(&ws)?;
     }
     resume_run(cfg, &run, &head_hash, log)
+}
+
+fn validate_base_caos(ws: &str) -> Result<(), String> {
+    let caos_dir = Path::new(ws).join(STEP_DIR);
+    if !caos_dir.exists() {
+        return Ok(());
+    }
+    caos(["get", path(&caos_dir)])?;
+    let mut entries = fs::read_dir(&caos_dir)
+        .map_err(|error| format!("reading {}: {error}", caos_dir.display()))?
+        .map(|entry| {
+            entry
+                .map_err(|error| format!("reading {}: {error}", caos_dir.display()))
+                .and_then(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| format!("{} contains a non-UTF-8 name", caos_dir.display()))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    if entries.len() == 1
+        && entries[0] == REPO_AGENT_FILE
+        && caos_dir.join(REPO_AGENT_FILE).is_file()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "the conversation's base tree contains reserved {STEP_DIR:?} state; only {STEP_DIR}/{REPO_AGENT_FILE} is allowed"
+    ))
 }
 
 /// Claim an exact request already visible on the canonical event spine before

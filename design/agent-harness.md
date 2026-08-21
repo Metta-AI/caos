@@ -330,9 +330,12 @@ suites for the tool set):
   requests a merge of the fetched selected-base tip only when that tip is not
   already an ancestor of the conversation head. This lets a child conversation
   stack on its parent's published history, while subsequent publications
-  fast-forward the same branch without redundant merges. Conflicts and reserved
-  `.caos` state at the tip stop publication and are reported in the command-error
-  panel. CAOS uses ordinary fast-forward pushes after a one-time
+  fast-forward the same branch without redundant merges. Conflicts and
+  harness-owned `.caos` state at the tip stop publication and are reported in
+  the command-error panel; checked-in `.caos/agent.json` repository policy is
+  retained. Its `pr_publish_instructions` string augments only PR publication,
+  not `/publish-branch` or the system prompt for every turn. CAOS uses ordinary
+  fast-forward pushes after a one-time
   exact-lease migration of a legacy snapshot branch, and opens or finds its open
   PR through `gh` against the same branch. Merely
   opening, running, switching, or publishing conversations never mutates the

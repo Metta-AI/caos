@@ -62,6 +62,14 @@ collisions. Only these v2 membership refs populate the sidebar. Unversioned
 chat refs remain stored but invisible: v2 clients do not read, import, rename,
 migrate, or delete them.
 
+When preparing a pull request, the TUI reads the checked-in
+`HEAD:.caos/agent.json` regular file when present. Its optional string
+`pr_publish_instructions` field is appended to that publication-preparation
+message only; it does not modify the system prompt or ordinary agent turns.
+Unknown fields and invalid JSON are reported as publication errors. Other
+top-level `.caos` content remains reserved for harness state and is rejected
+from clean conversation and publication tips.
+
 ## Controls
 
 Focus is either in the left pane (the conversation list) or the main pane (the
@@ -214,19 +222,21 @@ matches it exactly.
 Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
 branch prompt with `origin`'s advertised default selected; type another branch
 to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn that
-merges the exact fetched base with the standard `merge` tool, then resolves and
-tests the result. When that fetched base is already an ancestor of the current
-conversation head, the preparation turn runs without asking the agent to merge
-it again. For another base, only this conversation's delta is applied, so child
-conversations form clean PR stacks. Unresolved conflicts stop before the branch
-moves. The checkout and index remain untouched.
+merges the exact fetched base with the standard `merge` tool and resolves the
+result, following `pr_publish_instructions` from `.caos/agent.json` when
+configured.
+When that fetched base is already an ancestor of the current conversation head,
+the preparation turn runs without asking the agent to merge it again. For
+another base, only this conversation's delta is applied, so child conversations
+form clean PR stacks. Unresolved conflicts stop before the branch moves. The
+checkout and index remain untouched.
 
 CAOS points `caos/<conversation>` directly at the validated conversation head,
 pushes it, and uses the authenticated `gh` CLI to find or open its pull
 request. The first publication carries the conversation history; later
 publications advance the branch by fast-forward. The selected PR base is an
-ancestor of the published head, and the final tree must contain no reserved
-`.caos` state.
+ancestor of the published head, and the final tree may contain
+`.caos/agent.json` but no reserved `.caos` state.
 
 `/publish-branch` is the sharing-only form of publication: it does not run the
 agent merge-and-test preparation turn and does not create a PR. It still checks

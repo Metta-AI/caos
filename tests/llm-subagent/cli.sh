@@ -11,6 +11,8 @@ llm_test_setup
 stub_host="${stub_host:?llm_test_setup did not set stub_host}"
 mkdir -p ws/notes
 echo "hello notes" > ws/notes/todo.txt
+mkdir -p ws/.caos
+echo '{"pr_publish_instructions":"Keep repository policy with child workspaces."}' > ws/.caos/agent.json
 echo "You are a coding agent operating on a git workspace." > system.txt
 git add -A
 gc commit -qm fixtures
@@ -109,9 +111,12 @@ grep -qF "$SUBAGENT_DONE_TEXT" <<<"$(git show -s --format=%B "$agent_head")" \
   || fail "subagent terminal report is missing"
 [ "$(git show "$agent_head:notes/todo.txt")" = "hello notes" ] \
   || fail "subagent did not inherit the clean workspace snapshot"
-if git cat-file -e "$agent_head:.caos" 2>/dev/null; then
-  fail "subagent inherited parent harness state"
-fi
+[ "$(git show "$agent_head:.caos/agent.json")" = \
+  '{"pr_publish_instructions":"Keep repository policy with child workspaces."}' ] \
+  || fail "subagent did not inherit repository agent config"
+agent_caos=$(git ls-tree -r --name-only "$agent_head" -- .caos)
+[ "$agent_caos" = ".caos/agent.json" ] \
+  || fail "subagent inherited reserved parent harness state: $agent_caos"
 agent_events=$(git log --first-parent --format=%B "$agent_head")
 grep -qF "\"conversation\":\"$conv\"" <<<"$agent_events" \
   || fail "subagent root lacks its durable parent conversation"
