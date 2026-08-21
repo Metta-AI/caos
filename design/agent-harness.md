@@ -337,8 +337,12 @@ suites for the tool set):
   PR through `gh` against the same branch. Merely
   opening, running, switching, or publishing conversations never mutates the
   checkout. `/publish-branch` pushes the same full-history branch without PR
-  creation. Progress remains one completed API round at a time, and a running
-  turn is not cancellable until the server/runner protocol grows cancellation.
+  creation, while `/load` imports a `remote/caos/<conversation>` branch or
+  GitHub PR back into the canonical server-side conversation. Imports preserve
+  the ID and event spine, allow only first-parent advancement, and reject
+  divergent ID collisions. Progress remains one completed API round at a time,
+  and a running turn is not cancellable until the server/runner protocol grows
+  cancellation.
 
 ### Superseded protocol detail
 

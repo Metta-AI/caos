@@ -9,11 +9,12 @@ use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
     first_available_conversation_name, fork_conversation, generate_conversation_title,
-    interrupt_request, invite_user_to_conversation, list_user_conversations,
-    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
-    ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
-    TurnPhase, UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
+    import_published_conversation, interrupt_request, invite_user_to_conversation,
+    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
+    ConversationRole, ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent,
+    TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary,
+    WorkspaceDiff, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -23,9 +24,10 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
-    local_default_branch_tip, prepare_publish_workspace, publish_conversation_branch,
-    publish_conversation_pr, remote_base_is_ancestor, remote_default_branch,
+    commit_working_tree, fetch_published_conversation, fetch_remote_branch_tip,
+    load_conversation_workspace, local_default_branch_tip, prepare_publish_workspace,
+    publish_conversation_branch, publish_conversation_pr, remote_base_is_ancestor,
+    remote_default_branch, PublishedConversationSource,
 };
 
 #[path = "ui.rs"]
@@ -852,6 +854,7 @@ enum AppAction {
     From,
     Help,
     Invite,
+    Load,
     Model,
     Commands,
     PublishBranch,
@@ -898,12 +901,19 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 9] = [
+const COMMANDS: [Command; 10] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
         description: "start a conversation from a completed turn",
         action: AppAction::From,
+        takes_argument: true,
+    },
+    Command {
+        name: "/load",
+        usage: "/load <PR URL|remote/caos/conversation-id>",
+        description: "load a published conversation branch",
+        action: AppAction::Load,
         takes_argument: true,
     },
     Command {
@@ -1014,6 +1024,7 @@ struct ConversationState {
     turn_phase: TurnPhase,
     publishing: bool,
     forking: bool,
+    loading_remote: bool,
     scroll: ScrollState,
     unread_below: bool,
     transcript_selection: Option<TranscriptSelection>,
@@ -1059,6 +1070,7 @@ impl ConversationState {
             turn_phase: TurnPhase::System,
             publishing: false,
             forking: false,
+            loading_remote: false,
             scroll: ScrollState::default(),
             unread_below: false,
             transcript_selection: None,
@@ -1232,7 +1244,7 @@ impl ConversationState {
     }
 
     fn is_busy(&self) -> bool {
-        self.running || self.publishing || self.forking
+        self.running || self.publishing || self.forking || self.loading_remote
     }
 
     fn push_error(&mut self, error: impl Into<String>) {
@@ -1455,6 +1467,18 @@ enum UiMessage {
     BranchPublished {
         conversation: String,
         result: Result<String, String>,
+    },
+    ConversationImported {
+        origin: String,
+        source: String,
+        result: Result<
+            (
+                PublishedConversationSource,
+                UserConversationSummary,
+                Box<ConversationLoad>,
+            ),
+            String,
+        >,
     },
     Reconciled {
         conversation: String,
@@ -2051,6 +2075,11 @@ impl App {
                 .show_command_error("wait for this conversation fork to finish");
             return;
         }
+        if self.selected().loading_remote {
+            self.selected_mut()
+                .show_command_error("wait for the published conversation to finish loading");
+            return;
+        }
         if self.selected().publishing {
             self.selected_mut()
                 .show_command_error("finish publishing before sending another message");
@@ -2244,6 +2273,7 @@ impl App {
             AppAction::Help | AppAction::Commands => self.execute_action(command.action),
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
+            AppAction::Load => self.load_published(arguments),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2556,6 +2586,11 @@ impl App {
                         }
                     }
                 }
+                UiMessage::ConversationImported {
+                    origin,
+                    source,
+                    result,
+                } => self.finish_published_load(&origin, &source, result),
                 UiMessage::Reconciled {
                     conversation,
                     request,
@@ -2653,7 +2688,7 @@ impl App {
                     (
                         state.remote_head.clone(),
                         state.remote_title.clone(),
-                        state.forking,
+                        state.forking || state.loading_remote,
                     ),
                 )
             })
@@ -3380,6 +3415,7 @@ impl App {
             }
             AppAction::From
             | AppAction::Invite
+            | AppAction::Load
             | AppAction::Model
             | AppAction::PublishBranch
             | AppAction::Reference
@@ -3701,6 +3737,129 @@ impl App {
             self.selected_mut()
                 .show_command_error("this conversation has no commit to check out");
         }
+    }
+
+    fn load_published(&mut self, source: &str) {
+        if self.selected().is_busy() {
+            self.selected_mut().show_command_error(
+                "finish this conversation's operation before loading another conversation",
+            );
+            return;
+        }
+        let source = source.trim().to_string();
+        let origin = self.selected().id.clone();
+        self.selected_mut().loading_remote = true;
+        self.selected_mut().status = format!("loading published conversation from {source}");
+        let repo_dir = self.repo_dir.clone();
+        let user = self.user.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let published = fetch_published_conversation(&source, &repo_dir)?;
+                let transport = GitTransport::discover(&repo_dir)?;
+                let load = import_published_conversation(
+                    &transport,
+                    &user,
+                    &published.id,
+                    published.title.as_deref(),
+                    &published.head,
+                )?;
+                let summary =
+                    list_user_conversations(&transport, &user, UserConversationStatus::Active)?
+                        .into_iter()
+                        .find(|summary| summary.id == published.id)
+                        .ok_or_else(|| {
+                            format!(
+                                "imported conversation {:?} is missing from the active sidebar",
+                                published.id
+                            )
+                        })?;
+                Ok((published, summary, Box::new(load)))
+            })();
+            let _ = tx.send(UiMessage::ConversationImported {
+                origin,
+                source,
+                result,
+            });
+        });
+    }
+
+    fn finish_published_load(
+        &mut self,
+        origin: &str,
+        source: &str,
+        result: Result<
+            (
+                PublishedConversationSource,
+                UserConversationSummary,
+                Box<ConversationLoad>,
+            ),
+            String,
+        >,
+    ) {
+        let Some(origin_index) = self.conversation_index(origin) else {
+            return;
+        };
+        self.conversations[origin_index].loading_remote = false;
+        let (published, summary, load) = match result {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.conversations[origin_index]
+                    .show_command_error(format!("loading published conversation failed: {error}"));
+                return;
+            }
+        };
+        let options = self.conversations[origin_index].turn_options.clone();
+        let status = format!("loaded {} at {}", source, short_hash(&published.head));
+        let index = if let Some(index) = self.conversation_index(&summary.id) {
+            if self.conversations[index].is_busy() {
+                self.conversations[origin_index].show_command_error(format!(
+                    "conversation {:?} was imported but is busy locally; reload it when that operation finishes",
+                    summary.id
+                ));
+                return;
+            }
+            let state = &mut self.conversations[index];
+            state.title = summary.title;
+            state.remote_title = Some(state.title.clone());
+            state.parent = summary.parent;
+            state.apply_load(*load, &self.user);
+            state.status = status.clone();
+            index
+        } else {
+            let mut state = ConversationState::new(
+                summary.id.clone(),
+                summary.title,
+                options,
+                "loading imported conversation".to_string(),
+            );
+            state.parent = summary.parent;
+            state.remote_title = Some(state.title.clone());
+            state.apply_load(*load, &self.user);
+            state.status = status;
+            let insert_at = state
+                .parent
+                .as_deref()
+                .and_then(|parent| self.conversation_index(parent))
+                .map(|parent_index| {
+                    let mut index = parent_index + 1;
+                    while self
+                        .conversations
+                        .get(index)
+                        .is_some_and(|candidate| candidate.parent == state.parent)
+                    {
+                        index += 1;
+                    }
+                    index
+                })
+                .unwrap_or(0);
+            self.conversations.insert(insert_at, state);
+            insert_at
+        };
+        self.selected = index;
+        self.view = View::Chat;
+        self.focus = Focus::Conversation;
+        self.confirm_action = None;
     }
 
     fn publish_branch_selected(&mut self) {
@@ -4616,6 +4775,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "/from",
+                "/load",
                 "/help",
                 "/title",
                 "/update-tree",
@@ -4627,7 +4787,7 @@ mod tests {
             ]
         );
 
-        assert!(composer.select_command(2));
+        assert!(composer.select_command(3));
         assert!(composer.complete_command());
         assert_eq!(composer.text, "/title ");
         assert!(composer.command_matches().is_empty());
@@ -4672,6 +4832,11 @@ mod tests {
         assert_eq!(command.action, AppAction::From);
         assert_eq!(arguments, "abc123");
 
+        let (command, arguments) =
+            parse_command("/load https://github.com/Metta-AI/caos/pull/34").unwrap();
+        assert_eq!(command.action, AppAction::Load);
+        assert_eq!(arguments, "https://github.com/Metta-AI/caos/pull/34");
+
         let (command, arguments) = parse_command("/publish-branch").unwrap();
         assert_eq!(command.action, AppAction::PublishBranch);
         assert!(arguments.is_empty());
@@ -4702,6 +4867,58 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+    }
+
+    #[test]
+    fn completed_remote_load_selects_the_imported_conversation() {
+        let (mut app, _) = app_with(vec![state("origin")]);
+        app.selected_mut().loading_remote = true;
+        let head = "b".repeat(40);
+        let base = "a".repeat(40);
+        let published = PublishedConversationSource {
+            id: "shared/talk-1".to_string(),
+            title: Some("PR title".to_string()),
+            head: head.clone(),
+        };
+        let summary = UserConversationSummary {
+            id: published.id.clone(),
+            title: "Shared conversation".to_string(),
+            head: head.clone(),
+            updated_unix: 1,
+            parent: None,
+        };
+        let load = ConversationLoad {
+            snapshot: ConversationSnapshot {
+                id: published.id.clone(),
+                head: head.clone(),
+                title: published.title.clone().unwrap(),
+                status: "idle".to_string(),
+                request: None,
+                request_head: None,
+                interrupted: false,
+                messages: Vec::new(),
+            },
+            replay: ConversationReplay {
+                turns: Vec::new(),
+                activity: Vec::new(),
+            },
+            workspace_diff: WorkspaceDiff {
+                base_commit: base,
+                head: head.clone(),
+                patch: String::new(),
+            },
+        };
+
+        app.finish_published_load(
+            "origin",
+            "origin/caos/shared/talk-1",
+            Ok((published, summary, Box::new(load))),
+        );
+
+        assert_eq!(app.selected().id, "shared/talk-1");
+        assert_eq!(app.selected().title, "Shared conversation");
+        assert_eq!(app.selected().remote_head.as_deref(), Some(head.as_str()));
+        assert!(!app.conversations[1].loading_remote);
     }
 
     #[test]
@@ -4780,6 +4997,7 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.selected_mut().composer.insert_str("/");
 
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
