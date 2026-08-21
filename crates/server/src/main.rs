@@ -552,6 +552,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
                 .unwrap_or_default();
             compute::run(config, &query, &secrets_header)
         }
+        Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),
