@@ -25,7 +25,7 @@ use super::args::Args;
 use super::workspace::{
     commit_working_tree, fetch_remote_branch_tip, load_conversation_workspace,
     local_default_branch_tip, prepare_publish_workspace, publish_conversation_pr,
-    publish_merge_target, remote_default_branch,
+    remote_default_branch,
 };
 
 #[path = "ui.rs"]
@@ -3689,29 +3689,23 @@ impl App {
             self.selected_mut().status =
                 "enter a PR base branch or press Ctrl+P again for the default".to_string();
         } else {
-            let (default_base, pr_base) = match self.confirm_action.take() {
+            let pr_base = match self.confirm_action.take() {
                 Some(ConfirmAction::Publish {
                     default_base,
                     base_input,
                 }) => {
                     let base_input = base_input.trim();
                     if base_input.is_empty() {
-                        (default_base.clone(), default_base)
+                        default_base
                     } else {
-                        (default_base, base_input.to_string())
+                        base_input.to_string()
                     }
                 }
                 None => unreachable!("publication was confirmed"),
             };
             self.selected_mut().publish_prompt = false;
             let name = self.selected().id.clone();
-            let conversation_base = self
-                .selected()
-                .diff
-                .as_ref()
-                .expect("a non-empty diff was checked")
-                .base_commit
-                .clone();
+            let title = self.selected().title.clone();
             self.selected_mut().publishing = true;
             self.selected_mut().status = "fetching the selected PR base".to_string();
             let tx = self.tx.clone();
@@ -3720,19 +3714,14 @@ impl App {
             std::thread::spawn(move || {
                 let result = (|| {
                     let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
-                    let target = publish_merge_target(
-                        &conversation_base,
-                        &base_commit,
-                        pr_base != default_base,
-                        &repo_dir,
-                    )?;
+                    let target = base_commit;
                     let transport = GitTransport::discover(&repo_dir)?;
                     transport.ensure_pushed(&target)?;
                     let message = format!(
                         "Prepare this conversation for publication. First call the existing \
                          `merge` tool with `theirs` exactly `{target}`. Resolve every entry in \
-                         `.caos/conflicts`, then build and test. Finish only when the workspace \
-                         is ready to publish."
+                         `.caos/conflicts`, remove `.caos/conflicts`, then build and test. Finish \
+                         only when the workspace is ready to publish."
                     );
                     let outcome = run_chat_turn(
                         &transport,
@@ -3748,12 +3737,13 @@ impl App {
                             });
                         },
                     )?;
-                    let workspace = prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
+                    let conversation =
+                        prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
                     let _ = tx.send(UiMessage::Completed {
                         conversation: name.clone(),
                         outcome,
                     });
-                    publish_conversation_pr(&name, &workspace, &pr_base, &base_commit, &repo_dir)
+                    publish_conversation_pr(&name, &title, &conversation, &pr_base, &repo_dir)
                 })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,

@@ -431,9 +431,10 @@ that workspace commit chains back through the round's per-mutation commits —
 sidecar, no turn-ending special case; `merge` is not privileged, it just
 returns the commit it built.
 
-This makes commits per MUTATION (reads stay free). Fine under the squash
-workflow below; caching is unaffected — sub-runs key on their input TREE, not
-on commits.
+This makes commits per MUTATION (reads stay free). Publication preserves these
+commits along with the conversation-event spine, so the PR branch records the
+prompts, tool calls, results, and workspace mutations that produced its tip.
+Caching is unaffected — sub-runs key on their input TREE, not on commits.
 
 ## `merge --theirs=<commit>`
 
@@ -536,9 +537,10 @@ local rules, no "persistence exemption":
   included — it is workspace state. (A build run mid-merge keys on a tree that
   still carries the file, so it won't cache-hit the post-resolution build;
   negligible, and only during resolution.)
-- **Publish** (the tui's PR flow) strips `.caos/` from the snapshot AFTER the
-  guard below, so scaffolding never reaches the PR — a leftover or empty
-  `.caos/conflicts` cannot leak.
+- **Publish** (the tui's PR flow) requires the conversation TIP to have no
+  `.caos/` entry after the guard below. Earlier merge commits remain in the
+  published history with their conflict scaffolding, but the PR's final tree
+  cannot carry even a leftover empty `.caos/conflicts`.
 
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.
@@ -571,7 +573,6 @@ revision (and made the history tools' hashes readable the same way).
 ## Caveat
 
 Per-mutation commits mean real, sometimes marker-bearing, non-building commits
-land in history. These conversations produce throwaway histories that are only
-usable once SQUASHED, so this is fine — but an intermediate commit (a
-mid-resolution merge commit especially) is NOT safe to cherry-pick or check out
-in isolation.
+land in the published conversation history. Only the validated branch tip is
+promised to be ready for review; an intermediate commit (a mid-resolution merge
+commit especially) is NOT safe to cherry-pick or check out in isolation.

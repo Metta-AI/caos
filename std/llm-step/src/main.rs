@@ -552,13 +552,42 @@ fn drive(
 /// `theirs`) is reachable once a step hangs the latest `wc` off itself.
 fn advance_wc(ws: &str, wc: &str, what: &str) -> Result<String, String> {
     let tree = cas_hash(ws)?;
+    let timestamp = read_commit_timestamp(wc)?;
     let parent = cas_hash(wc)?;
     let out = fresh("wc");
-    // A retry of the same durable call must mint the same ancestry object; a
-    // wall-clock timestamp here used to make every recovered continuation a
-    // distinct request that could race its original.
-    write_commit_as(&tree, &[&parent], what, Some((AGENT_AUTHOR, 0)), &out)?;
+    // A retry of the same durable call must mint the same ancestry object. The
+    // parent's date is stable and keeps published workspace commits alongside
+    // the user turn that caused them.
+    write_commit_as(
+        &tree,
+        &[&parent],
+        what,
+        Some((AGENT_AUTHOR, timestamp)),
+        &out,
+    )?;
     Ok(out)
+}
+
+/// Read only the committer timestamp needed for a causal workspace commit.
+/// Keep this llm-step-specific concern out of worker-common: changing that
+/// bootstrap-bound source changes the seeded rustc result.
+fn read_commit_timestamp(cas_path: &str) -> Result<i64, String> {
+    caos(["get", cas_path])?;
+    let text = fs::read_to_string(cas_path).map_err(|e| format!("reading {cas_path}: {e}"))?;
+    parse_commit_timestamp(&text)
+}
+
+fn parse_commit_timestamp(text: &str) -> Result<i64, String> {
+    let (headers, _) = text
+        .split_once("\n\n")
+        .ok_or_else(|| format!("malformed commit (no blank line): {text:?}"))?;
+    headers
+        .lines()
+        .find(|line| line.starts_with("committer "))
+        .and_then(|line| line.split_whitespace().rev().nth(1))
+        .ok_or_else(|| format!("commit has no committer timestamp: {text:?}"))?
+        .parse::<i64>()
+        .map_err(|error| format!("commit has an invalid committer timestamp: {error}"))
 }
 
 /// One LLM API round over `messages`. `prev` is the exact canonical head used
@@ -2445,6 +2474,14 @@ pub(crate) fn fresh(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_timestamp_comes_from_the_committer() {
+        let commit = "tree 0123456789012345678901234567890123456789\n\
+author user <user@example.com> 1700000000 +0000\n\
+committer agent <agent@example.com> 1700000123 +0000\n\nmessage\n";
+        assert_eq!(parse_commit_timestamp(commit).unwrap(), 1_700_000_123);
+    }
 
     #[test]
     fn durable_hashes_are_canonical_lowercase() {

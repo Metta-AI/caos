@@ -1,13 +1,11 @@
 //! Local-checkout and publication policy for the conversation TUI.
 
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedPublishWorkspace {
+pub(crate) struct PreparedPublishConversation {
     pub(crate) head: String,
-    pub(crate) tree: String,
 }
 
 /// Check out a conversation's head commit in the local working tree.
@@ -58,42 +56,11 @@ pub(crate) fn commit_working_tree(message: &str, cwd: &Path) -> Result<String, S
     capture_required("git", &["rev-parse", "HEAD^{commit}"], cwd)
 }
 
-/// Name the exact commit the ordinary publish turn must merge. A stacked
-/// snapshot keeps the selected base's tree but shares the conversation's base,
-/// so `merge` applies only this conversation's delta.
-pub(crate) fn publish_merge_target(
-    conversation_base: &str,
-    publish_base: &str,
-    stacked: bool,
-    cwd: &Path,
-) -> Result<String, String> {
-    if !stacked {
-        return Ok(publish_base.to_string());
-    }
-    let tree = capture_required(
-        "git",
-        &["rev-parse", &format!("{publish_base}^{{tree}}")],
-        cwd,
-    )?;
-    capture_required(
-        "git",
-        &[
-            "commit-tree",
-            &tree,
-            "-p",
-            conversation_base,
-            "-m",
-            "temporary CAOS publish merge base",
-        ],
-        cwd,
-    )
-}
-
 pub(crate) fn prepare_publish_workspace(
     head: &str,
     target: &str,
     cwd: &Path,
-) -> Result<PreparedPublishWorkspace, String> {
+) -> Result<PreparedPublishConversation, String> {
     let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
     if !ancestry.status.success() {
         return Err(format!(
@@ -117,29 +84,6 @@ pub(crate) fn prepare_publish_workspace(
         }
     }
 
-    let tree = capture_required("git", &["rev-parse", &format!("{head}^{{tree}}")], cwd)?;
-    let listing = capture_required_bytes("git", &["ls-tree", "-z", &tree], cwd)?;
-    let mut clean_listing = Vec::with_capacity(listing.len());
-    for entry in listing.split_inclusive(|byte| *byte == 0) {
-        let name = entry
-            .splitn(2, |byte| *byte == b'\t')
-            .nth(1)
-            .unwrap_or_default()
-            .strip_suffix(&[0])
-            .unwrap_or_default();
-        if name != b".caos" {
-            clean_listing.extend_from_slice(entry);
-        }
-    }
-    let tree = if clean_listing == listing {
-        tree
-    } else {
-        let output = command_with_input("git", &["mktree", "-z"], cwd, &clean_listing)?;
-        String::from_utf8_lossy(&require_success("git mktree", output)?)
-            .trim()
-            .to_string()
-    };
-
     let markers = command_output(
         "git",
         &[
@@ -152,7 +96,7 @@ pub(crate) fn prepare_publish_workspace(
             "^=======$",
             "-e",
             "^>>>>>>> ",
-            &tree,
+            head,
             "--",
         ],
         cwd,
@@ -167,25 +111,30 @@ pub(crate) fn prepare_publish_workspace(
         require_success("git grep", markers)?;
     }
 
-    Ok(PreparedPublishWorkspace {
+    let reserved = capture_required("git", &["ls-tree", "--name-only", head, ".caos"], cwd)?;
+    if !reserved.is_empty() {
+        return Err(
+            "the publish head still contains reserved .caos state; remove .caos/conflicts after resolving it"
+                .to_string(),
+        );
+    }
+
+    Ok(PreparedPublishConversation {
         head: head.to_string(),
-        tree,
     })
 }
 
-/// Publish the virtual workspace as a clean branch without checking it out.
-///
-/// The chat core has already merged, resolved, tested, and removed harness
-/// state. Keep only that tree as one commit above the exact fetched PR base.
+/// Publish the validated conversation history without checking it out.
 pub(crate) fn publish_conversation_pr(
     name: &str,
-    workspace: &PreparedPublishWorkspace,
+    title: &str,
+    conversation: &PreparedPublishConversation,
     pr_base: &str,
-    base_commit: &str,
     cwd: &Path,
 ) -> Result<String, String> {
     let branch = format!("caos/{name}");
-    prepare_publish_branch(name, workspace, base_commit, cwd)?;
+    let title = conversation_pr_title(title);
+    prepare_publish_branch(name, conversation, cwd)?;
     push_publish_branch(&branch, cwd)?;
 
     let existing_url = capture_required(
@@ -207,24 +156,17 @@ pub(crate) fn publish_conversation_pr(
         cwd,
     )?;
     if !existing_url.is_empty() {
+        capture_required("gh", &["pr", "edit", &existing_url, "--title", &title], cwd)?;
         return Ok(existing_url);
     }
     let body = format!(
         "Published from virtual CAOS conversation `{name}` at `{}`.",
-        short_hash(&workspace.head)
+        short_hash(&conversation.head)
     );
     capture_required(
         "gh",
         &[
-            "pr",
-            "create",
-            "--head",
-            &branch,
-            "--base",
-            pr_base,
-            "--title",
-            &format!("CAOS conversation {name}"),
-            "--body",
+            "pr", "create", "--head", &branch, "--base", pr_base, "--title", &title, "--body",
             &body,
         ],
         cwd,
@@ -304,14 +246,48 @@ pub(crate) fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String
 fn push_publish_branch(branch: &str, cwd: &Path) -> Result<(), String> {
     let branch_ref = format!("refs/heads/{branch}");
     let remote_tip = remote_branch_tip(&branch_ref, cwd)?;
-    let expected = remote_tip.as_deref().unwrap_or("");
-    let lease = format!("--force-with-lease={branch_ref}:{expected}");
     let push_ref = format!("{branch_ref}:{branch_ref}");
-    capture_required(
-        "git",
-        &["push", "--set-upstream", &lease, "origin", &push_ref],
-        cwd,
-    )?;
+    let force_migration = match remote_tip.as_deref() {
+        None => false,
+        Some(remote_tip) => {
+            let present = command_output(
+                "git",
+                &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")],
+                cwd,
+            )?
+            .status
+            .success();
+            if !present {
+                true
+            } else {
+                let ancestry = command_output(
+                    "git",
+                    &["merge-base", "--is-ancestor", remote_tip, &branch_ref],
+                    cwd,
+                )?;
+                if ancestry.status.success() {
+                    false
+                } else if ancestry.status.code() == Some(1) {
+                    true
+                } else {
+                    require_success("git merge-base", ancestry)?;
+                    unreachable!("successful merge-base returned through an error branch");
+                }
+            }
+        }
+    };
+    let lease = force_migration.then(|| {
+        format!(
+            "--force-with-lease={branch_ref}:{}",
+            remote_tip.as_deref().expect("a migration has a remote tip")
+        )
+    });
+    let mut args = vec!["push", "--set-upstream"];
+    if let Some(lease) = lease.as_deref() {
+        args.push(lease);
+    }
+    args.extend(["origin", &push_ref]);
+    capture_required("git", &args, cwd)?;
     Ok(())
 }
 
@@ -343,52 +319,23 @@ fn remote_branch_tip(branch_ref: &str, cwd: &Path) -> Result<Option<String>, Str
 
 pub(crate) fn prepare_publish_branch(
     name: &str,
-    workspace: &PreparedPublishWorkspace,
-    base_commit: &str,
+    conversation: &PreparedPublishConversation,
     cwd: &Path,
 ) -> Result<String, String> {
     let branch = format!("caos/{name}");
     let branch_ref = format!("refs/heads/{branch}");
     let previous = capture_optional("git", &["rev-parse", "--verify", &branch_ref], cwd)?;
-    let reusable = if let Some(previous) = previous.as_deref() {
-        let previous_tree_spec = format!("{previous}^{{tree}}");
-        let previous_tree = capture_required("git", &["rev-parse", &previous_tree_spec], cwd)?;
-        let previous_parent =
-            capture_optional("git", &["rev-parse", &format!("{previous}^")], cwd)?;
-        previous_tree == workspace.tree && previous_parent.as_deref() == Some(base_commit)
-    } else {
-        false
-    };
-    let publish_commit = if reusable {
-        previous.clone().expect("a reusable publish commit exists")
-    } else {
-        capture_required(
-            "git",
-            &[
-                "commit-tree",
-                &workspace.tree,
-                "-p",
-                base_commit,
-                "-m",
-                &format!(
-                    "CAOS conversation {} at {}",
-                    short_hash(name),
-                    short_hash(&workspace.head)
-                ),
-            ],
-            cwd,
-        )?
-    };
+    let publish_commit = &conversation.head;
     match previous.as_deref() {
         Some(old) if old != publish_commit => {
             capture_required(
                 "git",
-                &["update-ref", &branch_ref, &publish_commit, old],
+                &["update-ref", &branch_ref, publish_commit, old],
                 cwd,
             )?;
         }
         None => {
-            capture_required("git", &["update-ref", &branch_ref, &publish_commit], cwd)?;
+            capture_required("git", &["update-ref", &branch_ref, publish_commit], cwd)?;
         }
         _ => {}
     }
@@ -423,31 +370,6 @@ fn command_output(program: &str, args: &[&str], cwd: &Path) -> Result<Output, St
         .map_err(|error| format!("running {program}: {error}"))
 }
 
-fn command_with_input(
-    program: &str,
-    args: &[&str],
-    cwd: &Path,
-    input: &[u8],
-) -> Result<Output, String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("running {program}: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("opening {program} stdin"))?
-        .write_all(input)
-        .map_err(|error| format!("writing {program} stdin: {error}"))?;
-    child
-        .wait_with_output()
-        .map_err(|error| format!("waiting for {program}: {error}"))
-}
-
 fn require_success(program: &str, output: Output) -> Result<Vec<u8>, String> {
     if output.status.success() {
         return Ok(output.stdout);
@@ -462,6 +384,10 @@ fn require_success(program: &str, output: Output) -> Result<Vec<u8>, String> {
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
+}
+
+fn conversation_pr_title(title: &str) -> String {
+    format!("caos conversation: {title}")
 }
 
 #[cfg(test)]
@@ -482,6 +408,14 @@ mod tests {
         capture_required("git", &["config", "user.name", "Test User"], &dir).unwrap();
         capture_required("git", &["config", "user.email", "test@example.com"], &dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn published_pr_title_uses_the_conversation_title() {
+        assert_eq!(
+            conversation_pr_title("Simplify README wording"),
+            "caos conversation: Simplify README wording"
+        );
     }
 
     fn commit_file(dir: &Path, content: &str, message: &str) -> String {
@@ -573,15 +507,19 @@ mod tests {
     }
 
     #[test]
-    fn prepared_publish_tree_is_merged_and_has_no_harness_state() {
+    fn prepared_publish_head_is_merged_and_has_no_reserved_tip_state() {
         let dir = temp_repo("publish-clean");
         let base = commit_file(&dir, "base\n", "base");
         std::fs::create_dir_all(dir.join(".caos")).unwrap();
         std::fs::write(dir.join(".caos/conflicts"), "").unwrap();
-        std::fs::write(dir.join(".caos/transcript"), "private\n").unwrap();
+        capture_required("git", &["add", ".caos/conflicts"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "merge resolved"], &dir).unwrap();
+        let resolved = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+
+        std::fs::remove_dir_all(dir.join(".caos")).unwrap();
         std::fs::write(dir.join("publish.txt"), "ready\n").unwrap();
-        capture_required("git", &["add", ".caos", "publish.txt"], &dir).unwrap();
-        capture_required("git", &["commit", "-q", "-m", "resolved"], &dir).unwrap();
+        capture_required("git", &["add", "-A"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "ready"], &dir).unwrap();
         let head = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
 
         let prepared = prepare_publish_workspace(&head, &base, &dir).unwrap();
@@ -590,16 +528,24 @@ mod tests {
         assert_eq!(
             capture_required(
                 "git",
-                &["show", &format!("{}:publish.txt", prepared.tree)],
+                &["show", &format!("{}:publish.txt", prepared.head)],
                 &dir
             )
             .unwrap(),
             "ready"
         );
+        assert!(command_output(
+            "git",
+            &["merge-base", "--is-ancestor", &resolved, &prepared.head],
+            &dir
+        )
+        .unwrap()
+        .status
+        .success());
         assert!(capture_optional(
             "git",
-            &["rev-parse", "--verify", &format!("{}:.caos", prepared.tree)],
-            &dir,
+            &["rev-parse", "--verify", &format!("{}:.caos", prepared.head)],
+            &dir
         )
         .unwrap()
         .is_none());
@@ -607,7 +553,23 @@ mod tests {
     }
 
     #[test]
-    fn prepared_publish_tree_refuses_unresolved_conflicts() {
+    fn prepared_publish_head_refuses_empty_reserved_tip_state() {
+        let dir = temp_repo("publish-reserved");
+        let base = commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(dir.join(".caos/conflicts"), "").unwrap();
+        capture_required("git", &["add", ".caos/conflicts"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "resolved"], &dir).unwrap();
+        let head = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+
+        let error = prepare_publish_workspace(&head, &base, &dir).unwrap_err();
+
+        assert!(error.contains("reserved .caos state"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prepared_publish_head_refuses_unresolved_conflicts() {
         let dir = temp_repo("publish-conflicts");
         let base = commit_file(&dir, "base\n", "base");
         std::fs::create_dir_all(dir.join(".caos")).unwrap();
@@ -624,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_publish_tree_refuses_conflict_markers() {
+    fn prepared_publish_head_refuses_conflict_markers() {
         let dir = temp_repo("publish-markers");
         let base = commit_file(&dir, "base\n", "base");
         std::fs::write(
@@ -644,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_branch_is_one_replaceable_snapshot_without_checkout_changes() {
+    fn publish_branch_preserves_conversation_history_and_repushes_fast_forward() {
         let dir = temp_repo("publish-test");
         let remote = dir.with_extension("remote.git");
         let remote_path = remote.to_string_lossy().to_string();
@@ -668,31 +630,38 @@ mod tests {
         assert_eq!(fetch_remote_branch_tip("main", &dir).unwrap(), main_tip);
 
         capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
-        std::fs::write(dir.join("key.txt"), "temporary secret\n").unwrap();
         std::fs::write(dir.join("inherited.txt"), "from conversation A\n").unwrap();
-        std::fs::write(dir.join("main.txt"), "new on main\n").unwrap();
+        capture_required("git", &["add", "inherited.txt"], &dir).unwrap();
+        let tool_event = r#"{"author":"assistant","calls":[{"name":"edit"}]}"#;
+        let first_head = commit_file(&dir, "first result\n", tool_event);
         capture_required(
             "git",
-            &["add", "key.txt", "inherited.txt", "main.txt"],
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "-m",
+                "publish merge",
+                &main_tip,
+            ],
             &dir,
         )
         .unwrap();
-        let first_head = commit_file(&dir, "first result\n", "internal turn with key");
+        let first_publish = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
         let before = std::fs::read_to_string(dir.join("file.txt")).unwrap();
-        let first_workspace = PreparedPublishWorkspace {
-            head: first_head.clone(),
-            tree: capture_required("git", &["rev-parse", "HEAD^{tree}"], &dir).unwrap(),
-        };
+        let first_conversation =
+            prepare_publish_workspace(&first_publish, &main_tip, &dir).unwrap();
 
-        let branch =
-            prepare_publish_branch("publish-test", &first_workspace, &main_tip, &dir).unwrap();
+        let branch = prepare_publish_branch("publish-test", &first_conversation, &dir).unwrap();
         assert_eq!(branch, "caos/publish-test");
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
             before
         );
-        let first_publish =
-            capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
+        assert_eq!(
+            capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
+            first_publish
+        );
         push_publish_branch(&branch, &dir).unwrap();
         let branch_ref = "refs/heads/caos/publish-test";
         assert_eq!(
@@ -700,28 +669,14 @@ mod tests {
             Some(first_publish.as_str())
         );
 
-        capture_required("git", &["rm", "-q", "key.txt"], &dir).unwrap();
-        let final_head = commit_file(&dir, "final result\n", "internal turn without key");
-        let final_workspace = PreparedPublishWorkspace {
-            head: final_head.clone(),
-            tree: capture_required("git", &["rev-parse", "HEAD^{tree}"], &dir).unwrap(),
-        };
-        prepare_publish_branch("publish-test", &final_workspace, &main_tip, &dir).unwrap();
+        let final_head = commit_file(&dir, "final result\n", "terminal assistant event");
+        let final_conversation = prepare_publish_workspace(&final_head, &main_tip, &dir).unwrap();
+        prepare_publish_branch("publish-test", &final_conversation, &dir).unwrap();
         let final_publish =
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap();
-        assert_ne!(final_publish, first_publish);
         assert_eq!(
-            capture_required(
-                "git",
-                &["show", "-s", "--format=%s", "caos/publish-test"],
-                &dir
-            )
-            .unwrap(),
-            format!(
-                "CAOS conversation {} at {}",
-                short_hash("publish-test"),
-                short_hash(&final_head)
-            )
+            final_publish, final_head,
+            "the publish branch must point at the conversation head"
         );
         assert_eq!(
             capture_required("git", &["show", "caos/publish-test:file.txt"], &dir).unwrap(),
@@ -736,10 +691,6 @@ mod tests {
             "from conversation A"
         );
         assert_eq!(
-            capture_required("git", &["rev-parse", "caos/publish-test^"], &dir).unwrap(),
-            main_tip
-        );
-        assert_eq!(
             capture_required(
                 "git",
                 &[
@@ -750,14 +701,21 @@ mod tests {
                 &dir
             )
             .unwrap(),
-            "1"
+            "3"
         );
-        assert!(
-            capture_optional("git", &["show", "caos/publish-test:key.txt"], &dir)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!command_output(
+        assert!(capture_required(
+            "git",
+            &[
+                "log",
+                "--format=%s",
+                &format!("{main_tip}..caos/publish-test")
+            ],
+            &dir
+        )
+        .unwrap()
+        .lines()
+        .any(|message| message == tool_event));
+        assert!(command_output(
             "git",
             &[
                 "merge-base",
@@ -770,7 +728,7 @@ mod tests {
         .unwrap()
         .status
         .success());
-        assert!(!command_output(
+        assert!(command_output(
             "git",
             &["merge-base", "--is-ancestor", &first_head, &final_publish],
             &dir
@@ -779,9 +737,8 @@ mod tests {
         .status
         .success());
 
-        // A failed earlier publish can leave the local snapshot ahead of a
-        // different remote tip. Lease against the freshly queried remote tip,
-        // not the stale local branch that this call is about to push.
+        // The remote still has the previous conversation head. Pushing the new
+        // head advances it without rewriting the published conversation.
         assert_eq!(
             remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
             Some(first_publish.as_str())
@@ -792,8 +749,7 @@ mod tests {
             Some(final_publish.as_str())
         );
 
-        // An auto-deleted merged branch is recreated only if it is still
-        // absent when the force-with-lease push reaches the remote.
+        // An auto-deleted merged branch is recreated by an ordinary create.
         capture_required("git", &[&git_dir, "update-ref", "-d", branch_ref], &dir).unwrap();
         assert_eq!(remote_branch_tip(branch_ref, &dir).unwrap(), None);
         push_publish_branch(&branch, &dir).unwrap();
@@ -802,10 +758,42 @@ mod tests {
             Some(final_publish.as_str())
         );
 
-        prepare_publish_branch("publish-test", &final_workspace, &main_tip, &dir).unwrap();
+        prepare_publish_branch("publish-test", &final_conversation, &dir).unwrap();
         assert_eq!(
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
             final_publish
+        );
+
+        // A branch made by the old publisher is a one-commit snapshot and is
+        // not an ancestor of the conversation. Migrate that shape once under
+        // an exact lease; subsequent updates take the fast-forward path above.
+        let final_tree = capture_required("git", &["rev-parse", "HEAD^{tree}"], &dir).unwrap();
+        let legacy_snapshot = capture_required(
+            "git",
+            &[
+                "commit-tree",
+                &final_tree,
+                "-p",
+                &main_tip,
+                "-m",
+                "legacy CAOS snapshot",
+            ],
+            &dir,
+        )
+        .unwrap();
+        capture_required(
+            "git",
+            &["update-ref", branch_ref, &legacy_snapshot, &final_publish],
+            &dir,
+        )
+        .unwrap();
+        let legacy_push = format!("+{branch_ref}:{branch_ref}");
+        capture_required("git", &["push", "--quiet", "origin", &legacy_push], &dir).unwrap();
+        prepare_publish_branch("publish-test", &final_conversation, &dir).unwrap();
+        push_publish_branch(&branch, &dir).unwrap();
+        assert_eq!(
+            remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
+            Some(final_publish.as_str())
         );
 
         std::fs::remove_dir_all(dir).unwrap();
@@ -813,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_uses_the_prepared_tree_on_the_selected_base() {
+    fn publish_uses_the_conversation_head_merged_with_the_selected_base() {
         let dir = temp_repo("publish-stacked-test");
         let base = commit_file(&dir, "base\n", "base");
         let _parent_head = commit_file(&dir, "parent conversation\n", "parent turn");
@@ -823,36 +811,58 @@ mod tests {
         std::fs::write(dir.join("upstream.txt"), "upstream\n").unwrap();
         capture_required("git", &["add", "upstream.txt"], &dir).unwrap();
         capture_required("git", &["commit", "-q", "-m", "base advances"], &dir).unwrap();
-        let selected_base = commit_file(
+        let selected_base = commit_file(&dir, "parent conversation\n", "parent conversation head");
+
+        std::fs::write(dir.join("file.txt"), "child conversation\n").unwrap();
+        capture_required("git", &["add", "file.txt"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "assembled tree"], &dir).unwrap();
+        let tree = capture_required("git", &["rev-parse", "HEAD^{tree}"], &dir).unwrap();
+        let merged_head = capture_required(
+            "git",
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &child_head,
+                "-p",
+                &selected_base,
+                "-m",
+                "publish merge event",
+            ],
             &dir,
-            "parent conversation\n",
-            "clean parent conversation snapshot",
+        )
+        .unwrap();
+        let conversation = prepare_publish_workspace(&merged_head, &selected_base, &dir).unwrap();
+        prepare_publish_branch("stacked-test", &conversation, &dir).unwrap();
+
+        assert_eq!(
+            capture_required("git", &["rev-parse", "caos/stacked-test"], &dir).unwrap(),
+            merged_head
         );
-
-        let workspace = PreparedPublishWorkspace {
-            head: child_head.clone(),
-            tree: capture_required(
-                "git",
-                &["rev-parse", &format!("{child_head}^{{tree}}")],
-                &dir,
-            )
-            .unwrap(),
-        };
-        prepare_publish_branch("stacked-test", &workspace, &selected_base, &dir).unwrap();
-
         assert_eq!(
             capture_required("git", &["show", "caos/stacked-test:file.txt"], &dir).unwrap(),
             "child conversation"
         );
-        assert!(
-            capture_optional("git", &["show", "caos/stacked-test:upstream.txt"], &dir)
-                .unwrap()
-                .is_none()
-        );
         assert_eq!(
-            capture_required("git", &["rev-parse", "caos/stacked-test^"], &dir).unwrap(),
-            selected_base
+            capture_required("git", &["show", "caos/stacked-test:upstream.txt"], &dir).unwrap(),
+            "upstream"
         );
+        assert!(command_output(
+            "git",
+            &["merge-base", "--is-ancestor", &selected_base, &merged_head],
+            &dir
+        )
+        .unwrap()
+        .status
+        .success());
+        assert!(command_output(
+            "git",
+            &["merge-base", "--is-ancestor", &child_head, &merged_head],
+            &dir
+        )
+        .unwrap()
+        .status
+        .success());
 
         std::fs::remove_dir_all(dir).unwrap();
     }

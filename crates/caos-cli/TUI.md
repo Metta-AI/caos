@@ -207,10 +207,12 @@ tests the result. For another base, only this conversation's delta is applied,
 so child conversations form clean PR stacks. Unresolved conflicts stop before
 the branch moves. The checkout and index remain untouched.
 
-CAOS creates or replaces `caos/<conversation>` with one clean snapshot commit
-directly above the selected base, pushes it, and uses the authenticated `gh`
-CLI to find or open its pull request. The snapshot excludes the internal step
-DAG and `.caos` metadata.
+CAOS points `caos/<conversation>` directly at the validated conversation head,
+pushes it, and uses the authenticated `gh` CLI to find or open its pull
+request. The first publication carries the conversation history; later
+publications advance the branch by fast-forward. The selected PR base is an
+ancestor of the published head, and the final tree must contain no reserved
+`.caos` state.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git
