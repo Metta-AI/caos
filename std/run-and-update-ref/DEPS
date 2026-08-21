@@ -1,5 +1,7 @@
-# The rustc worker factory compiles this source and curries the result onto the
-# opt-in Git runner. rustc brings its own default runner/cargo/worker-common;
-# this tool overrides only the runtime of the binary rustc produces.
+# The rustc worker factory compiles this source with the shared conversation
+# protocol and curries the result onto the opt-in Git runner. rustc brings its
+# own default runner/cargo/worker-common; this tool overrides only the runtime
+# of the binary rustc produces.
 ../rustc rustc
 ../git-runner git-runner
+../../crates/conversation-protocol conversation-protocol

@@ -848,18 +848,27 @@ impl Composer {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandAction {
+enum AppAction {
     From,
     Help,
     Invite,
     Model,
-    Palette,
+    Commands,
     Reference,
     Title,
     UpdateTree,
+    NewConversation,
+    Checkout,
+    Publish,
+    Activity,
+    Changes,
+    Tools,
+    Reload,
+    Archive,
+    SelectionLock,
 }
 
-impl CommandAction {
+impl AppAction {
     fn submits_message(self) -> bool {
         matches!(self, Self::UpdateTree)
     }
@@ -870,7 +879,7 @@ struct Command {
     name: &'static str,
     usage: &'static str,
     description: &'static str,
-    action: CommandAction,
+    action: AppAction,
     takes_argument: bool,
 }
 
@@ -893,56 +902,56 @@ const COMMANDS: [Command; 8] = [
         name: "/from",
         usage: "/from <commit>",
         description: "start a conversation from a completed turn",
-        action: CommandAction::From,
+        action: AppAction::From,
         takes_argument: true,
     },
     Command {
         name: "/help",
         usage: "/help",
         description: "show keyboard shortcuts and slash commands",
-        action: CommandAction::Help,
+        action: AppAction::Help,
         takes_argument: false,
     },
     Command {
         name: "/title",
         usage: "/title <new title>",
         description: "rename the selected conversation",
-        action: CommandAction::Title,
+        action: AppAction::Title,
         takes_argument: true,
     },
     Command {
         name: "/update-tree",
         usage: "/update-tree <message>",
         description: "fold working-tree edits into the commit",
-        action: CommandAction::UpdateTree,
+        action: AppAction::UpdateTree,
         takes_argument: true,
     },
     Command {
         name: "/commands",
         usage: "/commands",
         description: "open the searchable command palette",
-        action: CommandAction::Palette,
+        action: AppAction::Commands,
         takes_argument: false,
     },
     Command {
         name: "/ref",
         usage: "/ref",
         description: "show the copyable conversation ref and full head hash",
-        action: CommandAction::Reference,
+        action: AppAction::Reference,
         takes_argument: false,
     },
     Command {
         name: "/invite",
         usage: "/invite <username>",
         description: "add to one username's sidebar (case-sensitive; spaces allowed)",
-        action: CommandAction::Invite,
+        action: AppAction::Invite,
         takes_argument: true,
     },
     Command {
         name: "/model",
         usage: "/model <name|default>",
         description: "select the model for future turns in this client",
-        action: CommandAction::Model,
+        action: AppAction::Model,
         takes_argument: true,
     },
 ];
@@ -1090,12 +1099,7 @@ impl ConversationState {
             )
         });
         self.apply_snapshot(&load.snapshot);
-        self.activities = load
-            .replay
-            .turn_events
-            .last()
-            .map(|turn| replayed_activities(&turn.events))
-            .unwrap_or_default();
+        self.activities = replayed_activities(&load.replay.activity);
         if followed_activity_tail && self.activities.len() > previous_activity_len {
             self.activity_selection = self.activities.len().checked_sub(1);
             self.activity_detail_scroll = 0;
@@ -1465,87 +1469,96 @@ enum ConfirmAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaletteAction {
-    NewConversation,
-    Checkout,
-    Publish,
-    Activity,
-    Changes,
-    Tools,
-    Reload,
-    Help,
-    Archive,
-    SelectionLock,
+struct Shortcut {
+    keys: &'static str,
+    label: &'static str,
+    shifted: bool,
+    list_only: bool,
+}
+
+impl Shortcut {
+    const fn new(keys: &'static str, label: &'static str, shifted: bool, list_only: bool) -> Self {
+        Self {
+            keys,
+            label,
+            shifted,
+            list_only,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.label
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PaletteCommand {
     label: &'static str,
-    shortcut: &'static str,
+    shortcut: Shortcut,
     keywords: &'static str,
-    action: PaletteAction,
+    action: AppAction,
 }
 
 const PALETTE_COMMANDS: [PaletteCommand; 10] = [
     PaletteCommand {
         label: "New conversation",
-        shortcut: "Ctrl+N",
+        shortcut: Shortcut::new("n", "Ctrl+N", false, false),
         keywords: "create start chat",
-        action: PaletteAction::NewConversation,
+        action: AppAction::NewConversation,
     },
     PaletteCommand {
         label: "Check out conversation",
-        shortcut: "Ctrl+L",
+        shortcut: Shortcut::new("l", "Ctrl+L", false, false),
         keywords: "load workspace git",
-        action: PaletteAction::Checkout,
+        action: AppAction::Checkout,
     },
     PaletteCommand {
         label: "Publish pull request",
-        shortcut: "Ctrl+P twice",
+        shortcut: Shortcut::new("p", "Ctrl+P twice", false, false),
         keywords: "push pr github branch",
-        action: PaletteAction::Publish,
+        action: AppAction::Publish,
     },
     PaletteCommand {
         label: "Show activity",
-        shortcut: "Ctrl+T",
+        shortcut: Shortcut::new("t", "Ctrl+T", false, false),
         keywords: "tools progress browser",
-        action: PaletteAction::Activity,
+        action: AppAction::Activity,
     },
     PaletteCommand {
         label: "Show workspace changes",
-        shortcut: "Ctrl+Q",
+        shortcut: Shortcut::new("q", "Ctrl+Q", false, false),
         keywords: "diff files",
-        action: PaletteAction::Changes,
+        action: AppAction::Changes,
     },
     PaletteCommand {
         label: "Show available tools",
-        shortcut: "Ctrl+Shift+T",
+        shortcut: Shortcut::new("t", "Ctrl+Shift+T", true, false),
         keywords: "commands agent",
-        action: PaletteAction::Tools,
+        action: AppAction::Tools,
     },
     PaletteCommand {
         label: "Reload conversation",
-        shortcut: "Ctrl+R",
+        shortcut: Shortcut::new("r", "Ctrl+R", false, false),
         keywords: "refresh history",
-        action: PaletteAction::Reload,
+        action: AppAction::Reload,
     },
     PaletteCommand {
         label: "Show keyboard help",
-        shortcut: "Ctrl+H",
+        shortcut: Shortcut::new("h?/", "Ctrl+H", false, false),
         keywords: "shortcuts documentation",
-        action: PaletteAction::Help,
+        action: AppAction::Help,
     },
     PaletteCommand {
         label: "Archive conversation",
-        shortcut: "Ctrl+E in list",
+        shortcut: Shortcut::new("e", "Ctrl+E in list", false, true),
         keywords: "close remove",
-        action: PaletteAction::Archive,
+        action: AppAction::Archive,
     },
     PaletteCommand {
         label: "Toggle native selection lock",
-        shortcut: "Ctrl+Y",
+        shortcut: Shortcut::new("y", "Ctrl+Y", false, false),
         keywords: "copy mouse terminal freeze",
-        action: PaletteAction::SelectionLock,
+        action: AppAction::SelectionLock,
     },
 ];
 
@@ -1580,7 +1593,7 @@ impl CommandPalette {
         }
     }
 
-    fn selected_action(&self) -> Option<PaletteAction> {
+    fn selected_action(&self) -> Option<AppAction> {
         self.matches()
             .get(self.selected)
             .map(|command| command.action)
@@ -1694,12 +1707,11 @@ impl App {
                     "ready".to_string(),
                 );
                 state.parent = summary.parent.clone();
+                state.remote_head = Some(summary.head.clone());
                 state
             })
             .collect();
-        for state in &mut states {
-            let _ = state.reload(&transport, &args.user);
-        }
+        let load_selected = matches!(&choice, ConversationChoice::Existing(_));
         let selected_id = match choice {
             ConversationChoice::Existing(id) => id,
             ConversationChoice::New { id, title } => {
@@ -1723,6 +1735,9 @@ impl App {
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
+        if load_selected {
+            let _ = states[selected].reload(&transport, &args.user);
+        }
         let mut app = Self {
             repo_dir,
             user: args.user,
@@ -2185,9 +2200,6 @@ impl App {
                         });
                     },
                     |event| {
-                        if matches!(event, TurnEvent::Completed(_)) {
-                            return;
-                        }
                         let _ = tx.send(UiMessage::Turn {
                             conversation: conversation.clone(),
                             event,
@@ -2217,11 +2229,10 @@ impl App {
     fn run_local_command(&mut self, command: &Command, arguments: &str) {
         debug_assert!(!command.action.submits_message());
         match command.action {
-            CommandAction::Help => self.view = View::Help,
-            CommandAction::Palette => self.palette = Some(CommandPalette::default()),
-            CommandAction::Reference => self.show_selected_ref(),
-            CommandAction::Invite => self.invite_selected(arguments),
-            CommandAction::Model => {
+            AppAction::Help | AppAction::Commands => self.execute_action(command.action),
+            AppAction::Reference => self.show_selected_ref(),
+            AppAction::Invite => self.invite_selected(arguments),
+            AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
                         .show_command_error(format!("usage: {}", command.usage));
@@ -2238,9 +2249,18 @@ impl App {
                 self.selected_mut()
                     .push_info(format!("Model for future turns: {model}"));
             }
-            CommandAction::From => self.start_from_hash(arguments),
-            CommandAction::Title => self.rename_selected(arguments),
-            CommandAction::UpdateTree => unreachable!("message command reached local dispatch"),
+            AppAction::From => self.start_from_hash(arguments),
+            AppAction::Title => self.rename_selected(arguments),
+            AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
+            AppAction::NewConversation
+            | AppAction::Checkout
+            | AppAction::Publish
+            | AppAction::Activity
+            | AppAction::Changes
+            | AppAction::Tools
+            | AppAction::Reload
+            | AppAction::Archive
+            | AppAction::SelectionLock => unreachable!("palette-only action has no slash command"),
         }
     }
 
@@ -2724,11 +2744,6 @@ impl App {
     }
 
     fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
-        if let TurnEvent::Completed(outcome) = event {
-            self.finish_turn(index, outcome);
-            return;
-        }
-
         let state = &mut self.conversations[index];
         match event {
             TurnEvent::PhaseStarted(phase) => state.turn_phase = phase,
@@ -2737,16 +2752,6 @@ impl App {
                 elapsed_secs,
             } => state.status = format!("{label}: {elapsed_secs:.1}s"),
             TurnEvent::Status(status) => state.status = status,
-            TurnEvent::AssistantText(text) => {
-                state.note_transcript_append();
-                state.transcript.push(TranscriptEntry {
-                    role: EntryRole::Agent(state.turn_options.model.clone()),
-                    commit: None,
-                    text,
-                    pending_id: None,
-                });
-                state.transcript_selection = None;
-            }
             TurnEvent::ToolCall {
                 step_commit,
                 request,
@@ -2802,7 +2807,6 @@ impl App {
                     });
                 }
             }
-            TurnEvent::Completed(_) => unreachable!("completed events return above"),
         }
     }
 
@@ -2958,8 +2962,22 @@ impl App {
             return;
         }
         self.selected_mut().command_error = None;
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-            self.selection_locked = !self.selection_locked;
+        let shortcut = match key.code {
+            KeyCode::Char(input) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+                PALETTE_COMMANDS
+                    .iter()
+                    .find(|command| {
+                        command.shortcut.shifted == shifted
+                            && (!command.shortcut.list_only || self.focus == Focus::List)
+                            && command.shortcut.keys.contains(input.to_ascii_lowercase())
+                    })
+                    .map(|command| command.action)
+            }
+            _ => None,
+        };
+        if shortcut == Some(AppAction::SelectionLock) {
+            self.execute_action(AppAction::SelectionLock);
             return;
         }
         if self.selection_locked {
@@ -2977,61 +2995,55 @@ impl App {
             .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('p' | 'P'));
         if is_palette {
-            self.confirm_action = None;
-            self.selected_mut().publish_prompt = false;
-            self.palette = self.palette.take().is_none().then(CommandPalette::default);
+            self.execute_action(AppAction::Commands);
             return;
         }
         if self.palette.is_some() {
             self.handle_palette_key(key);
             return;
         }
-        let is_load =
-            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l');
-        let is_publish =
-            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p');
+        if shortcut == Some(AppAction::Publish) {
+            self.execute_action(AppAction::Publish);
+            return;
+        }
         if matches!(self.confirm_action, Some(ConfirmAction::Publish { .. })) {
-            if is_publish {
-                self.publish_selected();
-            } else {
-                match key.code {
-                    KeyCode::Esc => {
-                        self.confirm_action = None;
-                        self.selected_mut().status.clear();
-                        self.selected_mut().publish_prompt = false;
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.confirm_action = None;
-                        self.selected_mut().status.clear();
-                        self.selected_mut().publish_prompt = false;
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(ConfirmAction::Publish { base_input, .. }) =
-                            self.confirm_action.as_mut()
-                        {
-                            base_input.pop();
-                        }
-                    }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(ConfirmAction::Publish { base_input, .. }) =
-                            self.confirm_action.as_mut()
-                        {
-                            base_input.clear();
-                        }
-                    }
-                    KeyCode::Char(ch)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-                    {
-                        if let Some(ConfirmAction::Publish { base_input, .. }) =
-                            self.confirm_action.as_mut()
-                        {
-                            base_input.push(ch);
-                        }
-                    }
-                    _ => {}
+            match key.code {
+                KeyCode::Esc => {
+                    self.confirm_action = None;
+                    self.selected_mut().status.clear();
+                    self.selected_mut().publish_prompt = false;
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.confirm_action = None;
+                    self.selected_mut().status.clear();
+                    self.selected_mut().publish_prompt = false;
+                }
+                KeyCode::Backspace => {
+                    if let Some(ConfirmAction::Publish { base_input, .. }) =
+                        self.confirm_action.as_mut()
+                    {
+                        base_input.pop();
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(ConfirmAction::Publish { base_input, .. }) =
+                        self.confirm_action.as_mut()
+                    {
+                        base_input.clear();
+                    }
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                {
+                    if let Some(ConfirmAction::Publish { base_input, .. }) =
+                        self.confirm_action.as_mut()
+                    {
+                        base_input.push(ch);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -3052,68 +3064,8 @@ impl App {
             }
             return;
         }
-        // Ctrl+H is a distinct control byte in legacy terminal input. Keep
-        // Ctrl+? as an alias for terminals whose enhanced keyboard protocol
-        // reports the modifiers unambiguously.
-        let is_help = key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('h' | '?' | '/'));
-        if is_load {
-            self.load_selected();
-            return;
-        }
-        if is_publish {
-            self.publish_selected();
-            return;
-        }
-        if is_help {
-            self.view = if self.view == View::Help {
-                View::Chat
-            } else {
-                View::Help
-            };
-            self.selected_mut().follow_tail();
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
-            self.view = match self.view {
-                View::Chat | View::Activity | View::Tools | View::Help => View::Diff,
-                View::Diff => View::Chat,
-            };
-            self.selected_mut().follow_tail();
-            return;
-        }
-        let ctrl_t = key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'));
-        if ctrl_t && key.modifiers.contains(KeyModifiers::SHIFT) {
-            self.view = match self.view {
-                View::Tools => View::Chat,
-                View::Chat | View::Activity | View::Diff | View::Help => View::Tools,
-            };
-            self.selected_mut().follow_tail();
-            if self.view == View::Tools {
-                self.load_selected_tool_set();
-            }
-            return;
-        }
-        if ctrl_t {
-            self.view = if self.view == View::Activity {
-                View::Chat
-            } else {
-                self.selected_mut().ensure_activity_selection();
-                View::Activity
-            };
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
-            self.start_new_conversation(None);
-            self.focus = Focus::Conversation;
-            return;
-        }
-        if self.focus == Focus::List
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('e')
-        {
-            self.close_selected();
+        if let Some(action) = shortcut {
+            self.execute_action(action);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Up {
@@ -3122,10 +3074,6 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
             self.select_relative(1);
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            self.reload_selected();
             return;
         }
         if self.focus == Focus::List {
@@ -3315,7 +3263,7 @@ impl App {
                     .and_then(CommandPalette::selected_action);
                 self.palette = None;
                 if let Some(action) = action {
-                    self.execute_palette_action(action);
+                    self.execute_action(action);
                 }
             }
             KeyCode::Up => self.palette.as_mut().expect("palette is open").select(-1),
@@ -3346,31 +3294,63 @@ impl App {
         }
     }
 
-    fn execute_palette_action(&mut self, action: PaletteAction) {
+    fn execute_action(&mut self, action: AppAction) {
         match action {
-            PaletteAction::NewConversation => self.start_new_conversation(None),
-            PaletteAction::Checkout => self.load_selected(),
-            PaletteAction::Publish => self.publish_selected(),
-            PaletteAction::Activity => {
-                self.selected_mut().ensure_activity_selection();
-                self.view = View::Activity;
+            AppAction::NewConversation => {
+                self.start_new_conversation(None);
+                self.focus = Focus::Conversation;
             }
-            PaletteAction::Changes => {
-                self.view = View::Diff;
+            AppAction::Checkout => self.load_selected(),
+            AppAction::Publish => self.publish_selected(),
+            AppAction::Activity => {
+                self.view = if self.view == View::Activity {
+                    View::Chat
+                } else {
+                    self.selected_mut().ensure_activity_selection();
+                    View::Activity
+                };
+            }
+            AppAction::Changes => {
+                self.view = if self.view == View::Diff {
+                    View::Chat
+                } else {
+                    View::Diff
+                };
                 self.selected_mut().follow_tail();
             }
-            PaletteAction::Tools => {
-                self.view = View::Tools;
+            AppAction::Tools => {
+                self.view = if self.view == View::Tools {
+                    View::Chat
+                } else {
+                    View::Tools
+                };
                 self.selected_mut().follow_tail();
-                self.load_selected_tool_set();
+                if self.view == View::Tools {
+                    self.load_selected_tool_set();
+                }
             }
-            PaletteAction::Reload => self.reload_selected(),
-            PaletteAction::Help => {
-                self.view = View::Help;
+            AppAction::Reload => self.reload_selected(),
+            AppAction::Help => {
+                self.view = if self.view == View::Help {
+                    View::Chat
+                } else {
+                    View::Help
+                };
                 self.selected_mut().follow_tail();
             }
-            PaletteAction::Archive => self.close_selected(),
-            PaletteAction::SelectionLock => self.selection_locked = true,
+            AppAction::Archive => self.close_selected(),
+            AppAction::SelectionLock => self.selection_locked = !self.selection_locked,
+            AppAction::Commands => {
+                self.confirm_action = None;
+                self.selected_mut().publish_prompt = false;
+                self.palette = self.palette.take().is_none().then(CommandPalette::default);
+            }
+            AppAction::From
+            | AppAction::Invite
+            | AppAction::Model
+            | AppAction::Reference
+            | AppAction::Title
+            | AppAction::UpdateTree => unreachable!("slash action needs arguments"),
         }
     }
 
@@ -3547,6 +3527,12 @@ impl App {
         self.selected_mut().publish_prompt = false;
         self.selected = index;
         self.confirm_action = None;
+        let needs_load = self.selected().diff.is_none() && self.selected().remote_head.is_some();
+        if needs_load {
+            self.selected_mut().remote_head = None;
+            self.selected_mut().status = "loading conversation".to_string();
+            self.poll_remote();
+        }
         if self.view == View::Tools {
             self.load_selected_tool_set();
         }
@@ -3859,9 +3845,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos_cli::{
-        conversation_head, conversation_ref, ConversationReplay, ConversationTurnEvents,
-    };
+    use caos_cli::{conversation_head, conversation_ref, ConversationReplay};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -4584,36 +4568,35 @@ mod tests {
         );
 
         let (command, arguments) = parse_command("/title A useful title").unwrap();
-        assert_eq!(command.action, CommandAction::Title);
+        assert_eq!(command.action, AppAction::Title);
         assert_eq!(arguments, "A useful title");
 
         let (command, arguments) = parse_command("/from\nabc123").unwrap();
-        assert_eq!(command.action, CommandAction::From);
+        assert_eq!(command.action, AppAction::From);
         assert_eq!(arguments, "abc123");
 
         let (command, arguments) = parse_command("/ref").unwrap();
-        assert_eq!(command.action, CommandAction::Reference);
+        assert_eq!(command.action, AppAction::Reference);
         assert!(arguments.is_empty());
 
         let (command, arguments) = parse_command("/invite Bob Smith").unwrap();
-        assert_eq!(command.action, CommandAction::Invite);
+        assert_eq!(command.action, AppAction::Invite);
         assert_eq!(arguments, "Bob Smith");
 
         let (command, arguments) = parse_command("/model claude-sonnet-5").unwrap();
-        assert_eq!(command.action, CommandAction::Model);
+        assert_eq!(command.action, AppAction::Model);
         assert_eq!(arguments, "claude-sonnet-5");
 
         let (command, arguments) = parse_command("/update-tree include this text").unwrap();
-        assert_eq!(command.action, CommandAction::UpdateTree);
+        assert_eq!(command.action, AppAction::UpdateTree);
         assert_eq!(arguments, "include this text");
-        assert!(command.takes_argument);
 
         let (command, arguments) = parse_command("/help").unwrap();
-        assert_eq!(command.action, CommandAction::Help);
+        assert_eq!(command.action, AppAction::Help);
         assert_eq!(arguments, "");
 
         let (command, arguments) = parse_command("/commands").unwrap();
-        assert_eq!(command.action, CommandAction::Palette);
+        assert_eq!(command.action, AppAction::Commands);
         assert_eq!(arguments, "");
 
         assert!(parse_command("/future server convention").is_none());
@@ -4785,7 +4768,7 @@ mod tests {
         }
         let matches = app.palette.as_ref().unwrap().matches();
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].action, PaletteAction::Changes);
+        assert_eq!(matches[0].action, AppAction::Changes);
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4813,15 +4796,12 @@ mod tests {
             query: "github branch".to_string(),
             ..CommandPalette::default()
         };
-        assert_eq!(palette.matches()[0].action, PaletteAction::Publish);
+        assert_eq!(palette.matches()[0].action, AppAction::Publish);
 
         palette.query.clear();
         palette.select(-1);
         assert_eq!(palette.selected, PALETTE_COMMANDS.len() - 1);
-        assert_eq!(
-            palette.selected_action(),
-            Some(PaletteAction::SelectionLock)
-        );
+        assert_eq!(palette.selected_action(), Some(AppAction::SelectionLock));
     }
 
     #[test]
@@ -5227,7 +5207,13 @@ mod tests {
         conversation.scroll.scroll_up(5);
         let (mut app, _) = app_with(vec![conversation]);
 
-        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+        app.selected_mut().note_transcript_append();
+        app.selected_mut().transcript.push(TranscriptEntry {
+            role: EntryRole::Agent(None),
+            commit: None,
+            text: "new response".to_string(),
+            pending_id: None,
+        });
 
         assert_eq!(scroll_offset(40, 10, &app.selected().scroll), 7);
         assert!(app.selected().unread_below);
@@ -5253,7 +5239,13 @@ mod tests {
         terminal.draw(|frame| render(&app, frame)).unwrap();
         app.scroll_up(8);
 
-        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+        app.selected_mut().note_transcript_append();
+        app.selected_mut().transcript.push(TranscriptEntry {
+            role: EntryRole::Agent(None),
+            commit: None,
+            text: "new response".to_string(),
+            pending_id: None,
+        });
         terminal.draw(|frame| render(&app, frame)).unwrap();
 
         let rendered = rendered_main_pane(&terminal).join("\n");
@@ -6216,16 +6208,13 @@ mod tests {
                 },
                 replay: ConversationReplay {
                     turns: Vec::new(),
-                    turn_events: vec![ConversationTurnEvents {
-                        turn_commit: head.clone(),
-                        events: vec![TurnEvent::ToolCall {
-                            step_commit: "e".repeat(40),
-                            request: request.clone(),
-                            round: 2,
-                            tool_use_id: "sleep".to_string(),
-                            name: "bash".to_string(),
-                            summary: "$ sleep 120; echo done".to_string(),
-                        }],
+                    activity: vec![TurnEvent::ToolCall {
+                        step_commit: "e".repeat(40),
+                        request: request.clone(),
+                        round: 2,
+                        tool_use_id: "sleep".to_string(),
+                        name: "bash".to_string(),
+                        summary: "$ sleep 120; echo done".to_string(),
                     }],
                 },
                 workspace_diff: WorkspaceDiff {
@@ -6331,7 +6320,7 @@ mod tests {
                 },
                 replay: ConversationReplay {
                     turns: Vec::new(),
-                    turn_events: Vec::new(),
+                    activity: Vec::new(),
                 },
                 workspace_diff: WorkspaceDiff {
                     base_commit: "e".repeat(40),

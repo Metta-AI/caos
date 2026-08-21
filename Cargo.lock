@@ -126,6 +126,7 @@ name = "caos-cli"
 version = "0.1.0"
 dependencies = [
  "caos",
+ "conversation-protocol",
  "ratatui-core",
  "ratatui-crossterm",
  "ratatui-widgets",
@@ -196,6 +197,13 @@ dependencies = [
  "rustversion",
  "ryu",
  "static_assertions",
+]
+
+[[package]]
+name = "conversation-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
