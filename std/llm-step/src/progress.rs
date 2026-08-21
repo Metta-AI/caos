@@ -10,6 +10,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+use conversation_protocol::{
+    conversation_ref as protocol_conversation_ref,
+    validate_conversation_ref as protocol_validate_conversation_ref,
+    ConversationEvent as ProtocolEvent, EventBoundary,
+};
 use serde_json::Value;
 use worker_common::git::{RefUpdate, Repo};
 
@@ -331,62 +336,7 @@ fn append_event_at_head_inner(
 }
 
 fn validate_event(event: &Value) -> Result<(), String> {
-    validate_stored_event(event)?;
-    if event.get("base").is_some() {
-        return Err("an append event must not introduce a conversation base".to_string());
-    }
-    if event.get("forked_from").is_some() {
-        return Err("a worker append must not introduce a conversation fork".to_string());
-    }
-    Ok(())
-}
-
-fn validate_stored_event(event: &Value) -> Result<(), String> {
-    let object = event
-        .as_object()
-        .ok_or_else(|| "conversation event must be a JSON object".to_string())?;
-    if object.contains_key("v") {
-        return Err(
-            "conversation event must not carry a version; refs/caos/v2 selects the protocol"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_event_base(event: &Value, first_parent: &str) -> Result<bool, String> {
-    let Some(base) = event.get("base") else {
-        return Ok(false);
-    };
-    let base = base
-        .as_str()
-        .ok_or_else(|| "conversation event base is not a string".to_string())?;
-    validate_hash(base, "conversation base")?;
-    if base != first_parent {
-        return Err(format!(
-            "conversation root declares base {base}, but its first parent is {first_parent}"
-        ));
-    }
-    Ok(true)
-}
-
-fn validate_fork_marker(event: &Value, first_parent: &str) -> Result<bool, String> {
-    let Some(forked_from) = event.get("forked_from") else {
-        return Ok(false);
-    };
-    if event.get("base").is_some() {
-        return Err("a conversation fork marker must not introduce a new base".to_string());
-    }
-    let forked_from = forked_from
-        .as_str()
-        .ok_or_else(|| "conversation event forked_from is not a string".to_string())?;
-    validate_hash(forked_from, "forked_from")?;
-    if forked_from != first_parent {
-        return Err(format!(
-            "conversation fork marker declares {forked_from}, but its first parent is {first_parent}"
-        ));
-    }
-    Ok(true)
+    ProtocolEvent::parse_append(event).map(|_| ())
 }
 
 /// Read all chat events reachable from the canonical conversation head,
@@ -405,19 +355,18 @@ pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
         let value = serde_json::from_str::<Value>(commit.message.trim()).map_err(|error| {
             format!("conversation history commit {current} is not a JSON event: {error}")
         })?;
-        validate_stored_event(&value)
+        let event = ProtocolEvent::parse(&value)
             .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
         let parent = commit.parents.first().cloned();
         let parent = required_event_parent(parent.as_deref(), &current)?;
-        let is_root = validate_event_base(&value, &parent)?;
-        validate_fork_marker(&value, &parent)?;
+        let boundary = event.boundary(&parent)?;
         newest_first.push(ConversationEvent {
             commit: current.clone(),
             tree: commit.tree,
             value,
         });
         current = parent;
-        if is_root {
+        if boundary == EventBoundary::Root {
             break;
         }
     }
@@ -435,54 +384,14 @@ fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, St
 }
 
 pub(crate) fn conversation_ref(conversation: &str) -> Result<String, String> {
-    validate_conversation(conversation)?;
-    Ok(format!("refs/caos/v2/conversations/{conversation}/head"))
+    protocol_conversation_ref(conversation)
 }
 
 /// Validate an already-formed canonical conversation head ref with the same
 /// grammar used when this crate constructs one from a conversation id.
 pub(crate) fn validate_conversation_ref(refname: &str) -> Result<(), String> {
-    let Some(conversation) = refname
-        .strip_prefix("refs/caos/v2/conversations/")
-        .and_then(|rest| rest.strip_suffix("/head"))
-    else {
-        return Err(format!("invalid target conversation ref {refname:?}"));
-    };
-    validate_conversation(conversation)
+    protocol_validate_conversation_ref(refname)
         .map_err(|_| format!("invalid target conversation ref {refname:?}"))
-}
-
-/// A conservative in-worker equivalent of `git check-ref-format` for the id
-/// portion. In particular, canonical ref channels are reserved as *any* path
-/// component: allowing `a/head/b` would make its ref collide with conversation
-/// `a`'s ref-as-file, while `title` collides with its title ref.
-fn validate_conversation(conversation: &str) -> Result<(), String> {
-    if conversation.is_empty() || conversation.len() > 124 {
-        return Err(format!("invalid conversation name {conversation:?}"));
-    }
-    if conversation.starts_with('/')
-        || conversation.ends_with('/')
-        || conversation.contains("//")
-        || conversation.contains("..")
-        || conversation.contains("@{")
-        || conversation.ends_with('.')
-        || conversation.bytes().any(|b| {
-            b <= b' ' || b == 0x7f || matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-        })
-    {
-        return Err(format!("invalid conversation name {conversation:?}"));
-    }
-    for component in conversation.split('/') {
-        if component.is_empty()
-            || component == "."
-            || matches!(component, "head" | "title")
-            || component.starts_with('.')
-            || component.ends_with(".lock")
-        {
-            return Err(format!("invalid conversation name {conversation:?}"));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1325,11 +1234,22 @@ mod tests {
 
     #[test]
     fn fork_markers_inherit_instead_of_replacing_the_root_boundary() {
-        assert!(validate_fork_marker(&serde_json::json!({"forked_from": A}), A).is_ok());
-        assert!(
-            validate_fork_marker(&serde_json::json!({"base": A, "forked_from": A}), A).is_err()
+        assert_eq!(
+            ProtocolEvent::parse(&serde_json::json!({"forked_from": A}))
+                .unwrap()
+                .boundary(A),
+            Ok(EventBoundary::Fork)
         );
-        assert!(validate_fork_marker(&serde_json::json!({"forked_from": B}), A).is_err());
+        assert!(
+            ProtocolEvent::parse(&serde_json::json!({"base": A, "forked_from": A}))
+                .unwrap()
+                .boundary(A)
+                .is_err()
+        );
+        assert!(ProtocolEvent::parse(&serde_json::json!({"forked_from": B}))
+            .unwrap()
+            .boundary(A)
+            .is_err());
     }
 
     #[test]
