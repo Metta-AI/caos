@@ -570,12 +570,19 @@ revision (and made the history tools' hashes readable the same way).
   remaining marker is PUBLISH (the tui's PR or branch flow) — the moment work
   actually leaves the conversation.
 
-## Conversation branch publication
+## Conversation branch exchange
 
 The TUI publishes a complete conversation by pointing
 `refs/heads/caos/<conversation-id>` directly at its validated event head. A
 branch-only publication does not open a PR or run PR-base preparation; it is a
 sharing mechanism for the transcript and workspace history already present.
+
+Loading `<remote>/caos/<conversation-id>` or a GitHub PR whose head has that
+shape imports the exact first-parent event spine into the canonical CAOS
+conversation ref and indexes it for the current user. The imported head may
+create an absent conversation or fast-forward an existing copy. A stale import
+leaves a newer canonical head in place, and divergent history under the same ID
+is refused rather than force-pushed.
 
 ## Caveat
 

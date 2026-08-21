@@ -1288,6 +1288,90 @@ pub fn publish_user_conversation(
     invite_user_to_conversation_at(t, user, id, &head).map(|_| ())
 }
 
+/// Import a complete, locally available conversation history into the CAOS
+/// server and make it active for one user.
+///
+/// Published conversation branches point directly at the canonical event
+/// spine. Importing therefore preserves the original conversation identity and
+/// history instead of manufacturing a fork marker. An existing canonical head
+/// may only move forward along that same first-parent spine; a divergent head
+/// is an ID collision and is never overwritten.
+pub fn import_published_conversation(
+    t: &GitTransport,
+    user: &str,
+    id: &str,
+    title: Option<&str>,
+    imported_head: &str,
+) -> Result<ConversationLoad, String> {
+    validate_hash(imported_head, "published conversation head")?;
+    let imported = durable_conversation_from_local(t, id, imported_head)
+        .map_err(|error| format!("invalid published conversation {imported_head}: {error}"))?;
+    let title = validate_conversation_title(title.unwrap_or(&imported.snapshot.title))?;
+    if request_is_active(&imported.snapshot.status) {
+        return Err(format!(
+            "published conversation {id:?} is still {}; publish it after the active turn finishes",
+            imported.snapshot.status
+        ));
+    }
+
+    let head_ref = conversation_ref(id)?;
+    let title_ref = conversation_title_ref(id)?;
+    let active_ref = user_conversation_ref(user, UserConversationStatus::Active, id)?;
+    let archived_ref = user_conversation_ref(user, UserConversationStatus::Archived, id)?;
+    let title_hash = t.put_object("blob", title.as_bytes())?.to_string();
+
+    let head = loop {
+        let Some(observed) = remote_ref(t, &head_ref)? else {
+            match try_push_new_conversation(
+                t,
+                id,
+                NewConversationRefs {
+                    head: &head_ref,
+                    title: &title_ref,
+                    active: &active_ref,
+                    archived: &archived_ref,
+                },
+                imported_head,
+                &title_hash,
+                false,
+            )? {
+                Some(head) => break head,
+                None => continue,
+            }
+        };
+
+        fetch_commit(t, &observed)?;
+        durable_conversation_from_local(t, id, &observed).map_err(|error| {
+            format!("existing conversation {id:?} has invalid history at {observed}: {error}")
+        })?;
+        if first_parent_contains(t, imported_head, &observed)? {
+            if push_head_cas(t, &head_ref, Some(&observed), imported_head)? {
+                let Some(accepted) = remote_ref(t, &head_ref)? else {
+                    continue;
+                };
+                fetch_commit(t, &accepted)?;
+                if first_parent_contains(t, &accepted, imported_head)? {
+                    break accepted;
+                }
+            }
+            continue;
+        }
+        if first_parent_contains(t, &observed, imported_head)? {
+            break observed;
+        }
+        return Err(format!(
+            "conversation id {id:?} already names divergent history at {observed}; refusing to overwrite it with {imported_head}"
+        ));
+    };
+
+    create_conversation_title_if_absent(t, id, title)?;
+    if invite_user_to_conversation_at(t, user, id, &head)? == InviteOutcome::Archived {
+        unarchive_user_conversation(t, user, id)?;
+    }
+    let _ = update_local_cache(t, &head_ref, &head);
+    conversation_load_at(t, id, &head)
+}
+
 fn create_conversation_title_if_absent(
     t: &GitTransport,
     id: &str,
@@ -3785,6 +3869,102 @@ mod tests {
             list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "project/talk-1");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_conversation_import_preserves_and_advances_the_event_spine() {
+        let (root, repo, transport, base) = conversation_index_fixture("branch-import");
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let first = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "username": "Alice",
+                "content": "continue this published conversation",
+                "title": "Imported branch",
+                "status": "idle",
+            }),
+        )
+        .unwrap();
+
+        let loaded =
+            import_published_conversation(&transport, "Alice", "shared/talk-1", None, &first)
+                .unwrap();
+        assert_eq!(loaded.snapshot.head, first);
+        assert_eq!(loaded.replay.turns.len(), 1);
+
+        let second = create_event_commit(
+            &transport,
+            &tree,
+            &first,
+            &json!({
+                "author": "assistant",
+                "content": "the imported conversation continued",
+                "status": "idle",
+            }),
+        )
+        .unwrap();
+        let advanced = import_published_conversation(
+            &transport,
+            "Alice",
+            "shared/talk-1",
+            Some("A newer local title must not replace the shared title"),
+            &second,
+        )
+        .unwrap();
+        assert_eq!(advanced.snapshot.head, second);
+        assert_eq!(advanced.replay.turns.len(), 2);
+
+        let listed =
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "shared/talk-1");
+        assert_eq!(listed[0].title, "Imported branch");
+        assert_eq!(listed[0].head, second);
+
+        archive_user_conversation(&transport, "Alice", "shared/talk-1").unwrap();
+        let stale =
+            import_published_conversation(&transport, "Alice", "shared/talk-1", None, &first)
+                .unwrap();
+        assert_eq!(stale.snapshot.head, second);
+        assert_eq!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Archived)
+                .unwrap()
+                .is_empty()
+        );
+
+        let divergent = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "content": "different conversation with the same branch name",
+                "status": "idle",
+            }),
+        )
+        .unwrap();
+        let error = import_published_conversation(
+            &transport,
+            "Alice",
+            "shared/talk-1",
+            Some("Diverged"),
+            &divergent,
+        )
+        .unwrap_err();
+        assert!(error.contains("divergent history"), "{error}");
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -124,7 +124,14 @@ show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
 Enter `/publish-branch` to push the selected conversation's complete event
-history to `origin/caos/<conversation-id>` without opening a PR.
+history to `origin/caos/<conversation-id>` without opening a PR. Enter
+`/load origin/caos/<conversation-id>` to import one of those branches into the
+current CAOS server and sidebar, or pass a GitHub PR URL such as
+`/load https://github.com/Metta-AI/caos/pull/34`. PR loading uses `gh` to
+recover the head branch's conversation ID and GitHub's pull ref to support PRs
+from forks. An import preserves the conversation ID and exact first-parent
+event spine. It may advance an existing copy of that conversation, but refuses
+divergent history with the same ID.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
