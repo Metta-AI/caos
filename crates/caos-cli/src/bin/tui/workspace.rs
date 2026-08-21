@@ -8,6 +8,26 @@ pub(crate) struct PreparedPublishConversation {
     pub(crate) head: String,
 }
 
+/// Return whether the freshly fetched PR base is already in the conversation.
+///
+/// `git merge-base --is-ancestor` reserves exit status 1 for the ordinary
+/// "not an ancestor" result. Other failures still need to stop publication.
+pub(crate) fn remote_base_is_ancestor(
+    target: &str,
+    head: &str,
+    cwd: &Path,
+) -> Result<bool, String> {
+    let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
+    match ancestry.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            require_success("git merge-base --is-ancestor", ancestry)?;
+            unreachable!("a successful command has exit status 0")
+        }
+    }
+}
+
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
@@ -549,6 +569,19 @@ mod tests {
         )
         .unwrap()
         .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detects_when_the_remote_base_is_already_in_the_conversation() {
+        let dir = temp_repo("base-ancestry");
+        let base = commit_file(&dir, "base\n", "base");
+        let head = commit_file(&dir, "conversation\n", "conversation");
+
+        assert!(remote_base_is_ancestor(&base, &head, &dir).unwrap());
+        assert!(!remote_base_is_ancestor(&head, &base, &dir).unwrap());
+        assert!(remote_base_is_ancestor("not-a-commit", &head, &dir).is_err());
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 

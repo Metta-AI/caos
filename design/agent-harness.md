@@ -326,11 +326,13 @@ suites for the tool set):
   host checkout. `Ctrl+H` opens the keyboard and slash-command reference.
   `Ctrl+P` opens a PR-base prompt and a second press publishes the selected
   conversation without checking it out. It points `caos/<conversation>` at the
-  validated conversation head after merging the fetched tip of the selected
-  base. This lets a child conversation stack on its parent's published history,
-  while subsequent publications fast-forward the same branch. Conflicts and
-  reserved `.caos` state at the tip stop publication and are reported in the
-  command-error panel. CAOS uses ordinary fast-forward pushes after a one-time
+  validated conversation head after a publication-preparation turn. The turn
+  requests a merge of the fetched selected-base tip only when that tip is not
+  already an ancestor of the conversation head. This lets a child conversation
+  stack on its parent's published history, while subsequent publications
+  fast-forward the same branch without redundant merges. Conflicts and reserved
+  `.caos` state at the tip stop publication and are reported in the command-error
+  panel. CAOS uses ordinary fast-forward pushes after a one-time
   exact-lease migration of a legacy snapshot branch, and opens or finds its open
   PR through `gh` against the same branch. Merely
   opening, running, switching, or publishing conversations never mutates the
