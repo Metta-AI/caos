@@ -35,6 +35,45 @@ pub(crate) struct PublishedConversationSource {
     pub(crate) head: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublishProgress {
+    FetchingBase,
+    PreparingWorkspace,
+    ValidatingWorkspace,
+    PreparingBranch,
+    PushingBranch,
+    CheckingPullRequest,
+    UpdatingPullRequest,
+    OpeningPullRequest,
+}
+
+impl PublishProgress {
+    pub(crate) fn verb(self) -> &'static str {
+        match self {
+            Self::FetchingBase => "Fetching",
+            Self::PreparingWorkspace => "Preparing",
+            Self::ValidatingWorkspace => "Validating",
+            Self::PreparingBranch | Self::UpdatingPullRequest => "Updating",
+            Self::PushingBranch => "Pushing",
+            Self::CheckingPullRequest => "Checking",
+            Self::OpeningPullRequest => "Opening",
+        }
+    }
+
+    pub(crate) fn summary(self) -> &'static str {
+        match self {
+            Self::FetchingBase => "selected PR base",
+            Self::PreparingWorkspace => "conversation for publication",
+            Self::ValidatingWorkspace => "prepared workspace",
+            Self::PreparingBranch => "local publish branch",
+            Self::PushingBranch => "publish branch",
+            Self::CheckingPullRequest => "for an existing pull request",
+            Self::UpdatingPullRequest => "pull request title",
+            Self::OpeningPullRequest => "pull request",
+        }
+    }
+}
+
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
@@ -158,10 +197,15 @@ pub(crate) fn publish_conversation_pr(
     conversation: &PreparedPublishConversation,
     pr_base: &str,
     cwd: &Path,
+    mut progress: impl FnMut(PublishProgress),
 ) -> Result<String, String> {
     let title = conversation_pr_title(title);
-    let branch = publish_conversation_branch(name, conversation, cwd)?;
+    progress(PublishProgress::PreparingBranch);
+    let branch = prepare_publish_branch(name, conversation, cwd)?;
+    progress(PublishProgress::PushingBranch);
+    push_publish_branch(&branch, cwd)?;
 
+    progress(PublishProgress::CheckingPullRequest);
     let existing_url = capture_required(
         "gh",
         &[
@@ -181,6 +225,7 @@ pub(crate) fn publish_conversation_pr(
         cwd,
     )?;
     if !existing_url.is_empty() {
+        progress(PublishProgress::UpdatingPullRequest);
         capture_required("gh", &["pr", "edit", &existing_url, "--title", &title], cwd)?;
         return Ok(existing_url);
     }
@@ -188,6 +233,7 @@ pub(crate) fn publish_conversation_pr(
         "Published from virtual CAOS conversation `{name}` at `{}`.",
         short_hash(&conversation.head)
     );
+    progress(PublishProgress::OpeningPullRequest);
     capture_required(
         "gh",
         &[

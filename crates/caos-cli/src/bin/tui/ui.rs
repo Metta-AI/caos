@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     short_hash, ActivityState, App, Command, ConfirmAction, ConversationState, EntryRole, Focus,
-    ScrollState, TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
+    PublishProgress, ScrollState, TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
 };
 use caos_cli::TurnPhase;
 
@@ -538,7 +538,10 @@ fn render_live_activity(
     area: Rect,
 ) {
     let (verb, summary) = if state.publishing {
-        ("Publishing", state.status.as_str())
+        let progress = state
+            .publish_progress
+            .unwrap_or(PublishProgress::PreparingWorkspace);
+        (progress.verb(), progress.summary())
     } else if let Some(activity) = state.running_activity() {
         (activity.running_verb(), activity.running_summary())
     } else {
