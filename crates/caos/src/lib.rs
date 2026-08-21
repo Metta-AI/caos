@@ -4485,6 +4485,47 @@ fn request_compute_traced(
     request_compute_url(&url, secrets)
 }
 
+/// `caos resolve-image <hex hash | docker://ref>` — print the reference a
+/// runner would pull for this image.
+///
+/// The point is the git-docker case: the server converts the tree (base +
+/// layer<NN> + config) into a registry digest and caches it, but until now that
+/// digest was reachable only by RUNNING the image. Anything that wants to hand
+/// the converted image somewhere else — copy it to another registry, submit it
+/// to a platform — had to rebuild it, duplicating `convert_git_image`'s
+/// layer/diff_id/manifest arithmetic. This exposes what the server already
+/// computed.
+pub fn caos_resolve_image(args: &[String]) -> Result<(), String> {
+    let image = args
+        .first()
+        .ok_or("usage: resolve-image <hex hash | docker://<ref>>")?;
+    // `&` and `#` would split the query; nothing else in a hex hash or a
+    // docker reference needs escaping, and the server percent-decodes anyway.
+    if image.contains('&') || image.contains('#') {
+        return Err(format!("image reference cannot contain & or #: {image:?}"));
+    }
+    let base = server_url()?;
+    let url = format!("{}/resolve-image?image={image}", base.trim_end_matches('/'));
+    let response = minreq::get(&url)
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+        .send()
+        .map_err(|error| format!("GET {url}: {error}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let detail = response.as_str().unwrap_or("").trim();
+        return Err(format!(
+            "GET {url}: server returned {}{}",
+            response.status_code,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    println!("{}", response.as_str().map_err(|e| e.to_string())?.trim());
+    Ok(())
+}
+
 fn run_url(base: &str, arg_tree: &str, trace_id: Option<&str>) -> String {
     let mut url = format!("{}/run?req={arg_tree}", base.trim_end_matches('/'));
     if let Some(trace_id) = trace_id {
