@@ -246,14 +246,15 @@ These fields are enough to fully express what happened:
 To determine how two runs differed, we can diff their traces and see where the keys differ and how long each work took
 
 The server supports pulling current trace data for a run: `GET /status/<arg tree hash>` returns a json tree. For any arg tree:
-- If the work is done and there's no promise, the entry is skipped
-- If the work is done and there's a promise with a completion arg tree, use the completion arg tree
+- If the work is done and there's no completion arg tree, the entry is skipped. Not "no promise": a continuation with no `then` has a promise and nothing left to point at
+- If there's a completion arg tree, use it. Not gated on the work being done -- `ended` covers the continuation, so a node whose `then` is still running is not done, and gating would hide the `then` for exactly as long as it ran
 - If there are child arg trees, render the parent, with an array of rendered children. (The finished ones will be ignored)
 - Otherwise, render this node
 
 Rendering a node:
-- A node's name is the first line of the arg tree's help argument. Base args are searched resursively until one is found, falling back to the hash of the docker image
+- A node's name is the first line of the arg tree's help argument. Base args are searched recursively until one is found
 - When a child came through a map-then, prepend the map-then name for the child to the child's name
+- When no help is found, a map-then child is named by its map-then name alone and anything else by a short form of the image the base names. The full docker ref is the same sixty characters for every node of a fan-out, so appending it only displaces the part that differs
 
 While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
 

@@ -212,8 +212,9 @@ fn runner(job_json: &str) -> Result<(), String> {
     let mut job = RunnerJob::parse(job_json)?;
     let mut image_oid: Option<String> = None;
     loop {
-        let ran = run_runner_job(&t, &job, &mut image_oid);
-        post_result(&t, &job, &ran)?;
+        let mut out_trace = None;
+        let ran = run_runner_job(&t, &job, &mut image_oid, &mut out_trace);
+        post_result(&t, &job, &ran, out_trace.as_deref())?;
         reset_after_job();
         // A failed job doesn't kill a warm runner — but never having learned
         // our image's oid (setup failed before /cas/args existed) means we have
@@ -237,6 +238,7 @@ fn run_runner_job(
     t: &HttpTransport,
     job: &RunnerJob,
     image_oid: &mut Option<String>,
+    out_trace: &mut Option<String>,
 ) -> Result<String, String> {
     let (arg_tree, salt) = read_arg_tree(t, &job.arg_tree)?;
     let cas = cas_setup(Some(&arg_tree))?;
@@ -259,6 +261,11 @@ fn run_runner_job(
     // Remove the secrets whether the worker passed or failed; the next job's
     // `write_secrets` also wipes, but don't leave plaintext around meanwhile.
     remove_secrets();
+    // Perf data the worker chose to leave behind, read BEFORE the failure check
+    // so a run that died still reports it, and before `remove_cas` takes the
+    // directory away. Optional by construction: `read_hash` on a path no worker
+    // wrote is an error, and no out-trace is the normal case.
+    *out_trace = caos::read_hash(&cas.join("out-trace")).ok();
     ran?;
     let result = read_result(&cas)?;
     remove_cas(&cas)?;
@@ -330,8 +337,14 @@ fn post_result(
     t: &HttpTransport,
     job: &RunnerJob,
     ran: &Result<String, String>,
+    out_trace: Option<&str>,
 ) -> Result<(), String> {
-    let body = match ran {
+    // `out_trace` rides alongside the result, never inside it: a result is
+    // content-addressed and keys every consumer of it, so folding timings or
+    // cache statistics into one would make all of them miss whenever the
+    // numbers moved. That separation is the whole reason `/cas/out-trace`
+    // exists next to `/cas/out`.
+    let mut body = match ran {
         Ok(result) => serde_json::json!({
             "req": job.arg_tree, "nonce": job.nonce, "ok": true, "result": result,
         }),
@@ -339,6 +352,9 @@ fn post_result(
             "req": job.arg_tree, "nonce": job.nonce, "ok": false, "error": error,
         }),
     };
+    if let Some(oid) = out_trace {
+        body["out_trace"] = serde_json::Value::String(oid.to_string());
+    }
     let url = runner_url(t, "result")?;
     let resp = runner_post(&url, &body.to_string(), &job.token, 30)?;
     match resp.status_code {

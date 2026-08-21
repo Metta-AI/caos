@@ -31,6 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::objs::WriteTo;
 
 mod eval;
+mod watch;
 pub use eval::{cli_eval_path, eval_workspace_dep, eval_workspace_dep_with_store};
 
 /// `run-tool <name | script> [--name=value ...]` — run a caos-tool by hand: fire
@@ -194,6 +195,30 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
     }
     checkout(t, &target, hash, root)?;
     eprintln!("{kind} {hash} -> {path}");
+    Ok(())
+}
+
+/// Fetch `GET /status/<arg_tree>` — the server's view of the work under an
+/// ArgTree (SPEC.md "Tracing"). Returns the raw JSON, or None when the server
+/// has nothing to show (a `null` body: the work is finished, or never ran here).
+pub fn fetch_status(t: &dyn Transport, arg_tree: &str) -> Result<Option<String>, String> {
+    let base = t.server_url()?;
+    let body = http_get(&format!("{}/status/{arg_tree}", base.trim_end_matches('/')))?;
+    let text = String::from_utf8_lossy(&body).trim().to_string();
+    Ok((text != "null" && !text.is_empty()).then_some(text))
+}
+
+/// `status <arg tree hash>` — print the work tree under an ArgTree.
+///
+/// The one-shot form of what a run shows live. Useful on its own for a run
+/// happening in another terminal, and it is how the live display gets its data.
+pub fn cli_status(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
+    match fetch_status(t, arg_tree)? {
+        Some(json) => println!("{json}"),
+        // Not an error: "nothing is running under this key" is a real answer,
+        // and the commonest one — a finished run has no current work.
+        None => eprintln!("no current work under {arg_tree}"),
+    }
     Ok(())
 }
 
@@ -3023,6 +3048,11 @@ fn run_request(
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
     // at it).
     let server = t.server_url()?;
+    // Watch the work while the compute request blocks. Both `run` and
+    // `run-tool` come through here, so the live display is one place rather
+    // than two, and a caller that is not a person (the suite, a worker) gets
+    // nothing started on its behalf — see `watch::Watch::start`.
+    let _watch = watch::Watch::start(&server, &arg_tree);
     match trace {
         Some((id, output)) => request_compute_streamed(&server, &arg_tree, id, output, &header),
         None => request_compute(&server, &arg_tree, &header),

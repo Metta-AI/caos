@@ -178,6 +178,7 @@ Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 | `GET /run?req=<argTreeHash>&trace=<traceId>` | Run the ArgTree `<argTreeHash>` (`req` is the query param's historical name; its value is the ArgTree hash) and return `"<type> <hash>"` (the fully-resolved result), optionally emitting trace events. See [compute](#compute). |
 | `POST /sub-run` | Start one exact request without waiting, inheriting the in-flight launching job's server-side run context. |
 | `GET /trace/<traceId>/stream` | Stream one live trace as Chrome `B`/`E` events in JSONL. |
+| `GET /status/<argTreeHash>` | The work currently running under an ArgTree, as a JSON tree — or `null` when nothing is. See [tracing](#tracing). |
 | `POST /runner/poll` | A runner's hanging request for work, carrying its required args (name → oid). Answered with a job, `idle` (TTL expired), or `exit` (eviction). See `design/runner-protocol.md`. |
 | `POST /runner/result` | A runner posting a job's outcome, keyed by (req, nonce) — first post per nonce wins. |
 | `GET /info/refs?service=…`, `POST /git-upload-pack`, `POST /git-receive-pack` | Git smart-HTTP, delegated to `git http-backend` — this is the `caos` remote clients push to and fetch from. |
@@ -302,6 +303,43 @@ ways for one instance: the server pushes by name on the docker network
 (`CAOS_REGISTRY_PUSH_URL`), the host daemon (which runs the worker) pulls via the
 published port (`CAOS_REGISTRY_PULL_HOST`, insecure, no TLS).
 
+### Tracing
+
+Every ArgTree the server actually runs leaves a **trace record** in Redis
+(`caos:trace:<argTreeHash>`): an append-only list of typed JSON events —
+`requested`, `started`, `ended` (with a success/failure verdict), one `child`
+per dispatched sub-run, a `continuation` naming the promise type and its
+handler's ArgTree, and any `out-trace` the worker left. SPEC.md "Tracing" is
+normative; the shape follows from three constraints:
+
+- **Only a run that really happens records.** A cache hit and a single-flight
+  waiter write nothing, so a child whose record ended before its parent started
+  was *reused*, not re-run. That inference is how the record stays this small.
+- **`ended` covers continuation resolution**, not the container exit. A
+  promise's children start after the worker is gone, so an `ended` that stopped
+  at the container would place every map child after its parent's end.
+- **Appends, never rewrites.** A map fans out across threads, so a
+  read-modify-write would be check-then-act; and a `started` with no `ended` is
+  the hung-or-killed record, which a write-once-at-completion blob could not
+  express. One key per node also makes eviction atomic under `allkeys-lru`.
+
+`GET /status/<argTreeHash>` renders the **live** view over those records: work
+that is wholly finished is skipped, a finished promise resolves to its handler,
+and anything with children renders as a parent with its children beneath it.
+Node names come from the first line of the ArgTree's `help`, searching `base`
+recursively and falling back to the image the base names; a map-then child gets
+its map entry's name prepended — which is what turns a 29-way fan-out from a
+column of hashes into a list of test names.
+
+`caos-cli run` and `run-tool` poll this while they wait and draw it, on a
+terminal only. `caos-cli status <argTreeHash>` is the same view on demand.
+
+Workers may leave perf data (ccache statistics, phase timings) at
+`/cas/out-trace`. It rides *alongside* the result, never inside it: a result is
+content-addressed and keys everything downstream, so numbers that move every
+run would make every consumer miss. It is stored as an ordinary git object, so
+it is bounded, deduplicated and scrubbed for secrets like any other `caos put`.
+
 ## The two clients
 
 The generic `caos` crate and the higher-level `caos-cli` crate share
@@ -417,7 +455,14 @@ caos-cli run --trace <result-path> --base:<type>=<image> --input=value
 ```
 
 Traces are live-only and discarded when the run ends. Trace ids do not affect
-request or cache identity.
+request or cache identity. This is a different mechanism from the per-ArgTree
+trace records behind `/status` ([tracing](#tracing)), which outlive the run.
+
+On a terminal, `run` and `run-tool` also draw the work tree while they wait,
+polling `/status` on a second connection. Off a terminal they draw nothing and
+start no poller — the suite runs 29 clients at once, and none of them need it.
+`caos-cli status <argTreeHash>` prints the same view on demand, which is how
+you watch a run happening in another terminal.
 
 The worker-side `caos map-then <in> [--map:<type>=<image>] [--then:<type>=<image>]` is a
 different thing entirely: a **tail call**. It records the continuation

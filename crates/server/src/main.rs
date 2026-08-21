@@ -46,6 +46,7 @@ mod git;
 mod repair;
 mod runner;
 mod secrets;
+mod status;
 mod storage;
 mod trace;
 
@@ -551,6 +552,9 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
             compute::run(config, &query, &secrets_header)
+        }
+        Method::Get if path.starts_with("/status/") => {
+            status::serve(config, path.trim_start_matches("/status/"))
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),

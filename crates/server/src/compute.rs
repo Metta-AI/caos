@@ -303,7 +303,33 @@ fn run_work_request_inner(
 /// factored out so single-flight can broadcast its outcome. The error type is
 /// `(status, message)` — a plain-data [`HttpError`] that can be cloned to every
 /// waiter.
+///
+/// This is also the whole of the traced path (SPEC.md "Tracing"): only an
+/// arrival that actually RUNS the work gets here, so a cache hit and a
+/// single-flight waiter record nothing. That is what makes the reader's
+/// inference sound — a child whose record ended before its parent started was
+/// reused rather than re-run, and it would not be if every consumer appended.
 fn run_dispatch(
+    config: &Config,
+    request: &WorkRequest,
+    image: &str,
+    salt: &str,
+    key: &str,
+    traced_arg_entries: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<String, (u16, String)> {
+    // `requested` before anything else, `ended` however we leave — including
+    // the continuation resolution inside, which is why this wraps the whole
+    // body rather than sitting beside the runner dispatch. A promise's children
+    // are started after the worker has exited, so an `ended` that stopped at
+    // the container would place every child after its parent's end and make
+    // the reader call all of them evicted-and-rerun.
+    crate::status::requested(config, request.arg_tree);
+    let outcome = run_dispatch_traced(config, request, image, salt, key, traced_arg_entries);
+    crate::status::ended(config, request.arg_tree, outcome.is_ok());
+    outcome
+}
+
+fn run_dispatch_traced(
     config: &Config,
     request: &WorkRequest,
     image: &str,
@@ -357,6 +383,12 @@ fn run_dispatch(
             seeded,
             granted,
             |sub_request| start_sub_run(config, sub_request, &child_stack, trace_id, secrets),
+            |note| match note {
+                crate::runner::Note::Started => crate::status::started(config, arg_tree),
+                crate::runner::Note::OutTrace(oid) => {
+                    crate::status::out_trace(config, arg_tree, &oid)
+                }
+            },
         )
         .map_err(fail)?
     };
@@ -371,7 +403,16 @@ fn run_dispatch(
     let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(config, cont, salt, &child_stack, trace_id, secrets).map_err(fail)?
+            resolve_promise(
+                config,
+                arg_tree,
+                cont,
+                salt,
+                &child_stack,
+                trace_id,
+                secrets,
+            )
+            .map_err(fail)?
         }
         _ => (result, false),
     };
@@ -824,6 +865,18 @@ struct ServerEvalHost<'a> {
     stack: &'a [String],
     trace_id: Option<&'a str>,
     secrets: &'a [crate::secrets::Grant],
+    /// The promising ArgTree whose continuation this walk is, and the path it
+    /// was asked to evaluate — together the name under which each dispatch is
+    /// recorded as that node's child.
+    ///
+    /// An eval step's fan-out is NOT one child per directory: `eval_path` is a
+    /// loop on this thread whose `--base`/arg resolution recurses, and a `run`
+    /// verb at any depth dispatches (`caos-eval`). So the count comes from the
+    /// interpreter, not from anything in the continuation, and the only way to
+    /// know what ran is to record each dispatch as it goes.
+    parent: &'a str,
+    eval_path: &'a str,
+    dispatches: std::sync::atomic::AtomicUsize,
 }
 
 impl caos_eval::EvalHost for ServerEvalHost<'_> {
@@ -868,6 +921,9 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         image: &str,
         entries: Vec<gix::objs::tree::Entry>,
     ) -> Result<(String, String), String> {
+        let n = self
+            .dispatches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = run_image(
             self.config,
             image,
@@ -876,6 +932,15 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
             self.stack,
             self.trace_id,
             self.secrets,
+            |arg_tree| {
+                crate::status::child(
+                    self.config,
+                    self.parent,
+                    "eval",
+                    &format!("{}#{n}", self.eval_path),
+                    arg_tree,
+                )
+            },
         )
         .map_err(|e| e.message().to_string())?;
         // run_image returns "<kind> <hash>".
@@ -925,6 +990,7 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
 /// normally; the error blob is in its ArgTree, so same error in, same out.
 fn resolve_promise(
     config: &Config,
+    parent: &str,
     cont: &str,
     salt: &str,
     stack: &[String],
@@ -1005,6 +1071,18 @@ fn resolve_promise(
                                     stack,
                                     trace_id,
                                     secrets,
+                                    // The map entry's own name — which for the
+                                    // test suite is the test name, and is the
+                                    // only thing that gives a 29-way fan-out
+                                    // readable nodes. A `help` lookup cannot:
+                                    // children are curried from `base`, not
+                                    // from the tool's own ArgTree, so the
+                                    // tool's help is not in their lineage.
+                                    |arg_tree| {
+                                        crate::status::child(
+                                            config, parent, "map", &kid.name, arg_tree,
+                                        )
+                                    },
                                 )?;
                                 result_entry(&kid.name, &result)
                             })
@@ -1048,10 +1126,14 @@ fn resolve_promise(
                 stack,
                 trace_id,
                 secrets,
+                |arg_tree| crate::status::child(config, parent, "run", "run", arg_tree),
             ),
             catch,
         )?)
     } else if let Some(arg_tree) = &request {
+        // The one form whose child needs no currying: the continuation carries
+        // a complete ArgTree, so it is recorded as-is.
+        crate::status::child(config, parent, "request", "request", arg_tree);
         Some(continuation_result(
             config,
             cont,
@@ -1079,6 +1161,9 @@ fn resolve_promise(
             stack,
             trace_id,
             secrets,
+            parent,
+            eval_path: path,
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
         };
         let evaluated = caos_eval::eval_path(&host, &input.oid.to_string(), path)
             .map(|(kind, hash)| format!("{kind} {hash}"))
@@ -1095,6 +1180,17 @@ fn resolve_promise(
 
     let caught = mid.as_ref().is_some_and(|(_, _, caught)| *caught);
 
+    // The promise type, for the record. A continuation with only a `then` has
+    // no middle step at all (a plain tail call), which is a shape in its own
+    // right and not a missing one.
+    let kind = match (&map, &run, &request, &eval) {
+        (Some(_), _, _, _) => "map",
+        (_, Some(_), _, _) => "run",
+        (_, _, Some(_), _) => "request",
+        (_, _, _, Some(_)) => "eval",
+        _ => "then",
+    };
+
     match (then, mid) {
         // `then` combines: it gets the original `in` when this is an image
         // continuation, plus the middle step's contribution when one ran. An
@@ -1109,12 +1205,29 @@ fn resolve_promise(
                 args.push(extra);
             }
             Ok((
-                run_image(config, &img, args, salt, stack, trace_id, secrets)?,
+                run_image(
+                    config,
+                    &img,
+                    args,
+                    salt,
+                    stack,
+                    trace_id,
+                    secrets,
+                    // The handler's ArgTree is the one thing in a continuation
+                    // that is NOT derivable: its extra arg is the middle step's
+                    // RESULT (the `children` tree, `--result`, or a caught
+                    // `--error`), which no amount of replaying the continuation
+                    // can produce.
+                    |arg_tree| crate::status::continuation(config, parent, kind, Some(arg_tree)),
+                )?,
                 caught,
             ))
         }
         // No `then`: the middle step's own result is the request's result.
-        (None, Some((_, result, _))) => Ok((result, caught)),
+        (None, Some((_, result, _))) => {
+            crate::status::continuation(config, parent, kind, None);
+            Ok((result, caught))
+        }
         // Unreachable — the presence check above requires some step.
         (None, None) => Err(HttpError::new(
             500,
@@ -1221,6 +1334,15 @@ fn continuation_result(
 /// so the ArgTree hash (and cache key) is the same no matter who assembles it —
 /// and send it through [`run_work_request`]. Returns `"<type> <hash>"`.
 #[allow(clippy::too_many_arguments)] // the run context travels together
+/// `record` sees the ArgTree this call FORMED, before it is run.
+///
+/// The tree exists only here: a worker hands over an image (`--map:hash=…`,
+/// `--then:hash=…`) and the server curries the input into it, so nothing on
+/// disk holds the identity of the child that actually ran. A reader given only
+/// the continuation would have to replay this currying to name it, which is a
+/// second implementation of key-forming logic whose drift fails silently — it
+/// would point at hashes that have no records and report that nothing ran. So
+/// the caller records what it ran, and the reader never curries at all.
 fn run_image(
     config: &Config,
     image_ref: &str,
@@ -1229,6 +1351,7 @@ fn run_image(
     stack: &[String],
     trace_id: Option<&str>,
     secrets: &[crate::secrets::Grant],
+    record: impl FnOnce(&str),
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -1287,6 +1410,7 @@ fn run_image(
     }
     // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
     let arg_tree = store_git_tree(config, args).map_err(store_err)?.to_string();
+    record(&arg_tree);
     run_work_request(
         config,
         &WorkRequest {
@@ -2131,6 +2255,31 @@ fn cache_set(addr: &str, key: &str, value: &str) -> Result<(), String> {
     read_status_reply(&mut BufReader::new(stream))
 }
 
+/// `RPUSH key value` — append one element to a Redis list.
+///
+/// The trace record ([`crate::status`]) is a list rather than a rewritten blob
+/// precisely so this is an APPEND: a read-modify-write of a growing JSON value
+/// would be check-then-act across the threads a map fans out onto, and would
+/// re-serialize the whole record once per child. Redis serializes concurrent
+/// pushes to one key itself, so the map's threads need no coordination — and
+/// since every event carries its own timestamp, list order is not load-bearing.
+pub(crate) fn list_append(addr: &str, key: &str, value: &str) -> Result<(), String> {
+    let mut stream = redis_connect(addr)?;
+    stream
+        .write_all(&resp_command(&["RPUSH", key, value]))
+        .map_err(|e| format!("write: {e}"))?;
+    read_integer_reply(&mut BufReader::new(stream)).map(|_| ())
+}
+
+/// `LRANGE key 0 -1` — the whole list, in insertion order.
+pub(crate) fn list_read(addr: &str, key: &str) -> Result<Vec<String>, String> {
+    let mut stream = redis_connect(addr)?;
+    stream
+        .write_all(&resp_command(&["LRANGE", key, "0", "-1"]))
+        .map_err(|e| format!("write: {e}"))?;
+    read_array_reply(&mut BufReader::new(stream))
+}
+
 /// Connect to Redis with read/write timeouts so a stuck server can't hang us.
 fn redis_connect(addr: &str) -> Result<TcpStream, String> {
     let stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
@@ -2171,6 +2320,44 @@ fn read_bulk_reply(reader: &mut impl BufRead) -> Result<Option<String>, String> 
             String::from_utf8(buf)
                 .map(Some)
                 .map_err(|e| format!("non-utf8 value: {e}"))
+        }
+        Some(b'-') => Err(format!("redis error: {}", &header[1..])),
+        _ => Err(format!("unexpected reply: {header:?}")),
+    }
+}
+
+/// Read a RESP integer reply (`:<n>\r\n`); an error reply becomes Err.
+fn read_integer_reply(reader: &mut impl BufRead) -> Result<i64, String> {
+    let header = read_reply_line(reader)?;
+    match header.as_bytes().first() {
+        Some(b':') => header[1..]
+            .parse()
+            .map_err(|e| format!("bad integer reply: {e}")),
+        Some(b'-') => Err(format!("redis error: {}", &header[1..])),
+        _ => Err(format!("unexpected reply: {header:?}")),
+    }
+}
+
+/// Read a RESP array reply (`*<n>\r\n` followed by `n` bulk strings). A nil
+/// array (`*-1`) and an empty one both become an empty Vec — for a trace record
+/// "no events" and "no such key" are the same answer, and neither is an error.
+fn read_array_reply(reader: &mut impl BufRead) -> Result<Vec<String>, String> {
+    let header = read_reply_line(reader)?;
+    match header.as_bytes().first() {
+        Some(b'*') => {
+            let count: i64 = header[1..]
+                .parse()
+                .map_err(|e| format!("bad array length: {e}"))?;
+            let mut out = Vec::new();
+            for _ in 0..count.max(0) {
+                match read_bulk_reply(reader)? {
+                    Some(item) => out.push(item),
+                    // A nil element inside a LRANGE is not a thing redis emits;
+                    // treat it as the end rather than inventing a placeholder.
+                    None => break,
+                }
+            }
+            Ok(out)
         }
         Some(b'-') => Err(format!("redis error: {}", &header[1..])),
         _ => Err(format!("unexpected reply: {header:?}")),

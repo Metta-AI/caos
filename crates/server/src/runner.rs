@@ -104,11 +104,39 @@ enum Outcome {
 /// sub-run request is handled there because that thread owns the unhashed run
 /// context; the rendezvous table retains only this channel, never the context.
 enum DispatchEvent {
+    /// Something worth recording happened to the job. Reported to the compute
+    /// thread rather than written here because both sites ([`claim`] and
+    /// [`result`]) run under the rendezvous lock, and a trace write is a redis
+    /// round trip — one lock, held by everything, is not the place for network
+    /// I/O.
+    Note(Note),
     Outcome(Outcome),
     SubRun {
         arg_tree: String,
         reply: mpsc::Sender<Result<(), (u16, String)>>,
     },
+}
+
+/// A git object hash, in the one form this server writes and accepts.
+///
+/// Checked where a runner's word becomes a record: the value ends up in a trace
+/// entry and is handed back through `/status` as something to `caos get`, so a
+/// malformed one would be a piece of junk that outlives the run that posted it.
+fn is_object_hash(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A traceable fact about a job, on its way to the compute thread that owns it.
+pub(crate) enum Note {
+    /// A runner claimed the job and the work is now under way. A requeued job
+    /// claims again and says so again: that is two real starts, and the record
+    /// keeps the latest.
+    Started,
+    /// The worker left perf data at `/cas/out-trace`, by hash. Deliberately NOT
+    /// part of the result: a result is content-addressed and keys everything
+    /// downstream of it, so timings and cache statistics inside one would make
+    /// every consumer miss whenever they changed. Out of band is the point.
+    OutTrace(String),
 }
 
 /// A hanging `POST /runner/poll`, parked until matched, kicked, or expired.
@@ -325,6 +353,7 @@ pub(crate) fn dispatch(
     seeded: bool,
     secrets: Vec<(String, String)>,
     mut start_sub_run: impl FnMut(&str) -> Result<(), HttpError>,
+    mut on_note: impl FnMut(Note),
 ) -> Result<String, HttpError> {
     let (event_tx, event_rx) = mpsc::channel();
     let id = {
@@ -404,6 +433,7 @@ pub(crate) fn dispatch(
             None => wait,
         };
         match event_rx.recv_timeout(wait.max(Duration::from_millis(10))) {
+            Ok(DispatchEvent::Note(note)) => on_note(note),
             Ok(DispatchEvent::Outcome(Outcome::Done(result))) => return Ok(result),
             Ok(DispatchEvent::Outcome(Outcome::Failed(message))) => {
                 return Err(HttpError::new(500, message))
@@ -631,6 +661,7 @@ fn offer_job(st: &mut State, id: u64) {
 fn claim(st: &mut State, id: u64, reply: &mpsc::Sender<PollReply>) {
     let job = st.jobs.get_mut(&id).expect("job present under lock");
     job.phase = Phase::Inflight;
+    let _ = job.events.send(DispatchEvent::Note(Note::Started));
     let body = payload(job);
     let _ = reply.send(PollReply::Job(body));
 }
@@ -771,6 +802,14 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
 
     let job = remove_job(&mut st, id);
     drop(st);
+    // Sent before the outcome, and on the failing path too: perf data from a
+    // run that died is the case you most want it for. The outcome ends the
+    // dispatch loop, so a note after it would never be read.
+    if let Some(oid) = v["out_trace"].as_str().filter(|oid| is_object_hash(oid)) {
+        let _ = job
+            .events
+            .send(DispatchEvent::Note(Note::OutTrace(oid.to_string())));
+    }
     let outcome = if v["ok"].as_bool() == Some(true) {
         match v["result"].as_str() {
             Some(result) if !result.trim().is_empty() => Outcome::Done(result.trim().to_string()),

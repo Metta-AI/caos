@@ -161,6 +161,13 @@ fn run(args: &[String]) -> Result<(), String> {
             [hash, path] => caos::cli_get(&transport()?, hash, path),
             _ => Err(usage(args)),
         },
+        // `status <arg tree hash>` — what is running under an ArgTree, as JSON
+        // (SPEC.md "Tracing"). The same view `run`/`run-tool` show live, for a
+        // run happening elsewhere or one you want to look at after the fact.
+        Some("status") => match &args[2..] {
+            [arg_tree] => caos::cli_status(&transport()?, arg_tree),
+            _ => Err(usage(args)),
+        },
         // `secrets [--check]` — tend the local `.caos-secrets` store: fill a
         // missing `entropy=` with fresh entropy and warn on a weak one, so
         // cache isolation is safe by default (design/secrets.md). `--check`
@@ -215,6 +222,7 @@ fn usage(args: &[String]) -> String {
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \
+         {prog} status <arg tree hash>\n  \
          {prog} secrets [--check]"
     )
 }
