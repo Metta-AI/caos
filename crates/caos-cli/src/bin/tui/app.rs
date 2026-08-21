@@ -1090,12 +1090,7 @@ impl ConversationState {
             )
         });
         self.apply_snapshot(&load.snapshot);
-        self.activities = load
-            .replay
-            .turn_events
-            .last()
-            .map(|turn| replayed_activities(&turn.events))
-            .unwrap_or_default();
+        self.activities = replayed_activities(&load.replay.activity);
         if followed_activity_tail && self.activities.len() > previous_activity_len {
             self.activity_selection = self.activities.len().checked_sub(1);
             self.activity_detail_scroll = 0;
@@ -1694,12 +1689,11 @@ impl App {
                     "ready".to_string(),
                 );
                 state.parent = summary.parent.clone();
+                state.remote_head = Some(summary.head.clone());
                 state
             })
             .collect();
-        for state in &mut states {
-            let _ = state.reload(&transport, &args.user);
-        }
+        let load_selected = matches!(&choice, ConversationChoice::Existing(_));
         let selected_id = match choice {
             ConversationChoice::Existing(id) => id,
             ConversationChoice::New { id, title } => {
@@ -1723,6 +1717,9 @@ impl App {
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
+        if load_selected {
+            let _ = states[selected].reload(&transport, &args.user);
+        }
         let mut app = Self {
             repo_dir,
             user: args.user,
@@ -2185,9 +2182,6 @@ impl App {
                         });
                     },
                     |event| {
-                        if matches!(event, TurnEvent::Completed(_)) {
-                            return;
-                        }
                         let _ = tx.send(UiMessage::Turn {
                             conversation: conversation.clone(),
                             event,
@@ -2724,11 +2718,6 @@ impl App {
     }
 
     fn on_turn_event(&mut self, index: usize, event: TurnEvent) {
-        if let TurnEvent::Completed(outcome) = event {
-            self.finish_turn(index, outcome);
-            return;
-        }
-
         let state = &mut self.conversations[index];
         match event {
             TurnEvent::PhaseStarted(phase) => state.turn_phase = phase,
@@ -2737,16 +2726,6 @@ impl App {
                 elapsed_secs,
             } => state.status = format!("{label}: {elapsed_secs:.1}s"),
             TurnEvent::Status(status) => state.status = status,
-            TurnEvent::AssistantText(text) => {
-                state.note_transcript_append();
-                state.transcript.push(TranscriptEntry {
-                    role: EntryRole::Agent(state.turn_options.model.clone()),
-                    commit: None,
-                    text,
-                    pending_id: None,
-                });
-                state.transcript_selection = None;
-            }
             TurnEvent::ToolCall {
                 step_commit,
                 request,
@@ -2802,7 +2781,6 @@ impl App {
                     });
                 }
             }
-            TurnEvent::Completed(_) => unreachable!("completed events return above"),
         }
     }
 
@@ -3547,6 +3525,12 @@ impl App {
         self.selected_mut().publish_prompt = false;
         self.selected = index;
         self.confirm_action = None;
+        let needs_load = self.selected().diff.is_none() && self.selected().remote_head.is_some();
+        if needs_load {
+            self.selected_mut().remote_head = None;
+            self.selected_mut().status = "loading conversation".to_string();
+            self.poll_remote();
+        }
         if self.view == View::Tools {
             self.load_selected_tool_set();
         }
@@ -3859,9 +3843,7 @@ fn choose_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caos_cli::{
-        conversation_head, conversation_ref, ConversationReplay, ConversationTurnEvents,
-    };
+    use caos_cli::{conversation_head, conversation_ref, ConversationReplay};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -5227,7 +5209,13 @@ mod tests {
         conversation.scroll.scroll_up(5);
         let (mut app, _) = app_with(vec![conversation]);
 
-        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+        app.selected_mut().note_transcript_append();
+        app.selected_mut().transcript.push(TranscriptEntry {
+            role: EntryRole::Agent(None),
+            commit: None,
+            text: "new response".to_string(),
+            pending_id: None,
+        });
 
         assert_eq!(scroll_offset(40, 10, &app.selected().scroll), 7);
         assert!(app.selected().unread_below);
@@ -5253,7 +5241,13 @@ mod tests {
         terminal.draw(|frame| render(&app, frame)).unwrap();
         app.scroll_up(8);
 
-        app.on_turn_event(0, TurnEvent::AssistantText("new response".to_string()));
+        app.selected_mut().note_transcript_append();
+        app.selected_mut().transcript.push(TranscriptEntry {
+            role: EntryRole::Agent(None),
+            commit: None,
+            text: "new response".to_string(),
+            pending_id: None,
+        });
         terminal.draw(|frame| render(&app, frame)).unwrap();
 
         let rendered = rendered_main_pane(&terminal).join("\n");
@@ -6216,16 +6210,13 @@ mod tests {
                 },
                 replay: ConversationReplay {
                     turns: Vec::new(),
-                    turn_events: vec![ConversationTurnEvents {
-                        turn_commit: head.clone(),
-                        events: vec![TurnEvent::ToolCall {
-                            step_commit: "e".repeat(40),
-                            request: request.clone(),
-                            round: 2,
-                            tool_use_id: "sleep".to_string(),
-                            name: "bash".to_string(),
-                            summary: "$ sleep 120; echo done".to_string(),
-                        }],
+                    activity: vec![TurnEvent::ToolCall {
+                        step_commit: "e".repeat(40),
+                        request: request.clone(),
+                        round: 2,
+                        tool_use_id: "sleep".to_string(),
+                        name: "bash".to_string(),
+                        summary: "$ sleep 120; echo done".to_string(),
                     }],
                 },
                 workspace_diff: WorkspaceDiff {
@@ -6331,7 +6322,7 @@ mod tests {
                 },
                 replay: ConversationReplay {
                     turns: Vec::new(),
-                    turn_events: Vec::new(),
+                    activity: Vec::new(),
                 },
                 workspace_diff: WorkspaceDiff {
                     base_commit: "e".repeat(40),

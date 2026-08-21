@@ -56,7 +56,6 @@ pub enum TurnEvent {
         elapsed_secs: f64,
     },
     Status(String),
-    AssistantText(String),
     ToolCall {
         step_commit: String,
         request: String,
@@ -73,7 +72,6 @@ pub enum TurnEvent {
         is_error: bool,
         content: String,
     },
-    Completed(TurnOutcome),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,15 +105,9 @@ pub struct ConversationTurn {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ConversationTurnEvents {
-    pub turn_commit: String,
-    pub events: Vec<TurnEvent>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct ConversationReplay {
     pub turns: Vec<ConversationTurn>,
-    pub turn_events: Vec<ConversationTurnEvents>,
+    pub activity: Vec<TurnEvent>,
 }
 
 /// One consistent read of the durable conversation spine for rich clients.
@@ -1645,13 +1637,19 @@ pub fn list_user_conversations(
         "{USER_INDEX_PREFIX}{key}/conversations/{}/",
         status.ref_component()
     );
-    let state = remote_refs(t, [format!("{prefix}*")])?;
-    let canonical = remote_conversations(t)?
+    let refs = remote_refs(
+        t,
+        [
+            format!("{prefix}*"),
+            format!("{CONVERSATION_PREFIX}*{HEAD_SUFFIX}"),
+            format!("{CONVERSATION_PREFIX}*/title"),
+        ],
+    )?;
+    let canonical = conversations_from_refs(&refs)
         .into_iter()
         .collect::<HashMap<_, _>>();
-    let titles = remote_refs(t, [format!("{CONVERSATION_PREFIX}*/title")])?;
     let mut conversations = Vec::new();
-    for refname in state.keys() {
+    for refname in refs.keys() {
         let Some(key) = refname.strip_prefix(&prefix) else {
             continue;
         };
@@ -1668,7 +1666,7 @@ pub fn list_user_conversations(
         let summary = (|| {
             let metadata = remote_conversation_metadata(t, head)?;
             let title_ref = conversation_title_ref(&id)?;
-            let title = if let Some(hash) = titles.get(&title_ref) {
+            let title = if let Some(hash) = refs.get(&title_ref) {
                 let (kind, bytes) = t.get_object(hash)?;
                 if kind != "blob" {
                     return Err(format!("conversation title {hash} is a {kind}, not a blob"));
@@ -1855,7 +1853,7 @@ fn durable_turn_events(event: &StoredEvent) -> Vec<TurnEvent> {
     events
 }
 
-fn replay_from_events(events: &[StoredEvent], head: &str) -> ConversationReplay {
+fn replay_from_events(events: &[StoredEvent]) -> ConversationReplay {
     let mut turns = Vec::new();
     let mut activity = Vec::new();
     for event in events {
@@ -1894,22 +1892,13 @@ fn replay_from_events(events: &[StoredEvent], head: &str) -> ConversationReplay 
             message: content.to_string(),
         });
     }
-    ConversationReplay {
-        turns,
-        turn_events: (!activity.is_empty())
-            .then_some(ConversationTurnEvents {
-                turn_commit: head.to_string(),
-                events: activity,
-            })
-            .into_iter()
-            .collect(),
-    }
+    ConversationReplay { turns, activity }
 }
 
 pub fn conversation_replay(t: &GitTransport, id: &str) -> Result<ConversationReplay, String> {
     let conversation =
         durable_conversation(t, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
-    Ok(replay_from_events(&conversation.events, &conversation.head))
+    Ok(replay_from_events(&conversation.events))
 }
 
 fn workspace_diff(
@@ -1969,7 +1958,7 @@ fn load_durable_conversation(
     t: &GitTransport,
     conversation: DurableConversation,
 ) -> Result<ConversationLoad, String> {
-    let replay = replay_from_events(&conversation.events, &conversation.head);
+    let replay = replay_from_events(&conversation.events);
     let workspace_diff = workspace_diff(t, &conversation.base_commit, &conversation.head)?;
     Ok(ConversationLoad {
         snapshot: conversation.snapshot,
@@ -2662,12 +2651,13 @@ fn remote_ref(t: &GitTransport, refname: &str) -> Result<Option<String>, String>
 
 fn remote_conversations(t: &GitTransport) -> Result<Vec<(String, String)>, String> {
     let pattern = format!("{CONVERSATION_PREFIX}*{HEAD_SUFFIX}");
-    let output = t.git_capture(&["ls-remote", "--refs", CAOS_REMOTE, &pattern], None)?;
+    let refs = remote_refs(t, [pattern])?;
+    Ok(conversations_from_refs(&refs))
+}
+
+fn conversations_from_refs(refs: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut conversations = Vec::new();
-    for line in output.lines() {
-        let Some((hash, refname)) = line.split_once('\t') else {
-            continue;
-        };
+    for (refname, hash) in refs {
         if let Err(error) = validate_hash(hash, "remote conversation head") {
             warn_skipped_conversation(refname, &error);
             continue;
@@ -2684,7 +2674,7 @@ fn remote_conversations(t: &GitTransport) -> Result<Vec<(String, String)>, Strin
         }
         conversations.push((id.to_string(), hash.to_string()));
     }
-    Ok(conversations)
+    conversations
 }
 
 fn warn_skipped_conversation(id: &str, error: &str) {
@@ -3568,14 +3558,11 @@ mod tests {
 
     #[test]
     fn replay_retains_the_assistant_model() {
-        let replay = replay_from_events(
-            &[event(json!({
-                "author": "assistant",
-                "model": "claude-sonnet-5",
-                "content": "done"
-            }))],
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        );
+        let replay = replay_from_events(&[event(json!({
+            "author": "assistant",
+            "model": "claude-sonnet-5",
+            "content": "done"
+        }))]);
 
         assert_eq!(replay.turns[0].model.as_deref(), Some("claude-sonnet-5"));
     }
