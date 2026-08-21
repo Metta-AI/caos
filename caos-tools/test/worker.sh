@@ -64,7 +64,12 @@ suite)
   # its `help` — so the suite would build the stack a second time under a key no
   # agent call ever hits. The point of asking for the expression is that both
   # callers land on one cache entry.
-  fwd=("--worker1:@=/cas/args/worker1" --stage=suite-run)
+  # One wall clock follows this actual suite execution through every
+  # continuation. It never enters the build's ArgTree, so the build still
+  # cache-hits; it only makes the cheap continuation stages unique to the run
+  # whose timings they report.
+  fwd=("--worker1:@=/cas/args/worker1" --stage=suite-run
+       "--suite-start-time=$(date +%s%3N)")
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   # --test-salt: re-run the TESTS without re-running anything else. CAOS_SALT
@@ -100,7 +105,10 @@ suite-run)
 
   # `deepener` reads the workspace as /cas/args/in: run-then hands its `then` the
   # same --in it ran over, so the tree needs no second binding.
-  fwd=("--worker1:@=/cas/args/worker1" --stage=deepener "--build-ws:@=/cas/build-ws")
+  fwd=("--worker1:@=/cas/args/worker1" --stage=deepener
+       "--build-ws:@=/cas/build-ws"
+       "--suite-start-time:@=/cas/args/suite-start-time"
+       "--build-start-time=$(date +%s%3N)")
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
@@ -202,7 +210,10 @@ deepener)
   # away from the reserved `in`/`result`.
   fwd=("--worker1:@=/cas/args/worker1" --stage=deepen
        "--build:@=/cas/args/result" "--ws:@=/cas/args/in"
-       "--build-ws:@=/cas/args/build-ws")
+       "--build-ws:@=/cas/args/build-ws"
+       "--suite-start-time:@=/cas/args/suite-start-time"
+       "--build-start-time:@=/cas/args/build-start-time"
+       "--build-end-time=$(date +%s%3N)")
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
@@ -216,7 +227,10 @@ deepen)
   caos get /cas/args/result
   fwd=("--worker1:@=/cas/args/worker1" --stage=fanout
        "--build:@=/cas/args/build" "--ws:@=/cas/args/ws"
-       "--build-ws:@=/cas/args/build-ws")
+       "--build-ws:@=/cas/args/build-ws"
+       "--suite-start-time:@=/cas/args/suite-start-time"
+       "--build-start-time:@=/cas/args/build-start-time"
+       "--build-end-time:@=/cas/args/build-end-time")
   if [ -e /cas/args/api-key ]; then fwd+=("--api-key:@=/cas/args/api-key"); fi
   if [ -e /cas/args/only ]; then fwd+=("--only:@=/cas/args/only"); fi
   if [ -e /cas/args/test-salt ]; then fwd+=("--test-salt:@=/cas/args/test-salt"); fi
@@ -383,13 +397,15 @@ fanout)
   done
   caos put /tmp/sel /cas/sel
 
-  # The build's own elapsed seconds ride into the summariser so the report can
-  # show them. Curried HERE because the summariser is the `then` of the map — it
-  # receives --children and nothing else.
+  # The build's own elapsed seconds ride into the summariser as historical
+  # metadata: a cache hit replays the last uncached build's duration. The four
+  # timestamps alongside it instead measure THIS invocation's additive phases.
+  # Curried HERE because the summariser is the `then` of the map — it receives
+  # --children and nothing else.
   #
-  # --start-time is the clock for the test phase, and it is taken HERE, one line
-  # before the fan-out fires, because this is the last point that certainly runs
-  # when the tests might. The summariser subtracts it from its own `now`.
+  # --tests-start-time is taken HERE, one line before the fan-out fires, because
+  # this is the last point that certainly runs when the tests might. The
+  # summariser stamps their end as soon as it starts.
   #
   # The phase cannot be recovered from the tests themselves: a test's start and
   # end are files in its RESULT, so a cache hit replays the pair from whenever it
@@ -402,7 +418,11 @@ fanout)
   # is one cheap container, and it only runs at all when this stage does.
   then_img=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
-    "--build-time:@=/cas/args/build/time" "--start-time=$(date +%s)") \
+    "--build-time:@=/cas/args/build/time" \
+    "--suite-start-time:@=/cas/args/suite-start-time" \
+    "--build-start-time:@=/cas/args/build-start-time" \
+    "--build-end-time:@=/cas/args/build-end-time" \
+    "--tests-start-time=$(date +%s%3N)") \
     || fail "currying the summarize stage"
   caos map-then /cas/sel --map:hash="$map" --then:hash="$then_img"
   ;;
@@ -415,9 +435,16 @@ summarize)
   # put: recorded-hash reuse, no bytes move). The suite job itself always
   # SUCCEEDS with a report; the caller decides what a FAILED banner means.
   # Failures are values here so one broken test never hides the others.
+  # Stamp the map's completion before fetching its children. Report assembly is
+  # a separate phase, so all printed phase durations are additive rather than
+  # hiding work between `tests (...)` and the caller's wall clock.
+  tests_end_time=$(date +%s%3N)
   caos get /cas/args/children
   caos get /cas/args/build-time
-  caos get /cas/args/start-time
+  caos get /cas/args/suite-start-time
+  caos get /cas/args/build-start-time
+  caos get /cas/args/build-end-time
+  caos get /cas/args/tests-start-time
   mkdir -p /tmp/rep
   passn=0 failn=0 abortn=0
   {
@@ -469,12 +496,21 @@ summarize)
       if [ ${#t} -gt "$width" ]; then width=${#t}; fi
     done
 
-    # The build and the tests as two comparable lines, the tests indented beneath
-    # theirs. The test phase is now minus the stamp deepener took as it fired the
-    # fan-out: measured across two jobs that ran, never recovered from cached
-    # values.
-    echo "build ($(cat /cas/args/build-time)s)"
-    echo "tests ($(($(date +%s) - $(cat /cas/args/start-time)))s)"
+    # These are phases of THIS suite execution and add to its server-side total.
+    # The build result's own `time` is deliberately separate: on a build cache
+    # hit it describes the last actual build, not time spent now.
+    suite_start_time=$(cat /cas/args/suite-start-time)
+    build_start_time=$(cat /cas/args/build-start-time)
+    build_end_time=$(cat /cas/args/build-end-time)
+    tests_start_time=$(cat /cas/args/tests-start-time)
+    report_end_time=$(date +%s%3N)
+    fmt_ms() { printf '%d.%03d' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"; }
+    echo "suite ($(fmt_ms $((report_end_time - suite_start_time)))s server)"
+    echo "  build setup  $(fmt_ms $((build_start_time - suite_start_time)))s"
+    echo "  build wait   $(fmt_ms $((build_end_time - build_start_time)))s ($(cat /cas/args/build-time)s last uncached)"
+    echo "  test setup   $(fmt_ms $((tests_start_time - build_end_time)))s"
+    echo "  tests        $(fmt_ms $((tests_end_time - tests_start_time)))s"
+    echo "  report       $(fmt_ms $((report_end_time - tests_end_time)))s"
     # A mark rather than a word, and no colour: this report is a VALUE in a git
     # tree, so a worker cannot know whether whoever eventually reads it is a
     # terminal, and ANSI escapes would be baked into the artifact and into every
@@ -506,8 +542,9 @@ summarize)
     # have since become. Said out loud, because it read as "the tests are still
     # slow" the first time a report replayed times measured while the engine was
     # unpacking a new image across twenty concurrent stacks.
-    echo "(times are each test's LAST ACTUAL RUN; an unchanged test is a cache"
-    echo " hit and replays the time it recorded then."
+    echo "(per-test times are each cli.sh's LAST ACTUAL RUN; unchanged tests"
+    echo " replay them. Jobs overlap and their setup is outside that clock, so these"
+    echo " durations do not add up to the tests phase."
     echo " Pass \`--test-salt=\$(date --iso=s)\` to rerun all tests."
     echo " The hash is the test's record: \`test-result <hash>\` prints its full"
     echo " output, \`test-result <hash> --log=server\` an inner-stack log.)"
