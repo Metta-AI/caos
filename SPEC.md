@@ -139,7 +139,7 @@ name=<name>
 entropy=...
 # Inline secret
 value=<secret key>
-# External key
+# External key. Relative paths resolve from this secret file's directory.
 value:@=<file containing key>
 # A reader is a PATH to an expression, without arguments. It is eval-path'd to
 # an arg tree

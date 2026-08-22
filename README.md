@@ -392,7 +392,7 @@ putting it in a curried worker. A minimal per-device setup is:
 
 # .caos-secrets/anthropic-api-key
 name=anthropic-api-key
-value:@=/absolute/path/to/anthropic-api-key
+value:@=.anthropic-api-key-value
 reader=DEEP-DEPS/llm-step
 reader=DEEP-DEPS/llm-call
 ```
