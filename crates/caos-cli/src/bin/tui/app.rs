@@ -27,7 +27,7 @@ use super::workspace::{
     commit_working_tree, fetch_published_conversation, fetch_remote_branch_tip,
     load_conversation_workspace, local_default_branch_tip, prepare_publish_workspace,
     publish_conversation_branch, publish_conversation_pr, remote_base_is_ancestor,
-    remote_default_branch, PublishedConversationSource,
+    remote_default_branch, PublishProgress, PublishedConversationSource,
 };
 
 #[path = "ui.rs"]
@@ -1023,6 +1023,7 @@ struct ConversationState {
     reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
+    publish_progress: Option<PublishProgress>,
     forking: bool,
     loading_remote: bool,
     scroll: ScrollState,
@@ -1069,6 +1070,7 @@ impl ConversationState {
             reconcile_after: None,
             turn_phase: TurnPhase::System,
             publishing: false,
+            publish_progress: None,
             forking: false,
             loading_remote: false,
             scroll: ScrollState::default(),
@@ -1379,7 +1381,11 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
-        } else if self.reference_loading || self.publishing {
+        } else if self.publishing {
+            self.publish_progress
+                .map(|progress| format!("{} {}…", progress.verb(), progress.summary()))
+                .unwrap_or_else(|| "Publishing…".to_string())
+        } else if self.reference_loading {
             self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
             attention.clone()
@@ -1479,6 +1485,10 @@ enum UiMessage {
             ),
             String,
         >,
+    },
+    PublishProgress {
+        conversation: String,
+        progress: PublishProgress,
     },
     Reconciled {
         conversation: String,
@@ -2556,6 +2566,7 @@ impl App {
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.publishing = false;
+                        state.publish_progress = None;
                         match result {
                             Ok(url) => state.push_info(format!("PR ready: {url}")),
                             Err(error) => {
@@ -2591,6 +2602,17 @@ impl App {
                     source,
                     result,
                 } => self.finish_published_load(&origin, &source, result),
+                UiMessage::PublishProgress {
+                    conversation,
+                    progress,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        if state.publishing {
+                            state.publish_progress = Some(progress);
+                        }
+                    }
+                }
                 UiMessage::Reconciled {
                     conversation,
                     request,
@@ -3937,7 +3959,7 @@ impl App {
             let name = self.selected().id.clone();
             let title = self.selected().title.clone();
             self.selected_mut().publishing = true;
-            self.selected_mut().status = "fetching the selected PR base".to_string();
+            self.selected_mut().publish_progress = Some(PublishProgress::FetchingBase);
             let tx = self.tx.clone();
             let head = self
                 .selected()
@@ -3953,6 +3975,10 @@ impl App {
                     let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
                     let target = base_commit;
                     let base_is_ancestor = remote_base_is_ancestor(&target, &head, &repo_dir)?;
+                    let _ = tx.send(UiMessage::PublishProgress {
+                        conversation: name.clone(),
+                        progress: PublishProgress::PreparingWorkspace,
+                    });
                     let transport = GitTransport::discover(&repo_dir)?;
                     if !base_is_ancestor {
                         transport.ensure_pushed(&target)?;
@@ -3972,13 +3998,29 @@ impl App {
                             });
                         },
                     )?;
+                    let _ = tx.send(UiMessage::PublishProgress {
+                        conversation: name.clone(),
+                        progress: PublishProgress::ValidatingWorkspace,
+                    });
                     let conversation =
                         prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
                     let _ = tx.send(UiMessage::Completed {
                         conversation: name.clone(),
                         outcome,
                     });
-                    publish_conversation_pr(&name, &title, &conversation, &pr_base, &repo_dir)
+                    publish_conversation_pr(
+                        &name,
+                        &title,
+                        &conversation,
+                        &pr_base,
+                        &repo_dir,
+                        |progress| {
+                            let _ = tx.send(UiMessage::PublishProgress {
+                                conversation: name.clone(),
+                                progress,
+                            });
+                        },
+                    )
                 })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
@@ -5878,6 +5920,48 @@ mod tests {
             .collect();
         assert!(rendered.contains("Thinking…"));
         assert!(!rendered.contains("Chugging…"));
+    }
+
+    #[test]
+    fn publishing_progress_names_each_background_step() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.publish_progress = Some(PublishProgress::FetchingBase);
+        let (mut app, tx) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let fetching: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(fetching.contains("Fetching…"));
+        assert!(fetching.contains("selected PR base"));
+        assert!(!fetching.contains("Publishing…"));
+
+        tx.send(UiMessage::PublishProgress {
+            conversation: "talk-1".to_string(),
+            progress: PublishProgress::PushingBranch,
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+        assert_eq!(app.selected().sidebar_text(80).1, "Pushing publish branch…");
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let pushing: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(pushing.contains("Pushing…"));
+        assert!(pushing.contains("publish branch"));
+        assert!(!pushing.contains("Fetching…"));
     }
 
     #[test]

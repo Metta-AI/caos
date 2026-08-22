@@ -109,7 +109,10 @@ Failures from local UI commands are shown in a temporary red command-error
 panel instead of being inserted into the conversation transcript. A
 successfully opened PR is appended as a cyan `CAOS` entry so its URL remains
 available. Routine operation status is shown only while the operation is
-running and is not added to the transcript or title.
+running and is not added to the transcript or title. Publication names its
+current step in the Activity row and sidebar, including fetching the selected
+base, preparing and validating the workspace, updating and pushing the branch,
+and finding or opening the pull request.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
