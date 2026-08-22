@@ -13,6 +13,7 @@ use crate::{async_work, fresh, progress, read_commit_timestamp};
 
 pub const SPAWN_TOOL: &str = "spawn_agent";
 const STEP_DIR: &str = ".caos";
+const REPO_AGENT_FILE: &str = "agent.json";
 
 pub fn declarations() -> [Value; 1] {
     [json!({
@@ -118,7 +119,16 @@ fn clean_agent_base(ws: &str, wc: &str) -> Result<(String, String), String> {
     let clean = scratch("agent-workspace")?;
     for entry in entries(ws)? {
         let name = file_name(&entry);
-        if name != STEP_DIR {
+        if name == STEP_DIR {
+            caos(["get", path(&entry)])?;
+            let agent = entry.join(REPO_AGENT_FILE);
+            if agent.is_file() {
+                let target = clean.join(STEP_DIR);
+                fs::create_dir_all(&target)
+                    .map_err(|error| format!("creating {}: {error}", target.display()))?;
+                link(&agent, target.join(REPO_AGENT_FILE))?;
+            }
+        } else {
             link(&entry, clean.join(name))?;
         }
     }

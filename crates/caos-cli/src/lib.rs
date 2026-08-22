@@ -34,6 +34,7 @@ const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
     available tools for file access, builds, tests, and edits. Keep responses concise.";
+const REPO_AGENT_PATH: &str = ".caos/agent.json";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TurnOptions {
@@ -410,14 +411,15 @@ pub fn submit_message_with_tree(
 }
 
 fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), String> {
-    if t.git_capture(
-        &["rev-parse", "--verify", "--quiet", &format!("{root}:.caos")],
-        None,
-    )
-    .is_ok()
-    {
+    let entries = t.git_capture(&["ls-tree", "-r", "--name-only", root, "--", ".caos"], None)?;
+    let reserved = entries
+        .lines()
+        .filter(|path| *path != REPO_AGENT_PATH)
+        .collect::<Vec<_>>();
+    if !reserved.is_empty() {
         return Err(format!(
-            "the {what} contains top-level .caos state; choose a clean workspace"
+            "the {what} contains reserved top-level .caos state: {}",
+            reserved.join(", ")
         ));
     }
     Ok(())
@@ -4933,6 +4935,42 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repo_agent_is_the_only_non_reserved_top_level_caos_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "caos-chat-agent-instructions-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "test");
+        std::fs::create_dir_all(repo.join(".caos")).unwrap();
+        std::fs::write(
+            repo.join(REPO_AGENT_PATH),
+            r#"{"pr_publish_instructions":"Build before publishing."}"#,
+        )
+        .unwrap();
+        test_git(&repo, &["add", REPO_AGENT_PATH]);
+        test_git(&repo, &["commit", "--quiet", "-m", "agent instructions"]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let allowed = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+
+        reject_reserved_caos(&transport, &allowed, "base tree").unwrap();
+
+        std::fs::write(repo.join(".caos/step.json"), "reserved\n").unwrap();
+        test_git(&repo, &["add", ".caos/step.json"]);
+        let reserved = test_git(&repo, &["write-tree"]);
+        let error = reject_reserved_caos(&transport, &reserved, "base tree").unwrap_err();
+        assert!(error.contains(".caos/step.json"), "{error}");
+        assert!(!error.contains(REPO_AGENT_PATH), "{error}");
+
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
