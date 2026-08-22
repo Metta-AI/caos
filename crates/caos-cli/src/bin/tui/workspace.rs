@@ -8,6 +8,33 @@ pub(crate) struct PreparedPublishConversation {
     pub(crate) head: String,
 }
 
+/// Return whether the freshly fetched PR base is already in the conversation.
+///
+/// `git merge-base --is-ancestor` reserves exit status 1 for the ordinary
+/// "not an ancestor" result. Other failures still need to stop publication.
+pub(crate) fn remote_base_is_ancestor(
+    target: &str,
+    head: &str,
+    cwd: &Path,
+) -> Result<bool, String> {
+    let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
+    match ancestry.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            require_success("git merge-base --is-ancestor", ancestry)?;
+            unreachable!("a successful command has exit status 0")
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublishedConversationSource {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) head: String,
+}
+
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
@@ -132,10 +159,8 @@ pub(crate) fn publish_conversation_pr(
     pr_base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
-    let branch = format!("caos/{name}");
     let title = conversation_pr_title(title);
-    prepare_publish_branch(name, conversation, cwd)?;
-    push_publish_branch(&branch, cwd)?;
+    let branch = publish_conversation_branch(name, conversation, cwd)?;
 
     let existing_url = capture_required(
         "gh",
@@ -171,6 +196,179 @@ pub(crate) fn publish_conversation_pr(
         ],
         cwd,
     )
+}
+
+/// Push a complete conversation branch without opening or updating a PR.
+pub(crate) fn publish_conversation_branch(
+    name: &str,
+    conversation: &PreparedPublishConversation,
+    cwd: &Path,
+) -> Result<String, String> {
+    let branch = prepare_publish_branch(name, conversation, cwd)?;
+    push_publish_branch(&branch, cwd)?;
+    Ok(branch)
+}
+
+/// Fetch a full conversation branch from an ordinary Git remote or GitHub PR.
+///
+/// Branch inputs have the form `<remote>/caos/<conversation-id>` (with
+/// `caos/<conversation-id>` using `origin`). A GitHub PR is resolved through
+/// `gh` so its head branch supplies the stable conversation ID, then fetched
+/// through GitHub's pull ref so PRs from forks work without adding a remote.
+pub(crate) fn fetch_published_conversation(
+    source: &str,
+    cwd: &Path,
+) -> Result<PublishedConversationSource, String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err("published conversation source cannot be empty".to_string());
+    }
+
+    if let Some(pull) = parse_github_pull_url(source)? {
+        let output = capture_required(
+            "gh",
+            &["pr", "view", source, "--json", "headRefName,title"],
+            cwd,
+        )?;
+        let metadata: serde_json::Value = serde_json::from_str(&output)
+            .map_err(|error| format!("reading GitHub PR metadata: {error}"))?;
+        let branch = metadata
+            .get("headRefName")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "GitHub PR metadata has no head branch".to_string())?;
+        let id = conversation_id_from_branch(branch)?;
+        let pr_title = metadata
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&id);
+        let title = pr_title
+            .strip_prefix("caos conversation: ")
+            .unwrap_or(pr_title)
+            .to_string();
+        let remote = format!("https://github.com/{}/{}.git", pull.owner, pull.repository);
+        let remote_ref = format!("refs/pull/{}/head", pull.number);
+        let head = fetch_ref_tip(&remote, &remote_ref, cwd)?;
+        return Ok(PublishedConversationSource {
+            id,
+            title: Some(title),
+            head,
+        });
+    }
+
+    let (remote, branch) = parse_remote_conversation_branch(source, cwd)?;
+    let id = conversation_id_from_branch(&branch)?;
+    // Fetch by URL rather than configured remote name. A named-remote fetch can
+    // also apply its default fetch refspec and move unrelated tracking refs;
+    // loading one conversation should touch only its temporary import ref.
+    let remote_url = capture_required("git", &["remote", "get-url", &remote], cwd)?;
+    let head = fetch_ref_tip(&remote_url, &format!("refs/heads/{branch}"), cwd)?;
+    Ok(PublishedConversationSource {
+        title: None,
+        id,
+        head,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GithubPull<'a> {
+    owner: &'a str,
+    repository: &'a str,
+    number: &'a str,
+}
+
+fn parse_github_pull_url(source: &str) -> Result<Option<GithubPull<'_>>, String> {
+    let Some(path) = source
+        .strip_prefix("https://github.com/")
+        .or_else(|| source.strip_prefix("http://github.com/"))
+    else {
+        return Ok(None);
+    };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let parts = path.trim_end_matches('/').split('/').collect::<Vec<_>>();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return Err(format!(
+            "unsupported GitHub URL {source:?}; expected https://github.com/<owner>/<repo>/pull/<number>"
+        ));
+    }
+    if parts[0].is_empty()
+        || parts[1].is_empty()
+        || parts[3].is_empty()
+        || !parts[3].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("invalid GitHub pull request URL {source:?}"));
+    }
+    Ok(Some(GithubPull {
+        owner: parts[0],
+        repository: parts[1],
+        number: parts[3],
+    }))
+}
+
+fn parse_remote_conversation_branch(source: &str, cwd: &Path) -> Result<(String, String), String> {
+    if source.starts_with("caos/") {
+        return Ok(("origin".to_string(), source.to_string()));
+    }
+    let remotes = capture_required("git", &["remote"], cwd)?;
+    let mut remotes = remotes.lines().collect::<Vec<_>>();
+    remotes.sort_by_key(|remote| std::cmp::Reverse(remote.len()));
+    for remote in remotes {
+        let prefix = format!("{remote}/");
+        if let Some(branch) = source.strip_prefix(&prefix) {
+            if !branch.starts_with("caos/") {
+                return Err(format!(
+                    "remote branch {source:?} is not a published `caos/<conversation-id>` branch"
+                ));
+            }
+            return Ok((remote.to_string(), branch.to_string()));
+        }
+    }
+    Err(format!(
+        "cannot resolve {source:?}; use a GitHub PR URL or <remote>/caos/<conversation-id>"
+    ))
+}
+
+fn conversation_id_from_branch(branch: &str) -> Result<String, String> {
+    let id = branch.strip_prefix("caos/").unwrap_or_default();
+    if id.is_empty() {
+        return Err(format!(
+            "branch {branch:?} does not name a conversation; expected caos/<conversation-id>"
+        ));
+    }
+    Ok(id.to_string())
+}
+
+fn fetch_ref_tip(remote: &str, remote_ref: &str, cwd: &Path) -> Result<String, String> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("reading the clock: {error}"))?
+        .as_nanos();
+    let temporary_ref = format!("refs/caos/loads/{}-{unique}", std::process::id());
+    let refspec = format!("+{remote_ref}:{temporary_ref}");
+    let fetched = capture_required(
+        "git",
+        &["fetch", "--quiet", "--no-tags", remote, &refspec],
+        cwd,
+    );
+    let result = fetched.and_then(|_| {
+        capture_required(
+            "git",
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{temporary_ref}^{{commit}}"),
+            ],
+            cwd,
+        )
+    });
+    let cleanup = match result.as_deref() {
+        Ok(head) => capture_required("git", &["update-ref", "-d", &temporary_ref, head], cwd),
+        Err(_) => capture_required("git", &["update-ref", "-d", &temporary_ref], cwd),
+    };
+    match (result, cleanup) {
+        (Ok(head), Ok(_)) => Ok(head),
+        (Ok(_), Err(error)) => Err(format!("removing temporary fetch ref: {error}")),
+        (Err(error), _) => Err(error),
+    }
 }
 
 /// Resolve the default branch and its tip from the LOCAL branch, without
@@ -418,6 +616,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn github_pull_urls_expose_the_repository_and_pull_number() {
+        let parsed = parse_github_pull_url("https://github.com/Metta-AI/caos/pull/34")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.owner, "Metta-AI");
+        assert_eq!(parsed.repository, "caos");
+        assert_eq!(parsed.number, "34");
+        assert!(parse_github_pull_url("https://github.com/Metta-AI/caos/pull/nope").is_err());
+        assert_eq!(parse_github_pull_url("origin/caos/talk-1").unwrap(), None);
+    }
+
     fn commit_file(dir: &Path, content: &str, message: &str) -> String {
         std::fs::write(dir.join("file.txt"), content).unwrap();
         capture_required("git", &["add", "file.txt"], dir).unwrap();
@@ -553,6 +763,19 @@ mod tests {
     }
 
     #[test]
+    fn detects_when_the_remote_base_is_already_in_the_conversation() {
+        let dir = temp_repo("base-ancestry");
+        let base = commit_file(&dir, "base\n", "base");
+        let head = commit_file(&dir, "conversation\n", "conversation");
+
+        assert!(remote_base_is_ancestor(&base, &head, &dir).unwrap());
+        assert!(!remote_base_is_ancestor(&head, &base, &dir).unwrap());
+        assert!(remote_base_is_ancestor("not-a-commit", &head, &dir).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn prepared_publish_head_refuses_empty_reserved_tip_state() {
         let dir = temp_repo("publish-reserved");
         let base = commit_file(&dir, "base\n", "base");
@@ -652,7 +875,8 @@ mod tests {
         let first_conversation =
             prepare_publish_workspace(&first_publish, &main_tip, &dir).unwrap();
 
-        let branch = prepare_publish_branch("publish-test", &first_conversation, &dir).unwrap();
+        let branch =
+            publish_conversation_branch("publish-test", &first_conversation, &dir).unwrap();
         assert_eq!(branch, "caos/publish-test");
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
@@ -662,7 +886,6 @@ mod tests {
             capture_required("git", &["rev-parse", "caos/publish-test"], &dir).unwrap(),
             first_publish
         );
-        push_publish_branch(&branch, &dir).unwrap();
         let branch_ref = "refs/heads/caos/publish-test";
         assert_eq!(
             remote_branch_tip(branch_ref, &dir).unwrap().as_deref(),
@@ -882,5 +1105,58 @@ mod tests {
         assert!(parse_remote_default_branch("ref: refs/tags/v1\tHEAD\n")
             .unwrap_err()
             .contains("outside refs/heads"));
+    }
+
+    #[test]
+    fn remote_conversation_branches_fetch_without_moving_tracking_refs() {
+        let dir = temp_repo("load-remote-branch");
+        let remote = dir.with_extension("remote.git");
+        let remote_path = remote.to_string_lossy().to_string();
+        capture_required("git", &["init", "--bare", "-q", &remote_path], &dir).unwrap();
+        capture_required("git", &["remote", "add", "origin", &remote_path], &dir).unwrap();
+        let head = commit_file(&dir, "published conversation\n", "conversation event");
+        capture_required(
+            "git",
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{head}:refs/heads/caos/shared/talk-1"),
+            ],
+            &dir,
+        )
+        .unwrap();
+        capture_required(
+            "git",
+            &["update-ref", "-d", "refs/remotes/origin/caos/shared/talk-1"],
+            &dir,
+        )
+        .unwrap();
+
+        let loaded = fetch_published_conversation("origin/caos/shared/talk-1", &dir).unwrap();
+        assert_eq!(loaded.id, "shared/talk-1");
+        assert_eq!(loaded.title, None);
+        assert_eq!(loaded.head, head);
+        assert!(capture_optional(
+            "git",
+            &[
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/caos/shared/talk-1"
+            ],
+            &dir,
+        )
+        .unwrap()
+        .is_none());
+        assert!(capture_required(
+            "git",
+            &["for-each-ref", "--format=%(refname)", "refs/caos/loads"],
+            &dir,
+        )
+        .unwrap()
+        .is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 }

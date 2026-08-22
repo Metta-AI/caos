@@ -123,6 +123,16 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
+Enter `/publish-branch` to push the selected conversation's complete event
+history to `origin/caos/<conversation-id>` without opening a PR. Enter
+`/load origin/caos/<conversation-id>` to import one of those branches into the
+current CAOS server and sidebar, or pass a GitHub PR URL such as
+`/load https://github.com/Metta-AI/caos/pull/34`. PR loading uses `gh` to
+recover the head branch's conversation ID and GitHub's pull ref to support PRs
+from forks. An import preserves the conversation ID and exact first-parent
+event spine. It may advance an existing copy of that conversation, but refuses
+divergent history with the same ID.
+
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
@@ -205,9 +215,11 @@ Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
 branch prompt with `origin`'s advertised default selected; type another branch
 to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn that
 merges the exact fetched base with the standard `merge` tool, then resolves and
-tests the result. For another base, only this conversation's delta is applied,
-so child conversations form clean PR stacks. Unresolved conflicts stop before
-the branch moves. The checkout and index remain untouched.
+tests the result. When that fetched base is already an ancestor of the current
+conversation head, the preparation turn runs without asking the agent to merge
+it again. For another base, only this conversation's delta is applied, so child
+conversations form clean PR stacks. Unresolved conflicts stop before the branch
+moves. The checkout and index remain untouched.
 
 CAOS points `caos/<conversation>` directly at the validated conversation head,
 pushes it, and uses the authenticated `gh` CLI to find or open its pull
@@ -215,6 +227,13 @@ request. The first publication carries the conversation history; later
 publications advance the branch by fast-forward. The selected PR base is an
 ancestor of the published head, and the final tree must contain no reserved
 `.caos` state.
+
+`/publish-branch` is the sharing-only form of publication: it does not run the
+agent merge-and-test preparation turn and does not create a PR. It still checks
+the current tip for unresolved conflict records, conflict markers, and reserved
+`.caos` state before moving the branch. It can publish a completed conversation
+whose workspace diff is empty, since the transcript history itself is useful
+to another client.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git
