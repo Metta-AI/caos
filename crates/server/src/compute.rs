@@ -96,6 +96,24 @@ struct WorkRequest<'a> {
     secrets: &'a [crate::secrets::Grant],
 }
 
+/// `GET /resolve-image?image=<hex hash | docker://ref>` — the reference a
+/// runner would pull for this image, and nothing else. A git-docker tree is
+/// converted (and the convert is cached) exactly as a run would convert it.
+///
+/// This exists because the convert is otherwise INVISIBLE from outside the
+/// server: a client can hand a git image to `run` and a worker can curry one,
+/// but neither can learn the ref it resolved to. That left anyone who wants to
+/// hand the resulting image to a *different* registry — a policy image bound
+/// for a platform, say — reimplementing `convert_git_image` against the same
+/// base, which is a second copy of the layer/diff_id/manifest arithmetic and a
+/// second place for it to be wrong.
+pub(crate) fn resolve_image_endpoint(config: &Config, query: &str) -> Result<Vec<u8>, HttpError> {
+    let image = query_param(query, "image")
+        .ok_or_else(|| HttpError::new(400, "resolve-image needs ?image=<hash|docker://ref>"))?;
+    let reference = resolve_image(config, &image)?;
+    Ok(reference.into_bytes())
+}
+
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
 /// the worker image, std and salt under reserved entries) and return its result
 /// as `"<type> <hash>"`. (`req` is the query param's historical name; its value
