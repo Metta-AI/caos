@@ -89,9 +89,10 @@ deepen)
   ;;
 
 fanout)
-  # `--result` is the DEEPENED workspace, so a test's deps are at
-  # /cas/args/result/tests/<name>/DEEP-DEPS/<mount>. `--ws` is the workspace as
-  # it arrived, which is what the tests themselves come from.
+  # `--result` is the DEEPENED workspace, so a test's own `DEPS` have already
+  # become `tests/<name>/DEEP-DEPS/<mount>` — which is what a test's
+  # `.caos-expr` names its dependencies by. `--ws` is the workspace as it
+  # arrived, used only to enumerate which tests exist.
   caos get /cas/args/ws
   caos get /cas/args/ws/tests
   caos get /cas/args/result
@@ -99,11 +100,10 @@ fanout)
   caos get /cas/args/cli
   caos get /cas/args/runner
 
-  # The per-test image, as a hash for map-then.
-  # It carries no grants, unlike the image THIS script runs in: a test drives
-  # the tested client against this stack and needs nothing else.
-  # No `worker1` to curry: dev/run-test bakes the harness as its own /worker, so
-  # the resolved image IS the per-test runner.
+  # The image mapped over the per-test trees: dev/run-test, which evaluates one
+  # and turns the outcome into a verdict. It is the same image for every test —
+  # what differs per test is the TREE it is handed, because a test is an entry
+  # and running it is evaluating it.
   map=$(caos hash /cas/args/runner) || fail "reading the per-test image"
 
   only=""
@@ -111,10 +111,12 @@ fanout)
     caos get /cas/args/only
     only=" $(cat /cas/args/only) "
   fi
-  # --test-salt rides in EVERY wrapper and nowhere else, so a fresh value
-  # re-runs the tests and leaves the compile and the std publish hits. Nothing
-  # READS the file: its presence in the wrapper is what moves the key. Do not
-  # "clean up" the unused write — it is the whole mechanism.
+  # The salt is written for EVERY test, empty when none was passed, because a
+  # test's `.caos-expr` binds `--salt:@=salt` unconditionally and an absent path
+  # is an evaluation error rather than an omitted argument. Binding it is what
+  # makes a fresh value re-run the tests: the file changes the tree, which
+  # changes what the tree evaluates to, which changes the test's own ArgTree.
+  # Nothing READS it.
   salt=""
   if [ -e /cas/args/test-salt ]; then
     caos get /cas/args/test-salt
@@ -127,53 +129,50 @@ fanout)
     if [ -n "$only" ]; then
       case "$only" in *" $t "*) ;; *) continue ;; esac
     fi
-    caos get "/cas/args/ws/tests/$t"
-    if [ ! -e "/cas/args/ws/tests/$t/cli.sh" ]; then continue; fi
-    mkdir -p "/tmp/sel/$t"
-    ln -s "/cas/args/ws/tests/$t" "/tmp/sel/$t/test"
-    # THE TESTED CLIENT, as an arg rather than in the image: which client a test
-    # drives is a property of this run, and an arg is content-addressed, so a
-    # test re-keys when the client it drove changes. That is the whole point of
-    # a suite — it must not be possible for the binary under test to change
-    # without the tests noticing.
-    ln -s /cas/args/cli "/tmp/sel/$t/cli"
-    if [ -n "$salt" ]; then printf '%s' "$salt" > "/tmp/sel/$t/salt"; fi
+    # Expand this test's directory before asking what is in it: args arrive as
+    # lazy placeholders, so an unfetched directory answers "no" to every
+    # question about its contents.
+    caos get "$d" || fail "expanding tests/$t"
+    # An entry, or not a test. `tests/lib` is the CLI harness other tests DEP
+    # on, and has no expression of its own to run.
+    if [ ! -e "$d/.caos-expr" ]; then continue; fi
 
-    # WHAT THIS TEST REACHES FOR, and nothing else — read off its own DEPS,
-    # which the transform has already turned into a DEEP-DEPS/<name> mount per
-    # line. All that happens here is routing each mount into the `std` slot.
-    #
-    # A bash read loop, not sed/awk: kept from when this ran in std/bash, which
-    # carries neither (CLAUDE.md); harmless now and still the portable form.
-    mkdir -p "/tmp/sel/$t/std"
-    if [ -e "$d/DEPS" ]; then
-      caos get "/cas/args/ws/tests/$t/DEPS"
-      caos get "/cas/args/result/tests/$t"
-      caos get "/cas/args/result/tests/$t/DEEP-DEPS"
-      while read -r dep_path mount; do
-        case "${dep_path:-}" in "" | \#*) continue ;; esac
-        case "$dep_path" in
-          ../../std/*) ln -s "/cas/args/result/tests/$t/DEEP-DEPS/$mount" \
-                             "/tmp/sel/$t/std/$mount" ;;
-          *) fail "tests/$t/DEPS: $dep_path is not ../../std/*" ;;
-        esac
-      done < "$d/DEPS"
-    fi
+    # THE CHILD IS THE TEST'S OWN DEEPENED TREE, entry by entry, plus what
+    # varies per RUN rather than per tree. Symlinked rather than copied: `caos
+    # put` resolves a symlink to the recorded hash, so this moves no bytes — but
+    # it has to be entry by entry, because linking the directory itself would
+    # nest the test one level down and its `.caos-expr` would no longer be at
+    # the root where `--eval=.` looks for it.
+    src=/cas/args/result/tests/$t
+    caos get "$src"
+    mkdir -p "/tmp/sel/$t"
+    for e in "$src"/* "$src"/.[!.]*; do
+      [ -e "$e" ] || continue
+      ln -s "$e" "/tmp/sel/$t/$(basename "$e")"
+    done
+
+    # THE TESTED CLIENT, as content rather than as something ambient: a test
+    # re-keys when the client it drove changes, which is the property a suite
+    # exists to have. Bound by every test's expression whether or not it runs
+    # the thing.
+    ln -s /cas/args/cli "/tmp/sel/$t/cli"
+    printf '%s' "$salt" > "/tmp/sel/$t/salt"
 
     case "$t" in
-      cargo-self | unit-*)
-        # Dogfood the tree under test. The WHOLE workspace, because there is no
-        # pruned build tree to hand over any more: the compile happens in the
-        # dev container, not in a job whose key we control here.
-        ln -s /cas/args/ws "/tmp/sel/$t/workspace"
-        ;;
-      std-lint)
+      cargo-self | unit-* | std-lint)
+        # Dogfood the tree under test: the whole workspace, for the tests whose
+        # subject IS the workspace.
         ln -s /cas/args/ws "/tmp/sel/$t/workspace"
         ;;
       chat-online)
+        # Always present, possibly EMPTY — same reason as the salt: the
+        # expression binds it unconditionally, and this test self-skips on an
+        # empty key.
         if [ -e /cas/args/api-key ]; then
           caos get /cas/args/api-key
-          cp /cas/args/api-key /tmp/sel/chat-online/api-key
+          cp /cas/args/api-key "/tmp/sel/$t/api-key"
+        else
+          : > "/tmp/sel/$t/api-key"
         fi
         ;;
     esac
