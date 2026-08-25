@@ -25,6 +25,13 @@ set -euo pipefail
 
 fail() { echo "TEST FAIL: $*" >&2; exit 1; }
 
+# PHASE MARKERS. 70 of a 75-second single-test run was not the test, and the
+# split was invisible: everything up to the suite happens inside this one
+# container, so the trace shows one node and nothing about what it spent the
+# time on. `T0` is this job's start; each `phase` line is seconds since it.
+T0=$SECONDS
+phase() { echo "==> [+$((SECONDS - T0))s] $*" >&2; }
+
 caos get -r /cas/args/in || fail "materializing the workspace"
 cd /cas/args/in
 [ -f flake.nix ] || fail "no flake.nix in the workspace"
@@ -40,8 +47,10 @@ cd /cas/args/in
 # The dev stack is TEST world, so a host client is refused by it and vice versa.
 # It shares every dependency with the host build; only the thin workspace
 # compile differs (measured: one derivation, 13.8s).
+phase "building the test-world binaries"
 bins=$(nix build "path:$PWD#caos-test-world" --no-link --print-out-paths) \
   || fail "building the test-world binaries"
+phase "bringing the dev stack up"
 ./dev/stack-up --bins="$bins" >&2 || fail "bringing the dev stack up"
 CLI=/caos-dev/bin/caos-cli
 [ -x "$CLI" ] || fail "no client at $CLI after stack-up"
@@ -108,11 +117,6 @@ fi
 # `--base:@=<path>` is how a client names an expression: it eval-paths the
 # directory. A bare `run <path>` is not a form — `run` wants a base.
 #
-# NO COMMENT INSIDE THE BLOCK BELOW. Every line ends in a backslash, and a
-# continuation followed by a comment joins INTO it — the env prefix is severed
-# and the command runs with none of it. `bash -n` passes either way, which is
-# what makes it worth a warning rather than a fix (CLAUDE.md). This exact block
-# had it, and the symptom was a client with no server to talk to.
 # THE SUITE'S REQUEST, NAMED BEFORE IT RUNS, so the two stacks' traces join up.
 #
 # The dev stack writes its trace records to the SAME redis as the host — a trace
@@ -125,12 +129,14 @@ fi
 # watching a suite that is still running.
 #
 # NO COMMENT INSIDE THE BLOCK BELOW (see the warning further down).
+phase "forming the suite request"
 suite_req=$(CAOS_SERVER_URL=http://127.0.0.1 \
   "$CLI" prepare-request --base:@=dev/run-tests --in:@=. --cli:@=.caos-test-cli "${args[@]}") \
   || fail "forming the suite request"
 caos trace-child suite "$suite_req" || fail "linking the suite's trace to this job"
 echo "==> suite request $suite_req (caos-cli status --all $suite_req)" >&2
 
+phase "running the suite"
 status=0
 CAOS_SERVER_URL=http://127.0.0.1 \
   "$CLI" run /tmp/suite --base:@=dev/run-tests --in:@=. --cli:@=.caos-test-cli "${args[@]}" \
@@ -144,4 +150,5 @@ fi
 # with a `report` file has the report printed, and a FAILED banner in it marks
 # the call a failure — while `results/<test>` stays addressable, which is what
 # lets `test-result <hash>` read one test's full output.
+phase "done"
 caos put /tmp/suite /cas/out
