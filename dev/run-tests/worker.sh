@@ -100,32 +100,36 @@ fanout)
   caos get /cas/args/cli
   caos get /cas/args/runner
 
-  # The image mapped over the per-test trees: dev/run-test, which evaluates one
-  # and turns the outcome into a verdict. It is the same image for every test —
-  # what differs per test is the TREE it is handed, because a test is an entry
-  # and running it is evaluating it.
-  map=$(caos hash /cas/args/runner) || fail "reading the per-test image"
+  # THE IMAGE MAPPED OVER THE PER-TEST TREES: dev/run-test, which evaluates one
+  # and runs what evaluation returns. It is the same image for every test, so
+  # what a test needs that varies per RUN rather than per tree — the client
+  # under test, and the salt — is curried HERE, once, and dev/run-test passes it
+  # to the test's ArgTree when it calls it.
+  #
+  # Not staged into the test's own tree, which is what this did before: a
+  # checked-in `.caos-expr` reading `--cli:@=cli` named a path that is not in
+  # its directory and only resolved because this loop grafted a file in. An
+  # expression should name what is beside it.
+  #
+  # `--test-salt`, not `--salt`: that name is RESERVED, and the dispatcher
+  # merges the run's own salt last (compute.rs, `run_image`), so a per-test
+  # value bound under it is silently overwritten and never reaches the key —
+  # two different --test-salt values would produce one request and the test
+  # would not re-run. Nothing READS this; its presence in the ArgTree is the
+  # whole mechanism. Empty when none was passed, so the binding is uniform.
+  salt=""
+  if [ -e /cas/args/test-salt ]; then
+    caos get /cas/args/test-salt
+    salt=$(cat /cas/args/test-salt)
+  fi
+  map=$(caos curry --base:@=/cas/args/runner \
+    "--cli:@=/cas/args/cli" "--test-salt=$salt") \
+    || fail "currying the per-test image"
 
   only=""
   if [ -e /cas/args/only ]; then
     caos get /cas/args/only
     only=" $(cat /cas/args/only) "
-  fi
-  # The salt is written for EVERY test, empty when none was passed, because a
-  # test's `.caos-expr` binds `--test-salt:@=test-salt` unconditionally and an
-  # absent path
-  # is an evaluation error rather than an omitted argument. NOT `salt`: that name
-  # is RESERVED, and the dispatcher merges the run's own salt last
-  # (compute.rs, `run_image`), so a per-test value bound under it is silently
-  # overwritten and never reaches the key — two different --test-salt values
-  # would produce one request and the test would not re-run. Binding it is what
-  # makes a fresh value re-run the tests: the file changes the tree, which
-  # changes what the tree evaluates to, which changes the test's own ArgTree.
-  # Nothing READS it.
-  salt=""
-  if [ -e /cas/args/test-salt ]; then
-    caos get /cas/args/test-salt
-    salt=$(cat /cas/args/test-salt)
   fi
 
   mkdir /tmp/sel
@@ -142,37 +146,27 @@ fanout)
     # client tests DEP on — but it has no `worker.sh`, so nothing maps over it.
     if [ ! -e "$d/.caos-expr" ] || [ ! -e "$d/worker.sh" ]; then continue; fi
 
-    # THE CHILD IS THE TEST'S OWN DEEPENED TREE, entry by entry, plus what
-    # varies per RUN rather than per tree. Symlinked rather than copied: `caos
-    # put` resolves a symlink to the recorded hash, so this moves no bytes — but
-    # it has to be entry by entry, because linking the directory itself would
-    # nest the test one level down and its `.caos-expr` would no longer be at
-    # the root where `--eval=.` looks for it.
+    # THE CHILD IS A WRAPPER holding the test's own deepened tree at `test`,
+    # nothing rewritten. One symlink: `caos put` resolves it to the recorded
+    # hash, so no bytes move and the test's tree is ONE entry rather than a
+    # rebuilt copy of itself.
     src=/cas/args/result/tests/$t
-    caos get "$src"
     mkdir -p "/tmp/sel/$t"
-    for e in "$src"/* "$src"/.[!.]*; do
-      [ -e "$e" ] || continue
-      ln -s "$e" "/tmp/sel/$t/$(basename "$e")"
-    done
+    ln -s "$src" "/tmp/sel/$t/test"
 
-    # THE TESTED CLIENT, as content rather than as something ambient: a test
-    # re-keys when the client it drove changes, which is the property a suite
-    # exists to have. Bound by every test's expression whether or not it runs
-    # the thing.
-    ln -s /cas/args/cli "/tmp/sel/$t/cli"
-    printf '%s' "$salt" > "/tmp/sel/$t/test-salt"
-
+    # The two things that genuinely differ PER TEST, so they cannot ride on the
+    # map image the way `cli` and `test-salt` do. dev/run-test curries whichever
+    # of them the wrapper carries onto the test's ArgTree.
     case "$t" in
       cargo-self | unit-* | std-lint)
         # Dogfood the tree under test: the whole workspace, for the tests whose
-        # subject IS the workspace.
+        # subject IS the workspace. Only these — curried onto the map image it
+        # would reach every test, and every test would then re-key on any edit
+        # anywhere, including edits to other tests.
         ln -s /cas/args/ws "/tmp/sel/$t/workspace"
         ;;
       chat-online)
-        # Always present, possibly EMPTY — same reason as the salt: the
-        # expression binds it unconditionally, and this test self-skips on an
-        # empty key.
+        # Present but possibly EMPTY; this test self-skips on an empty key.
         if [ -e /cas/args/api-key ]; then
           caos get /cas/args/api-key
           cp /cas/args/api-key "/tmp/sel/$t/api-key"

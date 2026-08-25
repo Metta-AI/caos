@@ -6,13 +6,15 @@
 # dev/run-tests uses, and for the same reason: what each stage needs is only
 # knowable once the previous one's work has finished.
 #
-#   eval     (default) `--in` is the test's tree: the deepened tests/<name>
-#            with this run's `cli` and `salt` staged in. Evaluating its
-#            `.caos-expr` yields the test's ARG TREE. A worker may not evaluate
-#            — its `caos` has `eval-path-then` and no `eval-path` — so this
-#            records a continuation and exits. Every test evaluates in
-#            parallel, one map child each.
-#   launch   the `then` of that: --result is the ArgTree, so run it.
+#   eval     (default) `--in` is the WRAPPER the fan-out built: the test's own
+#            deepened tree at `test`, plus `workspace`/`api-key` for the few
+#            tests that need one. Evaluating `test` yields the test's ARG TREE.
+#            A worker may not evaluate — its `caos` has `eval-path-then` and no
+#            `eval-path` — so this records a continuation and exits. Every test
+#            evaluates in parallel, one map child each.
+#   launch   the `then` of that: --result is the ArgTree. Bind what this RUN
+#            supplies — the client under test, the salt, and a workspace or api
+#            key when the wrapper carries one — and run it.
 #   verdict  the `then` of THAT: --result is what the test returned, or
 #            --error what it failed with.
 #
@@ -56,9 +58,14 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 case "$stage" in
 
 eval)
+  # `cli` and `test-salt` are FORWARDED, not inherited. `/cas/args/base` is the
+  # reserved base entry — the bash image — not this job's ArgTree, so currying
+  # onto it carries none of what the fan-out bound alongside it. Anything a
+  # later stage reads has to be re-bound by name.
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
-    --stage=launch "--start=$(date +%s)") || fail "currying the launch stage"
-  caos eval-path-then /cas/args/in --eval=. --then:hash="$next" --catch
+    --stage=launch --cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt \
+    "--start=$(date +%s)") || fail "currying the launch stage"
+  caos eval-path-then /cas/args/in --eval=test --then:hash="$next" --catch
   ;;
 
 launch)
@@ -66,6 +73,10 @@ launch)
   # read, and an unfetched one reads as empty — which surfaces two containers
   # later as `1787683099 - : arithmetic syntax error` in the elapsed sum.
   caos get /cas/args/start || fail "reading --start"
+  # Expand the wrapper before asking what it holds: an unfetched directory
+  # answers "no" to every question about its contents, so the `workspace` and
+  # `api-key` checks below would silently bind nothing.
+  caos get /cas/args/in || fail "expanding the wrapper"
   if [ -e /cas/args/error ]; then
     # The EXPRESSION is broken — a missing `DEEP-DEPS/<name>`, a path that does
     # not resolve — so no test ever ran. Said plainly, because the failure a
@@ -92,15 +103,29 @@ launch)
   # bound arg: nothing unwrapped the curry, so `args` and `.caos-curry` arrived
   # as two arguments of those names and tests/lib died on `/cas/args/test`.
   #
-  # `<in>` is the test's own tree, which this job is already holding.
+  # WHAT THIS RUN SUPPLIES IS BOUND HERE, not staged into the test's tree. A
+  # test's `.caos-expr` names only what sits beside it in its own directory;
+  # the client under test and the salt are properties of the RUN, and they
+  # reach the test by being passed when its ArgTree is called — which is what
+  # currying is (SPEC, "Currying": takes an ArgTree and args, returns an
+  # ArgTree). `curry` fails on a rebind, so a test that bound one of these
+  # itself gets a loud error rather than a silent shadow.
   #
-  # The hash is printed before the run: this is the only place that knows it,
-  # and it is what anything wanting to watch or re-run this one test must name.
-  req=$(caos hash /cas/args/result) || fail "reading the test's arg tree"
+  # `cli` and `test-salt` are the same for every test and ride on this image,
+  # curried by the fan-out. `workspace` and `api-key` differ per test, so they
+  # ride in the wrapper — and are passed only to the tests that were given one.
+  bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt)
+  if [ -e /cas/args/in/workspace ]; then bind+=(--workspace:@=/cas/args/in/workspace); fi
+  if [ -e /cas/args/in/api-key ]; then bind+=(--api-key:@=/cas/args/in/api-key); fi
+  req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
+    || fail "binding this run's arguments onto the test"
+
+  # Printed before the run: this is the only place that knows it, and it is what
+  # anything wanting to watch or re-run this one test must name.
   echo "run-test: arg tree $req" >&2
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage=verdict "--start=$(cat /cas/args/start)") || fail "currying the verdict stage"
-  caos run-then /cas/args/in --run:hash="$req" --then:hash="$next" --catch
+  caos run-then /cas/args/in/test --run:hash="$req" --then:hash="$next" --catch
   ;;
 
 verdict)

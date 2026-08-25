@@ -11,5 +11,9 @@
 #           DEEP-DEPS alongside. `--test:@=.` is inert by construction:
 #           `strip_caos_expr` removes this file from the tree before the
 #           expression is evaluated against it, so nothing recurses.
-#   --cli   the client under test; --salt is what makes --test-salt re-run this
-curry --base:@=DEEP-DEPS/lib --worker1:@=worker.sh --test:@=. --cli:@=cli --test-salt:@=test-salt --api-key:@=api-key
+#
+# NOTHING HERE NAMES WHAT ONLY THE RUN KNOWS. The client under test, the salt,
+# and a workspace or api key are PASSED when dev/run-test calls this ArgTree —
+# so every path above exists in this directory, which is the whole point of an
+# expression being readable on its own.
+curry --base:@=DEEP-DEPS/lib --worker1:@=worker.sh --test:@=.

@@ -14,4 +14,4 @@
 # `salt` in the ArgTree is what makes `--test-salt` re-run the test, and `cli`
 # is what makes the test re-key when the client under test changes. This one
 # runs neither, and binds both for those two properties.
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --src:@=worker.rs --tree:@=tree --cli:@=cli --test-salt:@=test-salt
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --src:@=worker.rs --tree:@=tree
