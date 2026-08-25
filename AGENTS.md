@@ -89,16 +89,18 @@ Every script here runs with it, and two constructs quietly break under it.
 
 - **A `git fetch` can fail over an object it never asked for.** The post-fetch
   connectivity check is `rev-list --not --all --alternate-refs`, so it walks the
-  tips of every ALTERNATE object store too. The test harness gives each client
-  repo an alternate holding a deliberate SUBSET (`tests/lib/run-test.sh` →
-  `/tmp/seed-git/objects`, "exactly what this test declared"), so any fetch there
-  dies with `missing blob object <x>` naming an object with nothing to do with
-  the fetch — and blames the fetch. It cost a session on `tests/remote-ref`: the
-  identical `git fetch` succeeds in any ordinary repo and fails in the harness's
-  client repo, so the difference is the alternate, not the command. Add `-c
-  core.alternateRefsCommand=true` when the fetched closure stands alone
-  (`:@@=`'s `--depth 1` fetch does); do NOT add it where the alternate's tips are
-  legitimately part of the history you are completing.
+  tips of every ALTERNATE object store too — and any fetch into such a repo can
+  die with `missing blob object <x>` naming an object with nothing to do with
+  the fetch, blaming the fetch. It cost a session on `tests/remote-ref` back when
+  the harness gave each client repo an alternate: the identical `git fetch`
+  succeeded in any ordinary repo and failed in that one, so the difference was
+  the alternate, not the command. Add `-c core.alternateRefsCommand=true` when
+  the fetched closure stands alone (`:@@=`'s `--depth 1` fetch does); do NOT add
+  it where the alternate's tips are legitimately part of the history you are
+  completing. **The test harness no longer creates one** (`tests/lib/worker`
+  says so, and says to look there first if a push ever dies unable to read an
+  object), which is what lets `tests/push-closure` reproduce at all — it used to
+  have to delete the alternate itself.
 
 - **An unsalted `run-tool test` does not prove a push works.** `ensure_pushed`
   asks before pushing — a `HEAD /object/<argtree>`, and on a hit it returns
@@ -110,13 +112,6 @@ Every script here runs with it, and two constructs quietly break under it.
   `CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool test` (SPEC.md) and
   why a green unsalted suite once sat next to a hard-failing salted one for a
   whole session. Run the salted form before believing a push-path change.
-- **The test harness hides object-availability bugs.** Each per-test client repo
-  gets an ALTERNATE object store (`tests/lib/run-test.sh` → `/tmp/seed-git`)
-  holding what that test declared, so a client that could not otherwise read its
-  base image's closure reads it anyway. A test that is ABOUT what the client
-  holds must `rm .git/objects/info/alternates` first — see `tests/push-closure`,
-  which needs a rustc-built worker (whose base is reached by unwrapping a curry,
-  and so is covered by no advertised ref) to reproduce at all.
 
 # Caches and defaults, when a suite fans out
 
@@ -191,3 +186,32 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   `caos: usage:` listing that is missing the verb you just added.
 - If this doesn't catch everything, we need to add it to the above step
 
+
+# Tests
+
+- **A test is an ENTRY, not a script the harness interprets.** `tests/<name>/`
+  carries a `.caos-expr`, a `DEPS` and a `worker.sh`, exactly like a std entry,
+  and running a test is EVALUATING it (`dev/run-test` does nothing else, plus
+  turning the outcome into a verdict). Two consequences worth internalising:
+  - **Naming a dependency resolves it.** `:@=` evaluates any tree carrying a
+    `.caos-expr`, not just `--base` (caos-eval's `eval_if_evaluable`), so
+    `--rustc:@=DEEP-DEPS/rustc` hands the worker the BUILT image. A worker
+    cannot evaluate — its `caos` has `eval-path-then` and no `eval-path` — and
+    with this it never needs to.
+  - **A client test asks for its worktree.** `:@=` ingests git-tracked paths, so
+    a test that drives `caos-cli` names `--base:@=DEEP-DEPS/lib` and DEPs on
+    `../lib`; `tests/lib`'s `/worker` stages the repo and then runs `worker1`.
+    Grep `DEPS` for `lib` to see which tests are client tests. A worker test
+    names `std/bash` and never pays for a repo.
+- **`prepare-request` forms a run; `curry` builds an IMAGE.** Handing a curry
+  node to `run-request-then` produces an ArgTree the runner does not unwrap, and
+  it dies on `caos get /cas/args/worker1` — its own entrypoint arg, missing,
+  because the chain below was never merged. Prefer `run-request-then` over
+  `run-then` in a staged test: it runs a complete ArgTree unchanged, so no
+  `--in` is invented for a callee that does not want one (worker-cargo and
+  std/bash-tool both read `--in` in preference to their real argument, so an
+  empty one silently shadows it).
+- **`/cas/args/base` is the IMAGE, not this job's ArgTree.** A later stage must
+  re-bind by name whatever it reads. `--salt` has to ride in EVERY stage for
+  that reason: bound only at the top, a fresh `--test-salt` re-runs the first
+  container and hits the memo for all the rest.

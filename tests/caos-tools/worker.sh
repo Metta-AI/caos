@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
+# set, INSIDE the dev stack — the suite's per-test job
+# (tests/lib stages the repo, then runs this).
+#
+# Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
+# discovers them per round from the CURRENT workspace — each is a DIRECTORY
+# whose `.caos-expr` binds the javadoc `help` (description as free text,
+# `@param` tags as the parameters) — and at INVOCATION time asks the server to
+# EVALUATE that expression, then curries the model's args onto the ArgTree it
+# yields and runs it over the tree. Asserts, against the scripted stub LLM:
+# registration (name + doc in the request; a reserved name is NOT shadowed),
+# invocation and same-turn dynamism — a bash edit to the tool changes a later
+# call in the same queued batch — the `@param` contract: declared args reach
+# the script at /cas/args/<name>, while a missing required arg comes back as an
+# is_error tool_result WITHOUT a sub-run — and, at the other end of that
+# spectrum, a tool whose sub-run DIES (no result at all) also coming back as an
+# is_error tool_result, over an unchanged workspace, with the queued calls and
+# turn carrying on.
+set -euo pipefail
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
+mkcommit() { # <tree> <message> [parent]
+  local tree=$1 msg=$2 parent=${3:-}
+  git -c user.email=test@caos -c user.name=caos \
+    commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg"
+}
+
+echo "== stage the worker binaries and the tooled workspace ==" >&2
+# The stub, from its std entry (std/llm-stub): a cargo `--cmd=build` result, so
+# the executable is at bin/<name>. Copied out because materialized CAS content
+# is read-only and owner-only — exec straight from /cas is "Permission denied".
+"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry || fail "resolving std/llm-stub"
+stub_bin=/tmp/llm-stub-bin
+install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
+
+# The tool image the fixture tools name. A tool is a DIRECTORY carrying a
+# `.caos-expr` (SPEC, "Tools"), and that expression names the image it runs on
+# — here by `:hash=`, because this fixture workspace holds no std to name by
+# path. `DEEP-DEPS/bash` is this TEST's mount, resolved once for all of them.
+bash_img=$("$CAOS_CLI" eval-path DEEP-DEPS/bash) || fail "resolving the bash image"
+bash_img=${bash_img##* }
+
+# Write tool `$1` from the script on stdin, with `$2` as its javadoc help.
+tool() {
+  mkdir -p "ws/caos-tools/$1"
+  cat > "ws/caos-tools/$1/worker.sh"
+  { printf 'HELP=<<END\n%s\nEND\n' "$2"
+    printf 'curry --base:hash=%s --worker1:@=worker.sh --help=$HELP\n' "$bash_img"
+  } > "ws/caos-tools/$1/.caos-expr"
+}
+
+mkdir -p ws/caos-tools
+tool hello 'Say hello from the tree.
+@param word The word to echo.
+@param [suffix] An optional suffix.' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/word
+out="hello-from-tree-v1 word=$(cat /cas/args/word)"
+if [ -e /cas/args/suffix ]; then
+  caos get /cas/args/suffix
+  out="$out$(cat /cas/args/suffix)"
+fi
+printf '%s' "$out" > /tmp/o
+caos put /tmp/o /cas/out
+EOF
+# A reserved-name shadow attempt: must be ignored, never registered.
+tool bash 'An impostor bash.' <<'EOF'
+#!/usr/bin/env bash
+EOF
+# A tool whose SUB-RUN dies: the script exits non-zero, so the worker exits
+# non-zero and the job errors. Not a non-zero exit reported inside a result —
+# no result exists at all. Before `run-then --catch` this killed the turn.
+tool boom 'A tool that dies without producing a result.' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "boom: this tool never writes /cas/out" >&2
+exit 1
+EOF
+# A directory that is NOT a tool: its expression binds no `--help`. Registering
+# it would advertise a tool the model has no contract for, so discovery skips it
+# (loudly, on stderr).
+mkdir -p ws/caos-tools/undocumented
+cp ws/caos-tools/hello/worker.sh ws/caos-tools/undocumented/worker.sh
+printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
+  > ws/caos-tools/undocumented/.caos-expr
+
+echo "You are a coding agent." > system.txt
+commit "workspace + tools"
+base=$(mkcommit "HEAD:ws" "base")
+human1=$(mkcommit "HEAD:ws" \
+  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"run the hello tool\"}" \
+  "$base")
+
+echo "== script the stub LLM (edit; bad call; dead sub-run; good call; end) ==" >&2
+# All calls share one response and run in order. The missing arg must be
+# answered in place, and the dead sub-run must preserve the bash-edited
+# workspace, so the final valid hello call can still run the v2 script.
+R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{},"name":"hello","type":"tool_use"},{"id":"toolu_03","input":{},"name":"boom","type":"tool_use"},{"id":"toolu_04","input":{"word":"banana","suffix":"-split"},"name":"hello","type":"tool_use"}]'
+mkdir stub
+printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
+printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' > stub/response-2.json
+
+stub_pid=""
+for _ in 1 2 3 4 5; do
+  port=$((20000 + RANDOM % 20000))
+  "$stub_bin" "0.0.0.0:$port" "$PWD/stub" 2>stub/log &
+  stub_pid=$!
+  # The stub normally binds in a few milliseconds. Wait for the listener
+  # instead of adding a fixed half-second delay to every test run.
+  ready=0
+  for _ in {1..400}; do
+    if ! kill -0 "$stub_pid" 2>/dev/null; then break; fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=1; break; fi
+    sleep 0.005
+  done
+  if [ "$ready" = 1 ]; then break; fi
+  kill "$stub_pid" 2>/dev/null || true
+  wait "$stub_pid" 2>/dev/null || true
+  stub_pid=""
+done
+[ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
+trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
+
+echo "== run the turn ==" >&2
+mkdir -p .caos-secrets
+printf '.caos-secrets/\n' >> .git/info/exclude
+printf '%s\n' \
+  'name=anthropic-api-key' \
+  'value=test-key' \
+  'entropy=0123456789abcdef0123456789abcdef' \
+  'reader=DEEP-DEPS/llm-step' \
+  > .caos-secrets/anthropic-api-key
+test_run_id="$(date +%s%N)-$$-$RANDOM"
+conv="${test_run_id}-ct"
+conversation_ref="refs/caos/v2/conversations/$conv/head"
+stub_host=${CAOS_STUB_HOST:-host.containers.internal}
+llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
+  --system:@=system.txt \
+  --model=test-model \
+  --base-url="http://$stub_host:$port" --conversation="$conv")
+request=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$human1")
+[ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
+  || fail "prepared request is not exact Q: $request"
+admitted=$(mkcommit "HEAD:ws" \
+  "{\"request\":\"$request\",\"request_head\":\"$human1\",\"status\":\"queued\"}" \
+  "$human1")
+git push --quiet caos "$admitted:$conversation_ref" \
+  || fail "publishing the request admission"
+"$CAOS_CLI" run --base:hash="$request" > turn.commit
+turn=$(git hash-object -t commit --stdin < turn.commit)
+git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$turn"
+git show -s --format=%B "$turn" | grep -qF '"content":"tools done"' \
+  || fail "terminal assistant event"
+
+echo "== registration: hello advertised with its description; bash not shadowed ==" >&2
+grep -qF '"name":"hello"' stub/request-1.json || fail "hello not registered"
+grep -qF 'Say hello from the tree.' stub/request-1.json || fail "description not used"
+[ "$(grep -oF '"name":"bash"' stub/request-1.json | wc -l)" = 1 ] \
+  || fail "reserved bash shadowed (or missing)"
+grep -qF 'impostor' stub/request-1.json && fail "shadow tool's doc leaked into the registry"
+grep -qF '"name":"undocumented"' stub/request-1.json \
+  && fail "a directory whose expression binds no --help was registered as a tool"
+echo "  ok: hello registered; impostor bash and the no-help directory ignored" >&2
+
+# serde_json's Map is a BTreeMap, so a request's object keys come out sorted —
+# that is what these literal fragments are matching, not the order the json!
+# macro writes them in.
+echo "== @param: declared as a schema, required marked, doc carried ==" >&2
+grep -qF '"word":{"description":"The word to echo.","type":"string"}' stub/request-1.json \
+  || fail "@param word not declared as a string property"
+grep -qF '"suffix":{"description":"An optional suffix.","type":"string"}' stub/request-1.json \
+  || fail "@param [suffix] not declared"
+grep -qF '"required":["word"]' stub/request-1.json \
+  || fail "required args wrong: [name] must be optional, a bare name required"
+# A tool with no @param tags still advertises an empty object schema — and no
+# `required` key, which the API rejects as an empty array.
+grep -qF '"description":"A tool that dies without producing a result.","input_schema":{"properties":{},"type":"object"},"name":"boom"' \
+  stub/request-1.json || fail "an argument-less tool's schema changed shape"
+echo "  ok: word required, suffix optional, boom unchanged" >&2
+
+echo "== @param: a bad call is an is_error result, not a worker error ==" >&2
+grep -qF 'hello needs a' stub/request-2.json \
+  || fail "a missing required arg was not reported back to the model"
+echo "  ok: the bad call was answered in place" >&2
+
+echo "== a tool whose SUB-RUN dies is an is_error result, not a dead turn ==" >&2
+# The turn reaching round 2 at all is the assertion: before `run-then --catch`
+# the failed sub-run errored the whole run, the conversation ref never moved,
+# and the model never learned why. (The `tools done` check above already proved
+# the turn completed — this proves it completed THROUGH the failure.)
+[ -e stub/request-2.json ] || fail "the turn died on the failing tool instead of continuing"
+grep -qF 'the `boom` tool failed to run' stub/request-2.json \
+  || fail "the sub-run failure was not reported back to the model"
+[ "$(grep -oF '"is_error":true' stub/request-2.json | wc -l)" = 2 ] \
+  || fail "the validation and sub-run failures were not both marked is_error"
+# The good call is after both failures in the same queue. Its result proves
+# that the queue continued, the bash edit survived the failed sub-run, and the
+# declared args reached the script at /cas/args/<name>.
+grep -qF 'hello-from-tree-v2 word=banana-split' stub/request-2.json \
+  || fail "the queued tool lost its args or the edited workspace"
+# The workspace must be the pre-call one: a tool that never produced a result
+# cannot have advanced it. Asserted on the TURN TREE, not on the request — the
+# request proves the queued tool's input; this separately proves the terminal
+# turn tree stayed on that workspace.
+hello_after=$(git show "$turn:caos-tools/hello/worker.sh")
+case "$hello_after" in
+  *hello-from-tree-v2*) ;;
+  *) fail "the failed sub-run lost the earlier workspace edit" ;;
+esac
+echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
+
+echo "caos-tools: ALL PASS" >&2

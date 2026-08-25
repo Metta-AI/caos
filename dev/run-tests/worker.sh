@@ -200,7 +200,7 @@ summarize)
   caos get /cas/args/children
   caos get /cas/args/start-time
   mkdir -p /tmp/rep
-  passn=0 failn=0 abortn=0
+  passn=0 failn=0
   {
     names=() marks=() times=() hashes=() excerpts=()
     width=0
@@ -214,17 +214,10 @@ summarize)
       if grep -q "^RUN-TEST: PASS" "$c/verdict"; then
         mark="✓"; passn=$((passn + 1))
       else
-        # A test that ABORTED never reached an assertion — an unguarded command
-        # tripped `set -e`. That points at the cli.sh, or at what it was
-        # driving, rather than at an assertion that disagreed.
-        if grep -q "(aborted)" "$c/verdict"; then
-          mark="!"; abortn=$((abortn + 1))
-        else
-          mark="✗"
-        fi
+        mark="✗"
         failn=$((failn + 1))
-        # THE LAST LINES, NOT THE FIRST: every cli.sh narrates its way down and
-        # ends at `fail`, so the tail is the assertion that broke with its stage
+        # THE LAST LINES, NOT THE FIRST: a test narrates its way down and
+          # ends at `fail`, so the tail is the assertion that broke with its stage
         # heading right above it.
         caos get "/cas/args/children/$t/output"
         excerpt=$(tail -n "$EXCERPT_LINES" "$c/output")
@@ -245,14 +238,8 @@ summarize)
     echo
     if [ "$failn" -eq 0 ]; then
       echo "SUITE OK: $passn/$((passn + failn)) passed"
-    elif [ "$abortn" -eq 0 ]; then
-      echo "SUITE FAILED: $passn/$((passn + failn)) passed"
     else
-      echo "SUITE FAILED: $passn/$((passn + failn)) passed ($abortn aborted)"
-    fi
-    if [ "$abortn" -gt 0 ]; then
-      echo "(! = aborted before asserting: an unguarded command failed. Read the"
-      echo " cli.sh, or what it was driving — not an assertion that never ran.)"
+      echo "SUITE FAILED: $passn/$((passn + failn)) passed"
     fi
     echo "(times are each test's LAST ACTUAL RUN; an unchanged test is a cache"
     echo " hit and replays the time it recorded then."

@@ -211,7 +211,7 @@ CAOS_BUILTIN_BINS="$bins" \
 
 # `caos-cli` pushes over a git remote literally named `caos`
 # (crates/caos/src/lib.rs, CAOS_REMOTE) and refuses to run without one — the
-# same line tests/lib/run-test.sh runs for each test's client repo. The
+# same line tests/lib/worker runs for each test's client repo. The
 # workspace is a repo the tool made, so nothing has set it up.
 if git remote get-url caos >/dev/null 2>&1; then
   git remote set-url caos http://127.0.0.1

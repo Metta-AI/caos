@@ -56,9 +56,19 @@ git remote add caos "$CAOS_SERVER_URL"
 # merely in /cas, because the CLI ingests git-tracked paths: naming
 # `--base:@=DEEP-DEPS/rgrep` resolves by INGESTING that directory and evaluating
 # its `.caos-expr`.
-cp -rL /cas/args/test ./test || fail "staging the test tree"
+# `cp -r`, NOT `-rL`: tests/symlinks carries a symlink as its FIXTURE, and
+# dereferencing it here would stage a regular file and quietly delete the thing
+# under test. The deps below still need -L (they are hash-tagged CAS content).
+cp -r /cas/args/test ./test || fail "staging the test tree"
 chmod -R u+w ./test
-if [ -d ./test/DEEP-DEPS ]; then mv ./test/DEEP-DEPS ./DEEP-DEPS; fi
+# The deps move up to ./DEEP-DEPS, where every test script names them, and they
+# DO need `-L`: they are trees of read-only, hash-tagged CAS content, and the
+# CLI has to ingest them as real files to evaluate their `.caos-expr`.
+if [ -d ./test/DEEP-DEPS ]; then
+  cp -rL ./test/DEEP-DEPS ./DEEP-DEPS || fail "staging the test's deps"
+  chmod -R u+w ./DEEP-DEPS
+  rm -rf ./test/DEEP-DEPS
+fi
 
 # The workspace, for the tests that dogfood it (cargo-self, unit-*, std-lint).
 if [ -e /cas/args/workspace ]; then

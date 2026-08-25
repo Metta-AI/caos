@@ -21,3 +21,6 @@
 # no `std` at all (an empty directory does not survive a `caos put`),
 # and the interpreter needs one to seed from.
 ../../std/bash bash
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../lib lib

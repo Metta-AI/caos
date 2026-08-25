@@ -7,3 +7,6 @@
 # LITERAL, which the git closure does not follow.
 ../../std/flake-input-loader flake-input-loader
 ../../std/cargo cargo
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../lib lib

@@ -1,0 +1,13 @@
+# tests/deep-deps, as an ENTRY (design/caos-expr.md, Phase 3): running this test is
+# evaluating this directory.
+#
+# A CLIENT TEST — it drives `caos-cli`, so its base is `DEEP-DEPS/lib`
+# (tests/lib), the image that stages a git worktree and then runs `worker1`.
+# DEPping on `lib` is the greppable marker of which tests are client tests.
+#
+#   --test  this directory itself, staged into the repo as ./test with its
+#           DEEP-DEPS alongside. `--test:@=.` is inert by construction:
+#           `strip_caos_expr` removes this file from the tree before the
+#           expression is evaluated against it, so nothing recurses.
+#   --cli   the client under test; --salt is what makes --test-salt re-run this
+run --base:@=DEEP-DEPS/lib --worker1:@=worker.sh --test:@=. --cli:@=cli --salt:@=salt
