@@ -162,8 +162,8 @@ fanout)
         # THE ONLY TEST LEFT THAT NEEDS THE WHOLE TREE. cargo-self and unit-*
         # used to be here; they now DECLARE what they compile (`../../rust`) and
         # are self-contained. std-lint cannot: `lint-flake-src.sh` checks that the
-        # flake's src filter drops nothing the crates embed, and `refresh.sh
-        # --check` re-derives every checked-in lock from the root one — both are
+        # flake's src filter drops nothing the crates embed, and lint-bake-anchor
+        # checks every std tool's crates.io deps against the anchor — both are
         # ABOUT the whole tree, and linting a declared subset of it would pass
         # exactly the way the githist embeds did.
         #

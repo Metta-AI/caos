@@ -1,5 +1,6 @@
 # tests/lib's image (design/caos-expr.md, Phase 3): this directory is a flake
-# (flake.nix + flake.lock + worker), so its image is the flake-builder applied
+# (flake.nix + worker, with the lock DEPped and bound below), so its image is
+# the flake-builder applied
 # to the directory itself — the same shape as every std entry. It names the
 # builder by a LOCAL deep-deps mount, the only way anything here can name a
 # builtin.
@@ -9,4 +10,4 @@
 # dev/run-tests' fan-out skips directories with no `.caos-expr`; this one has
 # one, so the skip is not what keeps it out of the suite — it has no `worker1`
 # of its own to run, and nothing maps over it.
-run --base:@=DEEP-DEPS/flake-builder --in:@=.
+run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock

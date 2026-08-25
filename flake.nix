@@ -448,8 +448,8 @@
             linuxPkgs.bashInteractive
             linuxPkgs.coreutils
             # cmp/diff: the tests compare cached results byte for byte, and
-            # std/refresh.sh --check re-derives and diffs every checked-in
-            # std copy. This image is the environment every test runs in.
+            # lint-flake-src.sh and lint-bake-anchor.sh diff and grep. This
+            # image is the environment every test runs in.
             linuxPkgs.diffutils
             linuxPkgs.gnugrep
             linuxPkgs.gnused

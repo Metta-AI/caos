@@ -16,7 +16,7 @@
   # /usr/bin/env). /worker included.
   #
   # This directory IS the published tree (literal trees, part 2): flake.nix,
-  # flake.lock (derived from the main flake.lock by std/refresh.sh), worker —
+  # worker (the lock is DEPped from the repo root and placed by the flake-builder) —
   # build-builtins.sh copies it whole, and tests/std-lint verifies the
   # checked-in redundancies.
   description = "caos std/merge — the git-bearing merge worker: /worker three-way-merges two commits";

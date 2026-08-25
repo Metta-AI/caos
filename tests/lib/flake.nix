@@ -31,8 +31,10 @@
   # client test drives caos through a repo it stages itself. An absent binary
   # here is exit 127 at runtime, not a build error, so the list errs generous.
   #
-  # This directory IS the published tree (literal trees): flake.nix, flake.lock
-  # (derived from the main flake.lock by std/refresh.sh), worker.
+  # This directory IS the published tree (literal trees): flake.nix,
+  # worker. The lock is NOT here: it is DEPped from the repo root and placed by
+  # the flake-builder, so there is one lock in the tree rather than a copy per
+  # flake and a lint to keep the copies honest.
   description = "caos tests/lib — the image a CLIENT test runs in: a git worktree, the tested client, and the tools a test script shells out to";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

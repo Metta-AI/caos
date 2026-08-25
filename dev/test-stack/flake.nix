@@ -53,8 +53,10 @@
   # userland", learned by way of a missing `gawk`, since coreutils has no awk.
   # An absent binary here is exit 127 at runtime, not a build error.
   #
-  # This directory IS the published tree (literal trees): flake.nix, flake.lock
-  # (derived from the main flake.lock by std/refresh.sh), worker.
+  # This directory IS the published tree (literal trees): flake.nix,
+  # worker. The lock is NOT here: it is DEPped from the repo root and placed by
+  # the flake-builder, so there is one lock in the tree rather than a copy per
+  # flake and a lint to keep the copies honest.
   description = "caos dev/test-stack — the image a caos build or test runs in: nix, a stack userland, and the grants for both";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

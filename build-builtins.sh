@@ -359,19 +359,34 @@ if [ -n "$runner_delta" ]; then
   done
 fi
 
-declare -A undeepened staged_sources
+declare -A undeepened staged_sources is_file_dep
 
-# Stage a checked-in source dir into CLIENT and record its tree by dependency
-# name. Most are std/<name>; a DEPS path may point at source elsewhere.
-# `cp -RL`: PROJECT may be an image layout of SYMLINKS into the nix store (the
-# test stack); dereference so what is published is the content.
-stage_source() { # <name> <source-dir>
-  local name=$1 source_dir=$2
+# Stage a checked-in source into CLIENT and record it by dependency name. Most
+# are std/<name> directories; a DEPS path may point at source elsewhere, and
+# since deep-deps mounts a FILE dependency as-is (crates/worker-deep-deps), it
+# may also point at a file — the shared `flake.lock` every flake entry now
+# names instead of carrying a copy.
+#
+# `cp -RL`/`cp -L`: PROJECT may be an image layout of SYMLINKS into the nix
+# store (the test stack); dereference so what is published is the content.
+stage_source() { # <name> <source>
+  local name=$1 source=$2
   rm -rf "${CLIENT:?}/$name"
-  cp -RL "$source_dir" "$CLIENT/$name"
-  chmod -R u+w "$CLIENT/$name" # PROJECT may be a read-only store copy (caosd)
-  git -C "$CLIENT" add "$name"
-  undeepened[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
+  if [ -d "$source" ]; then
+    cp -RL "$source" "$CLIENT/$name"
+    chmod -R u+w "$CLIENT/$name" # PROJECT may be a read-only store copy (caosd)
+    git -C "$CLIENT" add "$name"
+    undeepened[$name]=$(git -C "$CLIENT" write-tree --prefix="$name/")
+  else
+    # A FILE dep is a blob, not a tree: there is no `write-tree --prefix` for
+    # one, and nothing under it to deepen. Recorded as its blob oid, and
+    # emitted by deepen_entry as `100644 blob` — which is what the worker's
+    # `link()` + `caos put` produces for the same file.
+    cp -L "$source" "$CLIENT/$name"
+    chmod u+w "$CLIENT/$name"
+    undeepened[$name]=$(git -C "$CLIENT" hash-object -w "$CLIENT/$name")
+    is_file_dep[$name]=1
+  fi
   staged_sources[$name]=1
 }
 
@@ -379,19 +394,20 @@ stage_source() { # <name> <source-dir>
 # participates in the caller's deepened cache key, so bootstrap must stage it
 # before deepen_entry recurses into it. Follow paths from the declaring source
 # directory, like deep-deps, instead of maintaining a second name list.
-stage_source_closure() { # <name> <source-dir>
-  local name=$1 source_dir=$2 dep_path mount
+stage_source_closure() { # <name> <source>
+  local name=$1 source=$2 dep_path mount
   if [ -n "${staged_sources[$name]:-}" ]; then return; fi
-  stage_source "$name" "$source_dir"
-  if [ -f "$source_dir/DEPS" ]; then
+  stage_source "$name" "$source"
+  # A file has no DEPS to follow.
+  if [ -f "$source/DEPS" ]; then
     while read -r dep_path mount; do
       if [ -n "$dep_path" ]; then
         case "$dep_path" in
           \#*) ;;
-          *) stage_source_closure "$(basename "$dep_path")" "$source_dir/$dep_path" ;;
+          *) stage_source_closure "$(basename "$dep_path")" "$source/$dep_path" ;;
         esac
       fi
-    done < "$source_dir/DEPS"
+    done < "$source/DEPS"
   fi
 }
 
@@ -430,12 +446,23 @@ deepen_entry() { # <name> -> deepened tree hash (stdout)
   else
     # DEEP-DEPS/<mount> = deepened(declared path). DEPS lines are
     # `<path> <name>`; comments/blank lines skipped. mktree sorts.
-    local dd_lines="" dep_path mount
+    local dd_lines="" dep_path mount dep_name
     while read -r dep_path mount; do
       if [ -n "$dep_path" ]; then
         case "$dep_path" in
           \#*) ;;
-          *) dd_lines+="040000 tree $(deepen_entry "$(basename "$dep_path")")"$'\t'"$mount"$'\n' ;;
+          # A FILE dep is mounted as-is, matching the worker: there is nothing
+          # under it to deepen. `100644 blob` is what `link()` + `caos put`
+          # record for a plain file, and a mode disagreement here would be a
+          # seed key that no caller ever forms.
+          *)
+            dep_name=$(basename "$dep_path")
+            if [ -n "${is_file_dep[$dep_name]:-}" ]; then
+              dd_lines+="100644 blob ${undeepened[$dep_name]}"$'\t'"$mount"$'\n'
+            else
+              dd_lines+="040000 tree $(deepen_entry "$dep_name")"$'\t'"$mount"$'\n'
+            fi
+            ;;
         esac
       fi
     done < <(git -C "$CLIENT" cat-file blob "$deps_oid")

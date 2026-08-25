@@ -5,4 +5,4 @@
 # since nothing resolves a builtin by name. Resolving this entry evaluates the
 # expression, which makes the flake→image step explicit rather than leaving it
 # to the server to detect.
-run --base:@=DEEP-DEPS/flake-builder --in:@=.
+run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock

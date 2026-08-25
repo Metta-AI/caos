@@ -50,7 +50,13 @@ orchestrate)
   # the image THIS run already resolved to — the flake-builder delta — so the
   # self-reference is a plain image ref (design/caos-expr.md: a worker reaches
   # its own image at /cas/args/base to call itself).
-  build=$(caos curry --base:@=/cas/args/base --stage=build) || fail "currying build"
+  # `--lock` is FORWARDED, not inherited: /cas/args/base is the reserved base
+  # entry — this image — not this job's ArgTree, so a curry onto it carries none
+  # of what the caller bound alongside it.
+  fwd=()
+  if [ -e /cas/args/lock ]; then fwd+=(--lock:@=/cas/args/lock); fi
+  build=$(caos curry --base:@=/cas/args/base --stage=build "${fwd[@]}") \
+    || fail "currying build"
   stack=$(caos curry --base:@=/cas/args/base --stage=stack) || fail "currying stack"
   caos run-then /cas/args/in --run:hash="$build" --then:hash="$stack"
   ;;
@@ -58,11 +64,31 @@ orchestrate)
 build)
   caos get -r /cas/args/in
   [ -e /cas/args/in/flake.nix ] || fail "no flake.nix in the flake tree"
-  [ -e /cas/args/in/flake.lock ] || fail "no flake.lock in the flake tree"
   mkdir /tmp/ws
   cp -rL /cas/args/in/. /tmp/ws/
 
+  # THE LOCK MAY BE BOUND RATHER THAN CHECKED IN, so a tree of flakes can share
+  # ONE lock — declared with a `DEPS` line and named by the entry's expression
+  # (`--lock:@=DEEP-DEPS/flake.lock`) — instead of every entry carrying a copy
+  # derived from the same source and a lint to keep the copies honest.
+  #
+  # nix does not mind a SUPERSET: handed a lock naming inputs this flake does
+  # not declare, it resolves the ones it does and prunes the rest ("Removed
+  # input 'rust-overlay'"), rewriting only its own copy under /tmp/ws.
   H=$(caos hash /cas/args/in) || fail "hashing the flake tree"
+  if [ -e /cas/args/lock ]; then
+    caos get /cas/args/lock || fail "reading the bound --lock"
+    cp -L /cas/args/lock /tmp/ws/flake.lock
+    # THE TAG MUST MOVE WITH THE LOCK. It is a registry name derived from the
+    # flake tree, and with the lock outside that tree a bump would leave the
+    # tree — and so the tag — unchanged, and this would serve the image built
+    # against the OLD pins. Fold both in. Unbound, the tag is exactly what it
+    # always was, so nothing that already carries its own lock re-keys.
+    L=$(caos hash /cas/args/lock) || fail "hashing the bound --lock"
+    H=$(printf '%s %s' "$H" "$L" | sha1sum | cut -d' ' -f1)
+  fi
+  [ -e /tmp/ws/flake.lock ] \
+    || fail "no flake.lock: the flake tree carries none and no --lock was bound"
   tag="caos-registry:5000/caos:flake-$H"
   # Single-user, unsandboxed nix: root in a container with no nixbld group and
   # no privilege to build a sandbox.
