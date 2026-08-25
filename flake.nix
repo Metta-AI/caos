@@ -248,6 +248,37 @@
           }
         );
 
+        # The same workspace, stamped for the TEST world (crates/caos-world).
+        # A dev stack is built from this; the host's is built from the above, so
+        # a client of one is refused by the other's server.
+        #
+        # IT HAS TO BE A SECOND COMPILE, and that is not a design choice here:
+        # the tag is `option_env!`, read by rustc, because caos-world explains
+        # why it cannot be read at runtime — the interpreter exports its
+        # environment into `worker1`, so an env-carried tag would travel with it
+        # and declare the wrong binary correct. The tag is a property of the
+        # ARTIFACT, so two worlds are two artifacts.
+        #
+        # WHAT IT DOES NOT DUPLICATE IS THE EXPENSIVE HALF. `cargoArtifacts` is
+        # `buildDepsOnly commonArgs`, and this adds nothing to `commonArgs` — so
+        # the ~176 dependencies are one derivation shared by both worlds, and
+        # only the thin workspace compile happens twice. caos-tools/build's own
+        # guard measured that split: the deps are 12.6s of a 15.0s cold build,
+        # the workspace alone 2.4s.
+        #
+        # Do NOT move the stamp into `commonArgs` to "share more". It would land
+        # in the dependency key and rebuild all of them per world, which is the
+        # exact opposite of the intent.
+        testWorkspaceBins = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "--workspace";
+            doCheck = false;
+            CAOS_WORLD = "test";
+          }
+        );
+
         # Every crate's binary is selected (by name, at copy time) from the one
         # build above, so these are all the same derivation. The generic `caos`
         # worker and the user-facing `caos-cli` are separate Cargo
@@ -548,6 +579,7 @@
             Env = stackEnv;
           };
         };
+
 
 
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
@@ -956,8 +988,9 @@
                 if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
                   echo "$NAME"
                 fi
+                # A dev stack is a WORKER now, so runnerd's own label covers it —
+                # there is no separate caos.test-stack label to look for.
                 docker ps --filter label=caos.runnerd.owner --format '{{.Names}}'
-                docker ps --filter label=caos.test-stack --format '{{.Names}}'
               )
               if [ -n "$running" ]; then
                 echo "caosd image-cleanup: CAOS is still running:" >&2
@@ -1062,6 +1095,7 @@
                   -e CAOS_STACK_REDIS_PORT=6379 \
                   -e CAOS_STACK_REDIS_PERSIST=yes \
                   -e CAOS_STACK_REGISTRY=yes \
+                  -e CAOS_STACK_REDIS=yes \
                   -e CAOS_STACK_RUNNERD=yes \
                   -e CAOS_STACK_SEEDER=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
@@ -1137,6 +1171,9 @@
           # binaries stay available as `.#caos`.
           default = caos-tools;
           inherit caos server runnerd caos-cli caosd caos-tools;
+          # The workspace stamped for the TEST world — what dev/stack-up builds
+          # a dev stack from, so a host client cannot drive it (and vice versa).
+          caos-test-world = testWorkspaceBins;
           # Agent-harness worker binaries (run as curry(runner, bin)).
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc

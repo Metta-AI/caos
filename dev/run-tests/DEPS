@@ -1,0 +1,11 @@
+# What this job needs, by PATH (format `<path> <name>`, relative to this dir).
+#
+# test-stack  the image this fan-out itself runs in. It is the tools' image, so
+#             this script inherits nix and the grants — which it does not use,
+#             but running the orchestrator somewhere else would mean a third
+#             image for no gain.
+# run-test    named so the entry is present for `eval-path-then --eval=` to
+#             resolve into the image each TEST runs in. That one carries no
+#             grants, which is the whole reason it is separate.
+../../dev/test-stack test-stack
+../../dev/run-test run-test

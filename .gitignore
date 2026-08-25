@@ -4,3 +4,4 @@
 .direnv/
 /.caos-dev/
 /.caos-data/
+/.caos-secrets/

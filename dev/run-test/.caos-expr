@@ -1,0 +1,9 @@
+# dev/run-test's image (design/caos-expr.md, Phase 3): this directory is a flake
+# (flake.nix + flake.lock + run-test.sh), so its image is the flake-builder
+# applied to the directory itself. The script IS the image's `/worker`, so
+# evaluating this entry yields something a map can run directly — no `worker1`
+# to curry, and no second place for the harness to live.
+#
+# It names the builder by a LOCAL deep-deps mount, since nothing resolves a
+# builtin by name.
+run --base:@=DEEP-DEPS/flake-builder --in:@=.

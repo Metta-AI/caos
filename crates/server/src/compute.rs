@@ -157,6 +157,18 @@ fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
 /// `"<type> <hash>"`. The whole pipeline behind both `GET /run` and promise
 /// sub-runs: cache lookup → run-cycle detection → the container run → promise
 /// resolution → cache store → top-level result publication.
+/// The redis key an ArgTree's result is cached under.
+///
+/// Unprefixed when no namespace is configured, so a deployment that sets nothing
+/// keeps the keys it already has and nothing has to be migrated.
+fn result_key(config: &Config, arg_tree: &str) -> String {
+    if config.cache_namespace.is_empty() {
+        format!("caos:result:{arg_tree}")
+    } else {
+        format!("caos:result:{}:{arg_tree}", config.cache_namespace)
+    }
+}
+
 fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, HttpError> {
     let WorkRequest {
         arg_tree,
@@ -173,12 +185,14 @@ fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, Ht
     }
 
     // The ArgTree hash is the cache key (it captures image, std, salt and every
-    // other arg); the value is
+    // other arg), NAMESPACED by the stack — see `Config::cache_namespace`, which
+    // covers the one thing the ArgTree cannot: which build of caos produced the
+    // answer. The value is
     // the final result "<type> <hash>" — a promise is resolved before it's cached,
     // so a hit never re-resolves. A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
-    let key = format!("caos:result:{arg_tree}");
-    match cache_get(&config.redis_addr, &key) {
+    let key = &result_key(config, arg_tree);
+    match cache_get(&config.redis_addr, key) {
         Ok(Some(result)) => {
             eprintln!("cache hit: arg_tree={arg_tree} -> {result}");
             let outcome = complete_cache_hit(arg_tree, stack, result, |result| {
@@ -222,28 +236,27 @@ fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, Ht
     // errors cleanly. An owner guard clears and broadcasts if its thread
     // unwinds; a waiter never promotes itself merely because a valid run is
     // slow, since duplicate execution may repeat external side effects.
-    let (outcome, owner) =
-        match claim_flight_after_miss(arg_tree, stack, || cache_get(&config.redis_addr, &key)) {
-            FlightDisposition::Run(owner) => {
-                (run_dispatch(config, request, &image, &salt, &key), owner)
+    let (outcome, owner) = match claim_flight_after_miss(arg_tree, stack, || {
+        cache_get(&config.redis_addr, key)
+    }) {
+        FlightDisposition::Run(owner) => (run_dispatch(config, request, &image, &salt, key), owner),
+        FlightDisposition::Complete {
+            outcome,
+            cache_hit,
+            owner,
+        } => {
+            // A hit HERE is the post-claim re-read catching a result that
+            // landed while this arrival was between its own miss and the
+            // flight — the near-duplicate the re-read exists to prevent.
+            // Logged beside the ordinary hit/miss lines because it is the
+            // only place that saving is visible; the trace records nothing
+            // for it, since this arrival performed no work.
+            if cache_hit {
+                eprintln!("cache hit after claiming the flight: arg_tree={arg_tree}");
             }
-            FlightDisposition::Complete {
-                outcome,
-                cache_hit,
-                owner,
-            } => {
-                // A hit HERE is the post-claim re-read catching a result that
-                // landed while this arrival was between its own miss and the
-                // flight — the near-duplicate the re-read exists to prevent.
-                // Logged beside the ordinary hit/miss lines because it is the
-                // only place that saving is visible; the trace records nothing
-                // for it, since this arrival performed no work.
-                if cache_hit {
-                    eprintln!("cache hit after claiming the flight: arg_tree={arg_tree}");
-                }
-                (outcome, owner)
-            }
-        };
+            (outcome, owner)
+        }
+    };
     let outcome = match owner {
         // Any top-level participant marks the shared flight for publication,
         // even when its executor entered as a promise sub-run. The owner keeps

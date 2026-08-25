@@ -274,18 +274,22 @@ While the cli is running something with `run` or `run-tool`, it uses `/status` t
 Caos can be built and tested on a host with just what's defined in flake.nix with ordinary commands like:
 - `nix build`
 - `result/bin/caosd up`
-- `result/bin/caos-cli run dev/run-tests` (`dev/run-tests` is a caos expr that depends on /tests and runs them all)
+- `result/bin/caos-cli run dev/run-tests` (`dev/run-tests` is a caos expr that depends on /tests and runs them all on the current stack. If you run this on the host, you use the host stack. But the world test might fail. The normal usage inside the test container.)
 
-The build and test tools use `dev/run-in-test-container <command>` to run the build steps in a container to enable more caching than they could get in a normal worker container:
-- Uses `nix eval --raw .#<x>.outPath` to determine the name of the stack that we are building. `x` is a new derivation that includes all of the workspace bins and anything else needed to run the stack
-- Uses flock to make sure that only one instance of the command runs at a time
-- Mounts the nix store and socket (to cache build products), the docker socket (to cache images) and a volume for git and redis data. The volume is a directory on the host that shares the stack name
+The build and test tools use `dev/test-stack --tree=<hash> --command=<command>` to run the build steps in a worker. The goal is isolation from the host stack, with enough caching to make this fast. test-stack is a worker that:
+- Mounts a persistent volume at /mounted-nix, copies anything missing in /mounted/nix/store from /nix/store and then mounts /mounted-nix at /nix
+- Mounts the docker socket (to cache images) and a volume for git (single directory on the host is shared for between all test stacks). It uses the host's redis since we want to share the caches between stacks but can't have multiple redis proccesses using the same files
+- Runs `caos get -r <hash>` to fetch the requested tree #todo still working on this
 - Runs the provided command in the container and exists with the exit code of the command
 - Uses --rm to remove the container after it exits
 
+We use a single short-lived test worker with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
+
 The build and tools are:
-- `caos-tools/build`: `run-in-test-container "nix build"`
-- `caos-tools/test`: `run-in-test-container "nix build && .../caosd up && .../caos-cli run dev/run-tests"`
+- `caos-tools/build <tree-oid>`: `run-in-test-container  --tree=<treeoid> --command="nix build"`
+- `caos-tools/test <tree-oid>`: `run-in-test-container --tree=<treeoid> --command="nix build && .../caosd up && .../caos-cli run dev/run-tests"`
+
+There should be exactly one copy of the code that starts a stack and builds the built-ins
 
 # Misc
 

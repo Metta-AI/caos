@@ -6,7 +6,7 @@
 #
 # The counterpart to caos-tools/test/worker.sh's report. A test's record —
 # {verdict, seconds, output, server.log, runnerd.log, ...} — already rides in
-# the suite result (tests/lib/run-test.sh writes it), so nothing here re-runs
+# the suite result (dev/run-test/run-test.sh writes it), so nothing here re-runs
 # anything: this is a READ, addressed by hash, of a tree the suite already
 # published. That is why the report can afford to be short.
 #

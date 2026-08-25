@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a test stack (tests/lib/run-test.sh).
+# set, INSIDE a test stack (dev/run-test/run-test.sh).
 #
 # The worker schedules its own in-flight ArgTree. If sub-run waited for the
 # result, the request would deadlock on itself. The server instead admits it

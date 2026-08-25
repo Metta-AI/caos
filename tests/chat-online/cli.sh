@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # One REAL turn against the live Anthropic API — the one check the stub suites
 # structurally can't make: only the live API rejects a bad model choice (e.g.

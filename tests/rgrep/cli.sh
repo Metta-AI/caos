@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # Exercises the rgrep worker directly (no LLM in the loop): a recursive grep
 # fold — one job per directory, results a SPARSE TREE (only matching files,

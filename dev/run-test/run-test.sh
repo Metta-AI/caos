@@ -75,10 +75,37 @@ fail() {
 # by the interpreter. Everything else a test runs on is in the image, which IS
 # the tree under test.
 
+# MATERIALIZE THE WRAPPER FIRST. Args arrive as lazy placeholders that are
+# owner-only until fetched, so reading one without this gets "Permission
+# denied" on a directory that looks like it is right there.
+#
+# This script does it because this script is the image's `/worker` now. It used
+# to arrive already materialized: the test-stack interpreter ran
+# `caos get -r /cas/args` before handing off to it, and that interpreter was
+# deleted along with the image it interpreted.
+caos get -r /cas/args/in || fail "materializing this test's wrapper"
+
 TEST=/cas/args/in/test
 [ -d "$TEST" ] || fail "no test tree at $TEST
   /cas/args:    $(ls -A /cas/args 2>&1 | tr '\n' ' ')
   /cas/args/in: $(ls -A /cas/args/in 2>&1 | tr '\n' ' ')"
+
+# THE TESTED CLIENT, from this test's own wrapper. It used to come from the
+# environment, set by the test-stack image's interpreter — which is gone, along
+# with the image: a test is now an ordinary worker on the dev stack, and the
+# thing that makes it a TEST of this tree rather than of some ambient caos is
+# that the client it drives rode in as a content-addressed arg. So a test
+# re-keys when the client changes, which is the property a suite exists to have.
+#
+# INSTALLED, not run in place: materialized CAS content is read-only and
+# owner-only, so exec'ing straight out of /cas is "Permission denied".
+caos get /cas/args/in/cli || fail "no tested client in this wrapper"
+install -m 755 /cas/args/in/cli /tmp/caos-cli || fail "installing the tested client"
+CAOS_CLI=/tmp/caos-cli
+export CAOS_CLI
+# CAOS_SERVER_URL is runnerd's, and runnerd here is the DEV stack's — so it
+# already points at the stack under test. Nothing to flip.
+: "${CAOS_SERVER_URL:?run-test needs CAOS_SERVER_URL from the runner}"
 
 # The client repo the test's cli.sh snapshots from, staged exactly as
 # tests/run.sh does: the test tree's contents at ./test.
@@ -89,27 +116,22 @@ git config user.name caos
 git config gc.auto 0
 git remote add caos "$CAOS_SERVER_URL"
 
-# The seed repo as an ALTERNATE object store, so the client can READ objects it
-# references but never fetched.
+# NO ALTERNATE OBJECT STORE, and if a push here ever dies unable to read an
+# object, this is the first place to look.
 #
-# A client pushes a request by walking the arg tree's closure, and git can only
-# skip an object the remote advertises by traversing that ref LOCALLY. The arg
-# tree's `image` is a RESOLVED image the client got back as a hash from a
-# server-side run — for a rustc-built tool that is `curry(runner, …)`, whose base
-# is the runner delta. The client has the hash and not the objects, so the push
-# dies on the first one it cannot read.
+# There used to be one: `/tmp/seed-git/objects`, the repo the old test-stack
+# interpreter fetched a wrapper's deps into. It existed because a client pushes
+# a request by walking the arg tree's closure, and git can only skip an object
+# the remote advertises by traversing that ref LOCALLY — so a client holding a
+# resolved image's HASH but not its objects died on the first one it could not
+# read.
 #
-# (This was first blamed on `std` riding in every arg tree. That was wrong:
-# removing the `std` arg did not fix it, because the image closure is a separate
-# path to the same missing objects.)
-#
-# The objects are already on this filesystem: /tmp/seed-git is what the
-# interpreter fetched the wrapper's deps and seed records into. Pointing at it
-# moves no bytes, and stays honest about the subset — the seed repo holds exactly
-# what this test declared.
-if [ -d /tmp/seed-git/objects ]; then
-  echo /tmp/seed-git/objects > /tmp/client/.git/objects/info/alternates
-fi
+# Two things changed. There is no interpreter to fetch that repo, and the stack
+# a test pushes to is the dev stack, which already holds every object it
+# resolved. So the alternate has nothing to add — and CLAUDE.md is explicit that
+# it also SUBTRACTS: it hides object-availability bugs, and `tests/push-closure`
+# had to delete it to reproduce at all. Starting without one means that test is
+# doing its job again.
 
 # Tests that dogfood the workspace (cargo-self) get it in their wrapper as
 # the git repo their cli.sh snapshots via $CAOS_PROJECT.
@@ -232,10 +254,11 @@ case "$rc" in
 esac
 echo $((SECONDS - t0)) > /tmp/out/seconds
 
-# The COMPLETE record rides in the result tree — the test's full output and
-# the inner stack's logs — so the suite result holds everything a debugger,
-# human or agent, would want to read. No streaming, no archaeology: address
-# the byte you need by path.
+# The COMPLETE record rides in the result tree — the test's full output — so
+# the suite result holds everything a debugger, human or agent, would want to
+# read. No streaming, no archaeology: address the byte you need by path. The
+# stack's own logs are NOT here any more: there is one dev stack shared by the
+# suite, so its log is the stack's to keep, not each test's to copy.
 cp /tmp/test.out /tmp/out/output
 # `phases` is the interpreter's clock for everything BEFORE this script ran —
 # arg materialization, finding the stack, fetching deps. None of it is in the
@@ -248,3 +271,8 @@ for log in server runnerd redis serve phases; do
   cp "/tmp/$log.log" "/tmp/out/$log.log"
 done
 
+
+# THE RESULT, published here rather than by an interpreter. This script is the
+# image's `/worker` now, so there is nothing above it in the container to do
+# this — that was `test-stack/worker`'s last job before it was deleted.
+caos put /tmp/out /cas/out

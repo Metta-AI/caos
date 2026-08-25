@@ -1,0 +1,12 @@
+# dev/run-tests (SPEC, "Building and testing caos, including inside caos"): the
+# suite, as a job ON THE DEV STACK.
+#
+# One image for the fan-out and for every test it maps over — which is what the
+# suite has always done: the old fan-out curried run-test.sh onto the test stack
+# image itself. A test's needs are a superset of this script's, so a second
+# image would only be a second thing to keep in step.
+#
+# The docs live here rather than in the script because a `.caos-expr` is
+# STRIPPED from the tree it is evaluated against, so editing them re-keys this
+# job and nothing it runs.
+curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh

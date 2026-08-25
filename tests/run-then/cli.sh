@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # Exercises run-then — the single-valued map-then (the continuation
 # `{in, run?, then?, catch?}`): a plain tail call (--run only), the sub-run's

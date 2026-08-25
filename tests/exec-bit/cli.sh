@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # Proves git's executable bit round-trips through the worker CAS as METADATA,
 # not as a placeholder permission: it is recorded on the placeholder (an xattr)

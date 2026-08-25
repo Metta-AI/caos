@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # `cargo doc` over the workspace, per-crate (mode=all) — the same
 # decomposition as unit-test and unit-clippy. `-D warnings` is applied

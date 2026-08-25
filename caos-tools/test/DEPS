@@ -1,5 +1,5 @@
-# This tool's worker image: the script runs on std/bash, named by a local
-# deep-deps mount (design/caos-expr.md). The root expression deepens the repo,
-# so `DEEP-DEPS/bash` exists in the tree this directory's `.caos-expr` is
-# evaluated against.
-../../std/bash bash
+# This tool's worker image: dev/test-stack — nix, a stack userland, and the two grants
+# a dev stack needs (persistent volumes and the engine socket). std/bash cannot
+# serve: a grant is read from the image's own config, so a tool that stands a
+# stack up needs an image that declares it.
+../../dev/test-stack test-stack

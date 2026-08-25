@@ -18,4 +18,4 @@ stack under test is compiled from these sources, inside workers.
 @param [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys the tests and nothing else.
 @param [only] Run only these tests — a space-separated list of tests/<name> directories.
 END
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
+curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh --help=$HELP

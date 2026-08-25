@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
 # discovers them per round from the CURRENT workspace — each is a DIRECTORY

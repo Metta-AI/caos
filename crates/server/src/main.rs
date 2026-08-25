@@ -82,6 +82,26 @@ struct Config {
     registry_push_url: String,
     registry_pull_host: String,
     redis_addr: String,
+    /// What this stack's cache keys are prefixed with, so several stacks can
+    /// share one redis without answering each other's questions.
+    ///
+    /// THE ARGTREE IS NOT ENOUGH ON ITS OWN, and that is the point. It captures
+    /// the image, std, salt and every arg — everything the WORK depends on —
+    /// but not the caos that ran it. Where a server's behaviour changes without
+    /// any of those moving, a stale entry is served as a hit: CLAUDE.md records
+    /// the observed case, a rebuilt `caos` binary leaving a seeded sentinel's
+    /// key unmoved so redis hands back the previous deploy's worker image. Any
+    /// value that identifies the build closes that, and folding it into the KEY
+    /// beats invalidating entries — nothing has to be deleted, so nothing has to
+    /// be deleted correctly.
+    ///
+    /// It is also what lets two stacks built from different trees run at once
+    /// against one redis: their namespaces differ because their builds do, with
+    /// no coordination and nothing host-specific in a key.
+    ///
+    /// Empty (the default) means no prefix at all, so a deployment that sets
+    /// nothing keeps exactly the keys it has today.
+    cache_namespace: String,
     /// Filesystem path to the git object database, passed to `git http-backend`
     /// as `GIT_PROJECT_ROOT` for the smart-HTTP transport (see [`mod git`]).
     git_dir: String,
@@ -256,6 +276,7 @@ fn main() {
         registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
         registry_pull_host: env_or("CAOS_REGISTRY_PULL_HOST", DEFAULT_REGISTRY_PULL_HOST),
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
+        cache_namespace: env_or("CAOS_CACHE_NAMESPACE", ""),
         git_dir,
         repo,
     });

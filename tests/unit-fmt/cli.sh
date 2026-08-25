@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# (dev/run-test/run-test.sh).
 #
 # `cargo fmt --all --check` over the workspace. Flat, not --mode=all:
 # formatting is syntactic, so there is no dep graph to decompose over and

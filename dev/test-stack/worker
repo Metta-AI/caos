@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# dev/test-stack/worker — the interpreter for the image a caos build or test runs in.
+#
+# std/bash's contract, plus one thing before it: give this container a nix store
+# that OUTLIVES it, so a second build is incremental rather than starting from
+# nothing.
+#
+# HOW THE STORE IS SWAPPED, and why it is this and not something simpler:
+#
+#   1. copy anything the image has that the volume does not
+#   2. dump the image's nix database
+#   3. `mount --bind` the volume over /nix — ONE operation, atomic
+#   4. load the dumped database into the volume's
+#
+# STEP 3 IS A BIND MOUNT because nothing else can do it. A volume and the
+# container's overlay are different filesystems (measured: device 178 against
+# 37), so `rename` and `renameat2(RENAME_EXCHANGE)` are both EXDEV. And a
+# two-step `mv` + `ln -s` cannot work at all: every binary here is a symlink into
+# /nix/store, including `ln` itself, whose ELF interpreter
+# (…-glibc/lib/ld-linux-x86-64.so.2) is under the path being replaced — so the
+# `ln` that would finish the job cannot start once the `mv` has run. Tested:
+# `mv /nix /nix.image` is immediately followed by `ln: command not found`.
+#
+# A bind mount has no such window. The processes already running keep the files
+# they have open; the next exec resolves through the new mount, which by then
+# holds everything the old one did. It needs CAP_SYS_ADMIN, which this image
+# declares (CAOS_GRANT_SYS_ADMIN) and runnerd grants per-image.
+#
+# STEP 4 IS NOT OPTIONAL. A store is not its directory: nix trusts
+# /nix/var/nix/db, and a path present on disk but absent from the db is a path it
+# considers invalid and will happily build again. So the whole of /nix moves,
+# not just /nix/store — and because `cp -n` will not overwrite the volume's own
+# db with the image's, the two are MERGED by dump-and-load instead. Without that,
+# a newer image's store paths would land on disk unregistered and be rebuilt,
+# which is the failure this whole mechanism exists to avoid.
+set -euo pipefail
+
+if [ -d /mounted-nix ]; then
+  # -n: the volume's copy wins. It is the newer truth — it has whatever previous
+  # runs built — and the image only ever supplies what is missing.
+  cp -an /nix/. /mounted-nix/ 2>/dev/null || true
+  nix-store --dump-db > /tmp/image-db.dump 2>/dev/null || : > /tmp/image-db.dump
+  mount --bind /mounted-nix /nix \
+    || { echo "test-stack: cannot bind the persistent store over /nix (CAP_SYS_ADMIN?)" >&2; exit 1; }
+  # Registers the image's paths in the volume's db. Harmless when they are
+  # already there, which is the common case.
+  nix-store --load-db < /tmp/image-db.dump 2>/dev/null || true
+fi
+
+# std/bash's contract from here: fetch the next executable in the chain and run
+# it; on exit caos reads the hash of /cas/out. If the script left no result
+# there, store an empty blob so there is something to read.
+caos get /cas/args/worker1
+bash /cas/args/worker1
+if [ ! -e /cas/out ]; then
+  : > /tmp/caos-empty-out
+  caos put /tmp/caos-empty-out /cas/out
+fi

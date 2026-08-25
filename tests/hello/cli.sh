@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE a test stack — the suite's per-test job (tests/lib/run-test.sh).
+# INSIDE a test stack — the suite's per-test job (dev/run-test/run-test.sh).
 #
 # `std/hello` is what a person runs to check that a caos installation works, so
 # what this pins down is the PROPERTY that makes it useful for that: one

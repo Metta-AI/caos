@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE a test stack — the suite's per-test job (tests/lib/run-test.sh).
+# INSIDE a test stack — the suite's per-test job (dev/run-test/run-test.sh).
 #
 # A CLIENT MUST BE ABLE TO PUSH A REQUEST IT IS ABLE TO FORM.
 #
@@ -22,9 +22,9 @@
 #     yields the runner-pool image, which NO advertised ref reaches. git has to
 #     pack it, cannot read it, and dies on `bad tree object <oid>`.
 #
-# Hence rgrep here rather than bash. The harness normally hides all of this by
-# handing each client an ALTERNATE object store (tests/lib/run-test.sh →
-# /tmp/seed-git); dropping it leaves exactly the state a host repo is in.
+# Hence rgrep here rather than bash. The old harness hid all of this by handing
+# each client an ALTERNATE object store; the dev-stack harness hands out none,
+# so a client is already in exactly the state a host repo is in.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -34,31 +34,21 @@ state() { # <oid> -> absent | partial | complete
   if git rev-list --objects "$1" >/dev/null 2>&1; then echo complete; else echo partial; fi
 }
 
-alt=.git/objects/info/alternates
-[ -e "$alt" ] \
-  || fail "this client has no alternate; the fixture's assumption about tests/lib/run-test.sh is stale"
-
-# OWN WHAT THIS REPO TRACKS, before taking the alternate away.
+# NO ALTERNATE TO REMOVE ANY MORE, and that is the point rather than a gap.
 #
-# The harness stages `DEEP-DEPS/**` with the alternate INSTALLED
-# (tests/lib/run-test.sh), so git skips writing any blob the seed store already
-# holds: the `testtree` commit references objects this repo does not own —
-# measured, every run. Removing the alternate then leaves them unreadable, and
-# the failure surfaces wherever something first NEEDS one, naming an object with
-# no bearing on this test. All three of these were reproduced here: `git commit`
-# dying in write-tree (`invalid object … Error building trees`), `git commit`
-# dying on `bad tree object HEAD` (it reads HEAD's tree to diff, so NO commit
-# survives), and the run's own ingest of `DEEP-DEPS/rgrep` 404ing on a tree the
-# server never had. Which one you get depends on git's CACHE TREE — it reuses a
-# cached oid for an unchanged directory and never reads its blobs, so the whole
-# thing hides until anything under `DEEP-DEPS/` perturbs it.
+# This fixture used to have to CREATE the condition it tests: the harness handed
+# every client an alternate object store, so a client could read objects it had
+# never fetched, and this test installed nothing but took that away again. The
+# dev-stack harness hands out no alternate, so every client is already in the
+# state a host repo is in — which is what this test was reaching for.
 #
-# `repack -ad` internalizes exactly the objects reachable from THIS repo's refs,
-# which is the precise line: it takes the worktree's own history and leaves the
-# base's CLOSURE — a resolved image reachable from no local ref, fetched one
-# object at a time from the server — exactly as unreadable as the test needs.
+# `repack -ad` stays, and still earns its place: it internalizes exactly the
+# objects reachable from THIS repo's refs, so the worktree owns its own history
+# while the base's CLOSURE — a resolved image reachable from no local ref —
+# stays as unreadable as the test needs. The assertions below check both halves
+# rather than assuming them, because a fixture that silently stops testing its
+# subject is precisely the failure this test exists to catch.
 git repack -adq
-rm -f "$alt"
 
 # Asserted rather than assumed: the failure this guards against surfaces far
 # from its cause, so let it fail HERE with a sentence about the fixture.

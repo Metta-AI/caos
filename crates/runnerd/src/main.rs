@@ -31,7 +31,9 @@
 //! `CAOS_DOCKER_ARGS` (global flags before `run`, e.g.
 //! `--remote --url unix://…` for the socket-delegation backend),
 //! `CAOS_RUNNER_SOCKET` (an engine socket, granted only to images that declare
-//! `CAOS_GRANT_ENGINE_SOCKET=1` in their own config env), and
+//! `CAOS_GRANT_ENGINE_SOCKET=1` in their own config env; `CAOS_GRANT_VOLUMES`
+//! is declared the same way and backs the listed mountpoints with persistent
+//! named volumes), and
 //! `CAOS_WORKER_REDIS_ADDR` (a redis a worker may use for its own caching,
 //! injected into the containers; unset means none is offered).
 //!
@@ -60,6 +62,25 @@ const ENGINE_SOCKET_PATH: &str = "/run/caos/engine.sock";
 /// and the runner decides whether to honour it. Before this, every worker in
 /// the pool got the socket because one image needed it.
 const SOCKET_GRANT_ENV: &str = "CAOS_GRANT_ENGINE_SOCKET";
+
+/// Declared the same way and read from the same place: the mountpoints an image
+/// wants backed by persistent named volumes. See `ImageGrants::volumes`.
+const VOLUME_GRANT_ENV: &str = "CAOS_GRANT_VOLUMES";
+
+/// Declared the same way: this image needs CAP_SYS_ADMIN. The one caller is an
+/// image that mounts a persistent store OVER its own — `mount --bind` is the
+/// only way to replace a directory whose replacement lives on a different
+/// filesystem (rename is EXDEV), and it needs the capability.
+const SYS_ADMIN_GRANT_ENV: &str = "CAOS_GRANT_SYS_ADMIN";
+
+/// Declared the same way: device nodes this image needs passed through.
+///
+/// The one caller wants `/dev/fuse`, because it runs a container engine of its
+/// own and that engine's overlay driver is `fuse-overlayfs` here. Without the
+/// device it falls back to `vfs`, which copies a whole rootfs per container
+/// instead of layering — measured at 1.84s against 0.25s for three starts of a
+/// 120 MB image, and the gap grows with image size.
+const DEVICE_GRANT_ENV: &str = "CAOS_GRANT_DEVICES";
 
 /// Label stamped on every worker container we start, so a restarted runnerd can
 /// find and delete the containers its predecessor left behind. Its value is
@@ -112,10 +133,77 @@ struct Config {
     /// `CAOS_WORKER_UID=0` declares its root grant. Unset here means no worker
     /// can be granted it at all, whatever the image claims.
     socket: Option<String>,
-    /// Memo for `image_wants_socket`: image ref -> declared. Refs are
+    /// Memo for `image_grants`: image ref -> what it declared. Refs are
     /// content-addressed, so a cached answer cannot go stale, and the same
     /// handful of images run over and over.
-    socket_grant: Mutex<HashMap<String, bool>>,
+    grants: Mutex<HashMap<String, ImageGrants>>,
+}
+
+/// What an image asks for in its own config env. Both are read from the IMAGE,
+/// never from a job or its args, so a caller cannot talk its way into either —
+/// only the image's author can, and an image is content-addressed.
+#[derive(Clone, Default)]
+struct ImageGrants {
+    /// `CAOS_GRANT_ENGINE_SOCKET=1`.
+    socket: bool,
+    /// `CAOS_GRANT_VOLUMES=<abs path> [<abs path>…]` — mountpoints this image
+    /// wants backed by persistent named volumes.
+    ///
+    /// NOT EXCLUSIVE, and that is the whole design rather than an omission.
+    /// What lands in them — a nix store, a git object database — is
+    /// content-addressed and safe for concurrent writers, so several workers
+    /// share one volume rather than queueing for it. The one thing that is NOT
+    /// safe that way is redis, which is why a dev stack points at an existing
+    /// redis instead of running its own on a shared directory: two servers on
+    /// one dbdir both start, neither locks, and they interleave one AOF between
+    /// two disagreeing datasets (measured).
+    ///
+    /// The image names PATHS; runnerd names the volumes. So an image cannot
+    /// address another deployment's storage, and nothing about the host's
+    /// filesystem layout has to reach a worker.
+    volumes: Vec<String>,
+    /// `CAOS_GRANT_DEVICES=<abs path> [<abs path>…]` — device nodes to pass
+    /// through. Validated like a mountpoint; runnerd decides nothing about what
+    /// they are, only that the image asked by absolute traversal-free path.
+    devices: Vec<String>,
+    /// `CAOS_GRANT_SYS_ADMIN=1` — add CAP_SYS_ADMIN.
+    ///
+    /// Asked for by exactly one thing: an image that mounts a persistent store
+    /// over its own with `mount --bind`. Nothing else can do that job. A
+    /// volume and a container's overlay are different filesystems (measured:
+    /// device 178 against 37), so `rename` and `renameat2(RENAME_EXCHANGE)` are
+    /// both EXDEV, and a symlink swap cannot be atomic — the `ln` that would
+    /// make it has its ELF interpreter under the very path being replaced, so
+    /// it cannot even start once the old one is gone.
+    ///
+    /// SMALLER THAN IT SOUNDS, in this company. It is CAP_SYS_ADMIN inside the
+    /// container's user namespace, and the image that asks for it already holds
+    /// the engine socket, which is root-equivalent on the HOST. This does not
+    /// widen what that image can reach; it lets it arrange its own filesystem.
+    sys_admin: bool,
+}
+
+/// The volume backing `path` for this deployment. Derived, never taken from the
+/// image: a mountpoint is a claim about the container's own filesystem, which is
+/// safe for an image to make, while a volume NAME is a claim about shared
+/// storage, which is not.
+fn volume_name(path: &str) -> String {
+    let slug: String = path
+        .trim_matches('/')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("caos-vol-{slug}")
+}
+
+/// Is this a mountpoint an image may ask for? Absolute, no traversal, no room
+/// for a second `-v` argument to hide in.
+fn valid_mountpoint(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && !path.contains("..")
+        && !path.contains(char::is_whitespace)
+        && !path.contains(':')
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -212,7 +300,7 @@ fn main() {
             .split_whitespace()
             .map(str::to_string)
             .collect(),
-        socket_grant: Mutex::new(HashMap::new()),
+        grants: Mutex::new(HashMap::new()),
         socket: std::env::var("CAOS_RUNNER_SOCKET")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -239,14 +327,9 @@ fn main() {
 /// it, so a miss pulls first. Both answers are memoized per ref: a wrong
 /// answer here is a silent loss of containment, so the failure mode is chosen
 /// deliberately — anything that goes wrong reads as "no grant".
-fn image_wants_socket(config: &Config, image_ref: &str) -> bool {
-    if let Some(known) = config
-        .socket_grant
-        .lock()
-        .expect("socket grant memo")
-        .get(image_ref)
-    {
-        return *known;
+fn image_grants(config: &Config, image_ref: &str) -> ImageGrants {
+    if let Some(known) = config.grants.lock().expect("grant memo").get(image_ref) {
+        return known.clone();
     }
     let inspect = |args: &[&str]| {
         Command::new(&config.docker_bin)
@@ -272,24 +355,56 @@ fn image_wants_socket(config: &Config, image_ref: &str) -> bool {
             image_ref,
         ]);
     }
-    let wants = match &out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .any(|line| line.trim() == format!("{SOCKET_GRANT_ENV}=1")),
-        _ => {
-            eprintln!("caos-runnerd: cannot inspect {image_ref}; no engine socket granted");
-            false
+    let mut grants = ImageGrants::default();
+    match &out {
+        Ok(o) if o.status.success() => {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let line = line.trim();
+                if line == format!("{SOCKET_GRANT_ENV}=1") {
+                    grants.socket = true;
+                } else if line == format!("{SYS_ADMIN_GRANT_ENV}=1") {
+                    grants.sys_admin = true;
+                } else if let Some(list) = line.strip_prefix(&format!("{DEVICE_GRANT_ENV}=")) {
+                    for path in list.split_whitespace() {
+                        if valid_mountpoint(path) {
+                            grants.devices.push(path.to_string());
+                        } else {
+                            eprintln!("caos-runnerd: {image_ref} asks for device {path:?}, which is not an absolute traversal-free path; ignoring it");
+                        }
+                    }
+                } else if let Some(list) = line.strip_prefix(&format!("{VOLUME_GRANT_ENV}=")) {
+                    for path in list.split_whitespace() {
+                        if valid_mountpoint(path) {
+                            grants.volumes.push(path.to_string());
+                        } else {
+                            eprintln!(
+                                "caos-runnerd: {image_ref} asks for mountpoint {path:?}, \
+                                 which is not an absolute traversal-free path; ignoring it"
+                            );
+                        }
+                    }
+                }
+            }
         }
-    };
-    if wants {
+        // The wrong answer here is a silent loss of containment, so anything
+        // that goes wrong reads as "nothing granted".
+        _ => eprintln!("caos-runnerd: cannot inspect {image_ref}; granting it nothing"),
+    }
+    if grants.socket {
         eprintln!("caos-runnerd: {image_ref} declares {SOCKET_GRANT_ENV}; granting engine socket");
     }
+    if !grants.volumes.is_empty() {
+        eprintln!(
+            "caos-runnerd: {image_ref} declares {VOLUME_GRANT_ENV}; granting {}",
+            grants.volumes.join(" ")
+        );
+    }
     config
-        .socket_grant
+        .grants
         .lock()
-        .expect("socket grant memo")
-        .insert(image_ref.to_string(), wants);
-    wants
+        .expect("grant memo")
+        .insert(image_ref.to_string(), grants.clone());
+    grants
 }
 
 /// One slot: poll for a job, run its container, wait for the container to die,
@@ -392,8 +507,10 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         // and must not sweep its siblings' containers.
         .args(["--label", &format!("{OWNER_LABEL}={}", owner_id())])
         .args(["--network", &config.network]);
+    // One inspect answers both grants, memoized together.
+    let grants = image_grants(config, &job.image_ref);
     if let Some(sock) = &config.socket {
-        if image_wants_socket(config, &job.image_ref) {
+        if grants.socket {
             // Hand THIS worker the engine socket so its own inner runnerd can
             // delegate sibling containers to this engine (phase 4). Bind it at
             // a fixed in-container path and advertise that path, so a worker
@@ -416,6 +533,21 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
                 .args(["-e", &format!("CAOS_ENGINE_SOCKET={ENGINE_SOCKET_PATH}")])
                 .args(["-e", &format!("CAOS_ENGINE_SOCKET_HOST={sock}")]);
         }
+    }
+    // Persistent storage the image asked for. Named volumes rather than bind
+    // mounts, deliberately: the engine owns the name, so nothing about the
+    // host's filesystem has to be known by — or reach — a worker. It also seeds
+    // itself, because mounting a FRESH named volume over a path that has content
+    // in the image copies that content in (verified), which is what lets a nix
+    // store survive here without any bootstrap step.
+    if grants.sys_admin {
+        command.args(["--cap-add", "SYS_ADMIN"]);
+    }
+    for dev in &grants.devices {
+        command.args(["--device", dev]);
+    }
+    for path in &grants.volumes {
+        command.args(["-v", &format!("{}:{path}", volume_name(path))]);
     }
     // A worker's own scratch cache, when this deployment offers one. Passed
     // only when set, so an unset address reaches the worker as an ABSENT env

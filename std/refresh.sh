@@ -7,7 +7,8 @@
 # drift from the generator. tests/std-lint runs the check in the suite.
 #
 # What it maintains:
-#   std/{bash,cargo,flake-builder,git-runner,merge}/flake.lock
+#   std/{bash,cargo,flake-builder,git-runner,merge}/flake.lock and
+#   dev/{test-stack,run-test}/flake.lock
 #       derived from the ROOT flake.lock: the named input nodes copied
 #       verbatim (locked revs + originals + follows edges) under a root
 #       naming just those inputs — a std flake's pins structurally cannot
@@ -63,8 +64,10 @@ derive_lock() { # <out> <input name>...
 }
 
 # Generate the whole redundant set under $tmp, mirroring the repo layout.
-mkdir -p "$tmp/std/bash" "$tmp/std/cargo" "$tmp/std/flake-builder" "$tmp/std/git-runner" "$tmp/std/merge"
+mkdir -p "$tmp/dev/test-stack" "$tmp/dev/run-test" "$tmp/std/bash" "$tmp/std/cargo" "$tmp/std/flake-builder" "$tmp/std/git-runner" "$tmp/std/merge"
 derive_lock "$tmp/std/bash/flake.lock" nixpkgs
+derive_lock "$tmp/dev/test-stack/flake.lock" nixpkgs
+derive_lock "$tmp/dev/run-test/flake.lock" nixpkgs
 derive_lock "$tmp/std/cargo/flake.lock" nixpkgs rust-overlay crane
 derive_lock "$tmp/std/flake-builder/flake.lock" nixpkgs
 derive_lock "$tmp/std/git-runner/flake.lock" nixpkgs
@@ -72,6 +75,8 @@ derive_lock "$tmp/std/merge/flake.lock" nixpkgs
 
 # The maintained set.
 files="std/bash/flake.lock
+dev/test-stack/flake.lock
+dev/run-test/flake.lock
 std/cargo/flake.lock
 std/flake-builder/flake.lock
 std/git-runner/flake.lock

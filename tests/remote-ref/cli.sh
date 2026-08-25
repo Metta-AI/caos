@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE a test stack — the suite's per-test job (tests/lib/run-test.sh).
+# INSIDE a test stack — the suite's per-test job (dev/run-test/run-test.sh).
 #
 # `--name:@@=<git ref>`: a tree that lives in ANOTHER repo, pinned by a commit
 # sha (design/flake-inputs.md). The claim under test is that the locator is a

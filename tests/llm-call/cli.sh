@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, inside a test stack (tests/lib/run-test.sh).
+# set, inside a test stack (dev/run-test/run-test.sh).
 #
 # Exercises the generic stateless LLM call worker against the scripted API
 # stub: caller-owned prompt/messages/config in, plain text blob out, with no

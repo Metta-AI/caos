@@ -3,8 +3,8 @@
 # until it is serving, then supervise it. This is the one bring-up in the
 # tree — `caosd serve` is this script, and every placement runs it:
 #
-#   test   the stack image's /worker starts it, runs worker1 against it,
-#          and stops it (test-stack/worker)
+#   dev    dev/stack-up starts it inside a caos worker, runs the suite on it,
+#          and dies with that worker (dev/stack-up)
 #   host   `caosd up` runs the stack image with this as its command
 #   seed   the flake's seed derivation runs it to publish std
 #
@@ -15,7 +15,7 @@
 #
 # DIES AS A GROUP. A half-dead stack is not something anyone should have to
 # diagnose, so any member's death takes the rest down and exits non-zero.
-# Callers that need to keep working (the test placement) run this in the
+# Callers that need to keep working (the dev placement) run this in the
 # background and watch both the ready file and this process.
 #
 # Configuration, all environment:
@@ -39,6 +39,15 @@
 #                             content-addressed registry shared across tests
 #                             cannot leak behaviour, only work, and sharing it
 #                             is what stops every test rebaking the toolchain.
+#   CAOS_STACK_REDIS          "yes" to run redis in the group, "no" to use
+#                             someone else at CAOS_STACK_REDIS_ADDR. Two redis
+#                             servers cannot share a DIRECTORY, so stacks that
+#                             want one cache share the PROCESS and keep their
+#                             entries apart with CAOS_CACHE_NAMESPACE.
+#   CAOS_STACK_REDIS_ADDR     where redis is, when this group does not run one
+#   CAOS_CACHE_NAMESPACE      prefix for this stack's cache keys, so sharing a
+#                             redis does not mean sharing answers. Identifies
+#                             the BUILD: see server Config::cache_namespace.
 #   CAOS_STACK_RUNNERD        "yes" to run runnerd, "no" for a placement that
 #                             dispatches no jobs. The seed is the "no": it only
 #                             PUBLISHES, and build-builtins.sh runs no workers,
@@ -68,6 +77,7 @@ set -euo pipefail
 : "${CAOS_STACK_REDIS_PORT:?serve needs CAOS_STACK_REDIS_PORT}"
 : "${CAOS_STACK_REDIS_PERSIST:?serve needs CAOS_STACK_REDIS_PERSIST (yes|no)}"
 : "${CAOS_STACK_REGISTRY:?serve needs CAOS_STACK_REGISTRY (yes|no)}"
+: "${CAOS_STACK_REDIS:?serve needs CAOS_STACK_REDIS (yes|no)}"
 : "${CAOS_STACK_RUNNERD:?serve needs CAOS_STACK_RUNNERD (yes|no)}"
 
 # The server self-bootstraps an empty repo on first boot, but the directory
@@ -94,12 +104,17 @@ if [ -n "${CAOS_STACK_SEED_GIT:-}" ] && [ ! -e "$CAOS_STACK_STATE/git/HEAD" ]; t
   chmod -R u+w "$CAOS_STACK_STATE/git"
 fi
 
-# The server always listens on :80 and always reaches redis on loopback: every
-# placement puts the group in one netns, so there is no address to negotiate.
-# Workers join that same netns (CAOS_DOCKER_NETWORK), which is why they can
-# use this URL verbatim.
+# The server always listens on :80. Where REDIS reaches is a placement's choice:
+# loopback when this group runs its own, and someone else's address when
+# CAOS_STACK_REDIS=no.
+#
+# A placement that DOESN'T run one is not an optimization. Two redis servers
+# cannot share a directory — both start, neither locks, and they interleave one
+# AOF between two disagreeing datasets (measured) — so several stacks that want
+# one cache have to share a redis PROCESS, not a redis DIRECTORY. What keeps
+# their entries apart there is CAOS_CACHE_NAMESPACE, not separate storage.
 SERVER_URL=http://127.0.0.1
-REDIS_ADDR=127.0.0.1:$CAOS_STACK_REDIS_PORT
+REDIS_ADDR=${CAOS_STACK_REDIS_ADDR:-127.0.0.1:$CAOS_STACK_REDIS_PORT}
 
 pids=()
 names=()
@@ -133,8 +148,8 @@ start() { # <name> <command...>
 # `--protected-mode no` because this redis is no longer only the server's. A
 # worker may use it too (ccache's redis backend, say), and on the HOST a worker
 # has its own netns on the bridge — so it arrives from a non-loopback address,
-# which protected mode refuses. In the test placement workers share this netns
-# and already reached it on loopback, so the flag is inert there.
+# which protected mode refuses. Where workers share a stack's netns they reach
+# it on loopback instead, so the flag is inert there.
 #
 # Bounded, and `allkeys-lru` rather than `volatile-lru`, because the tenant that
 # forced the question cannot set a TTL: ccache's redis backend has no TTL and no
@@ -146,6 +161,7 @@ start() { # <name> <command...>
 # evicted `caos:result:` key is a rebuild, so a ccache run big enough to fill
 # this cap costs caos memoization. Raise CAOS_STACK_REDIS_MAXMEM before blaming
 # the scheduler for work you thought was cached.
+if [ "$CAOS_STACK_REDIS" = yes ]; then
 redis_args=(
   --port "$CAOS_STACK_REDIS_PORT"
   --protected-mode no
@@ -173,6 +189,14 @@ for _ in $(seq 1 200); do
 done
 redis-cli -p "$CAOS_STACK_REDIS_PORT" ping >/dev/null 2>&1 \
   || fail "redis never came up"
+else
+  # Someone else's. Probed anyway, and by ADDRESS rather than by starting one:
+  # a stack whose cache is unreachable still works (the server treats redis as
+  # best-effort and runs uncached), but it works slowly and silently, and the
+  # cause is far from the symptom.
+  redis-cli -u "redis://$REDIS_ADDR" ping >/dev/null 2>&1 \
+    || fail "CAOS_STACK_REDIS=no, but nothing answers at $REDIS_ADDR"
+fi
 
 # --- registry: the image cache, when this placement owns one -----------------
 if [ "$CAOS_STACK_REGISTRY" = yes ]; then
@@ -201,6 +225,7 @@ fi
 start server env \
   CAOS_GIT_DIR="$CAOS_STACK_STATE/git" \
   CAOS_REDIS_ADDR="$REDIS_ADDR" \
+  CAOS_CACHE_NAMESPACE="${CAOS_CACHE_NAMESPACE:-}" \
   CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
   "$CAOS_STACK_BIN/server"
 ok=""
