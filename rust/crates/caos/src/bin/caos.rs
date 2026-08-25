@@ -113,6 +113,12 @@ fn run(args: &[String]) -> Result<(), String> {
             [request, kvs @ ..] => caos::caos_run_request_then(&http()?, request, kvs),
             _ => Err(usage(args)),
         },
+        // `trace-child <name> <arg-tree>` — record under this job that it
+        // started work on another stack, so `status` descends into it.
+        Some("trace-child") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(name), Some(arg_tree), None) => caos::caos_trace_child(&http()?, name, arg_tree),
+            _ => Err(usage(args)),
+        },
         // Start an already-stored ArgTree without waiting, preserving this
         // job's server-side run stack and secret store.
         Some("sub-run") => match &args[2..] {
@@ -510,6 +516,7 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
+         {prog} trace-child <name> <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
          (an image is :@=<cas path>, :docker=<ref> or :hash=<oid>)\n  \

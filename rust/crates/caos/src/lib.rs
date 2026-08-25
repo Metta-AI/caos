@@ -3407,6 +3407,51 @@ pub fn caos_sub_run(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `trace-child <name> <arg-tree>` — record, under THIS job's trace record, that
+/// it started `arg-tree` under `name`.
+///
+/// For work a job starts on ANOTHER STACK. A dev stack brought up inside a
+/// worker writes its trace records to the same redis the host uses, and a trace
+/// key carries no cache namespace, so the two sets of records already sit side
+/// by side — the only thing missing is the edge that joins them. With it,
+/// `caos-cli status` on the outer job descends into everything the inner stack
+/// did, which is what makes a long `run-tool test` watchable rather than opaque.
+///
+/// It records an EDGE and nothing else: the child's own record is written by
+/// whichever server ran it. So this is safe to call before the work starts —
+/// and it has to be, since the point is to watch it while it runs.
+pub fn caos_trace_child(t: &dyn Transport, name: &str, arg_tree: &str) -> Result<(), String> {
+    if arg_tree.len() != 40 || !arg_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "trace-child needs a 40-character ArgTree hash, got {arg_tree:?}"
+        ));
+    }
+    let nonce = std::env::var(JOB_NONCE_ENV)
+        .map_err(|_| "trace-child is available only inside a running worker".to_string())?;
+    let url = format!("{}/trace/child", t.server_url()?.trim_end_matches('/'));
+    let body = serde_json::json!({"req": arg_tree, "nonce": nonce, "name": name}).to_string();
+    let response = minreq::post(&url)
+        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+        .with_header("content-type", "application/json")
+        .with_timeout(5)
+        .with_body(body)
+        .send()
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    if !(200..300).contains(&response.status_code) {
+        let detail = response.as_str().unwrap_or("").trim();
+        return Err(format!(
+            "POST {url}: server returned {}{}",
+            response.status_code,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    Ok(())
+}
+
 enum ContinuationSubject<'a> {
     Input(&'a str),
     Request(&'a str),

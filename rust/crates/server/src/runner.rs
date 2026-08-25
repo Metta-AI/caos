@@ -579,6 +579,58 @@ pub(crate) fn sub_run(body: &str) -> Result<Vec<u8>, HttpError> {
     }
 }
 
+/// `POST /trace/child` — record that the CALLING job dispatched `req` under
+/// `name`, so a reader following the caller's record descends into it.
+///
+/// This exists for work a job starts on ANOTHER STACK. The dev stack a test run
+/// brings up writes its trace records to the same redis (`stack/serve` points
+/// it at the host's, and `caos:trace:<argtree>` carries no cache namespace), so
+/// the records are already side by side — what was missing was the one edge
+/// joining them. With it, `status` on the outer job renders the whole suite.
+///
+/// The nonce is the entire authority, exactly as for `/sub-run`: it names one
+/// claimed job, it is unpredictable, and it dies with the job. A caller can
+/// only ever add an edge under ITSELF.
+pub(crate) fn trace_child(config: &crate::Config, body: &str) -> Result<Vec<u8>, HttpError> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| HttpError::new(400, format!("invalid trace-child json: {error}")))?;
+    let child = value["req"].as_str().unwrap_or_default();
+    let nonce = value["nonce"].as_str().unwrap_or_default();
+    let name = value["name"].as_str().unwrap_or_default();
+    if !valid_hex(child, 40) {
+        return Err(HttpError::new(
+            400,
+            "trace-child needs a lowercase request hash",
+        ));
+    }
+    if !valid_hex(nonce, 32) {
+        return Err(HttpError::new(
+            400,
+            "trace-child needs a lowercase job nonce",
+        ));
+    }
+    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(HttpError::new(
+            400,
+            "trace-child needs a short printable name",
+        ));
+    }
+
+    let parent = {
+        let st = lock();
+        let Some(id) = st.by_nonce.get(nonce) else {
+            return Err(HttpError::new(410, "unknown or consumed job nonce"));
+        };
+        let job = &st.jobs[id];
+        if !matches!(job.phase, Phase::Inflight) {
+            return Err(HttpError::new(409, "job is not in flight"));
+        }
+        job.arg_tree.clone()
+    };
+    crate::status::child(config, &parent, "stack", name, child);
+    Ok(b"{}".to_vec())
+}
+
 fn valid_hex(value: &str, len: usize) -> bool {
     value.len() == len
         && value

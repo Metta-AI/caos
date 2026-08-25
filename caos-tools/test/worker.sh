@@ -113,6 +113,24 @@ fi
 # and the command runs with none of it. `bash -n` passes either way, which is
 # what makes it worth a warning rather than a fix (CLAUDE.md). This exact block
 # had it, and the symptom was a client with no server to talk to.
+# THE SUITE'S REQUEST, NAMED BEFORE IT RUNS, so the two stacks' traces join up.
+#
+# The dev stack writes its trace records to the SAME redis as the host — a trace
+# key carries no cache namespace, unlike a result — so both sets of records
+# already sit side by side. What was missing was an edge from this job to the
+# suite's, and `caos trace-child` records exactly that and nothing else.
+#
+# `prepare-request` forms and pushes the very ArgTree the `run` below will form,
+# so the hash is known before any work starts — which is the point: this is for
+# watching a suite that is still running.
+#
+# NO COMMENT INSIDE THE BLOCK BELOW (see the warning further down).
+suite_req=$(CAOS_SERVER_URL=http://127.0.0.1 \
+  "$CLI" prepare-request --base:@=dev/run-tests --in:@=. --cli:@=.caos-test-cli "${args[@]}") \
+  || fail "forming the suite request"
+caos trace-child suite "$suite_req" || fail "linking the suite's trace to this job"
+echo "==> suite request $suite_req (caos-cli status --all $suite_req)" >&2
+
 status=0
 CAOS_SERVER_URL=http://127.0.0.1 \
   "$CLI" run /tmp/suite --base:@=dev/run-tests --in:@=. --cli:@=.caos-test-cli "${args[@]}" \

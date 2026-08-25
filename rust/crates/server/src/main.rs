@@ -11,6 +11,8 @@
 //! * `GET /run?req=<hash>` — run the ArgTree `<hash>` (`req` is the
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result.
+//! * `POST /trace/child` — record, under an in-flight job, that it started work
+//!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
 //!   existing server-side run stack and secret store.
 //!
@@ -560,6 +562,11 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body)?;
             runner::sub_run(&body)
+        }
+        Method::Post if path == "/trace/child" => {
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)?;
+            runner::trace_child(config, &body)
         }
         Method::Post if path == "/runner/poll" || path == "/runner/result" => {
             let authorization = request
