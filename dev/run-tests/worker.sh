@@ -42,7 +42,7 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 # name. One function so a new one is added in one place rather than three, which
 # is how the old version of this lost `--only` for a while.
 forwarded() {
-  for a in api-key only test-salt; do
+  for a in only test-salt; do
     if [ -e "/cas/args/$a" ]; then printf '%s ' "--$a:@=/cas/args/$a"; fi
   done
 }
@@ -154,9 +154,9 @@ fanout)
     mkdir -p "/tmp/sel/$t"
     ln -s "$src" "/tmp/sel/$t/test"
 
-    # The two things that genuinely differ PER TEST, so they cannot ride on the
-    # map image the way `cli` and `test-salt` do. dev/run-test curries whichever
-    # of them the wrapper carries onto the test's ArgTree.
+    # The one thing that genuinely differs PER TEST, so it cannot ride on the
+    # map image the way `cli` and `test-salt` do. dev/run-test curries it onto
+    # the test's ArgTree when the wrapper carries it.
     case "$t" in
       std-lint)
         # THE ONLY TEST LEFT THAT NEEDS THE WHOLE TREE. cargo-self and unit-*
@@ -170,15 +170,6 @@ fanout)
         # Not on the map image: it is the whole tree, so every test would then
         # re-key on any edit anywhere, including edits to other tests.
         ln -s /cas/args/ws "/tmp/sel/$t/workspace"
-        ;;
-      chat-online)
-        # Present but possibly EMPTY; this test self-skips on an empty key.
-        if [ -e /cas/args/api-key ]; then
-          caos get /cas/args/api-key
-          cp /cas/args/api-key "/tmp/sel/$t/api-key"
-        else
-          : > "/tmp/sel/$t/api-key"
-        fi
         ;;
     esac
   done

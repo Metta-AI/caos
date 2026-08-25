@@ -7,14 +7,14 @@
 # knowable once the previous one's work has finished.
 #
 #   eval     (default) `--in` is the WRAPPER the fan-out built: the test's own
-#            deepened tree at `test`, plus `workspace`/`api-key` for the few
-#            tests that need one. Evaluating `test` yields the test's ARG TREE.
+#            deepened tree at `test`, plus `workspace` for the one test that
+#            needs it. Evaluating `test` yields the test's ARG TREE.
 #            A worker may not evaluate — its `caos` has `eval-path-then` and no
 #            `eval-path` — so this records a continuation and exits. Every test
 #            evaluates in parallel, one map child each.
 #   launch   the `then` of that: --result is the ArgTree. Bind what this RUN
-#            supplies — the client under test, the salt, and a workspace or api
-#            key when the wrapper carries one — and run it.
+#            supplies — the client under test, the salt, and a workspace when
+#            the wrapper carries one — and run it.
 #   verdict  the `then` of THAT: --result is what the test returned, or
 #            --error what it failed with.
 #
@@ -74,8 +74,8 @@ launch)
   # later as `1787683099 - : arithmetic syntax error` in the elapsed sum.
   caos get /cas/args/start || fail "reading --start"
   # Expand the wrapper before asking what it holds: an unfetched directory
-  # answers "no" to every question about its contents, so the `workspace` and
-  # `api-key` checks below would silently bind nothing.
+  # answers "no" to every question about its contents, so the
+  # `workspace` check below would silently bind nothing.
   caos get /cas/args/in || fail "expanding the wrapper"
   if [ -e /cas/args/error ]; then
     # The EXPRESSION is broken — a missing `DEEP-DEPS/<name>`, a path that does
@@ -112,11 +112,10 @@ launch)
   # itself gets a loud error rather than a silent shadow.
   #
   # `cli` and `test-salt` are the same for every test and ride on this image,
-  # curried by the fan-out. `workspace` and `api-key` differ per test, so they
-  # ride in the wrapper — and are passed only to the tests that were given one.
+  # curried by the fan-out. `workspace` differs per test, so it rides in the
+  # wrapper — and is passed only to the tests that were given one.
   bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt)
   if [ -e /cas/args/in/workspace ]; then bind+=(--workspace:@=/cas/args/in/workspace); fi
-  if [ -e /cas/args/in/api-key ]; then bind+=(--api-key:@=/cas/args/in/api-key); fi
   req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
     || fail "binding this run's arguments onto the test"
 

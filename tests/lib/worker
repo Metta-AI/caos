@@ -80,13 +80,6 @@ if [ -e /cas/args/workspace ]; then
   export CAOS_PROJECT=/tmp/ws
 fi
 
-# A real-API test's key, when one was configured (empty otherwise; the test
-# self-skips).
-if [ -e /cas/args/api-key ]; then
-  caos get /cas/args/api-key || fail "reading the api key"
-  ANTHROPIC_API_KEY=$(cat /cas/args/api-key)
-  export ANTHROPIC_API_KEY
-fi
 
 # CAOS_STUB_HOST points workers at in-job stub servers. THIS CONTAINER'S OWN
 # ADDRESS ON THE NETWORK, deliberately, and not `127.0.0.1`: the workers a test

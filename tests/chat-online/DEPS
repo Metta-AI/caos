@@ -1,5 +1,22 @@
-# What this test reaches for (format `<path> <name>`); deep-deps
-# mounts each RECURSIVELY DEEPENED at DEEP-DEPS/<name>.
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). deep-deps mounts each RECURSIVELY DEEPENED at
+# DEEP-DEPS/<name>, and tests/lib stages them into the client repo — which is
+# where `caos-cli talk` and this test's own `.caos-secrets` reader line both
+# name them from.
+#
+# These went undeclared for as long as this test SKIPPED: with no key granted
+# it exited before `talk`, so nothing ever resolved them and the omission was
+# invisible. The first real turn found it immediately —
+# `eval-path: "llm-step" not found`.
+#
+# llm-step   the turn worker; also this test's declared secret reader
+# llm-call   the single-shot call the harness makes
+# bash-tool  the tool the prompt asks the model to use
+# rgrep      the other tool a turn registers
+../../std/llm-step llm-step
+../../std/llm-call llm-call
+../../std/bash-tool bash-tool
+../../std/rgrep rgrep
 # The image this client test runs in, with the client-repo setup as its
 # /worker: a dependency, not a harness.
 ../lib lib

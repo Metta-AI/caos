@@ -7,23 +7,33 @@
 # structurally can't make: only the live API rejects a bad model choice (e.g.
 # the adaptive-thinking-on-haiku 400 this once caught). Discovered and run like
 # every other test, but it needs a real key, spends (a little) real money, and
-# needs runner egress to api.anthropic.com — so without ANTHROPIC_API_KEY it
-# skips (exit 0; run-all shows it as a PASS, with the skip on stderr).
+# needs runner egress to api.anthropic.com — so without one it skips (exit 0;
+# the report shows it as a PASS, with the skip as its output).
+#
+# THE KEY ARRIVES AT /secret, not in the environment. A secret store does not
+# cross a stack: the caller's `.caos-secrets` is resolved by ITS client and
+# granted within ITS call stack, and this turn runs two stacks down. So
+# `caos-tools/test` — a declared reader on the host — re-registers the value as
+# a store for the dev stack naming `tests/chat-online` as reader, and the server
+# grants it here because this job's ArgTree is a superset of that reader's.
 #
 # It doubles as the UX spec: everything above the `talk` line is the generic
 # test harness — a real turn itself is one command.
 set -euo pipefail
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "chat-online: ANTHROPIC_API_KEY not set — SKIPPED (no real-API turn run)" >&2
+if [ ! -e /secret/anthropic-api-key ]; then
+  echo "chat-online: no anthropic-api-key granted — SKIPPED (no real-API turn run)" >&2
   exit 0
 fi
+key=$(cat /secret/anthropic-api-key)
 
+# The store this test's OWN turn needs: `talk` spawns llm-step, which reads the
+# key from /secret in its turn. Git-excluded so it cannot be ingested.
 mkdir -p .caos-secrets
 printf '.caos-secrets/\n' >> .git/info/exclude
 printf '%s\n' \
   'name=anthropic-api-key' \
-  "value=$ANTHROPIC_API_KEY" \
+  "value=$key" \
   'entropy=0123456789abcdef0123456789abcdef' \
   'reader=DEEP-DEPS/llm-step' \
   > .caos-secrets/anthropic-api-key

@@ -69,9 +69,36 @@ if [ -e /cas/args/only ]; then
   caos get /cas/args/only
   args+=("--only=$(cat /cas/args/only)")
 fi
-if [ -e /cas/args/api-key ]; then
-  caos get /cas/args/api-key
-  args+=("--api-key:@=/cas/args/api-key")
+
+# A SECRET STORE DOES NOT CROSS A STACK. It is built by the client from its own
+# `.caos-secrets` and shipped in a header, and the server grants a secret to any
+# job whose ArgTree is a superset of a declared reader's — all within ONE call
+# stack. tests/chat-online's real-API turn runs two stacks down, on the dev
+# stack, so the value has to be re-registered there.
+#
+# That is what this does, and it is the one place in the tree where a secret is
+# written to disk: it arrives here at /secret/anthropic-api-key because the
+# caller's store names `caos-tools/test` as a reader, and it is written back as
+# a store for the dev stack naming `tests/chat-online` as its reader. The value
+# never enters an ArgTree or the CAS.
+#
+# AFTER `stack-up`, deliberately. stack-up git-inits this workspace with
+# `add -Af` — the tree is the truth — so a `.caos-secrets` written before it
+# would be COMMITTED and then ingested by `--in:@=.`. Written afterwards it is
+# untracked, and `:@=` ingests only tracked paths.
+#
+# Absent, nothing is written and chat-online self-skips, which is what happens
+# whenever the caller has no key or has not granted this tool.
+if [ -e /secret/anthropic-api-key ]; then
+  mkdir -p .caos-secrets
+  {
+    printf 'name=anthropic-api-key\n'
+    printf 'value=%s\n' "$(cat /secret/anthropic-api-key)"
+    printf 'entropy=0123456789abcdef0123456789abcdef\n'
+    printf 'reader=tests/chat-online\n'
+  } > .caos-secrets/anthropic-api-key
+  chmod 600 .caos-secrets/anthropic-api-key
+  echo "==> granting tests/chat-online the anthropic key on the dev stack" >&2
 fi
 
 # THE REPORT IS A VALUE, red or green. SPEC is explicit that a tool's expected
