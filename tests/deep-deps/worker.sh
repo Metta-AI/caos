@@ -81,6 +81,28 @@ diff -r outA/app outC/app >/dev/null && fail "app should change when bar changes
   || fail "foo's shared bar not updated"
 echo "  ok: every node reaching bar recomputed" >&2
 
+echo "== a FILE dependency is mounted, not walked ==" >&2
+# A dep may name a file. There is nothing under one to deepen and no `DEPS` it
+# could carry, so the mount IS the file — which is what lets a package name a
+# workspace manifest or a shared lock beside the directories it needs, instead
+# of forcing every such thing into a directory of its own.
+echo "root manifest" > tree/Manifest.toml
+printf '../lib/foo foo\n../lib/bar bar\n../Manifest.toml Manifest.toml\n' > tree/app/DEPS
+commit "file dep"
+deepen tree outE
+[ -f outE/app/DEEP-DEPS/Manifest.toml ] || fail "the file dep is not mounted as a file"
+[ "$(cat outE/app/DEEP-DEPS/Manifest.toml)" = "root manifest" ] \
+  || fail "the mounted file's content is wrong: $(cat outE/app/DEEP-DEPS/Manifest.toml)"
+# Its directory siblings still deepen, so one file dep does not disturb the rest.
+[ -e outE/app/DEEP-DEPS/foo/DEEP-DEPS/shared/bar.txt ] \
+  || fail "a directory dep stopped deepening once a file dep was declared"
+echo "  ok: mounted verbatim, alongside deepened directory deps" >&2
+
+# Back to the directory-only shape for the cycle case below.
+printf '../lib/foo foo\n../lib/bar bar\n' > tree/app/DEPS
+rm -f tree/Manifest.toml
+commit "drop the file dep"
+
 echo "== a dependency cycle is detected (by the worker) ==" >&2
 # Close a loop: lib/bar -> app, so app -> bar -> app. The deepen is ONE pass in
 # one worker, so nothing else can catch this: there is no server round trip, and

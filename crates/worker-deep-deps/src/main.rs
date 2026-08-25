@@ -13,6 +13,12 @@
 //! its `DEPS` is replaced by a `DEEP-DEPS/` subtree whose children are the named
 //! dependencies, each ITSELF deepened.
 //!
+//! A dependency may be a FILE as well as a directory. There is nothing under a
+//! file to walk and no `DEPS` it could carry, so it is mounted as-is — which is
+//! what lets a package name a workspace manifest or a shared lock beside the
+//! directories it needs, instead of forcing every such thing into a directory
+//! of its own.
+//!
 //! ONE RUN, one pass — do not split it back into per-directory jobs. Recursing
 //! through `map_then` (a job to enumerate each directory, another to rebuild it)
 //! costs ~2N containers for N directories, and buys nothing: the enumerating
@@ -115,6 +121,24 @@ fn deepen(
             return Err(format!(
                 "directory {rel:?} declares two deps mounted as {mount:?}"
             ));
+        }
+        // A FILE dependency is mounted, not deepened: there is nothing under it
+        // to walk and no `DEPS` it could carry, so the mount IS the file. This
+        // is what lets a package name a workspace manifest (`../../Cargo.toml
+        // Cargo.toml`) or a shared lock beside the directories it needs, rather
+        // than forcing every such thing to live in a directory of its own.
+        //
+        // `symlink_metadata` on the staged entry says "symlink" for every plain
+        // file — that is how a materialized tree represents one — so this asks
+        // `metadata`, which follows the link into /cas and answers about the
+        // content. A missing target errors here rather than further down in
+        // `entries`, where it would read as an empty directory.
+        let target_path = format!("{base}/{target}");
+        let meta = fs::metadata(&target_path)
+            .map_err(|e| format!("dependency {target:?} of {rel:?}: {e}"))?;
+        if !meta.is_dir() {
+            link(&target_path, &at)?;
+            continue;
         }
         // Already deepened somewhere else: re-stage that result rather than
         // walking it again. NOT a symlink to it — `caos put` resolves a symlink
