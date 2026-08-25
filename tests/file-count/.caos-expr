@@ -1,5 +1,5 @@
-# tests/file-count, as an ENTRY (design/caos-expr.md, Phase 3): a test is an
-# evaluable directory like any other, and running it is evaluating it.
+# tests/file-count, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # EVERY DEPENDENCY IS RESOLVED BY BEING NAMED. `:@=` evaluates any tree that
 # carries a `.caos-expr` — not just `--base` (caos-eval's `eval_if_evaluable`:
@@ -14,4 +14,4 @@
 # `salt` in the ArgTree is what makes `--test-salt` re-run the test, and `cli`
 # is what makes the test re-key when the client under test changes. This one
 # runs neither, and binds both for those two properties.
-run --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --src:@=worker.rs --tree:@=tree --cli:@=cli --salt:@=salt
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --src:@=worker.rs --tree:@=tree --cli:@=cli --test-salt:@=test-salt

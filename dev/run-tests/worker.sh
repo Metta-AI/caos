@@ -112,8 +112,13 @@ fanout)
     only=" $(cat /cas/args/only) "
   fi
   # The salt is written for EVERY test, empty when none was passed, because a
-  # test's `.caos-expr` binds `--salt:@=salt` unconditionally and an absent path
-  # is an evaluation error rather than an omitted argument. Binding it is what
+  # test's `.caos-expr` binds `--test-salt:@=test-salt` unconditionally and an
+  # absent path
+  # is an evaluation error rather than an omitted argument. NOT `salt`: that name
+  # is RESERVED, and the dispatcher merges the run's own salt last
+  # (compute.rs, `run_image`), so a per-test value bound under it is silently
+  # overwritten and never reaches the key — two different --test-salt values
+  # would produce one request and the test would not re-run. Binding it is what
   # makes a fresh value re-run the tests: the file changes the tree, which
   # changes what the tree evaluates to, which changes the test's own ArgTree.
   # Nothing READS it.
@@ -156,7 +161,7 @@ fanout)
     # exists to have. Bound by every test's expression whether or not it runs
     # the thing.
     ln -s /cas/args/cli "/tmp/sel/$t/cli"
-    printf '%s' "$salt" > "/tmp/sel/$t/salt"
+    printf '%s' "$salt" > "/tmp/sel/$t/test-salt"
 
     case "$t" in
       cargo-self | unit-* | std-lint)

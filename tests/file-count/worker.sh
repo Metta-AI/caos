@@ -17,15 +17,16 @@
 # promise and exits, so no container is ever parked waiting on a job that needs
 # a container of its own.
 #
-# `prepare-request` + `run-request-then`, not `run-then`: prepare-request forms
-# the very ArgTree a `run` would, and run-request-then runs one unchanged — "no
-# `--in` is added and no new request is assembled around an image". `run-then`
-# would bind its subject as `--in` whether or not the callee wants one, which
-# several workers read in preference to their real argument. `curry` is for
-# building the NEXT STAGE'S IMAGE, which is what a curry node is; forming a run
-# request with it produces an ArgTree the runner does not unwrap, and the
-# symptom is the runner dying on `caos get /cas/args/worker1` — its own
-# entrypoint arg, missing, because the chain below it was never merged.
+# `run-then --run:` names the ArgTree to run. Currying returns an ArgTree and an
+# ArgTree is what runs (SPEC, "Forming an ArgTree": "an image is just one arg"),
+# so the server unwraps the curry, merges its bound args and adds this job's
+# salt and secret grants. `run-request-then` is the other thing — it runs an
+# ArgTree by IDENTITY, for a caller that already knows the exact request hash
+# and must run that one unmodified — and using it here dropped every bound arg.
+#
+# `<in>` is the data the run is over, which for the two counts below is exactly
+# what file-count reads. The build is the odd one: rustc reads `--src`, so that
+# is curried and `<in>` is the same source, named as what is being built.
 #
 # NO `--catch` ANYWHERE. A failing sub-run should fail this test, and
 # dev/run-test already catches at the top: the failure becomes this test's FAIL
@@ -53,7 +54,7 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 next() { # <stage> [extra curry args...]
   local s=$1; shift
   caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
-    --stage="$s" --tree:@=/cas/args/tree --salt:@=/cas/args/salt "$@"
+    --stage="$s" --tree:@=/cas/args/tree --test-salt:@=/cas/args/test-salt "$@"
 }
 
 case "$stage" in
@@ -64,9 +65,9 @@ start)
   # DEEP-DEPS/rustc on the way in. No --runner either — rustc depends on the
   # runner pool and curries the built binary onto it itself, so a caller says
   # only what it is building.
-  req=$(caos prepare-request --base:@=/cas/args/rustc --src:@=/cas/args/src) \
-    || fail "forming the build request"
-  caos run-request-then "$req" --then:hash="$(next count-tree)"
+  img=$(caos curry --base:@=/cas/args/rustc --src:@=/cas/args/src) \
+    || fail "currying the build"
+  caos run-then /cas/args/src --run:hash="$img" --then:hash="$(next count-tree)"
   ;;
 
 count-tree)
@@ -74,9 +75,7 @@ count-tree)
   # --result is the built worker image. Keep its oid as a literal for the
   # second count, three containers from here.
   worker=$(caos hash /cas/args/result) || fail "reading the built worker"
-  req=$(caos prepare-request --base:hash="$worker" --in:@=/cas/args/tree) \
-    || fail "forming the tree count"
-  caos run-request-then "$req" --then:hash="$(next count-file --worker="$worker")"
+  caos run-then /cas/args/tree --run:hash="$worker" --then:hash="$(next count-file --worker="$worker")"
   ;;
 
 count-file)
@@ -88,9 +87,7 @@ count-file)
   echo "== a single file counts as 1 ==" >&2
   caos get /cas/args/tree || fail "expanding the fixture tree"
   caos get /cas/args/worker
-  req=$(caos prepare-request --base:hash="$(cat /cas/args/worker)" --in:@=/cas/args/tree/a.txt) \
-    || fail "forming the file count"
-  caos run-request-then "$req" --then:hash="$(next check)"
+  caos run-then /cas/args/tree/a.txt --run:hash="$(cat /cas/args/worker)" --then:hash="$(next check)"
   ;;
 
 check)

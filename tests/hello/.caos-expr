@@ -1,5 +1,5 @@
-# tests/hello, as an ENTRY (design/caos-expr.md, Phase 3): running this test is
-# evaluating this directory.
+# tests/hello, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A CLIENT TEST — it drives `caos-cli` and asserts on what the CLIENT resolves,
 # so its base is `DEEP-DEPS/lib` (tests/lib), the image that stages a git
@@ -11,4 +11,4 @@
 #           `strip_caos_expr` removes this file from the tree before the
 #           expression is evaluated against it, so nothing recurses.
 #   --cli   the client under test; --salt is what makes --test-salt re-run this
-run --base:@=DEEP-DEPS/lib --worker1:@=worker.sh --test:@=. --cli:@=cli --salt:@=salt
+curry --base:@=DEEP-DEPS/lib --worker1:@=worker.sh --test:@=. --cli:@=cli --test-salt:@=test-salt
