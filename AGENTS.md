@@ -64,7 +64,7 @@ Every script here runs with it, and two constructs quietly break under it.
 
 - **Workers are NOT network-free.** This gets asserted over and over and it is
   wrong. A worker container is launched with `--network caos-net`
-  (`crates/runnerd/src/main.rs`) and has to be — it reaches the server over
+  (`rust/crates/runnerd/src/main.rs`) and has to be — it reaches the server over
   HTTP. Beyond that, `std/llm-client` posts to `https://api.anthropic.com`, and
   `std/flake-builder`'s worker runs `nix build` (fetching flake inputs from the
   internet) and `skopeo copy` to the registry. A worker that wants the network
@@ -162,7 +162,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   and the next step ran against a stack that was not up. Use
   `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
 - **`run-tool test` does not cover `nix build`.** The suite compiles the tree
-  with cargo over the real `crates/` directory; `nix build` compiles a copy
+  with cargo over the real `rust/crates/` directory; `nix build` compiles a copy
   filtered by the flake's `src`. Anything that filter drops is invisible to a
   green suite — four `include_str!("githist/*.sh")` calls merged under a
   passing run and broke `nix build` on arrival. `tests/std-lint` now runs

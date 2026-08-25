@@ -10,7 +10,7 @@
 # budget below is the tripwire for that regression), and the workspace's own
 # crates must compile against them.
 #
-# The workspace source is ingested from $CAOS_PROJECT via a git snapshot —
+# The workspace source is this test's declared dependency (`../../rust`) —
 # exactly the tree an agent's conversation would carry.
 set -euo pipefail
 
@@ -26,8 +26,13 @@ tgt="$(uname -m)-unknown-linux-musl"
 
 # The caos workspace source, as git records it (tracked files only — target/,
 # .caos-dev etc. are untracked or ignored and never land here).
+# THE WORKSPACE IS THIS TEST'S OWN DEPENDENCY, not something handed to it:
+# `DEPS` names `../../rust`, and everything cargo compiles lives under that one
+# directory. Copied out of the mount because the tripwire edits below write to
+# it, and DEEP-DEPS is staged from read-only CAS content.
 mkdir ws
-git -C "$CAOS_PROJECT" archive HEAD | tar -x -C ws
+cp -rL DEEP-DEPS/rust/. ws/
+chmod -R u+w ws
 commit "caos workspace snapshot"
 
 # A GENUINELY cold run needs a salt. `ws` is a snapshot of $CAOS_PROJECT HEAD,

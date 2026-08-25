@@ -13,8 +13,13 @@ set -euo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
+# THE WORKSPACE IS THIS TEST'S OWN DEPENDENCY, not something handed to it:
+# `DEPS` names `../../rust`, and everything cargo compiles lives under that one
+# directory. Copied out of the mount because the tripwire edits below write to
+# it, and DEEP-DEPS is staged from read-only CAS content.
 mkdir ws
-git -C "$CAOS_PROJECT" archive HEAD | tar -x -C ws
+cp -rL DEEP-DEPS/rust/. ws/
+chmod -R u+w ws
 commit "workspace snapshot"
 
 echo "== cargo fmt --check of the workspace, in a caos worker ==" >&2

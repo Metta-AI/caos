@@ -18,3 +18,6 @@
 # The image this client test runs in, with the client-repo setup as its
 # /worker: a dependency, not a harness.
 ../lib lib
+# Everything cargo compiles, as a declared dependency rather than a workspace
+# handed to this test from outside.
+../../rust rust

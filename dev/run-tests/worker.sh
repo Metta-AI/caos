@@ -158,11 +158,17 @@ fanout)
     # map image the way `cli` and `test-salt` do. dev/run-test curries whichever
     # of them the wrapper carries onto the test's ArgTree.
     case "$t" in
-      cargo-self | unit-* | std-lint)
-        # Dogfood the tree under test: the whole workspace, for the tests whose
-        # subject IS the workspace. Only these — curried onto the map image it
-        # would reach every test, and every test would then re-key on any edit
-        # anywhere, including edits to other tests.
+      std-lint)
+        # THE ONLY TEST LEFT THAT NEEDS THE WHOLE TREE. cargo-self and unit-*
+        # used to be here; they now DECLARE what they compile (`../../rust`) and
+        # are self-contained. std-lint cannot: `lint-flake-src.sh` checks that the
+        # flake's src filter drops nothing the crates embed, and `refresh.sh
+        # --check` re-derives every checked-in lock from the root one — both are
+        # ABOUT the whole tree, and linting a declared subset of it would pass
+        # exactly the way the githist embeds did.
+        #
+        # Not on the map image: it is the whole tree, so every test would then
+        # re-key on any edit anywhere, including edits to other tests.
         ln -s /cas/args/ws "/tmp/sel/$t/workspace"
         ;;
       chat-online)

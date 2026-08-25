@@ -25,7 +25,7 @@ crates_io_deps() { # <Cargo.toml>
     | sed -E 's/^([A-Za-z0-9_-]+).*/\1/'
 }
 
-anchor=crates/bake-anchor/Cargo.toml
+anchor=rust/crates/bake-anchor/Cargo.toml
 [ -f "$anchor" ] || { echo "lint-bake-anchor: no $anchor" >&2; exit 1; }
 anchored=$(crates_io_deps "$anchor" | sort -u)
 

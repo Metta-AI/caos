@@ -4,4 +4,4 @@
 # of the binary rustc produces.
 ../rustc rustc
 ../git-runner git-runner
-../../crates/conversation-protocol conversation-protocol
+../../rust/crates/conversation-protocol conversation-protocol

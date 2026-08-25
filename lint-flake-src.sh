@@ -25,17 +25,19 @@ set -euo pipefail
 root=${1:-.}
 cd "$root"
 
-if [ ! -e flake.nix ] || [ ! -d crates ]; then
+if [ ! -e flake.nix ] || [ ! -d rust/crates ]; then
   echo "lint-flake-src: $root is not the caos workspace root" >&2
   exit 2
 fi
 
+# THE FILTER IS ROOTED AT ./rust, so this reasons in the same frame: descend,
+# and every path below — `crates/...`, `Cargo.lock` — means what flake.nix means
+# by it. Everything cargo compiles lives under this one directory.
+cd rust
+
 # Mirrors flake.nix `src`. Returns 0 if the filter keeps this repo-relative path.
 keep_rule() {
   local rel=$1
-  # ./tests is dropped wholesale — runtime DATA for the cargo/rgrep workers,
-  # never compiled here.
-  if [ "$rel" = tests ] || [ "${rel#tests/}" != "$rel" ]; then return 1; fi
   case "$rel" in
     *.rs | *.toml | Cargo.lock | */Cargo.lock) return 0 ;;
     # Scripts a worker bakes into its binary are source, not data.

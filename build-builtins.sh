@@ -548,7 +548,7 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   install -m 755 "${bin_path[rustc]}/bin/worker-rustc" "$CLIENT/seed-rustc"
   git -C "$CLIENT" add seed-rustc
   rm -rf "${CLIENT:?}/seed-rustc-wc"
-  cp -RL "$PROJECT/crates/worker-common" "$CLIENT/seed-rustc-wc"
+  cp -RL "$PROJECT/rust/crates/worker-common" "$CLIENT/seed-rustc-wc"
   chmod -R u+w "$CLIENT/seed-rustc-wc"
   git -C "$CLIENT" add seed-rustc-wc
   # curry(runner, worker1=<rustc bin>, cargo=<cargo image, a literal hash blob>,

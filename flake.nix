@@ -71,7 +71,7 @@
         # Linux (linuxPkgs) while the host build is the host's. On Linux those
         # are one derivation, which is what collapses the bake and
         # cargoArtifacts into a single compile.
-        rustChannel = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+        rustChannel = (builtins.fromTOML (builtins.readFile ./rust/rust-toolchain.toml)).toolchain.channel;
         mkRustToolchain =
           p:
           (if rustChannel == "stable" then p.rust-bin.stable.latest else p.rust-bin.stable.${rustChannel})
@@ -86,32 +86,31 @@
         rustToolchain = mkRustToolchain pkgs;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # The cargo source, WITHOUT ./tests. cleanCargoSource sweeps in every
-        # Cargo.toml in the tree, and crane's mkDummySrc keeps them, so the
-        # suite's cargo fixtures — tests/cargo-check/{broken,mini} and
-        # tests/cargo-crates/ws — landed in the DEPENDENCY cache key. They
-        # contribute nothing to it: ws declares its own [workspace], the other
-        # two have no dependencies at all, and none is a member here. Yet
-        # editing one rebuilt all ~176 deps.
+        # The cargo source: ./rust, the whole of it. Everything cargo compiles
+        # lives under that one directory — Cargo.toml, Cargo.lock,
+        # rust-toolchain.toml and crates/ — which is what lets a package DECLARE
+        # the workspace as a dependency (`../../rust rust` in a DEPS) rather
+        # than be handed the repository.
         #
-        # They are runtime DATA, not source: the suite hands those directories
-        # to the cargo worker as trees to check, delivered over caos by
-        # `--in:@=.` (cli_run_tool), never compiled by this build. Nothing
-        # under crates/ reaches into them — no crates/*/tests, no include_*,
-        # no path reference — so dropping them costs the compile nothing and
-        # makes this key exactly (manifests, lockfile, toolchain).
+        # It is also what retired the exclusion that used to be here. Rooting at
+        # the repo made `cleanCargoSource` sweep in every Cargo.toml in the
+        # tree, so the suite's cargo FIXTURES — tests/cargo-check/{broken,mini},
+        # tests/cargo-crates/ws — landed in the DEPENDENCY cache key and editing
+        # one rebuilt all ~176 deps. They are runtime data handed to the cargo
+        # worker as trees to check, never compiled by this build; now they are
+        # simply not under `src`.
         #
         # NOT cleanCargoSource: crane's filter keeps *.rs, *.toml, Cargo.lock
         # and .cargo/config and NOTHING else, so a `include_str!("x.sh")`
         # compiles everywhere a full tree is present and fails HERE — which is
         # exactly how crates/worker-llm-step/src/githist/*.sh broke this build
-        # after passing the whole suite (see caos-tools/test.sh: the compile
-        # runs over the real crates/, so the flake's filter is the one thing
-        # `run-tool test` never exercises). Keep crates/**/*.sh: scripts a
-        # worker bakes into its binary are source, not data.
+        # after passing the whole suite (the suite compiles over the real
+        # crates/, so the flake's filter is the one thing `run-tool test` never
+        # exercises). Keep crates/**/*.sh: scripts a worker bakes into its
+        # binary are source, not data.
         #
         # ./lint-flake-src.sh is the other half of this rule — it resolves every
-        # include!/include_str!/include_bytes! under crates/ and fails if the
+        # include!/include_str!/include_bytes! under rust/crates and fails if the
         # target is not kept here, WITHOUT running nix, so the suite can hold
         # it. Widen this filter and you widen its keep_rule.
         #
@@ -119,16 +118,15 @@
         # mkDummySrc, which keeps only Cargo.lock, .cargo/config.toml and
         # stubbed Cargo.tomls — never the .sh.
         src = pkgs.lib.cleanSourceWith {
-          src = pkgs.lib.cleanSource ./.;
+          src = pkgs.lib.cleanSource ./rust;
           name = "source";
           filter =
             path: type:
             let
-              rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+              rel = pkgs.lib.removePrefix (toString ./rust + "/") (toString path);
               isCrateScript = pkgs.lib.hasPrefix "crates/" rel && pkgs.lib.hasSuffix ".sh" rel;
             in
-            (rel != "tests" && !(pkgs.lib.hasPrefix "tests/" rel))
-            && (craneLib.filterCargoSources path type || isCrateScript);
+            craneLib.filterCargoSources path type || isCrateScript;
         };
 
         # Build for musl so the binary is fully static (crt-static is on by
