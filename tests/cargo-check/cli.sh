@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a test stack — the suite's per-test job
+# set, INSIDE the dev stack — the suite's per-test job
 # (dev/run-test/run-test.sh).
 #
 # Exercises the cargo worker (worker-cargo, design/cargo-workers.md): a
@@ -13,34 +13,65 @@
 # The mini projects here have no dependencies, so they exercise the worker's
 # materialize-and-run path without touching the baked caos deps; the full
 # dogfood (cargo check of the caos workspace itself) is tests/cargo-self.
+#
+# A STAGED TEST (dev/run-test/run-test.sh's header): each run is a `stage_next`
+# tail call, so this container never parks on a cargo job. Note that NONE of
+# these needs `--may-fail` — the broken package is the whole point of the second
+# case and it still SUCCEEDS as a run: the worker reports the compile error as a
+# value with a nonzero `exit`, which is exactly the property being asserted.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-ms() { date +%s%3N; } # epoch milliseconds
 
 # Every test runs in the Linux stack, so build musl (statics run there) — the
 # system's one target. No host build has a consumer.
 tgt="$(uname -m)-unknown-linux-musl"
 
-echo "== cargo test: a passing package ==" >&2
-t0=$(ms)
-"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=test/mini --cmd=test "--target=$tgt"
-t1=$(ms)
-[ "$(cat r1/exit)" = "0" ] || fail "test: exit $(cat r1/exit); stderr: $(cat r1/stderr)"
-grep -q "test result: ok. 1 passed" r1/stdout \
-  || fail "no passing test output: $(cat r1/stdout)"
-echo "  ok: tests ran and passed ($((t1 - t0))ms)" >&2
+cargo_job() { # <cmd> -> the image; the TREE rides as the subject (--in)
+  "$CAOS_CLI" curry --base:@=DEEP-DEPS/cargo --cmd="$1" "--target=$tgt"
+}
 
-echo "== cargo check: a compile error is a value, not a run error ==" >&2
-"$CAOS_CLI" run r2 --base:@=DEEP-DEPS/cargo --tree:@=test/broken --cmd=check "--target=$tgt"
-[ "$(cat r2/exit)" != "0" ] || fail "broken check exited 0"
-grep -q "mismatched types" r2/stderr || fail "no diagnostics: $(cat r2/stderr)"
-echo "  ok: diagnostics surfaced, exit $(cat r2/exit)" >&2
+case "$STAGE" in
 
-echo "== identical tree: the cached value comes back ==" >&2
-t2=$(ms)
-"$CAOS_CLI" run r3 --base:@=DEEP-DEPS/cargo --tree:@=test/mini --cmd=test "--target=$tgt"
-t3=$(ms)
-cmp -s r1/exit r3/exit && cmp -s r1/stdout r3/stdout \
-  || fail "re-run of an identical tree differed"
-echo "  ok: identical result (first $((t1 - t0))ms, cached $((t3 - t2))ms)" >&2
+start)
+  echo "== cargo test: a passing package ==" >&2
+  stage_next passed "$(cargo_job test)" test/mini
+  ;;
+
+passed)
+  fetch_result
+  [ "$(cat "$RESULT/exit")" = "0" ] \
+    || fail "test: exit $(cat "$RESULT/exit"); stderr: $(cat "$RESULT/stderr")"
+  grep -q "test result: ok. 1 passed" "$RESULT/stdout" \
+    || fail "no passing test output: $(cat "$RESULT/stdout")"
+  echo "  ok: tests ran and passed" >&2
+  # The passing run's value, to compare the cached re-run against.
+  printf '%s\n' "$RESULT_HASH" > "$CARRY_OUT/mini"
+
+  echo "== cargo check: a compile error is a value, not a run error ==" >&2
+  stage_next broken "$(cargo_job check)" test/broken
+  ;;
+
+broken)
+  fetch_result
+  [ "$(cat "$RESULT/exit")" != "0" ] || fail "broken check exited 0"
+  grep -q "mismatched types" "$RESULT/stderr" \
+    || fail "no diagnostics: $(cat "$RESULT/stderr")"
+  echo "  ok: diagnostics surfaced, exit $(cat "$RESULT/exit")" >&2
+
+  echo "== identical tree: the cached value comes back ==" >&2
+  stage_next cached "$(cargo_job test)" test/mini
+  ;;
+
+cached)
+  # The whole result by oid, rather than `cmp` on two checkouts: results are
+  # content-addressed, so an equal hash is a stronger statement than an equal
+  # exit and stdout, and it needs nothing carried but the hash.
+  [ "$RESULT_HASH" = "$(cat "$CARRY/mini")" ] \
+    || fail "re-run of an identical tree differed: $RESULT_HASH vs $(cat "$CARRY/mini")"
+  echo "  ok: identical result" >&2
+  echo "cargo-check: ALL PASS" >&2
+  ;;
+
+*) fail "unknown stage: $STAGE" ;;
+esac

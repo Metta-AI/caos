@@ -8,26 +8,50 @@
 # nothing to gain from per-crate keys — rustfmt reads the tree and stops.
 #
 # One of four unit-* tests — see tests/unit-test/cli.sh for why they are four.
+# A STAGED TEST (dev/run-test/run-test.sh's header): the cargo job is a
+# `stage_next` tail call, so this container exits instead of parking on a
+# compile that needs a container of its own.
+#
+# `--may-fail` KEEPS THE INFRA/VERDICT SPLIT. Without it the harness turns any
+# failed run into this test's FAIL, which would erase the distinction the old
+# shape drew with `|| ok=0`: a cargo worker that never ran is INFRA (uncached,
+# retried), while a worker that ran and reported a nonzero `exit` is the
+# verdict. Declaring the failure means the error arrives as $ERROR for this
+# script to classify, exactly as before.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-mkdir ws
-git -C "$CAOS_PROJECT" archive HEAD | tar -x -C ws
-commit "workspace snapshot"
+case "$STAGE" in
 
-echo "== cargo fmt --check of the workspace, in a caos worker ==" >&2
-ok=1
-"$CAOS_CLI" run r4 --base:@=DEEP-DEPS/cargo --tree:@=ws --cmd=fmt >/tmp/r4.log 2>&1 || ok=0
-cat /tmp/r4.log >&2
-if [ "$ok" = 0 ] || [ ! -e r4/exit ] || [ "$(cat r4/exit)" != "0" ]; then
-  echo "== cargo fmt FAILED (exit $(cat r4/exit 2>/dev/null)) — full output ==" >&2
-  # STDOUT LAST: rustfmt prints the offending diff there, and the suite report
-  # inlines a failing test's LAST lines.
-  echo "---- stderr ----" >&2; cat r4/stderr >&2 || true
-  echo "---- stdout ----" >&2; cat r4/stdout >&2 || true
-  if [ "$ok" = 0 ] || [ ! -e r4/exit ]; then infra "cargo worker did not run"; fi
-  fail "fmt failed"
-fi
-echo "unit-fmt: ALL PASS" >&2
+start)
+  mkdir ws
+  git -C "$CAOS_PROJECT" archive HEAD | tar -x -C ws
+  git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "workspace snapshot"
+  # No --target and no --mode: `cargo fmt` parses rather than compiles, so it
+  # needs neither the baked dep graph nor a per-crate decomposition. The run
+  # this replaces passed neither either.
+  echo "== cargo fmt of the workspace, in caos workers ==" >&2
+  img=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/cargo --cmd=fmt)
+  stage_next checked "$img" ws --may-fail
+  ;;
+
+checked)
+  # The run itself failed: the cargo worker never produced a value, so nothing
+  # was linted and this must not cache as a red.
+  if [ -n "$ERROR" ]; then
+    cat "$ERROR" >&2
+    infra "cargo worker did not run"
+  fi
+  fetch_result
+  if [ ! -e "$RESULT/exit" ] || [ "$(cat "$RESULT/exit")" != "0" ]; then
+    echo "== cargo fmt FAILED (exit $(cat "$RESULT/exit" 2>/dev/null)) — full output ==" >&2
+    echo "---- stdout ----" >&2; cat "$RESULT/stdout" >&2 || true
+    echo "---- stderr ----" >&2; cat "$RESULT/stderr" >&2 || true
+    fail "fmt failed"
+  fi
+  echo "unit-fmt: ALL PASS" >&2
+  ;;
+
+*) fail "unknown stage: $STAGE" ;;
+esac

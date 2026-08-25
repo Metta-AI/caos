@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a test stack — the suite's per-test job
+# set, INSIDE the dev stack — the suite's per-test job
 # (dev/run-test/run-test.sh).
 #
 # Proves the rustc builder loop: a Rust source file -> the builder compiles it
@@ -9,57 +9,87 @@
 # shared runner. Then it edits the source and rebuilds to confirm a distinct,
 # independently-working worker.
 #
-# It also times each phase: `build` (compile a source into a runnable worker) and
-# `first-run` (that new worker's first execution). On a warm server the runner is
-# already provisioned, so first-run reflects a warm dispatch; against a fresh stack
-# it's a cold provision.
+# A STAGED TEST (dev/run-test/run-test.sh's header): four runs, five stages, no
+# blocking. Two things that were free in one process are not free across five:
+#
+#   THE SALT MUST BE CARRIED, NOT REGENERATED. This test salts its sources with
+#   a per-run marker so every run compiles a NOVEL binary and `first-run` is a
+#   genuine cold path. cli.sh runs ONCE PER STAGE, so a `date +%s%N` at the top
+#   would mint a different marker each time and stage 3 would rebuild rather
+#   than reuse stage 1's image. It is generated once, at `start`, and rides in
+#   $CARRY. Anything else a later stage must agree with goes the same way.
+#
+#   AN IMAGE IS ITS $RESULT_HASH. The old shape checked a build out, committed
+#   it and read the tree hash back with `git rev-parse HEAD:img` — a round trip
+#   through the worktree to recover a hash the run already had. A staged test is
+#   handed it.
+#
+# The per-phase timings are gone with the blocking calls: `build` and
+# `first-run` are separate container round trips now, so the numbers would
+# measure the harness rather than the builder.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-ms() { date +%s%3N; }   # epoch milliseconds
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-# Salt each source with the per-run marker so every run compiles a NOVEL worker
-# binary — then `first-run` is always a genuine cold path, never a cache hit
-# from a previous run.
-test_run_id="$(date +%s%N)-$$-$RANDOM"
-uniq=$(printf '%s' "$test_run_id" | tr -cd '0-9a-zA-Z')
-greeter=$(<test/greeter.rs)
-edited=$(<test/greeter-edited.rs)
-printf '%s\n' "${greeter//source-built worker/source-built worker $uniq}" >g1.rs
-printf '%s\n' "${edited//different greeting entirely/different greeting entirely $uniq}" >g2.rs
-commit "salted sources"
-
-# Curry the runner into the rustc builder so each build call only passes src; the
-# builder compiles src and curries the result into this runner.
-# No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
-# the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
-
-# The builder's result is a worker image (a curry node over the runner). The CLI
-# checks results out as files, so re-ingest the checkout through git to get the
-# image tree's hash back — content-addressed, so it round-trips exactly.
-tree_hash() { # <dir> -> the git tree hash of its committed contents
-  git rev-parse "HEAD:$1"
+# The salted sources, rebuilt identically in whichever stage needs them: a pure
+# function of $CARRY_OUT/uniq (seeded from $CARRY) and the checked-in fixtures, so every stage that runs
+# this gets byte-identical files and therefore the same cache key.
+salt_sources() {
+  local uniq; uniq=$(cat "$CARRY_OUT/uniq")
+  local greeter edited
+  greeter=$(<test/greeter.rs)
+  edited=$(<test/greeter-edited.rs)
+  printf '%s\n' "${greeter//source-built worker/source-built worker $uniq}" > g1.rs
+  printf '%s\n' "${edited//different greeting entirely/different greeting entirely $uniq}" > g2.rs
+  git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "salted sources"
 }
 
-echo "build greeter.rs -> runnable worker -> run" >&2
-t0=$(ms); "$CAOS_CLI" run img --base:hash="$builder" --src:@=g1.rs; t1=$(ms)
-commit "built image 1"
-"$CAOS_CLI" run a --base:hash="$(tree_hash img)"; t2=$(ms)
-grep -q "source-built worker" a/greeting \
-  || fail "built worker did not produce the expected output"
+# No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
+# the built binary onto it itself, so a caller says only what it is building.
+# `--src` is CURRIED because `stage_next` binds its subject to `--in`.
+build() { # <source-file> -> the build image
+  local builder; builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
+  "$CAOS_CLI" curry --base:hash="$builder" --src:@="$1"
+}
 
-echo "edit source -> a distinct worker" >&2
-t3=$(ms); "$CAOS_CLI" run img2 --base:hash="$builder" --src:@=g2.rs; t4=$(ms)
-commit "built image 2"
-"$CAOS_CLI" run c --base:hash="$(tree_hash img2)"; t5=$(ms)
-grep -q "different greeting" c/greeting \
-  || fail "edited worker did not produce the new output"
-grep -q "different greeting" a/greeting \
-  && fail "the new output leaked into the original worker's result"
+case "$STAGE" in
 
-echo "rust-worker perf (ms):" >&2
-echo "  greeter  build=$((t1 - t0))  first-run=$((t2 - t1))" >&2
-echo "  edited   build=$((t4 - t3))  first-run=$((t5 - t4))" >&2
-echo "rust-worker: ALL PASS" >&2
+start)
+  printf '%s\n' "$(date +%s%N)-$$-$RANDOM" | tr -cd '0-9a-zA-Z\n' > "$CARRY_OUT/uniq"
+  salt_sources
+  echo "build greeter.rs -> runnable worker -> run" >&2
+  stage_next run-first "$(build g1.rs)" g1.rs
+  ;;
+
+run-first)
+  # $RESULT is the built worker image; run it with nothing bound.
+  stage_next check-first "$RESULT_HASH"
+  ;;
+
+check-first)
+  fetch_result
+  grep -q "source-built worker" "$RESULT/greeting" \
+    || fail "built worker did not produce the expected output"
+  # The original worker's output, kept for the leak check two stages on.
+  cp "$RESULT/greeting" "$CARRY_OUT/first-greeting"
+
+  echo "edit source -> a distinct worker" >&2
+  salt_sources
+  stage_next run-second "$(build g2.rs)" g2.rs
+  ;;
+
+run-second)
+  stage_next check-second "$RESULT_HASH"
+  ;;
+
+check-second)
+  fetch_result
+  grep -q "different greeting" "$RESULT/greeting" \
+    || fail "edited worker did not produce the new output"
+  grep -q "different greeting" "$CARRY/first-greeting" \
+    && fail "the new output leaked into the original worker's result"
+  echo "rust-worker: ALL PASS" >&2
+  ;;
+
+*) fail "unknown stage: $STAGE" ;;
+esac

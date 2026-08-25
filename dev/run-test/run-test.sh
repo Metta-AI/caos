@@ -39,7 +39,15 @@
 #   exit 0       the test passed                         -> PASS verdict (value)
 #   fail / 1     the thing UNDER TEST was wrong          -> FAIL verdict (value)
 #   abort / 2    cli.sh tripped `set -e` unexpectedly    -> FAIL verdict (value)
+#   stage_next/3 the test continues at another stage     -> a run-then, no verdict
 #   infra / *    the environment BROKE                   -> job error (uncached)
+#
+# STAGE 3 IS WHY A TEST NEED NOT BLOCK. `$CAOS_CLI run` waits for its result,
+# which parks this container on a job that needs a container of its own — the
+# hold-and-wait that made the suite need more runner slots than it has tests. A
+# test that calls `stage_next` instead records a `run-then` and EXITS, and the
+# server calls this image back with the result. The verdict then comes from the
+# last stage to run, and every stage's output is accumulated into it.
 #
 # `fail` is each cli.sh's own helper (exit 1); `abort` and `infra` the harness
 # provides. A test that GUARDS a risky step says which broke — `... || infra
@@ -85,10 +93,21 @@ fail() {
 # deleted along with the image it interpreted.
 caos get -r /cas/args/in || fail "materializing this test's wrapper"
 
-TEST=/cas/args/in/test
+# THE WRAPPER IS `--in` AT THE FIRST STAGE AND A CURRIED `--wrapper` AFTER IT.
+# A staged test's continuation is a `run-then`, and a `then` receives `--in` set
+# to the SUBJECT that was run — the test's own fixture, not its wrapper. So from
+# the second stage on the wrapper rides under a name of its own, curried by
+# `stage_next` below. Stage one has no `--wrapper` and `--in` is still it.
+WRAP=/cas/args/in
+if [ -e /cas/args/wrapper ]; then
+  caos get -r /cas/args/wrapper || fail "materializing the carried wrapper"
+  WRAP=/cas/args/wrapper
+fi
+
+TEST=$WRAP/test
 [ -d "$TEST" ] || fail "no test tree at $TEST
-  /cas/args:    $(ls -A /cas/args 2>&1 | tr '\n' ' ')
-  /cas/args/in: $(ls -A /cas/args/in 2>&1 | tr '\n' ' ')"
+  /cas/args: $(ls -A /cas/args 2>&1 | tr '\n' ' ')
+  $WRAP:     $(ls -A "$WRAP" 2>&1 | tr '\n' ' ')"
 
 # THE TESTED CLIENT, from this test's own wrapper. It used to come from the
 # environment, set by the test-stack image's interpreter — which is gone, along
@@ -99,8 +118,8 @@ TEST=/cas/args/in/test
 #
 # INSTALLED, not run in place: materialized CAS content is read-only and
 # owner-only, so exec'ing straight out of /cas is "Permission denied".
-caos get /cas/args/in/cli || fail "no tested client in this wrapper"
-install -m 755 /cas/args/in/cli /tmp/caos-cli || fail "installing the tested client"
+caos get "$WRAP/cli" || fail "no tested client in this wrapper"
+install -m 755 "$WRAP/cli" /tmp/caos-cli || fail "installing the tested client"
 CAOS_CLI=/tmp/caos-cli
 export CAOS_CLI
 # CAOS_SERVER_URL is runnerd's, and runnerd here is the DEV stack's — so it
@@ -135,8 +154,8 @@ git remote add caos "$CAOS_SERVER_URL"
 
 # Tests that dogfood the workspace (cargo-self) get it in their wrapper as
 # the git repo their cli.sh snapshots via $CAOS_PROJECT.
-if [ -e /cas/args/in/workspace ]; then
-  mkdir -p /tmp/ws && cp -r /cas/args/in/workspace/. /tmp/ws/
+if [ -e "$WRAP/workspace" ]; then
+  mkdir -p /tmp/ws && cp -r "$WRAP/workspace/." /tmp/ws/
   git -C /tmp/ws init -q
   git -C /tmp/ws add -A
   git -C /tmp/ws -c user.email=test@caos -c user.name=caos commit -qm workspace
@@ -176,8 +195,8 @@ echo "run-test: stubs reachable at $CAOS_STUB_HOST" >&2
 # out of /cas is "Permission denied".
 # A real-API test's key arrives in its wrapper (chat-online; absent = its
 # cli.sh self-skips).
-if [ -e /cas/args/in/api-key ]; then
-  ANTHROPIC_API_KEY=$(cat /cas/args/in/api-key)
+if [ -e "$WRAP/api-key" ]; then
+  ANTHROPIC_API_KEY=$(cat "$WRAP/api-key")
   export ANTHROPIC_API_KEY
 fi
 
@@ -195,9 +214,9 @@ cp -r "$TEST" ./test
 # `cp -rL` because CAS content is a tree of read-only, hash-tagged files; the
 # copy is small now that every entry is source (the runner is a `{.caos-expr}`
 # sentinel, not a 200MB delta).
-if [ -d /cas/args/in/std ]; then
+if [ -d "$WRAP/std" ]; then
   mkdir -p DEEP-DEPS
-  cp -rL /cas/args/in/std/. DEEP-DEPS/
+  cp -rL "$WRAP/std/." DEEP-DEPS/
   chmod -R u+w DEEP-DEPS
 fi
 
@@ -210,6 +229,105 @@ mkdir /tmp/out
 # last ran and the span reaches back to that run. The phase is stamped by the
 # `fanout` stage instead, across jobs that really ran.
 t0=$SECONDS
+
+# ---- what a STAGED test sees ------------------------------------------------
+# A staged test does not block on `$CAOS_CLI run`. It calls `stage_next` (in the
+# harness below), which tail-calls a `run-then`: the server runs the image, and
+# calls THIS image back with the result. So the same cli.sh runs once per stage,
+# dispatching on $STAGE, and no container is ever parked waiting on a job.
+#
+# Four things cross a stage boundary, and each is here because a `then` gets
+# only `--in` and `--result`:
+#
+#   $STAGE    which stage this is; `start` on the first.
+#   $RESULT   the previous run's result (and $RESULT_HASH its oid), "" at the start. `--error` instead
+#             when a `--catch` run failed — $ERROR holds it, and exactly one of
+#             the two is ever non-empty.
+#   $CARRY    a directory the test writes anything it needs later into. Read-only
+#             here (it is materialized CAS); write the NEXT stage's copy to
+#             $CARRY_OUT, which starts as a copy of this one.
+#   the log   accumulated across stages, so the verdict still carries the whole
+#             test's output rather than its last stage's.
+STAGE=start
+if [ -e /cas/args/stage ]; then
+  caos get /cas/args/stage || fail "reading --stage"
+  STAGE=$(cat /cas/args/stage)
+fi
+RESULT=""
+RESULT_HASH=""
+if [ -e /cas/args/result ]; then
+  RESULT=/cas/args/result
+  # ONE level, not `-r`: a result is as often a whole image as a number, and a
+  # test that wants the bytes of a blob and a test that wants the hash of an
+  # image both get what they need from this. `caos get -r "$RESULT"` in the
+  # cli.sh is the way to walk a deep one.
+  caos get /cas/args/result || fail "expanding --result"
+  RESULT_HASH=$(caos hash /cas/args/result) || fail "hashing --result"
+fi
+ERROR=""
+if [ -e /cas/args/error ]; then
+  caos get /cas/args/error || fail "reading --error"
+  ERROR=/cas/args/error
+fi
+CARRY=/tmp/carry-in
+mkdir -p "$CARRY" /tmp/carry-out
+if [ -e /cas/args/carry ]; then
+  caos get -r /cas/args/carry || fail "materializing --carry"
+  cp -rL /cas/args/carry/. "$CARRY"/ && chmod -R u+w "$CARRY"
+  cp -rL /cas/args/carry/. /tmp/carry-out/ && chmod -R u+w /tmp/carry-out
+fi
+CARRY_OUT=/tmp/carry-out
+export STAGE RESULT RESULT_HASH ERROR CARRY CARRY_OUT
+
+# The log so far. Each stage appends its own output before publishing or
+# handing on, so `output` in the result is the whole test, not its last stage.
+: > /tmp/accum.out
+if [ -e /cas/args/log ]; then
+  caos get /cas/args/log || fail "reading the accumulated log"
+  cat /cas/args/log > /tmp/accum.out
+fi
+# Elapsed so far, likewise: `seconds` in the report must be the test's total.
+t_prev=0
+if [ -e /cas/args/elapsed ]; then
+  caos get /cas/args/elapsed || fail "reading --elapsed"
+  t_prev=$(cat /cas/args/elapsed)
+fi
+
+# AN UNEXPECTED FAILURE IS THIS TEST'S VERDICT, NOT THE SUITE'S PROBLEM.
+#
+# Every `stage_next` runs with `--catch`, so a failing run comes back here as
+# `--error` instead of failing the job. That is deliberate and it is not
+# optional: an uncaught failure fails the map, which discards the other
+# forty-odd tests' results — a broken fixture in ONE test would report as a
+# suite with no results at all.
+#
+# Catching everything means the harness has to tell the two cases apart, and it
+# does it by what the previous stage DECLARED. `stage_next --may-fail` curries
+# `--may-fail`, and only then does the error reach cli.sh as $ERROR for it to
+# assert on. Without it, an error means the test broke: FAIL, with the error
+# text, and cli.sh is not run again — there is nothing for it to resume from.
+#
+# Bound as 0/1 rather than present/absent because the next stage is curried off
+# this job's base, which already carries the last stage's bindings — there is
+# nothing to UNbind, so the flag has to be overwritten.
+may_fail=0
+if [ -e /cas/args/may-fail ]; then
+  caos get /cas/args/may-fail || fail "reading --may-fail"
+  may_fail=$(cat /cas/args/may-fail)
+fi
+if [ -n "$ERROR" ] && [ "$may_fail" != "1" ]; then
+  {
+    cat /tmp/accum.out
+    echo "FAIL: the run at stage '$STAGE' failed and the test did not expect it"
+    echo "--- the failure"
+    cat "$ERROR"
+  } > /tmp/out/output
+  cat /tmp/out/output >&2
+  echo "RUN-TEST: FAIL" > /tmp/out/verdict
+  echo $((t_prev + SECONDS - t0)) > /tmp/out/seconds
+  caos put /tmp/out /cas/out
+  exit 0
+fi
 
 # The pass/fail/abort/infra vocabulary, sourced into cli.sh via BASH_ENV so it
 # lives in ONE place and no tests/<name>/cli.sh has to declare it. `set -o
@@ -229,6 +347,72 @@ trap 'abort "cli.sh aborted (rc=$?) — a command expected to succeed did not"' 
 # errtrace + ERR trap. The current shell keeps them (already sourced); only
 # descendants are spared, so nothing downstream changes behaviour.
 unset BASH_ENV
+
+# stage_next <stage> <image-hash> <subject-path> [--catch] — the tail call that
+# makes a test a chain of jobs instead of one container parked on a run.
+#
+# It only RECORDS the request and exits 3; run-test.sh performs the `run-then`.
+# That split is not tidiness: the continuation has to carry the wrapper, the
+# accumulated log, the elapsed total and $CARRY_OUT, none of which a cli.sh
+# knows about, and `run-then` is a tail call — whoever issues it cannot do
+# anything afterwards.
+#
+# <subject-path> is bound as the run's `--in`, so it is the test's own fixture.
+# Anything else the image needs must already be curried into <image-hash>;
+# `$CAOS_CLI curry` does that client-side without dispatching, which is why a
+# staged test can still build up its arguments in ordinary shell.
+#
+# --may-fail says the run is EXPECTED to fail, and the next stage asserts on
+# $ERROR instead of $RESULT. Every run is caught either way (a job error would
+# take the whole map down with it); what this changes is who handles it. Without
+# it a failure is the test's own verdict and cli.sh is not resumed.
+# <subject-path> may be omitted when the image already has everything it needs
+# curried onto it. It becomes an empty tree rather than something arbitrary, so
+# the key says "no subject" instead of dragging an unrelated fixture into it.
+#
+# AN OMITTED SUBJECT IS AN EMPTY `--in`, NOT AN ABSENT ONE, and that is not the
+# same thing to a worker. `run-then` always binds its subject, so there is no
+# way to leave `in` out of the ArgTree. Several workers read
+# `if Path::new(&arg("in")).exists() { arg("in") } else { arg("tree") }` —
+# worker-cargo and std/bash-tool both do — so an empty `--in` SHADOWS the
+# `--tree` a test curried, and the worker runs against nothing. It surfaced as
+# `caos: /cas/args/in/Cargo.toml: No such file or directory`, which reads like a
+# missing fixture rather than a fixture that was overridden. Pass the tree as
+# the subject in that case; do not curry it under another name.
+# Walk the whole of $RESULT, for a stage that asserts on a TREE rather than
+# reading a value. The harness expands one level for everyone (a blob's bytes,
+# a tree's child placeholders); this is the rest, and it is a separate call
+# because a result is as often a 200 MB image as a fixture with six files.
+fetch_result() {
+  [ -n "$RESULT" ] || abort "fetch_result: this stage has no --result"
+  caos get -r "$RESULT" >/dev/null || abort "materializing the result tree"
+}
+
+# The oid of anything IN the CAS — $RESULT_HASH for a path inside a result.
+# A caos object hash is a git object hash, so this compares directly against a
+# `git rev-parse` of the same content, which is how a test checks that a tree
+# went through a worker unchanged.
+cas_hash() { # <cas-path>
+  caos hash "$1" || abort "hashing $1"
+}
+
+stage_next() {
+  [ $# -ge 2 ] || abort "stage_next needs <stage> <image-hash> [subject-path]"
+  mkdir -p /tmp/stage
+  printf '%s\n' "$1" > /tmp/stage/name
+  printf '%s\n' "$2" > /tmp/stage/run
+  local subject="" a
+  shift 2
+  for a in "$@"; do
+    case "$a" in
+      --may-fail) : > /tmp/stage/may-fail ;;
+      --*) abort "stage_next: unknown flag $a" ;;
+      *) subject=$a ;;
+    esac
+  done
+  printf '%s\n' "$subject" > /tmp/stage/subject
+  exit 3
+}
 HARNESS
 
 # cli.sh's exit code IS the verdict (see the header): 0 pass, 1 fail, anything
@@ -237,6 +421,63 @@ HARNESS
 rc=0
 BASH_ENV=/tmp/harness.sh bash test/cli.sh >/tmp/test.out 2>&1 || rc=$?
 cat /tmp/test.out >&2
+cat /tmp/test.out >> /tmp/accum.out
+
+# EXIT 3 IS NOT A VERDICT: the test asked to continue at another stage. Issue
+# its `run-then` and leave — the request's result becomes whatever the chain
+# eventually publishes, so the verdict comes from the LAST stage to run.
+if [ "$rc" = 3 ]; then
+  [ -e /tmp/stage/name ] || fail "cli.sh exited 3 without recording a stage"
+  run=$(cat /tmp/stage/run)
+  subject=$(cat /tmp/stage/subject)
+  # `run-then` names its subject in the CAS, but a test builds fixtures as
+  # ordinary files in its client repo. Publish anything that is not already a
+  # /cas path, so a cli.sh can say `stage_next built "$img" tree/` and mean it.
+  # An omitted subject becomes an empty tree — see `stage_next`.
+  case "$subject" in
+    /cas/*) ;;
+    "") mkdir -p /tmp/no-subject
+        caos put /tmp/no-subject /cas/stage-subject || fail "publishing the empty subject"
+        subject=/cas/stage-subject ;;
+    *) [ -e "$subject" ] || fail "stage_next subject does not exist: $subject"
+       caos put "$subject" /cas/stage-subject || fail "publishing the subject $subject"
+       subject=/cas/stage-subject ;;
+  esac
+
+  # Everything the next stage needs that a `then` will not give it. The wrapper
+  # under its own name (`--in` there is the SUBJECT), and this stage's log,
+  # clock and carry directory so the chain accumulates rather than restarts.
+  caos put /tmp/accum.out /cas/stage-log || fail "publishing the accumulated log"
+  caos put "$CARRY_OUT" /cas/stage-carry || fail "publishing the carry directory"
+  printf '%s\n' "$((t_prev + SECONDS - t0))" > /tmp/elapsed
+  caos put /tmp/elapsed /cas/stage-elapsed || fail "publishing the elapsed total"
+
+  # `--may-fail` has to be REBOUND EVERY TIME, not merely set when asked for:
+  # the next stage is curried off THIS job's base, which already carries
+  # whatever the last one bound. A stage that expected a failure would
+  # otherwise leave every later stage expecting one too, and a real breakage
+  # would arrive at a cli.sh as a routine $ERROR.
+  curry_args=(
+    "--wrapper:@=$WRAP"
+    "--stage=$(cat /tmp/stage/name)"
+    --log:@=/cas/stage-log
+    --carry:@=/cas/stage-carry
+    --elapsed:@=/cas/stage-elapsed
+  )
+  if [ -e /tmp/stage/may-fail ]; then
+    curry_args+=(--may-fail=1)
+  else
+    curry_args+=(--may-fail=0)
+  fi
+  next=$(caos curry --base:@=/cas/args/base "${curry_args[@]}") \
+    || fail "currying the next stage"
+
+  # ALWAYS `--catch`: see the header above the $ERROR check. Whether the failure
+  # is the test's to assert on or the test's own verdict is decided there, from
+  # `--may-fail`; it is never allowed to fail the map.
+  caos run-then "$subject" --run:hash="$run" --then:hash="$next" --catch
+  exit 0
+fi
 
 case "$rc" in
   0) echo "RUN-TEST: PASS" > /tmp/out/verdict ;;
@@ -252,14 +493,14 @@ case "$rc" in
   # test's own output is already on stderr above; fail adds the stack's logs.
   *) fail "cli.sh exited $rc — an infrastructure failure, not a test verdict" ;;
 esac
-echo $((SECONDS - t0)) > /tmp/out/seconds
+echo $((t_prev + SECONDS - t0)) > /tmp/out/seconds
 
 # The COMPLETE record rides in the result tree — the test's full output — so
 # the suite result holds everything a debugger, human or agent, would want to
 # read. No streaming, no archaeology: address the byte you need by path. The
 # stack's own logs are NOT here any more: there is one dev stack shared by the
 # suite, so its log is the stack's to keep, not each test's to copy.
-cp /tmp/test.out /tmp/out/output
+cp /tmp/accum.out /tmp/out/output
 # `phases` is the interpreter's clock for everything BEFORE this script ran —
 # arg materialization, finding the stack, fetching deps. None of it is in the
 # `seconds` below, which starts once the stack is in hand, so without this the
