@@ -203,16 +203,26 @@ are the kind of thing that is invisible until 29 clients arrive at once.
     `../lib`; `tests/lib`'s `/worker` stages the repo and then runs `worker1`.
     Grep `DEPS` for `lib` to see which tests are client tests. A worker test
     names `std/bash` and never pays for a repo.
-- **`prepare-request` forms a run; `curry` builds an IMAGE.** Handing a curry
-  node to `run-request-then` produces an ArgTree the runner does not unwrap, and
-  it dies on `caos get /cas/args/worker1` — its own entrypoint arg, missing,
-  because the chain below was never merged. Prefer `run-request-then` over
-  `run-then` in a staged test: it runs a complete ArgTree unchanged, so no
-  `--in` is invented for a callee that does not want one (worker-cargo and
-  std/bash-tool both read `--in` in preference to their real argument, so an
-  empty one silently shadows it).
+- **A CURRY NODE IS AN ARGTREE, and an ArgTree is what runs.** SPEC is explicit
+  ("we generally talk about ArgTrees, not images; an image is just one arg"), so
+  `run-then --run:hash=<curried ArgTree>` is how a staged worker calls one: the
+  server's `run_image` unwraps the curry, merges its bound args, and adds `salt`
+  and `secret-hash` from the enclosing job. Passing arguments to it IS currying
+  them onto it.
+  - **`run-request-then` is NOT that verb.** It runs an ArgTree by IDENTITY, for
+    a caller that already knows the exact request hash and must run that one
+    unmodified — which is what `prepare-request` is paired with. Handed a curry
+    node it unwraps nothing, so `args` and `.caos-curry` arrive as two arguments
+    of those names and the callee dies on a missing `/cas/args/<its own arg>`.
+    That failure reads like "a curry node is not a request", which it is not:
+    it is the wrong verb.
+- **`salt`, `base`, `secret-hash` and `workerN` are RESERVED entry names.**
+  Binding one silently loses: `run_image` merges the run's own salt LAST, so a
+  per-test value bound as `--salt` is overwritten at dispatch and never reaches
+  the key — two different values then produce one request and nothing re-runs.
+  `tests/hello` asserts the list; the suite's own is `--test-salt`.
 - **`/cas/args/base` is the IMAGE, not this job's ArgTree.** A later stage must
-  re-bind by name whatever it reads. `--salt` has to ride in EVERY stage for
+  re-bind by name whatever it reads. `--test-salt` has to ride in EVERY stage for
   that reason: bound only at the top, a fresh `--test-salt` re-runs the first
   container and hits the memo for all the rest.
 
