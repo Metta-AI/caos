@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/std-lint check: every crates.io dependency a source-built std tool
+# tests/lint check: every crates.io dependency a source-built std tool
 # declares must be present in the bake-anchor crate (crates/bake-anchor), so the
 # std/cargo bake vendors+precompiles it (design/caos-expr.md, Phase 3). Source
 # std tools live OUTSIDE the workspace and compile against that bake; a dep the
@@ -14,7 +14,11 @@
 # (worker-common, llm-client) are NOT anchored — they are workspace crates / std
 # entries resolved by splice/mount, never from crates.io.
 set -euo pipefail
-cd "$(dirname "$0")"
+# THE TREE TO CHECK, as an argument — this script no longer lives at the root of
+# the tree it reads. It is `tests/lint/`'s, and the tree is whatever that test
+# assembled from its `DEPS` (or the repo root, run by hand from there).
+root=${1:-.}
+cd "$root"
 
 # The crates.io dep NAMES in a Cargo.toml's [dependencies]: lines `name = …`
 # that carry no `path` (a path dep is local). One name per line.

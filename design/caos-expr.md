@@ -383,7 +383,7 @@ meantime, *this* project reaches std through deep-deps (`DEEP-DEPS/x`).
   dependency-only workspace crate holding the std tools' crates.io deps (`regex`,
   `serde_json`, `minreq{https-rustls}`), so the `--workspace` `/std/cargo` bake
   keeps vendoring+precompiling them once the tool crates leave the workspace.
-  `lint-bake-anchor.sh` (run by `tests/std-lint`) enforces `anchor ⊇ every std
+  `tests/lint/lint-bake-anchor.sh` (run by `tests/lint`) enforces `anchor ⊇ every std
   tool's crates.io deps` by name; version/feature parity stays on the build-time
   bake-reuse guard. No `bake.nix` change (it's already `--workspace`).
 - **crates.io + `llm-client` leaves** (step 3) ✓: `llm-call`/`llm-step` are now

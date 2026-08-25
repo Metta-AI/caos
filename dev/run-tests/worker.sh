@@ -146,32 +146,17 @@ fanout)
     # client tests DEP on — but it has no `worker.sh`, so nothing maps over it.
     if [ ! -e "$d/.caos-expr" ] || [ ! -e "$d/worker.sh" ]; then continue; fi
 
-    # THE CHILD IS A WRAPPER holding the test's own deepened tree at `test`,
-    # nothing rewritten. One symlink: `caos put` resolves it to the recorded
-    # hash, so no bytes move and the test's tree is ONE entry rather than a
-    # rebuilt copy of itself.
-    src=/cas/args/result/tests/$t
-    mkdir -p "/tmp/sel/$t"
-    ln -s "$src" "/tmp/sel/$t/test"
-
-    # The one thing that genuinely differs PER TEST, so it cannot ride on the
-    # map image the way `cli` and `test-salt` do. dev/run-test curries it onto
-    # the test's ArgTree when the wrapper carries it.
-    case "$t" in
-      std-lint)
-        # THE ONLY TEST LEFT THAT NEEDS THE WHOLE TREE. cargo-self and unit-*
-        # used to be here; they now DECLARE what they compile (`../../rust`) and
-        # are self-contained. std-lint cannot: `lint-flake-src.sh` checks that the
-        # flake's src filter drops nothing the crates embed, and lint-bake-anchor
-        # checks every std tool's crates.io deps against the anchor — both are
-        # ABOUT the whole tree, and linting a declared subset of it would pass
-        # exactly the way the githist embeds did.
-        #
-        # Not on the map image: it is the whole tree, so every test would then
-        # re-key on any edit anywhere, including edits to other tests.
-        ln -s /cas/args/ws "/tmp/sel/$t/workspace"
-        ;;
-    esac
+    # THE CHILD IS THE TEST'S OWN DEEPENED TREE, and only that. One symlink:
+    # `caos put` resolves it to the recorded hash, so no bytes move and the
+    # child IS the tree rather than a wrapper around it.
+    #
+    # There used to be a wrapper here, because some tests were handed things
+    # from outside — the client, the salt, a workspace, an api key. None is
+    # handed in any more: the first two are curried onto the map image and
+    # passed when dev/run-test calls the test's ArgTree, and the last two turned
+    # out to be things the tests could DECLARE (`../../rust`, `../../std`) or
+    # read from `/secret`. A test is self-contained, so its tree is the child.
+    ln -s "/cas/args/result/tests/$t" "/tmp/sel/$t"
   done
   caos put /tmp/sel /cas/sel
 

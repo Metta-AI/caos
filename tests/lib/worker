@@ -70,17 +70,6 @@ if [ -d ./test/DEEP-DEPS ]; then
   rm -rf ./test/DEEP-DEPS
 fi
 
-# The workspace, for the tests that dogfood it (cargo-self, unit-*, std-lint).
-if [ -e /cas/args/workspace ]; then
-  caos get -r /cas/args/workspace || fail "materializing the workspace"
-  mkdir -p /tmp/ws && cp -rL /cas/args/workspace/. /tmp/ws/ && chmod -R u+w /tmp/ws
-  git -C /tmp/ws init -q
-  git -C /tmp/ws add -A
-  git -C /tmp/ws -c user.email=test@caos -c user.name=caos commit -qm workspace
-  export CAOS_PROJECT=/tmp/ws
-fi
-
-
 # CAOS_STUB_HOST points workers at in-job stub servers. THIS CONTAINER'S OWN
 # ADDRESS ON THE NETWORK, deliberately, and not `127.0.0.1`: the workers a test
 # scripts are launched into the STACK's netns, not this container's, so loopback

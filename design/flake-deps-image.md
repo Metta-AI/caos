@@ -165,7 +165,7 @@ note rests on, on the flake that motivated it.
 ## What it unlocks
 
 The only reason `std/cargo`'s tree is curated — empty stubs for the crates that
-do not build the `/worker`, `std/refresh.sh` to generate them, `tests/std-lint`
+do not build the `/worker`. (Historical: `std/refresh.sh` generated them and `tests/std-lint`
 to keep them honest — is that the tree hash was the sole memo, so anything in
 the tree was a rebuild trigger. With the expensive half keyed on a
 source-independent derivation, a tree can carry full source and still hit. The

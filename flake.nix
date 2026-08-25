@@ -109,7 +109,7 @@
         # exercises). Keep crates/**/*.sh: scripts a worker bakes into its
         # binary are source, not data.
         #
-        # ./lint-flake-src.sh is the other half of this rule — it resolves every
+        # tests/lint/lint-flake-src.sh is the other half of this rule — it resolves every
         # include!/include_str!/include_bytes! under rust/crates and fails if the
         # target is not kept here, WITHOUT running nix, so the suite can hold
         # it. Widen this filter and you widen its keep_rule.
@@ -322,7 +322,7 @@
         # flake path), so the host builds it. Its definition is
         # std/flake-builder's own flake, taken AS-IS: we call its outputs
         # function directly — the standard subflake call, no path-input
-        # lock churn — passing OUR nixpkgs (tests/std-lint pins the
+        # lock churn — passing OUR nixpkgs (tests/lint pins the
         # subflake's lock to the same revision). Its clean #caosImage is
         # exactly what streams.
         workerFlakeBuilderImage =
@@ -448,7 +448,7 @@
             linuxPkgs.bashInteractive
             linuxPkgs.coreutils
             # cmp/diff: the tests compare cached results byte for byte, and
-            # lint-flake-src.sh and lint-bake-anchor.sh diff and grep. This
+            # tests/lint's two lint scripts diff and grep. This
             # image is the environment every test runs in.
             linuxPkgs.diffutils
             linuxPkgs.gnugrep
@@ -516,7 +516,7 @@
         # stage 2 is `curry(<this image>, worker1=build.sh, stage=2, …)` and so
         # runs the SAME script with the toolchain and the baked deps in scope.
         # Copied rather than shared because std/bash is a published tree and
-        # this is a nix-built image; tests/std-lint keeps literal copies honest
+        # this is a nix-built image; tests/lint keeps the rules honest
         # elsewhere in the tree for the same reason.
         builderWorker = pkgs.runCommand "caos-builder-worker" { } ''
           mkdir -p $out

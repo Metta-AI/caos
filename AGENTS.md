@@ -82,7 +82,7 @@ Every script here runs with it, and two constructs quietly break under it.
 - **Where "no network" is true it is a BUILD-level choice.** `std/cargo` builds
   `--offline` against a vendored registry (`std/cargo/bake.nix`,
   `vendorCargoDeps`) — which is why a crates.io dep missing from the bake anchor
-  fails instead of being fetched (`lint-bake-anchor.sh`). That is the build
+  fails instead of being fetched (`tests/lint/lint-bake-anchor.sh`). That is the build
   refusing to reach out, not the container being unable to.
 
 # Git
@@ -165,8 +165,8 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   with cargo over the real `rust/crates/` directory; `nix build` compiles a copy
   filtered by the flake's `src`. Anything that filter drops is invisible to a
   green suite — four `include_str!("githist/*.sh")` calls merged under a
-  passing run and broke `nix build` on arrival. `tests/std-lint` now runs
-  `./lint-flake-src.sh` for the embedded-file case; for anything else the
+  passing run and broke `nix build` on arrival. `tests/lint` now runs
+  `tests/lint/lint-flake-src.sh` for the embedded-file case; for anything else the
   filter touches, run `nix build` yourself before committing.
 - **`caosd up` does NOT get a new `caos` binary into worker images —
   `caosd reset` does.** A worker image's `/bin/caos` is copied in by the

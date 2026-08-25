@@ -7,14 +7,14 @@
 # knowable once the previous one's work has finished.
 #
 #   eval     (default) `--in` is the WRAPPER the fan-out built: the test's own
-#            deepened tree at `test`, plus `workspace` for the one test that
-#            needs it. Evaluating `test` yields the test's ARG TREE.
+#            deepened tree, and only that — every test is self-contained now.
+#            Evaluating it yields the test's ARG TREE.
 #            A worker may not evaluate — its `caos` has `eval-path-then` and no
 #            `eval-path` — so this records a continuation and exits. Every test
 #            evaluates in parallel, one map child each.
 #   launch   the `then` of that: --result is the ArgTree. Bind what this RUN
-#            supplies — the client under test, the salt, and a workspace when
-#            the wrapper carries one — and run it.
+#            supplies — the client under test and the salt — and run it.
+
 #   verdict  the `then` of THAT: --result is what the test returned, or
 #            --error what it failed with.
 #
@@ -65,7 +65,7 @@ eval)
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage=launch --cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt \
     "--start=$(date +%s)") || fail "currying the launch stage"
-  caos eval-path-then /cas/args/in --eval=test --then:hash="$next" --catch
+  caos eval-path-then /cas/args/in --eval=. --then:hash="$next" --catch
   ;;
 
 launch)
@@ -73,10 +73,10 @@ launch)
   # read, and an unfetched one reads as empty — which surfaces two containers
   # later as `1787683099 - : arithmetic syntax error` in the elapsed sum.
   caos get /cas/args/start || fail "reading --start"
-  # Expand the wrapper before asking what it holds: an unfetched directory
-  # answers "no" to every question about its contents, so the
-  # `workspace` check below would silently bind nothing.
-  caos get /cas/args/in || fail "expanding the wrapper"
+  # Expand the input before reading it: an unfetched directory answers "no" to
+  # every question about its contents.
+
+  caos get /cas/args/in || fail "expanding the test tree"
   if [ -e /cas/args/error ]; then
     # The EXPRESSION is broken — a missing `DEEP-DEPS/<name>`, a path that does
     # not resolve — so no test ever ran. Said plainly, because the failure a
@@ -111,11 +111,10 @@ launch)
   # ArgTree). `curry` fails on a rebind, so a test that bound one of these
   # itself gets a loud error rather than a silent shadow.
   #
-  # `cli` and `test-salt` are the same for every test and ride on this image,
-  # curried by the fan-out. `workspace` differs per test, so it rides in the
-  # wrapper — and is passed only to the tests that were given one.
+  # `cli` and `test-salt` ride on this image, curried by the fan-out. They are
+  # the only things a test does not declare for itself, because they are
+  # properties of the RUN rather than of any tree.
   bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt)
-  if [ -e /cas/args/in/workspace ]; then bind+=(--workspace:@=/cas/args/in/workspace); fi
   req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
     || fail "binding this run's arguments onto the test"
 
@@ -124,7 +123,7 @@ launch)
   echo "run-test: arg tree $req" >&2
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage=verdict "--start=$(cat /cas/args/start)") || fail "currying the verdict stage"
-  caos run-then /cas/args/in/test --run:hash="$req" --then:hash="$next" --catch
+  caos run-then /cas/args/in --run:hash="$req" --then:hash="$next" --catch
   ;;
 
 verdict)

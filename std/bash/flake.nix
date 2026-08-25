@@ -11,7 +11,7 @@
   #
   # This directory IS the published tree (literal trees, part 2): flake.nix,
   # worker (the lock is DEPped from the repo root and placed by the flake-builder)
-  # — build-builtins.sh copies it whole, and tests/std-lint verifies the
+  # — build-builtins.sh copies it whole, and tests/lint verifies the
   # checked-in redundancies.
   description = "caos std/bash — the script worker: shell + file tools, /worker runs `worker1`";
 
@@ -42,7 +42,7 @@
             pkgs.gnugrep
             pkgs.findutils
             # JSON plumbing for worker scripts — the shared lock
-            # derivation (the std-lint suite check) among them.
+            # derivation (the lint suite check) among them.
             pkgs.jq
           ];
           config = {

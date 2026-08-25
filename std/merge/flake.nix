@@ -17,7 +17,7 @@
   #
   # This directory IS the published tree (literal trees, part 2): flake.nix,
   # worker (the lock is DEPped from the repo root and placed by the flake-builder) —
-  # build-builtins.sh copies it whole, and tests/std-lint verifies the
+  # build-builtins.sh copies it whole, and tests/lint verifies the
   # checked-in redundancies.
   description = "caos std/merge — the git-bearing merge worker: /worker three-way-merges two commits";
 

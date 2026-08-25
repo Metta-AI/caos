@@ -18,8 +18,9 @@
 # here but not there yields a red `nix build`; widened there but not here
 # yields a red lint. Neither yields a stale green.
 #
-# Run it anywhere — no nix, no caos, no compile. `tests/std-lint` runs it in
-# the suite; run it by hand from the repo root before committing.
+# Run it anywhere — no nix, no caos, no compile. `tests/lint` runs it in
+# the suite; run it by hand from the repo root before committing:
+#   bash tests/lint/lint-flake-src.sh .
 set -euo pipefail
 
 root=${1:-.}
