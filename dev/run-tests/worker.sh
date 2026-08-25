@@ -22,7 +22,7 @@
 #              run it over the WORKSPACE
 #   fanout     the `then` of that: --result is the deepened tree, so each test's
 #              deps are at tests/<name>/DEEP-DEPS/<mount> and the wrappers can
-#              be built — one job per tests/<name>/cli.sh
+#              be built — one job per tests/<name>
 #   summarize  the `then` of the fan-out — assemble the report
 set -euo pipefail
 
@@ -133,9 +133,9 @@ fanout)
     # lazy placeholders, so an unfetched directory answers "no" to every
     # question about its contents.
     caos get "$d" || fail "expanding tests/$t"
-    # An entry, or not a test. `tests/lib` is the CLI harness other tests DEP
-    # on, and has no expression of its own to run.
-    if [ ! -e "$d/.caos-expr" ]; then continue; fi
+    # A TEST IS AN ENTRY WITH A SCRIPT. `tests/lib` is an entry too — the image
+    # client tests DEP on — but it has no `worker.sh`, so nothing maps over it.
+    if [ ! -e "$d/.caos-expr" ] || [ ! -e "$d/worker.sh" ]; then continue; fi
 
     # THE CHILD IS THE TEST'S OWN DEEPENED TREE, entry by entry, plus what
     # varies per RUN rather than per tree. Symlinked rather than copied: `caos

@@ -1,0 +1,3 @@
+# lib's dependency (format `<path> <name>`, path relative to this dir): the
+# flake-builder that builds this flake into an image, named as a LOCAL dep.
+../../std/flake-builder flake-builder

@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE a test stack — the suite's per-test job (dev/run-test/run-test.sh).
+# tests/hello — a CLIENT test. Runs cwd'd into a fresh git repo with this test
+# tree at ./test, its deps at ./DEEP-DEPS and $CAOS_CLI set: tests/lib's
+# `/worker` stages all of that and then runs this, and this test's `.caos-expr`
+# names tests/lib as its base to ask for it.
 #
 # `std/hello` is what a person runs to check that a caos installation works, so
 # what this pins down is the PROPERTY that makes it useful for that: one
 # command, answer on stdout, no output path, no checkout, nothing to go looking
 # for. If the result ever became a tree, `run` would refuse to stream it and the
 # entry would stop being a smoke test — that is the regression this catches.
+#
+# It stays a CLIENT test rather than becoming a chain of jobs because what it
+# asserts is what the client does: `--base:@=outer/tool` resolving through an
+# ANCESTOR expression is client-side resolution, and staging that away would be
+# testing something else. It blocks on its runs, and those blocks are the
+# subject.
 set -euo pipefail
-
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 echo "== hello streams its arguments back, with no output path ==" >&2
