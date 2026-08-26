@@ -1,79 +1,77 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# tests/llm-interrupt — a WORKER test, in dev/worker-test (it needs git).
+#
 # Escape is a durable event, not a client-side cancellation: an in-flight model
 # response is recorded, its pending tools are closed as errors without running,
 # and the exact request still receives an idle interrupted result.
+#
+# NO CLIENT AT ALL, which suits this test better than it suited the old one.
+# The original ran the turn in a background client and interrupted it; the claim
+# is precisely that interruption does NOT depend on a caller going away, so
+# publishing the Escape event to the ref — with nothing holding the turn open —
+# is the stronger demonstration.
+#
+# THE MODEL ROUND IS HELD OPEN BY A FIFO. The stub blocks reading response-1
+# until this script releases it, so "the Escape arrived mid-round" is a fact the
+# test controls rather than races against.
 set -euo pipefail
-# The dependency is mounted only inside the test wrapper and exports globals.
-# shellcheck disable=SC1091
-source DEEP-DEPS/llm-test/common.sh
+
+caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+source /cas/args/common
 
 stage "workspace and blocked model response"
 llm_test_setup
-stub_host="${stub_host:?llm_test_setup did not set stub_host}"
-mkdir ws
-echo "hello" > ws/greeting.txt
-echo "You are a coding agent operating on a git workspace." > system.txt
-git add -A
-gc commit -qm fixtures
-base=$(mkcommit "HEAD:ws" base)
 
-mkdir stub
-mkfifo stub/response-1.json
+rm -rf /tmp/ws && mkdir -p /tmp/ws
+echo "hello" > /tmp/ws/greeting.txt
+caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
+ws=$(caos hash /cas/ws)
+
+rm -rf /tmp/stub && mkdir -p /tmp/stub
+mkfifo /tmp/stub/response-1.json
 stub_pid=""
 port=""
-start_stub stub stub_pid port
-stub_pid="${stub_pid:?start_stub did not set stub_pid}"
-new_llm_conversation llm-interrupt "$port"
-conv="${conv:?new_llm_conversation did not set conv}"
-conversation_ref="${conversation_ref:?new_llm_conversation did not set conversation_ref}"
-llm="${llm:?new_llm_conversation did not set llm}"
+start_stub /tmp/stub stub_pid port
+
+new_llm_conversation llm-interrupt "$port" "$ws" \
+  "You are a coding agent operating on a git workspace."
 
 stage "publish Escape at the model boundary"
-user1=$(mkcommit "HEAD:ws" \
-  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"this prompt was accidental\"}" \
-  "$base")
-request1=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user1")
-assert_oid "$request1" "interrupted prepared request"
-admitted1=$(mkcommit "HEAD:ws" \
-  "{\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
-  "$user1")
-git push --quiet caos "$admitted1:$conversation_ref" \
-  || fail "publishing interrupted request admission"
-"$CAOS_CLI" run --base:hash="$request1" >/tmp/llm-interrupt-result 2>/tmp/llm-interrupt-error &
-interrupt_pid=$!
-LLM_TEST_PIDS+=("$interrupt_pid")
+dispatch_turn "$ws" "this prompt was accidental"
+user1=$human
+request1=$request
 
 request_seen=0
 for _ in $(seq 1 300); do
-  if [ -e stub/request-1.json ]; then request_seen=1; break; fi
-  if ! kill -0 "$interrupt_pid" 2>/dev/null; then
-    fail "turn exited before its blocked response: $(cat /tmp/llm-interrupt-error)"
-  fi
+  if [ -e /tmp/stub/request-1.json ]; then request_seen=1; break; fi
   sleep 0.2
 done
 [ "$request_seen" -eq 1 ] || fail "model request never arrived"
 
-escape_parent=$(fetch_head)
+# ON TOP OF WHATEVER THE TURN HAS ALREADY APPENDED (llm-step publishes a
+# `running` event before calling the model), with --force-with-lease so a race
+# is a failed push rather than a lost event.
+escape_parent=$(current_head)
 escape_tree=$(git rev-parse "$escape_parent^{tree}")
-escape_commit=$(mkcommit "$escape_tree" \
+escape_commit=$(mint_commit /cas/escape "$escape_tree" \
   "{\"escape\":{\"request\":\"$request1\"}}" "$escape_parent")
+git -c fetch.negotiationAlgorithm=noop fetch -q caos "$escape_commit" \
+  || fail "fetching the escape commit back"
 git push --quiet --force-with-lease="$conversation_ref:$escape_parent" \
   caos "$escape_commit:$conversation_ref" || fail "publishing Escape event"
+
+# Now let the held round return — with a tool call in it, which must NOT run.
 printf '%s\n' \
   '{"content":[{"text":"I had started this response.","type":"text"},{"id":"toolu_interrupted","input":{"file_path":"interrupted.txt","content":"must not run\n"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
-  > stub/response-1.json
+  > /tmp/stub/response-1.json
 
-for _ in $(seq 1 300); do
-  if [ -e stub/request-2.json ]; then fail "Escape allowed another model round"; fi
-  if ! kill -0 "$interrupt_pid" 2>/dev/null; then break; fi
-  sleep 0.2
-done
-if ! wait "$interrupt_pid"; then
-  fail "running interrupted turn: $(cat /tmp/llm-interrupt-error)"
-fi
+head1=$(wait_turn) || {
+  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
+  fail "the interrupted turn never reached a terminal event"
+}
 
 stage "interrupted response is durable and tools did not run"
-head1=$(fetch_head)
 events1=$(git log --first-parent --format=%B "$user1..$head1")
 terminal1=$(git show -s --format=%B "$head1")
 grep -qF "\"request\":\"$request1\"" <<<"$events1" \
@@ -93,7 +91,9 @@ grep -qF '"interrupted":true' <<<"$terminal1" \
 if git cat-file -e "$head1:interrupted.txt" 2>/dev/null; then
   fail "Escape allowed the pending write tool to run"
 fi
-[ ! -e stub/request-2.json ] || fail "Escape allowed another model round"
+[ ! -e /tmp/stub/request-2.json ] || fail "Escape allowed another model round"
 
 stage "done"
-echo "llm-interrupt: ALL PASS" >&2
+printf 'llm-interrupt: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out

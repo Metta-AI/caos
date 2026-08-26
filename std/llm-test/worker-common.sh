@@ -215,6 +215,17 @@ remote_tip() { # <ref>
   printf '%s\n' "${line%%[[:space:]]*}"
 }
 
+# The conversation's current head, fetched so it can be read locally. For a test
+# that has to APPEND to a turn that is still in flight (tests/llm-interrupt),
+# rather than wait for it to finish.
+current_head() {
+  local head
+  head=$(remote_tip "$conversation_ref") || fail "the conversation ref is absent"
+  git -c fetch.negotiationAlgorithm=noop fetch -q caos "$head" \
+    || fail "fetching the conversation head $head"
+  printf '%s\n' "$head"
+}
+
 # Wait for this request's TERMINAL event and print its commit. This is the only
 # completion signal a hosting worker has: it cannot block on the run, and the
 # turn's commit oid is not predictable.
