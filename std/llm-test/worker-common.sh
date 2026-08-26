@@ -157,11 +157,15 @@ new_llm_conversation() { # <suffix> <port> <tree-oid> [system-text]
     || fail "currying llm-step"
 }
 
-# Publish a human turn and the admission event the worker expects, then dispatch
-# the request. Sets `human`, `request` and `admitted`; the conversation ref is
-# left at `admitted`, and wait_turn takes it from there.
+# SPLIT IN TWO, because a test may need to append to the conversation between
+# admission and dispatch — an interjection published before the turn starts is
+# one of llm-step's cases (tests/llm-step). `dispatch_turn` is the pair, for
+# everyone else.
+#
+# `admit_turn` publishes a human turn and the admission event the worker
+# expects. Sets `human`, `request` and `admitted`; the ref is left at `admitted`.
 LLM_TEST_TURN=0
-dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
+admit_turn() { # <tree-oid> <human-message> [parent-commit]
   local tree=$1 message=$2 parent=${3:-$base}
   # A FRESH CAS PATH PER TURN: `caos put-commit` records at a path, and a
   # conversation with two turns would otherwise mint the second over the first.
@@ -208,12 +212,19 @@ dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
     || fail "fetching the admission commit back"
   git push -q caos "$admitted:$conversation_ref" \
     || fail "publishing the request admission"
+}
 
-  # DISPATCHED BY IDENTITY, deliberately: `sub-run` runs exactly the ArgTree
-  # named in the admission, which is the one thing llm-step will accept. It also
-  # returns immediately, which is required — the stub only lives as long as this
-  # container, so the turn cannot be a `run-then` continuation.
+# DISPATCHED BY IDENTITY, deliberately: `sub-run` runs exactly the ArgTree named
+# in the admission, which is the one thing llm-step will accept. It also returns
+# immediately, which is required — the stub only lives as long as this
+# container, so the turn cannot be a `run-then` continuation.
+start_turn() {
   caos sub-run "$request" >/dev/null || fail "dispatching the turn"
+}
+
+dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
+  admit_turn "$@"
+  start_turn
 }
 
 remote_tip() { # <ref>

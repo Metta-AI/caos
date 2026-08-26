@@ -1,12 +1,19 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# tests/llm-step — a WORKER test, in dev/worker-test (it needs git).
+#
 # Core llm-step conversation behavior: durable event recording, ordered tool
 # replay, workspace mutation, and interjections on both sides of dispatch. The
 # independent-work, subagent, and Escape paths live in sibling tests so these
 # otherwise serial scenarios can fan out.
+#
+# All of it is llm-step's and all of it lands on the conversation ref, so there
+# is nothing here a client was needed for beyond currying the turns and blocking
+# on them — which worker-common.sh does without blocking.
 set -euo pipefail
-# The dependency is mounted only inside the test wrapper and exports globals.
-# shellcheck disable=SC1091
-source DEEP-DEPS/llm-test/common.sh
+
+caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+source /cas/args/common
 
 assert_event_spine() { # <head> <stop>
   local current=$1 stop=$2 count=0 message parent declared_base roots=0
@@ -46,13 +53,11 @@ assert_caos_dates() { # <revision range>
 
 stage "workspace and scripted model"
 llm_test_setup
-stub_host="${stub_host:?llm_test_setup did not set stub_host}"
-mkdir -p ws/notes
-echo "hello notes" > ws/notes/todo.txt
-echo "You are a coding agent operating on a git workspace." > system.txt
-git add -A
-gc commit -qm fixtures
-base=$(mkcommit "HEAD:ws" base)
+
+rm -rf /tmp/ws && mkdir -p /tmp/ws/notes
+echo "hello notes" > /tmp/ws/notes/todo.txt
+caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
+ws=$(caos hash /cas/ws)
 
 R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"cmd":"echo hi > out.txt","paths":[]},"name":"bash","type":"tool_use"}]'
 R2='[{"id":"toolu_03","input":{"cmd":"echo boom >&2; exit 3","paths":[]},"name":"bash","type":"tool_use"}]'
@@ -61,45 +66,44 @@ INTERJECTION_TEXT="one more thing before you finish"
 STALE_T2_TEXT="the workspace still holds out.txt"
 T2_TEXT="yes, I also saw your last message"
 
-mkdir stub
-printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
-printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > stub/response-2.json
+rm -rf /tmp/stub && mkdir -p /tmp/stub
+printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
+printf '{"content":%s,"stop_reason":"tool_use"}' "$R2" > /tmp/stub/response-2.json
 printf '%s\n' \
   '{"content":[{"text":"done: out.txt contains hi","type":"text"}],"stop_reason":"end_turn"}' \
-  > stub/response-3.json
+  > /tmp/stub/response-3.json
 # Hold the second turn at its terminal model response so an interjection can
 # race with it deterministically.
-mkfifo stub/response-4.json
+mkfifo /tmp/stub/response-4.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-  "$T2_TEXT" > stub/response-5.json
+  "$T2_TEXT" > /tmp/stub/response-5.json
 
 stub_pid=""
 port=""
-start_stub stub stub_pid port
-stub_pid="${stub_pid:?start_stub did not set stub_pid}"
-new_llm_conversation llm-step "$port"
-conv="${conv:?new_llm_conversation did not set conv}"
-conversation_ref="${conversation_ref:?new_llm_conversation did not set conversation_ref}"
-llm="${llm:?new_llm_conversation did not set llm}"
+start_stub /tmp/stub stub_pid port
+
+new_llm_conversation llm-step "$port" "$ws" \
+  "You are a coding agent operating on a git workspace."
 
 stage "first turn: durable tool events and workspace"
-user1=$(mkcommit "HEAD:ws" \
-  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"create out.txt containing hi, then confirm\"}" \
-  "$base")
-request1=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user1")
-assert_oid "$request1" "first prepared request"
-admitted1=$(mkcommit "HEAD:ws" \
-  "{\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
-  "$user1")
-early_interjection=$(mkcommit "HEAD:ws" \
+# ADMITTED, THEN INTERJECTED, THEN STARTED: the interjection has to be on the
+# spine before the worker begins, which is the pre-dispatch case.
+admit_turn "$ws" "create out.txt containing hi, then confirm"
+user1=$human
+request1=$request
+early_interjection=$(mint_commit /cas/early "$ws" \
   "{\"author\":\"user\",\"content\":\"$EARLY_INTERJECTION_TEXT\",\"username\":\"racer\"}" \
-  "$admitted1")
+  "$admitted")
+git -c fetch.negotiationAlgorithm=noop fetch -q caos "$early_interjection" \
+  || fail "fetching the pre-start interjection back"
 git push --quiet caos "$early_interjection:$conversation_ref" \
-  || fail "publishing queued event and pre-start interjection"
-"$CAOS_CLI" run --base:hash="$request1" >/tmp/llm-step-result \
-  || fail "running first turn"
+  || fail "publishing the pre-start interjection"
+start_turn
 
-head1=$(fetch_head)
+head1=$(wait_turn) || {
+  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
+  fail "the first turn never reached a terminal event"
+}
 assert_event_spine "$head1" "$base"
 assert_caos_dates "$base..$head1"
 events1=$(git log --first-parent --format=%B "$base..$head1")
@@ -120,64 +124,50 @@ grep -qF '"is_error":true' <<<"$events1" \
 grep -qF 'done: out.txt contains hi' <<<"$events1" \
   || fail "assistant transcript was not recorded"
 terminal1=$(git show -s --format=%B "$head1")
-grep -qF '"status":"idle"' <<<"$terminal1" \
-  || fail "turn did not become idle"
+grep -qF '"status":"idle"' <<<"$terminal1" || fail "turn did not become idle"
 [ "$(git show "$head1:out.txt")" = hi ] || fail "out.txt missing from canonical head"
 [ "$(git show "$head1:notes/todo.txt")" = "hello notes" ] \
   || fail "untouched subtree lost"
 
 stage "exact replay and terminal-race interjection"
 grep -qF "\"messages\":[{\"content\":\"create out.txt containing hi, then confirm\",\"role\":\"user\"},{\"content\":\"$EARLY_INTERJECTION_TEXT\",\"role\":\"user\"}]" \
-  stub/request-1.json || fail "queued messages were not replayed"
-grep -qF "\"content\":$R1,\"role\":\"assistant\"" stub/request-2.json \
+  /tmp/stub/request-1.json || fail "queued messages were not replayed"
+grep -qF "\"content\":$R1,\"role\":\"assistant\"" /tmp/stub/request-2.json \
   || fail "round-one response was not replayed verbatim"
-grep -qF '"tool_use_id":"toolu_01","type":"tool_result"' stub/request-2.json \
+grep -qF '"tool_use_id":"toolu_01","type":"tool_result"' /tmp/stub/request-2.json \
   || fail "round-one result missing"
-grep -qF "\"content\":$R2,\"role\":\"assistant\"" stub/request-3.json \
+grep -qF "\"content\":$R2,\"role\":\"assistant\"" /tmp/stub/request-3.json \
   || fail "round-two response was not replayed verbatim"
-grep -qF 'exit: 3' stub/request-3.json || fail "failed command result missing"
-[ ! -f stub/request-4.json ] || fail "unexpected extra model round"
+grep -qF 'exit: 3' /tmp/stub/request-3.json || fail "failed command result missing"
+[ ! -f /tmp/stub/request-4.json ] || fail "unexpected extra model round"
 
 tree1=$(git rev-parse "$head1^{tree}")
-user2=$(mkcommit "$tree1" '{"author":"user","content":"and now?"}' "$head1")
-request2=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user2")
-assert_oid "$request2" "second prepared request"
-admitted2=$(mkcommit "$tree1" \
-  "{\"request\":\"$request2\",\"request_head\":\"$user2\",\"status\":\"queued\"}" \
-  "$user2")
-git push --quiet caos "$admitted2:$conversation_ref" \
-  || fail "publishing second request admission"
-"$CAOS_CLI" run --base:hash="$request2" >/tmp/llm-step-result-2 2>/tmp/llm-step-error-2 &
-run2_pid=$!
-LLM_TEST_PIDS+=("$run2_pid")
+dispatch_turn "$tree1" "and now?" "$head1"
+admitted2=$admitted
 
 request_started=0
 for _ in $(seq 1 150); do
-  if [ -e stub/request-4.json ]; then request_started=1; break; fi
-  if ! kill -0 "$run2_pid" 2>/dev/null; then
-    fail "second turn exited before its blocked response: $(cat /tmp/llm-step-error-2)"
-  fi
+  if [ -e /tmp/stub/request-4.json ]; then request_started=1; break; fi
   sleep 0.2
 done
 [ "$request_started" -eq 1 ] || fail "second turn never reached the blocked response"
 
-running2=$(fetch_head)
+running2=$(current_head)
 [ "$(git rev-parse "$running2^1")" = "$admitted2" ] \
   || fail "running event is not immediately after admission"
 grep -qF '"status":"running"' <<<"$(git show -s --format=%B "$running2")" \
   || fail "worker request event is not running"
-interjection=$(mkcommit "$tree1" \
+interjection=$(mint_commit /cas/interjection "$tree1" \
   "{\"author\":\"user\",\"content\":\"$INTERJECTION_TEXT\",\"username\":\"racer\"}" \
   "$running2")
+git -c fetch.negotiationAlgorithm=noop fetch -q caos "$interjection" \
+  || fail "fetching the terminal-race interjection back"
 git push --quiet --force-with-lease="$conversation_ref:$running2" \
   caos "$interjection:$conversation_ref" || fail "publishing terminal-race interjection"
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-  "$STALE_T2_TEXT" > stub/response-4.json
-if ! wait "$run2_pid"; then
-  fail "running interjected second turn: $(cat /tmp/llm-step-error-2)"
-fi
+  "$STALE_T2_TEXT" > /tmp/stub/response-4.json
 
-head2=$(fetch_head)
+head2=$(wait_turn) || fail "the second turn never reached a terminal event"
 assert_event_spine "$head2" "$base"
 [ "$(git rev-parse "$head2^{tree}")" = "$tree1" ] \
   || fail "toolless turn changed the workspace"
@@ -190,14 +180,16 @@ grep -qF "$INTERJECTION_TEXT" <<<"$events2" || fail "racing interjection was los
 if grep -qF "$STALE_T2_TEXT" <<<"$events2"; then
   fail "stale pre-interjection response became canonical"
 fi
-if grep -qF "$INTERJECTION_TEXT" stub/request-4.json; then
+if grep -qF "$INTERJECTION_TEXT" /tmp/stub/request-4.json; then
   fail "racing interjection leaked into the in-flight request"
 fi
-if grep -qF "$STALE_T2_TEXT" stub/request-5.json; then
+if grep -qF "$STALE_T2_TEXT" /tmp/stub/request-5.json; then
   fail "discarded response was replayed to the model"
 fi
-grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" stub/request-5.json \
+grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" /tmp/stub/request-5.json \
   || fail "racing interjection was not replayed in the replacement call"
 
 stage "done"
-echo "llm-step: ALL PASS" >&2
+printf 'llm-step: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out
