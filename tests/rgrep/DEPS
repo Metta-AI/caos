@@ -18,4 +18,5 @@
 ../../std/cargo cargo
 # The image this client test runs in, with the client-repo setup as its
 # /worker: a dependency, not a harness.
-../../dev/cli-test cli-test
+../../std/bash bash
+../../std/flake-builder flake-builder

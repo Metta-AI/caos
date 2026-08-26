@@ -1,65 +1,89 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/rust-worker — a WORKER test: no client, no repo.
 #
 # Proves the rustc builder loop: a Rust source file -> the builder compiles it
-# (glibc/gnu, linking the vendored worker-common) and emits a ready-to-run worker
-# = curry(runner, bin=<compiled binary>) -> that runs as an ordinary worker in the
-# shared runner. Then it edits the source and rebuilds to confirm a distinct,
-# independently-working worker.
+# (glibc/gnu, linking the vendored worker-common) and emits a ready-to-run
+# worker = curry(runner, bin=<compiled binary>) -> that runs as an ordinary
+# worker in the shared runner. Then it edits the source and rebuilds to confirm
+# a distinct, independently-working worker.
 #
-# It also times each phase: `build` (compile a source into a runnable worker) and
-# `first-run` (that new worker's first execution). On a warm server the runner is
-# already provisioned, so first-run reflects a warm dispatch; against a fresh stack
-# it's a cold provision.
+# THE SALT IS --test-salt, not a fresh `date +%s%N`. The point of salting the
+# sources is that a NOVEL binary gets compiled, so the run after it is a genuine
+# cold path rather than a memo hit. Minting a new one per run made that true
+# always and made the compile un-cacheable; taking it from --test-salt makes it
+# true exactly when the suite is asked to re-run, which is what the flag means.
+# Empty (no --test-salt) compiles the checked-in sources, and hits.
+#
+# FIVE STAGES: build, run, assert, build again, run, assert — and no run can be
+# waited on, so each assertion is the `then` of the run it is about.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-ms() { date +%s%3N; }   # epoch milliseconds
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-# Salt each source with the per-run marker so every run compiles a NOVEL worker
-# binary — then `first-run` is always a genuine cold path, never a cache hit
-# from a previous run.
-test_run_id="$(date +%s%N)-$$-$RANDOM"
-uniq=$(printf '%s' "$test_run_id" | tr -cd '0-9a-zA-Z')
-greeter=$(<test/greeter.rs)
-edited=$(<test/greeter-edited.rs)
-printf '%s\n' "${greeter//source-built worker/source-built worker $uniq}" >g1.rs
-printf '%s\n' "${edited//different greeting entirely/different greeting entirely $uniq}" >g2.rs
-commit "salted sources"
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
+  --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
+  --rustc:@=/cas/args/rustc --greeter:@=/cas/args/greeter \
+  --edited:@=/cas/args/edited "$@"; }
 
-# Curry the runner into the rustc builder so each build call only passes src; the
-# builder compiles src and curries the result into this runner.
-# No --runner: rustc DEPENDS on the runner pool (std/rustc/DEPS) and curries
-# the built binary onto it itself, so a caller says only what it is building.
-builder=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/rustc)
-
-# The builder's result is a worker image (a curry node over the runner). The CLI
-# checks results out as files, so re-ingest the checkout through git to get the
-# image tree's hash back — content-addressed, so it round-trips exactly.
-tree_hash() { # <dir> -> the git tree hash of its committed contents
-  git rev-parse "HEAD:$1"
+# Salt a source and hand it to rustc. Bash parameter expansion, not sed:
+# std/bash carries no sed (CLAUDE.md), and this needs no more than a literal
+# substitution.
+build() { # <arg-name> <text-to-salt> -> the build ArgTree
+  local src marker
+  caos get "/cas/args/$1" || fail "reading $1"
+  caos get /cas/args/test-salt || true
+  marker=$(cat /cas/args/test-salt 2>/dev/null || true)
+  src=$(cat "/cas/args/$1")
+  printf '%s\n' "${src//$2/$2 $marker}" > /tmp/salted.rs
+  caos put /tmp/salted.rs /cas/salted || fail "publishing the salted source"
+  caos curry --base:@=/cas/args/rustc --src:@=/cas/salted
 }
 
-echo "build greeter.rs -> runnable worker -> run" >&2
-t0=$(ms); "$CAOS_CLI" run img --base:hash="$builder" --src:@=g1.rs; t1=$(ms)
-commit "built image 1"
-"$CAOS_CLI" run a --base:hash="$(tree_hash img)"; t2=$(ms)
-grep -q "source-built worker" a/greeting \
-  || fail "built worker did not produce the expected output"
+case "$stage" in
 
-echo "edit source -> a distinct worker" >&2
-t3=$(ms); "$CAOS_CLI" run img2 --base:hash="$builder" --src:@=g2.rs; t4=$(ms)
-commit "built image 2"
-"$CAOS_CLI" run c --base:hash="$(tree_hash img2)"; t5=$(ms)
-grep -q "different greeting" c/greeting \
-  || fail "edited worker did not produce the new output"
-grep -q "different greeting" a/greeting \
-  && fail "the new output leaked into the original worker's result"
+start)
+  echo "build greeter.rs -> runnable worker -> run" >&2
+  caos run-then /cas/args/greeter \
+    --run:hash="$(build greeter 'source-built worker')" --then:hash="$(next run-first)"
+  ;;
 
-echo "rust-worker perf (ms):" >&2
-echo "  greeter  build=$((t1 - t0))  first-run=$((t2 - t1))" >&2
-echo "  edited   build=$((t4 - t3))  first-run=$((t5 - t4))" >&2
-echo "rust-worker: ALL PASS" >&2
+run-first)
+  # --result is the built worker image; run it with nothing bound.
+  caos run-then /cas/args/greeter --run:hash="$(caos hash /cas/args/result)" \
+    --then:hash="$(next check-first)"
+  ;;
+
+check-first)
+  caos get -r /cas/args/result || fail "reading the greeting"
+  grep -q "source-built worker" /cas/args/result/greeting \
+    || fail "built worker did not produce the expected output"
+  cp /cas/args/result/greeting /tmp/first-greeting
+  caos put /tmp/first-greeting /cas/first || fail "keeping the first greeting"
+
+  echo "edit source -> a distinct worker" >&2
+  caos run-then /cas/args/edited \
+    --run:hash="$(build edited 'different greeting entirely')" \
+    --then:hash="$(next run-second --first:@=/cas/first)"
+  ;;
+
+run-second)
+  caos run-then /cas/args/edited --run:hash="$(caos hash /cas/args/result)" \
+    --then:hash="$(next check-second --first:@=/cas/args/first)"
+  ;;
+
+check-second)
+  caos get -r /cas/args/result || fail "reading the greeting"
+  caos get /cas/args/first
+  grep -q "different greeting" /cas/args/result/greeting \
+    || fail "edited worker did not produce the new output"
+  grep -q "different greeting" /cas/args/first \
+    && fail "the new output leaked into the original worker's result"
+  printf 'rust-worker: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac

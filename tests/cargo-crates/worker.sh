@@ -1,67 +1,121 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/cargo-crates — a WORKER test: no client, no repo.
 #
-# Exercises the per-crate decomposition (worker-cargo mode=all,
-# design/cargo-workers.md phase 2) on a two-crate workspace, b -> a:
-# a passing check/test; a broken *dep* (a) whose failure propagates to its
-# dependent's job as a value (b's section shows a's diagnostics — no compile
-# of b was attempted against a broken a); and per-crate caching — after a
-# fix-and-rerun, an edit to b re-runs b's jobs while a's are cache hits
-# (asserted by wall-clock: the b-only edit must be markedly cheaper than the
-# cold run... on tiny crates both are fast, so the assertion is on results,
-# with timings printed for the eyeball).
+# Per-crate decomposition (mode=all, design/cargo-workers.md) over a two-crate
+# workspace where b depends on a. Asserts: a clean check and a clean test; a
+# broken dependency propagating to its dependent AS A VALUE, with both crates'
+# sections and the real diagnostics; an edit confined to the dependent; and an
+# identical tree served from cache.
+#
+# THE FIXTURE EDITS ARE APPLIED FROM PRISTINE, not accumulated. Each stage
+# starts from the `ws` it was handed and applies exactly the edits its own run
+# needs, so every run's input is a stated function of the fixture rather than of
+# everything that happened before it. That also makes the "fix a" run honest
+# about itself: fixing a returns the tree to pristine, so it has the same key as
+# the first check and IS a cache hit — which was true before and invisible.
+#
+# Bash parameter expansion, not sed: std/bash carries no sed (CLAUDE.md), and
+# these are literal substitutions.
+#
+# The timings the old version printed are gone with the blocking calls that made
+# them meaningful — each run is a container round trip now.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-ms() { date +%s%3N; }
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-# Every test runs in the Linux stack, so build musl (statics run there) — the
-# system's one target. No host build has a consumer.
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
+  --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
+  --cargo:@=/cas/args/cargo --ws:@=/cas/args/ws "$@"; }
+
 tgt="$(uname -m)-unknown-linux-musl"
+cargo_job() { caos curry --base:@=/cas/args/cargo --cmd="$1" --mode=all "--target=$tgt"; }
 
-echo "== mode=all check: a clean two-crate workspace ==" >&2
-t0=$(ms)
-"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=test/ws --cmd=check --mode=all "--target=$tgt"
-t1=$(ms)
-[ "$(cat r1/exit)" = "0" ] || fail "check: exit $(cat r1/exit); stderr: $(cat r1/stderr)"
-echo "  ok: clean check ($((t1 - t0))ms)" >&2
+# A writable copy of the fixture, optionally with one edit applied, published so
+# it can be a run's subject. `$1` is "" (pristine), "break-a" or "edit-b".
+staged_ws() { # <edit> -> a /cas path
+  rm -rf /tmp/ws && mkdir -p /tmp/ws
+  caos get -r /cas/args/ws || fail "reading the fixture"
+  cp -rL /cas/args/ws/. /tmp/ws/ && chmod -R u+w /tmp/ws
+  case "$1" in
+    break-a) local f=/tmp/ws/a/src/lib.rs c; c=$(cat "$f"); printf '%s' "${c//x \* 2/x * \"two\"}" > "$f" ;;
+    edit-b)  local f=/tmp/ws/b/src/main.rs c; c=$(cat "$f"); printf '%s' "${c//b says/b announces}" > "$f" ;;
+  esac
+  caos put /tmp/ws /cas/staged-ws || fail "publishing the staged workspace"
+  echo /cas/staged-ws
+}
 
-echo "== mode=all test: b's unit test runs ==" >&2
-"$CAOS_CLI" run r2 --base:@=DEEP-DEPS/cargo --tree:@=test/ws --cmd=test --mode=all "--target=$tgt"
-[ "$(cat r2/exit)" = "0" ] || fail "test: exit $(cat r2/exit); stderr: $(cat r2/stderr)"
-grep -q "test result: ok. 1 passed" r2/stdout || fail "b's test didn't run: $(cat r2/stdout)"
-echo "  ok: tests ran" >&2
+case "$stage" in
 
-echo "== a broken dep propagates to its dependent as a value ==" >&2
-sed -i 's/x \* 2/x * "two"/' test/ws/a/src/lib.rs
-commit "break a"
-"$CAOS_CLI" run r3 --base:@=DEEP-DEPS/cargo --tree:@=test/ws --cmd=check --mode=all "--target=$tgt"
-[ "$(cat r3/exit)" != "0" ] || fail "broken dep: exit 0"
-grep -q "── a ──" r3/stderr || fail "no a section: $(cat r3/stderr)"
-grep -q "── b ──" r3/stderr || fail "no b section (propagation): $(cat r3/stderr)"
-# b's section carries a's diagnostics — the failure bubbled as a value.
-grep -q "cannot multiply" r3/stderr || fail "no diagnostics: $(cat r3/stderr)"
-echo "  ok: dep failure propagated with diagnostics" >&2
+start)
+  echo "== mode=all check: a clean two-crate workspace ==" >&2
+  caos run-then "$(staged_ws '')" --run:hash="$(cargo_job check)" --then:hash="$(next checked)"
+  ;;
 
-echo "== fix; edit only b; a's jobs are cache hits ==" >&2
-sed -i 's/x \* "two"/x * 2/' test/ws/a/src/lib.rs
-commit "fix a"
-"$CAOS_CLI" run r4 --base:@=DEEP-DEPS/cargo --tree:@=test/ws --cmd=check --mode=all "--target=$tgt"
-[ "$(cat r4/exit)" = "0" ] || fail "fixed check failed: $(cat r4/stderr)"
-sed -i 's/b says/b announces/' test/ws/b/src/main.rs
-commit "edit b"
-t2=$(ms)
-"$CAOS_CLI" run r5 --base:@=DEEP-DEPS/cargo --tree:@=test/ws --cmd=check --mode=all "--target=$tgt"
-t3=$(ms)
-[ "$(cat r5/exit)" = "0" ] || fail "b-edit check failed: $(cat r5/stderr)"
-echo "  ok: b-only edit checked ($((t3 - t2))ms; cold was $((t1 - t0))ms)" >&2
+checked)
+  caos get -r /cas/args/result || fail "reading the result"
+  [ "$(cat /cas/args/result/exit)" = "0" ] \
+    || fail "check: exit $(cat /cas/args/result/exit); stderr: $(cat /cas/args/result/stderr)"
+  echo "  ok: clean check" >&2
 
-echo "== identical tree: the cached value comes back ==" >&2
-t4=$(ms)
-"$CAOS_CLI" run r6 --base:@=DEEP-DEPS/cargo --tree:@=test/ws --cmd=check --mode=all "--target=$tgt"
-t5=$(ms)
-cmp -s r5/exit r6/exit || fail "cached rerun differed"
-echo "  ok: cached ($((t5 - t4))ms)" >&2
+  echo "== mode=all test: b's unit test runs ==" >&2
+  caos run-then "$(staged_ws '')" --run:hash="$(cargo_job test)" --then:hash="$(next tested)"
+  ;;
+
+tested)
+  caos get -r /cas/args/result || fail "reading the result"
+  [ "$(cat /cas/args/result/exit)" = "0" ] \
+    || fail "test: exit $(cat /cas/args/result/exit); stderr: $(cat /cas/args/result/stderr)"
+  grep -q "test result: ok. 1 passed" /cas/args/result/stdout \
+    || fail "b's test didn't run: $(cat /cas/args/result/stdout)"
+  echo "  ok: tests ran" >&2
+
+  echo "== a broken dep propagates to its dependent as a value ==" >&2
+  caos run-then "$(staged_ws break-a)" --run:hash="$(cargo_job check)" --then:hash="$(next broken)"
+  ;;
+
+broken)
+  caos get -r /cas/args/result || fail "reading the result"
+  [ "$(cat /cas/args/result/exit)" != "0" ] || fail "broken dep: exit 0"
+  grep -q "── a ──" /cas/args/result/stderr || fail "no a section"
+  grep -q "── b ──" /cas/args/result/stderr || fail "no b section (propagation)"
+  # b's section carries a's diagnostics — the failure bubbled as a value.
+  grep -q "cannot multiply" /cas/args/result/stderr || fail "no diagnostics"
+  echo "  ok: dep failure propagated with diagnostics" >&2
+
+  # `fix a` IS the pristine tree — nothing to apply.
+  echo "== fix; edit only b; a's jobs are cache hits ==" >&2
+  caos run-then "$(staged_ws '')" --run:hash="$(cargo_job check)" --then:hash="$(next fixed)"
+  ;;
+
+fixed)
+  caos get -r /cas/args/result || fail "reading the result"
+  [ "$(cat /cas/args/result/exit)" = "0" ] || fail "fixed check failed"
+  caos run-then "$(staged_ws edit-b)" --run:hash="$(cargo_job check)" --then:hash="$(next bedit)"
+  ;;
+
+bedit)
+  caos get -r /cas/args/result || fail "reading the result"
+  [ "$(cat /cas/args/result/exit)" = "0" ] || fail "b-edit check failed"
+  echo "  ok: b-only edit checked" >&2
+
+  echo "== identical tree: the cached value comes back ==" >&2
+  printf '%s\n' "$(caos hash /cas/args/result)" > /tmp/bedit
+  caos put /tmp/bedit /cas/bedit
+  caos run-then "$(staged_ws edit-b)" --run:hash="$(cargo_job check)" \
+    --then:hash="$(next cached --bedit:@=/cas/bedit)"
+  ;;
+
+cached)
+  caos get /cas/args/bedit
+  [ "$(caos hash /cas/args/result)" = "$(cat /cas/args/bedit)" ] \
+    || fail "cached rerun differed"
+  echo "  ok: cached" >&2
+  printf 'cargo-crates: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac

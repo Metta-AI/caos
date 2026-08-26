@@ -1,84 +1,118 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/bash-tool — a WORKER test: no client, no repo.
 #
-# Exercises the bounded bash tool (worker-bash-tool, design/agent-harness.md):
-# a command over a workspace tree with only the *declared* paths materialized.
+# Exercises the bounded bash tool (std/bash-tool, design/agent-harness.md): a
+# command over a workspace tree with only the *declared* paths materialized.
 # Asserts: a targeted read touches only its declared path and the result tree
 # round-trips the workspace identically; an undeclared touch fails with EACCES
 # and a structured `denied` retry hint; writes stage back correctly with
-# untouched placeholder subtrees intact by hash; and a failing command is a
-# VALUE ({exit, stdout, stderr, tree}), never a run error.
+# untouched placeholder subtrees intact by hash; a failing command is a VALUE
+# ({exit, stdout, stderr, tree}), never a run error; and the exec bit survives.
 #
-# The tool is DEEP-DEPS/bash-tool — a std source entry (std/bash-tool) built on
-# resolution via rustc and curried onto the runner pool (design/caos-expr.md,
-# Phase 3), no image of its own.
+# THE REQUEST IS A BUNDLE, which is the worker's OWN preferred shape rather than
+# an accommodation: std/bash-tool reads `{tree, cmd, paths}` out of `--in` when
+# it has one and falls back to three loose args only when it does not — "how a
+# run-then sub-run passes it", says the comment there. This IS a run-then
+# sub-run, so it takes the first branch.
+#
+# SIX STAGES: a run cannot be waited on, so each assertion is the `then` of the
+# run it is about. Trees are compared by OID — a caos object hash IS a git
+# object hash, and the fixture arrives as one.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
-# The git tree hash of a (possibly untracked) path, via a snapshot commit —
-# content-addressed, so equal content means equal hash.
-snap() { commit "snap" >/dev/null 2>&1 || true; git rev-parse "HEAD:$1"; }
 
-# The workspace under test: two levels, so undeclared subtrees stay placeholders.
-mkdir -p ws/a/b
-echo one > ws/a/one.txt
-echo two > ws/a/b/two.txt
-echo top > ws/top.txt
-# An executable file, to prove the exec bit round-trips both ways: as an
-# undeclared placeholder (resolved by hash) and as a declared, loaded copy.
-printf '#!/bin/sh\necho hi\n' > ws/run.sh
-chmod +x ws/run.sh
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
+  --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
+  --tool:@=/cas/args/tool --ws:@=/cas/args/ws "$@"; }
 
-# The tool is DEEP-DEPS/bash-tool — a source std entry (std/bash-tool) built on
-# resolution via rustc, curried onto the runner pool (design/caos-expr.md,
-# Phase 3). No host binary is threaded in; the tree under test IS the source.
-commit "workspace"
-base=$(git rev-parse HEAD)
-tool=DEEP-DEPS/bash-tool
+ws_oid() { caos hash /cas/args/ws; }
 
-echo "== targeted read: declared path only; workspace round-trips by hash ==" >&2
-"$CAOS_CLI" run r1 --base:@="$tool" --tree:@=ws --cmd='cat a/one.txt' --paths='a/one.txt'
-[ "$(cat r1/exit)" = "0" ] || fail "read: exit $(cat r1/exit)"
-[ "$(cat r1/stdout)" = "one" ] || fail "read: stdout $(cat r1/stdout)"
-[ "$(snap r1/tree)" = "$(git rev-parse "$base:ws")" ] \
-  || fail "read-only run changed the workspace tree"
-echo "  ok: read its file; tree unchanged (identical hash)" >&2
+# `{tree, cmd, paths}`, published so it can be a run's subject.
+req() { # <cmd> [paths] -> a /cas path
+  rm -rf /tmp/req && mkdir -p /tmp/req
+  caos get -r /cas/args/ws || fail "reading the fixture"
+  cp -rL /cas/args/ws /tmp/req/tree && chmod -R u+w /tmp/req/tree
+  printf '%s' "$1" > /tmp/req/cmd
+  if [ $# -ge 2 ]; then printf '%s\n' "$2" > /tmp/req/paths; fi
+  caos put /tmp/req /cas/req || fail "publishing the request"
+  echo /cas/req
+}
 
-echo "== undeclared touch: EACCES + structured retry hint ==" >&2
-"$CAOS_CLI" run r2 --base:@="$tool" --tree:@=ws --cmd='cat a/b/two.txt' --paths='top.txt'
-[ "$(cat r2/exit)" != "0" ] || fail "undeclared read did not fail"
-grep -qi "permission denied" r2/stderr || fail "no EACCES in stderr: $(cat r2/stderr)"
-[ -f r2/denied ] || fail "no denied hint in the result"
-grep -q "a/b/two.txt" r2/denied || fail "hint misses the path: $(cat r2/denied)"
-echo "  ok: EACCES surfaced, denied names a/b/two.txt" >&2
+case "$stage" in
 
-echo "== writes staged back; untouched placeholder subtree intact by hash ==" >&2
-"$CAOS_CLI" run r3 --base:@="$tool" --tree:@=ws \
-  --cmd='echo hi > new.txt && echo edited >> a/one.txt' --paths='a/one.txt'
-[ "$(cat r3/exit)" = "0" ] || fail "write: exit $(cat r3/exit)"
-[ "$(cat r3/tree/new.txt)" = "hi" ] || fail "created file missing/wrong"
-[ "$(cat r3/tree/a/one.txt)" = "$(printf 'one\nedited')" ] || fail "edit not staged"
-[ "$(snap r3/tree/a/b)" = "$(git rev-parse "$base:ws/a/b")" ] \
-  || fail "untouched subtree a/b did not round-trip by hash"
-[ "$(cat r3/tree/top.txt)" = "top" ] || fail "untouched top.txt lost"
-echo "  ok: new.txt + edit staged, a/b round-tripped" >&2
+start)
+  echo "== targeted read: declared path only; workspace round-trips by hash ==" >&2
+  caos run-then "$(req 'cat a/one.txt' 'a/one.txt')" \
+    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next read)"
+  ;;
 
-echo "== a failing command is a value, not a run error ==" >&2
-"$CAOS_CLI" run r4 --base:@="$tool" --tree:@=ws --cmd='echo oops >&2; exit 7'
-[ "$(cat r4/exit)" = "7" ] || fail "exit code not surfaced: $(cat r4/exit)"
-grep -q "oops" r4/stderr || fail "stderr not captured"
-[ "$(snap r4/tree)" = "$(git rev-parse "$base:ws")" ] || fail "failed run mangled the tree"
-echo "  ok: exit 7 + stderr returned as a value" >&2
+read)
+  R=/cas/args/result; caos get -r "$R" || fail "reading the result"
+  [ "$(cat "$R/exit")" = "0" ] || fail "read: exit $(cat "$R/exit")"
+  [ "$(cat "$R/stdout")" = "one" ] || fail "read: stdout $(cat "$R/stdout")"
+  [ "$(caos hash "$R/tree")" = "$(ws_oid)" ] || fail "read-only run changed the tree"
+  echo "  ok: read its file; tree unchanged (identical hash)" >&2
 
-echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
-"$CAOS_CLI" run r5 --base:@="$tool" --tree:@=ws --cmd='./run.sh' --paths='run.sh'
-[ "$(cat r5/exit)" = "0" ] || fail "exec run: exit $(cat r5/exit)"
-[ "$(cat r5/stdout)" = "hi" ] || fail "declared file was not executable: $(cat r5/stdout)"
-[ "$(snap r5/tree)" = "$(git rev-parse "$base:ws")" ] \
-  || fail "exec bit lost round-tripping a declared/loaded file"
-echo "  ok: ./run.sh ran and the 100755 mode round-tripped" >&2
+  echo "== undeclared touch: EACCES + structured retry hint ==" >&2
+  caos run-then "$(req 'cat a/b/two.txt' 'top.txt')" \
+    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next denied)"
+  ;;
 
-echo "bash-tool: ALL PASS" >&2
+denied)
+  R=/cas/args/result; caos get -r "$R" || fail "reading the result"
+  [ "$(cat "$R/exit")" != "0" ] || fail "undeclared read did not fail"
+  grep -qi "permission denied" "$R/stderr" || fail "no EACCES in stderr"
+  [ -f "$R/denied" ] || fail "no denied hint in the result"
+  grep -q "a/b/two.txt" "$R/denied" || fail "hint misses the path"
+  echo "  ok: EACCES surfaced, denied names a/b/two.txt" >&2
+
+  echo "== writes staged back; untouched placeholder subtree intact by hash ==" >&2
+  caos run-then "$(req 'echo hi > new.txt && echo edited >> a/one.txt' 'a/one.txt')" \
+    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next write)"
+  ;;
+
+write)
+  R=/cas/args/result; caos get -r "$R" || fail "reading the result"
+  [ "$(cat "$R/exit")" = "0" ] || fail "write: exit $(cat "$R/exit")"
+  [ "$(cat "$R/tree/new.txt")" = "hi" ] || fail "created file missing/wrong"
+  [ "$(cat "$R/tree/a/one.txt")" = "$(printf 'one\nedited')" ] || fail "edit not staged"
+  caos get -r /cas/args/ws || fail "reading the fixture"
+  [ "$(caos hash "$R/tree/a/b")" = "$(caos hash /cas/args/ws/a/b)" ] \
+    || fail "untouched subtree a/b did not round-trip by hash"
+  [ "$(cat "$R/tree/top.txt")" = "top" ] || fail "untouched top.txt lost"
+  echo "  ok: new.txt + edit staged, a/b round-tripped" >&2
+
+  echo "== a failing command is a value, not a run error ==" >&2
+  caos run-then "$(req 'echo oops >&2; exit 7')" \
+    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next failed)"
+  ;;
+
+failed)
+  R=/cas/args/result; caos get -r "$R" || fail "reading the result"
+  [ "$(cat "$R/exit")" = "7" ] || fail "exit code not surfaced: $(cat "$R/exit")"
+  grep -q "oops" "$R/stderr" || fail "stderr not captured"
+  [ "$(caos hash "$R/tree")" = "$(ws_oid)" ] || fail "failed run mangled the tree"
+  echo "  ok: exit 7 + stderr returned as a value" >&2
+
+  echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
+  caos run-then "$(req './run.sh' 'run.sh')" \
+    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next execbit)"
+  ;;
+
+execbit)
+  R=/cas/args/result; caos get -r "$R" || fail "reading the result"
+  [ "$(cat "$R/exit")" = "0" ] || fail "exec run: exit $(cat "$R/exit")"
+  [ "$(cat "$R/stdout")" = "hi" ] || fail "declared file was not executable"
+  [ "$(caos hash "$R/tree")" = "$(ws_oid)" ] || fail "exec bit lost round-tripping"
+  echo "  ok: ./run.sh ran and the 100755 mode round-tripped" >&2
+
+  printf 'bash-tool: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac
