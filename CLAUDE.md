@@ -97,7 +97,7 @@ Every script here runs with it, and two constructs quietly break under it.
   the alternate, not the command. Add `-c core.alternateRefsCommand=true` when
   the fetched closure stands alone (`:@@=`'s `--depth 1` fetch does); do NOT add
   it where the alternate's tips are legitimately part of the history you are
-  completing. **The test harness no longer creates one** (`tests/lib/worker`
+  completing. **The test harness no longer creates one** (`dev/cli-test/worker`
   says so, and says to look there first if a push ever dies unable to read an
   object), which is what lets `tests/push-closure` reproduce at all — it used to
   have to delete the alternate itself.
@@ -199,9 +199,9 @@ are the kind of thing that is invisible until 29 clients arrive at once.
     cannot evaluate — its `caos` has `eval-path-then` and no `eval-path` — and
     with this it never needs to.
   - **A client test asks for its worktree.** `:@=` ingests git-tracked paths, so
-    a test that drives `caos-cli` names `--base:@=DEEP-DEPS/lib` and DEPs on
-    `../lib`; `tests/lib`'s `/worker` stages the repo and then runs `worker1`.
-    Grep `DEPS` for `lib` to see which tests are client tests. A worker test
+    a test that drives `caos-cli` names `--base:@=DEEP-DEPS/cli-test` and DEPs on
+    `../../dev/cli-test`, whose `/worker` stages the repo and then runs `worker1`.
+    Grep `DEPS` for `cli-test` to see which tests are client tests. A worker test
     names `std/bash` and never pays for a repo.
 - **A CURRY NODE IS AN ARGTREE, and an ArgTree is what runs.** SPEC is explicit
   ("we generally talk about ArgTrees, not images; an image is just one arg"), so

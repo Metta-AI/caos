@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack (tests/lib stages the repo, then runs this).
+# set, INSIDE the dev stack (dev/cli-test stages the repo, then runs this).
 #
 # Exercises `caos eval-path-then` (design/caos-expr.md): the SERVER-side
 # evaluation continuation. A worker may not block on a run, so to evaluate a

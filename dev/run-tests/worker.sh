@@ -142,8 +142,8 @@ fanout)
     # lazy placeholders, so an unfetched directory answers "no" to every
     # question about its contents.
     caos get "$d" || fail "expanding tests/$t"
-    # A TEST IS AN ENTRY WITH A SCRIPT. `tests/lib` is an entry too — the image
-    # client tests DEP on — but it has no `worker.sh`, so nothing maps over it.
+    # A TEST IS AN ENTRY WITH A SCRIPT — both, so a directory under tests/ that
+    # is neither is skipped rather than mapped over and failed.
     if [ ! -e "$d/.caos-expr" ] || [ ! -e "$d/worker.sh" ]; then continue; fi
 
     # THE CHILD IS THE TEST'S OWN DEEPENED TREE, and only that. One symlink:

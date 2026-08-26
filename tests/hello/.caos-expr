@@ -2,7 +2,7 @@
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A CLIENT TEST — it drives `caos-cli` and asserts on what the CLIENT resolves,
-# so its base is `DEEP-DEPS/lib` (tests/lib), the image that stages a git
+# so its base is `DEEP-DEPS/cli-test` (dev/cli-test), the image that stages a git
 # worktree and then runs `worker1`. DEPping on `lib` is the honest, greppable
 # marker of which tests are client tests; most are not, and name std/bash.
 #
@@ -15,4 +15,4 @@
 # and a workspace or api key are PASSED when dev/run-test calls this ArgTree —
 # so every path above exists in this directory, which is the whole point of an
 # expression being readable on its own.
-curry --base:@=DEEP-DEPS/lib --worker1:@=worker.sh --test:@=.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.

@@ -191,7 +191,7 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
 — which walks the tips of every **alternate** object store as well. A repo whose
 alternate holds a deliberate SUBSET then fails with `missing blob object <x>`
 naming an object that has nothing to do with the fetch, blamed on the fetch.
-The test harness creates exactly that shape (`tests/lib/run-test.sh` points the
+The test harness creates exactly that shape (`dev/cli-test/run-test.sh` points the
 client at `/tmp/seed-git/objects`, "exactly what this test declared"), so
 `tests/remote-ref` failed the first time it ran — on a fetch that succeeds in
 any ordinary repo. The difference is the alternate, not the command.

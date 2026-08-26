@@ -9,4 +9,4 @@
 ../../std/bash bash
 ../../std/cargo cargo
 # The client-repo setup this test sources: a dependency, not a harness.
-../lib lib
+../../dev/cli-test cli-test

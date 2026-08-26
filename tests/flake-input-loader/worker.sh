@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE the dev stack — the suite's per-test job (tests/lib stages the repo, then runs this).
+# INSIDE the dev stack — the suite's per-test job (dev/cli-test stages the repo, then runs this).
 #
 # `std/flake-input-loader` (design/flake-inputs.md, "Consumer root"): a project
 # that is NOT caos mounts a PINNED input into its own evaluated tree, with

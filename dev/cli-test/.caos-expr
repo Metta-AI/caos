@@ -1,0 +1,13 @@
+# dev/cli-test's image: this directory is a flake (flake.nix + worker), so its
+# image is the flake-builder applied to the directory itself — the same shape as
+# every std entry. `./worker` says what the image is FOR; this file only says how
+# it is built.
+#
+# It names the builder by a LOCAL deep-deps mount, the only way anything here can
+# name a builtin. The lock is DEPped from the repo root and placed by the
+# builder, so there is one lock in the tree rather than a copy per flake.
+#
+# It lives under dev/ with the rest of the suite's machinery rather than under
+# tests/, because it is not a test — nothing maps over it and it has no
+# `worker.sh` of its own.
+run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock

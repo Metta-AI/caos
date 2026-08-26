@@ -1,12 +1,29 @@
 #!/usr/bin/env bash
-# tests/lib's `/worker`: the client-repo setup, then the test.
+# dev/cli-test — THE IMAGE A CLIENT TEST RUNS IN.
 #
-# A CLIENT TEST NAMES THIS AS ITS BASE (`--base:@=DEEP-DEPS/lib`) and its own
-# script as `--worker1`, exactly the way a bash test names std/bash. So the
-# setup is a DEPENDENCY a test asks for, not a harness wrapped around every
-# test — and `DEPS` naming `../lib lib` is the honest, greppable marker of
-# which tests are client tests. Most are not: they are workers, they name
-# things by /cas path and hash, and they never pay for a repo.
+# A "client test" is one that drives `caos-cli`. It needs a git worktree,
+# because `:@=` ingests git-tracked paths and nothing else. This supplies one:
+# it stages the repo, installs the client under test, and then runs the test's
+# own `worker.sh` inside it.
+#
+# A test asks for it by naming it as its base — two lines, and nothing else:
+#
+#     DEPS         ../../dev/cli-test cli-test
+#     .caos-expr   curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
+#
+# and then finds itself cwd'd in a repo with the test tree at ./test, its own
+# dependencies at ./DEEP-DEPS, and $CAOS_CLI pointing at the client to drive.
+#
+# MOST TESTS DO NOT NEED THIS. A worker test names std/bash, addresses
+# everything by /cas path and hash, and never pays for a repo. So DEPping on
+# `cli-test` is the greppable answer to "which tests are client tests" — which
+# is also the count that decides how many runner slots the suite needs, since a
+# client test blocks on its runs and a worker test does not.
+#
+# It lives under dev/ with the rest of the suite's machinery (dev/run-test,
+# dev/run-tests) rather than under tests/, because it is not a test.
+#
+# ---- the rest of this file is why each step is the way it is ----------------
 #
 # It is the image AND the script because they are one decision: a test that
 # starts using `jq` needs this flake to carry jq, and there is no version of
@@ -37,7 +54,7 @@ CAOS_CLI=/tmp/caos-cli
 export CAOS_CLI
 # CAOS_SERVER_URL is runnerd's, and runnerd here is the DEV stack's — so it
 # already points at the stack under test. Nothing to flip.
-: "${CAOS_SERVER_URL:?tests/lib needs CAOS_SERVER_URL from the runner}"
+: "${CAOS_SERVER_URL:?dev/cli-test needs CAOS_SERVER_URL from the runner}"
 
 # NO ALTERNATE OBJECT STORE, and if a push here ever dies unable to read an
 # object, this is the first place to look. There used to be one; CLAUDE.md is

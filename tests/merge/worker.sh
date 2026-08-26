@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job (tests/lib stages the repo, then runs this).
+# set, INSIDE the dev stack — the suite's per-test job (dev/cli-test stages the repo, then runs this).
 #
 # Drives the std/merge worker directly (SPEC "Merging and conflict
 # resolution"), the way tests/rgrep drives the fold before any chat wiring:

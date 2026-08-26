@@ -21,4 +21,4 @@
 ../../std/flake-builder flake-builder
 # The image this client test runs in, with the client-repo setup as its
 # /worker: a dependency, not a harness.
-../lib lib
+../../dev/cli-test cli-test

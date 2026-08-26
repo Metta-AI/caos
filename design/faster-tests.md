@@ -346,7 +346,7 @@ Wrong twice over.
 whichever server ran the job, and each stack's repo is private
 (`/tmp/stack/git`, seeded per job from its declared deps). A stack that hits
 another's entry gets a hash it cannot resolve. This tree already paid for that
-lesson in another guise — `tests/lib/run-test.sh`: "The client has the hash and
+lesson in another guise — `dev/cli-test/run-test.sh`: "The client has the hash and
 not the objects, so the push dies on the first one it cannot read."
 
 **And it would not help.** Single-flight is per-server, so concurrent misses all

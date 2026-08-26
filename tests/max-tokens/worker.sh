@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job (tests/lib stages the repo, then runs this).
+# set, INSIDE the dev stack — the suite's per-test job (dev/cli-test stages the repo, then runs this).
 #
 # max_tokens continuation (design/agent-harness.md): when a round ends with
 # stop_reason "max_tokens" the harness does NOT fail the turn — it appends the

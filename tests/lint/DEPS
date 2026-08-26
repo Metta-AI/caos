@@ -15,6 +15,6 @@
 ../../std std
 ../../flake.nix flake.nix
 # NOT for a worktree — this test drives no client. For the TOOLCHAIN: both lints
-# use `sed`, which std/bash does not carry (CLAUDE.md), and tests/lib's image is
+# use `sed`, which std/bash does not carry (CLAUDE.md), and dev/cli-test's image is
 # the one in this tree that does.
-../lib lib
+../../dev/cli-test cli-test

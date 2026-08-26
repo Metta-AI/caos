@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/hello — a CLIENT test. Runs cwd'd into a fresh git repo with this test
-# tree at ./test, its deps at ./DEEP-DEPS and $CAOS_CLI set: tests/lib's
+# tree at ./test, its deps at ./DEEP-DEPS and $CAOS_CLI set: dev/cli-test's
 # `/worker` stages all of that and then runs this, and this test's `.caos-expr`
-# names tests/lib as its base to ask for it.
+# names dev/cli-test as its base to ask for it.
 #
 # `std/hello` is what a person runs to check that a caos installation works, so
 # what this pins down is the PROPERTY that makes it useful for that: one

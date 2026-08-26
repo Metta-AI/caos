@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE the dev stack — the suite's per-test job
-# (tests/lib stages the repo, then runs this).
+# (dev/cli-test stages the repo, then runs this).
 #
 # Exercises the cargo worker (worker-cargo, design/cargo-workers.md): a
 # whole-workspace `cargo check/test` over a source tree, `--offline` atop the

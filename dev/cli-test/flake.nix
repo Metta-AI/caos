@@ -1,13 +1,14 @@
 {
-  # tests/lib: the image a CLIENT test runs in, with the client-repo setup baked
-  # in as `/worker`.
+  # dev/cli-test: the image a CLIENT TEST runs in — a git worktree, the client
+  # under test, and the tools a test script shells out to. `./worker` is what
+  # actually stages all that; read it first, it says what this is for.
   #
-  # A test that drives `caos-cli` needs a git worktree, because `:@=` ingests
+  # A test that drives `caos-cli` needs a worktree, because `:@=` ingests
   # git-tracked paths and nothing else. Most tests do not — they are workers,
   # they name things by /cas path and hash, and they should not pay for a repo
-  # they never read. So this is a DEPENDENCY a test declares (`../lib lib`) and
-  # names as its base, which makes "which tests are client tests" a fact you can
-  # grep for rather than a guess.
+  # they never read. So this is a DEPENDENCY a test declares
+  # (`../../dev/cli-test cli-test`) and names as its base, which makes "which
+  # tests are client tests" a fact you can grep for rather than a guess.
   #
   # THE IMAGE AND THE SCRIPT LIVE TOGETHER, deliberately. What a client test can
   # reach for and what the setup does with it are one decision — a test that
@@ -35,7 +36,7 @@
   # worker. The lock is NOT here: it is DEPped from the repo root and placed by
   # the flake-builder, so there is one lock in the tree rather than a copy per
   # flake and a lint to keep the copies honest.
-  description = "caos tests/lib — the image a CLIENT test runs in: a git worktree, the tested client, and the tools a test script shells out to";
+  description = "caos dev/cli-test — the image a CLIENT test runs in: a git worktree, the tested client, and the tools a test script shells out to";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

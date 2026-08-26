@@ -1,6 +1,6 @@
 # What this test reaches for that no DEPS edge supplies (format
 # `<path> <name>`). deep-deps mounts each RECURSIVELY DEEPENED at
-# DEEP-DEPS/<name>, and tests/lib stages them into the client repo — which is
+# DEEP-DEPS/<name>, and dev/cli-test stages them into the client repo — which is
 # where `caos-cli talk` and this test's own `.caos-secrets` reader line both
 # name them from.
 #
@@ -19,4 +19,4 @@
 ../../std/rgrep rgrep
 # The image this client test runs in, with the client-repo setup as its
 # /worker: a dependency, not a harness.
-../lib lib
+../../dev/cli-test cli-test

@@ -599,7 +599,7 @@ is what made resolution-by-descent affordable.
   `./flake-inputs/caos/std/foo`. The expander is small — a commit already
   materializes via `--name:commit=`, and `read_commit` gives its tree — but it
   does not exist, and nothing in this repo needs it yet.
-- **`tests/lib/run-test.sh`'s `objects/info/alternates`.** A client pushes by
+- **`dev/cli-test/run-test.sh`'s `objects/info/alternates`.** A client pushes by
   walking the arg tree's closure, and git can only skip an advertised object by
   traversing that ref LOCALLY. The arg tree's `image` is a resolved image the
   client holds only as a hash (for a rustc-built tool, `curry(runner, …)` whose

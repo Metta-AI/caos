@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE the dev stack — the suite's per-test job
-# (tests/lib stages the repo, then runs this).
+# (dev/cli-test stages the repo, then runs this).
 #
 # Proves the rustc builder loop: a Rust source file -> the builder compiles it
 # (glibc/gnu, linking the vendored worker-common) and emits a ready-to-run worker

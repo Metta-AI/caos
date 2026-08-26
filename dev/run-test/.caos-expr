@@ -6,7 +6,7 @@
 # this file's predecessor did has no one left to do it for. It used to install
 # the tested client, build a git worktree, copy the test's deps into it and
 # interpret an exit code; a test that needs a client repo now DEPs on
-# `tests/lib` and asks for it, and a test that does not needs none of it.
+# `dev/cli-test` and asks for it, and a test that does not needs none of it.
 #
 # What is left is the two things a test cannot do for itself: turn a tree into
 # a running test (evaluation, which a worker may not perform — the worker-side

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE the dev stack — the suite's per-test job
-# (tests/lib stages the repo, then runs this).
+# (dev/cli-test stages the repo, then runs this).
 #
 # Exercises the dirs-only worker, a filter that keeps only a node's directory
 # children and drops its files. The fixture tree/ holds 6 files across nested

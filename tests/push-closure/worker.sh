@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE the dev stack — the suite's per-test job (tests/lib stages the repo, then runs this).
+# INSIDE the dev stack — the suite's per-test job (dev/cli-test stages the repo, then runs this).
 #
 # A CLIENT MUST BE ABLE TO PUSH A REQUEST IT IS ABLE TO FORM.
 #

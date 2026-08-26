@@ -222,7 +222,7 @@ aborting `tests/<name>/cli.sh` inside the `test` tool errored that tool's
 sub-run, which killed the turn, discarded every other test's result, and
 orphaned the model's in-turn work — twice in two days, both times on a bug the
 model had just written and could have fixed had it been allowed to read the
-failure. The other half of that fix is in `tests/lib/run-test.sh`, which no
+failure. The other half of that fix is in `dev/cli-test/run-test.sh`, which no
 longer classifies an unguarded `set -e` abort as infrastructure.
 
 Infrastructure failures are still uncached, and a request whose resolution

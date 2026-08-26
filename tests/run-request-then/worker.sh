@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack (tests/lib stages the repo, then runs this).
+# set, INSIDE the dev stack (dev/cli-test stages the repo, then runs this).
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
