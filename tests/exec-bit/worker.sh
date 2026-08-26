@@ -1,22 +1,47 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/exec-bit — a WORKER test: no client, no repo, just this script run over
+# the fixture in a bash worker.
 #
 # Proves git's executable bit round-trips through the worker CAS as METADATA,
 # not as a placeholder permission: it is recorded on the placeholder (an xattr)
-# and only becomes a real +x mode bit once the file is fetched. The assertions
-# are about the modes a *worker* sees in a real /cas, so they live in check.sh
-# and run inside a bash worker; this script just builds the workspace and
-# launches it.
+# and only becomes a real +x mode bit once the file is fetched.
+#
+# `[ -x ]` here is exactly the question "does this file carry the exec bit?":
+# with no exec bits set it is false for owner, group, other AND root, and with
+# them set it is true — so the assertions hold whether or not the worker is the
+# CAS owner.
+#
+# The fixture is CHECKED IN with its mode rather than chmod'd at runtime. git
+# records 100755, and caos ingests git's recorded mode, so this exercises the
+# real path rather than one the test arranged for itself.
 set -euo pipefail
+W=/cas/args/ws
+fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# An executable file and a plain one. chmod HERE (not a committed fixture mode)
-# so the exec bit is unambiguous regardless of how the harness stored the tree.
-mkdir -p ws
-printf '#!/bin/sh\necho hi\n' > ws/run.sh
-chmod +x ws/run.sh
-echo plain > ws/plain.txt
-git add -A && git -c user.email=test@caos -c user.name=caos commit -qm exec-bit-ws
+# Expand ONE level: the entries appear as unfetched placeholders, not loaded
+# content — exactly the state we want to inspect.
+caos get "$W"
 
-"$CAOS_CLI" run --base:@=DEEP-DEPS/bash --worker1:@=test/check.sh --ws:@=ws
+echo "== an unfetched placeholder is NOT executable, even for an exe file ==" >&2
+[ -e "$W/run.sh" ] || fail "run.sh placeholder missing"
+[ ! -x "$W/run.sh" ] || fail "placeholder run.sh is +x before it is fetched"
+[ ! -x "$W/plain.txt" ] || fail "placeholder plain.txt is +x"
+echo "  ok: neither placeholder carries +x" >&2
+
+echo "== fetching restores +x on the executable only ==" >&2
+caos get "$W/run.sh"
+caos get "$W/plain.txt"
+[ -x "$W/run.sh" ] || fail "fetched run.sh is not +x"
+[ ! -x "$W/plain.txt" ] || fail "fetched plain.txt gained +x"
+echo "  ok: run.sh is +x, plain.txt is not" >&2
+
+echo "== put/get round-trips the exec bit ==" >&2
+caos put "$W" /cas/exec-roundtrip
+caos get -r /cas/exec-roundtrip
+[ -x /cas/exec-roundtrip/run.sh ] || fail "run.sh lost +x through put/get"
+[ ! -x /cas/exec-roundtrip/plain.txt ] || fail "plain.txt gained +x through put/get"
+echo "  ok: +x preserved on run.sh, absent on plain.txt" >&2
+
+printf 'exec-bit: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out

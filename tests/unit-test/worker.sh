@@ -1,59 +1,52 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/unit-test — a WORKER test: no client, no repo. It curries the cargo worker
+# with the command it wants, runs it over `rust` (everything cargo compiles,
+# arriving as a declared dependency), and reads the result.
 #
-# The workspace's UNIT tests (`cargo test`), as just another suite test: the
-# per-crate decomposition (mode=all) keys each crate's tests on its pruned
-# source closure, so an edit re-tests the touched crates and their
-# dependents, not the world. The workspace arrives in this test's wrapper
-# (everything cargo compiles) as its declared dependency `../../rust`.
+# STDERR FIRST, STDOUT LAST when it fails. The report inlines a failing test`s
+# LAST few lines, and for `cargo test` the part worth reading — failing test
+# names and their panics — is on stdout, while stderr is compile chatter.
 #
-# One of four unit-* tests — test, clippy, doc, fmt — that were a single
-# `unit` test running two at a time and then two in sequence. They share
-# nothing but the workspace snapshot, so as separate suite tests they land in
-# separate outer-pool slots, and a clippy failure no longer hides whether the
-# tests pass. All four name the same workspace in caos-tools/test.sh, so they
-# re-key together on a Rust edit and none re-keys on anything else.
+# TWO STAGES: a run cannot be waited on, so the assertion is the `then`.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-# THE WORKSPACE IS THIS TEST'S OWN DEPENDENCY, not something handed to it:
-# `DEPS` names `../../rust`, and everything cargo compiles lives under that one
-# directory. Copied out of the mount because the tripwire edits below write to
-# it, and DEEP-DEPS is staged from read-only CAS content.
-mkdir ws
-cp -rL DEEP-DEPS/rust/. ws/
-chmod -R u+w ws
-commit "workspace snapshot"
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+# --test-salt rides in EVERY stage: bound only at the top, a fresh value would
+# re-run the first container and hit the memo for the rest.
+next() { caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
+  --stage="$1" --test-salt:@=/cas/args/test-salt; }
 
-# Target musl: that's the one target the deps bake carries, so tests reuse
-# it instead of recompiling the dep graph. musl statics run in the Linux
-# worker, so `cargo test` still runs them.
-tgt="$(uname -m)-unknown-linux-musl"
+case "$stage" in
 
-echo "== cargo test of the workspace, per-crate, in caos workers ==" >&2
-# `|| ok=0`, not a bare call: under `set -e` a failed run would kill the
-# script before the diagnostics below ever print.
-ok=1
-"$CAOS_CLI" run r1 --base:@=DEEP-DEPS/cargo --tree:@=ws --cmd=test --mode=all \
-  "--target=$tgt" >/tmp/r1.log 2>&1 || ok=0
-cat /tmp/r1.log >&2
-if [ "$ok" = 0 ] || [ ! -e r1/exit ] || [ "$(cat r1/exit)" != "0" ]; then
-  echo "== cargo test FAILED (exit $(cat r1/exit 2>/dev/null)) — full output ==" >&2
-  # STDERR FIRST, STDOUT LAST. The suite report inlines a failing test's LAST
-  # few lines, and for `cargo test` the part worth reading — the failing test
-  # names and their panic messages — is on stdout, while stderr is compile
-  # chatter. Printing the informative stream last puts it in the excerpt.
-  # unit-clippy and unit-doc want the opposite order, and say so.
-  echo "---- stderr ----" >&2; cat r1/stderr >&2 || true
-  echo "---- stdout ----" >&2; cat r1/stdout >&2 || true
-  # Split the outcome: no result at all (the caos run failed, or no exit file)
-  # is INFRA — the cargo worker never ran, so this is uncached and retried, not
-  # a cached red. A result whose exit is non-zero is the test's own verdict.
-  if [ "$ok" = 0 ] || [ ! -e r1/exit ]; then infra "cargo worker did not run"; fi
-  fail "unit tests failed"
-fi
-echo "unit-test: ALL PASS" >&2
+start)
+  echo "== cargo test of the workspace, in caos workers ==" >&2
+  # Target musl: the one target the deps bake carries, so this reuses it
+  # instead of recompiling the dep graph.
+  tgt="$(uname -m)-unknown-linux-musl"
+  img=$(caos curry --base:@=/cas/args/cargo --cmd=test --mode=all "--target=$tgt") \
+    || fail "currying the cargo job"
+  caos run-then /cas/args/rust --run:hash="$img" --then:hash="$(next checked)"
+  ;;
+
+checked)
+  # A cargo job REPORTS rather than fails: a lint or a broken build comes back
+  # as a value with a nonzero `exit`, so the run succeeding says nothing about
+  # the verdict. (A run that genuinely fails never reaches here — dev/run-test
+  # catches it and this test is FAIL with the worker's own stderr.)
+  caos get -r /cas/args/result || fail "reading the cargo result"
+  if [ ! -e /cas/args/result/exit ] || [ "$(cat /cas/args/result/exit)" != "0" ]; then
+    echo "== cargo test FAILED (exit $(cat /cas/args/result/exit 2>/dev/null)) ==" >&2
+    echo "---- stderr ----" >&2; cat /cas/args/result/stderr >&2 || true
+    echo "---- stdout ----" >&2; cat /cas/args/result/stdout >&2 || true
+    fail "test failed"
+  fi
+  printf 'unit-test: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac

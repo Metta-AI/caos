@@ -1,42 +1,50 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/unit-doc — a WORKER test: no client, no repo. It curries the cargo worker
+# with the command it wants, runs it over `rust` (everything cargo compiles,
+# arriving as a declared dependency), and reads the result.
 #
-# `cargo doc` over the workspace, per-crate (mode=all) — the same
-# decomposition as unit-test and unit-clippy. `-D warnings` is applied
-# worker-side (RUSTDOCFLAGS, scoped to this cmd so doctests are unaffected),
-# and --no-deps keeps it to our own docs.
+# STDOUT FIRST, STDERR LAST: rustdoc`s diagnostics are on stderr.
 #
-# One of four unit-* tests — see tests/unit-test/cli.sh for why they are four.
+# TWO STAGES: a run cannot be waited on, so the assertion is the `then`.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
 
-# THE WORKSPACE IS THIS TEST'S OWN DEPENDENCY, not something handed to it:
-# `DEPS` names `../../rust`, and everything cargo compiles lives under that one
-# directory. Copied out of the mount because the tripwire edits below write to
-# it, and DEEP-DEPS is staged from read-only CAS content.
-mkdir ws
-cp -rL DEEP-DEPS/rust/. ws/
-chmod -R u+w ws
-commit "workspace snapshot"
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+# --test-salt rides in EVERY stage: bound only at the top, a fresh value would
+# re-run the first container and hit the memo for the rest.
+next() { caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
+  --stage="$1" --test-salt:@=/cas/args/test-salt; }
 
-tgt="$(uname -m)-unknown-linux-musl"
+case "$stage" in
 
-echo "== cargo doc of the workspace, per-crate, in caos workers ==" >&2
-ok=1
-"$CAOS_CLI" run r3 --base:@=DEEP-DEPS/cargo --tree:@=ws --cmd=doc --mode=all \
-  "--target=$tgt" >/tmp/r3.log 2>&1 || ok=0
-cat /tmp/r3.log >&2
-if [ "$ok" = 0 ] || [ ! -e r3/exit ] || [ "$(cat r3/exit)" != "0" ]; then
-  echo "== cargo doc FAILED (exit $(cat r3/exit 2>/dev/null)) — full output ==" >&2
-  # STDERR LAST: rustdoc's warnings-as-errors land there, and the suite report
-  # inlines a failing test's LAST lines.
-  echo "---- stdout ----" >&2; cat r3/stdout >&2 || true
-  echo "---- stderr ----" >&2; cat r3/stderr >&2 || true
-  if [ "$ok" = 0 ] || [ ! -e r3/exit ]; then infra "cargo worker did not run"; fi
-  fail "doc failed"
-fi
-echo "unit-doc: ALL PASS" >&2
+start)
+  echo "== cargo doc of the workspace, in caos workers ==" >&2
+  # Target musl: the one target the deps bake carries, so this reuses it
+  # instead of recompiling the dep graph.
+  tgt="$(uname -m)-unknown-linux-musl"
+  img=$(caos curry --base:@=/cas/args/cargo --cmd=doc --mode=all "--target=$tgt") \
+    || fail "currying the cargo job"
+  caos run-then /cas/args/rust --run:hash="$img" --then:hash="$(next checked)"
+  ;;
+
+checked)
+  # A cargo job REPORTS rather than fails: a lint or a broken build comes back
+  # as a value with a nonzero `exit`, so the run succeeding says nothing about
+  # the verdict. (A run that genuinely fails never reaches here — dev/run-test
+  # catches it and this test is FAIL with the worker's own stderr.)
+  caos get -r /cas/args/result || fail "reading the cargo result"
+  if [ ! -e /cas/args/result/exit ] || [ "$(cat /cas/args/result/exit)" != "0" ]; then
+    echo "== cargo doc FAILED (exit $(cat /cas/args/result/exit 2>/dev/null)) ==" >&2
+    echo "---- stdout ----" >&2; cat /cas/args/result/stdout >&2 || true
+    echo "---- stderr ----" >&2; cat /cas/args/result/stderr >&2 || true
+    fail "doc failed"
+  fi
+  printf 'unit-doc: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac
