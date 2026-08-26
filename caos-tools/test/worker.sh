@@ -33,6 +33,7 @@ T0=$SECONDS
 phase() { echo "==> [+$((SECONDS - T0))s] $*" >&2; }
 
 caos get -r /cas/args/in || fail "materializing the workspace"
+phase "materialized the workspace"
 cd /cas/args/in
 [ -f flake.nix ] || fail "no flake.nix in the workspace"
 [ -x dev/stack-up ] || fail "no dev/stack-up in the workspace"

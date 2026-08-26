@@ -58,7 +58,9 @@ mkdir -p "$state/logs"
 phase "git-init the workspace"
 if [ ! -d .git ]; then
   git init -q -b main
+  phase "git add -Af"
   git add -Af
+  phase "committing the workspace"
   GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000" \
     git -c user.name=caos -c user.email=dev@caos commit -q -m workspace \
     || fail "committing the workspace"
