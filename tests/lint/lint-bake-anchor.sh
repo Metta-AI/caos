@@ -22,11 +22,24 @@ cd "$root"
 
 # The crates.io dep NAMES in a Cargo.toml's [dependencies]: lines `name = …`
 # that carry no `path` (a path dep is local). One name per line.
+#
+# A BASH LOOP, NOT sed: this runs in std/bash now, which is bash, coreutils,
+# diffutils, gnugrep, findutils and jq — an absent binary is exit 127 at
+# runtime, not a build error. `[[ =~ ]]` rather than a `case` glob keeps both
+# patterns exact: `path[[:space:]]*=` must not match a dep NAMED `pathfinder`,
+# and a glob cannot say "spaces then =".
 crates_io_deps() { # <Cargo.toml>
-  sed -n '/^\[dependencies\]/,/^\[/p' "$1" \
-    | grep -E '^[A-Za-z0-9_-]+[[:space:]]*=' \
-    | grep -v 'path[[:space:]]*=' \
-    | sed -E 's/^([A-Za-z0-9_-]+).*/\1/'
+  local in_deps=0 line name
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line == '[dependencies]' ]]; then in_deps=1; continue; fi
+    if [[ $line == '['* ]]; then in_deps=0; continue; fi
+    if [ "$in_deps" != 1 ]; then continue; fi
+    if [[ ! $line =~ ^([A-Za-z0-9_-]+)[[:space:]]*= ]]; then continue; fi
+    # Captured before the next `=~` clobbers BASH_REMATCH.
+    name=${BASH_REMATCH[1]}
+    if [[ $line =~ path[[:space:]]*= ]]; then continue; fi
+    printf '%s\n' "$name"
+  done < "$1"
 }
 
 anchor=rust/crates/bake-anchor/Cargo.toml

@@ -1,20 +1,8 @@
-# What this test reaches for (format `<path> <name>`). deep-deps mounts each at
-# DEEP-DEPS/<name>, and the MOUNT NAMES MATCH THE REPO NAMES on purpose: both
-# lints resolve their inputs relative to a tree root, so `DEEP-DEPS/` simply IS
-# that root and nothing has to be assembled.
-#
-# This test used to be handed the whole workspace as $CAOS_PROJECT, so it
-# re-keyed on every edit to every file, including edits to other tests. Now it
-# re-keys on what it actually reads.
-#
-# flake.nix is declared although only its EXISTENCE is checked: `keep_rule` in
-# lint-flake-src.sh MIRRORS the filter in flake.nix, and the two drifting apart
-# is the whole failure mode — declaring it is what makes this test re-run when
-# the filter changes rather than when anything changes.
+# What this test reaches for (format `<path> <name>`). These three ARE the tree
+# the lints check: deepening mounts them side by side under DEEP-DEPS, so
+# `rust/`, `std/` and `flake.nix` sit next to each other exactly as they do in
+# the repo, and both scripts take that directory as their root.
+../../std/bash bash
 ../../rust rust
 ../../std std
 ../../flake.nix flake.nix
-# NOT for a worktree — this test drives no client. For the TOOLCHAIN: both lints
-# use `sed`, which std/bash does not carry (CLAUDE.md), and dev/cli-test's image is
-# the one in this tree that does.
-../../dev/cli-test cli-test
