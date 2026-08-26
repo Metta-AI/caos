@@ -1,19 +1,12 @@
 # tests/run-then, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
-# directory yields the test's ARG TREE, which dev/run-test then runs. Pure
-# evaluation, so a broken expression is told apart from a failing assertion and
-# the request has a name before it is dispatched.
+# directory yields the test's ARG TREE, which dev/run-test then runs.
 #
-# A CLIENT TEST — it drives `caos-cli`, so its base is `DEEP-DEPS/cli-test`
-# (dev/cli-test), the image that stages a git worktree and then runs `worker1`.
-# DEPping on `lib` is the greppable marker of which tests are client tests.
+# A WORKER TEST. `run-then` is a WORKER verb and every fixture here is already a
+# worker; the client was only a convenient way to dispatch them and read stdout.
 #
-#   --test  this directory itself, staged into the repo as ./test with its
-#           DEEP-DEPS alongside. `--test:@=.` is inert by construction:
-#           `strip_caos_expr` removes this file from the tree before the
-#           expression is evaluated against it, so nothing recurses.
-#
-# NOTHING HERE NAMES WHAT ONLY THE RUN KNOWS. The client under test, the salt,
-# and a workspace or api key are PASSED when dev/run-test calls this ArgTree —
-# so every path above exists in this directory, which is the whole point of an
-# expression being readable on its own.
-curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
+# The two failure cases are why it looked like it needed one — they assert that
+# a failing run fails the whole request UNCAUGHT, and a worker that lets a run
+# fail uncaught dies with it. The uncaught path is one level down: dispatch the
+# driver that does the uncaught run-then, and CATCH that dispatch. The error
+# text is the proof and the subject is unchanged.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --num:@=in.txt --double:@=double.sh --combine:@=combine.sh --driver:@=driver.sh --outer:@=outer.sh --checks:@=checks.sh --boom:@=boom.sh --catcher:@=catcher.sh --cycle:@=cycle.sh

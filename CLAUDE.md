@@ -168,8 +168,10 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   passing run and broke `nix build` on arrival. `tests/lint` now runs
   `tests/lint/lint-flake-src.sh` for the embedded-file case; for anything else the
   filter touches, run `nix build` yourself before committing.
-- **`caosd up` does NOT get a new `caos` binary into worker images —
-  `caosd reset` does.** A worker image's `/bin/caos` is copied in by the
+- **`caosd up` does NOT get a new `caos` binary into worker images.** A cheap
+  `CAOS_SALT=$(date --iso=s) caosd up` does; `caosd reset` also does, but it
+  wipes the whole stack's state to achieve it, so reach for the salt FIRST.
+  A worker image's `/bin/caos` is copied in by the
   flake-builder at IMAGE-BUILD time (`std/flake-builder/worker`:
   `cp /bin/caos "$l/usr/bin/caos"`), and the flake-builder is reached through a
   seeded sentinel whose ArgTree is `{base: docker://seeded-…, in: <std entry
@@ -180,6 +182,10 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   bash image came back at the same oid with no marker, while `server.log`
   showed `cache hit: arg_tree=… -> tree …` naming the previous deploy's image
   and the fresh seed record naming a different one.
+  The salt is the direct fix for exactly that: it threads into every sub-run, so
+  the flake-builder's key moves, the memo misses and the image is rebuilt —
+  while everything the stack has already cached survives. A reset gets there by
+  having nothing left to answer from, which costs a full cold rebuild after it.
   This bites only when something calls a NEW VERB on the DEPLOYED (outer)
   stack — `caos-tools/*` do, the suite does not, because it compiles its own
   binaries inside the test stack. The symptom is a worker dying with a plain
@@ -221,6 +227,13 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   per-test value bound as `--salt` is overwritten at dispatch and never reaches
   the key — two different values then produce one request and nothing re-runs.
   `tests/hello` asserts the list; the suite's own is `--test-salt`.
+  **`in` is taken too, for a test.** `dev/run-test` launches one with
+  `run-then <the test's own tree> --run:hash=<the test>`, so the continuation
+  binds `in` to that tree and a test's own `--in:@=file` loses to a DIRECTORY —
+  which surfaces one container later as `cat: /cas/args/in: Is a directory`,
+  naming a path the test's `.caos-expr` does bind. Name a test's input anything
+  else (`tests/run-then` uses `--num`); fixtures the test itself dispatches read
+  `/cas/args/in` normally, since their own `run-then` is what binds it.
 - **`/cas/args/base` is the IMAGE, not this job's ArgTree.** A later stage must
   re-bind by name whatever it reads. `--test-salt` has to ride in EVERY stage for
   that reason: bound only at the top, a fresh `--test-salt` re-runs the first

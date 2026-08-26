@@ -1,6 +1,5 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
-# INSIDE the dev stack — the suite's per-test job (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/flake-input-loader — a WORKER test: no client, no repo, no remote.
 #
 # `std/flake-input-loader` (design/flake-inputs.md, "Consumer root"): a project
 # that is NOT caos mounts a PINNED input into its own evaluated tree, with
@@ -8,90 +7,117 @@
 # input, what of it, and where it goes; the loader checks the pin against
 # `flake.lock` and splices.
 #
-# The fixture is a synthetic input repo reached over `git+file://` — the subject
-# is the loader, not anyone's TLS. What it must show:
-#
-#   - the input tree lands at `--output-path`, creating parent directories that
-#     the consumer's tree does not have;
+# WHAT IT MUST SHOW:
+#   - the input tree lands at `--output-path`, creating parent directories the
+#     consumer's tree does not have;
 #   - every sibling survives the splice (it is a merge, not a replacement);
-#   - the mounted tree is IDENTICAL to the input repo's own subtree, i.e. the
-#     locator resolved to content and nothing was rebuilt;
-#   - a pin that DRIFTS from flake.lock is refused — the `nix flake update`
-#     without regenerating case, which is the whole reason for the check.
+#   - the mounted tree is IDENTICAL to the tree handed in — nothing rebuilt;
+#   - a pin that DRIFTS from flake.lock is refused, naming both revisions.
+#
+# THE REVS ARE STRINGS. The loader "cannot resolve a rev to a tree — mapping a
+# rev to a tree needs a fetch, and by the time a worker runs the locator is
+# already an oid" (its own header). It parses the rev out of `--expr` and
+# compares it with `flake.lock`. So two distinct forty-hex strings exercise the
+# check exactly, and the test needs no repo at all.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# ---- the input repo, standing in for caos ------------------------------------
-SRC=/tmp/fil-src
-rm -rf "$SRC"; mkdir -p "$SRC/std/thing"
-git init -q "$SRC"
-git -C "$SRC" config uploadpack.allowReachableSHA1InWant true
-printf 'from the input\n' > "$SRC/std/thing/file"
-git -C "$SRC" add -A
-git -C "$SRC" -c user.email=test@caos -c user.name=caos commit -qm one
-OLD=$(git -C "$SRC" rev-parse HEAD)
-# A second commit, so the drift case can pin a rev that EXISTS (a bogus sha
-# would fail in the client's fetch, before the loader ever ran, and would prove
-# nothing about the check).
-printf 'changed\n' > "$SRC/std/thing/file"
-git -C "$SRC" add -A
-git -C "$SRC" -c user.email=test@caos -c user.name=caos commit -qm two
-SHA=$(git -C "$SRC" rev-parse HEAD)
-REPO="git+file://$SRC"
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
+  --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
+  --loader:@=/cas/args/loader "$@"; }
 
-# ---- a consumer package ------------------------------------------------------
-# The loader is reached by a local mount here; `tests/remote-ref` already covers
-# reaching a worker by locator, and this test is about what the loader DOES.
-mk_consumer() { # <dir> <rev the expression pins>
-  local dir=$1 rev=$2
-  mkdir -p "$dir"
-  cp -r DEEP-DEPS/flake-input-loader "$dir/loader"
-  printf '{ inputs.demo.url = "git+file://%s"; outputs = _: { }; }\n' "$SRC" > "$dir/flake.nix"
-  cat > "$dir/flake.lock" <<LOCK
+SHA=1111111111111111111111111111111111111111   # what flake.lock locks
+OLD=2222222222222222222222222222222222222222   # what a drifted expression pins
+REPO='git+file:///synthetic/input'
+
+# The input to splice: a plain tree, standing in for whatever a locator would
+# have resolved to. The loader takes it as `--input-tree` either way.
+input_tree() {
+  rm -rf /tmp/input && mkdir -p /tmp/input/thing
+  printf 'from the input\n' > /tmp/input/thing/file
+  caos put /tmp/input /cas/input >/dev/null || fail "publishing the input tree"
+  echo /cas/input
+}
+
+# The consumer: a flake (the loader refuses a non-flake — it loads a flake
+# INPUT), a flake.lock locking `demo` at SHA, and a sibling that must
+# survive the splice. No `.caos-expr` — evaluation strips the directive before
+# the loader ever sees the tree, so a dispatch reproduces that state exactly.
+consumer() {
+  rm -rf /tmp/pkg && mkdir -p /tmp/pkg
+  cat > /tmp/pkg/flake.lock <<LOCK
 { "nodes": { "root":   { "inputs": { "demo": "demo" } },
-             "demo":   { "locked": { "type": "git", "url": "file://$SRC", "rev": "$SHA" } } },
+             "demo":   { "locked": { "type": "git", "url": "file:///synthetic/input", "rev": "$SHA" } } },
   "root": "root", "version": 7 }
 LOCK
-  printf 'keep me\n' > "$dir/sibling.txt"
-  cat > "$dir/.caos-expr" <<EXPR
-run --base:@=loader --in:@=. --expr=\$CAOS_EXPR --input=demo --input-tree:@@=$REPO?rev=$rev&dir=std --output-path=vendor/demo-std
-EXPR
+  printf '{ inputs.demo.url = "git+file:///synthetic/input"; outputs = _: { }; }\n' > /tmp/pkg/flake.nix
+  printf 'keep me\n' > /tmp/pkg/sibling.txt
+  caos put /tmp/pkg /cas/pkg >/dev/null || fail "publishing the consumer tree"
+  echo /cas/pkg
 }
-mk_consumer pkg "$SHA"
-mk_consumer pkg-drift "$OLD"
-git add -A && git -c user.email=test@caos -c user.name=caos commit -qm flake-input-loader
 
-echo "== a pinned input is mounted into the consumer's evaluated tree ==" >&2
-out=$("$CAOS_CLI" eval-path pkg) || fail "eval-path pkg failed: $out"
-[ "${out%% *}" = tree ] || fail "expected a tree result, got: $out"
-"$CAOS_CLI" get "${out##* }" got || fail "get ${out##* }"
+# The consumer's root expression, as TEXT — the only thing the loader sees of
+# it, and the only place a rev is pinned.
+expr_pinning() { # <rev> -> a /cas path
+  printf 'run --base:@=loader --in:@=. --expr=$CAOS_EXPR --input=demo --input-tree:@@=%s?rev=%s&dir=std --output-path=vendor/demo-std\n' \
+    "$REPO" "$1" > /tmp/expr
+  caos put /tmp/expr "/cas/expr-$1" >/dev/null || fail "publishing the expression"
+  echo "/cas/expr-$1"
+}
 
-[ "$(cat got/vendor/demo-std/thing/file)" = changed ] \
-  || fail "mounted content: $(cat got/vendor/demo-std/thing/file 2>&1)"
-echo "  ok: the input landed at vendor/demo-std, parent dirs created" >&2
+load() { # <rev-the-expression-pins> -> the ArgTree to run
+  caos curry --base:@=/cas/args/loader \
+    --expr:@="$(expr_pinning "$1")" --input=demo \
+    --input-tree:@="$(input_tree)" --output-path=vendor/demo-std
+}
 
-# A merge, not a replacement — and the directive is gone, because the expression
-# was evaluated against its directory MINUS itself.
-[ "$(cat got/sibling.txt)" = "keep me" ] || fail "a sibling was lost in the splice"
-[ -e got/flake.lock ] || fail "flake.lock was lost in the splice"
-[ ! -e got/.caos-expr ] || fail ".caos-expr came back in the result"
-echo "  ok: siblings survived; the directive did not" >&2
+case "$stage" in
 
-# The mounted tree IS the input repo's own subtree: the locator resolved to
-# content, nothing was rebuilt or copied.
-mounted=$(cd got/vendor/demo-std && git -C "$SRC" rev-parse "$SHA:std")
-have=$("$CAOS_CLI" eval-path pkg/vendor/demo-std) || fail "eval-path into the mount failed"
-[ "${have##* }" = "$mounted" ] \
-  || fail "the mount is ${have##* }, not the input's own std tree $mounted"
-echo "  ok: the mount is the input repo's own tree oid" >&2
+start)
+  echo "== a pinned input is mounted into the consumer's evaluated tree ==" >&2
+  caos run-then "$(consumer)" --run:hash="$(load "$SHA")" \
+    --then:hash="$(next spliced --input:@=/cas/input)"
+  ;;
 
-echo "== a pin that drifts from flake.lock is refused ==" >&2
-if "$CAOS_CLI" eval-path pkg-drift >/dev/null 2>/tmp/err; then
-  fail "a drifted pin was accepted"
-fi
-grep -q "is locked at $SHA in flake.lock" /tmp/err \
-  || fail "wrong error for a drifted pin: $(cat /tmp/err)"
-grep -q "but the expression pins $OLD" /tmp/err \
-  || fail "the drift error did not name the expression's rev: $(cat /tmp/err)"
-echo "  ok: the loader named both revisions and refused" >&2
+spliced)
+  R=/cas/args/result; caos get -r "$R" || fail "reading the spliced tree"
+  [ "$(cat "$R/vendor/demo-std/thing/file")" = "from the input" ] \
+    || fail "mounted content: $(cat "$R/vendor/demo-std/thing/file" 2>&1)"
+  echo "  ok: the input landed at vendor/demo-std, parent dirs created" >&2
+
+  # A merge, not a replacement.
+  [ "$(cat "$R/sibling.txt")" = "keep me" ] || fail "a sibling was lost in the splice"
+  [ -e "$R/flake.lock" ] || fail "flake.lock was lost in the splice"
+  echo "  ok: siblings survived" >&2
+
+  # The mounted tree IS the tree handed in: nothing was rebuilt or copied.
+  caos get /cas/args/input
+  [ "$(caos hash "$R/vendor/demo-std")" = "$(caos hash /cas/args/input)" ] \
+    || fail "the mount is not the input tree that was passed in"
+  echo "  ok: the mount is the input tree's own oid" >&2
+
+  echo "== a pin that drifts from flake.lock is refused ==" >&2
+  # `--catch` because the refusal IS the assertion.
+  caos run-then "$(consumer)" --run:hash="$(load "$OLD")" \
+    --then:hash="$(next drifted)" --catch
+  ;;
+
+drifted)
+  [ -e /cas/args/error ] || fail "a drifted pin was accepted"
+  caos get /cas/args/error
+  grep -q "is locked at $SHA in flake.lock" /cas/args/error \
+    || fail "wrong error for a drifted pin: $(cat /cas/args/error)"
+  grep -q "but the expression pins $OLD" /cas/args/error \
+    || fail "the drift error did not name the expression's rev: $(cat /cas/args/error)"
+  echo "  ok: the loader named both revisions and refused" >&2
+
+  printf 'flake-input-loader: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac

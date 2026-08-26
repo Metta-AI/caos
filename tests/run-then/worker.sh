@@ -1,102 +1,149 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack — the suite's per-test job
-# (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/run-then — a WORKER test: no client, no repo.
 #
 # Exercises run-then — the single-valued map-then (the continuation
 # `{in, run?, then?, catch?}`): a plain tail call (--run only), the sub-run's
 # result threading into `then` as --result, a nested promise from the run
-# position, the client-side flag validation, run-cycle detection, and `--catch`
-# — a failing run delivered to `then` as --error instead of failing the request,
-# with the uncaught case asserted alongside it so the default cannot drift. The
-# workers are curried bash scripts (see the *.sh fixtures), so no new images
-# are needed.
+# position, client-side flag validation, run-cycle detection, and `--catch` — a
+# failing run delivered to `then` as --error instead of failing the request,
+# with the uncaught case asserted alongside it so the default cannot drift.
+#
+# EIGHT STAGES: no run can be waited on, so each assertion is the `then` of the
+# run it is about. The timings the old version printed are gone with the
+# blocking calls that made them meaningful.
+#
+# THE NUMBER IS `--num`, NOT `--in`. `in` is not ours to bind: dev/run-test
+# launches a test with `run-then <the test's tree> --run:hash=<the test>`, and
+# the continuation's own `in` is that tree — so a test that binds `--in` is
+# handed a directory instead, and dies at the first `cat` with "Is a directory".
+# The fixtures below DO read `/cas/args/in`, correctly: each is dispatched by a
+# `run-then /cas/args/num`, which is what binds their `in`.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-ms() { date +%s%3N; }   # epoch milliseconds
 
-echo "21" > in.txt
-git add in.txt
-git -c user.email=test@caos -c user.name=caos commit -qm 'input'
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
+  --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
+  --bash:@=/cas/args/bash --num:@=/cas/args/num --double:@=/cas/args/double \
+  --combine:@=/cas/args/combine --driver:@=/cas/args/driver \
+  --outer:@=/cas/args/outer --checks:@=/cas/args/checks --boom:@=/cas/args/boom \
+  --catcher:@=/cas/args/catcher --cycle:@=/cas/args/cycle "$@"; }
 
-# The run/then steps: double.sh writes 2*<in>; combine.sh writes
-# "in=<in> result=<result>". driver.sh run-thens over --in with whatever
-# run-img/then-img were curried into it.
-double=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/double.sh)
-combine=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/combine.sh)
+# A bash worker running one of this test's fixture scripts.
+fixture() { local w=$1; shift; caos curry --base:@=/cas/args/bash --worker1:@="/cas/args/$w" "$@"; }
+result_text() { caos get /cas/args/result >/dev/null; cat /cas/args/result; }
 
-echo "== run with no then: a plain tail call to run ==" >&2
-tail_driver=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/driver.sh --run-img="$double")
-t0=$(ms); n=$("$CAOS_CLI" run --base:hash="$tail_driver" --in:@=in.txt); t1=$(ms)
-[ "$n" = "42" ] || fail "expected 42, got: $n"
-echo "  ok: run(--in=21) -> 42 is the request's result" >&2
+case "$stage" in
 
-echo "== run + then: the result threads into then as --result ==" >&2
-both_driver=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/driver.sh --run-img="$double" --then-img="$combine")
-t2=$(ms); s=$("$CAOS_CLI" run --base:hash="$both_driver" --in:@=in.txt); t3=$(ms)
-[ "$s" = "in=21 result=42" ] || fail "expected 'in=21 result=42', got: $s"
-echo "  ok: then saw --in=21 and --result=42" >&2
+start)
+  # double.sh writes 2*<in>; combine.sh writes "in=<in> result=<result>".
+  # driver.sh run-thens over --in with whatever run-img/then-img it was curried.
+  echo "== run with no then: a plain tail call to run ==" >&2
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture driver --run-img="$(fixture double)")" \
+    --then:hash="$(next tail)"
+  ;;
 
-echo "== an identical request is a cache hit with the same value ==" >&2
-t4=$(ms); s2=$("$CAOS_CLI" run --base:hash="$both_driver" --in:@=in.txt); t5=$(ms)
-[ "$s2" = "$s" ] || fail "cached rerun differs: $s2 vs $s"
-echo "  ok: rerun -> same value" >&2
+tail)
+  [ "$(result_text)" = "42" ] || fail "expected 42, got: $(result_text)"
+  echo "  ok: run(--in=21) -> 42 is the request's result" >&2
 
-echo "== a nested promise from the run position resolves ==" >&2
-# outer.sh's whole body is itself a run-then (over the curried double), so the
-# driver's `run` sub-run returns a promise the server must collapse before
-# combine sees --result.
-outer=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/outer.sh --inner-img="$double")
-nested_driver=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/driver.sh --run-img="$outer" --then-img="$combine")
-s=$("$CAOS_CLI" run --base:hash="$nested_driver" --in:@=in.txt)
-[ "$s" = "in=21 result=42" ] || fail "nested promise: expected 'in=21 result=42', got: $s"
-echo "  ok: run's promise collapsed to 42 before then" >&2
+  echo "== run + then: the result threads into then as --result ==" >&2
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture driver --run-img="$(fixture double)" --then-img="$(fixture combine)")" \
+    --then:hash="$(next threaded)"
+  ;;
 
-echo "== --map/--run exclusivity and missing --run are rejected client-side ==" >&2
-ok=$("$CAOS_CLI" run --base:@=DEEP-DEPS/bash --worker1:@=test/checks.sh --in:@=in.txt)
-[ "$ok" = "ok" ] || fail "checks.sh did not pass: $ok"
-echo "  ok: bad flag combinations refused before anything is recorded" >&2
+threaded)
+  [ "$(result_text)" = "in=21 result=42" ] \
+    || fail "expected 'in=21 result=42', got: $(result_text)"
+  echo "  ok: then saw --in=21 and --result=42" >&2
 
-echo "== without --catch, a failing run fails the whole request ==" >&2
-# The default, asserted so `--catch` below can't quietly become the behaviour
-# everywhere: a pipeline that loses a step has no business reporting success.
-boom=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/boom.sh)
-catcher=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/catcher.sh)
-uncaught_driver=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/driver.sh --run-img="$boom" --then-img="$catcher")
-if "$CAOS_CLI" run --base:hash="$uncaught_driver" --in:@=in.txt 2>boom.err; then
-  fail "expected the failing run to fail the request, but it succeeded"
-fi
-grep -q "exit status: 1" boom.err \
-  || fail "no worker failure reported; got: $(cat boom.err)"
-echo "  ok: the run's failure propagated" >&2
+  echo "== an identical request is a cache hit with the same value ==" >&2
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture driver --run-img="$(fixture double)" --then-img="$(fixture combine)")" \
+    --then:hash="$(next cached)"
+  ;;
 
-echo "== with --catch, the failure reaches then as --error ==" >&2
-# Same failing run, same then — only the flag differs, so what changes is the
-# interpreter's handling and nothing else.
-caught_driver=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/driver.sh --run-img="$boom" --then-img="$catcher" --catch=1)
-c=$("$CAOS_CLI" run --base:hash="$caught_driver" --in:@=in.txt) \
-  || fail "expected --catch to make the request succeed"
-[ "$c" = "in=21 caught=yes" ] || fail "expected 'in=21 caught=yes', got: $c"
-echo "  ok: then ran with --in and --error, and the request succeeded" >&2
+cached)
+  [ "$(result_text)" = "in=21 result=42" ] || fail "cached rerun differs: $(result_text)"
+  echo "  ok: rerun -> same value" >&2
 
-echo "== a run-then cycle is detected (by the server) ==" >&2
-# cycle.sh re-curries itself (content-addressed, so the sub-request is
-# byte-identical to the in-flight one) and run-thens the same input.
-cyc=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/cycle.sh)
-if "$CAOS_CLI" run --base:hash="$cyc" --in:@=in.txt 2>cyc.err; then
-  fail "expected the self-recursive run-then to fail, but the run succeeded"
-fi
-grep -q "run cycle detected" cyc.err || fail "no cycle reported; got: $(cat cyc.err)"
-echo "  ok: run failed with a run-cycle error" >&2
+  echo "== a nested promise from the run position resolves ==" >&2
+  # outer.sh's whole body is itself a run-then (over the curried double), so the
+  # driver's `run` sub-run returns a promise the server must collapse before
+  # combine sees --result.
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture driver \
+      --run-img="$(fixture outer --inner-img="$(fixture double)")" \
+      --then-img="$(fixture combine)")" \
+    --then:hash="$(next nested)"
+  ;;
 
-# tail = 2 cold jobs (driver + run); then = 3; rerun = 0 (pure cache hit).
-echo "run-then perf (ms):" >&2
-echo "  tail=$((t1 - t0))  then=$((t3 - t2))  cached=$((t5 - t4))" >&2
-echo "run-then: ALL PASS" >&2
+nested)
+  [ "$(result_text)" = "in=21 result=42" ] \
+    || fail "nested promise: expected 'in=21 result=42', got: $(result_text)"
+  echo "  ok: run's promise collapsed to 42 before then" >&2
+
+  echo "== --map/--run exclusivity and missing --run are rejected ==" >&2
+  caos run-then /cas/args/num --run:hash="$(fixture checks)" --then:hash="$(next validated)"
+  ;;
+
+validated)
+  [ "$(result_text)" = "ok" ] || fail "checks.sh did not pass: $(result_text)"
+  echo "  ok: bad flag combinations refused before anything is recorded" >&2
+
+  echo "== without --catch, a failing run fails the whole request ==" >&2
+  # The default, asserted so `--catch` below cannot quietly become the behaviour
+  # everywhere: a pipeline that loses a step has no business reporting success.
+  # The `--catch` HERE is on our own dispatch of the uncaught driver, so the
+  # propagation arrives as a value; the driver itself catches nothing.
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture driver --run-img="$(fixture boom)" --then-img="$(fixture catcher)")" \
+    --then:hash="$(next uncaught)" --catch
+  ;;
+
+uncaught)
+  [ -e /cas/args/error ] || fail "expected the failing run to fail the request"
+  caos get /cas/args/error
+  grep -q "exit status: 1" /cas/args/error \
+    || fail "no worker failure reported; got: $(cat /cas/args/error)"
+  echo "  ok: the run's failure propagated" >&2
+
+  echo "== with --catch, the failure reaches then as --error ==" >&2
+  # Same failing run, same then — only the flag on the DRIVER differs, so what
+  # changes is the interpreter's handling and nothing else.
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture driver --run-img="$(fixture boom)" \
+      --then-img="$(fixture catcher)" --catch=1)" \
+    --then:hash="$(next caught)"
+  ;;
+
+caught)
+  [ "$(result_text)" = "in=21 caught=yes" ] \
+    || fail "expected 'in=21 caught=yes', got: $(result_text)"
+  echo "  ok: then ran with --in and --error, and the request succeeded" >&2
+
+  echo "== a run-then cycle is detected (by the server) ==" >&2
+  # cycle.sh re-curries itself (content-addressed, so the sub-request is
+  # byte-identical to the in-flight one) and run-thens the same input.
+  caos run-then /cas/args/num --run:hash="$(fixture cycle)" \
+    --then:hash="$(next cycled)" --catch
+  ;;
+
+cycled)
+  [ -e /cas/args/error ] || fail "expected the self-recursive run-then to fail"
+  caos get /cas/args/error
+  grep -q "run cycle detected" /cas/args/error \
+    || fail "no cycle reported; got: $(cat /cas/args/error)"
+  echo "  ok: run failed with a run-cycle error" >&2
+
+  printf 'run-then: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac

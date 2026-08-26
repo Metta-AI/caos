@@ -158,6 +158,14 @@ fanout)
     # read from `/secret`. A test is self-contained, so its tree is the child.
     ln -s "/cas/args/result/tests/$t" "/tmp/sel/$t"
   done
+  # AN EMPTY SELECTION IS A USER ERROR, said here. `--only` is SPACE-separated
+  # (the match above is `*" $t "*`), so the comma form everyone reaches for first
+  # selects nothing — and an empty map has no children, which surfaced two
+  # containers later as the summariser's `/cas/args/children/*: No such file or
+  # directory`, a message about neither `--only` nor the names it was given.
+  if [ -z "$(ls -A /tmp/sel)" ]; then
+    fail "--only matched no tests:$only(the list is SPACE-separated)"
+  fi
   caos put /tmp/sel /cas/sel
 
   # --start-time is the clock for the test phase, taken HERE because this is the
