@@ -160,11 +160,26 @@ new_llm_conversation() { # <suffix> <port> <tree-oid> [system-text]
 # Publish a human turn and the admission event the worker expects, then dispatch
 # the request. Sets `human`, `request` and `admitted`; the conversation ref is
 # left at `admitted`, and wait_turn takes it from there.
+LLM_TEST_TURN=0
 dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
   local tree=$1 message=$2 parent=${3:-$base}
+  # A FRESH CAS PATH PER TURN: `caos put-commit` records at a path, and a
+  # conversation with two turns would otherwise mint the second over the first.
+  LLM_TEST_TURN=$(( LLM_TEST_TURN + 1 ))
+  local n=$LLM_TEST_TURN
+  # `base` ONLY ON THE OPENING TURN. It marks the event that starts the
+  # conversation, and llm-step's readers filter on `has("base")` — so putting it
+  # on a follow-up turn changes how the history is assembled. (Observed as
+  # llm-async's second turn losing the independent-completion notice.) A caller
+  # that names an explicit parent is continuing a conversation, so it is left off.
+  local head_event
+  if [ -n "${3:-}" ]; then
+    head_event="{\"author\":\"user\",\"content\":\"$message\"}"
+  else
+    head_event="{\"base\":\"$parent\",\"author\":\"user\",\"content\":\"$message\"}"
+  fi
   # `human` is a global: tests assert the turn descends from it.
-  human=$(mint_commit /cas/human "$tree" \
-    "{\"base\":\"$parent\",\"author\":\"user\",\"content\":\"$message\"}" "$parent")
+  human=$(mint_commit "/cas/human-$n" "$tree" "$head_event" "$parent")
   # `--secret-hash` BOUND BY HAND, and it is what makes this work at all.
   # llm-step's admission protocol requires the conversation to name the EXACT
   # request hash before the run starts, and a secret-bearing request carries a
@@ -176,10 +191,10 @@ dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
   # the server runs the same object.
   [ -e /cas/args/secret-hash ] \
     || fail "this job carries no secret-hash: caos-tools/test must grant dev/worker-test the mock key"
-  request=$(caos prepare-request --base:hash="$llm" --head:@=/cas/human \
+  request=$(caos prepare-request --base:hash="$llm" --head:@="/cas/human-$n" \
     --secret-hash:@=/cas/args/secret-hash) || fail "preparing the turn request"
   assert_oid "$request" "the prepared turn request"
-  admitted=$(mint_commit /cas/admitted "$tree" \
+  admitted=$(mint_commit "/cas/admitted-$n" "$tree" \
     "{\"request\":\"$request\",\"request_head\":\"$human\",\"status\":\"queued\"}" "$human")
   git -c fetch.negotiationAlgorithm=noop fetch -q caos "$admitted" \
     || fail "fetching the admission commit back"

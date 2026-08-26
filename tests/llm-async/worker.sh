@@ -1,68 +1,63 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# tests/llm-async — a WORKER test, in dev/worker-test (it needs git).
+#
 # Durable independent work through llm-step: the primary turn queues a request
 # and becomes idle, completion appends later, and the following turn receives a
 # deterministic completion notice.
+#
+# THE BARRIER IS A SECOND STUB WITH A FIFO RESPONSE. async.sh POSTs to it and
+# blocks reading the reply, so "the conversation went idle while the work was
+# still running" is a fact this test controls rather than races against.
 set -euo pipefail
-# The dependency is mounted only inside the test wrapper and exports globals.
-# shellcheck disable=SC1091
-source DEEP-DEPS/llm-test/common.sh
+
+caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+source /cas/args/common
 
 stage "workspace, worker barrier, and scripted model"
 llm_test_setup
-stub_host="${stub_host:?llm_test_setup did not set stub_host}"
-mkdir -p ws/notes
-echo "hello notes" > ws/notes/todo.txt
-echo "You are a coding agent operating on a git workspace." > system.txt
-git add -A
-gc commit -qm fixtures
-base=$(mkcommit "HEAD:ws" base)
+caos get -r /cas/args/bash || fail "reading the bash image"
+caos get /cas/args/async  || fail "reading async.sh"
+
+rm -rf /tmp/ws && mkdir -p /tmp/ws/notes
+echo "hello notes" > /tmp/ws/notes/todo.txt
+caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
+ws=$(caos hash /cas/ws)
 
 # The independent worker reaches this server and blocks on its response FIFO.
-# Unlike the old combined test, both stub servers use the readiness probe; no
-# fixed half-second sleep sits on the test's critical path.
-mkdir async-gate
-mkfifo async-gate/response-1.json
+rm -rf /tmp/async-gate && mkdir -p /tmp/async-gate
+mkfifo /tmp/async-gate/response-1.json
 gate_pid=""
 gate_port=""
-start_stub async-gate gate_pid gate_port
-gate_pid="${gate_pid:?start_stub did not set gate_pid}"
-async_request=$("$CAOS_CLI" prepare-request --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/async.sh --gate-host="$stub_host" --gate-port="$gate_port")
+start_stub /tmp/async-gate gate_pid gate_port
+async_request=$(caos prepare-request --base:hash="$(caos hash /cas/args/bash)" \
+  --worker1:@=/cas/args/async --gate-host="$stub_host" --gate-port="$gate_port") \
+  || fail "preparing the independent subrequest"
 assert_oid "$async_request" "independent subrequest"
 
 ASYNC_QUEUED_TEXT="the independent task is queued"
 ASYNC_OBSERVED_TEXT="I observed the independent task completion"
-mkdir stub
+mkdir -p /tmp/stub
 printf '{"content":[{"id":"toolu_async","input":{"request":"%s"},"name":"run_async","type":"tool_use"}],"stop_reason":"tool_use"}' \
-  "$async_request" > stub/response-1.json
+  "$async_request" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-  "$ASYNC_QUEUED_TEXT" > stub/response-2.json
+  "$ASYNC_QUEUED_TEXT" > /tmp/stub/response-2.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-  "$ASYNC_OBSERVED_TEXT" > stub/response-3.json
+  "$ASYNC_OBSERVED_TEXT" > /tmp/stub/response-3.json
 stub_pid=""
 port=""
-start_stub stub stub_pid port
-stub_pid="${stub_pid:?start_stub did not set stub_pid}"
-new_llm_conversation llm-async "$port"
-conv="${conv:?new_llm_conversation did not set conv}"
-conversation_ref="${conversation_ref:?new_llm_conversation did not set conversation_ref}"
-llm="${llm:?new_llm_conversation did not set llm}"
+start_stub /tmp/stub stub_pid port
+
+new_llm_conversation llm-async "$port" "$ws" \
+  "You are a coding agent operating on a git workspace."
 
 stage "primary turn queues work and becomes idle"
-user1=$(mkcommit "HEAD:ws" \
-  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"queue the independent request\"}" \
-  "$base")
-request1=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user1")
-assert_oid "$request1" "primary prepared request"
-admitted1=$(mkcommit "HEAD:ws" \
-  "{\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
-  "$user1")
-git push --quiet caos "$admitted1:$conversation_ref" \
-  || fail "publishing independent-work admission"
-"$CAOS_CLI" run --base:hash="$request1" >/tmp/llm-async-result \
-  || fail "running independent-work turn"
-
-head1=$(fetch_head)
+dispatch_turn "$ws" "queue the independent request"
+user1=$human
+head1=$(wait_turn) || {
+  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
+  fail "the primary turn never reached a terminal event"
+}
 terminal1=$(git show -s --format=%B "$head1")
 grep -qF '"status":"idle"' <<<"$terminal1" \
   || fail "primary turn did not become idle after run_async"
@@ -75,16 +70,16 @@ mapfile -t pending_tasks < <(
 [ "${#pending_tasks[@]}" -eq 1 ] || fail "run_async did not record exactly one task"
 task=${pending_tasks[0]}
 assert_oid "$task" "pending task"
-grep -qF '"name":"run_async"' stub/request-1.json \
+grep -qF '"name":"run_async"' /tmp/stub/request-1.json \
   || fail "run_async was not registered for the model"
-grep -qF '"tool_use_id":"toolu_async"' stub/request-2.json \
+grep -qF '"tool_use_id":"toolu_async"' /tmp/stub/request-2.json \
   || fail "run_async's immediate result was not replayed"
-grep -qF "$task" stub/request-2.json \
+grep -qF "$task" /tmp/stub/request-2.json \
   || fail "run_async's immediate result omitted the task"
 
 gate_reached=0
 for _ in $(seq 1 300); do
-  if [ -e async-gate/request-1.json ]; then gate_reached=1; break; fi
+  if [ -e /tmp/async-gate/request-1.json ]; then gate_reached=1; break; fi
   sleep 0.2
 done
 [ "$gate_reached" -eq 1 ] || fail "independent worker never reached its barrier"
@@ -92,7 +87,7 @@ done
   || fail "conversation advanced while independent work was blocked"
 
 stage "completion appends and is observed next turn"
-printf '%s\n' '{"content":[],"stop_reason":"end_turn"}' > async-gate/response-1.json
+printf '%s\n' '{"content":[],"stop_reason":"end_turn"}' > /tmp/async-gate/response-1.json
 completion_head=""
 for _ in $(seq 1 300); do
   candidate=$(remote_tip "$conversation_ref")
@@ -119,25 +114,17 @@ task_result=$(jq -r --arg task "$task" \
 assert_oid "$task_result" "independent task result"
 
 tree1=$(git rev-parse "$completion_head^{tree}")
-user2=$(mkcommit "$tree1" \
-  '{"author":"user","content":"what completed?"}' "$completion_head")
-request2=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user2")
-admitted2=$(mkcommit "$tree1" \
-  "{\"request\":\"$request2\",\"request_head\":\"$user2\",\"status\":\"queued\"}" \
-  "$user2")
-git push --quiet caos "$admitted2:$conversation_ref" \
-  || fail "publishing post-completion admission"
-"$CAOS_CLI" run --base:hash="$request2" >/tmp/llm-async-result-2 \
-  || fail "running post-completion turn"
-
-head2=$(fetch_head)
+dispatch_turn "$tree1" "what completed?" "$completion_head"
+head2=$(wait_turn) || fail "the post-completion turn never reached a terminal event"
 grep -qF "$ASYNC_OBSERVED_TEXT" <<<"$(git show -s --format=%B "$head2")" \
   || fail "post-completion turn did not finish"
 notice="Independent task $task is complete. Its result is $task_result."
-grep -qF "$notice" stub/request-3.json \
+grep -qF "$notice" /tmp/stub/request-3.json \
   || fail "later model step did not observe independent completion"
 [ "$(git rev-parse "$head2^{tree}")" = "$tree1" ] \
   || fail "post-completion observation changed the workspace"
 
 stage "done"
-echo "llm-async: ALL PASS" >&2
+printf 'llm-async: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out
