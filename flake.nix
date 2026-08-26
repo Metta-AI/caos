@@ -704,6 +704,33 @@
           worker-rustc
         ];
 
+        # EVERYTHING A STACK BRING-UP NEEDS, in one derivation — so ONE
+        # `nix build` produces all of it: the daemons under `bin/` and the
+        # worker images under `images/`.
+        #
+        # `build-builtins.sh` takes both as store paths (CAOS_BUILTIN_BINS,
+        # CAOS_BUILTIN_IMAGES) and runs no nix when it has them. Handing them
+        # over is therefore the fast path, and this is what lets BOTH callers
+        # take it: caosd for the host, caos-tools/test for a dev stack.
+        #
+        # On the host that aggregation used to fall out by accident — caosd's
+        # script text names the image derivations, so building caosd built them.
+        # The dev stack had no equivalent, so `dev/stack-up` evaluated the flake
+        # three more times at runtime to find the same paths: 12 seconds of a
+        # 16-second bring-up, against ~1 second to actually start the stack.
+        #
+        # `bin` is a symlink to the workspace's own, so a consumer looks for
+        # `<inputs>/bin/<name>` exactly as it would in a plain build output. The
+        # images keep their store basenames, which is how build-builtins maps
+        # each back to its builtin (`*-caos-worker-<name>.tar.gz`).
+        stackInputs =
+          pname: bins:
+          pkgs.runCommand pname { } ''
+            mkdir -p $out/images
+            ln -s ${bins}/bin $out/bin
+            ${pkgs.lib.concatMapStringsSep "\n" (i: "ln -s ${i} $out/images/") builtinWorkerImages}
+          '';
+
         # The dev stack's control command. Subcommands:
         #   caosd up     (default) idempotently bring the stack up and publish all
         #                of std, then RETURN — the stack stays running in the
@@ -873,18 +900,21 @@
 
             # Publish std to this stack: build-builtins.sh with the flake's own
             # prebuilt images and binaries, so nothing is nix-built at runtime.
+            # THE SAME SHAPE THE DEV STACK USES: one aggregate store path
+            # (`stackInputs`) carrying the daemons under `bin/` and the worker
+            # images under `images/`, handed to build-builtins so it runs no
+            # nix. The two bring-ups differ only in where that path comes from
+            # — substituted at flake-build time here, one `nix build` of the
+            # tree under test there — and in placement, which is stack/serve's
+            # business rather than this script's.
             std_build() {
               echo "==> publishing stdlib (build-builtins.sh)" >&2
               CAOS_SERVER_URL=http://localhost:9090 \
               CAOS_REGISTRY_HTTP="$REGISTRY" \
               CAOS_CLI=${caos-cli}/bin/caos-cli \
               CAOS_CLIENT_REPO="$CLIENT" \
-              CAOS_BUILTIN_IMAGES="${
-                pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
-              }" \
-              CAOS_BUILTIN_BINS="${
-                pkgs.lib.concatMapStringsSep " " toString builtinWorkerBins
-              }" \
+              CAOS_BUILTIN_IMAGES="$(echo ${stackInputs "caos-stack-inputs" workspaceBins}/images/*)" \
+              CAOS_BUILTIN_BINS="${stackInputs "caos-stack-inputs" workspaceBins}" \
                 bash ${self}/build-builtins.sh >/dev/null
             }
 
@@ -1172,6 +1202,10 @@
           # The workspace stamped for the TEST world — what dev/stack-up builds
           # a dev stack from, so a host client cannot drive it (and vice versa).
           caos-test-world = testWorkspaceBins;
+          # The two stack-bring-up aggregates (see `stackInputs`): one nix
+          # build each, and both are handed to the same build-builtins.
+          caos-stack-inputs = stackInputs "caos-stack-inputs" workspaceBins;
+          caos-test-stack-inputs = stackInputs "caos-test-stack-inputs" testWorkspaceBins;
           # Agent-harness worker binaries (run as curry(runner, bin)).
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc

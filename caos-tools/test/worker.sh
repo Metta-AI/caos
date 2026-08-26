@@ -44,14 +44,17 @@ cd /cas/args/in
 # Its failure is an INFRASTRUCTURE failure, not a test verdict: nothing was
 # tested, so a caller must retry rather than read a red report. Hence the bare
 # exit rather than a report with a FAILED banner.
-# The dev stack is TEST world, so a host client is refused by it and vice versa.
+# ONE nix build, for everything the stack needs: `.#caos-test-stack-inputs`
+# carries the daemons and the worker images in a single derivation, so stack-up
+# resolves nothing. The dev stack is TEST world, so a host client is refused by
+# it and vice versa.
 # It shares every dependency with the host build; only the thin workspace
 # compile differs (measured: one derivation, 13.8s).
-phase "building the test-world binaries"
-bins=$(nix build "path:$PWD#caos-test-world" --no-link --print-out-paths) \
-  || fail "building the test-world binaries"
+phase "building the stack inputs"
+inputs=$(nix build "path:$PWD#caos-test-stack-inputs" --no-link --print-out-paths) \
+  || fail "building the stack inputs"
 phase "bringing the dev stack up"
-./dev/stack-up --bins="$bins" >&2 || fail "bringing the dev stack up"
+./dev/stack-up --inputs="$inputs" >&2 || fail "bringing the dev stack up"
 CLI=/caos-dev/bin/caos-cli
 [ -x "$CLI" ] || fail "no client at $CLI after stack-up"
 
