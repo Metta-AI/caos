@@ -1,19 +1,11 @@
-# tests/chat-tools-grep, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
-# directory yields the test's ARG TREE, which dev/run-test then runs. Pure
-# evaluation, so a broken expression is told apart from a failing assertion and
-# the request has a name before it is dispatched.
+# tests/chat-tools-grep, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
 #
-# A CLIENT TEST — it drives `caos-cli`, so its base is `DEEP-DEPS/cli-test`
-# (dev/cli-test), the image that stages a git worktree and then runs `worker1`.
-# DEPping on `lib` is the greppable marker of which tests are client tests.
+# A WORKER TEST, for the same reason as its sibling tests/chat-tools: the
+# subject is llm-step's grep tool, and `caos-cli chat` was the client's turn
+# loop, which has its own test. std/llm-test/worker-common.sh does the three
+# steps that were plumbing.
 #
-#   --test  this directory itself, staged into the repo as ./test with its
-#           DEEP-DEPS alongside. `--test:@=.` is inert by construction:
-#           `strip_caos_expr` removes this file from the tree before the
-#           expression is evaluated against it, so nothing recurses.
-#
-# NOTHING HERE NAMES WHAT ONLY THE RUN KNOWS. The client under test, the salt,
-# and a workspace or api key are PASSED when dev/run-test calls this ArgTree —
-# so every path above exists in this directory, which is the whole point of an
-# expression being readable on its own.
-curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
+# dev/worker-test, not std/bash: the conversation REF is the completion signal,
+# and refs on the server are the one thing caos gives a worker no verb for.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh

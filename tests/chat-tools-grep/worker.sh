@@ -1,59 +1,68 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# tests/chat-tools-grep — a WORKER test, in dev/worker-test (it needs git).
+#
 # Grep's llm-step integration: root and subtree dispatch plus invalid-pattern
 # preflight. Purpose-built files replace two unrelated prior chat turns.
+#
+# The client used to type `caos-cli chat`; that is the client's turn loop, not
+# llm-step's grep, and std/llm-test/worker-common.sh does those steps here. The
+# assertions about the client's progress RENDERING are gone with it — what is
+# left is the turn tree and what llm-step sent the model.
 set -euo pipefail
-# The dependency is mounted only inside the test wrapper and exports globals.
-# shellcheck disable=SC1091
-source DEEP-DEPS/llm-test/common.sh
+
+caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+source /cas/args/common
 
 stage "search fixture and scripted grep turn"
 llm_test_setup
-stub_host="${stub_host:?llm_test_setup did not set stub_host}"
-mkdir -p ws/notes
-echo "hello notes" > ws/notes/todo.txt
-echo "goodbye world" > ws/notes/new.txt
-commit "search fixture"
-git config user.name tester
-git config user.email tester@example.com
-base=$(mkcommit "HEAD:ws" base)
+
+mkdir -p /tmp/ws/notes
+echo "hello notes" > /tmp/ws/notes/todo.txt
+echo "goodbye world" > /tmp/ws/notes/new.txt
+caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the search fixture"
+ws=$(caos hash /cas/ws)
 
 GREP_CALLS='[
  {"id":"tu_g1","input":{"pattern":"hello"},"name":"grep","type":"tool_use"},
  {"id":"tu_g2","input":{"pattern":"goodbye","path":"notes"},"name":"grep","type":"tool_use"},
  {"id":"tu_g3","input":{"pattern":"("},"name":"grep","type":"tool_use"}]'
-mkdir stub
+mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
-  "$(printf '%s' "$GREP_CALLS" | tr -d '\n')" > stub/response-1.json
+  "$(printf '%s' "$GREP_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
 printf '%s\n' \
   '{"content":[{"text":"grep done","type":"text"}],"stop_reason":"end_turn"}' \
-  > stub/response-2.json
+  > /tmp/stub/response-2.json
 stub_pid=""
 port=""
-start_stub stub stub_pid port
-stub_pid="${stub_pid:?start_stub did not set stub_pid}"
+start_stub /tmp/stub stub_pid port
 
-test_run_id="$(date +%s%N)-$$-$RANDOM"
-conv="${test_run_id}-tools-grep"
-conversation_ref="refs/caos/v2/conversations/$conv/head"
-opts=(--model test-model --base-url "http://$stub_host:$port")
+new_llm_conversation tools-grep "$port" "$ws"
 
 stage "root, scoped, and invalid-pattern grep"
-"$CAOS_CLI" chat "$conv" -m "search the workspace" \
-  --base "$base" "${opts[@]}" > grep.out
-while IFS= read -r line; do echo "  grep| $line" >&2; done < grep.out
-turn=$(remote_tip "$conversation_ref") || fail "grep conversation has no head"
-git fetch -q caos "$turn"
-git diff --quiet "$base" "$turn" -- || fail "grep changed the workspace tree"
-grep -qF "grep hello" grep.out || fail "root grep progress line missing"
-grep -qF "grep goodbye notes" grep.out || fail "scoped grep progress line missing"
-grep -qF 'notes/todo.txt:1:hello notes' stub/request-2.json \
+dispatch_turn "$ws" "search the workspace"
+turn=$(wait_turn) || {
+  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
+  fail "the turn never reached a terminal event"
+}
+echo "  turn $turn" >&2
+
+# GREP READS; it must not write. The turn's tree is compared against the
+# workspace it started from.
+[ "$(git rev-parse "$turn^{tree}")" = "$ws" ] || fail "grep changed the workspace tree"
+
+stage "and each result reached the model"
+grep -qF 'notes/todo.txt:1:hello notes' /tmp/stub/request-2.json \
   || fail "root grep match not sent"
-grep -qF 'notes/new.txt:1:goodbye world' stub/request-2.json \
+grep -qF 'notes/new.txt:1:goodbye world' /tmp/stub/request-2.json \
   || fail "scoped grep match not sent"
-grep -qF '"is_error":true' stub/request-2.json \
+grep -qF '"is_error":true' /tmp/stub/request-2.json \
   || fail "invalid pattern not marked is_error"
-grep -qF 'invalid pattern' stub/request-2.json || fail "invalid pattern error not explained"
-[ ! -f stub/request-3.json ] || fail "unexpected extra model round"
+grep -qF 'invalid pattern' /tmp/stub/request-2.json \
+  || fail "invalid pattern error not explained"
+[ ! -f /tmp/stub/request-3.json ] || fail "unexpected extra model round"
 
 stage "done"
-echo "chat-tools-grep: ALL PASS" >&2
+printf 'chat-tools-grep: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out
