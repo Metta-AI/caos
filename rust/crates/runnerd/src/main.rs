@@ -1,8 +1,9 @@
 //! caos-runnerd: the generic runner — the host agent that mints fresh worker
 //! containers (see `design/runner-protocol.md`).
 //!
-//! Each of its slots long-polls the server's `POST /runner/poll` with *no*
-//! required args, so it matches any job. On a job it runs
+//! Each of its slots long-polls the server's `POST /runner/poll` with the
+//! required args from `CAOS_RUNNER_REQUIRE` — *none* by default, so the generic
+//! pool matches any job that does not itself demand a pool. On a job it runs
 //!
 //! ```text
 //! docker run --name caos-worker-<nonce> --label caos.runnerd.owner=<id> \
@@ -118,6 +119,17 @@ struct Config {
     /// work, never as a reason to fail.
     worker_redis_addr: Option<String>,
     token: Option<String>,
+    /// Args this runner REQUIRES a job to carry, name → git blob oid of the
+    /// value, from `CAOS_RUNNER_REQUIRE` (`name=value` pairs, whitespace or
+    /// comma separated). Empty for the generic pool.
+    ///
+    /// The server's rendezvous is symmetric: this says which jobs the runner
+    /// will accept, and a job's own `required*` args say which runners it will
+    /// accept. So a dedicated pool needs BOTH halves — this process requiring
+    /// `required-pool=test`, and the job carrying it — and neither alone
+    /// changes anything: a runner requiring it simply never matches ordinary
+    /// work, which is the point.
+    required: std::collections::BTreeMap<String, String>,
     slots: u32,
     network: String,
     docker_bin: String,
@@ -304,10 +316,14 @@ fn main() {
         socket: std::env::var("CAOS_RUNNER_SOCKET")
             .ok()
             .filter(|s| !s.is_empty()),
+        required: required_args(&env_or("CAOS_RUNNER_REQUIRE", "")),
     });
+    // The required set is part of this line because it is what decides which
+    // jobs this process can ever see, and `stack/serve` greps this line to know
+    // runnerd is up.
     eprintln!(
-        "caos-runnerd: {} slots, server {}, network {}",
-        config.slots, config.server_url, config.network
+        "caos-runnerd: {} slots, server {}, network {}, requiring {:?}",
+        config.slots, config.server_url, config.network, config.required
     );
     reap_leftovers(&config);
     let mut threads = Vec::new();
@@ -433,10 +449,43 @@ struct Job {
     payload: String,
 }
 
-/// One generic long-poll. `Some(job)` to run; `None` on idle/evicted.
+/// A git blob's object id: sha1 over `blob <len>\0` then the content. The
+/// server's rendezvous compares OIDS, and a job's arg value reaches it as the
+/// blob of that value — so a runner requiring `required-pool=test` has to name
+/// the same object the ArgTree does, not the string.
+fn blob_oid(value: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", value.len()).as_bytes());
+    hasher.update(value.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Parse `CAOS_RUNNER_REQUIRE` — `name=value` pairs, whitespace or comma
+/// separated — into the required set. A pair with no `=`, or an empty name, is
+/// dropped with a warning rather than failing the process: a runner that starts
+/// and matches nothing is far easier to diagnose than one that does not start.
+fn required_args(spec: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for pair in spec.split([' ', '\t', '\n', ',']).filter(|s| !s.is_empty()) {
+        match pair.split_once('=') {
+            Some((name, value)) if !name.is_empty() => {
+                out.insert(name.to_string(), blob_oid(value));
+            }
+            _ => eprintln!("caos-runnerd: ignoring malformed CAOS_RUNNER_REQUIRE entry {pair:?}"),
+        }
+    }
+    out
+}
+
+/// One long-poll. `Some(job)` to run; `None` on idle/evicted.
 fn poll(config: &Config) -> Result<Option<Job>, String> {
     let body = serde_json::json!({
-        "required": {},
+        "required": config.required,
         "lineage": [],
         "ttl_ms": POLL_TTL.as_millis() as u64,
     });

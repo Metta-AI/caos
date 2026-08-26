@@ -236,12 +236,33 @@ fn new_nonce(id: u64) -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Does `required` match a job with `arg_entries`? Every required (name, oid)
-/// must equal the job's entry of that name — pure oid equality.
+/// Does `required` match a job with `arg_entries`? The rendezvous is SYMMETRIC,
+/// and both halves are pure oid equality:
+///
+/// * every (name, oid) the RUNNER requires must equal the job's entry of that
+///   name — the runner saying which jobs it will accept;
+/// * every job entry named with [`caos_world::REQUIRED_ARG_PREFIX`] must equal
+///   the runner's required entry of that name — the JOB saying which runners it
+///   will accept.
+///
+/// The second half is what makes a dedicated pool possible. The generic pool
+/// requires nothing, so the first half alone matches it against everything,
+/// including work that wanted a specific pool; a `required*` arg excludes it,
+/// because it advertises no entry of that name. Nothing here knows what any
+/// particular pool is FOR — `required-pool=test` is just a name both sides
+/// happen to agree on.
+///
+/// A job whose pool is absent therefore matches nothing and fails at its
+/// pending deadline. That is the intended failure: leaking onto the general
+/// pool is precisely what it asked not to do.
 fn matches(required: &ArgTree, arg_entries: &ArgTree) -> bool {
     required
         .iter()
         .all(|(name, oid)| arg_entries.get(name) == Some(oid))
+        && arg_entries
+            .iter()
+            .filter(|(name, _)| name.starts_with(caos_world::REQUIRED_ARG_PREFIX))
+            .all(|(name, oid)| required.get(name) == Some(oid))
 }
 
 /// Why a seeded job is unanswerable, if that is PROVABLE right now.
@@ -935,5 +956,35 @@ mod tests {
         let near = args(&[("base", "sent"), ("in", "aaa"), ("worker1", "w")]);
         let why = disagreeing_seeder(&job, [&far, &near].into_iter()).expect("a verdict");
         assert!(!why.contains("worker1"), "{why}");
+    }
+
+    /// A job that names a pool is invisible to the generic runner, which is the
+    /// whole mechanism: without it, capping the general pool deadlocks the
+    /// moment every slot holds a test waiting on a child.
+    #[test]
+    fn a_pool_arg_excludes_the_generic_runner_and_admits_only_that_pool() {
+        let oid = |s: &str| s.repeat(40 / s.len());
+        let generic = ArgTree::new();
+        let test_pool = ArgTree::from([("required-pool".to_string(), oid("a"))]);
+
+        let ordinary = ArgTree::from([("base".to_string(), oid("b"))]);
+        let pooled = ArgTree::from([
+            ("base".to_string(), oid("b")),
+            ("required-pool".to_string(), oid("a")),
+        ]);
+
+        // The generic runner takes ordinary work and nothing that named a pool.
+        assert!(matches(&generic, &ordinary));
+        assert!(!matches(&generic, &pooled));
+        // The test pool takes its own work and nothing else — so it never
+        // steals capacity from the general pool either.
+        assert!(matches(&test_pool, &pooled));
+        assert!(!matches(&test_pool, &ordinary));
+        // A pool arg whose VALUE differs is a different pool, not a wildcard.
+        let other = ArgTree::from([
+            ("base".to_string(), oid("b")),
+            ("required-pool".to_string(), oid("c")),
+        ]);
+        assert!(!matches(&test_pool, &other));
     }
 }

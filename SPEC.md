@@ -289,6 +289,11 @@ The build and tools are:
 - `caos-tools/build <tree-oid>`: `run-in-test-container  --tree=<treeoid> --command="nix build"`
 - `caos-tools/test <tree-oid>`: `run-in-test-container --tree=<treeoid> --command="nix build && .../caosd up && .../caos-cli run dev/run-tests"`
 
+Some tests need to remain running/block while their child workers run. (Examples: anything that calls `caos-cli run`, and anything that needs to start a daemon that a worker talks to.) By default, this could easily deadlock given limited worker slots (this is why we use run-then instead of run inside workers). We avoid this with a separate worker pool for tests:
+- dev/stack-up starts a second runner, matching on --required-pool=test
+- The server requires an exact match on any args starting with `required`, so the default pool will not match tests
+- dev/run-test passes `--required-pool=test` when running a test
+
 There should be exactly one copy of the code that starts a stack and builds the built-ins
 
 # Misc

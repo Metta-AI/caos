@@ -114,7 +114,22 @@ launch)
   # `cli` and `test-salt` ride on this image, curried by the fan-out. They are
   # the only things a test does not declare for itself, because they are
   # properties of the RUN rather than of any tree.
-  bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt)
+  #
+  # `--required-pool=test` PUTS THE TEST IN ITS OWN RUNNER POOL (SPEC, "Misc").
+  # Some tests have to stay running while a worker they started runs — a client
+  # test blocking on `caos-cli run`, or one hosting a stub HTTP server that
+  # llm-step calls back into. On one pool that is hold-and-wait: every slot can
+  # end up holding a test that is waiting for a child that can never be
+  # scheduled. So tests run in a small dedicated pool and their children draw
+  # from the general one, which is what makes the general pool safe to shrink.
+  #
+  # BOUND HERE, ON THE TEST'S OWN ARGTREE, and deliberately not forwarded. A
+  # test's sub-runs and later stages are formed by the test itself and carry no
+  # `required-pool`, so they are dispatched normally — that separation IS the
+  # mechanism, and forwarding it in some future `next()` would quietly restore
+  # the deadlock.
+  bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt
+        --required-pool=test)
   req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
     || fail "binding this run's arguments onto the test"
 

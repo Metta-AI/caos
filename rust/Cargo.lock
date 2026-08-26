@@ -1620,6 +1620,7 @@ dependencies = [
  "caos-world",
  "minreq",
  "serde_json",
+ "sha1",
 ]
 
 [[package]]

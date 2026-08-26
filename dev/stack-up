@@ -165,6 +165,19 @@ fi
 # severed and serve runs with none of it. Not a parse error, so `bash -n` passes
 # and it surfaces as a stack dying at bring-up over a variable that is right
 # there in the source (CLAUDE.md).
+# TWO POOLS, and the split is what lets either be small. Some tests must stay
+# running while a worker they started runs — a client test blocking on
+# `caos-cli run`, or one hosting a stub server llm-step calls back into — so on
+# a single pool they are hold-and-wait: every slot ends up holding a test that
+# is waiting for a child that can never be scheduled. That is why the general
+# pool used to be 128, which is not capacity, it is headroom bought to avoid a
+# deadlock.
+#
+# `dev/run-test` binds `--required-pool=test` on each test and the server's
+# rendezvous keeps the general pool away from any job naming a pool, so
+# CAOS_TEST_RUNNER_SLOTS is exactly "how many tests run at once" and nothing
+# else competes for it. With holders bounded, the general pool only ever holds
+# work that runs to completion, so 48 is a real number rather than a cushion.
 phase "starting serve"
 ready=$state/stack.ready
 rm -f "$ready"
@@ -181,7 +194,9 @@ CAOS_STACK_REGISTRY=no \
 CAOS_STACK_RUNNERD=yes \
 CAOS_STACK_SEEDER=yes \
 CAOS_CACHE_NAMESPACE="$namespace" \
-CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-128}" \
+CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-48}" \
+CAOS_STACK_TEST_RUNNERD=yes \
+CAOS_TEST_RUNNER_SLOTS="${CAOS_TEST_RUNNER_SLOTS:-8}" \
 CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
 CAOS_DOCKER_BIN=podman \
 CAOS_DOCKER_ARGS="--root $engine_store/store --runroot $engine_store/run" \
