@@ -8,7 +8,7 @@
 # now injected by caos-tools/test, which grants std/llm-call a mock key on the
 # dev stack for the whole suite.
 #
-# `--llm-call:@=DEEP-DEPS/llm-call` and `--stub:@=DEEP-DEPS/llm-stub --relay:@=relay.sh` hand this
+# `--llm-call:@=DEEP-DEPS/llm-call` and `--stub:@=DEEP-DEPS/llm-stub --relay:@=DEEP-DEPS/llm-test/relay.sh` hand this
 # worker the BUILT artifacts: naming a dependency with `:@=` EVALUATES it, so a
 # worker never has to (its caos has eval-path-then and no eval-path).
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --llm-call:@=DEEP-DEPS/llm-call --stub:@=DEEP-DEPS/llm-stub --relay:@=relay.sh
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --llm-call:@=DEEP-DEPS/llm-call --stub:@=DEEP-DEPS/llm-stub --relay:@=DEEP-DEPS/llm-test/relay.sh

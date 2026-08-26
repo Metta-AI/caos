@@ -8,3 +8,4 @@
 ../../std/llm-stub llm-stub
 ../../std/cargo cargo
 ../../std/flake-builder flake-builder
+../../std/llm-test llm-test

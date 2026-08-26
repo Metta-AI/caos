@@ -142,9 +142,21 @@ mkdir -p .caos-secrets
   printf 'value=mock-key-for-the-llm-call-stub\n'
   printf 'entropy=fedcba9876543210fedcba9876543210\n'
   printf 'reader=std/llm-call\n'
-} > .caos-secrets/llm-call-mock
-chmod 600 .caos-secrets/llm-call-mock
-echo "==> granting std/llm-call a mock key on the dev stack" >&2
+  printf 'reader=std/llm-step\n'
+  # AND THE TEST IMAGE ITSELF, which is what lets a worker test form a request
+  # that can be granted anything. `caos prepare-request` in a worker folds NO
+  # `secret-hash` (it has no store), and the server fail-closes without it — so
+  # a request a test forms is refused, and one the server folds the entry into
+  # has a hash the test cannot predict. Since all three readers here share one
+  # name and one entropy, they imply the SAME digest: a test running in
+  # dev/worker-test carries that entry in its own ArgTree and can bind it onto
+  # the request it forms, which then matches what llm-step is dispatched as.
+  # That is why llm-step's admission protocol — which requires naming the exact
+  # request hash in advance — works from a worker at all.
+  printf 'reader=dev/worker-test\n'
+} > .caos-secrets/llm-mock
+chmod 600 .caos-secrets/llm-mock
+echo "==> granting llm-call, llm-step and dev/worker-test a mock key" >&2
 
 # THE REPORT IS A VALUE, red or green. SPEC is explicit that a tool's expected
 # failures are results the model can read, and a failing suite is the single
