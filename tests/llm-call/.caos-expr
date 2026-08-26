@@ -1,19 +1,14 @@
 # tests/llm-call, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
-# directory yields the test's ARG TREE, which dev/run-test then runs. Pure
-# evaluation, so a broken expression is told apart from a failing assertion and
-# the request has a name before it is dispatched.
+# directory yields the test's ARG TREE, which dev/run-test then runs.
 #
-# A CLIENT TEST — it drives `caos-cli`, so its base is `DEEP-DEPS/cli-test`
-# (dev/cli-test), the image that stages a git worktree and then runs `worker1`.
-# DEPping on `lib` is the greppable marker of which tests are client tests.
+# A WORKER TEST, of a worker. Nothing here was ever about the client: the
+# subject is the HTTP request std/llm-call builds and the text it extracts from
+# the reply, and the stub is the mock that observes both. The client was
+# carried for one reason — a secret store is built client-side — and that is
+# now injected by caos-tools/test, which grants std/llm-call a mock key on the
+# dev stack for the whole suite.
 #
-#   --test  this directory itself, staged into the repo as ./test with its
-#           DEEP-DEPS alongside. `--test:@=.` is inert by construction:
-#           `strip_caos_expr` removes this file from the tree before the
-#           expression is evaluated against it, so nothing recurses.
-#
-# NOTHING HERE NAMES WHAT ONLY THE RUN KNOWS. The client under test, the salt,
-# and a workspace or api key are PASSED when dev/run-test calls this ArgTree —
-# so every path above exists in this directory, which is the whole point of an
-# expression being readable on its own.
-curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
+# `--llm-call:@=DEEP-DEPS/llm-call` and `--stub:@=DEEP-DEPS/llm-stub --relay:@=relay.sh` hand this
+# worker the BUILT artifacts: naming a dependency with `:@=` EVALUATES it, so a
+# worker never has to (its caos has eval-path-then and no eval-path).
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --llm-call:@=DEEP-DEPS/llm-call --stub:@=DEEP-DEPS/llm-stub --relay:@=relay.sh

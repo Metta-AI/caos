@@ -114,6 +114,38 @@ if [ -e /secret/anthropic-api-key ]; then
   echo "==> granting tests/chat-online the anthropic key on the dev stack" >&2
 fi
 
+# A MOCK KEY FOR std/llm-call, unconditionally — and it is not a secret: the
+# value is a constant, and the only thing that ever sees it is a stub HTTP
+# server the test starts in its own container.
+#
+# WHY IT IS INJECTED HERE. A secret store is built by a CLIENT from its own
+# `.caos-secrets`, so a test that needs one used to have to BE a client — which
+# is the only reason tests/llm-call staged a repo and drove caos-cli, to test a
+# worker. Written here instead, the suite's own run carries it, and the server
+# grants it to any job whose ArgTree is a superset of the reader's. So the test
+# forms an llm-call request directly and the key arrives at /secret.
+#
+# A SECOND FILE, not a second `reader=` line on the one above. Both grants use
+# the name `anthropic-api-key` (llm-call reads exactly that path) but must carry
+# DIFFERENT VALUES: adding `reader=std/llm-call` to chat-online's file would POST
+# the caller's real key to a stub, which then writes it to a request-N.json the
+# test greps. The store is a list, matched per-reader and deduped by name, so two
+# entries sharing a name are fine as long as no job matches both — and none can:
+# a tests/chat-online job does not run the llm-call image.
+#
+# The entropy differs from chat-online's for the same reason it exists at all:
+# it is the cache-isolation tag, and two values under one name must not share a
+# cache key.
+mkdir -p .caos-secrets
+{
+  printf 'name=anthropic-api-key\n'
+  printf 'value=mock-key-for-the-llm-call-stub\n'
+  printf 'entropy=fedcba9876543210fedcba9876543210\n'
+  printf 'reader=std/llm-call\n'
+} > .caos-secrets/llm-call-mock
+chmod 600 .caos-secrets/llm-call-mock
+echo "==> granting std/llm-call a mock key on the dev stack" >&2
+
 # THE REPORT IS A VALUE, red or green. SPEC is explicit that a tool's expected
 # failures are results the model can read, and a failing suite is the single
 # most expected failure this tool has. Only the harness breaking is an error.
