@@ -12,21 +12,25 @@
 #
 # HOW THE SECOND CLAIM IS OBSERVED, given there is deliberately no caller to ask.
 # The delayed job's result content is unique to this run, so its git oid is
-# unique too — and that oid is PREDICTED here, from the bytes, then probed for
-# with `caos get-hash` until the server has it. Predicted rather than looked up
-# because every way of asking caos for the oid (`put`, a run) would either store
-# the object or join the request, and either would make the probe answer yes for
-# the wrong reason.
+# unique too — and that oid is PREDICTED here, from the bytes, then looked up
+# with `caos get-hash`. Predicted rather than obtained, because every way of
+# asking caos for the oid (`put`, a run) would either store the object or join
+# the request, and either would make the lookup answer yes for the wrong reason.
 #
 # THE OID IS COMPUTED WITH sha1sum, not `git hash-object`: std/bash has no git.
 # A git blob's id is sha1 of `blob <byte-count>\0` followed by the content, and
 # spelling that out is a fair thing for a test about object addressability to do.
 #
-# THIS STAGE HOLDS A RUNNER SLOT WHILE IT POLLS, and needs the delayed job to get
-# one concurrently — one spare slot, no more. (The client version held a slot too:
-# the container polling was itself a job on this stack.)
+# NO STAGE HERE WAITS ON ANOTHER JOB — which an earlier version of this file got
+# wrong, polling `caos get-hash` in a loop until the result appeared. That is
+# hold-and-wait: a container occupying a runner slot while the job it needs is
+# queued for one, which is exactly what design/map-then.md's "this cannot
+# deadlock" argument rules out. The one thing this test genuinely needs is for
+# TIME to pass with nothing observing, so the delay is a job of its own
+# (settle.sh): it depends on nothing, always finishes, always frees its slot,
+# and its `then` looks exactly once.
 #
-# FOUR STAGES: no run can be waited on, so each assertion is the `then` of the
+# FIVE STAGES: no run can be waited on, so each assertion is the `then` of the
 # dispatch it is about.
 set -euo pipefail
 
@@ -37,7 +41,7 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
   --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
   --self:@=/cas/args/self --delayed:@=/cas/args/delayed \
-  --launch:@=/cas/args/launch "$@"; }
+  --launch:@=/cas/args/launch --settle:@=/cas/args/settle "$@"; }
 
 # The image this test is running in, by oid — what a fixture runs in too.
 BASH=$(caos hash /cas/args/base)
@@ -89,15 +93,31 @@ dispatched)
     || fail "launcher dispatched the wrong request: $(result_text)"
   echo "  launcher dispatched $qd and exited" >&2
 
-  # Nothing is waiting for $qd now — the launcher's container is gone and this
-  # job never asked for its result. Only the disconnected request can make this
-  # oid addressable.
-  found=0
-  for _ in $(seq 1 150); do
-    if caos get-hash "$oid" /cas/probe 2>/dev/null; then found=1; break; fi
-    sleep 0.1
-  done
-  [ "$found" -eq 1 ] || fail "dispatched request $qd never stored its result ($oid)"
+  # LETTING TIME PASS WITH NOTHING OBSERVING, which is the claim. The delayed
+  # job sleeps 2s and nobody is waiting for it: the launcher's container is
+  # gone, and this job must not wait either — a worker that blocks on another
+  # job holds a runner slot while the job it needs is queued for one, which is
+  # the hold-and-wait design/map-then.md's deadlock argument rules out.
+  #
+  # So the delay is its OWN job. settle.sh depends on nothing, always finishes
+  # and always frees its slot, so no number of them can deadlock a suite — and
+  # its `then` looks exactly once. `--marker` keys it to this run; a cached
+  # sleep would return instantly and prove nothing.
+  caos run-request-then \
+    "$(caos prepare-request --base:hash="$BASH" --worker1:@=/cas/args/settle \
+       --seconds=8 --marker="$oid")" \
+    --then:hash="$(next settled --qd="$qd" --oid="$oid" \
+      --content="$(cat /cas/args/content)")"
+  ;;
+
+settled)
+  caos get /cas/args/qd; caos get /cas/args/oid; caos get /cas/args/content
+  qd=$(cat /cas/args/qd); oid=$(cat /cas/args/oid)
+  # ONE LOOK, no loop: the sleeper has finished, so the dispatched job has had
+  # its 2 seconds several times over. Only the disconnected request can make
+  # this oid addressable, and nothing ever asked it for a result.
+  caos get-hash "$oid" /cas/probe \
+    || fail "dispatched request $qd never stored its result ($oid)"
   [ "$(cat /cas/probe)" = "$(cat /cas/args/content)" ] \
     || fail "background result contents were wrong: $(cat /cas/probe)"
   echo "  ok: result became addressable with no caller waiting for it" >&2

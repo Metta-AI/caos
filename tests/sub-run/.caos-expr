@@ -6,4 +6,4 @@
 # The client did two things neither of which was under test: it curried and ran
 # them, which a worker does with prepare-request/run-request-then, and it polled
 # the server for an object, which `caos get-hash` does.
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --self:@=self.sh --delayed:@=delayed.sh --launch:@=launch.sh
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --self:@=self.sh --delayed:@=delayed.sh --launch:@=launch.sh --settle:@=settle.sh
