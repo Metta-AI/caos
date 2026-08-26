@@ -99,8 +99,17 @@ Every script here runs with it, and two constructs quietly break under it.
   running and have a secret-bearing job dispatched sends the `run-then` ONE JOB
   DOWN. `sub-run` carries the grant list into that relay (`start_sub_run`
   clones `secrets`), the relay's `run-then` folds the hash, and the caller stays
-  alive. `tests/llm-call/relay.sh` is that relay, and it exists because the test
+  alive. `std/llm-test/relay.sh` is that relay, and it exists because the test
   is hosting the stub server the call has to reach.
+  **The relay is not enough when the CALLEE checks its own request hash.**
+  llm-step's admission protocol requires the conversation ref to name the exact
+  ArgTree before the run starts, and a relay's `run-then` produces one nobody
+  can predict. The way out is that `secret-hash` is a pure function of the
+  matched grants' `(name, entropy)` pairs — so granting the SAME key under the
+  SAME entropy to the caller's image as well puts that identical digest in the
+  caller's own ArgTree, at `/cas/args/secret-hash`, where it can be bound onto
+  the request it forms. `caos-tools/test` grants `dev/worker-test` for exactly
+  this, and `std/llm-test/worker-common.sh` binds it.
 
 # Git
 
@@ -226,6 +235,34 @@ are the kind of thing that is invisible until 29 clients arrive at once.
     `../../dev/cli-test`, whose `/worker` stages the repo and then runs `worker1`.
     Grep `DEPS` for `cli-test` to see which tests are client tests. A worker test
     names `std/bash` and never pays for a repo.
+  - **THREE BASE IMAGES, and picking the smallest is most of a test's cost.**
+    `std/bash` for a worker test; **`dev/worker-test`** when it needs `git` (or
+    sed/awk/curl/tar) but no client; `dev/cli-test` only when the CLIENT is the
+    subject. The gap is not the tools — worker-test and cli-test carry the same
+    ones — it is that cli-test must `cp -rL` the test's whole `DEEP-DEPS` into a
+    worktree, which means copying BUILT IMAGES out of read-only CAS. That copy is
+    most of the difference between a 50-second client test and a 1-second worker
+    test; converting 17 of them took the salted suite's client tests from 29 to 11.
+  - **What actually needs a client** is a short list: `caos status` and
+    `talk`/`chat` and `secrets` have no worker equivalent, and `:@=` ingestion,
+    `eval-path`'s own verb, the world guard and the client push/pack path are
+    themselves the subject. Everything else has one — `run` is
+    `run-then`/`run-request-then`, `eval-path` is `eval-path-then`, `get` is
+    `get`/`get-hash`, and `git` is only ever needed for REFS.
+  - **A stub server pins the test to ONE container**, so it cannot stage-split.
+    A worker may not block on a run and a `run-then` continuation exits — killing
+    the stub before the model is called — so the turn is `sub-run` and the test
+    WAITS ON AN OBSERVABLE: the conversation ref (`std/llm-test/worker-common.sh`),
+    or a result oid it can predict (`tests/llm-call`, `tests/sub-run`). Predicting
+    one means the expected bytes must be UNIQUE PER RUN: a fixed reply hashes to a
+    fixed oid that outlives the run that stored it, and the probe then answers yes
+    on a previous run's blob — observed as llm-call passing without ever calling
+    its stub.
+  - **A worker CAN name a secret-bearing request, but only by copying its own
+    `secret-hash` across.** See the Workers section for why neither
+    `prepare-request` nor `run-then` can produce a hash the caller knows;
+    `caos-tools/test` grants the mock key to `dev/worker-test` under the same
+    entropy so the digest matches, and `worker-common.sh` binds it.
 - **A CURRY NODE IS AN ARGTREE, and an ArgTree is what runs.** SPEC is explicit
   ("we generally talk about ArgTrees, not images; an image is just one arg"), so
   `run-then --run:hash=<curried ArgTree>` is how a staged worker calls one: the
