@@ -13,14 +13,17 @@
 #   and `wait_turn` watches the CONVERSATION REF, which is the same thing the
 #   client was watching.
 #
-#   THE SECRET COMES THROUGH A RELAY.  A request a worker forms itself can never
-#   be granted a secret: `caos prepare-request` passes an empty store, and the
-#   server fail-closes when a job's ArgTree lacks the matching `secret-hash`.
-#   Only `run_image` — the dispatch behind `run-then` — folds that in, and it
-#   recomputes it against the callee's own args. So the run-then happens one job
-#   down, in relay.sh, which `sub-run` carries the grant list into. The key
-#   itself is a MOCK, granted to std/llm-step and std/llm-call for the whole
-#   suite by caos-tools/test.
+#   THE SECRET-HASH IS COPIED ACROSS.  `caos prepare-request` in a worker folds
+#   no `secret-hash` (it has no store), and the server fail-closes when a job's
+#   ArgTree lacks the digest its matched grants imply — so a request a worker
+#   forms is refused. Having the server fold one in instead (`run_image`, behind
+#   `run-then`) does not help either: llm-step's admission protocol requires the
+#   conversation to name the EXACT request hash before the run starts, and that
+#   hash would then be unpredictable. What resolves it is that caos-tools/test
+#   grants the same MOCK key, under the SAME entropy, to std/llm-step,
+#   std/llm-call AND dev/worker-test — so this job's own `secret-hash` entry
+#   holds the very digest llm-step's job implies, and `dispatch_turn` binds it
+#   onto the request it forms.
 #
 #   COMMITS ARE MINTED, NOT COMMITTED.  `caos put` publishes a tree and
 #   `caos put-commit` mints a commit from raw bytes; there is no worktree and
@@ -155,11 +158,11 @@ new_llm_conversation() { # <suffix> <port> <tree-oid> [system-text]
 }
 
 # Publish a human turn and the admission event the worker expects, then dispatch
-# the request. Sets `request` and `admitted`. The conversation ref is left at
-# `admitted`, which is what wait_turn watches for movement from.
+# the request. Sets `human`, `request` and `admitted`; the conversation ref is
+# left at `admitted`, and wait_turn takes it from there.
 dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
   local tree=$1 message=$2 parent=${3:-$base}
-  local human
+  # `human` is a global: tests assert the turn descends from it.
   human=$(mint_commit /cas/human "$tree" \
     "{\"base\":\"$parent\",\"author\":\"user\",\"content\":\"$message\"}" "$parent")
   # `--secret-hash` BOUND BY HAND, and it is what makes this work at all.
