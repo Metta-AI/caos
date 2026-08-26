@@ -1,64 +1,111 @@
-#!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE the dev stack (dev/cli-test stages the repo, then runs this).
+#!/bin/bash
+# tests/sub-run — a WORKER test: no client, no repo.
 #
-# The worker schedules its own in-flight ArgTree. If sub-run waited for the
-# result, the request would deadlock on itself. The server instead admits it
-# under the current stack, where the recursive edge fails independently.
+# `sub-run` dispatches a request and returns immediately. Two claims:
+#
+#   * A worker may sub-run its OWN in-flight ArgTree. A blocking implementation
+#     would wait on itself and deadlock; the server admits the request under the
+#     current stack instead, where the recursive edge fails independently.
+#   * Work dispatched that way finishes AFTER ITS CALLER EXITS. The launcher
+#     container is gone by the time the delayed job completes, so nothing is
+#     waiting for it — and it must still store its result.
+#
+# HOW THE SECOND CLAIM IS OBSERVED, given there is deliberately no caller to ask.
+# The delayed job's result content is unique to this run, so its git oid is
+# unique too — and that oid is PREDICTED here, from the bytes, then probed for
+# with `caos get-hash` until the server has it. Predicted rather than looked up
+# because every way of asking caos for the oid (`put`, a run) would either store
+# the object or join the request, and either would make the probe answer yes for
+# the wrong reason.
+#
+# THE OID IS COMPUTED WITH sha1sum, not `git hash-object`: std/bash has no git.
+# A git blob's id is sha1 of `blob <byte-count>\0` followed by the content, and
+# spelling that out is a fair thing for a test about object addressability to do.
+#
+# THIS STAGE HOLDS A RUNNER SLOT WHILE IT POLLS, and needs the delayed job to get
+# one concurrently — one spare slot, no more. (The client version held a slot too:
+# the container polling was itself a job on this stack.)
+#
+# FOUR STAGES: no run can be waited on, so each assertion is the `then` of the
+# dispatch it is about.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-object_status() { # <oid>
-  curl -sS -o /dev/null -w '%{http_code}' -I "$CAOS_SERVER_URL/object/$1"
-}
 
-echo "== sub-run dispatches an in-flight request without waiting ==" >&2
-self=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/self.sh)
-reply=$("$CAOS_CLI" run --base:hash="$self")
+stage=start
+if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
+next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
+  --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
+  --self:@=/cas/args/self --delayed:@=/cas/args/delayed \
+  --launch:@=/cas/args/launch "$@"; }
 
-q=${reply#request }
-if [ "$q" = "$reply" ] || [ "${#q}" -ne 40 ] || [[ ! "$q" =~ ^[0-9a-f]+$ ]]; then
-  fail "expected 'request <40-character Q>', got: $reply"
-fi
+# The image this test is running in, by oid — what a fixture runs in too.
+BASH=$(caos hash /cas/args/base)
+result_text() { caos get /cas/args/result >/dev/null; cat /cas/args/result; }
 
-echo "  ok: the worker continued after dispatching the request" >&2
+case "$stage" in
 
-echo "== dispatched work finishes after its caller exits ==" >&2
-delayed=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash --worker1:@=test/delayed.sh)
-payload="background-finished-$(date +%s%N)-$$-$RANDOM"
-expected_content="completed: $payload"
-expected_oid=$(printf '%s\n' "$expected_content" | git hash-object --stdin)
-q=$("$CAOS_CLI" prepare-request --base:hash="$delayed" --payload="$payload")
-[ "${#q}" -eq 40 ] && [[ "$q" =~ ^[0-9a-f]+$ ]] \
-  || fail "prepare-request returned malformed Q: $q"
+start)
+  echo "== sub-run dispatches an in-flight request without waiting ==" >&2
+  # self.sh hashes its own /cas/args and sub-runs THAT. `run-request-then` runs
+  # the ArgTree unmodified, so the hash self.sh computes is the request it is
+  # already running as — the self-reference the claim is about.
+  req=$(caos prepare-request --base:hash="$BASH" --worker1:@=/cas/args/self) \
+    || fail "forming the self-referential request"
+  caos run-request-then "$req" --then:hash="$(next selfed)"
+  ;;
 
-launcher=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash \
-  --worker1:@=test/launch.sh --request="$q")
-dispatched=$("$CAOS_CLI" run --base:hash="$launcher")
-[ "$dispatched" = "request $q" ] \
-  || fail "launcher dispatched the wrong request: $dispatched"
-
-# There is no blocking caller for Q here: the launcher container is already gone.
-# The result content is unique to this run, so only the disconnected request
-# can make its known object id addressable through the core object API.
-complete=0
-for _ in $(seq 1 150); do
-  status=""
-  if ! status=$(object_status "$expected_oid"); then
-    fail "server unreachable while waiting for dispatched request $q"
+selfed)
+  reply=$(result_text)
+  q=${reply#request }
+  if [ "$q" = "$reply" ] || [ "${#q}" -ne 40 ]; then
+    fail "expected 'request <40-character Q>', got: $reply"
   fi
-  case "$status" in
-    200) complete=1; break ;;
-    404) ;;
-    *) fail "server returned HTTP $status while waiting for dispatched request $q" ;;
-  esac
-  sleep 0.1
-done
-[ "$complete" -eq 1 ] || fail "dispatched request $q never stored its result"
+  case "$q" in *[!0-9a-f]*) fail "Q is not a hex oid: $q" ;; esac
+  echo "  ok: the worker continued after dispatching the request ($q)" >&2
 
-"$CAOS_CLI" run actual --base:hash="$q" >/dev/null
-[ "$(cat actual)" = "$expected_content" ] \
-  || fail "background result contents were wrong: $(cat actual)"
-echo "  ok: result became addressable with no foreground Q caller" >&2
+  echo "== dispatched work finishes after its caller exits ==" >&2
+  # Unique to THIS run, so the object it hashes to cannot already exist —
+  # otherwise the probe below would pass on a previous run's leftovers.
+  caos get /cas/args/test-salt
+  payload="background-finished-$(date +%s%N)-$$-$RANDOM-$(cat /cas/args/test-salt)"
+  content="completed: $payload"
+  # A git blob's id: sha1 over `blob <n>\0<content>`, n counting the newline.
+  oid=$({ printf 'blob %d\000' "$((${#content} + 1))"; printf '%s\n' "$content"; } \
+    | sha1sum | cut -d' ' -f1)
 
-echo "sub-run: ALL PASS" >&2
+  qd=$(caos prepare-request --base:hash="$BASH" --worker1:@=/cas/args/delayed \
+    --payload="$payload") || fail "preparing the delayed request"
+  launcher=$(caos prepare-request --base:hash="$BASH" \
+    --worker1:@=/cas/args/launch --request="$qd") || fail "preparing the launcher"
+  caos run-request-then "$launcher" \
+    --then:hash="$(next dispatched --qd="$qd" --oid="$oid" --content="$content")"
+  ;;
+
+dispatched)
+  caos get /cas/args/qd; caos get /cas/args/oid; caos get /cas/args/content
+  qd=$(cat /cas/args/qd); oid=$(cat /cas/args/oid)
+  [ "$(result_text)" = "request $qd" ] \
+    || fail "launcher dispatched the wrong request: $(result_text)"
+  echo "  launcher dispatched $qd and exited" >&2
+
+  # Nothing is waiting for $qd now — the launcher's container is gone and this
+  # job never asked for its result. Only the disconnected request can make this
+  # oid addressable.
+  found=0
+  for _ in $(seq 1 150); do
+    if caos get-hash "$oid" /cas/probe 2>/dev/null; then found=1; break; fi
+    sleep 0.1
+  done
+  [ "$found" -eq 1 ] || fail "dispatched request $qd never stored its result ($oid)"
+  [ "$(cat /cas/probe)" = "$(cat /cas/args/content)" ] \
+    || fail "background result contents were wrong: $(cat /cas/probe)"
+  echo "  ok: result became addressable with no caller waiting for it" >&2
+
+  printf 'sub-run: ALL PASS\n' > /tmp/report
+  cat /tmp/report >&2
+  caos put /tmp/report /cas/out
+  ;;
+
+*) fail "unknown --stage: $stage" ;;
+esac
