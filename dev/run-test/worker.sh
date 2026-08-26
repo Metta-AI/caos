@@ -40,9 +40,22 @@ set -euo pipefail
 
 fail() { echo "RUN-TEST FAIL: $*" >&2; exit 1; }
 
-# Write the report's {verdict, seconds, output} and finish. `--start` is stamped
-# at `eval` and carried, so `seconds` is WALL time across the test's whole
-# chain — which is what "which test is the long pole" wants to mean.
+# Write the report's {verdict, seconds, output} and finish.
+#
+# `--start` IS RE-STAMPED AT `launch`, so `seconds` excludes the queueing of the
+# `eval` and `launch` stages. It used to be stamped at `eval` and carried, which
+# was right while every per-test job ran the moment it was queued.
+#
+# IT IS STILL NOT THE TEST'S OWN RUNTIME, and the report should not be read as
+# if it were. Now that tests run in a bounded pool, this number includes the
+# test's wait for a slot, and there is nowhere to stamp past that: the next
+# thing to execute is the test's own worker, which is arbitrary. Measured at 8
+# slots over 46 tests: stamping at `eval` gave 83-95s, stamping here gives
+# 64-78s, and the real work spans 1s to 70s — so the spread is dominated by
+# waiting either way. What this number now answers is "how long did this test
+# take to get through the suite", not "how expensive is this test". The latter
+# needs the runner's own start note out of the trace, which the verdict stage
+# does not read.
 publish() { # <verdict-line> <output-file>
   caos get /cas/args/start || fail "reading --start"
   mkdir -p /tmp/out
@@ -64,6 +77,7 @@ eval)
   # later stage reads has to be re-bound by name.
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage=launch --cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt \
+    --required-pool=test \
     "--start=$(date +%s)") || fail "currying the launch stage"
   caos eval-path-then /cas/args/in --eval=. --then:hash="$next" --catch
   ;;
@@ -123,11 +137,19 @@ launch)
   # scheduled. So tests run in a small dedicated pool and their children draw
   # from the general one, which is what makes the general pool safe to shrink.
   #
-  # BOUND HERE, ON THE TEST'S OWN ARGTREE, and deliberately not forwarded. A
-  # test's sub-runs and later stages are formed by the test itself and carry no
-  # `required-pool`, so they are dispatched normally — that separation IS the
-  # mechanism, and forwarding it in some future `next()` would quietly restore
-  # the deadlock.
+  # EVERY JOB OF THIS TEST CARRIES IT — the map image (dev/run-tests), so `eval`
+  # does; forwarded to `launch` and `verdict`; and bound here onto the test's own
+  # ArgTree. So CAOS_TEST_RUNNER_SLOTS really is "how many tests are in flight",
+  # which is the number anyone will check. With it on the test job alone, a
+  # `caos-cli status` showed 15 test names running at 8 slots — every one of them
+  # an `eval` on the general pool, and the reading was fair: the number named
+  # after tests was not bounding tests.
+  #
+  # WHAT MUST NOT CARRY IT is anything the test SPAWNS. A test's sub-runs are
+  # formed by the test itself and carry no `required-pool`, so they draw from the
+  # general pool — that separation IS the mechanism. Forward it into a test's own
+  # `next()` and a test holding a slot would be waiting for a child that needs
+  # the same pool, which is the deadlock this exists to prevent.
   bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt
         --required-pool=test)
   req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
@@ -137,7 +159,8 @@ launch)
   # anything wanting to watch or re-run this one test must name.
   echo "run-test: arg tree $req" >&2
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
-    --stage=verdict "--start=$(cat /cas/args/start)") || fail "currying the verdict stage"
+    --stage=verdict --required-pool=test "--start=$(date +%s)") \
+    || fail "currying the verdict stage"
   caos run-then /cas/args/in --run:hash="$req" --then:hash="$next" --catch
   ;;
 

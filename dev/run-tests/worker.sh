@@ -123,7 +123,7 @@ fanout)
     salt=$(cat /cas/args/test-salt)
   fi
   map=$(caos curry --base:@=/cas/args/runner \
-    "--cli:@=/cas/args/cli" "--test-salt=$salt") \
+    "--cli:@=/cas/args/cli" "--test-salt=$salt" --required-pool=test) \
     || fail "currying the per-test image"
 
   only=""

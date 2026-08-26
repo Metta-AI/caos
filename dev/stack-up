@@ -175,9 +175,10 @@ fi
 #
 # `dev/run-test` binds `--required-pool=test` on each test and the server's
 # rendezvous keeps the general pool away from any job naming a pool, so
-# CAOS_TEST_RUNNER_SLOTS is exactly "how many tests run at once" and nothing
-# else competes for it. With holders bounded, the general pool only ever holds
-# work that runs to completion, so 48 is a real number rather than a cushion.
+# CAOS_TEST_RUNNER_SLOTS is "how many tests are in flight": every job of a test
+# — eval, launch, the test, verdict — carries the arg, while everything a test
+# SPAWNS does not. With holders bounded, the general pool only ever holds work
+# that runs to completion, so 48 is a real number rather than a cushion.
 phase "starting serve"
 ready=$state/stack.ready
 rm -f "$ready"
