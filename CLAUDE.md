@@ -85,6 +85,23 @@ Every script here runs with it, and two constructs quietly break under it.
   fails instead of being fetched (`tests/lint/lint-bake-anchor.sh`). That is the build
   refusing to reach out, not the container being unable to.
 
+- **A request a worker forms itself can NEVER be granted a secret.**
+  `caos_prepare_request` passes an EMPTY store, so its ArgTree carries no
+  `secret-hash`, and the server fail-closes: `secrets::grant` refuses injection
+  unless the tree already carries the hash its matched grants imply. The only
+  thing that folds that entry in server-side is `run_image` — the dispatch
+  behind `run-then`/`map-then`, which recomputes it against the callee's OWN
+  args (not inherited: "a sub-worker is entitled by matching its own arg tree").
+  So `prepare-request` + `sub-run`, or + `run-request-then`, both reach the
+  worker with nothing at `/secret`, and the callee dies saying the secret is
+  missing while the grant sits right there in the store.
+  The consequence is a shape, not a workaround: a worker that must both keep
+  running and have a secret-bearing job dispatched sends the `run-then` ONE JOB
+  DOWN. `sub-run` carries the grant list into that relay (`start_sub_run`
+  clones `secrets`), the relay's `run-then` folds the hash, and the caller stays
+  alive. `tests/llm-call/relay.sh` is that relay, and it exists because the test
+  is hosting the stub server the call has to reach.
+
 # Git
 
 - **A `git fetch` can fail over an object it never asked for.** The post-fetch
@@ -234,6 +251,11 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   naming a path the test's `.caos-expr` does bind. Name a test's input anything
   else (`tests/run-then` uses `--num`); fixtures the test itself dispatches read
   `/cas/args/in` normally, since their own `run-then` is what binds it.
+  The flip side is useful: **`/cas/args/in` IS the test's own deepened tree**, so
+  `/cas/args/in/DEEP-DEPS/<name>` reaches a dependency WITHOUT binding it. That
+  is the only way to reach an EVALUABLE dep unevaluated — `tests/lint` needs
+  `std/*/Cargo.toml`, and `--std:@=DEEP-DEPS/std` would build every std entry to
+  read them, because `:@=` evaluates anything carrying a `.caos-expr`.
 - **`/cas/args/base` is the IMAGE, not this job's ArgTree.** A later stage must
   re-bind by name whatever it reads. `--test-salt` has to ride in EVERY stage for
   that reason: bound only at the top, a fresh `--test-salt` re-runs the first
