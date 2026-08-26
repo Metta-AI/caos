@@ -18,6 +18,42 @@
 #     locator resolved to content and nothing was rebuilt;
 #   - a pin that DRIFTS from flake.lock is refused — the `nix flake update`
 #     without regenerating case, which is the whole reason for the check.
+#
+# ---- why this test MUST go through $CAOS_CLI (the tested client) --------------
+# The loader is not a script you can run against a directory the way std-lint
+# runs its lint scripts. It is a caos worker whose whole existence is a step in
+# the tested client's evaluation pipeline, and the properties above are only
+# real when that pipeline drives it. Three of them are behaviour OF the tested
+# client, not of the tool, and there is no other way to observe them:
+#
+#   - `:@@=` LOCATOR RESOLUTION happens in the client, before a request exists.
+#     The consumer's `.caos-expr` names `--input-tree:@@=git+file://…?rev=…&dir=std`;
+#     it is the tested CLI's `eval-path`/ingest that fetches that locator and
+#     turns it into an oid so the ArgTree carries content, never a URL. The
+#     "mount is the input repo's own tree oid" assertion PINS exactly that: only
+#     because the client resolved the locator to the repo's own subtree does the
+#     mounted oid equal `rev-parse $SHA:std`. Run the tool by hand and there is
+#     no locator resolution to check.
+#
+#   - `--expr=$CAOS_EXPR` and the strip-self rule are the evaluator's contract.
+#     The loader reads the directive it is interpreting only because the tested
+#     evaluator hands over the blob AND evaluates the directory MINUS its own
+#     `.caos-expr`. The "siblings survived; the directive did not" assertion is
+#     verifying that evaluator behaviour end-to-end — flake.lock and sibling.txt
+#     present in the result, `.caos-expr` absent — which can only be seen in a
+#     tree the client actually evaluated and we `get` back.
+#
+#   - the DRIFT REFUSAL must surface as an eval-path failure. The check the tool
+#     performs is only meaningful when it aborts a real evaluation the client
+#     asked for; the test drives `eval-path pkg-drift` and reads the client's
+#     non-zero exit and error text. That is the client-facing behaviour a
+#     consumer would hit, and it is what we pin.
+#
+# So `$CAOS_CLI eval-path` and `$CAOS_CLI get` are essential, not incidental:
+# they exercise the tested client's locator resolution, `$CAOS_EXPR` handoff and
+# job-driving against the inner stack — the very machinery that makes the loader
+# usable. A bash reimplementation would test a copy of splice()/check_expr() and
+# prove nothing about the client that ships them.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

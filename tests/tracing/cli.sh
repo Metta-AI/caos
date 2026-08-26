@@ -6,6 +6,32 @@
 # Exercises tracing (SPEC.md "Tracing"): the server's per-ArgTree trace record
 # and the `/status` view over it.
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI).
+# Tracing has no existence apart from the client that surfaces it. The subject
+# is a PAIR — the server RECORDS a per-ArgTree trace, and the client RENDERS a
+# live view over it — and the only way to observe the recording is the client's
+# own `status`. There is no file to lint, no artifact left behind: a completed
+# run is deliberately absent from `/status` (see below), so the trace exists
+# ONLY as something the client can read back WHILE work is in flight. Reaching
+# past the CLI to poke the server directly would test a different, undefined
+# surface and would not pin down what a real user sees.
+#
+# Every step here is a link in that one chain, and each is a tested-client
+# subcommand whose behaviour IS the property under test:
+#   - `prepare-request` computes the ArgTree hash the trace is keyed under —
+#     the test's promise that the client and server agree on that identity
+#     BEFORE dispatch, so the thing polled is the thing that will run.
+#   - `run` drives a REAL computation (a slow fan-out) through the client into
+#     the inner stack; nothing is recorded until this client asks for the work.
+#   - `status` is the live view itself: node presence, the named child fan-out,
+#     admission times, the out-trace edge, and the "no current work" states
+#     both before and after — all are assertions about the CLIENT'S rendering.
+#   - `get` reads the parent's /cas/out-trace back, closing the loop from a
+#     node the client showed to the perf blob it points at.
+# The client is essential, not incidental: swap it out and there is nothing
+# left to test. Hence, too, the care below — a background run and a poll — to
+# catch the trace in the only window the client can render it.
+#
 # It has to assert while the run is STILL GOING. `/status` is the live view —
 # a node whose work is wholly finished is skipped — so a completed run renders
 # as `null`, and a test that only looked afterwards would pass against a server

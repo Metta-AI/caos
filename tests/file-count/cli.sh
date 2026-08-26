@@ -3,6 +3,40 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# -----------------------------------------------------------
+# This test's subject is NOT a static artifact a script could inspect on disk —
+# it is a live recursive computation that only exists while it runs, and the
+# ONLY way to make it run is to drive the tested client against the inner
+# server. Nothing here can be shortcut with plain bash (contrast tests/std-lint,
+# which reads checked-in files): the property under test is a behaviour of the
+# CLI+server round-trip itself.
+#
+# What it pins down, and why the CLI is essential to each:
+#
+#   * curry + run round-trip. `$CAOS_CLI curry` builds the runner-pool base and
+#     `$CAOS_CLI run` submits the request; the client walks the arg tree's git
+#     closure and pushes it (via the seed alternate — see run-test.sh) so the
+#     server can resolve it. A test that bypassed the client would never
+#     exercise that closure-push / resolve path, which is exactly the client's
+#     job.
+#
+#   * The map-then PROMISE PIPELINE. file-count on a tree does not return a
+#     number; it records a continuation {in, map: file-count, then: file-count}
+#     and exits. The SERVER fans out over the children in parallel, then calls
+#     the ArgTree back with their results to sum them. That recursion is
+#     server-resolved — it happens only because a `run` was submitted through
+#     the client and the server drove the continuations. There is no on-disk
+#     value to assert against; the "5" only comes into being by running it.
+#
+#   * LAZINESS / placeholder args. The worker reads `--in`/`--children` as
+#     placeholders and only `caos get`s the bytes it needs — behaviour that is
+#     meaningful only when a real client/server materialize args on demand.
+#
+# So the CLI here is essential, not incidental: it IS the thing that turns a
+# fixture tree into a computed count. Asserting `tree -> 5` and `file -> 1` is
+# asserting that the tested client can drive a real recursive job to completion.
+#
 # Exercises the file-count worker: a file counts as 1, a tree recurses over its
 # children through server-resolved map-then continuations (with itself on both
 # sides) and sums the counts — so it totals a tree's leaf files, exercising the

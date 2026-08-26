@@ -4,6 +4,24 @@
 #
 # A CLIENT MUST BE ABLE TO PUSH A REQUEST IT IS ABLE TO FORM.
 #
+# WHY THIS TEST GOES THROUGH THE TESTED CLIENT ($CAOS_CLI), essentially and not
+# incidentally: the subject IS the tested client's push path. `caos-cli run`
+# forms an ArgTree, walks its closure and negotiates a `git push` with the
+# server; that walk — and the negative-tip / closure-reachability logic it
+# leans on — lives ENTIRELY in the client binary compiled from the tree under
+# test. There is no way to observe it except by driving that binary: reproducing
+# the bug with git plumbing or a hand-rolled pack would exercise stock git, not
+# the client's own decision about which objects it must include and which it may
+# treat as already-present on the remote. `eval-path` and `run` here are the
+# client's real resolve/ingest/push code — the exact code this test pins — so
+# the CLI is the instrument, not a convenience wrapper around some other check.
+# The property pinned is a behavioural guarantee of that client: when a client
+# holds a resolved image's ROOT hash but none of its interior (the everyday
+# state of a host repo, which fetches objects one at a time and never an image's
+# whole closure), a request naming that image as its base must still push and
+# run. Verify it any other way and you would be testing something that is not
+# the client. Hence $CAOS_CLI, not bash.
+#
 # An ArgTree references its base image as a real tree entry
 # (`base_arg_entry`), so `git push` must walk that image's whole closure to
 # build a pack. But the client only ever holds the image's ROOT tree —

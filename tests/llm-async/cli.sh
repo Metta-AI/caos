@@ -2,6 +2,34 @@
 # Durable independent work through llm-step: the primary turn queues a request
 # and becomes idle, completion appends later, and the following turn receives a
 # deterministic completion notice.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The subject here IS the tested client's async lifecycle — behaviour that only
+# exists when a real turn runs through this build against the inner stack. There
+# is no artifact to inspect statically; the property is the sequence of commits
+# the client PRODUCES, so every hinge below must be driven by $CAOS_CLI:
+#
+#  * `prepare-request` is the client resolving an arg tree (the independent
+#    subrequest, and each turn's request) into a content-addressed request oid.
+#    We assert those oids and later match them in the model's transcript — the
+#    round-trip is only meaningful because the tested build minted them.
+#  * `run` is the client EXECUTING a turn against the inner server + runnerd:
+#    calling the `run_async` tool, registering exactly one pending task, then
+#    terminating the primary turn as `idle` rather than blocking on the worker.
+#    "Becomes idle while independent work is outstanding" is a client control-
+#    flow property; nothing but the tested client can exhibit or violate it.
+#  * The completion that appends AFTER the turn (a new commit whose parent is
+#    the idle head, whose tree is unchanged, carrying the task's result oid) is
+#    the client's async machinery landing durable work back on the conversation.
+#  * The SECOND `run` proves the client feeds that completion forward: the next
+#    turn's model step must observe the deterministic "Independent task … is
+#    complete" notice. That the notice reaches the model, verbatim, is the whole
+#    point — and it only reaches it because the tested client assembled it.
+#
+# Verifying any of this with plain tooling (unlike tests/std-lint, which lints
+# static files) would mean reimplementing the client's request/run protocol.
+# The CLI is essential, not incidental: it is the thing under test.
 set -euo pipefail
 # The dependency is mounted only inside the test wrapper and exports globals.
 # shellcheck disable=SC1091

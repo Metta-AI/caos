@@ -1,7 +1,30 @@
 #!/usr/bin/env bash
-# Inline file tools through the real chat/llm-step path. Five calls share one
-# model response and no compute sub-run; mixed queues and grep are independent
-# sibling tests rather than later turns in this conversation.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI):
+#
+# The subject here IS the tested client's `chat` subcommand — specifically its
+# inline file-tool loop, which lives nowhere else. When a scripted model turn
+# returns a `tool_use` block, it is the CLIENT that must:
+#   - dispatch each call to the built-in file tools (write/read/edit/ls),
+#   - APPLY those tools to the conversation turn's git tree (we assert the turn
+#     tree ends with `goodbye world` and keeps the untouched sibling file),
+#   - emit the per-tool progress lines it prints to the user,
+#   - marshal every result back as a `tool_result` in the NEXT model request —
+#     the exact byte-level payloads (`wrote … (11 bytes)`, `edited … (1
+#     replacement)`, the ls listing, the read content), AND mark a failed edit
+#     with `"is_error":true` plus the `old_string not found` explanation,
+#   - and do all of that within ONE extra model round (request-3 must not exist).
+#
+# Every one of those properties is a behaviour of the client binary compiled
+# from the tree under test: the model is stubbed, the tools run in-process, and
+# the only way to observe the loop — the tree it writes, the lines it prints,
+# and the request it sends back — is to let a real `chat` invocation execute it.
+# There is no host-side script that reproduces this; a different client build
+# would answer differently, which is exactly the property we pin down. Hence the
+# test drives $CAOS_CLI directly rather than exercising the subject some other
+# way (contrast tests/std-lint, whose subject is inert scripts).
+#
+# Five calls share one model response and no compute sub-run; mixed queues and
+# grep are independent sibling tests rather than later turns in this conversation.
 set -euo pipefail
 # The dependency is mounted only inside the test wrapper and exports globals.
 # shellcheck disable=SC1091

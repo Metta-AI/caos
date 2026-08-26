@@ -3,6 +3,43 @@
 # replay, workspace mutation, and interjections on both sides of dispatch. The
 # independent-work, subagent, and Escape paths live in sibling tests so these
 # otherwise serial scenarios can fan out.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI):
+# The subject here IS the tested client's turn-advancement path — `caos-cli
+# prepare-request` and `caos-cli run` — not something a script could recompute
+# on the side. Every property this test pins down exists only as an effect of
+# running that exact code against the live inner stack:
+#
+#   - prepare-request is the code under test. It walks the user head over the
+#     llm base into a request object; the returned hash and its closure are the
+#     client's own output, and asserting on them (assert_oid, the queued/running
+#     admission events built on $request1/$request2) is asserting on the client.
+#
+#   - run is the turn engine under test. The durable event spine this test
+#     verifies (assert_event_spine, the "running"/"idle" status events, the
+#     recorded response/calls/tool_result records, the epoch-date guard) is not
+#     an input we stage — it is precisely what `run` writes to the conversation
+#     ref as it drives the turn. Recomputing it without the client would be
+#     re-implementing the feature the test exists to protect.
+#
+#   - run's tool dispatch really executes. `echo hi > out.txt` and the failing
+#     `exit 3` command run through the tested bash tool inside the inner stack;
+#     the canonical head's tree (out.txt == hi, the untouched notes subtree,
+#     the toolless second turn leaving the tree unchanged) is the workspace the
+#     CLI committed. Only a real computation driven by the client produces it.
+#
+#   - the model replay (stub/request-*.json) is the client's own wire output:
+#     verbatim assistant turns, ordered tool_result blocks, and — critically —
+#     the interjection semantics that are the point of the terminal-race
+#     scenario. That a pre-start interjection is replayed, a racing one lands in
+#     the REPLACEMENT call while the stale in-flight response is discarded, is a
+#     concurrency contract of `run` observable ONLY by watching what the tested
+#     client sends and which response it makes canonical.
+#
+# So the CLI is essential, not incidental: strip it out and there is no subject
+# left to test. (Contrast tests/std-lint, whose subject — checked-in std copies,
+# the flake src filter — is verifiable by running the lint scripts directly,
+# never touching $CAOS_CLI.)
 set -euo pipefail
 # The dependency is mounted only inside the test wrapper and exports globals.
 # shellcheck disable=SC1091

@@ -3,6 +3,42 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The SUBJECT here is not "does cargo compile these crates" — that could be
+# checked with a bare `cargo check`. The subject is the per-crate DECOMPOSITION
+# worker-cargo performs (mode=all, design/cargo-workers.md phase 2): the way
+# the runner splits a workspace into one job PER CRATE, wires each crate's job
+# to its dependencies' jobs, propagates a dependency's failure to its dependent
+# AS A VALUE, and CACHES each crate's job independently by content.
+#
+# That decomposition exists ONLY inside the inner stack. It is produced by the
+# tree-under-test's runner/interpreter when a `run` is submitted, executed by
+# the inner runnerd, and memoised in the inner server's registry. There is no
+# artifact on disk a plain `bash`/`cargo` invocation could inspect to see it:
+# running `cargo check --workspace` locally would compile the same crates but
+# reveal NOTHING about job granularity, value-vs-error propagation, or per-crate
+# cache keys. The only way to observe any of it is to drive a real computation
+# through the tested client against the inner stack and read back the results it
+# returns — which is exactly what `$CAOS_CLI run … --mode=all` does here.
+#
+# So the CLI is ESSENTIAL, not incidental: each assertion below reads a fact
+# that is only true of a run routed through the tested client —
+#   * clean check/test:   the workspace decomposes into crate jobs that succeed
+#                         and b's unit test actually runs (r1, r2);
+#   * dep propagation:    a broken *dep* (a) surfaces in its DEPENDENT's section
+#                         with a's diagnostics — the failure crossed the job
+#                         boundary as a value, and b was never compiled against
+#                         a broken a (r3);
+#   * per-crate caching:  after a fix, editing only b re-runs b's jobs while a's
+#                         are cache hits, and an identical tree replays the
+#                         cached value (r4-r6).
+# None of these are properties of cargo; all are properties of how the tested
+# client and the inner stack decompose, propagate, and cache the run. A version
+# that shelled out to `cargo` directly would still be green on a client that had
+# BROKEN every one of these behaviours — so bypassing $CAOS_CLI would gut the
+# test.
+#
 # Exercises the per-crate decomposition (worker-cargo mode=all,
 # design/cargo-workers.md phase 2) on a two-crate workspace, b -> a:
 # a passing check/test; a broken *dep* (a) whose failure propagates to its

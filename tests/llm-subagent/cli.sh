@@ -1,4 +1,36 @@
 #!/usr/bin/env bash
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ==========================================================
+# The subject here is subagent SPAWNING, and spawning is a behaviour that
+# lives ENTIRELY inside the tested client's turn machinery. There is no ref to
+# read, no file to lint, no static artifact that "contains" a subagent: a child
+# conversation only comes into existence when the tested client actually RUNS a
+# turn, sees the model emit a `spawn_agent` tool call, and executes it against
+# the inner stack. So the property can only be pinned down by driving a real
+# computation through $CAOS_CLI:
+#
+#   * `$CAOS_CLI prepare-request` turns a user commit into the request object
+#     the server admits — the exact ingestion/closure path a real client takes.
+#   * `$CAOS_CLI run` executes the parent turn, and it is the tested client's
+#     own handling of the `spawn_agent` tool that (a) mints the child's stable
+#     agent id, (b) publishes the child as a durable conversation with its own
+#     canonical head/title refs, (c) seeds the child with a CLEAN workspace
+#     snapshot (no inherited .caos harness state) and the human owner's index
+#     entry, and (d) records the parent lineage (conversation/request/call).
+#
+# Every assertion below reads back state that ONLY the tested client produces:
+# the recorded spawn_agent result, the child's async completion, its canonical
+# head equalling that result, its owner-index and title refs, the inherited
+# `notes/todo.txt`, the absence of `.caos`, and the parent-lineage fields on the
+# child's root. A stub or a direct check could fake the model's reply, but it
+# could not exercise the client code that TURNS that reply into a durable child
+# — which is the whole subject. The CLI is therefore essential, not incidental:
+# swap it out and there is nothing left to test.
+#
+# (The stub only stands in for the Anthropic API; the spawning logic under test
+# is all in the binary compiled from the tree — see tests/lib/run-test.sh on why
+# `caos-cli` on PATH must be the one every test command goes through.)
+#
 # Subagents are ordinary durable conversations: spawning returns stable
 # identifiers, and the child inherits a clean workspace and human owner.
 set -euo pipefail

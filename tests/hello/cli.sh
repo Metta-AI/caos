@@ -7,6 +7,33 @@
 # command, answer on stdout, no output path, no checkout, nothing to go looking
 # for. If the result ever became a tree, `run` would refuse to stream it and the
 # entry would stop being a smoke test — that is the regression this catches.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI), NOT AROUND IT.
+# Every assertion below is a claim about `caos-cli run` ITSELF — the behaviour of
+# the compiled client under test as it drives a real computation against the
+# inner stack — not about `std/hello`'s source, which is trivial. There is no
+# way to observe any of these properties without the tested client, because each
+# one is produced BY it, on the wire, in the moment it runs:
+#   - "answer on stdout, no output path": `run` decides a scalar result streams
+#     and a tree result does not. That is a client rendering choice, invisible
+#     to anyone who reads hello's tree — only the tested `run` can be caught
+#     printing (or refusing to print) it.
+#   - argument mirroring / self-reference suppression: which entries of the
+#     ArgTree the client SHOWS the caller (literals) and which it hides
+#     (reserved `base`/`salt`/`secret-hash`, and the curried `workerN` binary)
+#     is logic in the client's arg-report path — the regression it caught (a
+#     5 MB `worker1 = blob …`) was the client over-fetching to describe itself.
+#   - tree summarization: `run` must report a tree arg as `tree <oid>` — the
+#     hash the cache keyed on — WITHOUT walking it. Whether it summarizes or
+#     descends is the client's decision, testable only by running it.
+#   - base-path resolution through an EVALUATED ancestor: `--base:@=outer/tool`
+#     resolves by descending from the workspace root through every `.caos-expr`,
+#     reaching an entry that exists in no on-disk directory. Only the tested
+#     client's resolver can prove it takes that path and not the old
+#     ingest-the-named-dir shortcut.
+# So the CLI is ESSENTIAL, not incidental: swap it for direct inspection of the
+# subject and the test would assert nothing about the thing it exists to guard —
+# the client's own `run` semantics against a live inner stack.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

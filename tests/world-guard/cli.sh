@@ -12,9 +12,27 @@
 #
 # `host` is not an arbitrary string here: it is exactly what every host-built
 # binary stamps on its requests, so sending it reproduces the real crossing.
-# The stack under test is `test`, which this script deliberately does not
-# hardcode — the suite passing at all is the proof that a client's own world
-# is accepted.
+# The negative cases below therefore use `curl` on purpose — to FORGE a foreign
+# world the tested client would never send, you must NOT go through the tested
+# client. That is the rejection half of the guard.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI).
+# The acceptance half is the half that cannot be faked. The property this test
+# pins down is not "the server accepts the literal string `test`" — it is "the
+# server accepts the world THE TESTED CLIENT ACTUALLY STAMPS on its requests,
+# and that world is this stack's". curl could only assert about a hardcoded
+# string, and a hardcoded string is exactly the failure mode this whole guard
+# exists to catch: a host binary (or a stale literal) sails through green while
+# the code under test is a different world entirely. So the positive case is
+# driven by $CAOS_CLI itself — a real `run` that pushes an arg-tree closure,
+# schedules a worker on the inner runnerd, and reads the result back, every hop
+# carrying the client's own world stamp. If the tree under test ever changes
+# the client's world (the one mismatch that is otherwise SILENT — see above),
+# THIS assertion is the one that goes red, because the real client, not a
+# stand-in, has to be accepted by the real server. The stack under test is
+# `test`, which this script deliberately never hardcodes: the CLI supplying its
+# own world, and the suite passing at all, is the proof that a client's own
+# world is accepted. The CLI is essential to that proof, not incidental.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -50,8 +68,11 @@ done
 echo "  ok: all removed ref APIs return 404" >&2
 
 echo "== the tested client still works against its own stack ==" >&2
-# The positive case, through the real client rather than curl: if the guard
-# rejected same-world traffic, this would fail.
+# The positive case, and the reason this test drives $CAOS_CLI rather than curl:
+# only the real client emits the world value the tree under test compiled in.
+# A real `run` — push closure, schedule a worker, read the result — is accepted
+# end to end iff the tested client's own world matches the stack's. If the guard
+# rejected same-world traffic, or the tree bumped the client's world, this fails.
 echo hello > file.txt
 "$CAOS_CLI" run out --base:@=DEEP-DEPS/bash --worker1:@=test/worker.sh >/dev/null
 [ "$(cat out)" = "world-guard ok" ] || fail "same-world job did not run: $(cat out)"

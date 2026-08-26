@@ -1,6 +1,45 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack (tests/lib/run-test.sh).
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The subject here is a client behaviour that has no existence outside the
+# client: the EXACT-REQUEST continuation form of `run-request-then` and the
+# `curry`/`run` pipeline that produces the request it continues. There is no
+# static artefact to lint and no server endpoint to poke directly — the
+# property only appears when a real ArgTree is curried, recorded, and re-run
+# against a live inner stack. So $CAOS_CLI is essential, not incidental: it is
+# the very thing under test, and every command below drives it deliberately.
+#
+# Concretely, the client alone owns the invariants this test pins down:
+#
+#   * IDENTITY. `run` on a curried base must reproduce the SAME 40-char ArgTree
+#     hash the request had when built — the client must forward R by its exact
+#     hash, not rebuild a near-equivalent request around its image. Only the
+#     client computes and forwards that identity; the server just runs what it
+#     is handed.
+#
+#   * then WITHOUT a synthetic --in. When an exact request has a `--then`
+#     callback, the client must deliver ONLY the request's result as --result
+#     (or its failure as --error), never a fabricated --in. That argument-
+#     shaping is the client's job; the callbacks assert on exactly the arg set
+#     the client produced.
+#
+#   * VALIDATION BEFORE A PROMISE. Malformed hashes, `--catch` without
+#     `--then`, and unsupported `--run` must be refused by the client up front,
+#     before any promise is recorded. This is client-side argument parsing;
+#     nothing but the tested client exercises it.
+#
+#   * FAILURE PROPAGATION AND catch. An exact request's failure must propagate
+#     by default (surfacing the worker's exit status) and, with `--catch`, be
+#     delivered to the callback as --error. This routing is decided by the
+#     client as it continues the request.
+#
+# A host-side or server-only reconstruction could not observe any of these:
+# they are precisely the client's decisions about how a continuation is
+# constructed, validated, and delivered. Hence $CAOS_CLI must be the one client
+# every command below goes through.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

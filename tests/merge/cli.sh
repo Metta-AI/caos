@@ -6,8 +6,32 @@
 # resolution"), the way tests/rgrep drives the fold before any chat wiring:
 # build two commits with plain git, merge them through the worker, and assert
 # the two-parent result commit — a conflicted merge (inline markers +
-# .caos/conflicts) and a clean one. The git-bearing worker fetches both commit
-# closures from the server's own transport, so this also exercises that path.
+# .caos/conflicts) and a clean one.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI), not just verify
+# a merge some other way:
+#
+# The subject IS the std/merge worker, and a worker is not a library call or a
+# checked-in artifact — it is a flake computation (std/merge is a `.caos-expr`
+# plus a `worker` binary) that only ever exists as a JOB RUN against a server.
+# There is no in-process entry point to call and no static output to lint; the
+# merged commit M does not exist until the worker runs and produces it. The
+# only way to make that happen is `caos-cli run --base:@=DEEP-DEPS/merge ...`,
+# so the CLI is the essential and only path to the thing under test, not an
+# incidental convenience — dropping it would leave nothing to assert against.
+#
+# Going through the client also pins the client-side half of a real merge
+# invocation, on THIS build (the tested client, distinct in general from the
+# host's — see run-test.sh): `caos-cli run` INGESTS the DEEP-DEPS/merge base
+# and evaluates its expr, WALKS the arg tree's closure and PUSHES it to the
+# inner server over git transport — here the closures of both input commits,
+# `ours` and `theirs` — LAUNCHES the git-bearing worker, and STREAMS the result
+# commit back as raw bytes (which is why run_merge hashes stdin and fetches M's
+# closure). Every one of those steps is client behaviour a plain-git merge
+# would never exercise. The worker in turn fetches both commit closures from
+# the server's own transport, so this covers that path too, and the two
+# identical runs assert the run is a content-addressed cache hit — a property
+# that is only meaningful when a real client submits a real run.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

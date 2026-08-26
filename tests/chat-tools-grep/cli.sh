@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
-# Grep's llm-step integration: root and subtree dispatch plus invalid-pattern
-# preflight. Purpose-built files replace two unrelated prior chat turns.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+#
+# The subject here is the tested client's OWN chat tool-use loop, specifically
+# how `$CAOS_CLI chat` dispatches the built-in `grep` tool. That behavior lives
+# entirely inside the client and cannot be observed except by driving it:
+#
+#   * The stub is a dumb model — it just replays scripted tool_use blocks and a
+#     final text turn. It never runs grep. Everything between "model asked for
+#     grep" and "model was handed the matches" is the CLIENT: it parses the
+#     tool_use, RESOLVES the request against the inner stack (root vs. a `path`-
+#     scoped subtree), runs the search, and packs the result back into the next
+#     request to the model. request-2.json is the client's work made visible.
+#
+#   * The progress lines this test pins ("grep hello", "grep goodbye notes")
+#     are emitted by the client's own tool_call_summary (caos-cli src/lib.rs),
+#     so asserting on them pins the client's rendering of a tool call, not the
+#     stub's.
+#
+#   * The invalid-pattern case ("(") pins the client's PREFLIGHT: a bad regex
+#     must come back as an is_error tool_result carrying "invalid pattern" —
+#     the client catching the error and reporting it to the model — rather than
+#     aborting the turn or reaching a third model round. Only the real client
+#     decides that; no direct grep invocation would reproduce the loop's
+#     is_error contract.
+#
+# So the CLI is essential, not incidental: root dispatch, subtree (path-scoped)
+# dispatch, and invalid-pattern handling are properties of the tested chat
+# client itself, verifiable only by making a real chat turn go through it.
 set -euo pipefail
 # The dependency is mounted only inside the test wrapper and exports globals.
 # shellcheck disable=SC1091

@@ -12,6 +12,35 @@
 # other blocking a server thread. Covered: a `run`-valued expression evaluated
 # server-side matches the client's result hash, and `--catch` turns a broken
 # eval into a value the `then` receives.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI) — the CLI is not
+# incidental scaffolding here, it is LITERALLY BOTH OPERANDS OF THE EQUALITY
+# this test asserts, and neither operand exists outside the tested client
+# driving the inner stack:
+#
+#   * The REFERENCE side is `$CAOS_CLI eval-path pkg` — the client walking the
+#     `.caos-expr` at top level (blocking on its sub-run), producing the
+#     "correct" object hash. There is no other honest source for that hash:
+#     it is by definition what the tested client's eval walk yields, computed
+#     against THIS stack's CAS and runner. Precomputing or hand-asserting a
+#     hash would test a constant, not the client's evaluator.
+#   * The SUBJECT side is `$CAOS_CLI run …` dispatching a worker that calls
+#     `caos eval-path-then` — driving the SERVER's copy of the same walk on a
+#     request thread, dispatching its own sub-run through the inner runner.
+#     Server-side evaluation is only reachable by asking a real inner stack to
+#     do it, and the only way to ask is to record a job through the tested
+#     client. `--catch` likewise is a server-side codepath: it can only be
+#     observed by what the `then` combiner receives back from a real eval.
+#
+# So the property pinned down — that the server's evaluation continuation and
+# the client's blocking eval are the SAME computation (crate `caos-eval`,
+# differing only in where they block) and therefore agree byte-for-byte — is a
+# round-trip whose two halves are both produced by the tested client against a
+# live inner stack. Nothing here can be checked "directly": there is no
+# artifact to lint, no script to run against $CAOS_PROJECT; the subject is the
+# runtime equality of two dynamic evaluations that only the CLI can elicit, and
+# comparing them out-of-band would defeat the point (both hashes must come from
+# the SAME build of `caos-eval` reached two ways). The CLI is essential.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

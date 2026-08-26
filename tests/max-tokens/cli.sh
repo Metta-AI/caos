@@ -9,6 +9,28 @@
 # stub through TWO truncations before an end_turn and asserts (a) the turn
 # advanced, (b) its message is the concatenation of all three partials, and
 # (c) each continuation request replayed the running prefill verbatim.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI).
+# The continuation loop IS the subject, and it lives entirely inside the
+# tested client's `run` turn logic — nowhere else. The llm-stub only replays
+# canned JSON (a max_tokens body, another, then an end_turn); it has no notion
+# of "resume", no prefill, no accumulation. Every property this test pins down
+# is a decision the tested client makes while executing a turn against the
+# inner stack:
+#   - `run` must RECOGNISE stop_reason "max_tokens" as continue-not-terminate,
+#     so it must be the tested `run` that reads the stub's reply and loops;
+#   - `run` must CONSTRUCT each continuation request, re-sending the growing
+#     assistant prefill verbatim (asserted against stub/request-{2,3}.json) —
+#     a request only the client builds, invisible unless the client sends it;
+#   - `run` must FUSE the partials into the single terminal turn commit whose
+#     message is the three joined with "\n\n" (response_text's own rule),
+#     and must STOP after end_turn (no request-4.json).
+# curry/prepare-request/run are the exact seam under test: a stub replaying
+# fixed responses can prove none of this on its own — only observing what the
+# tested client does with those responses can. Substituting a hand-rolled
+# HTTP loop for $CAOS_CLI would test that substitute, not the shipping client,
+# which is precisely the behaviour a regression here would break. The CLI is
+# essential, not incidental.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

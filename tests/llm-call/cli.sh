@@ -5,6 +5,37 @@
 # Exercises the generic stateless LLM call worker against the scripted API
 # stub: caller-owned prompt/messages/config in, plain text blob out, with no
 # agent tools, thinking mode, commits, or conversation refs.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The subject here — std/llm-call — is not a script we can invoke directly:
+# it is a caos WORKER that exists only as a computation the client curries and
+# runs against the inner stack. There is no other surface. To observe it at all
+# we must drive the real round-trip through the tested client:
+#
+#   * `$CAOS_CLI get   DEEP-DEPS/llm-stub` — resolve a std entry to its built
+#      artifact through the client's ingest+evaluate path, the only way to get
+#      the stub binary the worker will talk to;
+#   * `$CAOS_CLI curry --base:@=DEEP-DEPS/llm-call` — bind the worker's config
+#      (the stub's base-url) into a call, producing a hash;
+#   * `$CAOS_CLI run --base:hash=<call> …` — hand it the caller-owned system
+#      prompt, messages and model params and let the WORKER shape and issue the
+#      HTTP request to the model, inside the stack, with the stack's secret
+#      resolution supplying the api-key.
+#
+# The CLI is ESSENTIAL, not incidental: the properties this test pins down are
+# only real when the actual worker code runs through the actual client against
+# the actual stack. It asserts, from the stub's recorded request/response, that
+# a llm-call:
+#   - returns the model's plain text blob and nothing else (statelessness);
+#   - forwards the caller's model / max_tokens / system / messages VERBATIM,
+#     as the worker serializes them — a behaviour that lives in the request the
+#     worker builds, not in anything a test could construct itself;
+#   - registers NO tools and enables NO thinking (it is the bare, generic call,
+#     distinct from the agent path); and
+#   - makes EXACTLY ONE model call (no retries, no follow-ups).
+# Every one of those is an observation of the tested client + worker doing the
+# work; short-circuiting the CLI would test a reimplementation, not llm-call.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

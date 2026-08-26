@@ -1,6 +1,47 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, inside a test stack (tests/lib/run-test.sh).
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The subject here — the `run-and-update-ref` worker (std/run-and-update-ref) —
+# has NO observable behaviour that exists off the wire. It is a two-position
+# promise worker: `start` emits `run-request-then <R>` with itself curried as
+# the callback, and `finish` makes R's result addressable, appends an async
+# status event naming that result OID to a conversation ref, and returns R's
+# result unchanged. Every property this test pins down is therefore a property
+# of a REAL computation submitted to the inner server and of the ref it mutates
+# there — not of any file we could inspect directly. Driving $CAOS_CLI is
+# essential, not incidental, because:
+#
+#   * The things under test ARE the tested client's verbs. `curry`, `run` and
+#     `prepare-request` are how a client submits an arg tree to the inner
+#     server and gets back a content-addressed identity. The image hashes, the
+#     exact subrequest identities (R), and the flat Q the worker builds only
+#     come into existence by asking THIS client to evaluate against THIS stack;
+#     there is no local computation that reproduces them.
+#
+#   * Result IDENTITY is the assertion. We prove Q hands back R's result
+#     byte-for-byte (`actual_identity == success_identity`, `diff -r`) and that
+#     the failure path yields a structured result tree carrying R's exit status.
+#     "Same content-addressed result" is only meaningful once both R and Q have
+#     been run for real through the client against the server that memoises them.
+#
+#   * The REF UPDATE is the whole point and lives only on the remote. The
+#     complete/failed events, their being based on the conversation head, the
+#     surviving workspace, and the tree-neutral status commit are read back with
+#     `git ls-remote`/`fetch` from the inner stack — state the worker produced
+#     server-side in response to a client-submitted run. No direct check can
+#     stand in for "the run appended this event to that ref".
+#
+#   * IDEMPOTENCE is a server/caching property. Replaying a completed or failed
+#     Q must NOT append a second event; that holds only because the client's
+#     request is keyed by content and the server replays the memoised result.
+#     Exercising it requires re-issuing the identical `run` through the client.
+#
+# In short: this test verifies end-to-end that a request driven through the
+# tested client produces the right result AND the right ref side effect on the
+# inner stack, idempotently. Take the CLI out and there is nothing left to test.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

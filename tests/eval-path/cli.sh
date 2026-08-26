@@ -11,6 +11,38 @@
 # files, so no new images are needed. Covered: a `run`-valued expression, the
 # `NAME=`/`$NAME` variable form (which must converge on the same result),
 # descending PAST an expression into its result, and cache-hit determinism.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI).
+# `eval-path` is not a probe wrapped around some server behaviour we could poke
+# another way — it IS a subcommand of the tested client, the client entry point
+# into `caos_eval::eval_path` (crates/caos-cli -> caos::cli_eval_path ->
+# caos_eval::eval_path). The SUBJECT here is that client-side evaluator itself:
+# how the tested build reads a `.caos-expr`, resolves its verbs (`run`/`curry`),
+# binds args, and threads the walk down the tree. There is no ambient tool, no
+# server RPC, and no shell equivalent that reproduces this resolution — the only
+# way to observe what the tested client decides is to make the tested client
+# decide it. So $CAOS_CLI is essential, not incidental: swap in the host's
+# client and you are no longer testing the tree under test.
+#
+# Concretely, each assertion pins down a property of the tested client that only
+# it can answer:
+#   - the `.caos-expr` PARSER and evaluator (verbs, args, descent) — pkg-direct;
+#   - that the variable/`curry` form and a here-string collapse to the SAME
+#     result hash the direct form yields — pkg-var, pkg-here — a determinism
+#     claim only meaningful when one client computes both hashes;
+#   - path-image resolution THROUGH a subtree's own `.caos-expr` — pkg-nested;
+#   - descending PAST an expression into what it BUILT (not the source dir) —
+#     pkg-direct/greeting;
+#   - the `:@=` rule that an arg target with a `.caos-expr` is EVALUATED while a
+#     plain directory stays raw DATA — pkg-argexpr vs pkg-argdata;
+#   - the reserved `$CAOS_EXPR` binding and the directive-stripping rule that
+#     makes it the only route to the expression's own blob — pkg-self;
+#   - error handling: a here-string rejected in image position — pkg-here-bad.
+# Verifying these also requires driving a REAL computation through the tested
+# client against the inner stack (the bash worker actually runs and its result
+# is fetched back with `$CAOS_CLI get`), because the properties are about what
+# the client resolves AND what that resolution then produces end to end — not a
+# static parse we could check offline.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

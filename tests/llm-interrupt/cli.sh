@@ -1,7 +1,30 @@
 #!/usr/bin/env bash
-# Escape is a durable event, not a client-side cancellation: an in-flight model
-# response is recorded, its pending tools are closed as errors without running,
-# and the exact request still receives an idle interrupted result.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# Interrupt handling is not a property of the server, the model, or any stub —
+# it is a property of the tested client's turn loop, and there is no other place
+# it can be observed. `$CAOS_CLI run` is what fetches the conversation, drives
+# the model round, and — crucially — reacts to an Escape event that is published
+# against the conversation ref WHILE a response is in flight. So the CLI is the
+# subject, not a convenience for reaching one: a substitute driver would be
+# testing itself, not the code under test.
+#
+# Concretely, this test pins down that Escape is a DURABLE EVENT and not a
+# client-side cancellation, and every clause of that claim is a decision made
+# only inside the tested `run`:
+#   - prepare-request/run must admit and begin the exact request ($request1),
+#     so the request identity is preserved across the interrupt;
+#   - when Escape is published mid-turn, the client must RECORD the partial,
+#     in-flight model response as a real event rather than discarding it;
+#   - it must CLOSE the response's pending tool_use as an is_error result
+#     ("interrupted before this tool ran") WITHOUT executing the tool — proven
+#     here by the `write` tool never creating interrupted.txt;
+#   - it must NOT start another model round (no request-2.json); and
+#   - it must land the conversation in a terminal idle+interrupted status.
+# None of these are visible except by running a real turn through $CAOS_CLI
+# against the inner stack and inspecting the events it commits. That is why the
+# CLI is essential here, and why this test cannot be reduced to checking the
+# subject directly.
 set -euo pipefail
 # The dependency is mounted only inside the test wrapper and exports globals.
 # shellcheck disable=SC1091

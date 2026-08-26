@@ -1,6 +1,37 @@
 #!/usr/bin/env bash
-# The merge tool through a canonical conversation. The canonical event head, rather
-# than the llm-step result object, must retain the real merge ancestry.
+# The merge tool through a canonical conversation, driven END TO END through the
+# TESTED client ($CAOS_CLI). The property this pins down: after a real merge
+# turn, the CANONICAL EVENT HEAD on the conversation ref — not the llm-step
+# result object — is what owns the merged workspace AND the real git merge
+# ancestry of the branch that was merged in.
+#
+# WHY THE TESTED CLI IS ESSENTIAL, NOT INCIDENTAL
+#
+# This subject cannot be checked by inspecting fixtures or running a script
+# against $CAOS_PROJECT (the way tests/std-lint checks a static, generatable
+# fact). Everything the assertions read into existence has to be PRODUCED by a
+# genuine computation flowing through the tested client against the inner stack:
+#
+#   - `curry` composes the llm-step base with `--merge-refs`, so the turn even
+#     KNOWS about the feature branch to merge.
+#   - `prepare-request` must mint an exact content-addressed request Q (the
+#     40-hex assertion), the identity the run and the terminal event pin to.
+#   - `run` dispatches the whole merge turn through the inner server, runnerd
+#     and redis: it must invoke the merge TOOL inside a real runner, perform an
+#     actual git merge of `feature`, and publish an event spine to the canonical
+#     conversation ref.
+#
+# The downstream assertions are precisely the things you CANNOT fabricate
+# without that real round-trip having happened: `git merge-base --is-ancestor
+# feature $head` (a true merge commit reachable from the canonical head), the
+# merged file contents, the well-formed event spine with exactly one explicit
+# base, the ordered `calls`/`result` records, the recorded merge `tool_use`/
+# `tool_use_id`, the assistant transcript, and the idle terminal event naming
+# its request. Each is an observable consequence of the tested client's
+# merge-turn machinery working correctly; drive it with anything other than the
+# tested client and you would be testing a different binary than the one under
+# test. Hence every command below goes through $CAOS_CLI, as the harness
+# (tests/lib/run-test.sh) requires.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

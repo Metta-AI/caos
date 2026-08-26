@@ -2,6 +2,22 @@
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI set,
 # INSIDE a test stack — the suite's per-test job (tests/lib/run-test.sh).
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI), NOT INCIDENTALLY:
+# `:@@=` resolution is a CLIENT CAPABILITY and lives nowhere else. Turning a
+# url+rev locator into an oid happens inside the tested client binary, at eval
+# time, BEFORE any request is formed — the server never sees a URL, and a worker
+# is forbidden to do it at all (check.sh pins that: a worker's `:@@=` is refused
+# for "CLIENT capability"). So the subject here is not something reached THROUGH
+# the client on the way to a server-side computation; the subject IS the client's
+# own resolve step. There is no script one could run "directly" to observe it —
+# unlike tests/std-lint, which shells lint scripts against $CAOS_PROJECT — because
+# the behaviour being pinned is literally what THIS build of the client does when
+# it meets a `:@@=` arg. A different client build could resolve it differently,
+# which is exactly why every command below must be the tested $CAOS_CLI: swap in
+# any other client and the test would be measuring the wrong binary. The
+# assertions even reach for the coldest possible surface — `curry`, which BUILDS
+# an ArgTree and runs no compute — so what they inspect is the resolve, not a run.
+#
 # `--name:@@=<git ref>`: a tree that lives in ANOTHER repo, pinned by a commit
 # sha (design/flake-inputs.md). The claim under test is that the locator is a
 # FETCH COORDINATE AND NOTHING ELSE — the client resolves url+rev to an oid at

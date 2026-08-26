@@ -6,6 +6,19 @@
 # Exercises CONCURRENT `ensure_pushed` (crates/caos/src/lib.rs): two clients
 # pushing the same object to one server must both succeed.
 #
+# WHY THIS TEST MUST GO THROUGH $CAOS_CLI — the tested client IS the subject.
+# The property pinned here is a behaviour of the client's push path: when two
+# instances of `ensure_pushed` plan a CREATE for the same content-addressed
+# ref, the loser must NOTICE the create precondition failed and RETRY rather
+# than die. That code lives only in the tested client, so the only way to
+# observe it is to run the tested client — concurrently, against a real server
+# — and watch what its exit codes and outputs do under the race. The CLI is
+# not a convenient driver for some other subject (a stub, a git command, a
+# server API could not stand in): the retry logic under test is precisely the
+# thing $CAOS_CLI does and nothing else does. Reimplementing the push with raw
+# `git push` would test git, not the fix; the point is that the tested client
+# survives the race that git's ref-lock refuses.
+#
 # The failure it guards is not a slow path, it is a dead one. A request's
 # objects ship under a content-addressed `refs/caos/req/<hash>`, and two
 # clients pushing the same object both read an advertisement without that ref,

@@ -3,6 +3,35 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI).
+# Its subject is not a pure function this script could recompute in bash: it is
+# the FULL ROUND-TRIP of a tree-defined agent tool through the tested client
+# into the inner stack. Everything asserted below is a behaviour that only
+# EXISTS once a real turn runs — there is no other door to the inner server
+# than the tested client (the harness contract in run-test.sh: `caos` here is
+# the tested client aimed at the inner CAOS_SERVER_URL, and driving the stack
+# any other way 404s or, worse, runs host code where the tree's code was the
+# point). Concretely the client is essential, not incidental, at every step:
+#   - `eval-path`/`curry` build the tool images and the llm-step invocation the
+#     way any consumer would — resolving deps by INGESTING the tree and
+#     EVALUATING its `.caos-expr`, which is the tested client's job;
+#   - `prepare-request` is the tested client turning a human head into the exact
+#     request Q the server will run (the 40-hex assertion pins that down);
+#   - `run` is the tested client executing the turn against the inner server,
+#     which is what makes the server DISCOVER the caos-tools/ directory tools,
+#     advertise them to the (stubbed) model, evaluate each tool's expression at
+#     invocation, curry the model's args onto the ArgTree, and launch the
+#     sub-run over the tree.
+# The properties this pins down about the tested client + inner stack — tool
+# REGISTRATION (name + doc in the request; a reserved name NOT shadowed), the
+# `@param` schema contract, same-turn DYNAMISM (a bash edit to a tool changing a
+# later call in the same queued batch), and turn RESILIENCE (a bad call and a
+# DEAD sub-run each coming back as an is_error tool_result rather than killing
+# the turn, over a preserved workspace) — are observable ONLY by scripting the
+# model and reading what a genuine client-driven turn actually sent and left.
+# A bash reimplementation would test a reimplementation, not the client, so the
+# CLI is the whole point of the test.
+#
 # Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
 # discovers them per round from the CURRENT workspace — each is a DIRECTORY
 # whose `.caos-expr` binds the javadoc `help` (description as free text,

@@ -3,14 +3,36 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
-# Exercises run-then — the single-valued map-then (the continuation
-# `{in, run?, then?, catch?}`): a plain tail call (--run only), the sub-run's
-# result threading into `then` as --result, a nested promise from the run
-# position, the client-side flag validation, run-cycle detection, and `--catch`
-# — a failing run delivered to `then` as --error instead of failing the request,
-# with the uncaught case asserted alongside it so the default cannot drift. The
-# workers are curried bash scripts (see the *.sh fixtures), so no new images
-# are needed.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# -----------------------------------------------------------
+# Its subject is run-then itself — the single-valued continuation
+# `{in, run?, then?, catch?}` (design/map-then.md) — and that subject exists
+# ONLY as behaviour of a real request evaluated by the tested client against
+# the inner server. There is no file on disk to lint and no shortcut that would
+# still be checking the thing: the properties below are what the interpreter
+# DOES when a continuation runs, so the only way to pin them down is to make the
+# tested client submit one and watch what comes back.
+#
+#   - a tail call (--run only) delivers the sub-run's value AS the request's
+#     result — a claim about how the client encodes the continuation and how the
+#     server resolves it, observable only by running it;
+#   - the sub-run's result threads into `then` as --result — a data-flow the
+#     server performs between two jobs, invisible unless a real second job sees
+#     it;
+#   - a promise returned from the run position is COLLAPSED by the server before
+#     `then` sees --result — a server-side fixpoint with no on-disk shadow;
+#   - a run-then CYCLE is detected by the SERVER (not the client), so only a
+#     real self-recursive request in flight can trip it;
+#   - --catch reroutes a failing run to `then` as --error instead of failing the
+#     request, with the uncaught default asserted right beside it so neither can
+#     silently become the other — a difference only a live failing run reveals;
+#   - even the client-side flag validation (--map/--run exclusivity, --run/--then
+#     requirements) is a property OF the tested client's own arg parser, so it is
+#     exactly $CAOS_CLI's behaviour under test.
+#
+# The CLI is therefore essential, not incidental: swap in a different client and
+# every assertion here is about a different thing. The workers are curried bash
+# scripts (see the *.sh fixtures), so no new images are needed.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

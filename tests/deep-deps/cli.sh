@@ -3,6 +3,36 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI).
+# ------------------------------------------------------------
+# deep-deps is not a script we can invoke and diff on its own: its SUBJECT is a
+# computation the tested client performs against the inner stack. Every property
+# below is a property of HOW THAT CLIENT EVALUATES, SHARES, CACHES and RESOLVES
+# content-addressed nodes — none of it is legible in source text, so there is no
+# `bash`-only path to it (contrast tests/std-lint, which only reads files):
+#
+#   - `run --base:@=DEEP-DEPS/deep-deps` ingests the fixture, resolves the
+#     deep-deps entry's `.caos-expr` to a curry node, and RUNS it on the inner
+#     stack. The deepened SHAPE we assert on is the value that evaluation emits;
+#     it exists only once the client has driven the transform end to end.
+#   - DAG SHARING (`bar` byte-identical everywhere it is reached) is a property
+#     of content-addressed evaluation — the same input tree hashing to the same
+#     node. It is observable only by materializing the client's real outputs and
+#     comparing them; a source read cannot see it.
+#   - INCREMENTAL RECOMPUTE (an unrelated edit leaves app/lib byte-identical; an
+#     edit to the shared leaf recomputes exactly what reaches it) is a claim
+#     about the client-plus-stack's content-keyed memoization across successive
+#     runs. Only re-running the client and diffing outputs can pin it.
+#   - CYCLE DETECTION happens inside the worker during ONE run — no server round
+#     trip, no run-cycle fallback (see the cycle block). It is reachable only by
+#     actually executing the deepen through the client and reading its failure.
+#   - EVAL-PATH exercises a SECOND client entrypoint: resolving a top-level
+#     `.caos-expr` and descending (`get`) into a node of the deepened result.
+#     That resolution path is precisely what the tested client is for.
+#
+# So the CLI is ESSENTIAL, not incidental: it is the thing under test, and each
+# assertion is a statement about the client's evaluation semantics.
+#
 # deep-deps (design/caos-expr.md) restructures a tree so that every directory
 # carrying a `DEPS` file gets its dependencies, recursively deepened, mounted
 # inside it under `DEEP-DEPS/`. A `DEPS` line is `<path> <name>`: the path is

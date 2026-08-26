@@ -8,6 +8,22 @@
 # workspace arrives in this test's wrapper (the pruned build tree — what
 # cargo reads), staged as $CAOS_PROJECT.
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI):
+# Unlike a literal-tree lint (tests/std-lint), this test does NOT verify a
+# file-shaped fact it could read straight off $CAOS_PROJECT. Its subject IS a
+# real computation — clippy compiling every crate of the workspace with
+# `-D warnings` — and the only thing that can DRIVE that computation is the
+# tested client. `caos-cli run` is what ingests the tree, resolves the
+# `std/cargo` worker from DEPS, dispatches the job to the inner stack's server
+# and runnerd, and streams a real cargo build in a worker. There is no
+# host-side `bash` path that reaches the inner stack; a plain `cargo clippy`
+# here would compile the HOST checkout with the host toolchain, testing neither
+# the tree under test's dispatch path nor its cargo-worker plumbing. So the CLI
+# is essential, not incidental: it is the sole conduit to the inner world, and
+# exercising `caos-cli run --base=.../cargo --mode=all` end-to-end is precisely
+# what pins down that the tested client can drive a per-crate cargo computation
+# and surface its exit code as a verdict.
+#
 # Clippy runs HERE rather than as a nix check because the suite is the only
 # runner anyone invokes: `nix flake check` has no CI behind it, and clippy had
 # no coverage at all until this. `-D warnings` is applied worker-side

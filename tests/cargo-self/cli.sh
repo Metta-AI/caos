@@ -12,6 +12,35 @@
 #
 # The workspace source is ingested from $CAOS_PROJECT via a git snapshot —
 # exactly the tree an agent's conversation would carry.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# Its subject is NOT the source tree and it is NOT cargo. The source-tree lints
+# (see tests/std-lint) verify a property you can read straight off the files, so
+# they run plain scripts against $CAOS_PROJECT and never touch $CAOS_CLI. This
+# test verifies the opposite kind of thing: the RUNTIME behaviour of caos's own
+# orchestration — content-addressed per-crate job memoization and deps-bake
+# reuse. That property only EXISTS once a real request is materialized into an
+# ArgTree, dispatched as a DAG of jobs, and its results either performed or
+# reused against a running stack. There is no on-disk artifact to inspect and no
+# way to conjure it with bash: the inner stack can only be driven through the
+# tested client, and the reuse the test pins down is produced by, and recorded
+# by, that client-plus-server round-trip.
+#
+# Concretely, all three properties below are observable ONLY through $CAOS_CLI:
+#   * `prepare-request` forms and pushes the exact ArgTree `run` will use, so its
+#     hash is known BEFORE any work runs — the handle every `status` reads back.
+#   * `run` is what actually exercises the memoization DAG: whether the baked
+#     deps are reused and whether an edit to one leaf crate leaves every other
+#     member's compile a cache hit is decided inside the tested client/server
+#     interaction, nowhere else.
+#   * `status --all` reads the completed trace's OWN answer for how many nodes
+#     were reused (SPEC, "Tracing") — the count the reuse assertions gate on.
+# Swap the client for a direct `cargo check` and the whole subject evaporates:
+# you would be testing cargo's incrementality, not caos's caching, and the
+# `reused`-job trace the assertions depend on would not exist at all. The CLI
+# here is essential, not incidental — it is the thing under test AND the only
+# instrument that can measure what the test claims.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

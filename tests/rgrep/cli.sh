@@ -3,12 +3,38 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
-# Exercises the rgrep worker directly (no LLM in the loop): a recursive grep
-# fold — one job per directory, results a SPARSE TREE (only matching files,
+# Exercises the rgrep worker (no LLM in the loop): a recursive grep fold —
+# one job per directory, results a SPARSE TREE (only matching files,
 # `linenum:line` content, child results embedded by hash). Covers the sparse
 # shape (non-matching files/dirs absent), regex matching, binary skipping,
 # the file-scoped blob result, the no-matches empty tree, and the
 # (subtree, pattern) cache: an identical second run is served from cache.
+#
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# rgrep is NOT a script this test can run on its own (contrast tests/std-lint,
+# which invokes lint bash scripts against $CAOS_PROJECT and never touches the
+# CLI). rgrep is a std WORKER expressed as a `.caos-expr` (std/rgrep, mounted
+# at DEEP-DEPS/rgrep): a promise-pipeline computation — one grep job per
+# directory, fanned out and folded back into a sparse result tree, child
+# results embedded by hash. There is no standalone entry point to call; the
+# ONLY way to evaluate it is to ingest that `.caos-expr` and drive the inner
+# stack's interpreter/runner. And inside a test stack that can happen through
+# exactly one path: the tested client. `caos-cli run --base:@=DEEP-DEPS/rgrep`
+# is what ingests the base expr and the `--in:@=` inputs, ships the request to
+# the inner server, has the runner fan out and combine the per-directory jobs,
+# and checks the result tree back out into `out/`. Every assertion below reads
+# a file the tested client MATERIALIZED from that round-trip, so the test pins
+# down properties of the tested client end-to-end: that it correctly ingests a
+# worker expr plus tree/blob inputs, faithfully drives the fold through the
+# inner stack, and reconstitutes the sparse result tree locally. Even the
+# behaviours that look like "the worker's" — sparse shaping, binary skipping,
+# the empty-tree no-match case — are only observable via what the client
+# checks out, and the cache assertion is a property of the inner stack's
+# (subtree, pattern) memoization that only repeated client runs can reveal.
+# Bypassing $CAOS_CLI (e.g. running the rgrep binary directly) would test a
+# different binary against a different world and prove nothing about the
+# tree-under-test's client or its round-trip with the stack it brought up.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

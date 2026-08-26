@@ -2,9 +2,37 @@
 # Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
 # set, INSIDE a test stack (tests/lib/run-test.sh).
 #
-# The worker schedules its own in-flight ArgTree. If sub-run waited for the
-# result, the request would deadlock on itself. The server instead admits it
-# under the current stack, where the recursive edge fails independently.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The subject here IS the sub-run dispatch path of the tested client: its
+# `curry` / `prepare-request` / `run` / `sub-run` verbs and the request-wire
+# contract they speak to the inner server. Nothing this test pins down exists
+# outside that interaction, so the CLI is essential, not incidental — a plain
+# reimplementation would exercise none of the tested code and prove nothing.
+#
+# Concretely, the two properties are only observable by driving real work
+# through the client against the inner stack:
+#
+#   1. NON-BLOCKING DISPATCH. `caos sub-run <Q>` must return `request <Q>` and
+#      let its worker keep running, rather than waiting on the result. The
+#      worker below (self.sh) schedules its OWN in-flight ArgTree: a blocking
+#      implementation would wait on this worker's own result and deadlock on
+#      itself. The server admits the recursive edge under the current stack,
+#      where it fails independently. The verdict is the exact wire reply the
+#      client parses back — `request <40-hex Q>` — which only the tested client
+#      can produce, and which is the whole point of the feature.
+#
+#   2. FIRE-AND-FORGET COMPLETION. Work the client dispatches must finish and
+#      become addressable through the core object API AFTER its caller
+#      container is gone (launch.sh dispatches Q, then exits). With no
+#      foreground Q caller left, the dispatched result's known object id can
+#      only appear if the client's `prepare-request` + `sub-run` actually
+#      handed the server a self-standing request. Polling the object API for
+#      that id, then reading it back with `caos run`, tests precisely the
+#      client's dispatch-and-detach behaviour end to end.
+#
+# So every command routes through $CAOS_CLI deliberately: the tested client's
+# dispatch protocol is the thing under test.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

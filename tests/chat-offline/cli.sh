@@ -1,8 +1,46 @@
 #!/usr/bin/env bash
-# End-to-end line-client test against a scripted LLM. Request preparation must
-# fail before admission, and an admitted request must keep advancing its
-# canonical conversation after the submitting client disappears. The completed
-# closure must then be readable by a completely fresh client.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ==========================================================
+# The subject here IS the tested client's conversation path — its `chat`/`talk`
+# subcommands and everything they do on the wire. Every property below is a
+# behaviour of that binary, verifiable only by driving it against the inner
+# stack; none of it could be reconstructed by poking the server or the refs
+# directly (the way tests/std-lint checks a subject that never involves the CLI).
+# The $CAOS_CLI here is essential, not incidental:
+#
+#   1. CLIENT-SIDE REQUEST PREPARATION REJECTS BEFORE ADMISSION. The whole
+#      point of the first two phases is that the TESTED CLIENT refuses to admit
+#      a request it cannot honour — a missing model secret, or a base carrying a
+#      reserved top-level `.caos` — and that this rejection happens in the client
+#      BEFORE anything is published or the LLM is reached. We assert on the
+#      client's own diagnostics (the secret name, the `reader=` grants it needs,
+#      the `secrets` setup hint) and then prove no conversation ref appeared and
+#      no LLM request file exists. Only the tested client can be asked "did you
+#      correctly decline to admit this?"; a server-side probe would already be
+#      past the client-side gate this test pins down.
+#
+#   2. ADMITTED WORK SURVIVES LOSS OF ITS SUBMITTING CLIENT. This is the test's
+#      title property, and it is a durable computation driven THROUGH the tested
+#      client against the inner stack: `talk` submits, we kill the submitting
+#      client mid-request, and the canonical conversation must keep advancing to
+#      completion on the server, recording the exact admission event (queued
+#      status, request tree, secret-hash isolation with no curried API key) and
+#      the post-disconnect assistant turn. Verifying this genuinely requires a
+#      real request originated by the tested client — the admission event, the
+#      request tree's shape, and the offline continuation only exist because the
+#      tested client prepared and handed off the request the way it does.
+#
+#   3. A FRESH CLIENT REPLAYS THE CLOSURE. The final phase spins up a brand-new
+#      client repo with nothing fetched and asks the TESTED client to `talk
+#      --log` the conversation: it must fetch and replay the whole closure from
+#      the refs alone. That fetch-and-replay path is client code under test; the
+#      assertion that a cold client reproduces "fresh start" / the assistant
+#      reply is a statement about the tested binary, not about stored bytes.
+#
+# In short: request preparation, atomic admission, offline durability, and cold
+# replay are all properties OF the tested client. Bypassing $CAOS_CLI would test
+# a different program than the one shipped, so the CLI is the subject, not a
+# convenience.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

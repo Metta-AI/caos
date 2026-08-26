@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Runs cwd'd into a client repo with this test tree at ./test and $CAOS_CLI
-# set, INSIDE a test stack — the suite's per-test job
-# (tests/lib/run-test.sh).
+# Runs cwd'd into a client repo with this test tree at ./test, INSIDE a test
+# stack — the suite's per-test job (tests/lib/run-test.sh).
+#
+# This suite deliberately does NOT drive the tested client: though the harness
+# puts $CAOS_CLI on PATH like it does for every test, nothing here touches it.
+# Its subject is the LITERAL tree ($CAOS_PROJECT) — checked-in redundancies and
+# what the flake's src filter keeps — which is inspected directly by plain-bash
+# lint scripts. No inner-stack command runs, so no tested-client call is needed
+# and none would add coverage; the client's own behaviour is tested elsewhere.
 #
 # The literal-tree lints (design/flake-images.md, part 2): std's checked-in
 # redundancies must match what std/refresh.sh regenerates from their sources

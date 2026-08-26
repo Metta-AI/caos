@@ -9,6 +9,36 @@
 # dependents, not the world. The workspace arrives in this test's wrapper
 # (the pruned build tree — what cargo reads), staged as $CAOS_PROJECT.
 #
+# WHY THIS TEST MUST GO THROUGH $CAOS_CLI (not a bare `cargo test`).
+# The subject here is NOT just "do the crates pass their tests" — that a
+# host-side `cargo test` could answer on its own. The subject is "the tested
+# client can drive a real cargo computation over this workspace on the inner
+# stack and get the right verdict back." That property only exists if the
+# command actually goes through $CAOS_CLI, so the CLI is ESSENTIAL, not a
+# convenience wrapper around cargo:
+#
+#   - The single `caos-cli run r1 --base:@=DEEP-DEPS/cargo --tree:@=ws
+#     --cmd=test --mode=all --target=<musl>` exercises the client's whole run
+#     path end to end: ingesting the DEPS closure (std/cargo, deepened),
+#     resolving the curried `cargo` worker image, walking and pushing the arg
+#     tree's closure to the inner server, launching the job in a real caos
+#     worker, and materializing its result tree (r1/exit, r1/stdout,
+#     r1/stderr). A bare `cargo test` would test the code while leaving every
+#     one of those moving parts — the exact machinery CAOS ships — unexercised.
+#
+#   - `--mode=all` is a property OF THE CLIENT'S run machinery, not of cargo:
+#     it decomposes the workspace per crate and keys each crate's tests on its
+#     pruned source closure. This test is the thing that pins that decomposition
+#     down against a live stack — that it fans out, runs, and recombines into
+#     one exit code correctly. There is no way to observe that without the
+#     tested client producing it.
+#
+#   - The verdict is therefore a CONJUNCTION the CLI makes: "the crates are
+#     correct" AND "the tested client + std/cargo worker can actually run them
+#     against the inner server." Routing around $CAOS_CLI would silently drop
+#     the second half — precisely the half that is CAOS rather than Rust — and
+#     turn this into a duplicate of what a plain `cargo test` already covers.
+#
 # One of four unit-* tests — test, clippy, doc, fmt — that were a single
 # `unit` test running two at a time and then two in sequence. They share
 # nothing but the workspace snapshot, so as separate suite tests they land in

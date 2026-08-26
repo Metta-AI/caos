@@ -9,6 +9,38 @@
 # shared runner. Then it edits the source and rebuilds to confirm a distinct,
 # independently-working worker.
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI), essentially and
+# not incidentally:
+#
+#   The subject here is NOT a script or a file on disk — it is a *server-side
+#   computation* that only exists when reached through the client protocol. The
+#   rustc builder is a curry over the runner pool that the client resolves,
+#   dispatches, and materializes; there is no way to "compile this source into a
+#   runnable worker and run it" except by driving `curry`/`run` on the tested
+#   client against the inner stack. So exercising the loop at all IS exercising
+#   the client end-to-end.
+#
+#   Every step below pins a property that lives in the client:
+#     - `curry --base:@=DEEP-DEPS/rustc` makes the client INGEST the declared
+#       dep tree, evaluate its .caos-expr, and produce a builder image hash —
+#       the client's dependency-naming and closure walk.
+#     - `run img --base:hash=$builder --src:@=g1.rs` makes the client push the
+#       arg-tree closure (source blob + the builder's runner-delta objects it
+#       only holds by hash), dispatch the build to the inner server, and check
+#       the resulting worker image out as files — the client's push/resolve/
+#       checkout round-trip against a real stack.
+#     - `run a --base:hash=$(tree_hash img)` runs that freshly built worker,
+#       proving the emitted curry(runner,bin=...) actually dispatches and
+#       executes in the shared runner — reachable only via the client.
+#     - the edit-and-rebuild half proves a changed source yields a DISTINCT,
+#       independently-working worker with no cross-contamination of results:
+#       content-addressed identity and cache behavior that only the client's
+#       hashing/dispatch path can demonstrate.
+#
+#   None of this is verifiable "directly" (the std-lint way): the artifact under
+#   test is produced and run by the stack, so removing the client would remove
+#   the subject. The CLI is the instrument, not an incidental driver.
+#
 # It also times each phase: `build` (compile a source into a runnable worker) and
 # `first-run` (that new worker's first execution). On a warm server the runner is
 # already provisioned, so first-run reflects a warm dispatch; against a fresh stack

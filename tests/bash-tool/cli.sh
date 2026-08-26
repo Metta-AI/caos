@@ -11,6 +11,35 @@
 # untouched placeholder subtrees intact by hash; and a failing command is a
 # VALUE ({exit, stdout, stderr, tree}), never a run error.
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLI ($CAOS_CLI):
+# The subject is not a script we can run on this host — it is the bash-tool
+# WORKER, and every property under test is a property of that worker executing
+# inside the inner stack. The tool has no image and no host binary: it is
+# DEEP-DEPS/bash-tool, a std source entry (std/bash-tool) that resolves via
+# rustc and is curried onto the runner pool (design/caos-expr.md, Phase 3). The
+# ONLY way to make it run is to submit a `run` to the inner server, and the ONLY
+# thing that submits to the inner server is the tested client (run-test.sh:
+# `caos-cli` on PATH is the client built from the tree under test, and
+# CAOS_SERVER_URL is the stack it brought up). There is no side door — no
+# /bin/caos, no direct invocation — that reaches this worker.
+#
+# So `caos-cli run` is essential, not incidental, on both sides of the
+# round-trip it drives:
+#   - INGEST/RESOLVE: `--base:@=<tool> --tree:@=ws` makes the client ingest the
+#     workspace as a git tree and resolve the curried tool, then dispatch the
+#     command with only `--paths` materialized. The whole "declared paths only"
+#     contract (EACCES on an undeclared touch, the `denied` retry hint,
+#     placeholder subtrees that survive by hash) is enforced by the SERVER-side
+#     materialization the client requests — plain `bash` on this host would
+#     materialize the entire tree and could observe none of it.
+#   - RESULT AS VALUE: the client returns the run's result tree
+#     ({exit,stdout,stderr,tree,denied?}) as addressable paths, so a failing
+#     command surfaces as a VALUE rather than a run error, and the staged tree
+#     is compared by git hash against the input. That value/round-trip shape is
+#     precisely what only a real client<->inner-stack run produces.
+# In short: verifying the worker genuinely requires driving a real computation
+# through the tested client against the inner stack — the pin this test holds.
+#
 # The tool is DEEP-DEPS/bash-tool — a std source entry (std/bash-tool) built on
 # resolution via rustc and curried onto the runner pool (design/caos-expr.md,
 # Phase 3), no image of its own.

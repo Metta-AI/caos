@@ -3,14 +3,38 @@
 # set, INSIDE a test stack — the suite's per-test job
 # (tests/lib/run-test.sh).
 #
-# Round-trips a first-class commit: the client passes HEAD as a `:commit=` arg
-# (unpeeled — the worker sees the commit, not its tree); a source-built worker
-# (commit-worker.rs, compiled by the rustc builder, linking worker-common's
-# commit helpers) reads it, walks its tree and parent by hash, runs one tool
-# call through run-then, and mints a child commit — message from the tool's
-# output, tree unchanged, parent = HEAD — returned as `commit <hash>`. The
-# client gets the raw commit bytes on stdout and can fetch the real object
-# from the server by hash.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The subject here is first-class commits as CROSS-STACK VALUES: a commit that
+# the client hands to the inner stack as a `:commit=` arg, that a worker reads,
+# walks and re-mints server-side, and that comes back as a real git object the
+# client can fetch by hash. None of that exists outside a live run — there is
+# no object to inspect, no minted child, no round-trip — until the tested
+# client drives a real computation against the inner server. So the CLI is not
+# incidental scaffolding for verifying something inspectable on disk; it is the
+# ONE and ONLY thing that can put a commit onto the inner stack and pull the
+# result back. Every step below is a property OF the tested client:
+#
+#   - `curry`/`run` build and launch a source-built worker on the inner stack —
+#     the inner stack can only be driven through the tested client (run-test.sh:
+#     "must be the one every test command goes through").
+#   - `--head:commit=HEAD` pins that the client marshals a commit UNPEELED
+#     (the worker must see the commit, not its tree) — a wire-format property of
+#     the client's arg encoding, observable only by running it.
+#   - the stdout `commit <hash>` and the `git fetch caos <hash>` round-trip pin
+#     that the minted child is a genuine server-held commit the client can name
+#     by hash — the client's result decoding and fetch negotiation, end to end.
+#
+# Replace the CLI with plain git or a direct object read and there is nothing
+# left to test: the commit was never marshalled, never minted, never fetched.
+#
+# Mechanics: the client passes HEAD as a `:commit=` arg (unpeeled — the worker
+# sees the commit, not its tree); a source-built worker (commit-worker.rs,
+# compiled by the rustc builder, linking worker-common's commit helpers) reads
+# it, walks its tree and parent by hash, runs one tool call through run-then,
+# and mints a child commit — message from the tool's output, tree unchanged,
+# parent = HEAD — returned as `commit <hash>`. The client gets the raw commit
+# bytes on stdout and can fetch the real object from the server by hash.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

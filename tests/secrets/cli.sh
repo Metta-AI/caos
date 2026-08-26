@@ -1,12 +1,48 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with $CAOS_CLI set, INSIDE a test stack.
 #
-# Exercises secret injection with the store carried as ephemeral run context
-# (design/secrets.md): the client reads its own git-ignored `.caos-secrets`,
-# resolves each reader with eval-path, and sends the result to the server,
-# which subset-matches and injects at `/secret/<name>`. Covers: a granted vs a
-# denied secret, the output-leak assertion, log masking, and a grant naming a
-# repo-local tool by path.
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI)
+# ----------------------------------------------------------
+# The secret machinery IS the tested client's behaviour — there is no seam at
+# which the subject could be checked without driving $CAOS_CLI, because the CLI
+# is the only thing that ever touches a secret value or decides where it goes
+# (design/secrets.md). Concretely, the properties pinned here live where nothing
+# but the tested build can reach them:
+#
+#   - READING & RESOLUTION. The store `.caos-secrets` is git-ignored and never
+#     sent as-is; the CLI reads it locally, resolves each `reader` with its own
+#     `eval-path`, and hands the SERVER only resolved readers to subset-match.
+#     Only the tested client performs this read-resolve-send step, so only a run
+#     through $CAOS_CLI can show a granted secret injected at /secret/<name>
+#     while a differently-scoped one is denied (the check.sh assertion).
+#   - THE LEAK & MASKING ASSERTIONS. Refusing to publish an output that echoes a
+#     secret value, and redacting a value a worker prints to the log, are
+#     enforcement paths INSIDE the tested run pipeline. There is no artifact to
+#     inspect out-of-band: the value only exists transiently in a run the CLI
+#     drives, so the refusal (leak.sh) and the "redacted secret" marker
+#     (shout.sh) are observable only by making the tested client run the worker.
+#   - SECRET-HASH FOLDING & CALLER-PROPAGATION. `eval-path` folds a matched
+#     secret's hash into the returned arg tree, which is what makes a granted
+#     worker — and anything that embeds it via `:@=` — per-user. This is a
+#     property OF `eval-path`'s output; the test compares that output with and
+#     without the store, so it can only be exercised by calling the tested
+#     `eval-path` (mytool and embedder).
+#   - SERVER-HELD STORE ACROSS SUB-RUN. A detached child must still receive the
+#     store its launcher could not read. The store reaches the server only via
+#     the CLI's request, and the child is admitted only via the CLI's
+#     prepare-request/curry/run; a real computation driven through the tested
+#     client against the inner stack is the only way to prove the edge carries it.
+#   - `secrets` SUBCOMMAND. Autofilling missing entropy and gating weak entropy
+#     with `--check` is a command of the tested client itself.
+#
+# So the CLI is essential, not incidental: swap in the host's client and every
+# assertion above would either measure the wrong build or have nothing to
+# measure. Below, the store is carried as ephemeral run context: the client
+# reads its own git-ignored `.caos-secrets`, resolves each reader with
+# eval-path, and sends the result to the server, which subset-matches and
+# injects at `/secret/<name>`. Covers: a granted vs a denied secret, the
+# output-leak assertion, log masking, and a grant naming a repo-local tool by
+# path.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

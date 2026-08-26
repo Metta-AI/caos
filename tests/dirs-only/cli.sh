@@ -11,6 +11,26 @@
 # (Worker-to-worker composition is covered by tests/run-then and
 # tests/rust-worker.)
 #
+# WHY THIS TEST MUST GO THROUGH THE TESTED CLIENT ($CAOS_CLI):
+# The subject here is a CAOS WORKER — a behavior that only exists when it is
+# RUN, and a worker runs only inside the inner stack, driven by a `caos-cli
+# run`. There is no way to observe "keeps directories, drops files" by reading
+# a file or running a plain script (contrast tests/std-lint, whose subject is a
+# checked-in tree that can be re-derived with bare bash): the filter is defined
+# by what the worker DOES to a tree once the server, runner and CAS carry the
+# input, compute, and hand back a result. That whole round-trip — ingesting the
+# fixture, resolving the arg-tree closure, launching the worker, checking out
+# what it left at /cas/out — is exactly what the tested client mediates. Both
+# calls below are `$CAOS_CLI` for that reason:
+#   * `curry`/`run img` COMPILE the fixture via std/rustc — itself a real
+#     server-side computation that only the tested client can drive; and
+#   * `run filtered` EXECUTES the built worker against the inner stack, which
+#     is the only place a worker's effect can be observed.
+# So the CLI is essential, not incidental: swap it out and there is nothing
+# left to assert against. What the test pins down is that a tree round-tripped
+# through the tested client and a rustc-built worker returns precisely the
+# directory children, with subtrees intact and files gone.
+#
 # The worker is a TEST FIXTURE, not a std entry: this test carries its source
 # (./worker.rs) and builds it with std/rustc — memoized, so the compile
 # happens once per source edit, not per run.
