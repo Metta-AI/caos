@@ -526,7 +526,23 @@ done
 # lets the test harness hand each job a std SUBSET. The server matches a required
 # set as a SUBSET of the job's arg entries (runner::matches), still far more
 # specific than runnerd's empty required.
+#
+# EVERY RECORD REQUIRES `required-pool=seeded`, and each seeded entry's
+# `.caos-expr` binds the same pair — which is what keeps the generic runner away
+# from a job only a seeder can answer (caos_world::SEEDED_POOL). Before it, the
+# seeder won only by being more specific among the polls parked at that instant,
+# so whenever it was between polls runnerd took the job and really tried to
+# build it. For `cargo` that meant `nix build` on a flake that deliberately
+# exposes no `caosImage`, reported as a nix error three layers from the cause.
+seeded_pool_oid=$(printf 'seeded' | git -C "$CLIENT" hash-object -w --stdin)
 seed_entries=""
+# The key a caller forms, as JSON — `base` and `in` plus the pool every seeded
+# entry declares. It OMITS `std`/`salt` (and cargo's `lock`): the server matches
+# a required set as a SUBSET of the job's arg entries, so a core item's answer
+# does not depend on what else the caller bound.
+seed_required() { # <base-oid> <in-oid> -> the required JSON
+  printf '{"base":"%s","in":"%s","required-pool":"%s"}' "$1" "$2" "$seeded_pool_oid"
+}
 add_seed_record() { # <name> <required-json> <result-tree>
   local reqblob record
   reqblob=$(printf '%s' "$2" | git -C "$CLIENT" hash-object -w --stdin)
@@ -543,7 +559,7 @@ if [ -n "$fb_delta" ] && [ -n "${hash_of[flake-builder]:-}" ]; then
   # so identity) flake-builder source entry.
   seeded_blob=$(printf 'docker://seeded' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record flake-builder \
-    "$(printf '{"base":"%s","in":"%s"}' "$seeded_blob" "${in_of[flake-builder]}")" "$fb_delta"
+    "$(seed_required "$seeded_blob" "${in_of[flake-builder]}")" "$fb_delta"
 fi
 
 if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; then
@@ -551,7 +567,7 @@ if [ -n "$cargo_delta" ] && [ -n "${hash_of[cargo]:-}" ] && [ -n "$fb_delta" ]; 
   # the flake-builder image (fb_delta), so the caller's arg-tree `image` is that
   # tree oid and `in` is the deepened cargo entry — both known here.
   add_seed_record cargo \
-    "$(printf '{"base":"%s","in":"%s"}' "$fb_delta" "${in_of[cargo]}")" "$cargo_delta"
+    "$(seed_required "$fb_delta" "${in_of[cargo]}")" "$cargo_delta"
 fi
 
 # rustc/deep-deps: SEEDED core. Their `.caos-expr` is a distinct sentinel
@@ -568,7 +584,7 @@ if [ -n "$runner_delta" ] && [ -n "${bin_path[deep-deps]:-}" ] && [ -n "${hash_o
   bts "curried deep-deps"
   dd_blob=$(printf 'docker://seeded-deep-deps' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record deep-deps \
-    "$(printf '{"base":"%s","in":"%s"}' "$dd_blob" "${in_of[deep-deps]}")" "$dd_curry"
+    "$(seed_required "$dd_blob" "${in_of[deep-deps]}")" "$dd_curry"
 fi
 
 if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}" ] && [ -n "${hash_of[rustc]:-}" ]; then
@@ -594,7 +610,7 @@ if [ -n "$runner_delta" ] && [ -n "$cargo_delta" ] && [ -n "${bin_path[rustc]:-}
   bts "curried rustc"
   rustc_blob=$(printf 'docker://seeded-rustc' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record rustc \
-    "$(printf '{"base":"%s","in":"%s"}' "$rustc_blob" "${in_of[rustc]}")" "$rustc_curry"
+    "$(seed_required "$rustc_blob" "${in_of[rustc]}")" "$rustc_curry"
 fi
 
 # runner: the pooled interpreter, a self-contained nix closure with no source to
@@ -605,7 +621,7 @@ fi
 if [ -n "$runner_delta" ] && [ -n "${hash_of[runner]:-}" ]; then
   runner_blob=$(printf 'docker://seeded-runner' | git -C "$CLIENT" hash-object -w --stdin)
   add_seed_record runner \
-    "$(printf '{"base":"%s","in":"%s"}' "$runner_blob" "${in_of[runner]}")" "$runner_delta"
+    "$(seed_required "$runner_blob" "${in_of[runner]}")" "$runner_delta"
 fi
 
 if [ -n "$seed_entries" ]; then

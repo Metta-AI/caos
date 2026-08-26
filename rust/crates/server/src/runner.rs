@@ -236,6 +236,28 @@ fn new_nonce(id: u64) -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The git blob oid of a pool NAME — what a `required-pool` arg's entry is, and
+/// so what the rendezvous compares. Memoized per name: the names are a fixed
+/// tiny set and this is read under the dispatch path.
+pub(crate) fn pool_oid(name: &str) -> String {
+    static MEMO: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = memo.lock().expect("pool oid memo").get(name) {
+        return known.clone();
+    }
+    let oid = gix::objs::compute_hash(
+        gix::hash::Kind::Sha1,
+        gix::objs::Kind::Blob,
+        name.as_bytes(),
+    )
+    .expect("hashing a pool name")
+    .to_string();
+    memo.lock()
+        .expect("pool oid memo")
+        .insert(name.to_string(), oid.clone());
+    oid
+}
+
 /// Does `required` match a job with `arg_entries`? The rendezvous is SYMMETRIC,
 /// and both halves are pure oid equality:
 ///

@@ -85,6 +85,24 @@ pub fn secret_hash_material(pairs: &[(&str, &str)]) -> Vec<u8> {
 /// and later stages carry none and are dispatched normally.
 pub const REQUIRED_ARG_PREFIX: &str = "required";
 
+/// The one such arg in use: which runner POOL may answer this job.
+pub const REQUIRED_POOL_ARG: &str = "required-pool";
+
+/// The pool the core-seeder-runner serves. A seeded entry's `.caos-expr` binds
+/// `--required-pool=seeded` and `build-builtins.sh` puts the same pair in the
+/// record's `required`, so the seeder satisfies the demand and the generic pool
+/// cannot.
+///
+/// Before this, the seeder won only by being MORE SPECIFIC: the server hands a
+/// job to the parked poll with the longest `required` (`offer_job`'s
+/// `max_by_key`), and a full arg-tree match beats runnerd's empty one. That is a
+/// preference among polls parked AT THAT INSTANT — so whenever the seeder was
+/// between polls (it rescans every 5s and its TTL turns over every 20s) the only
+/// match was the generic runner, which took a job nothing but a seeder can
+/// answer. Intermittent, and it presented as a nix error about a missing flake
+/// attribute. An exclusion cannot race; a preference can.
+pub const SEEDED_POOL: &str = "seeded";
+
 #[cfg(test)]
 mod tests {
     use super::*;

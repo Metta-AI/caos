@@ -9,4 +9,4 @@
 # hand-built delta). If the seeder is absent the job hits the generic runner and
 # fails loudly on a bogus image — an honest "bootstrap broken" signal, never a
 # silent wrong answer.
-run --base:docker=seeded --in:@=. --lock:@=DEEP-DEPS/flake.lock
+run --base:docker=seeded --in:@=. --lock:@=DEEP-DEPS/flake.lock --required-pool=seeded
