@@ -1,0 +1,3 @@
+# dev/worker-test's image: this directory is a flake (flake.nix + worker), so
+# its image is the flake-builder applied to the directory itself.
+run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
