@@ -183,6 +183,16 @@ suite_req=$(CAOS_SERVER_URL=http://127.0.0.1 \
   || fail "forming the suite request"
 caos trace-child suite "$suite_req" || fail "linking the suite's trace to this job"
 echo "==> suite request $suite_req (caos-cli status --all $suite_req)" >&2
+# THE RAW TRACE, fetchable from the HOST after this is all over. A trace key
+# carries no cache namespace, so the dev stack's records land in the same redis
+# the host server reads — which is why an address inside this container is not
+# what to print. `all=1` is the COMPLETE view (View::Complete): the live one
+# elides finished work, and after a run that is all of it.
+#
+# Printed rather than left to be reconstructed: the suite's request hash is
+# knowable only here, and without it the trace is unreachable.
+echo "==> full trace JSON:" >&2
+echo "    curl -s localhost:9090/status/$suite_req?all=1 | jq ." >&2
 
 phase "running the suite"
 status=0
@@ -193,6 +203,21 @@ if [ "$status" -ne 0 ]; then
   cat /tmp/run.err >&2
   fail "the suite did not produce a report (exit $status)"
 fi
+
+# THE TRACE COMMAND GOES IN THE REPORT, not just on stderr above: this job's
+# stderr is relayed only when it FAILS, and the run you most want to take apart
+# is a green one that was slower than it should have been.
+#
+# The result tree is a checkout, so its files are read-only.
+chmod u+w /tmp/suite/report
+{ echo
+  echo "full trace (the host reads the dev stack's records — a trace key carries"
+  echo "no cache namespace, so both stacks write to the one redis):"
+  echo "  curl -s localhost:9090/status/$suite_req?all=1 | jq ."
+  echo
+  echo "and while a run is in flight, CAOS_WATCH_LINES=0 shows every node"
+  echo "instead of the first 16."
+} >> /tmp/suite/report
 
 # THE WHOLE RESULT TREE, not just the report. SPEC's tool conventions: a tree
 # with a `report` file has the report printed, and a FAILED banner in it marks

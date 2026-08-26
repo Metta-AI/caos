@@ -302,6 +302,15 @@ pub(crate) struct Node {
     /// that otherwise produces no container and no log line at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     started: Option<u64>,
+    /// Finished at, CONTINUATION RESOLUTION INCLUDED (see [`ended`]). Absent
+    /// while the work is still going.
+    ///
+    /// Without it a reader can measure WAITING (`started - requested`) but not
+    /// DURATION, which is most of what a trace is wanted for — "which of these
+    /// 913 nodes is the expensive one" has no answer from a start time alone.
+    /// The record has always held it; only this view dropped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended: Option<u64>,
     /// Git objects the worker left at `/cas/out-trace`, by hash — `caos get`
     /// one to read it.
     ///
@@ -360,7 +369,7 @@ pub(crate) fn serve(
     } else {
         View::Live
     };
-    let node = walk(config, arg_tree, None, view, None, &mut 0);
+    let node = walk(config, arg_tree, None, view, None, &mut 0, &mut Vec::new());
     serde_json::to_vec(&node)
         .map_err(|e| crate::HttpError::new(500, format!("encoding status: {e}")))
 }
@@ -382,9 +391,22 @@ pub(crate) fn serve(
 /// an earlier run (SPEC.md "Tracing"). None at the root, which by definition is
 /// the run being read.
 ///
-/// `budget` bounds the whole walk. The tree is read from records that a
-/// concurrent run is still appending to, so a malformed or circular set of
-/// child edges must not turn a status request into an unbounded traversal.
+/// `budget` bounds the whole walk and `ancestors` bounds its DEPTH, and it took
+/// both. The tree is read from records a concurrent run is still appending to,
+/// so a malformed or circular set of child edges must not turn a status request
+/// into an unbounded traversal.
+///
+/// The budget alone did not do that. It caps how many nodes are RENDERED, and a
+/// cycle renders one node per hop — so a circular edge recursed 10,000 frames
+/// deep and overflowed the thread's stack. Rust aborts the PROCESS on stack
+/// overflow, so `GET /status/<x>?all=1` over a suite trace killed the server and
+/// took the whole stack group with it. A read request must not be able to do
+/// that whatever the records say.
+///
+/// `ancestors` is the path from the root, not a global visited set: the same
+/// ArgTree legitimately appears in several places in one trace (a cache hit
+/// reused by two parents), and pruning those would silently drop real work.
+/// Only re-entering a node that is already on the current path is a cycle.
 fn walk(
     config: &Config,
     arg_tree: &str,
@@ -392,13 +414,46 @@ fn walk(
     view: View,
     parent_started: Option<u64>,
     budget: &mut usize,
+    ancestors: &mut Vec<String>,
 ) -> Option<Node> {
     const MAX_NODES: usize = 10_000;
-    if *budget >= MAX_NODES {
+    /// A backstop under the cycle check, for a trace that is merely very deep
+    /// rather than circular. Far past any real chain: the suite's deepest is a
+    /// test's stages under the fan-out, tens of hops, not hundreds.
+    const MAX_DEPTH: usize = 512;
+    if *budget >= MAX_NODES || ancestors.len() >= MAX_DEPTH {
+        return None;
+    }
+    if ancestors.iter().any(|seen| seen == arg_tree) {
         return None;
     }
     *budget += 1;
+    ancestors.push(arg_tree.to_string());
+    let node = walk_inner(
+        config,
+        arg_tree,
+        prefix,
+        view,
+        parent_started,
+        budget,
+        ancestors,
+    );
+    ancestors.pop();
+    node
+}
 
+/// The body of [`walk`], split out so the cycle check has one place to push and
+/// pop the path however the walk returns.
+#[allow(clippy::too_many_arguments)]
+fn walk_inner(
+    config: &Config,
+    arg_tree: &str,
+    prefix: Option<&str>,
+    view: View,
+    parent_started: Option<u64>,
+    budget: &mut usize,
+    ancestors: &mut Vec<String>,
+) -> Option<Node> {
     let record = read(config, arg_tree);
 
     // No record at all means this ArgTree has never run here — not that it is
@@ -465,6 +520,7 @@ fn walk(
                 view,
                 parent_started,
                 budget,
+                ancestors,
             );
         }
     }
@@ -484,7 +540,15 @@ fn walk(
             // a child usually names itself (a `run` step is often another
             // tool's ArgTree, `help` and all).
             let label = matches!(via.as_str(), "map" | "eval").then_some(name);
-            walk(config, &child, label.as_deref(), view, started, budget)
+            walk(
+                config,
+                &child,
+                label.as_deref(),
+                view,
+                started,
+                budget,
+                ancestors,
+            )
         })
         .collect();
     if view == View::Complete {
@@ -496,6 +560,7 @@ fn walk(
                 view,
                 started,
                 budget,
+                ancestors,
             ));
         }
     }
@@ -529,6 +594,7 @@ fn leaf(
         name,
         requested: record.requested_at(),
         started: record.started_at(),
+        ended: record.ended().map(|(ts, _)| ts),
         out_trace: record.out_traces(),
         reused,
         children: Vec::new(),

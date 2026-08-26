@@ -20,9 +20,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const POLL: Duration = Duration::from_millis(400);
 
 /// Most nodes drawn before the rest are summarised. A wide map (the suite's
-/// 29-way fan-out) would otherwise scroll the display off the screen, which
+/// 46-way fan-out) would otherwise scroll the display off the screen, which
 /// makes it worse than no display.
-const MAX_LINES: usize = 16;
+///
+/// `CAOS_WATCH_LINES` overrides it, because the default is tuned for watching
+/// and the opposite need is real: when the question is "what is everything
+/// doing right now" — why a 46-test suite takes 100s when one test takes 8 —
+/// sixteen rows hide exactly the answer. `0` means no cap.
+fn max_lines() -> usize {
+    static LINES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LINES.get_or_init(|| {
+        std::env::var("CAOS_WATCH_LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|n: usize| if n == 0 { usize::MAX } else { n })
+            .unwrap_or(16)
+    })
+}
 
 /// How much of a node's name a line will show. Names are as long as they need
 /// to be — the server's job is to identify a node, not to fit it — so the
@@ -214,7 +228,7 @@ fn elide(name: &str) -> String {
 /// Redraw, replacing the `previous` lines already on screen. Returns how many
 /// lines are now drawn.
 fn draw(previous: usize, lines: &[String]) -> usize {
-    let shown: Vec<&String> = lines.iter().take(MAX_LINES).collect();
+    let shown: Vec<&String> = lines.iter().take(max_lines()).collect();
     let hidden = lines.len().saturating_sub(shown.len());
     let mut err = std::io::stderr();
     let mut buf = String::new();
@@ -336,11 +350,11 @@ mod tests {
 
     #[test]
     fn a_wide_tree_is_capped_with_a_count_of_the_rest() {
-        let lines: Vec<String> = (0..MAX_LINES + 5).map(|i| format!("node{i}")).collect();
+        let lines: Vec<String> = (0..max_lines() + 5).map(|i| format!("node{i}")).collect();
         // Drawing writes to a stderr that is not a terminal under `cargo test`,
         // so this asserts the arithmetic, which is what can be wrong.
         let drawn = draw(0, &lines);
-        assert_eq!(drawn, MAX_LINES + 1, "the capped lines plus the summary");
+        assert_eq!(drawn, max_lines() + 1, "the capped lines plus the summary");
     }
 
     #[test]
