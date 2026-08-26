@@ -1,70 +1,60 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# tests/llm-subagent — a WORKER test, in dev/worker-test (it needs git).
+#
 # Subagents are ordinary durable conversations: spawning returns stable
 # identifiers, and the child inherits a clean workspace and human owner.
+# Everything asserted here lives in refs on the server, which is the point —
+# the client was only currying the parent turn and blocking on it.
 set -euo pipefail
-# The dependency is mounted only inside the test wrapper and exports globals.
-# shellcheck disable=SC1091
-source DEEP-DEPS/llm-test/common.sh
+
+caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+source /cas/args/common
 
 stage "workspace and scripted parent/child model"
 llm_test_setup
-stub_host="${stub_host:?llm_test_setup did not set stub_host}"
-mkdir -p ws/notes
-echo "hello notes" > ws/notes/todo.txt
-echo "You are a coding agent operating on a git workspace." > system.txt
-git add -A
-gc commit -qm fixtures
-base=$(mkcommit "HEAD:ws" base)
+
+rm -rf /tmp/ws && mkdir -p /tmp/ws/notes
+echo "hello notes" > /tmp/ws/notes/todo.txt
+caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
+ws=$(caos hash /cas/ws)
 
 SUBAGENT_PROMPT="inspect the snapshot and report the notes file"
 SUBAGENT_DONE_TEXT="subagent round complete"
-mkdir stub
+rm -rf /tmp/stub && mkdir -p /tmp/stub
 printf '{"content":[{"id":"toolu_spawn","input":{"prompt":"%s"},"name":"spawn_agent","type":"tool_use"}],"stop_reason":"tool_use"}' \
-  "$SUBAGENT_PROMPT" > stub/response-1.json
+  "$SUBAGENT_PROMPT" > /tmp/stub/response-1.json
 # Parent and child race for the next two API slots. Both responses are terminal
 # and equivalent, so FIFO release order does not couple the test to scheduling.
-mkfifo stub/response-2.json stub/response-3.json
+mkfifo /tmp/stub/response-2.json /tmp/stub/response-3.json
 stub_pid=""
 port=""
-start_stub stub stub_pid port
-stub_pid="${stub_pid:?start_stub did not set stub_pid}"
-new_llm_conversation llm-subagent "$port"
-conv="${conv:?new_llm_conversation did not set conv}"
-conversation_ref="${conversation_ref:?new_llm_conversation did not set conversation_ref}"
-llm="${llm:?new_llm_conversation did not set llm}"
+start_stub /tmp/stub stub_pid port
+
+new_llm_conversation llm-subagent "$port" "$ws" \
+  "You are a coding agent operating on a git workspace."
 
 stage "spawn a durable child conversation"
-user1=$(mkcommit "HEAD:ws" \
-  "{\"base\":\"$base\",\"author\":\"user\",\"username\":\"Alice\",\"content\":\"delegate a focused check\"}" \
-  "$base")
-request1=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user1")
-assert_oid "$request1" "subagent prepared request"
-admitted1=$(mkcommit "HEAD:ws" \
-  "{\"request\":\"$request1\",\"request_head\":\"$user1\",\"status\":\"queued\"}" \
-  "$user1")
-git push --quiet caos "$admitted1:$conversation_ref" \
-  || fail "publishing subagent admission"
-"$CAOS_CLI" run --base:hash="$request1" >/tmp/llm-subagent-result 2>/tmp/llm-subagent-error &
-spawn_pid=$!
-LLM_TEST_PIDS+=("$spawn_pid")
+LLM_TEST_USERNAME=Alice
+dispatch_turn "$ws" "delegate a focused check"
+user1=$human
+request1=$request
 
 for request_number in 2 3; do
   request_seen=0
   for _ in $(seq 1 300); do
-    if [ -e "stub/request-$request_number.json" ]; then request_seen=1; break; fi
-    # The primary turn may finish before the independent child reaches the
-    # model. Its process ending therefore says nothing about child progress.
+    if [ -e "/tmp/stub/request-$request_number.json" ]; then request_seen=1; break; fi
     sleep 0.2
   done
   [ "$request_seen" -eq 1 ] || fail "subagent API request $request_number never arrived"
   printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-    "$SUBAGENT_DONE_TEXT" > "stub/response-$request_number.json"
+    "$SUBAGENT_DONE_TEXT" > "/tmp/stub/response-$request_number.json"
 done
-if ! wait "$spawn_pid"; then
-  fail "running subagent turn: $(cat /tmp/llm-subagent-error)"
-fi
 
-head1=$(fetch_head)
+head1=$(wait_turn) || {
+  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
+  fail "the parent turn never reached a terminal event"
+}
 events1=$(git log --first-parent --format=%B "$user1..$head1")
 spawn_detail=$(jq -r \
   'select(.result.tool_use_id == "toolu_spawn") | .result.content[0].text' \
@@ -77,9 +67,11 @@ agent_request=$(jq -r '.request // empty' <<<"$spawn_detail")
 assert_oid "$agent_task" "subagent task"
 assert_oid "$agent_request" "subagent request"
 
+# The child is INDEPENDENT of the parent turn, so its completion appends after
+# it — polled on the parent's spine, exactly as the async task does.
 agent_result=""
 for _ in $(seq 1 300); do
-  head1=$(fetch_head)
+  head1=$(current_head)
   events1=$(git log --first-parent --format=%B "$user1..$head1")
   agent_result=$(jq -r --arg task "$agent_task" \
     'select(.async.task == $task and (.async.status == "complete" or .async.status == "failed")) | .async.result // empty' \
@@ -123,4 +115,6 @@ grep -qF '"username":"Alice"' <<<"$agent_events" \
   || fail "subagent root lacks its human owner"
 
 stage "done"
-echo "llm-subagent: ALL PASS" >&2
+printf 'llm-subagent: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out

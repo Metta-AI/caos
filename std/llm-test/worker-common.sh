@@ -172,11 +172,19 @@ dispatch_turn() { # <tree-oid> <human-message> [parent-commit]
   # on a follow-up turn changes how the history is assembled. (Observed as
   # llm-async's second turn losing the independent-completion notice.) A caller
   # that names an explicit parent is continuing a conversation, so it is left off.
+  # `LLM_TEST_USERNAME`, when set, names the HUMAN OWNER on the event — which is
+  # what a spawned subagent inherits and indexes itself under
+  # (tests/llm-subagent). A global rather than another positional, because it is
+  # a property of the conversation, not of the turn.
+  local owner=""
+  if [ -n "${LLM_TEST_USERNAME:-}" ]; then
+    owner="\"username\":\"$LLM_TEST_USERNAME\","
+  fi
   local head_event
   if [ -n "${3:-}" ]; then
-    head_event="{\"author\":\"user\",\"content\":\"$message\"}"
+    head_event="{\"author\":\"user\",$owner\"content\":\"$message\"}"
   else
-    head_event="{\"base\":\"$parent\",\"author\":\"user\",\"content\":\"$message\"}"
+    head_event="{\"base\":\"$parent\",\"author\":\"user\",$owner\"content\":\"$message\"}"
   fi
   # `human` is a global: tests assert the turn descends from it.
   human=$(mint_commit "/cas/human-$n" "$tree" "$head_event" "$parent")
