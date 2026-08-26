@@ -1,105 +1,61 @@
-#!/usr/bin/env bash
-# The merge tool through a canonical conversation. The canonical event head, rather
-# than the llm-step result object, must retain the real merge ancestry.
+#!/bin/bash
+# tests/merge-harness — a WORKER test, in dev/worker-test (it needs git).
+#
+# The merge tool through a canonical conversation. The canonical event head,
+# rather than the llm-step result object, must retain the real merge ancestry —
+# which is a claim about a ref, so this reads refs and needs no client.
 set -euo pipefail
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
-gc() { git -c user.email=test@caos -c user.name=caos "$@"; }
-mkcommit() { # <tree> <message> [parent...] -> commit
-  local tree=$1 message=$2
-  shift 2
-  local parents=() parent
-  for parent in "$@"; do parents+=(-p "$parent"); done
-  gc commit-tree "$tree" "${parents[@]}" -m "$message"
-}
+caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+source /cas/args/common
 
-echo "== workspace, feature, and scripted model ==" >&2
-"$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry \
-  || fail "resolving llm-stub"
-stub_bin=/tmp/llm-stub-bin
-install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
+stage "workspace, feature, and scripted model"
+llm_test_setup
 
-mkdir ws
-echo v1 > ws/f.txt
-echo "You are a coding agent." > system.txt
-git add -A
-gc commit -qm fixtures
-base_tree=$(git rev-parse HEAD:ws)
-base=$(mkcommit "$base_tree" base)
+rm -rf /tmp/ws && mkdir -p /tmp/ws
+echo v1 > /tmp/ws/f.txt
+caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
+base_tree=$(caos hash /cas/ws)
 
-mkdir feat
-echo v1 > feat/f.txt
-echo hello > feat/g.txt
-git add feat
-gc commit -qm feature-fixture
-feature=$(mkcommit "$(git rev-parse HEAD:feat)" feature "$base")
-git push --quiet caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
+rm -rf /tmp/feat && mkdir -p /tmp/feat
+echo v1 > /tmp/feat/f.txt
+echo hello > /tmp/feat/g.txt
+caos put /tmp/feat /cas/feat >/dev/null || fail "publishing the feature tree"
 
 R1='[{"id":"toolu_01","input":{"theirs":"feature"},"name":"merge","type":"tool_use"}]'
-mkdir stub
-printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > stub/response-1.json
+rm -rf /tmp/stub && mkdir -p /tmp/stub
+printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"merged the feature branch","type":"text"}],"stop_reason":"end_turn"}' \
-  > stub/response-2.json
-
+  > /tmp/stub/response-2.json
 stub_pid=""
-for _ in 1 2 3 4 5; do
-  port=$((20000 + RANDOM % 20000))
-  "$stub_bin" "0.0.0.0:$port" "$PWD/stub" 2>stub/log &
-  stub_pid=$!
-  # The stub normally binds in a few milliseconds. Wait for the listener
-  # instead of adding a fixed half-second delay to every test run.
-  ready=0
-  for _ in {1..400}; do
-    if ! kill -0 "$stub_pid" 2>/dev/null; then break; fi
-    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=1; break; fi
-    sleep 0.005
-  done
-  if [ "$ready" = 1 ]; then break; fi
-  kill "$stub_pid" 2>/dev/null || true
-  wait "$stub_pid" 2>/dev/null || true
-  stub_pid=""
-done
-[ -n "$stub_pid" ] || fail "could not start llm-stub: $(cat stub/log)"
-trap 'kill "$stub_pid" 2>/dev/null || true' EXIT
+port=""
+start_stub /tmp/stub stub_pid port
 
-echo "== dispatch merge turn ==" >&2
-mkdir -p .caos-secrets
-printf '.caos-secrets/\n' >> .git/info/exclude
-printf '%s\n' \
-  'name=anthropic-api-key' \
-  'value=test-key' \
-  'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-step' \
-  > .caos-secrets/anthropic-api-key
-test_run_id="$(date +%s%N)-$$-$RANDOM"
-conv="${test_run_id}-merge"
-conversation_ref="refs/caos/v2/conversations/$conv/head"
-stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-llm=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/llm-step \
-  --system:@=system.txt \
-  --merge-refs="feature $feature" \
-  --model=test-model --base-url="http://$stub_host:$port" \
-  --conversation="$conv")
+new_llm_conversation merge "$port" "$base_tree"
 
-user=$(mkcommit "$base_tree" \
-  "{\"base\":\"$base\",\"author\":\"user\",\"content\":\"merge in the feature branch\"}" \
-  "$base")
-request=$("$CAOS_CLI" prepare-request --base:hash="$llm" --head:commit="$user")
-[ "${#request}" -eq 40 ] && [[ "$request" =~ ^[0-9a-f]+$ ]] \
-  || fail "prepared request is not exact Q: $request"
-admitted=$(mkcommit "$base_tree" \
-  "{\"request\":\"$request\",\"request_head\":\"$user\",\"status\":\"queued\"}" "$user")
-git push --quiet caos "$admitted:$conversation_ref" || fail "publishing request admission"
-"$CAOS_CLI" run --base:hash="$request" >/tmp/merge-result || fail "running merge turn"
+# The feature side branches off the conversation base, so the merge has real
+# ancestry to preserve. Minted after `base` exists, and given a ref so the
+# closure is anchored on the server for the merge worker to fetch.
+feature=$(mint_commit /cas/feature "$(caos hash /cas/feat)" feature "$base")
+git -c fetch.negotiationAlgorithm=noop fetch -q caos "$feature" \
+  || fail "fetching the feature commit back"
+git push --quiet caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
 
-advertised=$(git ls-remote --refs caos "$conversation_ref") \
-  || fail "reading canonical conversation head"
-head=${advertised%%$'\t'*}
-[ -n "$head" ] || fail "canonical conversation head is absent"
-git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$head" \
-  || fail "fetching canonical conversation head"
+# CURRIED ONTO THE CONFIGURED llm-step, not passed to new_llm_conversation:
+# currying takes an ArgTree and args and returns an ArgTree, so a caller adds
+# what only it knows without the shared helper growing a parameter for it.
+llm=$(caos curry --base:hash="$llm" --merge-refs="feature $feature") \
+  || fail "currying the merge refs onto llm-step"
 
-echo "== event spine owns the merged workspace and ancestry ==" >&2
+stage "dispatch merge turn"
+dispatch_turn "$base_tree" "merge in the feature branch"
+head=$(wait_turn) || {
+  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
+  fail "the merge turn never reached a terminal event"
+}
+
+stage "event spine owns the merged workspace and ancestry"
 git merge-base --is-ancestor "$feature" "$head" \
   || fail "feature is not reachable from canonical conversation head"
 [ "$(git show "$head:g.txt")" = hello ] || fail "merged file g.txt missing"
@@ -141,4 +97,7 @@ grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' <<<"$terminal" \
 grep -qF "\"request\":\"$request\"" <<<"$terminal" \
   || fail "terminal event did not identify its request"
 
-echo "merge-harness: ALL PASS" >&2
+stage "done"
+printf 'merge-harness: ALL PASS\n' > /tmp/report
+cat /tmp/report >&2
+caos put /tmp/report /cas/out
