@@ -294,14 +294,21 @@ pub(crate) struct Node {
     /// makes it: its ArgTree is its cache key.
     arg_tree: String,
     name: String,
-    /// Admitted at. Present whenever we have a record at all.
+    /// Admitted at, in MILLISECONDS relative to the root request's `requested`
+    /// time (so the root reads 0 and every other node reads how long after the
+    /// run began it was admitted). Present whenever we have a record at all.
+    ///
+    /// Relative and in ms rather than absolute microseconds because these are
+    /// read by a person: an absolute unix-µs stamp is sixteen digits that say
+    /// nothing at a glance, whereas `840` is "0.84s into the run". Reused work
+    /// (which ran in an EARLIER run) reads negative, which is the honest answer.
     #[serde(skip_serializing_if = "Option::is_none")]
-    requested: Option<u64>,
-    /// Claimed by a runner at, if it has been. Absent means the job is still
-    /// waiting for capacity — `requested` with no `started` is the parked job
-    /// that otherwise produces no container and no log line at all.
+    requested: Option<i64>,
+    /// Claimed by a runner at, same units as `requested`. Absent means the job
+    /// is still waiting for capacity — `requested` with no `started` is the
+    /// parked job that otherwise produces no container and no log line at all.
     #[serde(skip_serializing_if = "Option::is_none")]
-    started: Option<u64>,
+    started: Option<i64>,
     /// Git objects the worker left at `/cas/out-trace`, by hash — `caos get`
     /// one to read it.
     ///
@@ -360,9 +367,35 @@ pub(crate) fn serve(
     } else {
         View::Live
     };
-    let node = walk(config, arg_tree, None, view, None, &mut 0);
+    let node = walk(
+        config,
+        arg_tree,
+        None,
+        view,
+        None,
+        baseline_of(config, arg_tree),
+        &mut 0,
+    );
     serde_json::to_vec(&node)
         .map_err(|e| crate::HttpError::new(500, format!("encoding status: {e}")))
+}
+
+/// The absolute microsecond stamp every node's times are reported RELATIVE to:
+/// the root request's `requested`. Read once, up front, so the whole tree shares
+/// one origin and the root reads 0.
+///
+/// Falls back to 0 (i.e. absolute epoch-ms) only when the root has no
+/// `requested` to anchor on — which, since `requested` is the first event a run
+/// writes, means the root has no record at all and the walk renders nothing.
+fn baseline_of(config: &Config, arg_tree: &str) -> u64 {
+    read(config, arg_tree).requested_at().unwrap_or(0)
+}
+
+/// A wall-clock microsecond stamp, expressed as MILLISECONDS relative to
+/// `baseline`. Signed, because reused work ran in an earlier run and so is
+/// legitimately before the baseline.
+fn rebase(ts: u64, baseline: u64) -> i64 {
+    (ts as i64 - baseline as i64) / 1000
 }
 
 /// Render `arg_tree`'s subtree, or None if it has nothing to show.
@@ -385,12 +418,17 @@ pub(crate) fn serve(
 /// `budget` bounds the whole walk. The tree is read from records that a
 /// concurrent run is still appending to, so a malformed or circular set of
 /// child edges must not turn a status request into an unbounded traversal.
+///
+/// `baseline` is the root request's `requested` time (absolute µs); every
+/// node's reported times are milliseconds relative to it. It is the same value
+/// for the whole walk, so the root reads 0 and the tree shares one origin.
 fn walk(
     config: &Config,
     arg_tree: &str,
     prefix: Option<&str>,
     view: View,
     parent_started: Option<u64>,
+    baseline: u64,
     budget: &mut usize,
 ) -> Option<Node> {
     const MAX_NODES: usize = 10_000;
@@ -427,7 +465,7 @@ fn walk(
     let reused = parent_started
         .is_some_and(|started| record.ended().is_some_and(|(ended, _)| ended < started));
     if reused {
-        return Some(leaf(config, arg_tree, prefix, &record, true));
+        return Some(leaf(config, arg_tree, prefix, &record, true, baseline));
     }
 
     // A promise that produced a handler HAS MOVED to that handler: the
@@ -464,6 +502,7 @@ fn walk(
                 carried.as_deref(),
                 view,
                 parent_started,
+                baseline,
                 budget,
             );
         }
@@ -484,7 +523,15 @@ fn walk(
             // a child usually names itself (a `run` step is often another
             // tool's ArgTree, `help` and all).
             let label = matches!(via.as_str(), "map" | "eval").then_some(name);
-            walk(config, &child, label.as_deref(), view, started, budget)
+            walk(
+                config,
+                &child,
+                label.as_deref(),
+                view,
+                started,
+                baseline,
+                budget,
+            )
         })
         .collect();
     if view == View::Complete {
@@ -495,12 +542,13 @@ fn walk(
                 carried.as_deref(),
                 view,
                 started,
+                baseline,
                 budget,
             ));
         }
     }
 
-    let mut node = leaf(config, arg_tree, prefix, &record, false);
+    let mut node = leaf(config, arg_tree, prefix, &record, false, baseline);
     node.children = children;
     Some(node)
 }
@@ -512,6 +560,7 @@ fn leaf(
     prefix: Option<&str>,
     record: &Record,
     reused: bool,
+    baseline: u64,
 ) -> Node {
     // The prefix alone, when the node has no name of its own. Appending the
     // image to a named map child gives every line of a fan-out the SAME sixty
@@ -527,8 +576,8 @@ fn leaf(
     Node {
         arg_tree: arg_tree.to_string(),
         name,
-        requested: record.requested_at(),
-        started: record.started_at(),
+        requested: record.requested_at().map(|ts| rebase(ts, baseline)),
+        started: record.started_at().map(|ts| rebase(ts, baseline)),
         out_trace: record.out_traces(),
         reused,
         children: Vec::new(),

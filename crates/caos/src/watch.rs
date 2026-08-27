@@ -41,8 +41,8 @@ const MAX_NAME: usize = 58;
 /// bake-anchor change (`lint-bake-anchor.sh`) for four fields.
 struct Node {
     name: String,
-    requested: Option<u64>,
-    started: Option<u64>,
+    requested: Option<i64>,
+    started: Option<i64>,
     children: Vec<Node>,
 }
 
@@ -55,8 +55,8 @@ impl Node {
         }
         Some(Self {
             name: value["name"].as_str().unwrap_or("(unnamed)").to_string(),
-            requested: value["requested"].as_u64(),
-            started: value["started"].as_u64(),
+            requested: value["requested"].as_i64(),
+            started: value["started"].as_i64(),
             children: value["children"]
                 .as_array()
                 .map(|kids| kids.iter().filter_map(Node::parse).collect())
@@ -90,6 +90,14 @@ impl Watch {
         let (server, arg_tree) = (server.to_string(), arg_tree.to_string());
         let thread = std::thread::spawn(move || {
             let mut drawn = 0usize;
+            // The origin of the server's relative timeline, in OUR clock. The
+            // server reports node times as ms since the root request's
+            // `requested`, and this watch is started immediately before the
+            // compute request that records it — so our wall clock here is that
+            // moment, to within the request's own latency. Anchoring on it lets
+            // the elapsed counter keep ticking between polls, off local time,
+            // rather than needing the server to re-report a "now".
+            let origin = now_us();
             // The sleep IS the wait for the stop signal, so it ends the instant
             // the run does. A first draw is deliberately one interval away: a
             // run served from cache finishes before it, and flashing a tree at
@@ -110,7 +118,8 @@ impl Watch {
                     continue;
                 };
                 let mut lines = Vec::new();
-                render(&root, 0, &mut lines);
+                let now_rel_ms = (now_us().saturating_sub(origin) / 1_000) as i64;
+                render(&root, 0, now_rel_ms, &mut lines);
                 drawn = draw(drawn, &lines);
             }
             clear(drawn);
@@ -146,17 +155,19 @@ fn fetch(server: &str, arg_tree: &str) -> Result<Option<String>, String> {
 }
 
 /// Flatten the tree into display lines, deepest-last within each parent.
-fn render(node: &Node, depth: usize, out: &mut Vec<String>) {
-    let now = now_us();
+///
+/// `now_ms` is the current instant on the server's relative timeline (ms since
+/// the root request began), so a node's elapsed time is just `now_ms - since`.
+fn render(node: &Node, depth: usize, now_ms: i64, out: &mut Vec<String>) {
     // `requested` with no `started` is a job waiting for capacity, and saying so
     // is most of why this display is worth having: an idle machine mid-run means
     // something is queued, and that is otherwise invisible until it times out.
     let (state, since) = match (node.started, node.requested) {
         (Some(started), _) => ("run", started),
         (None, Some(requested)) => ("queue", requested),
-        (None, None) => ("?", now),
+        (None, None) => ("?", now_ms),
     };
-    let secs = now.saturating_sub(since) / 1_000_000;
+    let secs = (now_ms - since).max(0) / 1_000;
     // The state/elapsed columns come first and the DEPTH indents the name, so
     // the numbers stay in one column however deep the tree goes — a nested tree
     // whose times step rightwards with it is unreadable as a scan.
@@ -167,7 +178,7 @@ fn render(node: &Node, depth: usize, out: &mut Vec<String>) {
         indent = depth * 2
     ));
     for child in &node.children {
-        render(child, depth + 1, out);
+        render(child, depth + 1, now_ms, out);
     }
 }
 
@@ -258,7 +269,7 @@ fn now_us() -> u64 {
 mod tests {
     use super::*;
 
-    fn node(name: &str, requested: Option<u64>, started: Option<u64>) -> Node {
+    fn node(name: &str, requested: Option<i64>, started: Option<i64>) -> Node {
         Node {
             name: name.to_string(),
             requested,
@@ -270,18 +281,18 @@ mod tests {
     #[test]
     fn a_queued_job_is_marked_as_waiting_not_running() {
         let mut lines = Vec::new();
-        render(&node("build", Some(now_us()), None), 0, &mut lines);
+        render(&node("build", Some(0), None), 0, 1_000, &mut lines);
         assert!(lines[0].contains("queue"), "got: {}", lines[0]);
         assert!(!lines[0].contains("run"), "got: {}", lines[0]);
     }
 
     #[test]
     fn children_are_indented_under_their_parent_but_the_columns_stay_put() {
-        let mut root = node("test", Some(now_us()), Some(now_us()));
+        let mut root = node("test", Some(0), Some(0));
         root.children
-            .push(node("chat-offline: run one test", Some(now_us()), None));
+            .push(node("chat-offline: run one test", Some(10), None));
         let mut lines = Vec::new();
-        render(&root, 0, &mut lines);
+        render(&root, 0, 1_000, &mut lines);
         assert_eq!(lines.len(), 2);
         // The state column is at the same offset on both lines; only the name
         // moves right.

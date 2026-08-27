@@ -4509,7 +4509,7 @@ pub fn compute_client_request_with_store(
 /// runner would pull for this image.
 ///
 /// The point is the git-docker case: the server converts the tree (base +
-/// layer<NN> + config) into a registry digest and caches it, but until now that
+/// `layer<NN>` + config) into a registry digest and caches it, but until now that
 /// digest was reachable only by RUNNING the image. Anything that wants to hand
 /// the converted image somewhere else — copy it to another registry, submit it
 /// to a platform — had to rebuild it, duplicating `convert_git_image`'s

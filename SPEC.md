@@ -263,6 +263,8 @@ A name is qualified by a prefix, `<prefix>: <name>`:
 
 Names are for display and may be truncated to fit; the arg trees are what forensics reads
 
+Each rendered node reports its `requested` and `started` times in milliseconds relative to the root request's `requested` time -- the root reads 0, every other node reads how long after the run began it reached that state, and work reused from an earlier run reads negative. The stored record keeps absolute times (they are compared across runs and processes); the relative ms are a rendering of them, for a human reading one run's tree
+
 `GET /status/<arg tree hash>?all=1` asks what HAPPENED rather than what is happening:
 - Nothing is skipped for being finished, and a completion arg tree is rendered as a CHILD of the node that promised it rather than replacing it. The shape is then the run's actual structure, which is what one run is diffed against another
 - A node whose record ended before its parent started was REUSED by this run rather than performed by it. It is marked and not descended into: its children belong to the run that did the work, and following them would splice another invocation's tree into this one
