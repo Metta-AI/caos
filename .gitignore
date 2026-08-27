@@ -1,8 +1,9 @@
-/target
-/rust/target
-/result
-/result-*
-.direnv/
+/.direnv/
 /.caos-dev/
 /.caos-data/
-/.caos-secrets/
+/.caos-secrets
+/result
+/result-*
+/target
+# Everything cargo compiles lives under rust/, so its target dir does too.
+/rust/target

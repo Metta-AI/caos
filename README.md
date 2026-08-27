@@ -327,6 +327,11 @@ normative; the shape follows from three constraints:
 `GET /status/<argTreeHash>` renders the **live** view over those records: work
 that is wholly finished is skipped, a promise resolves to the handler it moved
 to, and anything with children renders as a parent with its children beneath it.
+Each node's `requested`/`started` are reported in **milliseconds relative to the
+root request's `requested`** — the root reads 0, a child reads how long into the
+run it was admitted, and reused work (from an earlier run) reads negative — so
+the numbers are readable at a glance rather than sixteen digits of absolute
+unix-µs.
 `?all=1` asks the other question — what *happened* — and answers it differently:
 nothing is skipped, a handler hangs off the node that promised it rather than
 replacing it, so the shape is the run's actual structure, and a node whose work
@@ -394,7 +399,7 @@ putting it in a curried worker. A minimal per-device setup is:
 
 # .caos-secrets/anthropic-api-key
 name=anthropic-api-key
-value:@=/absolute/path/to/anthropic-api-key
+value:@=.anthropic-api-key-value
 reader=DEEP-DEPS/llm-step
 reader=DEEP-DEPS/llm-call
 ```

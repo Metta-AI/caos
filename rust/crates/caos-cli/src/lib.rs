@@ -1110,9 +1110,10 @@ fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
         "conversations need an Anthropic API key. Create the git-ignored file \
          `.caos-secrets/{MODEL_API_SECRET}` with:\n\n\
          name={MODEL_API_SECRET}\n\
-         value:@=/absolute/path/to/your/anthropic-api-key\n\
+         value:@=.anthropic-api-key-value\n\
          reader=DEEP-DEPS/llm-step\n\
          reader=DEEP-DEPS/llm-call\n\n\
+         Store the key in `.caos-secrets/.anthropic-api-key-value`.\n\n\
          Then run `{invoked_as} secrets` to add cache-isolation entropy. \
          See the README's Secrets section for details."
     ))

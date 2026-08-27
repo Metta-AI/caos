@@ -139,7 +139,7 @@ name=<name>
 entropy=...
 # Inline secret
 value=<secret key>
-# External key
+# External key. Relative paths resolve from this secret file's directory.
 value:@=<file containing key>
 # A reader is a PATH to an expression, without arguments. It is eval-path'd to
 # an arg tree
@@ -262,6 +262,8 @@ A name is qualified by a prefix, `<prefix>: <name>`:
 - Descending into a map-then or eval child, the child's own name from the parent replaces the prefix: it is separate work, not a later stage. A run-then or exact-request child takes no prefix, because the name there is the child's position in the continuation rather than a description of it, and such a child usually names itself
 
 Names are for display and may be truncated to fit; the arg trees are what forensics reads
+
+Each rendered node reports its `requested` and `started` times in milliseconds relative to the root request's `requested` time -- the root reads 0, every other node reads how long after the run began it reached that state, and work reused from an earlier run reads negative. The stored record keeps absolute times (they are compared across runs and processes); the relative ms are a rendering of them, for a human reading one run's tree
 
 `GET /status/<arg tree hash>?all=1` asks what HAPPENED rather than what is happening:
 - Nothing is skipped for being finished, and a completion arg tree is rendered as a CHILD of the node that promised it rather than replacing it. The shape is then the run's actual structure, which is what one run is diffed against another
