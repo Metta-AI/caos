@@ -195,9 +195,9 @@ CAOS_STACK_REGISTRY=no \
 CAOS_STACK_RUNNERD=yes \
 CAOS_STACK_SEEDER=yes \
 CAOS_CACHE_NAMESPACE="$namespace" \
-CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-2}" \
+CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-48}" \
 CAOS_STACK_TEST_RUNNERD=yes \
-CAOS_TEST_RUNNER_SLOTS="${CAOS_TEST_RUNNER_SLOTS:-8}" \
+CAOS_TEST_RUNNER_SLOTS="${CAOS_TEST_RUNNER_SLOTS:-2}" \
 CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
 CAOS_DOCKER_BIN=podman \
 CAOS_DOCKER_ARGS="--root $engine_store/store --runroot $engine_store/run" \
@@ -256,3 +256,10 @@ fi
 phase "done"
 ln -sfn "$inputs/bin" "$state/bin"
 echo "==> dev stack ready (client: $state/bin/caos-cli)" >&2
+# WHICH POOLS EXIST, from the runnerds themselves. The slot counts are set three
+# files away (here -> stack/serve -> runnerd) and nothing else reports them, so a
+# pool that silently did not start, or started with the wrong `required`, looked
+# exactly like a pool that was not binding.
+# `1>&2` BEFORE `2>/dev/null`: the other order points stdout at the fd that has
+# just become /dev/null, so the whole diagnostic vanishes (it did).
+grep -h "caos-runnerd:" "$state"/logs/runnerd.log "$state"/logs/test-runnerd.log 1>&2 2>/dev/null || true
