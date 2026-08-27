@@ -42,7 +42,7 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 # name. One function so a new one is added in one place rather than three, which
 # is how the old version of this lost `--only` for a while.
 forwarded() {
-  for a in only test-salt; do
+  for a in only test-salt max-parallel; do
     if [ -e "/cas/args/$a" ]; then printf '%s ' "--$a:@=/cas/args/$a"; fi
   done
 }
@@ -178,7 +178,19 @@ fanout)
   then_img=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
     "--start-time=$(date +%s)") || fail "currying the summarize stage"
-  caos map-then /cas/sel --map:hash="$map" --then:hash="$then_img"
+  # HOW MANY TESTS RUN AT ONCE, and the only place that can say it. A runner
+  # pool bounds CONTAINERS, and a test that has recorded a continuation and
+  # exited holds none while the work it is waiting for runs — so capping slots
+  # left all 46 tests in flight. A map child's thread spans its whole chain,
+  # continuations included, so bounding children here bounds TESTS.
+  if [ -e /cas/args/max-parallel ]; then
+    caos get /cas/args/max-parallel
+    mp=$(cat /cas/args/max-parallel)
+  else
+    mp=8
+  fi
+  parallel=("--max-parallel=$mp")
+  caos map-then /cas/sel --map:hash="$map" --then:hash="$then_img" "${parallel[@]}"
   ;;
 
 summarize)

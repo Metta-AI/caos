@@ -82,6 +82,14 @@ if [ -e /cas/args/only ]; then
   caos get /cas/args/only
   args+=("--only=$(cat /cas/args/only)")
 fi
+# HOW MANY TESTS RUN AT ONCE. Passed through to the suite's `map-then`, which is
+# the only place that can bound it — a runner-slot cap bounds CONTAINERS, and a
+# test waiting on a sub-run holds none. Absent means all of them, which is what
+# this always did.
+if [ -e /cas/args/max-parallel ]; then
+  caos get /cas/args/max-parallel
+  args+=("--max-parallel=$(cat /cas/args/max-parallel)")
+fi
 
 # A SECRET STORE DOES NOT CROSS A STACK. It is built by the client from its own
 # `.caos-secrets` and shipped in a header, and the server grants a secret to any
@@ -192,7 +200,7 @@ echo "==> suite request $suite_req (caos-cli status --all $suite_req)" >&2
 # Printed rather than left to be reconstructed: the suite's request hash is
 # knowable only here, and without it the trace is unreachable.
 echo "==> full trace JSON:" >&2
-echo "    curl -s localhost:9090/status/$suite_req?all=1 | jq ." >&2
+echo "    curl -s localhost:9090/status/$suite_req?all=1 | jless" >&2
 
 phase "running the suite"
 status=0
@@ -213,7 +221,7 @@ chmod u+w /tmp/suite/report
 { echo
   echo "full trace (the host reads the dev stack's records — a trace key carries"
   echo "no cache namespace, so both stacks write to the one redis):"
-  echo "  curl -s localhost:9090/status/$suite_req?all=1 | jq ."
+  echo "  curl -s localhost:9090/status/$suite_req?all=1 | jless"
   echo
   echo "and while a run is in flight, CAOS_WATCH_LINES=0 shows every node"
   echo "instead of the first 16."

@@ -514,7 +514,7 @@ fn usage(args: &[String]) -> String {
          {prog} put-commit <src-file> <cas-path>\n  \
          {prog} hash <cas-path>\n  \
          {prog} forward <src-cas-path> <dst-cas-path>\n  \
-         {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n  \
+         {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n      [--max-parallel=<n>]\n  \
          {prog} run-then <in-cas-path> --run:<type>=<image> [--then:<type>=<image>] [--catch]\n  \
          {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \

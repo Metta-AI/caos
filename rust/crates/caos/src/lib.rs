@@ -3241,18 +3241,52 @@ fn assemble_arg_tree(
 /// and resolved through the same path a `--base` takes (`resolve_base`).
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
+///
+/// `--max-parallel=<n>` bounds how many children are IN FLIGHT at once; absent,
+/// all of them are, which is what this always did. It is the only way to bound a
+/// fan-out, because the runner pool bounds CONTAINERS and a child that has
+/// recorded a continuation and exited holds no container while the work it is
+/// waiting for runs — so a 46-way map reaches 46 children in flight however few
+/// runner slots exist. The server holds one thread per in-flight child, spanning
+/// that child's whole chain, which is exactly the quantity being bounded.
 pub fn caos_map_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
+    // The WIDTH is checked here, where the caller can see it. The server checks
+    // it too, but a continuation is resolved long after the worker that recorded
+    // it has exited — so a bad width discovered there is a failure with nobody
+    // left to tell. Zero is the one worth naming: it reads as "no parallelism"
+    // and would mean "no child ever runs".
+    for kv in kvs {
+        if let Some(value) = kv.strip_prefix("--max-parallel=") {
+            match value.parse::<usize>() {
+                Ok(n) if n >= 1 => {}
+                _ => {
+                    return Err(format!(
+                        "`map-then --max-parallel` wants a positive integer, got {value:?}"
+                    ))
+                }
+            }
+        }
+    }
     record_continuation(
         t,
         "map-then",
         ContinuationSubject::Input(input),
         kvs,
         &["map", "then"],
-        &[],
+        // `max-parallel` is a LITERAL, recorded verbatim: it is a count, not an
+        // image to resolve.
+        &["max-parallel"],
         &[],
         |given| {
             if given.is_empty() {
                 return Err("`map-then` needs --map and/or --then".to_string());
+            }
+            if given.contains(&"max-parallel") && !given.contains(&"map") {
+                return Err(
+                    "`map-then --max-parallel` needs --map: it bounds the fan-out, and \
+                     without a --map there is nothing to fan out"
+                        .to_string(),
+                );
             }
             Ok(())
         },

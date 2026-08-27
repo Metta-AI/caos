@@ -977,6 +977,7 @@ fn resolve_promise(
     let (mut map, mut run, mut then) = (None, None, None);
     let mut eval = None;
     let mut catch = false;
+    let mut max_parallel: Option<usize> = None;
     for entry in fetch_tree(config, cont)
         .map_err(|e| HttpError::new(500, format!("reading continuation {cont}: {e}")))?
     {
@@ -997,6 +998,23 @@ fn resolve_promise(
             "eval" => eval = Some(blob_string(config, &entry.oid.to_string())?),
             // Presence is the whole signal; the content is unread.
             "catch" => catch = true,
+            // How many map children may be IN FLIGHT at once. Absent means all
+            // of them, which is what this always did.
+            "max-parallel" => {
+                let text = blob_string(config, &entry.oid.to_string())?;
+                max_parallel = Some(text.trim().parse::<usize>().map_err(|_| {
+                    HttpError::new(
+                        400,
+                        format!("continuation {cont}: max-parallel must be a positive integer, got {text:?}"),
+                    )
+                })?);
+                if max_parallel == Some(0) {
+                    return Err(HttpError::new(
+                        400,
+                        format!("continuation {cont}: max-parallel must be at least 1"),
+                    ));
+                }
+            }
             other => {
                 return Err(HttpError::new(
                     500,
@@ -1021,54 +1039,73 @@ fn resolve_promise(
     // runs an already-complete ArgTree unchanged.
     let mid: Option<(gix::objs::tree::Entry, String, bool)> = if let Some(img) = &map {
         let input = input.as_ref().expect("validated input");
-        // Map the children in parallel — one thread per child, each a full
-        // [`run_work_request`] (so a child may itself promise). Concurrency is bounded by
-        // the runner pool, not the thread count; threads are cheap and mostly
-        // blocked. A blob `in` is a leaf: nothing to map, an empty children tree.
+        // Map the children in parallel — each a full [`run_work_request`], so a
+        // child may itself promise and this thread is held for its WHOLE chain,
+        // continuations included. A blob `in` is a leaf: nothing to map, an
+        // empty children tree.
+        //
+        // `--max-parallel` bounds how many are in flight. Without it the bound
+        // is the runner pool, which is a bound on CONTAINERS and therefore not a
+        // bound on children at all: a child that has recorded a continuation and
+        // exited holds no slot while the work it is waiting for runs, so a
+        // fan-out of 46 reaches 46 in flight however few slots exist. Bounding
+        // it here is the only place the two coincide, because a child's thread
+        // spans exactly the child's life.
+        //
+        // A FIXED SET OF THREADS PULLING AN INDEX, not chunks of N: chunking
+        // would gate each group on its slowest member, which for a test suite is
+        // the difference between the cap costing nothing and costing the tail of
+        // every batch.
         let children: Vec<gix::objs::tree::Entry> = if input.mode.is_tree() {
             let kids = fetch_tree(config, &input.oid.to_string())
                 .map_err(|e| HttpError::new(500, format!("reading map source: {e}")))?;
-            let results: Vec<Result<gix::objs::tree::Entry, HttpError>> =
-                std::thread::scope(|scope| {
-                    let handles: Vec<_> = kids
-                        .iter()
-                        .map(|kid| {
-                            let img = img.as_str();
-                            scope.spawn(move || {
-                                let arg = named_entry("in", kid.mode, kid.oid);
-                                let result = run_image(
-                                    config,
-                                    img,
-                                    vec![arg],
-                                    salt,
-                                    stack,
-                                    secrets,
-                                    // The map entry's own name — which for the
-                                    // test suite is the test name, and is the
-                                    // only thing that gives a 29-way fan-out
-                                    // readable nodes. A `help` lookup cannot:
-                                    // children are curried from `base`, not
-                                    // from the tool's own ArgTree, so the
-                                    // tool's help is not in their lineage.
-                                    |arg_tree| {
-                                        crate::status::child(
-                                            config, parent, "map", &kid.name, arg_tree,
-                                        )
-                                    },
-                                )?;
-                                result_entry(&kid.name, &result)
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join().unwrap_or_else(|_| {
-                                Err(HttpError::new(500, "a map worker thread panicked"))
-                            })
-                        })
-                        .collect()
-                });
+            let width = max_parallel.unwrap_or(kids.len()).min(kids.len()).max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            // One slot per child, filled by whichever thread takes that index —
+            // so results stay in the input's order however they interleave.
+            let slots: Vec<Mutex<Option<Result<gix::objs::tree::Entry, HttpError>>>> =
+                (0..kids.len()).map(|_| Mutex::new(None)).collect();
+            std::thread::scope(|scope| {
+                for _ in 0..width {
+                    let (kids, next, slots) = (&kids, &next, &slots);
+                    let img = img.as_str();
+                    scope.spawn(move || loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(kid) = kids.get(i) else { return };
+                        let outcome = (|| {
+                            let arg = named_entry("in", kid.mode, kid.oid);
+                            let result = run_image(
+                                config,
+                                img,
+                                vec![arg],
+                                salt,
+                                stack,
+                                secrets,
+                                // The map entry's own name — which for the
+                                // test suite is the test name, and is the
+                                // only thing that gives a 29-way fan-out
+                                // readable nodes. A `help` lookup cannot:
+                                // children are curried from `base`, not
+                                // from the tool's own ArgTree, so the
+                                // tool's help is not in their lineage.
+                                |arg_tree| {
+                                    crate::status::child(config, parent, "map", &kid.name, arg_tree)
+                                },
+                            )?;
+                            result_entry(&kid.name, &result)
+                        })();
+                        *slots[i].lock().expect("map result slot") = Some(outcome);
+                    });
+                }
+            });
+            let results: Vec<Result<gix::objs::tree::Entry, HttpError>> = slots
+                .into_iter()
+                .map(|slot| {
+                    slot.into_inner()
+                        .expect("map result slot")
+                        .unwrap_or_else(|| Err(HttpError::new(500, "a map worker thread panicked")))
+                })
+                .collect();
             // Every child ran to completion (or failure) before we got here; the
             // first failure fails the whole map, exactly like a failing child in
             // the old blocking recursion.
