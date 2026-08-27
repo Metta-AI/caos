@@ -28,7 +28,17 @@ use conversation_protocol::{
 };
 
 const MAX_APPEND_ATTEMPTS: usize = 32;
-const MODEL_API_SECRET: &str = "anthropic-api-key";
+/// Local-store name of the conversation model credential (`/secret/<name>` in
+/// the granted workers). Public alongside its companions below so the tui's
+/// first-run setup writes exactly the store entry this crate requires.
+pub const MODEL_API_SECRET: &str = "anthropic-api-key";
+/// Canonical dotfile inside `.caos-secrets/` holding the key's value when the
+/// store keeps it locally (README "Secrets"). A dotfile: the store loader
+/// treats dot-prefixed entries as metadata, never as a second secret.
+pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
+/// The readers granted the model credential: both conversation LLM workers
+/// (the turn engine, and the stateless title/auxiliary caller).
+pub const MODEL_API_SECRET_READERS: [&str; 2] = ["DEEP-DEPS/llm-step", "DEEP-DEPS/llm-call"];
 const AUTO_NAME_PREFIX: &str = "talk-";
 const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin/master"];
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -1096,27 +1106,59 @@ fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
     if store.iter().any(|secret| secret.name() == MODEL_API_SECRET) {
         return Ok(());
     }
-    // The shipped `caos`/`caos-cli` wrapper records its runtime $0 before
-    // replacing argv[0] with the stable name used by usage diagnostics. That
-    // keeps this recovery command bound to the checkout or profile binary the
-    // person actually invoked. Direct cargo-built binaries fall back to their
-    // own argv[0].
-    let invoked_as = std::env::var_os("CAOS_INVOKED_AS")
+    Err(format!(
+        "conversations need an Anthropic API key. Run `{} tui` to be prompted \
+         for one (it writes the secret, its entropy, and the ignore rule for \
+         you), or {}",
+        invoked_as(),
+        model_secret_manual_setup()
+    ))
+}
+
+/// The command name recovery instructions should print. The shipped
+/// `caos`/`caos-cli` wrapper records its runtime $0 in `CAOS_INVOKED_AS` before
+/// replacing argv[0] with the stable name used by usage diagnostics; reading it
+/// keeps a recovery command bound to the checkout or profile binary the person
+/// actually invoked. Direct cargo-built binaries fall back to their own
+/// argv[0].
+fn invoked_as() -> String {
+    std::env::var_os("CAOS_INVOKED_AS")
         .or_else(|| std::env::args_os().next())
         .filter(|command| !command.is_empty())
         .map(|command| command.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "caos-cli".to_string());
-    Err(format!(
-        "conversations need an Anthropic API key. Create the git-ignored file \
-         `.caos-secrets/{MODEL_API_SECRET}` with:\n\n\
+        .unwrap_or_else(|| "caos-cli".to_string())
+}
+
+/// The by-hand setup steps for the model credential, phrased to complete a
+/// sentence ("… or {this}" / "To set the key up by hand, {this}"). One text
+/// shared by the missing-secret error and the tui setup's abort path, so the
+/// two never drift.
+pub fn model_secret_manual_setup() -> String {
+    format!(
+        "create the git-ignored file `.caos-secrets/{MODEL_API_SECRET}` with:\n\n\
          name={MODEL_API_SECRET}\n\
-         value:@=.anthropic-api-key-value\n\
-         reader=DEEP-DEPS/llm-step\n\
-         reader=DEEP-DEPS/llm-call\n\n\
-         Store the key in `.caos-secrets/.anthropic-api-key-value`.\n\n\
-         Then run `{invoked_as} secrets` to add cache-isolation entropy. \
-         See the README's Secrets section for details."
-    ))
+         value:@={MODEL_API_SECRET_VALUE_FILE}\n\
+         reader={}\n\
+         reader={}\n\n\
+         Store the key in `.caos-secrets/{MODEL_API_SECRET_VALUE_FILE}` (no \
+         trailing newline — the value is used verbatim).\n\n\
+         Then run `{} secrets` to add cache-isolation entropy. \
+         See the README's Secrets section for details.",
+        MODEL_API_SECRET_READERS[0],
+        MODEL_API_SECRET_READERS[1],
+        invoked_as(),
+    )
+}
+
+/// Whether the conversation model credential is absent from an otherwise
+/// loadable store — the "offer to set one up" case. Distinct from a store that
+/// fails to load at all (unreadable value file, unresolvable reader): that is
+/// someone's existing configuration broken, reported as the error it is rather
+/// than papered over with a setup prompt.
+pub fn model_secret_missing(t: &GitTransport) -> Result<bool, String> {
+    Ok(build_secret_store(t)?
+        .iter()
+        .all(|secret| secret.name() != MODEL_API_SECRET))
 }
 
 fn conversation_secret_store(t: &GitTransport) -> Result<Vec<ClientSecret>, String> {
