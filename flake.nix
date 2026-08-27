@@ -1276,6 +1276,7 @@
             # the fly backend (apps, machines, logs). caosd itself talks to the
             # Machines API + registry over HTTP and does not need this.
             pkgs.flyctl
+            pkgs.jless
           ];
         };
       }
