@@ -591,6 +591,12 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
     // store survive here without any bootstrap step.
     if grants.sys_admin {
         command.args(["--cap-add", "SYS_ADMIN"]);
+        // A nested container engine needs more than the capability: pivot_root
+        // and keyctl are blocked by the default seccomp profile even with
+        // SYS_ADMIN, so crun dies with "OCI permission denied" before the
+        // container starts. Unconfined is the standard answer for a container
+        // that runs its own engine — and this grant already implies that trust.
+        command.args(["--security-opt", "seccomp=unconfined"]);
     }
     for dev in &grants.devices {
         command.args(["--device", dev]);

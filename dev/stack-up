@@ -136,7 +136,11 @@ command -v podman >/dev/null 2>&1 || fail "no podman in this image"
 # Only when it is worth doing: repacking 288 MB on every bring-up would be a
 # tax on a step that is otherwise seconds.
 phase "counting packs"
-packs=$(find "$state/git/objects/pack" -name '*.pack' 2>/dev/null | wc -l)
+if [ -d "$state/git/objects/pack" ]; then
+  packs=$(find "$state/git/objects/pack" -name '*.pack' | wc -l)
+else
+  packs=0
+fi
 if [ "$packs" -gt 16 ]; then
   echo "==> repacking the dev repo ($packs packs)" >&2
   git -C "$state/git" repack -adkq || fail "repacking the dev repo"
