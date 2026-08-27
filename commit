@@ -1,0 +1,71 @@
+Run the test suite as caos jobs on a dev stack
+
+The suite runs inside caos now. Every test is an entry (.caos-expr +
+DEPS + worker.sh), the suite is a map-then fan-out, and the dev stack
+is brought up inside a test-stack container with its own podman.
+
+What changed, and why:
+
+TESTS ARE ENTRIES. Each test carries .caos-expr, DEPS and worker.sh
+(was cli.sh). The old tests/lib/run-test.sh harness is gone; running a
+test is evaluating it. dev/run-test stages each test through eval,
+launch and verdict as a chain of continuations.
+
+MOST TESTS ARE WORKER TESTS. 35 of 46 tests were client tests that
+cp -rL'd built images into a worktree; only 11 actually test the
+client. Converting them (std/bash or dev/worker-test base instead of
+dev/cli-test) took the salted suite from 29 client tests to 11.
+dev/worker-test is a new image: git and tools, no client, no repo.
+
+ONE NIX BUILD PER STACK BRING-UP. The flake produces caos-test-stack-
+inputs (binaries + images), and dev/stack-up consumes it. Same path on
+the host (caosd up) and inside the dev stack. build-builtins.sh is the
+publisher in both.
+
+EVERYTHING CARGO COMPILES LIVES UNDER rust/. Cargo.toml, Cargo.lock,
+rust-toolchain.toml, crates/ all moved there. This lets a test declare
+the workspace as a dependency (../../rust rust in DEPS) instead of
+being handed the whole repo, and it retired a cleanCargoSource exclusion
+that made editing test fixtures rebuild 176 deps. This is used by the
+lint test
+
+ONE flake.lock. Per-entry locks are gone; the root lock is DEPped and
+the flake-builder places it. One lock to update, no lint to keep copies
+honest. This required making deep-deps allow deps on files in addition
+to dirs
+
+THE DEV STACK RUNS ITS OWN PODMAN. Workers run with --network=host
+inside the test-stack container, so they reach the server at 127.0.0.1.
+No engine socket grant, no sibling containers on the host.
+
+map-then --max-parallel BOUNDS THE FAN-OUT. A runner pool bounds
+containers, but a test that has recorded a continuation and exited holds
+no container while the work it waits for runs. --max-parallel bounds
+the server threads that drive map children. Default 8, measured by
+sweeping 4-46: 8 is consistently fastest (36-38s wall), unbounded (46)
+is worst (~55s) from container engine contention.
+
+The server understands required args when matching work to a runner.
+Previously, there was no way to prevent a generic runner from running
+something specific. We added this to force tests to run on a test runner
+with its own pool. That wasn't enough and we still needed max-parallel
+on run-then, but it allowed us to prevent the generic runner from trying
+to run work that should be provided by pinned core results, so we kept
+it. This prompted us to thread the required-pool arg through to
+continuations automatically
+
+FIX NESTED CONTAINERS ON ORBSTACK. Two issues: find ... | wc -l under
+pipefail exits the script when the pack directory doesn't exist on a
+fresh machine; and CAP_SYS_ADMIN alone doesn't let crun do pivot_root
+inside a nested container — added --security-opt seccomp=unconfined.
+
+Also: jless in the dev shell, /status times in milliseconds relative to
+the root request, a /status walk can no longer abort the server,
+chat-online reads its key from /secret, tests/std-lint becomes
+tests/lint, deep-deps supports file dependencies, phase markers in
+caos-tools/test, dev stack traces join the host's trace tree.
+
+- Traces, when fetched over http, now show times in ms and relative to
+  the request time of the root, to be more readable
+- The number of trace lines shown by run and run-tool can be controlled
+  with CAOS_WATCH_LINES
