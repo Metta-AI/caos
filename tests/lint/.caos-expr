@@ -1,0 +1,13 @@
+# tests/lint, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST, and it never was anything else: the two lints read files and
+# run grep, with no caos call, no compile and no client between them. It named
+# dev/cli-test only to get a container with a filesystem in it.
+#
+# THE TREE TO CHECK IS NOT AN ARGUMENT HERE. `std` carries a `.caos-expr`, so
+# `--std:@=DEEP-DEPS/std` would EVALUATE it — building every std entry to lint
+# three Cargo.toml files. The deepened tree arrives anyway: dev/run-test runs a
+# test with `run-then <the test's own tree>`, so `/cas/args/in/DEEP-DEPS` is
+# exactly these mounts, unevaluated.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --src-lint:@=lint-flake-src.sh --bake-lint:@=lint-bake-anchor.sh

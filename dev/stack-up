@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# dev/stack-up — bring a dev stack up inside this worker, and publish std into
+# it. Run from a materialized workspace, in the std/dev image.
+#
+# THE `dev` PLACEMENT. stack/serve's header names the others — `test`, `host`,
+# `seed` — and says the container is the caller's decision, not the script's.
+# This one is shaped like `test`: the server, runnerd and seeder are children of
+# this container and die with it. Nothing is launched as a sibling, so nothing
+# collides with the host stack's container, aliases or ports.
+#
+# WHAT IT SHARES, and why each is safe:
+#
+#   /nix          a granted volume. Content-addressed, and nix locks per
+#                 derivation, so concurrent dev stacks build against one store.
+#   /caos-dev/git a granted volume. Git is built for concurrent writers —
+#                 objects are write-temp-rename, ref updates take lockfiles —
+#                 and GC is off here, so there is no pruning race either.
+#   redis         the HOST's, shared. Not a volume: two redis servers cannot
+#                 share a directory (both start, neither locks, and they
+#                 interleave one AOF between two disagreeing datasets), so
+#                 stacks that want one cache share the PROCESS.
+#   registry      the host's, by the name that resolves on caos-net. Content
+#                 addressed; design/test-stack-image.md argues sharing it
+#                 "cannot leak behavior — only work".
+#
+# WHAT KEEPS THEM APART is CAOS_CACHE_NAMESPACE, below — not separate storage.
+set -euo pipefail
+
+fail() { echo "stack-up: $*" >&2; exit 1; }
+
+# PHASE MARKERS, same shape as caos-tools/test's: this script is 16 seconds of a
+# 37-second single-test run and the split was invisible.
+S0=$SECONDS
+phase() { echo "==> [stack-up +$((SECONDS - S0))s] $*" >&2; }
+
+inputs=""
+for a in "$@"; do
+  case "$a" in
+    --inputs=*) inputs=${a#--inputs=} ;;
+    *) fail "unrecognised argument: $a" ;;
+  esac
+done
+[ -n "$inputs" ] || fail "stack-up needs --inputs=<dir>; the caller builds, this does not"
+
+state=/caos-dev
+[ -d "$state" ] || fail "no $state — this image must declare it in CAOS_GRANT_VOLUMES"
+[ -f flake.nix ] || fail "no flake.nix in $PWD; run me from a materialized workspace"
+mkdir -p "$state/logs"
+
+# THE WORKSPACE BECOMES A GIT REPO, because `caos-cli` refuses to run outside a
+# working tree (crates/caos/src/lib.rs) and a stack exists to be driven by one.
+# Committed at a FIXED date so the commit is a pure function of the tree: a
+# commit carrying the wall clock would mint a new rev every run, and nix keys
+# its eval cache on the rev when a `.git` is present.
+#
+# `add -Af`: the tree is the truth. A caos `--in` carries what the client
+# pushed, so honouring the extracted `.gitignore` would drop real content.
+phase "git-init the workspace"
+if [ ! -d .git ]; then
+  git init -q -b main
+  phase "git add -Af"
+  git add -Af
+  phase "committing the workspace"
+  GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000" \
+    git -c user.name=caos -c user.email=dev@caos commit -q -m workspace \
+    || fail "committing the workspace"
+fi
+# ---- what this stack is made of --------------------------------------------
+# EVERYTHING IS THE CALLER'S, and this runs no `nix` at all. `--inputs` is one
+# store path — `.#caos-test-stack-inputs` — carrying the daemons under `bin/`
+# and the worker images under `images/`, so ONE evaluation of the flake produces
+# the lot. It used to say the first half of that and then evaluate the flake
+# three more times for the images, which was 12 seconds of a 16-second bring-up
+# against ~1 second to actually start the stack.
+#
+# TEST world, not host: a dev stack is `.#caos-test-stack-inputs`, so a host
+# client is refused by it and vice versa (rust/crates/caos-world). It shares
+# every dependency with the host build — only the thin workspace compile
+# differs. The worker IMAGES are world-neutral userland (no caos binary is baked
+# in; build-builtins composes one on from `CAOS_BUILTIN_BINS`), which is why one
+# set of images serves both.
+phase "checking the stack binaries"
+echo "==> using the stack inputs at $inputs" >&2
+for b in server runnerd core-seeder-runner caos-cli caos; do
+  [ -x "$inputs/bin/$b" ] || fail "no $b in $inputs/bin"
+done
+
+# THE CACHE NAMESPACE IS THE BUILD'S OWN IDENTITY, and it is why several dev
+# stacks can share one redis without answering each other's questions. A nix out
+# path is INPUT-addressed, so it holds still across rebuilds of an unchanged tree
+# whether or not cargo emitted identical bytes — which is exactly the stability
+# design/faster-tests.md could not get from hashing built artifacts, and still
+# records as unresolved.
+#
+# It also closes the staleness CLAUDE.md documents from the other direction: a
+# rebuilt `caos` leaves a seeded sentinel's ArgTree unmoved, so redis would hand
+# back the previous deploy's worker image. A different build is a different
+# namespace, so it cannot.
+namespace=$(basename "$inputs")
+namespace=${namespace%%-*}
+
+# ---- this stack's own engine -----------------------------------------------
+# A PODMAN OF OUR OWN, not the host's through a socket. That is what lets this
+# script go back to the address every other placement uses: workers run with
+# `--network=host`, which inside this container means THIS container's netns, so
+# a worker reaches its own server at 127.0.0.1 — the uniformity stack/serve's
+# header describes ("every placement puts the group in one netns, so there is no
+# address to negotiate"). No IP has to be discovered, advertised, or carried.
+#
+# It also drops the engine-socket grant entirely: this stack's containers are
+# invisible to the host engine, so there are no siblings to collide with, no
+# netns dependents blocking their parent's removal, and nothing of ours left
+# behind on the host if we die badly.
+#
+# The image ships the storage and cgroup config (dev/test-stack/flake.nix), so
+# there is nothing to construct here — runnerd just needs to be told which
+# binary and where its store lives. The store is a granted volume so images
+# survive the container; otherwise every run would re-pull std.
+engine_store=/caos-images
+mkdir -p "$engine_store/store" "$engine_store/run"
+command -v podman >/dev/null 2>&1 || fail "no podman in this image"
+[ -e /dev/fuse ] || fail "no /dev/fuse — the image must declare CAOS_GRANT_DEVICES"
+
+# ---- keep the pack count under gix's slot limit -----------------------------
+# A SHARED, PERSISTENT REPO ACCUMULATES ONE PACK PER PUSH, and gix's object
+# store has a fixed number of slots. At 33 packs the server started answering
+# `reading arg tree: object <oid> not found: The slotmap turned out to be too
+# small with 32 entries, would need 1 more` — which reads as a missing object
+# and is really a full table. Measured, not predicted: the count was 33.
+#
+# `-k` IS LOAD-BEARING. GC is off in a caos repo precisely because almost every
+# object is unreachable from any ref (SPEC), so a repack that dropped unreachable
+# objects would delete most of the store. `-a -d -k` consolidates into one pack
+# and keeps everything.
+#
+# Only when it is worth doing: repacking 288 MB on every bring-up would be a
+# tax on a step that is otherwise seconds.
+phase "counting packs"
+if [ -d "$state/git/objects/pack" ]; then
+  packs=$(find "$state/git/objects/pack" -name '*.pack' | wc -l)
+else
+  packs=0
+fi
+if [ "$packs" -gt 16 ]; then
+  echo "==> repacking the dev repo ($packs packs)" >&2
+  git -C "$state/git" repack -adkq || fail "repacking the dev repo"
+fi
+
+# ---- serve -----------------------------------------------------------------
+#
+# NO COMMENTS INSIDE THE BLOCK BELOW. Every line ends in a backslash, and a
+# continuation followed by a comment joins INTO the comment — the env prefix is
+# severed and serve runs with none of it. Not a parse error, so `bash -n` passes
+# and it surfaces as a stack dying at bring-up over a variable that is right
+# there in the source (CLAUDE.md).
+phase "starting serve"
+ready=$state/stack.ready
+rm -f "$ready"
+echo "==> starting the dev stack (namespace $namespace, own engine at $engine_store)" >&2
+CAOS_STACK_STATE="$state" \
+CAOS_STACK_LOGS="$state/logs" \
+CAOS_STACK_READY="$ready" \
+CAOS_STACK_BIN="$inputs/bin" \
+CAOS_STACK_REDIS=no \
+CAOS_STACK_REDIS_ADDR="${CAOS_DEV_REDIS_ADDR:-caos-redis:6379}" \
+CAOS_STACK_REDIS_PORT=6379 \
+CAOS_STACK_REDIS_PERSIST=no \
+CAOS_STACK_REGISTRY=no \
+CAOS_STACK_RUNNERD=yes \
+CAOS_STACK_SEEDER=yes \
+CAOS_CACHE_NAMESPACE="$namespace" \
+CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-48}" \
+CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
+CAOS_DOCKER_BIN=podman \
+CAOS_DOCKER_ARGS="--root $engine_store/store --runroot $engine_store/run" \
+CAOS_DOCKER_NETWORK=host \
+CAOS_STACK_RUNNER_SERVER_URL=http://127.0.0.1 \
+CAOS_REGISTRY_PULL_HOST="${CAOS_DEV_REGISTRY:-caos-registry:5000}" \
+CAOS_STACK_RUNNER_REDIS_ADDR="${CAOS_DEV_REDIS_ADDR:-caos-redis:6379}" \
+  bash ./stack/serve > "$state/logs/serve.log" 2>&1 &
+serve=$!
+
+# serve dies as a group, so its pid is the whole liveness question.
+for _ in $(seq 1 600); do
+  if [ -e "$ready" ]; then break; fi
+  if ! kill -0 "$serve" 2>/dev/null; then
+    cat "$state/logs/serve.log" >&2
+    fail "the dev stack died during bring-up"
+  fi
+  sleep 0.1
+done
+if [ ! -e "$ready" ]; then
+  cat "$state/logs/serve.log" >&2
+  fail "the dev stack never came up"
+fi
+
+# ---- publish std -----------------------------------------------------------
+# build-builtins.sh, the same call caosd's std_build makes. Not a second
+# expression of it. The seeder picks records up while running — the
+# core-seeder-runner re-reads the seed ref on a timer — so publishing AFTER
+# bring-up is the supported order, and is what `caosd up` does too.
+#
+# CAOS_REGISTRY_BASE_HOST is deliberately untouched: it is written into every
+# delta's `base` blob, so it is DATA, and changing it moves every image hash.
+phase "publishing std"
+echo "==> publishing std" >&2
+CAOS_SERVER_URL=http://127.0.0.1 \
+CAOS_REGISTRY_HTTP="${CAOS_DEV_REGISTRY:-caos-registry:5000}" \
+CAOS_CLI="$inputs/bin/caos-cli" \
+CAOS_CLIENT_REPO="$state/publish-client-repo" \
+CAOS_BUILTIN_IMAGES="$(echo "$inputs"/images/*)" \
+CAOS_BUILTIN_BINS="$inputs" \
+  bash ./build-builtins.sh >&2 || fail "publishing std"
+
+# `caos-cli` pushes over a git remote literally named `caos`
+# (crates/caos/src/lib.rs, CAOS_REMOTE) and refuses to run without one — the
+# same line tests/lib/worker runs for each test's client repo. The
+# workspace is a repo the tool made, so nothing has set it up.
+if git remote get-url caos >/dev/null 2>&1; then
+  git remote set-url caos http://127.0.0.1
+else
+  git remote add caos http://127.0.0.1
+fi
+
+# Where the next command finds a client, as a directory of symlinks: environment
+# does not survive back to the caller, which is a separate process under the
+# same shell.
+phase "done"
+ln -sfn "$inputs/bin" "$state/bin"
+echo "==> dev stack ready (client: $state/bin/caos-cli)" >&2
+grep -h "caos-runnerd:" "$state"/logs/runnerd.log 1>&2 2>/dev/null || true

@@ -1,0 +1,7 @@
+# tests/rust-worker, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Everything it does is dispatch-and-read: build a source into a
+# worker, run it, edit the source, build and run again. `rustc` resolves to the
+# built builder by being named; the two sources are bound as data.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --greeter:@=greeter.rs --edited:@=greeter-edited.rs

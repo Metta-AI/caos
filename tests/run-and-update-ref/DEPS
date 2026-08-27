@@ -1,6 +1,6 @@
-# The test invokes both bases through hashes held in curry blobs, so their
-# seeded build chain must be named explicitly (see design/caos-expr.md).
+# What this test reaches for (format `<path> <name>`).
 ../../std/bash bash
 ../../std/run-and-update-ref run-and-update-ref
-../../std/cargo cargo
-../../std/flake-builder flake-builder
+# The image a WORKER test runs in when std/bash is not enough. This one needs
+# git, for the one thing caos has no verb for: refs on the server.
+../../dev/worker-test worker-test

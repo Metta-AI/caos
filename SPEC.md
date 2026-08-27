@@ -271,6 +271,30 @@ Each rendered node reports its `requested` and `started` times in milliseconds r
 
 While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
 
+# Building and testing caos, including inside caos
+
+Caos can be built and tested on a host with just what's defined in flake.nix with ordinary commands like:
+- `nix build`
+- `result/bin/caosd up`
+- `result/bin/caos-cli run dev/run-tests` (`dev/run-tests` is a caos expr that depends on /tests and runs them all on the current stack. If you run this on the host, you use the host stack. But the world test might fail. The normal usage inside the test container.)
+
+The build and test tools use `dev/test-stack --tree=<hash> --command=<command>` to run the build steps in a worker. The goal is isolation from the host stack, with enough caching to make this fast. test-stack is a worker that:
+- Mounts a persistent volume at /mounted-nix, copies anything missing in /mounted/nix/store from /nix/store and then mounts /mounted-nix at /nix
+- Mounts the docker socket (to cache images) and a volume for git (single directory on the host is shared for between all test stacks). It uses the host's redis since we want to share the caches between stacks but can't have multiple redis proccesses using the same files
+- Runs `caos get -r <hash>` to fetch the requested tree #todo still working on this
+- Runs the provided command in the container and exists with the exit code of the command
+- Uses --rm to remove the container after it exits
+
+We use a single short-lived test worker with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
+
+The build and tools are:
+- `caos-tools/build <tree-oid>`: `run-in-test-container  --tree=<treeoid> --command="nix build"`
+- `caos-tools/test <tree-oid>`: `run-in-test-container --tree=<treeoid> --command="nix build && .../caosd up && .../caos-cli run dev/run-tests"`
+
+Some tests need to remain running/block while their child workers run. (Examples: anything that calls `caos-cli run`, and anything that needs to start a daemon that a worker talks to.) `--max-parallel` on the suite's `map-then` bounds how many tests are in flight (default 8), so the general pool has room for both tests and their children.
+
+There should be exactly one copy of the code that starts a stack and builds the built-ins
+
 # Misc
 
 - `run-tool` does not fetch the output of the tool that it runs. It just prints the hash and the stdout part

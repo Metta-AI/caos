@@ -1,6 +1,2 @@
-# What this test reaches for that no DEPS edge supplies (format
-# `<path> <name>`), deepened at DEEP-DEPS/<name> (design/caos-expr.md).
-# We build a package by running the bash worker, so we need bash (and the
-# flake-builder that builds it).
+# What this test reaches for (format `<path> <name>`).
 ../../std/bash bash
-../../std/flake-builder flake-builder

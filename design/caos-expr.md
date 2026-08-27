@@ -383,7 +383,7 @@ meantime, *this* project reaches std through deep-deps (`DEEP-DEPS/x`).
   dependency-only workspace crate holding the std tools' crates.io deps (`regex`,
   `serde_json`, `minreq{https-rustls}`), so the `--workspace` `/std/cargo` bake
   keeps vendoring+precompiling them once the tool crates leave the workspace.
-  `lint-bake-anchor.sh` (run by `tests/std-lint`) enforces `anchor ⊇ every std
+  `tests/lint/lint-bake-anchor.sh` (run by `tests/lint`) enforces `anchor ⊇ every std
   tool's crates.io deps` by name; version/feature parity stays on the build-time
   bake-reuse guard. No `bake.nix` change (it's already `--workspace`).
 - **crates.io + `llm-client` leaves** (step 3) ✓: `llm-call`/`llm-step` are now
@@ -599,7 +599,7 @@ is what made resolution-by-descent affordable.
   `./flake-inputs/caos/std/foo`. The expander is small — a commit already
   materializes via `--name:commit=`, and `read_commit` gives its tree — but it
   does not exist, and nothing in this repo needs it yet.
-- **`tests/lib/run-test.sh`'s `objects/info/alternates`.** A client pushes by
+- **`dev/cli-test/run-test.sh`'s `objects/info/alternates`.** A client pushes by
   walking the arg tree's closure, and git can only skip an advertised object by
   traversing that ref LOCALLY. The arg tree's `image` is a resolved image the
   client holds only as a hash (for a rustc-built tool, `curry(runner, …)` whose

@@ -1,0 +1,17 @@
+# tests/file-count, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# EVERY DEPENDENCY IS RESOLVED BY BEING NAMED. `:@=` evaluates any tree that
+# carries a `.caos-expr` — not just `--base` (caos-eval's `eval_if_evaluable`:
+# "a TREE carrying a `.caos-expr` is an expression and is evaluated; anything
+# else is data and is referenced raw"). So `--rustc:@=DEEP-DEPS/rustc` hands the
+# worker the BUILT rustc image at /cas/args/rustc, resolved before the container
+# starts. A worker cannot evaluate — its `caos` has `eval-path-then` and no
+# `eval-path` — and with this it never needs to.
+#
+# `cli` and `salt` are what varies per RUN rather than per tree, staged into
+# this directory by dev/run-tests' fan-out. Binding them is not decoration:
+# `salt` in the ArgTree is what makes `--test-salt` re-run the test, and `cli`
+# is what makes the test re-key when the client under test changes. This one
+# runs neither, and binds both for those two properties.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --src:@=worker.rs --tree:@=tree

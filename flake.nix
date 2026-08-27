@@ -71,7 +71,7 @@
         # Linux (linuxPkgs) while the host build is the host's. On Linux those
         # are one derivation, which is what collapses the bake and
         # cargoArtifacts into a single compile.
-        rustChannel = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+        rustChannel = (builtins.fromTOML (builtins.readFile ./rust/rust-toolchain.toml)).toolchain.channel;
         mkRustToolchain =
           p:
           (if rustChannel == "stable" then p.rust-bin.stable.latest else p.rust-bin.stable.${rustChannel})
@@ -86,32 +86,31 @@
         rustToolchain = mkRustToolchain pkgs;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # The cargo source, WITHOUT ./tests. cleanCargoSource sweeps in every
-        # Cargo.toml in the tree, and crane's mkDummySrc keeps them, so the
-        # suite's cargo fixtures — tests/cargo-check/{broken,mini} and
-        # tests/cargo-crates/ws — landed in the DEPENDENCY cache key. They
-        # contribute nothing to it: ws declares its own [workspace], the other
-        # two have no dependencies at all, and none is a member here. Yet
-        # editing one rebuilt all ~176 deps.
+        # The cargo source: ./rust, the whole of it. Everything cargo compiles
+        # lives under that one directory — Cargo.toml, Cargo.lock,
+        # rust-toolchain.toml and crates/ — which is what lets a package DECLARE
+        # the workspace as a dependency (`../../rust rust` in a DEPS) rather
+        # than be handed the repository.
         #
-        # They are runtime DATA, not source: the suite hands those directories
-        # to the cargo worker as trees to check, delivered over caos by
-        # `--in:@=.` (cli_run_tool), never compiled by this build. Nothing
-        # under crates/ reaches into them — no crates/*/tests, no include_*,
-        # no path reference — so dropping them costs the compile nothing and
-        # makes this key exactly (manifests, lockfile, toolchain).
+        # It is also what retired the exclusion that used to be here. Rooting at
+        # the repo made `cleanCargoSource` sweep in every Cargo.toml in the
+        # tree, so the suite's cargo FIXTURES — tests/cargo-check/{broken,mini},
+        # tests/cargo-crates/ws — landed in the DEPENDENCY cache key and editing
+        # one rebuilt all ~176 deps. They are runtime data handed to the cargo
+        # worker as trees to check, never compiled by this build; now they are
+        # simply not under `src`.
         #
         # NOT cleanCargoSource: crane's filter keeps *.rs, *.toml, Cargo.lock
         # and .cargo/config and NOTHING else, so a `include_str!("x.sh")`
         # compiles everywhere a full tree is present and fails HERE — which is
         # exactly how crates/worker-llm-step/src/githist/*.sh broke this build
-        # after passing the whole suite (see caos-tools/test.sh: the compile
-        # runs over the real crates/, so the flake's filter is the one thing
-        # `run-tool test` never exercises). Keep crates/**/*.sh: scripts a
-        # worker bakes into its binary are source, not data.
+        # after passing the whole suite (the suite compiles over the real
+        # crates/, so the flake's filter is the one thing `run-tool test` never
+        # exercises). Keep crates/**/*.sh: scripts a worker bakes into its
+        # binary are source, not data.
         #
-        # ./lint-flake-src.sh is the other half of this rule — it resolves every
-        # include!/include_str!/include_bytes! under crates/ and fails if the
+        # tests/lint/lint-flake-src.sh is the other half of this rule — it resolves every
+        # include!/include_str!/include_bytes! under rust/crates and fails if the
         # target is not kept here, WITHOUT running nix, so the suite can hold
         # it. Widen this filter and you widen its keep_rule.
         #
@@ -119,16 +118,15 @@
         # mkDummySrc, which keeps only Cargo.lock, .cargo/config.toml and
         # stubbed Cargo.tomls — never the .sh.
         src = pkgs.lib.cleanSourceWith {
-          src = pkgs.lib.cleanSource ./.;
+          src = pkgs.lib.cleanSource ./rust;
           name = "source";
           filter =
             path: type:
             let
-              rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+              rel = pkgs.lib.removePrefix (toString ./rust + "/") (toString path);
               isCrateScript = pkgs.lib.hasPrefix "crates/" rel && pkgs.lib.hasSuffix ".sh" rel;
             in
-            (rel != "tests" && !(pkgs.lib.hasPrefix "tests/" rel))
-            && (craneLib.filterCargoSources path type || isCrateScript);
+            craneLib.filterCargoSources path type || isCrateScript;
         };
 
         # Build for musl so the binary is fully static (crt-static is on by
@@ -248,6 +246,37 @@
           }
         );
 
+        # The same workspace, stamped for the TEST world (crates/caos-world).
+        # A dev stack is built from this; the host's is built from the above, so
+        # a client of one is refused by the other's server.
+        #
+        # IT HAS TO BE A SECOND COMPILE, and that is not a design choice here:
+        # the tag is `option_env!`, read by rustc, because caos-world explains
+        # why it cannot be read at runtime — the interpreter exports its
+        # environment into `worker1`, so an env-carried tag would travel with it
+        # and declare the wrong binary correct. The tag is a property of the
+        # ARTIFACT, so two worlds are two artifacts.
+        #
+        # WHAT IT DOES NOT DUPLICATE IS THE EXPENSIVE HALF. `cargoArtifacts` is
+        # `buildDepsOnly commonArgs`, and this adds nothing to `commonArgs` — so
+        # the ~176 dependencies are one derivation shared by both worlds, and
+        # only the thin workspace compile happens twice. caos-tools/build's own
+        # guard measured that split: the deps are 12.6s of a 15.0s cold build,
+        # the workspace alone 2.4s.
+        #
+        # Do NOT move the stamp into `commonArgs` to "share more". It would land
+        # in the dependency key and rebuild all of them per world, which is the
+        # exact opposite of the intent.
+        testWorkspaceBins = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "--workspace";
+            doCheck = false;
+            CAOS_WORLD = "test";
+          }
+        );
+
         # Every crate's binary is selected (by name, at copy time) from the one
         # build above, so these are all the same derivation. The generic `caos`
         # worker and the user-facing `caos-cli` are separate Cargo
@@ -293,7 +322,7 @@
         # flake path), so the host builds it. Its definition is
         # std/flake-builder's own flake, taken AS-IS: we call its outputs
         # function directly — the standard subflake call, no path-input
-        # lock churn — passing OUR nixpkgs (tests/std-lint pins the
+        # lock churn — passing OUR nixpkgs (tests/lint pins the
         # subflake's lock to the same revision). Its clean #caosImage is
         # exactly what streams.
         workerFlakeBuilderImage =
@@ -419,8 +448,8 @@
             linuxPkgs.bashInteractive
             linuxPkgs.coreutils
             # cmp/diff: the tests compare cached results byte for byte, and
-            # std/refresh.sh --check re-derives and diffs every checked-in
-            # std copy. This image is the environment every test runs in.
+            # tests/lint's two lint scripts diff and grep. This
+            # image is the environment every test runs in.
             linuxPkgs.diffutils
             linuxPkgs.gnugrep
             linuxPkgs.gnused
@@ -487,7 +516,7 @@
         # stage 2 is `curry(<this image>, worker1=build.sh, stage=2, …)` and so
         # runs the SAME script with the toolchain and the baked deps in scope.
         # Copied rather than shared because std/bash is a published tree and
-        # this is a nix-built image; tests/std-lint keeps literal copies honest
+        # this is a nix-built image; tests/lint keeps the rules honest
         # elsewhere in the tree for the same reason.
         builderWorker = pkgs.runCommand "caos-builder-worker" { } ''
           mkdir -p $out
@@ -548,6 +577,7 @@
             Env = stackEnv;
           };
         };
+
 
 
         # ---- Cross-tree consumption: caos-cli, the stack, the stdlib ----
@@ -673,6 +703,33 @@
           # worker-common source curried in.
           worker-rustc
         ];
+
+        # EVERYTHING A STACK BRING-UP NEEDS, in one derivation — so ONE
+        # `nix build` produces all of it: the daemons under `bin/` and the
+        # worker images under `images/`.
+        #
+        # `build-builtins.sh` takes both as store paths (CAOS_BUILTIN_BINS,
+        # CAOS_BUILTIN_IMAGES) and runs no nix when it has them. Handing them
+        # over is therefore the fast path, and this is what lets BOTH callers
+        # take it: caosd for the host, caos-tools/test for a dev stack.
+        #
+        # On the host that aggregation used to fall out by accident — caosd's
+        # script text names the image derivations, so building caosd built them.
+        # The dev stack had no equivalent, so `dev/stack-up` evaluated the flake
+        # three more times at runtime to find the same paths: 12 seconds of a
+        # 16-second bring-up, against ~1 second to actually start the stack.
+        #
+        # `bin` is a symlink to the workspace's own, so a consumer looks for
+        # `<inputs>/bin/<name>` exactly as it would in a plain build output. The
+        # images keep their store basenames, which is how build-builtins maps
+        # each back to its builtin (`*-caos-worker-<name>.tar.gz`).
+        stackInputs =
+          pname: bins:
+          pkgs.runCommand pname { } ''
+            mkdir -p $out/images
+            ln -s ${bins}/bin $out/bin
+            ${pkgs.lib.concatMapStringsSep "\n" (i: "ln -s ${i} $out/images/") builtinWorkerImages}
+          '';
 
         # The dev stack's control command. Subcommands:
         #   caosd up     (default) idempotently bring the stack up and publish all
@@ -843,18 +900,21 @@
 
             # Publish std to this stack: build-builtins.sh with the flake's own
             # prebuilt images and binaries, so nothing is nix-built at runtime.
+            # THE SAME SHAPE THE DEV STACK USES: one aggregate store path
+            # (`stackInputs`) carrying the daemons under `bin/` and the worker
+            # images under `images/`, handed to build-builtins so it runs no
+            # nix. The two bring-ups differ only in where that path comes from
+            # — substituted at flake-build time here, one `nix build` of the
+            # tree under test there — and in placement, which is stack/serve's
+            # business rather than this script's.
             std_build() {
               echo "==> publishing stdlib (build-builtins.sh)" >&2
               CAOS_SERVER_URL=http://localhost:9090 \
               CAOS_REGISTRY_HTTP="$REGISTRY" \
               CAOS_CLI=${caos-cli}/bin/caos-cli \
               CAOS_CLIENT_REPO="$CLIENT" \
-              CAOS_BUILTIN_IMAGES="${
-                pkgs.lib.concatMapStringsSep " " toString builtinWorkerImages
-              }" \
-              CAOS_BUILTIN_BINS="${
-                pkgs.lib.concatMapStringsSep " " toString builtinWorkerBins
-              }" \
+              CAOS_BUILTIN_IMAGES="$(echo ${stackInputs "caos-stack-inputs" workspaceBins}/images/*)" \
+              CAOS_BUILTIN_BINS="${stackInputs "caos-stack-inputs" workspaceBins}" \
                 bash ${self}/build-builtins.sh >/dev/null
             }
 
@@ -956,8 +1016,9 @@
                 if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
                   echo "$NAME"
                 fi
+                # A dev stack is a WORKER now, so runnerd's own label covers it —
+                # there is no separate caos.test-stack label to look for.
                 docker ps --filter label=caos.runnerd.owner --format '{{.Names}}'
-                docker ps --filter label=caos.test-stack --format '{{.Names}}'
               )
               if [ -n "$running" ]; then
                 echo "caosd image-cleanup: CAOS is still running:" >&2
@@ -1062,6 +1123,7 @@
                   -e CAOS_STACK_REDIS_PORT=6379 \
                   -e CAOS_STACK_REDIS_PERSIST=yes \
                   -e CAOS_STACK_REGISTRY=yes \
+                  -e CAOS_STACK_REDIS=yes \
                   -e CAOS_STACK_RUNNERD=yes \
                   -e CAOS_STACK_SEEDER=yes \
                   -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
@@ -1137,6 +1199,13 @@
           # binaries stay available as `.#caos`.
           default = caos-tools;
           inherit caos server runnerd caos-cli caosd caos-tools;
+          # The workspace stamped for the TEST world — what dev/stack-up builds
+          # a dev stack from, so a host client cannot drive it (and vice versa).
+          caos-test-world = testWorkspaceBins;
+          # The two stack-bring-up aggregates (see `stackInputs`): one nix
+          # build each, and both are handed to the same build-builtins.
+          caos-stack-inputs = stackInputs "caos-stack-inputs" workspaceBins;
+          caos-test-stack-inputs = stackInputs "caos-test-stack-inputs" testWorkspaceBins;
           # Agent-harness worker binaries (run as curry(runner, bin)).
           inherit worker-deep-deps;
           # The staged /worker binaries (std/runner, std/cargo) and the rustc
@@ -1207,6 +1276,7 @@
             # the fly backend (apps, machines, logs). caosd itself talks to the
             # Machines API + registry over HTTP and does not need this.
             pkgs.flyctl
+            pkgs.jless
           ];
         };
       }

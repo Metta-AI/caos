@@ -58,12 +58,12 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | Path | Purpose |
 |---|---|
 | `flake.nix` | Dev shell, binary packages, and Docker images — all from one pinned toolchain |
-| `rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
-| `Cargo.toml` | Workspace root (members + shared release profile) |
-| `crates/caos/` | Generic CAOS client library and worker-side `caos` binary |
-| `crates/caos-cli/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
-| `crates/server/` | The `server` crate → `caos-server` |
-| `crates/worker-*/` | The worker crates |
+| `rust/rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
+| `rust/Cargo.toml` | Workspace root (members + shared release profile) |
+| `rust/crates/caos/` | Generic CAOS client library and worker-side `caos` binary |
+| `rust/crates/caos-cli/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
+| `rust/crates/server/` | The `server` crate → `caos-server` |
+| `rust/crates/worker-*/` | The worker crates |
 | `build-builtins.sh` | Bootstraps the seeded core and publishes `refs/caos/seed` |
 | `caos-tools/`, `tests/` | The `build`/`test`/`test-result` tools and the integration suites |
 
@@ -76,7 +76,9 @@ Enter a shell with the pinned `rustc`, `cargo`, `clippy`, `rustfmt`, plus
 nix develop
 ```
 
-Inside it, use Cargo as normal (`cargo build`, `cargo run`, `cargo test`).
+Inside it, use Cargo as normal from `rust/` — everything cargo compiles lives
+under that one directory, which is what lets a package DECLARE the workspace as
+a dependency (`../../rust rust` in a `DEPS`) rather than be handed the repo.
 `nix flake check` runs clippy, rustfmt and the doc build.
 
 **Tests run through caos, not through nix**: `caos-cli run-tool test` (see

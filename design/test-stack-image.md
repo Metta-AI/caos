@@ -17,7 +17,7 @@ an image-building path that production no longer uses, over a userland
 production no longer ships, from binaries the tree under test did not compile
 inside caos.
 
-`tests/lib/run-nested.sh` then stands up an inner stack per test from those
+`dev/cli-test/run-nested.sh` then stands up an inner stack per test from those
 pieces, publishing an inner std by hand (`git mktree` + curries) — a third
 expression of what `build-builtins.sh` already does on the host.
 
@@ -154,7 +154,7 @@ on the pending timeout: `no runner for req (waited 900s)`, after 38 minutes.
 Measuring only the warm case measured the one case where the difference cannot
 appear.
 
-**So: warm once, then fan out.** Stage 3 runs `tests/lib/warm-std.sh` in a
+**So: warm once, then fan out.** Stage 3 runs `dev/cli-test/warm-std.sh` in a
 single stack and stage 4 fans out. That is this note's original build-std-once
 design *minus the digest-passing*, which turned out to be unnecessary: the
 registry is already the sharing mechanism, so nothing has to be handed to
@@ -214,7 +214,7 @@ optimization.
 - `caos-tools/lib/{image-build,bake,build-stage2b,build-stage2c,build-final}.sh`
 - `caos-tools/{debian-base,nix-base}.ref` — and with them the last debian
   userland in the tree
-- `tests/lib/run-nested.sh`, `tests/lib/suite-stage3.sh`'s closure rules, and
+- `dev/cli-test/run-nested.sh`, `dev/cli-test/suite-stage3.sh`'s closure rules, and
   every `tests/*/std-manifest`
 - the `--bins` interface: `refs/caos/bins` stops being an input to the build
   and test tools
@@ -259,7 +259,7 @@ optimization.
    the baked flake-builder, the interpreter `/worker`) and `#depsImage` over
    the source-independent half.
 3. **DONE** — the rewritten `build.sh` / `test.sh` / `suite*.sh` and
-   `tests/lib/run-test.sh`.
+   `dev/cli-test/run-test.sh`.
 4. **DONE** — deleted the second pipeline, the `.ref` pins, `run-nested.sh`,
    and the manifests.
 5. **DONE** — per-image socket grant in runnerd, declared via image env.

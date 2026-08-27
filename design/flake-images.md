@@ -117,7 +117,7 @@ that cannot be checked in, a nix-built binary.
 
 Every `flake.lock` is **derived from the main flake.lock** — checked in,
 not generated: `std/refresh.sh` (re)writes each std lock from the root
-lock's nodes, and `tests/std-lint` runs the same script in `--check` mode
+lock's nodes, and `tests/std-lint` ran the same script in `--check` mode
 (re-derive, byte-compare), so a std flake's pins cannot drift from the
 root's unnoticed — which keeps `std/cargo`'s rustc the exact compiler that
 builds caos (the caos-in-caos suite depends on that). The same
@@ -183,7 +183,7 @@ redundancy the simplification introduces.
 
 **Phase A (SHIPPED, 2026-07): literal checked-in std trees.** One script,
 `std/refresh.sh`, regenerates every checked-in redundancy from its source
-of truth; `tests/std-lint` runs the SAME script in `--check` mode
+of truth; `tests/std-lint` ran the SAME script in `--check` mode
 (regenerate, byte-compare) inside the suite, so the check cannot drift
 from the generator. Drift becomes impossible to miss instead of impossible
 to create. Per tree:

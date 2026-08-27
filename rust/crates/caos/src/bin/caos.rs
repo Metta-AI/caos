@@ -1,0 +1,664 @@
+//! caos: the worker-side client, baked setuid-root into worker images as
+//! `/bin/caos`.
+//!
+//! It speaks HTTP to the server (`/object`, for storage) via
+//! [`caos::HttpTransport`], and provides the container `runner` — which runs a
+//! job (set up the root-owned `/cas`, run `/worker` as an unprivileged user,
+//! post the kind + hash recorded at `/cas/out` back to the server), then
+//! long-polls for more work for its image until an idle TTL passes (see
+//! `design/runner-protocol.md`). It normally records continuations that the
+//! server resolves after the worker's job finishes; `sub-run` starts detached
+//! work while retaining the current server-side run context. The
+//! shared command logic lives in the `caos` library; this binary is the worker's
+//! CLI surface plus the privileged runner.
+//!
+//! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
+//! `run-then`, `run-request-then`, `sub-run`, `prepare-request`, `curry`, and `runner`.
+//! (Image import and ref resolution are user-facing only — see `caos-cli`.)
+
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::process::ExitCode;
+
+use caos::{prog_name, HttpTransport, Transport};
+
+/// The program a job always runs. Images that build off the
+/// `caos-worker-base` image supply this binary.
+const DEFAULT_WORKER: &str = "/worker";
+
+/// The unprivileged user a job runs `/worker` as. The container starts as
+/// root so the runner can set up — and later tear down — the root-owned
+/// `/cas`; it drops to this uid/gid only for the `/worker` child. The worker
+/// therefore can't tamper with `/cas` directly: it must go through `caos`, which
+/// is setuid-root. Override (e.g. for a different image user) with the env vars.
+const WORKER_UID_ENV: &str = "CAOS_WORKER_UID";
+const WORKER_GID_ENV: &str = "CAOS_WORKER_GID";
+const DEFAULT_WORKER_UID: u32 = 1000;
+const DEFAULT_WORKER_GID: u32 = 1000;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{}: {err}", prog_name(&args));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    match args.get(1).map(String::as_str) {
+        Some("get-hash") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(hash), Some(path), None) => caos::get_hash(&http()?, hash, path),
+            _ => Err(usage(args)),
+        },
+        Some("get") => {
+            let (path, depth) = caos::parse_get(&args[2..])?;
+            caos::get(&http()?, path, depth)
+        }
+        Some("put") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(src), Some(dst), None) => caos::put(&http()?, src, dst),
+            _ => Err(usage(args)),
+        },
+        // `put-commit <src-file> <cas-path>` — store the file's bytes as a git
+        // *commit* object, record it (kind-tagged) at the CAS path, and print
+        // its hash. How a worker mints a turn/step commit.
+        Some("put-commit") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(src), Some(dst), None) => caos::put_commit(&http()?, src, dst),
+            _ => Err(usage(args)),
+        },
+        // `hash <cas-path>` — print the git hash recorded on a CAS path (e.g. a
+        // commit-valued arg whose hash becomes the next commit's parent).
+        Some("hash") => match (args.get(2), args.get(3)) {
+            (Some(path), None) => caos::cas_hash(path),
+            _ => Err(usage(args)),
+        },
+        // `forward <src> <dst>` — preserve a blob/tree/commit CAS value under
+        // another path without fetching or re-uploading it.
+        Some("forward") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(src), Some(dst), None) => caos::forward(src, dst),
+            _ => Err(usage(args)),
+        },
+        // `map-then <in> [--map:<type>=<image>] [--then:<type>=<image>]` —
+        // record a map-then
+        // continuation over the CAS path `<in>` as this worker's result at
+        // /cas/out (a tail call; the server resolves it after the worker exits).
+        Some("map-then") => match &args[2..] {
+            [input, kvs @ ..] => caos::caos_map_then(&http()?, input, kvs),
+            _ => Err(usage(args)),
+        },
+        // `run-then <in> --run:<type>=<image> [--then:<type>=<image>] [--catch]` — the
+        // single-valued map-then: the server runs `run(--in=<in>)` once, then
+        // (optionally) `then(--in=<in>, --result=<R>)`. The same tail-call
+        // contract. With `--catch`, a failing `run` reaches `then` as
+        // `--error=<blob>` instead of failing the whole request.
+        Some("run-then") => match &args[2..] {
+            [input, kvs @ ..] => caos::caos_run_then(&http()?, input, kvs),
+            _ => Err(usage(args)),
+        },
+        // `eval-path-then <in> --eval=<path> [--then:<type>=<image>] [--catch]` — the
+        // evaluation sibling of run-then: the server walks `.caos-expr` from
+        // `<in>`'s root down to `<path>` (blocking a request thread, not a worker
+        // slot), then (optionally) `then(--in=<in>, --result=<R>)`. How a worker
+        // gets a `.caos-expr` evaluated without blocking (design/caos-expr.md).
+        Some("eval-path-then") => match &args[2..] {
+            [input, kvs @ ..] => caos::caos_eval_then(&http()?, input, kvs),
+            _ => Err(usage(args)),
+        },
+        // `run-request-then <R> [--then:<type>=<image>] [--catch]` — tail-call
+        // the exact, already-complete ArgTree R, optionally delivering its
+        // result (or caught error) to a callback image.
+        Some("run-request-then") => match &args[2..] {
+            [request, kvs @ ..] => caos::caos_run_request_then(&http()?, request, kvs),
+            _ => Err(usage(args)),
+        },
+        // `trace-child <name> <arg-tree>` — record under this job that it
+        // started work on another stack, so `status` descends into it.
+        Some("trace-child") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(name), Some(arg_tree), None) => caos::caos_trace_child(&http()?, name, arg_tree),
+            _ => Err(usage(args)),
+        },
+        // Start an already-stored ArgTree without waiting, preserving this
+        // job's server-side run stack and secret store.
+        Some("sub-run") => match &args[2..] {
+            [arg_tree] => caos::caos_sub_run(&http()?, arg_tree),
+            _ => Err(usage(args)),
+        },
+        // `prepare-request --base:<type>=<image> [...]` — construct and store the
+        // exact flat runnable ArgTree without executing it. This is the durable
+        // identity accepted by sub-run.
+        Some("prepare-request") => caos::caos_prepare_request(&http()?, &args[2..]),
+        // `resolve-image <hash|docker://ref>` — the reference a runner would
+        // pull. Converts (and caches) a git-docker tree exactly as a run would.
+        Some("resolve-image") => caos::caos_resolve_image(&args[2..]),
+        // `curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]` —
+        // bind args to the `--base` ArgTree (a bare image, a curry node, or a flat
+        // args tree like `own_args_tree`), printing a ref to the resulting curried
+        // ArgTree (run/curry it like any other). `--unbind` releases a bound arg
+        // so it can be rebound.
+        Some("curry") => caos::caos_curry(&http()?, &args[2..]),
+        // `runner --job=<json>` — run the handed-in job, then poll for more; see
+        // `runner()`.
+        Some("runner") => match &args[2..] {
+            [flag] => match flag.strip_prefix("--job=") {
+                Some(json) => runner(json),
+                None => Err(usage(args)),
+            },
+            _ => Err(usage(args)),
+        },
+        _ => Err(usage(args)),
+    }
+}
+
+/// The worker talks to the server over HTTP.
+fn http() -> Result<HttpTransport, String> {
+    HttpTransport::from_env()
+}
+
+/// The runner's idle budget, in milliseconds: how long one follow-up poll
+/// hangs before the runner exits. Ski-rental: set it near the cost of
+/// restarting a container for this image. Override with `CAOS_RUNNER_TTL_MS`.
+const RUNNER_TTL_ENV: &str = "CAOS_RUNNER_TTL_MS";
+const DEFAULT_RUNNER_TTL_MS: u32 = 2000;
+
+/// A job handed to this runner: the rendezvous ids (the ArgTree is fetched and
+/// unpacked from `arg_tree` itself), plus the bearer token children present back
+/// to the server. Everything else about the job is derived from the ArgTree.
+/// (`req` is the wire field name; its value is the ArgTree hash.)
+struct RunnerJob {
+    arg_tree: String,
+    nonce: String,
+    token: Option<String>,
+    /// Secrets the server granted this job (design/secrets.md): name → value.
+    /// Dropped at `/secret/<name>` for the worker, out of band from its args.
+    secrets: Vec<(String, String)>,
+}
+
+impl RunnerJob {
+    fn parse(json: &str) -> Result<RunnerJob, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("invalid job json: {e}"))?;
+        RunnerJob::from_value(&v)
+    }
+
+    fn from_value(v: &serde_json::Value) -> Result<RunnerJob, String> {
+        let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+        let arg_tree = field("req").unwrap_or_default().to_string();
+        let nonce = field("nonce").unwrap_or_default().to_string();
+        if arg_tree.is_empty() || nonce.is_empty() {
+            return Err("job missing req/nonce".to_string());
+        }
+        let secrets = match v.get("secrets") {
+            Some(serde_json::Value::Object(map)) => map
+                .iter()
+                .map(|(name, value)| {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| format!("secret {name:?} value is not a string"))?;
+                    Ok((name.clone(), value.to_string()))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            _ => Vec::new(),
+        };
+        Ok(RunnerJob {
+            arg_tree,
+            nonce,
+            token: field("token").map(str::to_string),
+            secrets,
+        })
+    }
+}
+
+/// `runner --job=<json>` — the container runner (see
+/// `design/runner-protocol.md`): run the handed-in job through the staged
+/// lifecycle, post its result to the server, then long-poll for more work for
+/// this image — required args `{image: <oid>}`, learned from our own
+/// materialization of the first job's args — until a poll comes back empty
+/// (`idle`), the server evicts us (`exit`), or we never learned the oid.
+fn runner(job_json: &str) -> Result<(), String> {
+    let t = http()?;
+    let mut job = RunnerJob::parse(job_json)?;
+    let mut image_oid: Option<String> = None;
+    loop {
+        let mut out_trace = None;
+        let ran = run_runner_job(&t, &job, &mut image_oid, &mut out_trace);
+        post_result(&t, &job, &ran, out_trace.as_deref())?;
+        reset_after_job();
+        // A failed job doesn't kill a warm runner — but never having learned
+        // our image's oid (setup failed before /cas/args existed) means we have
+        // nothing to advertise, so don't linger.
+        let Some(oid) = image_oid.clone() else {
+            return ran.map(|_| ());
+        };
+        match next_job(&t, &oid, &job.token)? {
+            Some(next) => job = next,
+            None => return Ok(()),
+        }
+    }
+}
+
+/// One job through the staged lifecycle: unpack the ArgTree, set up `/cas`,
+/// run `/worker`, read back `/cas/out`, tear down. The process is reused across
+/// jobs, so the salt must come from the ArgTree rather than our env: the worker
+/// child gets it as an env var — `caos map-then`/`curry` running under it read
+/// it from there — and it is re-derived per job, never inherited.
+fn run_runner_job(
+    t: &HttpTransport,
+    job: &RunnerJob,
+    image_oid: &mut Option<String>,
+    out_trace: &mut Option<String>,
+) -> Result<String, String> {
+    let (arg_tree, salt) = read_arg_tree(t, &job.arg_tree)?;
+    let cas = cas_setup(Some(&arg_tree))?;
+    // Our image's CAS-level name, for the follow-up poll's required args — read
+    // off the placeholder cas_setup just materialized (every entry is tagged
+    // with its hash).
+    if image_oid.is_none() {
+        *image_oid = caos::read_hash(&cas.join("args").join("base")).ok();
+    }
+    let envs = [
+        (caos::SALT_ENV, salt.as_str()),
+        (caos::JOB_NONCE_ENV, job.nonce.as_str()),
+    ];
+    // Drop the granted secrets at `/secret/<name>` just before the worker runs
+    // (design/secrets.md). `write_secrets` wipes any prior job's `/secret`
+    // first, so a warm runner never leaks a secret into a later job that wasn't
+    // granted it.
+    write_secrets(&job.secrets)?;
+    let ran = run_worker(&envs, &job.secrets);
+    // Remove the secrets whether the worker passed or failed; the next job's
+    // `write_secrets` also wipes, but don't leave plaintext around meanwhile.
+    remove_secrets();
+    // Perf data the worker chose to leave behind, read BEFORE the failure check
+    // so a run that died still reports it, and before `remove_cas` takes the
+    // directory away. Optional by construction: `read_hash` on a path no worker
+    // wrote is an error, and no out-trace is the normal case.
+    *out_trace = caos::read_hash(&cas.join("out-trace")).ok();
+    ran?;
+    let result = read_result(&cas)?;
+    remove_cas(&cas)?;
+    Ok(result)
+}
+
+/// In-container directory the runner drops granted secrets into, one file per
+/// secret, for the worker to read (design/secrets.md, `/secret/<name>`).
+const SECRET_DIR: &str = caos::SECRET_DIR;
+
+/// Write `secrets` (name → value) into `/secret/<name>`, wiping any prior
+/// contents first. Written root-owned but world-readable so the unprivileged
+/// worker can read them; a name with a path separator is rejected (it must be a
+/// single file component).
+fn write_secrets(secrets: &[(String, String)]) -> Result<(), String> {
+    remove_secrets();
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(SECRET_DIR).map_err(|e| format!("creating {SECRET_DIR}: {e}"))?;
+    std::fs::set_permissions(SECRET_DIR, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {SECRET_DIR}: {e}"))?;
+    for (name, value) in secrets {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(format!(
+                "secret name {name:?} is not a single path component"
+            ));
+        }
+        let path = format!("{SECRET_DIR}/{name}");
+        std::fs::write(&path, value).map_err(|e| format!("writing secret {name}: {e}"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .map_err(|e| format!("chmod secret {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Remove `/secret` and everything in it. Succeeds if it's already gone.
+fn remove_secrets() {
+    let _ = std::fs::remove_dir_all(SECRET_DIR);
+}
+
+/// Unpack an ArgTree: its hash (returned back for `/cas/args`) and the salt
+/// (its reserved `salt` entry, empty if absent). `base`/`salt` are entries of
+/// this one tree, per SPEC's ArgTree.
+fn read_arg_tree(t: &dyn Transport, arg_tree: &str) -> Result<(String, String), String> {
+    let (kind, content) = t.get_object(arg_tree)?;
+    if kind != "tree" {
+        return Err(format!("arg tree {arg_tree} is a {kind}, not a tree"));
+    }
+    let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+        .map_err(|e| format!("malformed arg tree {arg_tree}: {e}"))?;
+    let blob = |oid: gix::ObjectId| -> Result<String, String> {
+        let (_, content) = t.get_object(&oid.to_string())?;
+        Ok(String::from_utf8_lossy(&content).trim().to_string())
+    };
+    let mut salt = String::new();
+    for entry in tree.entries {
+        if entry.filename.to_vec().as_slice() == b"salt" {
+            salt = blob(entry.oid.into())?;
+        }
+    }
+    Ok((arg_tree.to_string(), salt))
+}
+
+/// POST the job's outcome to `/runner/result`. A 410 means the nonce was
+/// already consumed (someone else reported) — fine, the job is settled.
+/// (`req` is the wire field name; its value is the ArgTree hash.)
+fn post_result(
+    t: &HttpTransport,
+    job: &RunnerJob,
+    ran: &Result<String, String>,
+    out_trace: Option<&str>,
+) -> Result<(), String> {
+    // `out_trace` rides alongside the result, never inside it: a result is
+    // content-addressed and keys every consumer of it, so folding timings or
+    // cache statistics into one would make all of them miss whenever the
+    // numbers moved. That separation is the whole reason `/cas/out-trace`
+    // exists next to `/cas/out`.
+    let mut body = match ran {
+        Ok(result) => serde_json::json!({
+            "req": job.arg_tree, "nonce": job.nonce, "ok": true, "result": result,
+        }),
+        Err(error) => serde_json::json!({
+            "req": job.arg_tree, "nonce": job.nonce, "ok": false, "error": error,
+        }),
+    };
+    if let Some(oid) = out_trace {
+        body["out_trace"] = serde_json::Value::String(oid.to_string());
+    }
+    let url = runner_url(t, "result")?;
+    let resp = runner_post(&url, &body.to_string(), &job.token, 30)?;
+    match resp.status_code {
+        200 | 410 => Ok(()),
+        code => Err(format!(
+            "posting result ({code}): {}",
+            resp.as_str().unwrap_or("")
+        )),
+    }
+}
+
+/// One follow-up long-poll for more work for our image. `Some(job)` to run it;
+/// `None` on `idle` (our TTL passed) or `exit` (evicted) — either way, quit.
+fn next_job(
+    t: &HttpTransport,
+    image_oid: &str,
+    token: &Option<String>,
+) -> Result<Option<RunnerJob>, String> {
+    let ttl_ms = caos::env_u32(RUNNER_TTL_ENV).unwrap_or(DEFAULT_RUNNER_TTL_MS);
+    let body = serde_json::json!({
+        "required": { "base": image_oid },
+        // Our parent is a generic runner (runnerd) — it polls with no required
+        // args once we die, so a job we can't serve can evict us toward it.
+        "lineage": [ {} ],
+        "ttl_ms": ttl_ms,
+    });
+    let url = runner_url(t, "poll")?;
+    // The HTTP timeout only backstops a dead server; the poll itself hangs for
+    // the TTL server-side, so pad well past it (seconds granularity).
+    let resp = runner_post(
+        &url,
+        &body.to_string(),
+        token,
+        u64::from(ttl_ms) / 1000 + 15,
+    )?;
+    if resp.status_code != 200 {
+        return Err(format!(
+            "poll failed ({}): {}",
+            resp.status_code,
+            resp.as_str().unwrap_or("")
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_str(resp.as_str().unwrap_or(""))
+        .map_err(|e| format!("invalid poll reply: {e}"))?;
+    match v.get("job") {
+        Some(job) if job.is_object() => Ok(Some(RunnerJob::from_value(job)?)),
+        _ => Ok(None),
+    }
+}
+
+/// The server's runner endpoint `/runner/<leaf>`.
+fn runner_url(t: &HttpTransport, leaf: &str) -> Result<String, String> {
+    Ok(format!(
+        "{}/runner/{leaf}",
+        t.server_url()?.trim_end_matches('/')
+    ))
+}
+
+/// POST a runner-protocol request, presenting the job's bearer token if any.
+fn runner_post(
+    url: &str,
+    body: &str,
+    token: &Option<String>,
+    timeout_secs: u64,
+) -> Result<minreq::Response, String> {
+    let mut req = minreq::post(url)
+        .with_header("content-type", "application/json")
+        .with_timeout(timeout_secs)
+        .with_body(body.to_string());
+    if let Some(token) = token {
+        req = req.with_header("Authorization", format!("Bearer {token}"));
+    }
+    req.send().map_err(|e| format!("POST {url}: {e}"))
+}
+
+/// Reset the worker-writable surface between jobs. A pooled runner keeps the
+/// container across jobs, so nothing is disposed for us: `entrypoint` wipes
+/// `/cas` on each run, and here we reap strays and clear the scratch dirs
+/// (`scratch()` writes /tmp).
+fn reset_after_job() {
+    let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
+    reap_uid(uid);
+    for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+        wipe_dir_contents(dir);
+    }
+}
+
+/// SIGKILL every process owned by `uid`. The slot means one job at a time and the
+/// worker uid is dedicated, so this only reaps strays the just-finished worker
+/// left behind — nothing else tears them down in a pooled container.
+fn reap_uid(uid: u32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let me = std::process::id() as i32;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let owned = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|u| u.parse::<u32>().ok())
+            == Some(uid);
+        if owned {
+            unsafe { kill(pid, 9) };
+        }
+    }
+}
+
+/// Remove the children of `dir` (keeping it as a mount point). On tmpfs this is
+/// fast and complete.
+fn wipe_dir_contents(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        let _ = removed;
+    }
+}
+
+fn usage(args: &[String]) -> String {
+    let prog = prog_name(args);
+    format!(
+        "usage:\n  {prog} get-hash <hash> <path>\n  \
+         {prog} get [-r | --recursive[=<depth>]] <path>\n  \
+         {prog} put <src-path> <cas-path>\n  \
+         {prog} put-commit <src-file> <cas-path>\n  \
+         {prog} hash <cas-path>\n  \
+         {prog} forward <src-cas-path> <dst-cas-path>\n  \
+         {prog} map-then <in-cas-path> [--map:<type>=<image>] [--then:<type>=<image>]\n      [--max-parallel=<n>]\n  \
+         {prog} run-then <in-cas-path> --run:<type>=<image> [--then:<type>=<image>] [--catch]\n  \
+         {prog} eval-path-then <in-cas-path> --eval=<path> [--then:<type>=<image>] [--catch]\n  \
+         {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
+         {prog} sub-run <arg-tree-hash>\n  \
+         {prog} trace-child <name> <arg-tree-hash>\n  \
+         {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
+         {prog} resolve-image <hex hash | docker://<ref>>\n  \
+         {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
+         (an image is :@=<cas path>, :docker=<ref> or :hash=<oid>)\n  \
+         {prog} runner --job=<json>"
+    )
+}
+
+/// Set up a fresh `/cas` for one job: wipe whatever a prior job left, recreate
+/// it empty (fail if we can't), verify it supports the xattrs we rely on, then
+/// populate `/cas/args` from `args_hash` (one level, like `get-hash`), so the
+/// worker can read its inputs there.
+fn cas_setup(args_hash: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let cas = caos::cas_dir();
+    remove_cas(&cas)?;
+    std::fs::create_dir_all(&cas).map_err(|e| format!("creating {}: {e}", cas.display()))?;
+    // Root-owned and only root-writable: the worker reaches `/cas` solely through
+    // this setuid-root binary, never by writing here directly.
+    caos::set_mode(&cas, caos::MODE_FETCHED_DIR)?;
+    caos::probe_xattr(&cas)?;
+    if let Some(hash) = args_hash {
+        caos::fetch_and_materialize(&http()?, &cas.join("args"), hash)?;
+    }
+    Ok(cas)
+}
+
+/// Run `/worker` with `envs` added to its environment. We stay root (to tear
+/// down `/cas` after), but drop the worker to an unprivileged user so it can't
+/// tamper with the root-owned `/cas` — only the setuid-root `caos` it invokes
+/// can. Its output is captured, MASKED (any injected `secrets` value replaced —
+/// design/secrets.md log masking), then relayed to our stderr (the container
+/// log) and included in the error on failure. Masking here is the one
+/// chokepoint that covers the whole chain: every downstream log (this
+/// container's stderr, runnerd's relay, the server's failure message) derives
+/// from this string. Best-effort and transform-blind — a value the worker
+/// base64'd or split slips through; this catches an accidental echo, not a
+/// determined exfiltrator.
+fn run_worker(envs: &[(&str, &str)], secrets: &[(String, String)]) -> Result<(), String> {
+    let uid = caos::env_u32(WORKER_UID_ENV).unwrap_or(DEFAULT_WORKER_UID);
+    let gid = caos::env_u32(WORKER_GID_ENV).unwrap_or(DEFAULT_WORKER_GID);
+    let mut command = std::process::Command::new(DEFAULT_WORKER);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    // SAFETY: the closure runs in the forked child before exec and only makes
+    // async-signal-safe syscalls. We drop privileges by hand (rather than
+    // `Command::uid`/`gid`) so we can also clear supplementary groups — `groups`
+    // is still unstable — and in the right order: groups, then gid, then uid,
+    // each while we're still root.
+    unsafe {
+        command.pre_exec(move || {
+            if drop_privileges(uid, gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command
+        .output()
+        .map_err(|e| format!("running {DEFAULT_WORKER}: {e}"))?;
+    let log = mask_secrets(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        secrets,
+    );
+    eprint!("{log}");
+    if !out.status.success() {
+        return Err(format!(
+            "{DEFAULT_WORKER} exited with {}:\n{log}",
+            out.status
+        ));
+    }
+    Ok(())
+}
+
+/// Replace every injected secret value in `log` with a fixed marker. Longest
+/// values first, so a secret that contains another is masked whole. Empty
+/// values are skipped (they'd match everywhere). The marker names no secret.
+fn mask_secrets(mut log: String, secrets: &[(String, String)]) -> String {
+    let mut values: Vec<&str> = secrets
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for value in values {
+        if log.contains(value) {
+            log = log.replace(value, "[redacted secret]");
+        }
+    }
+    log
+}
+
+/// Read back the result the worker recorded at `/cas/out`, as `"<type> <hash>"`.
+/// Everything under /cas got there via get/put, which tag each path with its
+/// hash, so no re-hashing — the caller can record a correctly-typed result
+/// placeholder without fetching, or resolve a `promise` (a map-then continuation
+/// `caos map-then` recorded) once this job's slot is free.
+fn read_result(cas: &std::path::Path) -> Result<String, String> {
+    let out = cas.join("out");
+    let hash = caos::read_hash(&out)?;
+    let kind = caos::result_kind(&out)?;
+    Ok(format!("{kind} {hash}"))
+}
+
+/// Delete the CAS directory and everything in it. Succeeds if it's already gone.
+fn remove_cas(cas: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(cas) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("removing {}: {e}", cas.display())),
+    }
+}
+
+/// Drop to `uid`/`gid`, clearing supplementary groups first. Returns 0 on
+/// success, or a non-zero return from the first failing syscall (the caller then
+/// reads `errno`). Must be called while still privileged, in this order:
+/// supplementary groups, then the group, then the user — once the uid is dropped
+/// the others would be denied. Only used from `entrypoint`'s `pre_exec`, so it
+/// must stay async-signal-safe: these three raw syscalls are.
+fn drop_privileges(uid: u32, gid: u32) -> i32 {
+    // Resolved against the libc std already links (musl in the image).
+    extern "C" {
+        fn setgroups(size: usize, list: *const u32) -> i32;
+        fn setgid(gid: u32) -> i32;
+        fn setuid(uid: u32) -> i32;
+    }
+    unsafe {
+        let rc = setgroups(0, std::ptr::null());
+        if rc != 0 {
+            return rc;
+        }
+        let rc = setgid(gid);
+        if rc != 0 {
+            return rc;
+        }
+        setuid(uid)
+    }
+}

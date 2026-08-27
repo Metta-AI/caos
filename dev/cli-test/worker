@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# dev/cli-test — THE IMAGE A CLIENT TEST RUNS IN.
+#
+# A "client test" is one that drives `caos-cli`. It needs a git worktree,
+# because `:@=` ingests git-tracked paths and nothing else. This supplies one:
+# it stages the repo, installs the client under test, and then runs the test's
+# own `worker.sh` inside it.
+#
+# A test asks for it by naming it as its base — two lines, and nothing else:
+#
+#     DEPS         ../../dev/cli-test cli-test
+#     .caos-expr   curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
+#
+# and then finds itself cwd'd in a repo with the test tree at ./test, its own
+# dependencies at ./DEEP-DEPS, and $CAOS_CLI pointing at the client to drive.
+#
+# MOST TESTS DO NOT NEED THIS. A worker test names std/bash, addresses
+# everything by /cas path and hash, and never pays for a repo. So DEPping on
+# `cli-test` is the greppable answer to "which tests are client tests" — which
+# is also the count that decides how many runner slots the suite needs, since a
+# client test blocks on its runs and a worker test does not.
+#
+# It lives under dev/ with the rest of the suite's machinery (dev/run-test,
+# dev/run-tests) rather than under tests/, because it is not a test.
+#
+# ---- the rest of this file is why each step is the way it is ----------------
+#
+# It is the image AND the script because they are one decision: a test that
+# starts using `jq` needs this flake to carry jq, and there is no version of
+# that where the two usefully live apart. An absent binary here is exit 127 at
+# runtime, not a build error.
+#
+# WHAT IT DELIBERATELY DOES NOT CARRY: any grant. dev/test-stack declares
+# persistent volumes and CAP_SYS_ADMIN because it hosts a stack; a test does
+# not, and runnerd honours grants per image — so running tests in that image
+# would hand every one of them write access to the dev stack's own nix store
+# and object database.
+#
+# Nor a caos client: `caos-cli` arrives as a curried ARG, because which client
+# a test drives is a property of the RUN. That is what makes a test re-key when
+# the binary under test changes, which is the point of having a suite.
+set -euo pipefail
+
+fail() { echo "TESTS/LIB FAIL: $*" >&2; exit 1; }
+
+caos get -r /cas/args/test || fail "materializing the test tree"
+caos get /cas/args/cli || fail "no tested client bound (--cli:@=cli)"
+caos get /cas/args/worker1 || fail "no test script bound (--worker1:@=worker.sh)"
+
+# INSTALLED, not run in place: materialized CAS content is read-only and
+# owner-only, so exec'ing straight out of /cas is "Permission denied".
+install -m 755 /cas/args/cli /tmp/caos-cli || fail "installing the tested client"
+CAOS_CLI=/tmp/caos-cli
+export CAOS_CLI
+# CAOS_SERVER_URL is runnerd's, and runnerd here is the DEV stack's — so it
+# already points at the stack under test. Nothing to flip.
+: "${CAOS_SERVER_URL:?dev/cli-test needs CAOS_SERVER_URL from the runner}"
+
+# NO ALTERNATE OBJECT STORE, and if a push here ever dies unable to read an
+# object, this is the first place to look. There used to be one; CLAUDE.md is
+# explicit that it HID object-availability bugs, and tests/push-closure had to
+# delete it to reproduce at all. The stack a test pushes to already holds every
+# object it resolved, so the alternate has nothing to add.
+mkdir -p /tmp/client && cd /tmp/client
+git init -q .
+git config user.email test@caos
+git config user.name caos
+git config gc.auto 0
+git remote add caos "$CAOS_SERVER_URL"
+
+# The test's own tree at ./test and its dependencies at ./DEEP-DEPS — the two
+# places every test script has always looked. They have to be IN the repo, not
+# merely in /cas, because the CLI ingests git-tracked paths: naming
+# `--base:@=DEEP-DEPS/rgrep` resolves by INGESTING that directory and evaluating
+# its `.caos-expr`.
+# `cp -r`, NOT `-rL`: tests/symlinks carries a symlink as its FIXTURE, and
+# dereferencing it here would stage a regular file and quietly delete the thing
+# under test. The deps below still need -L (they are hash-tagged CAS content).
+cp -r /cas/args/test ./test || fail "staging the test tree"
+chmod -R u+w ./test
+# The deps move up to ./DEEP-DEPS, where every test script names them, and they
+# DO need `-L`: they are trees of read-only, hash-tagged CAS content, and the
+# CLI has to ingest them as real files to evaluate their `.caos-expr`.
+if [ -d ./test/DEEP-DEPS ]; then
+  cp -rL ./test/DEEP-DEPS ./DEEP-DEPS || fail "staging the test's deps"
+  chmod -R u+w ./DEEP-DEPS
+  rm -rf ./test/DEEP-DEPS
+fi
+
+# CAOS_STUB_HOST points workers at in-job stub servers. THIS CONTAINER'S OWN
+# ADDRESS ON THE NETWORK, deliberately, and not `127.0.0.1`: the workers a test
+# scripts are launched into the STACK's netns, not this container's, so loopback
+# would be the stack rather than the test. Read from /etc/hosts in bash — there
+# is no `hostname`, `getent`, `ip` or `ifconfig` in this image, and an absent
+# binary is exit 127 at runtime, not a build error.
+self=$(cat /etc/hostname) || fail "no /etc/hostname"
+CAOS_STUB_HOST=""
+while read -r ip names; do
+  case " $names " in *" $self "*) CAOS_STUB_HOST=$ip; break ;; esac
+done < /etc/hosts
+[ -n "$CAOS_STUB_HOST" ] || fail "no /etc/hosts entry for $self"
+export CAOS_STUB_HOST
+
+git add -A && git commit -qm testtree
+
+# THE TEST, with everything it narrates captured once and used twice: relayed
+# to stderr, which is what a FAILING worker's error text carries (so the
+# report's excerpt is the test's own story), and published as the result blob
+# on success, which is what `test-result` prints.
+#
+# Captured rather than tee'd: the output has to be COMPLETE before it is
+# published, and a tee'd fd is not guaranteed to have flushed by then.
+#
+# The test's exit code fails this worker, and dev/run-test's `--catch` turns
+# that into this test's FAIL — so a failure never touches another test's result.
+rc=0
+bash /cas/args/worker1 > /tmp/narration 2>&1 || rc=$?
+cat /tmp/narration >&2
+if [ "$rc" != 0 ]; then exit "$rc"; fi
+caos put /tmp/narration /cas/out

@@ -9,3 +9,6 @@
 # entry reached the two different ways the test compares.
 ../../std/bash bash
 ../../std/flake-builder flake-builder
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../dev/cli-test cli-test

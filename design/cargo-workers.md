@@ -272,7 +272,7 @@ publish is possible at all. The nix-building and toolchain-image tests
 **The unification (2026-07-21): one runner, socket-only, sharing via the
 cache.** The phase demos (`proc-stack`, `test-in-caos`, `suite-in-caos`,
 `socket-in-caos`, the `test-all` meta-test) are deleted; `tests/run-all.sh` is
-THE runner and `tests/lib/run-nested.sh` its one inner script. The settled
+THE runner and `dev/cli-test/run-nested.sh` its one inner script. The settled
 architecture, from the restart discussion:
 
 - **Each test is one outer caos job** — the cache unit. An unchanged test is a
@@ -342,7 +342,7 @@ the semantics we want for it, like every other test.)
 **Phase B landed (2026-07-21): the binaries under test are built BY caos.**
 run-all fires one bash job that run-thens `std/cargo --cmd=build
 --target=<musl> --profile=release` over the workspace and strips the result
-to the bin tree (`tests/lib/build-bins.sh` + `strip-bins.sh`). The strip is
+to the bin tree (`dev/cli-test/build-bins.sh` + `strip-bins.sh`). The strip is
 cache honesty: cargo's result carries volatile stderr (timings), so
 downstream jobs key on the content-stable bin tree only. The host threads
 that tree to every test job as `--bins:tree=<hash>` — a new CLI arg form
@@ -363,7 +363,7 @@ bake — see below) — plus a musl cross-cc (`pkgsCross`) with matching
 but C-carrying deps (ring, via rustls) need a real musl cc, and the small
 rustc-built workers never hit that because their dep set has no C.
 
-**Phase C landed (2026-07-21): the suite IS a worker.** `tests/lib/suite.sh`
+**Phase C landed (2026-07-21): the suite IS a worker.** `dev/cli-test/suite.sh`
 (a bash job keyed on everything — workspace, harness scripts, image IDs,
 key; a full-suite hit means literally nothing changed, salt to force):
 run-then the workspace build → `suite-stage2.sh` selects the tests/<name>
@@ -499,7 +499,7 @@ dogma" stance as network and the uid-0 grant.
 
 Mechanics (all proven end to end, 2026-07-20, by a manual spike since retired
 along with the demo tests — the living implementation is
-`tests/lib/run-nested.sh`):
+`dev/cli-test/run-nested.sh`):
 
 - **runnerd knobs** (`crates/runnerd`): `CAOS_RUNNER_SOCKET=<host sock>` makes
   the *outer* runnerd bind-mount the engine socket into a granted worker at a

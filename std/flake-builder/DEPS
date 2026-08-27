@@ -1,0 +1,4 @@
+# flake-builder's only dependency: the shared lock. It has no flake-builder mount
+# of its own — its base is the bootstrap sentinel (`docker://seeded`), since the
+# thing that builds flakes cannot be built by itself.
+../../flake.lock flake.lock

@@ -1,0 +1,12 @@
+# tests/run-and-update-ref, as an ENTRY (design/caos-expr.md, Phase 3):
+# evaluating this directory yields the test's ARG TREE, which dev/run-test runs.
+#
+# A WORKER TEST, in dev/worker-test rather than std/bash: the subject is a
+# worker that UPDATES A REF, so observing it means reading refs on the server,
+# and that is the one thing caos gives a worker no verb for. Everything else the
+# client was doing — curry, prepare-request, run — a worker does directly.
+#
+# `prepare.sh` is gone with it. It existed to make a worker call
+# `prepare-request` on a curried image; this script IS a worker, so it makes
+# that call itself.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --updater:@=DEEP-DEPS/run-and-update-ref --succeed:@=succeed.sh --fail:@=fail.sh

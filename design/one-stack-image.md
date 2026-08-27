@@ -18,8 +18,8 @@ and nothing makes them agree. They can drift silently, and when they drift the
 suite is testing a stack shape the host never runs.
 
 **`build-builtins.sh` has three callers and runs ~20 times per suite.** Once on
-the host (`caosd up`), once as `tests/lib/warm-std.sh`, and once inside every
-per-test stack (`tests/lib/run-test.sh`). The warm-up exists only to stop a
+the host (`caosd up`), once as `dev/cli-test/warm-std.sh`, and once inside every
+per-test stack (`dev/cli-test/run-test.sh`). The warm-up exists only to stop a
 cold registry from producing a thundering herd (`test-stack-image.md`, "Std is
 published per test"). Three call sites, two configurations, one of them a
 scheduling workaround.
@@ -301,7 +301,7 @@ that, and it is unchanged by any of this.
   stop being two separately-built images
 - `load_once`, `check_current`/`stale`, `compose_up`, `compose_up_diagnose` and
   the `docker load` content-tag memo in `caosd`
-- `tests/lib/warm-std.sh` entirely, and `run-test.sh`'s publish block — and
+- `dev/cli-test/warm-std.sh` entirely, and `run-test.sh`'s publish block — and
   with them the suite stage that existed to serialize the first publish, so
   `suite-stage4.sh` folds back into `suite-stage3.sh`
 - `/caos/images` and `/caos/tree` from the stack image: with nothing publishing

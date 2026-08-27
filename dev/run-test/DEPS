@@ -1,0 +1,2 @@
+# What this needs, by PATH (format `<path> <name>`, relative to this dir).
+../../std/bash bash

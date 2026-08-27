@@ -11,4 +11,4 @@
 # delta>, in: <this deepened tree> }` — so resolving this entry returns that
 # delta without the flake-builder worker ever running (design/caos-expr.md, the
 # hand-assembled seed keys).
-run --base:@=DEEP-DEPS/flake-builder --in:@=.
+run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock --required-pool=seeded

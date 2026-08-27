@@ -1,0 +1,7 @@
+# tests/exec-bit, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST — it asserts on modes a worker sees in a real /cas, so it IS a
+# worker. It used to be a cli.sh that built the fixture in a git repo and then
+# ran `$CAOS_CLI run` to launch exactly this script.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --ws:@=ws

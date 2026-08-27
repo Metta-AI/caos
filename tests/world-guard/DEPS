@@ -16,3 +16,6 @@
 # unnecessary line only over-keys the test, so when in doubt, declare.
 ../../std/bash bash
 ../../std/flake-builder flake-builder
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../dev/cli-test cli-test

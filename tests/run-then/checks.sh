@@ -45,5 +45,29 @@ fi
 grep -q 'takes only --map and --then' /tmp/err \
   || fail "wrong error for map-then --catch: $(cat /tmp/err)"
 
+# `--max-parallel` bounds a FAN-OUT, so it belongs to map-then and needs a
+# --map. Without one there is nothing to bound, and silently accepting it would
+# let a caller believe a cap was in force that never applied to anything.
+if caos map-then /cas/args/in --then:hash="$img" --max-parallel=2 2>/tmp/err; then
+  fail "map-then accepted --max-parallel without --map"
+fi
+grep -q 'needs --map' /tmp/err \
+  || fail "wrong error for --max-parallel without --map: $(cat /tmp/err)"
+
+# ...and it is map-then's alone: run-then runs ONE thing, so a width would mean
+# nothing there.
+if caos run-then /cas/args/in --run:hash="$img" --max-parallel=2 2>/tmp/err; then
+  fail "run-then accepted --max-parallel"
+fi
+grep -q 'takes only --run and --then' /tmp/err \
+  || fail "wrong error for run-then --max-parallel: $(cat /tmp/err)"
+
+# A width the server cannot honour is refused where the caller can see it. Zero
+# is the interesting one: it reads as "no parallelism" but means "no children
+# ever run", which is a hang rather than a slow run.
+if caos map-then /cas/args/in --map:hash="$img" --max-parallel=0 2>/tmp/err; then
+  fail "map-then accepted --max-parallel=0"
+fi
+
 echo ok > /tmp/ok
 caos put /tmp/ok /cas/out

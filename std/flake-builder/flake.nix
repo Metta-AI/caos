@@ -18,7 +18,7 @@
   # REGISTERED in /nix/var/nix/db, not merely present in /nix/store.
   #
   # The tree is LITERAL: this file, ./worker, and a flake.lock derived from
-  # the main flake.lock (std/refresh.sh; verified by tests/std-lint).
+  # the repo's ONE flake.lock, DEPped and bound as `--lock`.
   description = "caos std/flake-builder — builds flake images into runnable images";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

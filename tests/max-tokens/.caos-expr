@@ -1,0 +1,8 @@
+# tests/max-tokens, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. The subject is llm-step's max_tokens continuation — a worker
+# behaviour observed entirely in what it sent the model and what it committed.
+# The client curried the turn and blocked on it; worker-common.sh does the first
+# and polls the conversation ref instead of the second.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh

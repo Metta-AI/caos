@@ -1,0 +1,8 @@
+# What this test reaches for (format `<path> <name>`). These three ARE the tree
+# the lints check: deepening mounts them side by side under DEEP-DEPS, so
+# `rust/`, `std/` and `flake.nix` sit next to each other exactly as they do in
+# the repo, and both scripts take that directory as their root.
+../../std/bash bash
+../../rust rust
+../../std std
+../../flake.nix flake.nix

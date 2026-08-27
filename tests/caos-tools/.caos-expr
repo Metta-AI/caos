@@ -1,0 +1,11 @@
+# tests/caos-tools, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Tree-defined agent tools are discovered, registered and invoked
+# by llm-step, in a worker, with no client anywhere in the loop — the client was
+# here only to curry the turn and block on it, and std/llm-test/worker-common.sh
+# does both without blocking.
+#
+# dev/worker-test, not std/bash: the conversation REF is the completion signal,
+# and refs on the server are the one thing caos gives a worker no verb for.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh

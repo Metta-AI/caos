@@ -15,3 +15,9 @@
 # test loudly rather than letting it borrow something ambient. An
 # unnecessary line only over-keys the test, so when in doubt, declare.
 ../../std/cargo cargo
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../dev/cli-test cli-test
+# Everything cargo compiles, as a declared dependency rather than a workspace
+# handed to this test from outside.
+../../rust rust

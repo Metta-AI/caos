@@ -1,0 +1,14 @@
+# tests/flake-input-loader, as an ENTRY (design/caos-expr.md, Phase 3):
+# evaluating this directory yields the test's ARG TREE, which dev/run-test runs.
+#
+# A WORKER TEST, and a UNIT test of the loader rather than an integration test
+# of resolution. Everything the loader reads is an argument: `--in` is the
+# consumer tree, `--expr` is the expression TEXT, `--input-tree` is whatever
+# tree to splice. So the test supplies all three itself — no repo to fetch from,
+# no locator to resolve, no client.
+#
+# It used to build a real git repo, reach it over `git+file://`, and evaluate
+# through `caos-cli eval-path` so a `:@@=` locator would resolve. None of that
+# was under test: the loader never fetches. It compares the rev in the
+# expression text against the one in flake.lock, and both are inputs.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --loader:@=DEEP-DEPS/flake-input-loader

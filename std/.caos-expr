@@ -5,7 +5,7 @@
 # entry's `DEEP-DEPS/<dep>` mounts are computed by the REAL deep-deps worker at
 # resolve time instead of being baked in by bootstrap. That is what makes the
 # checked-in tree self-resolving: an entry is reached BY DESCENT through this
-# expression, never by a name looked up against a pre-deepened ref.
+# expression, never by a nameº looked up against a pre-deepened ref.
 #
 # `deep-deps` names the sibling entry BY PATH, and that is what breaks cycle-2
 # (design/caos-expr.md, "Breaking the cycles"): `resolve_expr_base` evaluates

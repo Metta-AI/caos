@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# dev/worker-test — THE IMAGE A WORKER TEST RUNS IN WHEN std/bash IS NOT ENOUGH.
+#
+# Most worker tests name `std/bash` and are done: bash, coreutils, diffutils,
+# gnugrep, findutils, jq. A few need something that image deliberately does not
+# carry — `git`, above all, for the one thing caos itself has no verb for:
+# reading and writing REFS on the server. Those tests name this instead:
+#
+#     DEPS         ../../dev/worker-test worker-test
+#     .caos-expr   curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh
+#
+# WHAT MAKES IT DIFFERENT FROM dev/cli-test, which carries the same tools:
+#
+#   NO CLIENT.  `caos-cli` never reaches a test through this image, so a test
+#               using it cannot drive `run`, `talk`, `chat`, `status` or
+#               `eval-path`. That is the point — those are the verbs whose
+#               presence made a test couple to the client binary, and every
+#               other verb a test wants has a worker equivalent
+#               (run-then/run-request-then, eval-path-then, get/get-hash,
+#               curry, prepare-request, sub-run, put/put-commit).
+#
+#   NO REPO.    dev/cli-test stages a git worktree and copies the test's whole
+#               DEEP-DEPS into it with `cp -rL` — which means copying BUILT
+#               IMAGES out of read-only CAS, hundreds of megabytes for a test
+#               that wanted one binary. It has to: `:@=` ingests git-tracked
+#               paths, so a client test's deps must be real files in a
+#               worktree. A worker names things by /cas path and hash, so
+#               nothing is copied and nothing is committed. That copy is most
+#               of the difference between a 50-second client test and a
+#               1-second worker test.
+#
+# A test that wants a repo makes one (`git init`; `git remote add caos
+# "$CAOS_SERVER_URL"`) — three lines, in the tests that actually need it,
+# rather than in every test that happens to share a base image.
+#
+# THE CONTENTS ARE WHAT A TEST SCRIPT SHELLS OUT TO. An absent binary here is
+# exit 127 at runtime, not a build error, so the list errs generous — it is
+# dev/cli-test's list, minus nothing: the difference between the two images is
+# what the WORKER script does, not what is installed.
+#
+# Like std/bash's, this /worker is a script interpreter: fetch `worker1` and run
+# it with bash. On exit caos reads the hash of /cas/out; if the script left no
+# result there, store an empty blob so there is something to read.
+set -euo pipefail
+
+caos get /cas/args/worker1
+bash /cas/args/worker1
+if [ ! -e /cas/out ]; then
+  : > /tmp/caos-empty-out
+  caos put /tmp/caos-empty-out /cas/out
+fi

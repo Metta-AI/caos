@@ -1,0 +1,8 @@
+# tests/bash-tool, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Five dispatches and their values — nothing a client is needed
+# for. `bash-tool` resolves to the built worker by being named; `ws` is the
+# workspace it operates on, checked in with its modes (run.sh is 100755, which
+# is what the exec-bit assertion is about).
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --tool:@=DEEP-DEPS/bash-tool --ws:@=ws

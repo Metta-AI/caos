@@ -5,4 +5,4 @@
 # names a distinct sentinel (`docker://seeded-deep-deps`); bootstrap hand-builds
 # the result — curry(runner, worker1=<worker-deep-deps binary>) — and seeds it
 # under this expression's key. No binary is staged into the checked-in entry.
-run --base:docker=seeded-deep-deps --in:@=.
+run --base:docker=seeded-deep-deps --in:@=. --required-pool=seeded

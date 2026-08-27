@@ -1,2 +1,3 @@
+# What this test reaches for (format `<path> <name>`).
 ../../std/bash bash
 ../../std/flake-builder flake-builder

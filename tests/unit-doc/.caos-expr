@@ -1,0 +1,9 @@
+# tests/unit-doc, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. It dispatches one cargo job and reads its value — nothing a
+# client is needed for. Both things it needs are DECLARED and resolved by being
+# named: `cargo` is the built worker image, `rust` is everything cargo
+# compiles. It used to stage a git repo, copy `rust` into it and drive
+# `caos-cli run` to do the same dispatch.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --cargo:@=DEEP-DEPS/cargo --rust:@=DEEP-DEPS/rust

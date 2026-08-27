@@ -1,0 +1,12 @@
+# tests/run-then, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. `run-then` is a WORKER verb and every fixture here is already a
+# worker; the client was only a convenient way to dispatch them and read stdout.
+#
+# The two failure cases are why it looked like it needed one — they assert that
+# a failing run fails the whole request UNCAUGHT, and a worker that lets a run
+# fail uncaught dies with it. The uncaught path is one level down: dispatch the
+# driver that does the uncaught run-then, and CATCH that dispatch. The error
+# text is the proof and the subject is unchanged.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --num:@=in.txt --double:@=double.sh --combine:@=combine.sh --driver:@=driver.sh --outer:@=outer.sh --checks:@=checks.sh --boom:@=boom.sh --catcher:@=catcher.sh --cycle:@=cycle.sh

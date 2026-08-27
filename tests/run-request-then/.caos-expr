@@ -1,0 +1,15 @@
+# tests/run-request-then, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST — and it should always have been one: `run-request-then` is a
+# WORKER verb, and every fixture here is already a worker. It was a client test
+# only because the client was a convenient way to dispatch them and read their
+# stdout.
+#
+# The failure cases are why it looked like it needed a client. They assert that
+# an exact-request failure propagates UNCAUGHT, and a worker that lets a run
+# fail uncaught dies with it. The answer is that the uncaught path is one level
+# down: dispatch a driver that does the uncaught `run-request-then`, and CATCH
+# that dispatch. The error text is the proof, and the thing under test is still
+# the uncaught path.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --identify:@=identify.sh --driver:@=driver.sh --callback:@=callback.sh --checks:@=checks.sh --boom:@=boom.sh

@@ -1,0 +1,7 @@
+# tests/cargo-crates, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Six cargo dispatches and their values — nothing a client is
+# needed for. `cargo` resolves to the built worker image by being named; `ws` is
+# the two-crate fixture it checks.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --cargo:@=DEEP-DEPS/cargo --ws:@=ws

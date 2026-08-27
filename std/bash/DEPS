@@ -3,3 +3,8 @@
 # (mounted at DEEP-DEPS/flake-builder by deepening) rather than /std, so std has
 # no ambient self-reference.
 ../flake-builder flake-builder
+# The lock, SHARED rather than copied: one `flake.lock` at the repo root pins
+# every flake in the tree, and the flake-builder places it (`--lock` below).
+# nix takes a superset happily — it resolves the inputs this flake declares and
+# prunes the rest.
+../../flake.lock flake.lock

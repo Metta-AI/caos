@@ -1,0 +1,9 @@
+# tests/symlinks, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. It asserts on what a worker sees in a real /cas, so it IS a
+# worker: std/bash as its base, the fixture bound as an arg, and no client or
+# git worktree anywhere. It used to be a one-line cli.sh whose whole body was
+# `$CAOS_CLI run --base:@=DEEP-DEPS/bash --worker1:@=check.sh` — a client test
+# whose only job was to launch a worker test.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --tree:@=tree

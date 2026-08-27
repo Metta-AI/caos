@@ -1,0 +1,7 @@
+# tests/cargo-check, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. It dispatches cargo jobs and reads their values — nothing a
+# client is needed for. `cargo` resolves to the built worker image by being
+# named; the two fixture packages are bound as data.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --cargo:@=DEEP-DEPS/cargo --mini:@=mini --broken:@=broken

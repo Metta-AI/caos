@@ -1,0 +1,8 @@
+# tests/deep-deps, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Every deepen is a dispatch, and the one case that goes through
+# evaluation uses `eval-path-then` — the worker's way to have a `.caos-expr`
+# walked, which tests/eval-then exists to prove builds byte-identically to a
+# client `eval-path`. So nothing here needs a client.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --deep-deps:@=DEEP-DEPS/deep-deps

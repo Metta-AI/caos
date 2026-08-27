@@ -1,0 +1,7 @@
+# tests/rgrep, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Every assertion is about a run's RESULT, and dispatching a run
+# is what a worker does with `curry` + `run-then`. `rgrep` resolves to the built
+# worker by being named; `tree` is the fixture it greps.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rgrep:@=DEEP-DEPS/rgrep --tree:@=tree

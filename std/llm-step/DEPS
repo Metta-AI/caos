@@ -13,7 +13,7 @@
 ../rustc rustc
 ../git-runner git-runner
 ../llm-client llm-client
-../../crates/conversation-protocol conversation-protocol
+../../rust/crates/conversation-protocol conversation-protocol
 ../bash-tool bash-tool
 ../rgrep rgrep
 ../bash bash

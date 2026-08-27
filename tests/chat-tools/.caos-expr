@@ -1,0 +1,13 @@
+# tests/chat-tools, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. The subject is llm-step's INLINE FILE TOOLS — what the worker
+# does with a queued batch of write/read/edit/ls calls — and the client was
+# here to type `chat`, which is a different subject with a test of its own.
+# So this drives llm-step the way the client does: mint the human turn, publish
+# the admission event, dispatch, and read the turn commit back.
+#
+# dev/worker-test, not std/bash: reading and writing the conversation REF is the
+# one thing caos gives a worker no verb for, so this needs git — and nothing
+# else the client was providing.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh

@@ -5,3 +5,5 @@
 /result
 /result-*
 /target
+# Everything cargo compiles lives under rust/, so its target dir does too.
+/rust/target

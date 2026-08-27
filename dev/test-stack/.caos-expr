@@ -1,0 +1,8 @@
+# dev/test-stack's image (design/caos-expr.md, Phase 3): this directory is a flake
+# (flake.nix + flake.lock + worker), so its image is the flake-builder applied
+# to the directory itself. It names the builder by a LOCAL deep-deps mount
+# (DEEP-DEPS/flake-builder, declared in DEPS) — the only way it CAN name it,
+# since nothing resolves a builtin by name. Resolving this entry evaluates the
+# expression, which makes the flake→image step explicit rather than leaving it
+# to the server to detect.
+run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock

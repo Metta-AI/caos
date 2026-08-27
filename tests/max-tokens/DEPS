@@ -19,3 +19,7 @@
 ../../std/cargo cargo
 ../../std/flake-builder flake-builder
 ../../std/llm-stub llm-stub
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../std/llm-test llm-test
+../../dev/worker-test worker-test

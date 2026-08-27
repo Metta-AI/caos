@@ -1,0 +1,7 @@
+# tests/dirs-only, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. It builds a fixture worker with rustc and runs it — both
+# dispatches, which a worker does with `curry` + `run-then`. `rustc` resolves to
+# the built builder by being named; `src` and `tree` are its inputs.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --src:@=worker.rs --tree:@=tree

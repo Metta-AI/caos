@@ -1,0 +1,8 @@
+# tests/llm-subagent, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Subagents are ordinary durable conversations — the identifiers,
+# the owner index, the title ref and the inherited workspace are all on the
+# server — so everything asserted here is read from refs, and the client was
+# only currying the parent turn and blocking on it.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh

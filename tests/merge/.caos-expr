@@ -1,0 +1,9 @@
+# tests/merge, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. std/merge is a worker and the subject throughout; git was here
+# as a LOCAL TOOL — to mint the fixture commits and to read the result — and a
+# worker has both without it. `caos put-commit` mints a commit, and a commit
+# RESULT arrives as its raw object bytes, so `tree`/`parent` are lines to read
+# and the tree behind them is one `caos get-hash` away.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --merge:@=DEEP-DEPS/merge

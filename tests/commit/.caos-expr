@@ -1,0 +1,12 @@
+# tests/commit, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. The subject is commit-worker.rs — a source-built worker that
+# reads a `:commit=` arg, walks its tree and parent by hash, runs one tool call
+# through run-then, and mints a child commit. Git was here to MAKE the head
+# commit and to READ the child; `caos put-commit` does the first and a
+# commit-kind result arrives as raw object bytes, which is the second.
+#
+# `--rustc:@=DEEP-DEPS/rustc` hands this worker the BUILT builder image: naming
+# a dependency evaluates it, so a worker never has to.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --rustc:@=DEEP-DEPS/rustc --cworker:@=commit-worker.rs --tool:@=tool.sh

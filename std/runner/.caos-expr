@@ -9,4 +9,4 @@
 # PATH: `std/rustc/DEPS` says `../runner`, and a tree cannot be self-resolving
 # if one of its dependencies is not in it. That is also what lets the repo-root
 # `.caos-expr` deepen this tree at all.
-run --base:docker=seeded-runner --in:@=.
+run --base:docker=seeded-runner --in:@=. --required-pool=seeded

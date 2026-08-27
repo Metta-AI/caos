@@ -10,8 +10,8 @@
   # the image except the caos additions. /worker included.
   #
   # This directory IS the published tree (literal trees, part 2): flake.nix,
-  # flake.lock (derived from the main flake.lock by std/refresh.sh), worker
-  # — build-builtins.sh copies it whole, and tests/std-lint verifies the
+  # worker (the lock is DEPped from the repo root and placed by the flake-builder)
+  # — build-builtins.sh copies it whole, and tests/lint verifies the
   # checked-in redundancies.
   description = "caos std/bash — the script worker: shell + file tools, /worker runs `worker1`";
 
@@ -41,8 +41,8 @@
             pkgs.diffutils
             pkgs.gnugrep
             pkgs.findutils
-            # JSON plumbing for worker scripts — std/refresh.sh's lock
-            # derivation (the std-lint suite check) among them.
+            # JSON plumbing for worker scripts — the shared lock
+            # derivation (the lint suite check) among them.
             pkgs.jq
           ];
           config = {
