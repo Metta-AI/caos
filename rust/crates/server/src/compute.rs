@@ -1155,6 +1155,25 @@ fn resolve_promise(
             if let Some((extra, _, _)) = mid {
                 args.push(extra);
             }
+            // THE HANDLER INHERITS THE PARENT'S RUNNER POOL, and this is the
+            // only place in the file that does it — the `run` and `map` sites
+            // above deliberately do not.
+            //
+            // A continuation is the SAME LOGICAL WORK one stage on, which the
+            // trace already models (`status::walk` follows a node's completion
+            // as that node continuing, not as a child of it). So a job that
+            // asked for a pool is still asking for it at its next stage, and
+            // that has to hold without every worker remembering to re-bind it:
+            // a test whose `next()` forgot dropped its later stages into the
+            // general pool, freed its slot the moment it recorded a
+            // continuation, and let another test start — so the cap bounded
+            // the first job of each test and nothing else.
+            //
+            // A CHILD IS NOT THE SAME WORK. It is new work the parent may be
+            // waiting for, so inheriting there would put a blocked parent and
+            // the child it needs in one bounded pool, which is the deadlock the
+            // pools exist to prevent.
+            args.extend(inherited_pool_entries(config, parent)?);
             Ok((
                 run_image(
                     config,
@@ -1252,6 +1271,37 @@ fn validate_continuation_shape(
 /// optionally representing a failure as an `error` blob. Shared by rebuilt
 /// `run` requests and exact `request` continuations so catch semantics cannot
 /// drift between them.
+/// The `required*` entries of `parent`, to be merged into the ArgTree of a
+/// continuation OF that parent (see the call site in `resolve_promise`).
+///
+/// Read off the parent's own ArgTree rather than threaded through as a
+/// parameter, because that is where the answer already is: `required-pool` is
+/// an ordinary arg, and a job that has one has it in its entries.
+///
+/// Returns every `required*` entry, not `required-pool` specifically. The prefix
+/// is the reserved namespace for runner selection (`caos_world`), so a second
+/// pool dimension added later inherits without touching this.
+fn inherited_pool_entries(
+    config: &Config,
+    parent: &str,
+) -> Result<Vec<gix::objs::tree::Entry>, HttpError> {
+    let entries = args_entries(config, parent)?;
+
+    entries
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(caos_world::REQUIRED_ARG_PREFIX))
+        .map(|(name, oid)| {
+            let oid = gix::ObjectId::from_hex(oid.as_bytes())
+                .map_err(|e| HttpError::new(500, format!("invalid {name} oid: {e}")))?;
+            Ok(named_entry(
+                &name,
+                gix::objs::tree::EntryKind::Blob.into(),
+                oid,
+            ))
+        })
+        .collect()
+}
+
 fn continuation_result(
     config: &Config,
     cont: &str,
