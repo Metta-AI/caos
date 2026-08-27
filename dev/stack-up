@@ -147,42 +147,12 @@ if [ "$packs" -gt 16 ]; then
 fi
 
 # ---- serve -----------------------------------------------------------------
-# SLOTS MUST EXCEED THE NUMBER OF TESTS, and by enough for what they spawn.
-#
-# A test is a job on this stack now, and every job a test submits — building a
-# fixture worker, running a cargo check — goes to this same runnerd. So a test
-# occupies a slot for its whole life WHILE waiting for a sub-job that needs a
-# slot of its own. Set slots below the fan-out width and every slot ends up
-# holding a test that is waiting for a job that can never start: nothing moves
-# until the pending timeout fires, and the 503 says `no runner for arg_tree`,
-# which blames capacity in a way that sounds like the pool is merely busy.
-#
-# Observed at 16 slots against 47 tests: a 15m47s run that ended in exactly that
-# message. The old harness never hit it because each test had its OWN inner
-# stack and its own runnerd, so a test's sub-jobs never competed with the test.
-#
-# Slots are poll loops, not machines — the cost of a spare one is a parked HTTP
-# request — so this is sized generously on purpose.
 #
 # NO COMMENTS INSIDE THE BLOCK BELOW. Every line ends in a backslash, and a
 # continuation followed by a comment joins INTO the comment — the env prefix is
 # severed and serve runs with none of it. Not a parse error, so `bash -n` passes
 # and it surfaces as a stack dying at bring-up over a variable that is right
 # there in the source (CLAUDE.md).
-# TWO POOLS, and the split is what lets either be small. Some tests must stay
-# running while a worker they started runs — a client test blocking on
-# `caos-cli run`, or one hosting a stub server llm-step calls back into — so on
-# a single pool they are hold-and-wait: every slot ends up holding a test that
-# is waiting for a child that can never be scheduled. That is why the general
-# pool used to be 128, which is not capacity, it is headroom bought to avoid a
-# deadlock.
-#
-# `dev/run-test` binds `--required-pool=test` on each test and the server's
-# rendezvous keeps the general pool away from any job naming a pool, so
-# CAOS_TEST_RUNNER_SLOTS is "how many tests are in flight": every job of a test
-# — eval, launch, the test, verdict — carries the arg, while everything a test
-# SPAWNS does not. With holders bounded, the general pool only ever holds work
-# that runs to completion, so 48 is a real number rather than a cushion.
 phase "starting serve"
 ready=$state/stack.ready
 rm -f "$ready"
@@ -200,8 +170,6 @@ CAOS_STACK_RUNNERD=yes \
 CAOS_STACK_SEEDER=yes \
 CAOS_CACHE_NAMESPACE="$namespace" \
 CAOS_RUNNER_SLOTS="${CAOS_RUNNER_SLOTS:-48}" \
-CAOS_STACK_TEST_RUNNERD=yes \
-CAOS_TEST_RUNNER_SLOTS="${CAOS_TEST_RUNNER_SLOTS:-40}" \
 CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
 CAOS_DOCKER_BIN=podman \
 CAOS_DOCKER_ARGS="--root $engine_store/store --runroot $engine_store/run" \
@@ -260,10 +228,4 @@ fi
 phase "done"
 ln -sfn "$inputs/bin" "$state/bin"
 echo "==> dev stack ready (client: $state/bin/caos-cli)" >&2
-# WHICH POOLS EXIST, from the runnerds themselves. The slot counts are set three
-# files away (here -> stack/serve -> runnerd) and nothing else reports them, so a
-# pool that silently did not start, or started with the wrong `required`, looked
-# exactly like a pool that was not binding.
-# `1>&2` BEFORE `2>/dev/null`: the other order points stdout at the fd that has
-# just become /dev/null, so the whole diagnostic vanishes (it did).
-grep -h "caos-runnerd:" "$state"/logs/runnerd.log "$state"/logs/test-runnerd.log 1>&2 2>/dev/null || true
+grep -h "caos-runnerd:" "$state"/logs/runnerd.log 1>&2 2>/dev/null || true

@@ -126,9 +126,9 @@ struct Config {
     /// The server's rendezvous is symmetric: this says which jobs the runner
     /// will accept, and a job's own `required*` args say which runners it will
     /// accept. So a dedicated pool needs BOTH halves — this process requiring
-    /// `required-pool=test`, and the job carrying it — and neither alone
-    /// changes anything: a runner requiring it simply never matches ordinary
-    /// work, which is the point.
+    /// a pool arg, and the job carrying it — and neither alone changes
+    /// anything: a runner requiring it simply never matches ordinary work,
+    /// which is the point.
     required: std::collections::BTreeMap<String, String>,
     slots: u32,
     network: String,
@@ -451,8 +451,8 @@ struct Job {
 
 /// A git blob's object id: sha1 over `blob <len>\0` then the content. The
 /// server's rendezvous compares OIDS, and a job's arg value reaches it as the
-/// blob of that value — so a runner requiring `required-pool=test` has to name
-/// the same object the ArgTree does, not the string.
+/// blob of that value — so a runner requiring `required-pool=seeded` has to
+/// name the same object the ArgTree does, not the string.
 fn blob_oid(value: &str) -> String {
     use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();

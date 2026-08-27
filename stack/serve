@@ -64,13 +64,6 @@
 #                             "The seed"), so a fresh stack has std without
 #                             publishing it.
 #   CAOS_RUNNER_SLOTS         the general pool's concurrency
-#   CAOS_STACK_TEST_RUNNERD   "yes" to run a SECOND runnerd requiring
-#                             `required-pool=test` — the pool `dev/run-test`
-#                             puts each test in, so tests cannot starve the
-#                             children they are waiting for. Default "no": only
-#                             a stack that runs the suite needs one.
-#   CAOS_TEST_RUNNER_SLOTS    that pool's concurrency, i.e. how many tests run
-#                             at once. Default 8.
 #   CAOS_PENDING_TIMEOUT_SECS how long a job waits for a runner to exist
 #
 # Passed through to runnerd untouched, because they are the caller's business:
@@ -262,15 +255,6 @@ done
 # netns, and the host placement overrides it with `caos-redis:<port>`. A worker
 # that finds it unset has no cache offered and must still do the work.
 #
-# A SECOND POOL is optional (CAOS_STACK_TEST_RUNNERD), and exists so a stack can
-# run tests without them starving each other. A test may have to stay running
-# while a worker it started runs — blocking on `caos-cli run`, or hosting a stub
-# server a worker calls back into — which on a single pool is hold-and-wait:
-# every slot ends up holding a test waiting for a child that can never be
-# scheduled. `dev/run-test` binds `--required-pool=test` on each test, this pool
-# requires it, and the server's rendezvous excludes the generic pool from any job
-# naming one. Tests are then capped by this pool while their children draw from
-# the general one, which is what makes the general pool safe to shrink.
 start_runnerd() { # <log-name> <slots> <require>
   local name=$1 slots=$2 require=$3 pid ok=""
   start "$name" env \
@@ -297,10 +281,6 @@ start_runnerd() { # <log-name> <slots> <require>
 
 if [ "$CAOS_STACK_RUNNERD" = yes ]; then
   start_runnerd runnerd "${CAOS_RUNNER_SLOTS:-8}" ""
-fi
-
-if [ "${CAOS_STACK_TEST_RUNNERD:-no}" = yes ]; then
-  start_runnerd test-runnerd "${CAOS_TEST_RUNNER_SLOTS:-8}" "required-pool=test"
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -

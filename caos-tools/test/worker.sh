@@ -226,20 +226,10 @@ chmod u+w /tmp/suite/report
   echo "and while a run is in flight, CAOS_WATCH_LINES=0 shows every node"
   echo "instead of the first 16."
   echo
-  # WHAT EACH POOL ACTUALLY DID. A pool can be configured perfectly and still
-  # claim nothing: if no job carries its `required` arg it simply never matches,
-  # and from outside that is indistinguishable from a cap that is not binding.
-  # Both readings were live at once here, and nothing reported which.
-  echo "runner pools (jobs claimed / log lines):"
-  for p in runnerd test-runnerd; do
-    if [ -f "/caos-dev/logs/$p.log" ]; then
-      echo "  $p: $(grep -c 'running job' "/caos-dev/logs/$p.log" || true) claimed," \
-        "$(wc -l < "/caos-dev/logs/$p.log") lines," \
-        "$(grep -m1 -o 'requiring .*' "/caos-dev/logs/$p.log" || echo 'requiring ?')"
-    else
-      echo "  $p: no log — did it start?"
-    fi
-  done
+  if [ -f "/caos-dev/logs/runnerd.log" ]; then
+    echo "runnerd: $(grep -c 'running job' /caos-dev/logs/runnerd.log || true) claimed," \
+      "$(wc -l < /caos-dev/logs/runnerd.log) lines"
+  fi
 } >> /tmp/suite/report
 
 # THE WHOLE RESULT TREE, not just the report. SPEC's tool conventions: a tree

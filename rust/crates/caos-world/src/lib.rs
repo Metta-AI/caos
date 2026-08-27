@@ -75,14 +75,8 @@ pub fn secret_hash_material(pairs: &[(&str, &str)]) -> Vec<u8> {
 /// It makes the rendezvous symmetric. A runner's `required` set says which jobs
 /// it will accept; a `required*` arg says which runners the JOB will accept —
 /// so the generic pool, which requires nothing and therefore matches everything,
-/// is excluded from a job that names a pool. That is what lets a test run in a
-/// small dedicated pool while its children draw from the general one: without
-/// it, capping the general pool deadlocks the moment every slot holds a test
-/// that is waiting for a child it can no longer schedule.
-///
-/// It deliberately does NOT propagate. `dev/run-test` binds `required-pool=test`
-/// onto the test's own ArgTree, and nothing forwards it — so a test's sub-runs
-/// and later stages carry none and are dispatched normally.
+/// is excluded from a job that names a pool. The seeded pool is the live
+/// example: `required-pool=seeded` keeps seed jobs off the generic runnerd.
 pub const REQUIRED_ARG_PREFIX: &str = "required";
 
 /// The one such arg in use: which runner POOL may answer this job.

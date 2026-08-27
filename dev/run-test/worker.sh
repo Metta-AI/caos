@@ -77,7 +77,6 @@ eval)
   # later stage reads has to be re-bound by name.
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage=launch --cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt \
-    --required-pool=test \
     "--start=$(date +%s)") || fail "currying the launch stage"
   caos eval-path-then /cas/args/in --eval=. --then:hash="$next" --catch
   ;;
@@ -129,29 +128,7 @@ launch)
   # the only things a test does not declare for itself, because they are
   # properties of the RUN rather than of any tree.
   #
-  # `--required-pool=test` PUTS THE TEST IN ITS OWN RUNNER POOL (SPEC, "Misc").
-  # Some tests have to stay running while a worker they started runs — a client
-  # test blocking on `caos-cli run`, or one hosting a stub HTTP server that
-  # llm-step calls back into. On one pool that is hold-and-wait: every slot can
-  # end up holding a test that is waiting for a child that can never be
-  # scheduled. So tests run in a small dedicated pool and their children draw
-  # from the general one, which is what makes the general pool safe to shrink.
-  #
-  # EVERY JOB OF THIS TEST CARRIES IT — the map image (dev/run-tests), so `eval`
-  # does; forwarded to `launch` and `verdict`; and bound here onto the test's own
-  # ArgTree. So CAOS_TEST_RUNNER_SLOTS really is "how many tests are in flight",
-  # which is the number anyone will check. With it on the test job alone, a
-  # `caos-cli status` showed 15 test names running at 8 slots — every one of them
-  # an `eval` on the general pool, and the reading was fair: the number named
-  # after tests was not bounding tests.
-  #
-  # WHAT MUST NOT CARRY IT is anything the test SPAWNS. A test's sub-runs are
-  # formed by the test itself and carry no `required-pool`, so they draw from the
-  # general pool — that separation IS the mechanism. Forward it into a test's own
-  # `next()` and a test holding a slot would be waiting for a child that needs
-  # the same pool, which is the deadlock this exists to prevent.
-  bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt
-        --required-pool=test)
+  bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt)
   req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
     || fail "binding this run's arguments onto the test"
 
@@ -159,7 +136,7 @@ launch)
   # anything wanting to watch or re-run this one test must name.
   echo "run-test: arg tree $req" >&2
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
-    --stage=verdict --required-pool=test "--start=$(date +%s)") \
+    --stage=verdict "--start=$(date +%s)") \
     || fail "currying the verdict stage"
   caos run-then /cas/args/in --run:hash="$req" --then:hash="$next" --catch
   ;;

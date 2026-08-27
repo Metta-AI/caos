@@ -123,7 +123,7 @@ fanout)
     salt=$(cat /cas/args/test-salt)
   fi
   map=$(caos curry --base:@=/cas/args/runner \
-    "--cli:@=/cas/args/cli" "--test-salt=$salt" --required-pool=test) \
+    "--cli:@=/cas/args/cli" "--test-salt=$salt") \
     || fail "currying the per-test image"
 
   only=""
@@ -178,11 +178,6 @@ fanout)
   then_img=$(caos curry --base:@=/cas/args/base \
     "--worker1:@=/cas/args/worker1" --stage=summarize \
     "--start-time=$(date +%s)") || fail "currying the summarize stage"
-  # HOW MANY TESTS RUN AT ONCE, and the only place that can say it. A runner
-  # pool bounds CONTAINERS, and a test that has recorded a continuation and
-  # exited holds none while the work it is waiting for runs — so capping slots
-  # left all 46 tests in flight. A map child's thread spans its whole chain,
-  # continuations included, so bounding children here bounds TESTS.
   if [ -e /cas/args/max-parallel ]; then
     caos get /cas/args/max-parallel
     mp=$(cat /cas/args/max-parallel)
