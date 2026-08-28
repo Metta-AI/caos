@@ -64,30 +64,28 @@ migrate, or delete them.
 
 ## Controls
 
-Focus is either in the left pane (the conversation list) or the main pane (the
-conversation). While the conversation list is focused, `Up` / `Down` move
-through conversations and `Enter` moves focus into the conversation pane;
-`Escape` in the conversation pane (with no slash-command matches showing) moves
-focus back to the list. The focused pane's border is highlighted.
+The left pane lists conversations; keyboard input goes to the conversation
+pane. Change the selected conversation from anywhere with `Ctrl+Up` /
+`Ctrl+Down`, jump straight to one with `Ctrl+1` … `Ctrl+9`, or click its row
+in the sidebar. `Escape` stops a running turn or dismisses the current layer,
+so it never leaves the conversation pane.
 
 | Input | Action |
 |---|---|
-| `Up` / `Down` (list focused) | Select the previous or next conversation |
-| `Enter` (list focused) | Focus the conversation pane |
-| `Ctrl+E` (list focused) | Archive the selected conversation for this user |
-| `Escape` (conversation focused) | Dismiss slash-command matches, else focus the list |
-| `Ctrl+A` / `Ctrl+E` (conversation focused) | Move to the start / end of the current line |
+| `Escape` | Stop a running turn, else dismiss the current layer |
+| `Ctrl+A` / `Ctrl+E` | Move to the start / end of the current line |
 | `Ctrl+S` | Send the prompt (`Ctrl+Enter` also works in terminals with enhanced keyboard input) |
 | `Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
 | `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right`, or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
 | `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
-| `Ctrl+W` (conversation focused) | Delete the previous word |
-| `Ctrl+K` (conversation focused) | Kill from the cursor to the end of the line |
-| `Ctrl+D` (conversation focused) | Delete the character to the right of the cursor |
+| `Ctrl+W` | Delete the previous word |
+| `Ctrl+K` | Kill from the cursor to the end of the line |
+| `Ctrl+D` | Delete the character to the right of the cursor |
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
-| `Ctrl+N` | Start a new virtual conversation (from either focus) and focus it |
+| `Ctrl+1` … `Ctrl+9` | Select the Nth conversation (terminals with enhanced keyboard input) |
+| `Ctrl+N` | Start a new virtual conversation and select it |
 | `Ctrl+H` | Enter or leave keyboard help |
 | `Ctrl+Shift+P` | Open or close the searchable command palette |
 | `Ctrl+Q` | Switch between conversation and workspace changes |
@@ -178,12 +176,13 @@ step chain when the TUI restarts. If the selection is already on the newest
 step, new activity remains selected. Moving to an older step pauses that
 tail-follow behavior.
 
-Archiving atomically moves only the selected user's membership ref from
-`active` to `archived`; it does not move the conversation HEAD or affect other
-users. A running or publishing conversation must finish first. Closing an
-unsent virtual conversation simply discards it. Use `--list-archived` and
-`--unarchive <conversation-id>` outside the full-screen UI to recover old
-conversations.
+Archive the selected conversation from the command palette (`Ctrl+Shift+P`,
+then `archive`). Archiving atomically moves only the selected user's
+membership ref from `active` to `archived`; it does not move the conversation
+HEAD or affect other users. A running or publishing conversation must finish
+first. Closing an unsent virtual conversation simply discards it. Use
+`--list-archived` and `--unarchive <conversation-id>` outside the full-screen
+UI to recover old conversations.
 
 The transcript fills the conversation pane above the fixed composer. Use
 `PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
