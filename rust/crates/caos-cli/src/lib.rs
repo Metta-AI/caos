@@ -195,6 +195,11 @@ pub struct ConversationSnapshot {
     /// the turn without treating later interjections as its input head.
     pub request_head: Option<String>,
     pub interrupted: bool,
+    /// The `error` recorded by the terminal `failed` event, when the worker
+    /// wrote one. The status alone says only that a turn ended; this is the
+    /// reason, and reporting the status without it makes every distinct
+    /// failure read identically.
+    pub error: Option<String>,
     pub messages: Vec<ConversationMessage>,
 }
 
@@ -2052,6 +2057,16 @@ fn load_durable_conversation(
     })
 }
 
+/// Render a terminal `failed` status for a human. The durable event carries the
+/// reason the turn ended; the status is only the fallback for a worker that
+/// recorded none.
+pub fn failure_reason(snapshot: &ConversationSnapshot) -> String {
+    match snapshot.error.as_deref() {
+        Some(error) => error.to_string(),
+        None => format!("conversation request ended {}", snapshot.status),
+    }
+}
+
 /// Run/admit one turn while retaining the old TUI's progress callback.
 /// Durable transcript/activity is read by the TUI's remote poller; this method
 /// emits only transient phase and status hints, avoiding duplicate rows.
@@ -2134,7 +2149,7 @@ pub fn run_chat_turn(
                     interrupted: snapshot.interrupted,
                 })
             }
-            "failed" => return Err(format!("conversation request ended {}", snapshot.status)),
+            "failed" => return Err(failure_reason(&snapshot)),
             _ => {}
         }
         if let Some(rx) = &request_result {
@@ -3007,6 +3022,7 @@ fn fold_events(
     let mut request: Option<String> = None;
     let mut request_head: Option<String> = None;
     let mut interrupted = false;
+    let mut error: Option<String> = None;
     for event in events {
         let value = &event.value;
         if let Some(content) = value.get("content") {
@@ -3039,6 +3055,17 @@ fn fold_events(
         waterfall_string(value, "request", &mut request)?;
         waterfall_string(value, "request_head", &mut request_head)?;
         if let Some(event_status) = value.get("status").and_then(Value::as_str) {
+            // A reason belongs to one terminal event. Any later status retires
+            // it, so a retry that succeeds does not keep showing the failure it
+            // replaced.
+            error = match event_status {
+                "failed" => match value.get("error") {
+                    Some(Value::String(reason)) => Some(reason.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(_) => return Err("conversation event error is not a string".to_string()),
+                },
+                _ => None,
+            };
             if matches!(event_status, "queued" | "running") {
                 interrupted = false;
             } else if matches!(event_status, "idle" | "failed") {
@@ -3086,6 +3113,7 @@ fn fold_events(
         request,
         request_head,
         interrupted,
+        error,
         messages,
     })
 }
@@ -4129,6 +4157,73 @@ mod tests {
         assert_eq!(
             snapshot.request.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn a_failed_terminal_reports_its_recorded_reason_and_a_retry_retires_it() {
+        let user = "1111111111111111111111111111111111111111";
+        let admitted = "2222222222222222222222222222222222222222";
+        let failed = "3333333333333333333333333333333333333333";
+        let request = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let reason = "POST https://api.anthropic.com/v1/messages: 401 Unauthorized";
+        let events = [
+            event_at(user, json!({"author":"user","content":"start"})),
+            event_at(
+                admitted,
+                json!({"request":request,"request_head":user,"status":"queued"}),
+            ),
+            event_at(
+                failed,
+                json!({"request":request,"round":0,"status":"failed","error":reason}),
+            ),
+        ];
+        let snapshot = fold_events("one", failed, &events).unwrap();
+        assert_eq!(snapshot.status, "failed");
+        assert_eq!(snapshot.error.as_deref(), Some(reason));
+        assert_eq!(failure_reason(&snapshot), reason);
+
+        // A later turn owns the status, so the previous turn's reason must not
+        // survive into it.
+        let retried = "4444444444444444444444444444444444444444";
+        let queued = "5555555555555555555555555555555555555555";
+        let mut retry = events.to_vec();
+        retry.push(event_at(
+            retried,
+            json!({"author":"user","content":"again"}),
+        ));
+        retry.push(event_at(
+            queued,
+            json!({"request":"cccccccccccccccccccccccccccccccccccccccc","request_head":retried,"status":"queued"}),
+        ));
+        let snapshot = fold_events("one", queued, &retry).unwrap();
+        assert_eq!(snapshot.status, "queued");
+        assert_eq!(snapshot.error, None);
+    }
+
+    #[test]
+    fn a_failed_terminal_without_a_reason_falls_back_to_the_status() {
+        let user = "1111111111111111111111111111111111111111";
+        let admitted = "2222222222222222222222222222222222222222";
+        let failed = "3333333333333333333333333333333333333333";
+        let request = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let snapshot = fold_events(
+            "one",
+            failed,
+            &[
+                event_at(user, json!({"author":"user","content":"start"})),
+                event_at(
+                    admitted,
+                    json!({"request":request,"request_head":user,"status":"queued"}),
+                ),
+                event_at(failed, json!({"request":request,"status":"failed"})),
+            ],
+        )
+        .unwrap();
+        assert_eq!(snapshot.error, None);
+        assert_eq!(
+            failure_reason(&snapshot),
+            "conversation request ended failed"
         );
     }
 

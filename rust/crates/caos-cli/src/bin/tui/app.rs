@@ -1216,6 +1216,12 @@ impl ConversationState {
         None
     }
 
+    /// Keep a multi-line reason (an HTTP body, a conflict report) out of the
+    /// one-line status.
+    fn first_line(text: &str) -> &str {
+        text.lines().next().unwrap_or(text).trim_end()
+    }
+
     fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
         self.running = matches!(snapshot.status.as_str(), "queued" | "running");
         self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
@@ -1226,6 +1232,14 @@ impl ConversationState {
                 format!("interrupted {}", short_hash(&snapshot.head))
             }
             "idle" => format!("updated {}", short_hash(&snapshot.head)),
+            // A follower never runs the turn, so this status line is the only
+            // place it learns why one ended. Recomputed from the snapshot on
+            // every poll, so it cannot accumulate the way a transcript row
+            // would.
+            "failed" => match snapshot.error.as_deref() {
+                Some(error) => format!("failed: {}", Self::first_line(error)),
+                None => "failed".to_string(),
+            },
             other => other.to_string(),
         };
         if !self.running {
@@ -4896,6 +4910,7 @@ mod tests {
                 request: None,
                 request_head: None,
                 interrupted: false,
+                error: None,
                 messages: Vec::new(),
             },
             replay: ConversationReplay {
@@ -6523,6 +6538,7 @@ mod tests {
                     request: Some(request.clone()),
                     request_head: Some("c".repeat(40)),
                     interrupted: false,
+                    error: None,
                     messages: Vec::new(),
                 },
                 replay: ConversationReplay {
@@ -6635,6 +6651,7 @@ mod tests {
                     request: Some("c".repeat(40)),
                     request_head: Some("d".repeat(40)),
                     interrupted: false,
+                    error: None,
                     messages: Vec::new(),
                 },
                 replay: ConversationReplay {
