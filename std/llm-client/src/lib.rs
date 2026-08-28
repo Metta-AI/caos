@@ -25,6 +25,11 @@ pub fn post_messages(
     body: &Value,
     status: &dyn Fn(&str),
 ) -> Result<Value, String> {
+    // Secret files conventionally end in a newline. Passing that byte through
+    // to an HTTP header can terminate the header block early, leaving the API
+    // to see an empty or header-prefixed request body. Strip line endings, but
+    // reject embedded ones instead of silently changing the credential.
+    let api_key = api_key_header(api_key)?;
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
     let payload = body.to_string();
     let mut attempt = 0;
@@ -81,5 +86,28 @@ pub fn post_messages(
             }
             Err(error) => return Err(format!("POST {url}: {error}")),
         }
+    }
+}
+
+fn api_key_header(api_key: &str) -> Result<&str, String> {
+    let api_key = api_key.trim_end_matches(['\r', '\n']);
+    if api_key.contains(['\r', '\n']) {
+        return Err("anthropic API key contains an embedded line ending".to_string());
+    }
+    Ok(api_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_file_line_endings_are_not_sent_in_the_header() {
+        assert_eq!(api_key_header("test-key\r\n").unwrap(), "test-key");
+    }
+
+    #[test]
+    fn embedded_api_key_line_endings_are_rejected() {
+        assert!(api_key_header("test\nkey").is_err());
     }
 }
