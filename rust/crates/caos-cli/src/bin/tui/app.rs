@@ -3278,6 +3278,9 @@ impl App {
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.kill_line()
             }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.delete()
+            }
             KeyCode::Char(ch)
                 if !key
                     .modifiers
