@@ -45,11 +45,13 @@ asks for one — paste the key, or enter the path to a file that holds it — an
 writes the canonical secret entry, trimmed, with fresh cache-isolation entropy
 already included (what `caos secrets` would add). It ensures git ignores
 `.caos-secrets/` (adding the rule to `.git/info/exclude` when nothing else
-covers it), re-loads the store through the normal loader, and continues
-straight into the UI — no relaunch. A pasted key is erased from the screen the
-moment it is submitted. A store that exists but fails to load is reported as
-the error it is rather than prompting, so an existing broken configuration is
-never overwritten.
+covers it), re-reads the entry through the same store parser every turn starts
+from, and continues straight into the UI — no relaunch. A pasted key is erased
+from the screen the moment it is submitted. A store that exists but fails to
+read is reported as the error it is rather than prompting, so an existing
+broken configuration is never overwritten. The check is parse-only: the
+secret's `reader=` expressions are resolved by the first turn, behind the
+TUI's progress display, never while the terminal is still blank at startup.
 
 ```text
 caos tui                  continue the most recent conversation

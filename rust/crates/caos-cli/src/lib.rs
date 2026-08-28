@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use caos::{
     build_secret_store, compute_client_request_with_store, curry_client_object,
-    eval_workspace_dep_with_store, prepare_client_request_with_store,
+    eval_workspace_dep_with_store, local_secret_names, prepare_client_request_with_store,
     run_client_request_with_store, ClientSecret, GitTransport, Transport, CAOS_REMOTE,
 };
 #[cfg(test)]
@@ -1102,8 +1102,8 @@ fn resolve_llm(
     curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
 }
 
-fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
-    if store.iter().any(|secret| secret.name() == MODEL_API_SECRET) {
+fn require_model_secret<'a>(mut names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    if names.any(|name| name == MODEL_API_SECRET) {
         return Ok(());
     }
     Err(format!(
@@ -1151,26 +1151,37 @@ pub fn model_secret_manual_setup() -> String {
 }
 
 /// Whether the conversation model credential is absent from an otherwise
-/// loadable store — the "offer to set one up" case. Distinct from a store that
-/// fails to load at all (unreadable value file, unresolvable reader): that is
-/// someone's existing configuration broken, reported as the error it is rather
-/// than papered over with a setup prompt.
-pub fn model_secret_missing(t: &GitTransport) -> Result<bool, String> {
-    Ok(build_secret_store(t)?
+/// readable store — the "offer to set one up" case. Distinct from a store
+/// whose files fail to read at all (a malformed spec, an unreadable value):
+/// that is someone's existing configuration broken, reported as the error it
+/// is rather than papered over with a setup prompt.
+///
+/// Parse-only deliberately ([`local_secret_names`]): resolving a reader runs
+/// eval-path over the workspace, which dispatches real computation — the
+/// deepening run, and worker builds for `DEEP-DEPS/llm-step`'s inputs — and
+/// that took tens of seconds of blank terminal after any build that touched
+/// them. The turn that sends a request resolves the full store behind its own
+/// progress UI ([`conversation_secret_store`]), where a broken reader is
+/// reported just as readably.
+pub fn model_secret_missing() -> Result<bool, String> {
+    Ok(local_secret_names()?
         .iter()
-        .all(|secret| secret.name() != MODEL_API_SECRET))
+        .all(|name| name != MODEL_API_SECRET))
 }
 
 fn conversation_secret_store(t: &GitTransport) -> Result<Vec<ClientSecret>, String> {
     let store = build_secret_store(t)?;
-    require_model_secret(&store)?;
+    require_model_secret(store.iter().map(ClientSecret::name))?;
     Ok(store)
 }
 
 /// Check the model credential before an interactive client takes over the
-/// terminal, so setup failures remain readable at the shell prompt.
-pub fn ensure_conversation_secret(t: &GitTransport) -> Result<(), String> {
-    conversation_secret_store(t).map(drop)
+/// terminal, so setup failures remain readable at the shell prompt. Parse-only,
+/// like [`model_secret_missing`] and for the same reason: the declared names
+/// answer "is a key configured?" without evaluating the workspace.
+pub fn ensure_conversation_secret() -> Result<(), String> {
+    let names = local_secret_names()?;
+    require_model_secret(names.iter().map(String::as_str))
 }
 
 fn request_is_active(status: &str) -> bool {

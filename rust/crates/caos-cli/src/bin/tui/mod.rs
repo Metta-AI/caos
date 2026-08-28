@@ -250,8 +250,9 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     let transport = GitTransport::from_cwd()?;
     transport.ensure_server_reachable()?;
     // Missing model credential? Ask for one and install it right here, while
-    // the shell still has the terminal (setup::ensure_model_secret).
-    setup::ensure_model_secret(&transport)?;
+    // the shell still has the terminal (setup::ensure_model_secret). The check
+    // is parse-only: nothing before the first draw may evaluate the workspace.
+    setup::ensure_model_secret()?;
     let mut app = App::new(args)?;
 
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;
