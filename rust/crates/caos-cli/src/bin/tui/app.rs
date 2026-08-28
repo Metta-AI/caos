@@ -3278,6 +3278,9 @@ impl App {
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.kill_line()
             }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.delete()
+            }
             KeyCode::Char(ch)
                 if !key
                     .modifiers
@@ -6856,6 +6859,22 @@ mod tests {
         app.selected_mut().composer.move_end();
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.selected().composer.text, "firstsecond");
+    }
+
+    #[test]
+    fn ctrl_d_deletes_the_character_to_the_right_in_the_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("abc");
+        app.selected_mut().composer.move_home();
+
+        // Ctrl+D deletes forward, like readline and Emacs delete-char.
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "bc");
+
+        // At the end of the text there is nothing to delete, so it is a no-op.
+        app.selected_mut().composer.move_end();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "bc");
     }
 
     #[test]

@@ -1403,6 +1403,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
+        Line::raw("  Ctrl+D          delete the character to the right"),
         Line::raw("  Esc             stop a running agent or dismiss the current layer"),
         Line::raw("  Ctrl+Up/Down    switch conversations"),
         Line::raw("  Ctrl+C          clear the prompt, then quit"),
