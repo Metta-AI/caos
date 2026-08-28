@@ -235,7 +235,10 @@ moves. The checkout and index remain untouched.
 
 CAOS points `caos/<conversation>` directly at the validated conversation head,
 pushes it, and uses the authenticated `gh` CLI to find or open its pull
-request. The first publication carries the conversation history; later
+request. The live status names each publication stage as it runs — fetching
+the base tip, sending it to the CAOS server, the preparation turn (whose tool
+activity shows through, like an ordinary turn), validating the prepared
+workspace, pushing the branch, and finding or opening the pull request. The first publication carries the conversation history; later
 publications advance the branch by fast-forward. The selected PR base is an
 ancestor of the published head, and the final tree must contain no reserved
 `.caos` state.

@@ -25,8 +25,8 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::workspace::{
     commit_working_tree, fetch_published_conversation, fetch_remote_branch_tip,
-    load_conversation_workspace, local_default_branch_tip, prepare_publish_workspace,
-    publish_conversation_branch, publish_conversation_pr, remote_base_is_ancestor,
+    find_or_open_conversation_pr, load_conversation_workspace, local_default_branch_tip,
+    prepare_publish_workspace, publish_conversation_branch, remote_base_is_ancestor,
     remote_default_branch, PublishedConversationSource,
 };
 
@@ -1371,7 +1371,7 @@ impl ConversationState {
     }
 
     fn sidebar_text(&self, max_cells: u16) -> (String, String) {
-        let detail = if self.running {
+        let detail = if self.running || self.publishing {
             self.running_activity()
                 .map(|activity| {
                     format!("{} {}", activity.running_verb(), activity.running_summary())
@@ -1379,7 +1379,7 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
-        } else if self.reference_loading || self.publishing {
+        } else if self.reference_loading {
             self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
             attention.clone()
@@ -3890,12 +3890,19 @@ impl App {
         };
         let conversation = self.selected().id.clone();
         self.selected_mut().publishing = true;
-        self.selected_mut().status = "publishing the complete conversation branch".to_string();
+        self.selected_mut().status = "validating the conversation tip".to_string();
         let repo_dir = self.repo_dir.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            let status = |text: String| {
+                let _ = tx.send(UiMessage::Turn {
+                    conversation: conversation.clone(),
+                    event: TurnEvent::Status(text),
+                });
+            };
             let result = (|| {
                 let prepared = prepare_publish_workspace(&diff.head, &diff.base_commit, &repo_dir)?;
+                status(format!("pushing branch caos/{conversation}"));
                 publish_conversation_branch(&conversation, &prepared, &repo_dir)
             })();
             let _ = tx.send(UiMessage::BranchPublished {
@@ -3951,7 +3958,7 @@ impl App {
             let name = self.selected().id.clone();
             let title = self.selected().title.clone();
             self.selected_mut().publishing = true;
-            self.selected_mut().status = "fetching the selected PR base".to_string();
+            self.selected_mut().status = format!("fetching the tip of {pr_base}");
             let tx = self.tx.clone();
             let head = self
                 .selected()
@@ -3963,14 +3970,25 @@ impl App {
             let options = self.selected().turn_options.clone();
             let repo_dir = self.repo_dir.clone();
             std::thread::spawn(move || {
+                let status = |text: String| {
+                    let _ = tx.send(UiMessage::Turn {
+                        conversation: name.clone(),
+                        event: TurnEvent::Status(text),
+                    });
+                };
                 let result = (|| {
                     let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
                     let target = base_commit;
                     let base_is_ancestor = remote_base_is_ancestor(&target, &head, &repo_dir)?;
                     let transport = GitTransport::discover(&repo_dir)?;
                     if !base_is_ancestor {
+                        status(format!(
+                            "sending base {} to the caos server",
+                            short_hash(&target)
+                        ));
                         transport.ensure_pushed(&target)?;
                     }
+                    status("starting the publication preparation turn".to_string());
                     let message = publish_turn_message(&target, base_is_ancestor);
                     let outcome = run_chat_turn(
                         &transport,
@@ -3986,13 +4004,24 @@ impl App {
                             });
                         },
                     )?;
+                    status("validating the prepared workspace".to_string());
                     let conversation =
                         prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
                     let _ = tx.send(UiMessage::Completed {
                         conversation: name.clone(),
                         outcome,
                     });
-                    publish_conversation_pr(&name, &title, &conversation, &pr_base, &repo_dir)
+                    status(format!("pushing branch caos/{name}"));
+                    let branch = publish_conversation_branch(&name, &conversation, &repo_dir)?;
+                    status("finding or opening the pull request".to_string());
+                    find_or_open_conversation_pr(
+                        &name,
+                        &title,
+                        &branch,
+                        &conversation,
+                        &pr_base,
+                        &repo_dir,
+                    )
                 })();
                 let _ = tx.send(UiMessage::Published {
                     conversation: name,
@@ -6423,6 +6452,92 @@ mod tests {
         let rendered = rows.join("\n");
         assert!(rendered.contains("PR failed: gh could not open the PR"));
         assert!(!rendered.contains("Status"));
+    }
+
+    fn rendered_screen(app: &App) -> String {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn publish_stage_statuses_replace_the_generic_publishing_summary() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "fetching the tip of main".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Publishing…"));
+        assert!(rendered.contains("fetching the tip of main"));
+
+        tx.send(UiMessage::Turn {
+            conversation: "talk-1".to_string(),
+            event: TurnEvent::Status("pushing branch caos/talk-1".to_string()),
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+        assert_eq!(app.selected().status, "pushing branch caos/talk-1");
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Publishing…"));
+        assert!(rendered.contains("pushing branch caos/talk-1"));
+    }
+
+    #[test]
+    fn publishing_shows_a_running_tool_instead_of_the_generic_verb() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "starting the publication preparation turn".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+
+        tx.send(UiMessage::Turn {
+            conversation: "talk-1".to_string(),
+            event: TurnEvent::ToolCall {
+                step_commit: "b".repeat(40),
+                request: "c".repeat(40),
+                round: 1,
+                tool_use_id: "call-1".to_string(),
+                name: "bash".to_string(),
+                summary: "$ cargo test".to_string(),
+            },
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Running…"));
+        assert!(rendered.contains("$ cargo test"));
+        assert!(!rendered.contains("Publishing…"));
+        let (_, detail) = app.selected().sidebar_text(60);
+        assert_eq!(detail, "Running $ cargo test");
+
+        tx.send(UiMessage::Turn {
+            conversation: "talk-1".to_string(),
+            event: TurnEvent::ToolResult {
+                step_commit: "b".repeat(40),
+                request: "c".repeat(40),
+                round: 1,
+                tool_use_id: "call-1".to_string(),
+                is_error: false,
+                content: "ok".to_string(),
+            },
+        })
+        .unwrap();
+        assert!(app.drain_messages());
+
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Publishing…"));
+        assert!(rendered.contains("starting the publication preparation turn"));
+        let (_, detail) = app.selected().sidebar_text(60);
+        assert_eq!(detail, "starting the publication preparation turn");
     }
 
     #[test]
