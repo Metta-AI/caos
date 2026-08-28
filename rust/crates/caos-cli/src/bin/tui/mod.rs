@@ -4,10 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use caos::GitTransport;
-use caos_cli::{
-    ensure_conversation_secret, list_user_conversations, unarchive_user_conversation,
-    UserConversationStatus,
-};
+use caos_cli::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
 use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
@@ -24,6 +21,7 @@ use ratatui_crossterm::CrosstermBackend;
 
 mod app;
 mod args;
+mod setup;
 mod workspace;
 
 use app::{ui::render, App, MouseAction, View};
@@ -251,7 +249,9 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     }
     let transport = GitTransport::from_cwd()?;
     transport.ensure_server_reachable()?;
-    ensure_conversation_secret(&transport)?;
+    // Missing model credential? Ask for one and install it right here, while
+    // the shell still has the terminal (setup::ensure_model_secret).
+    setup::ensure_model_secret(&transport)?;
     let mut app = App::new(args)?;
 
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;

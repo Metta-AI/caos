@@ -39,6 +39,18 @@ The TUI checks the configured server before entering the alternate screen. If
 it cannot connect within five seconds, it exits with the server URL and asks
 you to check the running service and the `caos` git remote.
 
+The Anthropic API key is checked next, still at the shell prompt. When the
+git-ignored `.caos-secrets` store has no `anthropic-api-key` secret, the TUI
+asks for one — paste the key, or enter the path to a file that holds it — and
+writes the canonical secret entry, trimmed, with fresh cache-isolation entropy
+already included (what `caos secrets` would add). It ensures git ignores
+`.caos-secrets/` (adding the rule to `.git/info/exclude` when nothing else
+covers it), re-loads the store through the normal loader, and continues
+straight into the UI — no relaunch. A pasted key is erased from the screen the
+moment it is submitted. A store that exists but fails to load is reported as
+the error it is rather than prompting, so an existing broken configuration is
+never overwritten.
+
 ```text
 caos tui                  continue the most recent conversation
 caos tui --username alice use alice's active conversation list

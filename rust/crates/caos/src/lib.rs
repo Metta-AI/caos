@@ -4167,15 +4167,19 @@ fn merge_entries(
 /// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
 /// param's historical name; its value is the arg-tree hash.)
 /// Directory of the caller's git-ignored secrets store (design/secrets.md).
-const SECRETS_DIR: &str = ".caos-secrets";
+/// Public so clients that *write* the store (the tui's first-run key setup)
+/// name the same directory the loader reads.
+pub const SECRETS_DIR: &str = ".caos-secrets";
 
 /// Minimum entropy length (chars) not flagged weak. A `secret-hash` is only
 /// unguessable if the entropy is: below this, it's brute-forceable out of the
 /// hash (like GitHub Actions refusing to mask short secrets).
 const MIN_ENTROPY_LEN: usize = 16;
 
-/// Fresh entropy for a secret: 128 random bits as 32 hex chars.
-fn fresh_entropy() -> Result<String, String> {
+/// Fresh entropy for a secret: 128 random bits as 32 hex chars. Public so a
+/// client writing a new secret file can include the entropy up front (what
+/// `secrets` would otherwise add on a second pass) with the one policy.
+pub fn fresh_entropy() -> Result<String, String> {
     use std::io::Read;
     let mut file =
         std::fs::File::open("/dev/urandom").map_err(|e| format!("opening /dev/urandom: {e}"))?;
