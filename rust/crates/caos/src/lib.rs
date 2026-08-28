@@ -25,7 +25,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
@@ -4270,11 +4270,21 @@ pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String
             .map_err(|e| format!("reading secret {file_name}: {e}"))?;
         let spec = parse_local_secret_spec(&file_name, &text)?;
         let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
-        let readers = spec
-            .readers
-            .iter()
-            .map(|r| resolve_reader_client(t, &pinned, r))
-            .collect::<Result<_, _>>()?;
+        let mut readers = Vec::new();
+        for reader in &spec.readers {
+            match resolve_reader_client(t, &pinned, reader)? {
+                Some(entries) => readers.push(entries),
+                // A reader naming a path the tree does not carry grants nothing
+                // — no arg tree can be a superset of an image that does not
+                // exist — so it is DROPPED rather than failing the load. A store
+                // is read by every client on every turn, so a reader that has
+                // outlived the directory it named (a tool moved from
+                // `caos-tools/` into `std/`) would otherwise take down `tui`,
+                // `talk` and `run-tool` alike, over a grant that was already
+                // inert. Dropping only narrows access, so it is fail-closed.
+                None => warn_absent_reader(&file_name, reader),
+            }
+        }
         store.push(ClientSecret {
             name: spec.name,
             value,
@@ -4520,18 +4530,23 @@ fn resolve_local_secret_value(
 /// arg tree the run uses), unwrap any curry layers, and take its entries. That
 /// tree already carries whatever the expression bakes in (e.g. a curried
 /// `worker1` script), so it is as specific as the expression is.
+///
+/// `None` when the tree carries no such path: an OPTIONAL reader, see
+/// [`build_secret_store`].
 fn resolve_reader_client(
     t: &dyn Transport,
     pinned: &str,
     reader: &str,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
+) -> Result<Option<std::collections::BTreeMap<String, String>>, String> {
     if reader.split_whitespace().count() != 1 {
         return Err(format!(
             "reader {reader:?} must be a single path (argument pins are not supported — \
              point at a narrower expression instead)"
         ));
     }
-    let image = resolve_reader_image(t, pinned, reader.trim())?;
+    let Some(image) = resolve_reader_image(t, pinned, reader.trim())? else {
+        return Ok(None);
+    };
     let (base, bound) = unwrap_curry(t, &image)?;
     let mut entries = std::collections::BTreeMap::new();
     for entry in bound {
@@ -4542,7 +4557,39 @@ fn resolve_reader_client(
     }
     // The image entry wins over any like-named bound arg, mirroring assembly.
     entries.insert("base".to_string(), base);
-    Ok(entries)
+    Ok(Some(entries))
+}
+
+/// Whether an `eval-path` failure means the TREE simply does not carry the
+/// reader's path, as opposed to the expression at that path being broken.
+///
+/// The walk reports a missing component as `eval-path: "<name>" not found in
+/// <tree oid>`; the other "not found" messages name a path *inside* an
+/// expression and end in `in tree`. Only the first is an absent reader — a
+/// reader that resolves to a `.caos-expr` which then fails must stay loud.
+fn reader_path_absent(error: &str) -> bool {
+    error
+        .strip_prefix("eval-path: ")
+        .and_then(|rest| rest.rsplit_once(" not found in "))
+        .is_some_and(|(_, node)| is_hex_hash(node))
+}
+
+/// Report an absent reader ONCE per process. Once, because the store is rebuilt
+/// on every turn while an interactive client owns the terminal: the first load
+/// happens before the TUI takes the screen, so the notice lands at the shell
+/// prompt instead of being repainted over inside a frame.
+fn warn_absent_reader(secret: &str, reader: &str) {
+    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert(format!("{secret}\u{0}{reader}")) {
+        eprintln!(
+            "caos: secret {secret}: reader {reader:?} names no path in this tree — ignored \
+             (it grants nothing; drop the line or point it at the path that replaced it)"
+        );
+    }
 }
 
 /// Resolve a reader's image token: a bare hash, or a path in the pinned tree
@@ -4554,14 +4601,23 @@ fn resolve_reader_client(
 /// reaches a dependency. That is also why it converges with the run's own
 /// resolution — the root `.caos-expr` deepens the tree, and the entry a reader
 /// descends to is the same node a `DEEP-DEPS/<name>` mount points at.
-fn resolve_reader_image(t: &dyn Transport, pinned: &str, expr: &str) -> Result<String, String> {
+///
+/// `None` when that path is not in the tree ([`reader_path_absent`]).
+fn resolve_reader_image(
+    t: &dyn Transport,
+    pinned: &str,
+    expr: &str,
+) -> Result<Option<String>, String> {
     if is_hex_hash(expr) {
-        return Ok(expr.to_string());
+        return Ok(Some(expr.to_string()));
     }
     // Empty store: a reader's own resolution must not be marked (its arg tree is
     // what the match compares against; marking it would be circular).
-    let (_, oid) = eval::eval_path(t, pinned, expr, &[])?;
-    Ok(oid)
+    match eval::eval_path(t, pinned, expr, &[]) {
+        Ok((_, oid)) => Ok(Some(oid)),
+        Err(error) if reader_path_absent(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
@@ -4963,6 +5019,27 @@ mod local_secret_tests {
             .err()
             .expect("unknown field was accepted");
         assert!(error.contains("unknown key \"wat\""), "{error}");
+    }
+
+    /// An optional reader is exactly "the tree has no such path", which is the
+    /// walk's message — naming the node it looked in. Everything else, up to
+    /// and including a `not found` raised by the reader's OWN expression, is a
+    /// broken reader and has to keep failing the load.
+    #[test]
+    fn only_a_missing_tree_path_makes_a_reader_optional() {
+        let oid = "2114331da99790fef932866de7176d408c5a6e19";
+        assert!(super::reader_path_absent(&format!(
+            "eval-path: \"caos-tools\" not found in {oid}"
+        )));
+        for loud in [
+            "eval-path: path \"src\" not found in tree",
+            "eval-path: base path \"std/bash\" not found in tree",
+            "eval-path: cannot descend into \"tool\": the prefix evaluated to a blob",
+            "eval-path: undefined variable $BASE",
+            "transport: connection refused",
+        ] {
+            assert!(!super::reader_path_absent(loud), "{loud}");
+        }
     }
 }
 

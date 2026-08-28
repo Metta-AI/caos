@@ -147,6 +147,8 @@ reader=std/github-push
 reader=tools/deploy
 ```
 - When a call stack is started, such as `caos-cli run`, we read the current source tree and the list of secrets. Readers in secrets are matched against the tree. Any worker named as a reader is granted access to the secret. These workers have a hash of the names and entropy of all exposed secrets injected into them as /cas/args/secret-hash
+- A reader naming a path the tree does not carry is ignored, with a warning
+  on stderr. Otherwise, it's too easy for a bad edit to prevent the tui from running
 - Something is considered to be the same worker (ie, to have access to the secret) if it its arg tree is a superset of the reader's arg tree and secret-hash matches the set of secrets that the server computes for it
 - Each granted secret contributes its (worker-visible name, entropy) to a
   `secret-hash` entry folded into the worker's arg tree (visible at

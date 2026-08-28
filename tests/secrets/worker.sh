@@ -178,6 +178,32 @@ verdict=$(cat tgot/verdict)
   || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
 echo "  ok: a reader naming a repo path grants the secret" >&2
 
+echo "== a reader naming a path the tree lacks is ignored, not fatal ==" >&2
+# A store is loaded by every client on every turn, so a stale reader (a tool
+# that moved directories) must not take the client down: it grants nothing, so
+# it is dropped with a warning while the rest of the store still resolves.
+cat > .caos-secrets/stale <<'EOF'
+value=STALE-nobody-can-read-this
+entropy=00112233445566778899aabbccddeeff
+reader=gone-tools/test
+EOF
+out=$("$CAOS_CLI" run stillgot --base:@=DEEP-DEPS/bash --worker1:@=check.sh 2>stale.err) \
+  || fail "a stale reader broke the store: $(cat stale.err)"
+verdict=$(cat stillgot/verdict)
+[ "$verdict" = "token-ok deploy-absent" ] \
+  || fail "verdict with a stale reader: $verdict (expected 'token-ok deploy-absent')"
+grep -q 'gone-tools/test' stale.err \
+  || fail "the dropped reader should be reported: $(cat stale.err)"
+# A reader that is malformed rather than absent stays loud.
+printf 'value=x\nentropy=00112233445566778899aabbccddeeff\nreader=mytool extra-arg\n' \
+  > .caos-secrets/badreader
+if "$CAOS_CLI" run nope --base:@=DEEP-DEPS/bash --worker1:@=check.sh >/dev/null 2>bad.err; then
+  fail "a malformed reader should still fail the load"
+fi
+grep -q 'single path' bad.err || fail "expected the malformed-reader error: $(cat bad.err)"
+rm -f .caos-secrets/badreader .caos-secrets/stale
+echo "  ok: an absent reader is dropped with a warning; a malformed one fails" >&2
+
 echo "== sub-run preserves the server-held secret store ==" >&2
 # The launcher is an ordinary bash worker and cannot read deploytok. Its child
 # is the independently authorized subtool request; the child succeeds only if
