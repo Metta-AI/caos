@@ -6862,6 +6862,22 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_deletes_the_character_to_the_right_in_the_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("abc");
+        app.selected_mut().composer.move_home();
+
+        // Ctrl+D deletes forward, like readline and Emacs delete-char.
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "bc");
+
+        // At the end of the text there is nothing to delete, so it is a no-op.
+        app.selected_mut().composer.move_end();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "bc");
+    }
+
+    #[test]
     fn new_conversation_is_available_from_either_focus() {
         // Force transport discovery to fail so a dispatched attempt has an
         // observable command error without depending on the test runner's
