@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use caos_cli::AGENT_CONFIG_NAME;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedPublishConversation {
     pub(crate) head: String,
@@ -138,12 +140,27 @@ pub(crate) fn prepare_publish_workspace(
         require_success("git grep", markers)?;
     }
 
-    let reserved = capture_required("git", &["ls-tree", "--name-only", head, ".caos"], cwd)?;
-    if !reserved.is_empty() {
-        return Err(
-            "the publish head still contains reserved .caos state; remove .caos/conflicts after resolving it"
-                .to_string(),
-        );
+    let caos_entry = capture_required("git", &["ls-tree", "--name-only", head, ".caos"], cwd)?;
+    if !caos_entry.is_empty() {
+        // `.caos/agent.json` — checked-in repository instructions — publishes
+        // with the tree; everything else under `.caos` is harness state and
+        // must be gone by the tip (even an empty, resolved conflict record).
+        let entries = capture_required(
+            "git",
+            &["ls-tree", "--name-only", &format!("{head}:.caos")],
+            cwd,
+        )?;
+        let reserved: Vec<&str> = entries
+            .lines()
+            .filter(|name| !name.is_empty() && *name != AGENT_CONFIG_NAME)
+            .collect();
+        if !reserved.is_empty() {
+            return Err(format!(
+                "the publish head still contains reserved .caos state ({}); \
+                 remove .caos/conflicts after resolving it",
+                reserved.join(", ")
+            ));
+        }
     }
 
     Ok(PreparedPublishConversation {
@@ -789,6 +806,47 @@ mod tests {
 
         assert!(error.contains("reserved .caos state"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prepared_publish_head_keeps_checked_in_agent_instructions() {
+        let dir = temp_repo("publish-agent-config");
+        let base = commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(
+            dir.join(".caos/agent.json"),
+            "{\"instructions\":\"run the tests\"}",
+        )
+        .unwrap();
+        capture_required("git", &["add", ".caos/agent.json"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "instructions"], &dir).unwrap();
+        let head = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+
+        let prepared = prepare_publish_workspace(&head, &base, &dir).unwrap();
+
+        assert_eq!(prepared.head, head);
+    }
+
+    #[test]
+    fn prepared_publish_head_refuses_conflicts_beside_agent_instructions() {
+        let dir = temp_repo("publish-agent-config-conflicts");
+        let base = commit_file(&dir, "base\n", "base");
+        std::fs::create_dir_all(dir.join(".caos")).unwrap();
+        std::fs::write(
+            dir.join(".caos/agent.json"),
+            "{\"instructions\":\"run the tests\"}",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".caos/conflicts"), "").unwrap();
+        capture_required("git", &["add", ".caos"], &dir).unwrap();
+        capture_required("git", &["commit", "-q", "-m", "leftover record"], &dir).unwrap();
+        let head = capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap();
+
+        let error = prepare_publish_workspace(&head, &base, &dir).unwrap_err();
+
+        assert!(error.contains("reserved .caos state"));
+        assert!(error.contains("conflicts"));
+        assert!(!error.contains("agent.json"));
     }
 
     #[test]

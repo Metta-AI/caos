@@ -1,0 +1,12 @@
+# tests/agent-instructions, as an ENTRY (design/caos-expr.md, Phase 3):
+# evaluating this directory yields the test's ARG TREE, which dev/run-test
+# then runs.
+#
+# A CLIENT TEST — it drives `caos-cli`, so its base is `DEEP-DEPS/cli-test`
+# (dev/cli-test), the image that stages a git worktree and then runs `worker1`.
+#
+#   --test  this directory itself, staged into the repo as ./test with its
+#           DEEP-DEPS alongside. `--test:@=.` is inert by construction:
+#           `strip_caos_expr` removes this file from the tree before the
+#           expression is evaluated against it, so nothing recurses.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.

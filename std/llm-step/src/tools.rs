@@ -901,7 +901,8 @@ fn components_opt(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
 
 /// Validate and split a workspace-relative path argument. A leading `/` is
 /// tolerated (treated as the workspace root); `..` and the reserved `.caos`
-/// are refused.
+/// are refused — except `.caos/conflicts` (the merge conflict set) and
+/// `.caos/agent.json` (checked-in repository instructions).
 fn components(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
     let raw = call["input"][key]
         .as_str()
@@ -919,10 +920,13 @@ fn components(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
     if comps.iter().any(|c| c == "..") {
         return Err(User("`..` is not allowed in workspace paths".to_string()));
     }
-    if comps[0] == STEP_DIR && !(comps.len() == 2 && comps[1] == "conflicts") {
+    if comps[0] == STEP_DIR
+        && !(comps.len() == 2 && (comps[1] == "conflicts" || comps[1] == crate::AGENT_CONFIG))
+    {
         return Err(User(format!(
             "{STEP_DIR}/ is reserved for the harness; only {STEP_DIR}/conflicts (the merge \
-             conflict set) is editable"
+             conflict set) and {STEP_DIR}/{} (repository instructions) are editable",
+            crate::AGENT_CONFIG
         )));
     }
     Ok(comps)
@@ -1128,6 +1132,26 @@ mod tests {
             .find(|d| d["name"] == "read")
             .unwrap();
         assert!(read["input_schema"].get("required").is_none());
+    }
+
+    #[test]
+    fn workspace_paths_reserve_caos_except_conflicts_and_agent_config() {
+        let split =
+            |path: &str| match components(&json!({"input": {"file_path": path}}), "file_path") {
+                Ok(comps) => comps,
+                Err(User(message)) | Err(Infra(message)) => {
+                    panic!("{path} must be allowed: {message}")
+                }
+            };
+        assert_eq!(split("src/main.rs"), ["src", "main.rs"]);
+        assert_eq!(split(".caos/conflicts"), [".caos", "conflicts"]);
+        assert_eq!(split(".caos/agent.json"), [".caos", "agent.json"]);
+        for refused in [".caos", ".caos/step.json", ".caos/agent.json/nested"] {
+            match components(&json!({"input": {"file_path": refused}}), "file_path") {
+                Err(User(message)) => assert!(message.contains("reserved"), "{message}"),
+                Ok(_) | Err(Infra(_)) => panic!("{refused} must be refused as a user error"),
+            }
+        }
     }
 
     #[test]
