@@ -120,6 +120,17 @@ fn clean_agent_base(ws: &str, wc: &str) -> Result<(String, String), String> {
         let name = file_name(&entry);
         if name != STEP_DIR {
             link(&entry, clean.join(name))?;
+            continue;
+        }
+        // Keep the checked-in repository instructions with the workspace; the
+        // rest of `.caos` is this conversation's harness state, which the
+        // subagent must not inherit.
+        caos(["get", path(&entry)])?;
+        let config = entry.join(crate::AGENT_CONFIG);
+        if config.exists() {
+            let dir = clean.join(STEP_DIR);
+            fs::create_dir(&dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
+            link(&config, dir.join(crate::AGENT_CONFIG))?;
         }
     }
     let clean_tree = fresh("agent-workspace");

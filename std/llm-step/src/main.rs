@@ -24,13 +24,17 @@ use conversation_protocol::ObjectId;
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
-    arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, forward, link,
-    own_args_tree, path, read_arg, read_arg_opt, read_commit, run_then_catching, run_worker,
+    arg, caos, caos_curry, caos_recurry, cas_hash, entries, eval_then_catching, file_name, forward,
+    link, own_args_tree, path, read_arg, read_arg_opt, read_commit, run_then_catching, run_worker,
     scratch, secret, write_commit_as, Arg,
 };
 
 const AGENT_AUTHOR: &str = "caos-agent";
 const STEP_DIR: &str = ".caos";
+/// Checked-in repository instructions for the agent (SPEC, "Repository agent
+/// instructions"). The one `.caos` entry a workspace may legitimately carry at
+/// rest; everything else under `.caos` is harness state.
+pub(crate) const AGENT_CONFIG: &str = "agent.json";
 
 /// The per-round output-token cap sent to the API. A single response is
 /// unlikely to need this much; when one does, `stop_reason: "max_tokens"`
@@ -148,10 +152,8 @@ fn start(cfg: &Config) -> Result<(), String> {
         ));
     }
     let (ws, _) = canonical_workspace(&log)?;
-    if log.events.len() <= 2 && Path::new(&ws).join(STEP_DIR).exists() {
-        return Err(format!(
-            "the conversation's base tree already contains the reserved {STEP_DIR:?} entry"
-        ));
+    if log.events.len() <= 2 {
+        reject_reserved_base(&ws)?;
     }
     resume_run(cfg, &run, &head_hash, log)
 }
@@ -591,6 +593,82 @@ fn parse_commit_timestamp(text: &str) -> Result<i64, String> {
         .map_err(|error| format!("commit has an invalid committer timestamp: {error}"))
 }
 
+/// Refuse a conversation base whose `.caos` carries anything beyond the
+/// checked-in `agent.json`: the rest of that directory is harness state and a
+/// base already holding some would make it ambiguous.
+fn reject_reserved_base(ws: &str) -> Result<(), String> {
+    let dir = format!("{ws}/{STEP_DIR}");
+    if !Path::new(&dir).exists() {
+        return Ok(());
+    }
+    caos(["get", &dir])?;
+    let reserved: Vec<String> = entries(&dir)?
+        .iter()
+        .map(|entry| file_name(entry))
+        .filter(|name| name != AGENT_CONFIG)
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the conversation's base tree carries reserved {STEP_DIR:?} state ({}); \
+         only {STEP_DIR}/{AGENT_CONFIG} may be checked in",
+        reserved.join(", ")
+    ))
+}
+
+/// Read the workspace's `{STEP_DIR}/{AGENT_CONFIG}` instructions, if any.
+/// Reread from the CURRENT workspace every round, like the tool registry, so
+/// an agent that edits the file sees the change on its next request.
+fn agent_instructions(ws: &str) -> Result<Option<String>, String> {
+    let dir = format!("{ws}/{STEP_DIR}");
+    if !Path::new(&dir).exists() {
+        return Ok(None);
+    }
+    caos(["get", &dir])?;
+    let file = format!("{dir}/{AGENT_CONFIG}");
+    if !Path::new(&file).exists() {
+        return Ok(None);
+    }
+    caos(["get", &file])?;
+    let text = fs::read_to_string(&file)
+        .map_err(|error| format!("reading {STEP_DIR}/{AGENT_CONFIG}: {error}"))?;
+    parse_agent_instructions(&text).map(Some)
+}
+
+/// Parse `.caos/agent.json`: an object whose `instructions` string is the
+/// repository's standing guidance to the agent (build/test commands,
+/// conventions, publication requirements). Unknown fields are ignored so an
+/// older harness keeps working when the schema grows; a malformed file fails
+/// the round loudly rather than silently running without the repository's
+/// instructions.
+fn parse_agent_instructions(text: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(text)
+        .map_err(|error| format!("{STEP_DIR}/{AGENT_CONFIG} is not valid JSON: {error}"))?;
+    value["instructions"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!("{STEP_DIR}/{AGENT_CONFIG} must carry a string `instructions` field")
+        })
+}
+
+/// The system prompt for one round: the curried system plus the workspace's
+/// checked-in repository instructions.
+fn round_system(cfg: &Config, ws: &str) -> Result<String, String> {
+    let instructions = agent_instructions(ws)?;
+    Ok(compose_system(&cfg.system, instructions.as_deref()))
+}
+
+fn compose_system(system: &str, instructions: Option<&str>) -> String {
+    match instructions {
+        Some(instructions) => format!(
+            "{system}\n\nRepository instructions ({STEP_DIR}/{AGENT_CONFIG}):\n{instructions}"
+        ),
+        None => system.to_string(),
+    }
+}
+
 /// One LLM API round over `messages`. `prev` is the exact canonical head used
 /// to build the request; publication is conditional on that head so a response
 /// can never claim to have seen a concurrent interjection.
@@ -612,7 +690,7 @@ fn llm_round(
         // sniffing per-model capabilities here would rot.
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
-        "system": cfg.system,
+        "system": round_system(cfg, ws)?,
         "tools": registry(cfg, ws)?,
         "messages": messages,
     });
@@ -2583,6 +2661,39 @@ committer agent <agent@example.com> 1700000123 +0000\n\nmessage\n";
                 ]}),
                 json!({"role":"user","content":"also do this"}),
             ]
+        );
+    }
+
+    #[test]
+    fn agent_config_yields_its_instructions_or_a_clear_error() {
+        assert_eq!(
+            parse_agent_instructions(r#"{"instructions":"Build with nix; test with cargo."}"#)
+                .unwrap(),
+            "Build with nix; test with cargo."
+        );
+        // Unknown fields ride along so the schema can grow without breaking
+        // an older harness baked into a worker image.
+        assert_eq!(
+            parse_agent_instructions(r#"{"instructions":"x","future":{"a":1}}"#).unwrap(),
+            "x"
+        );
+        assert!(parse_agent_instructions("{}")
+            .unwrap_err()
+            .contains("instructions"));
+        assert!(parse_agent_instructions(r#"{"instructions":42}"#)
+            .unwrap_err()
+            .contains("instructions"));
+        assert!(parse_agent_instructions("not json")
+            .unwrap_err()
+            .contains("valid JSON"));
+    }
+
+    #[test]
+    fn repository_instructions_extend_the_curried_system_prompt() {
+        assert_eq!(compose_system("base prompt", None), "base prompt");
+        assert_eq!(
+            compose_system("base prompt", Some("Run the fast checks.")),
+            "base prompt\n\nRepository instructions (.caos/agent.json):\nRun the fast checks."
         );
     }
 
