@@ -39,6 +39,10 @@ pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
 /// The readers granted the model credential: both conversation LLM workers
 /// (the turn engine, and the stateless title/auxiliary caller).
 pub const MODEL_API_SECRET_READERS: [&str; 2] = ["DEEP-DEPS/llm-step", "DEEP-DEPS/llm-call"];
+/// The one `.caos` entry a workspace may carry at rest: checked-in repository
+/// instructions the agent harness folds into its system prompt (SPEC,
+/// "Repository agent instructions").
+pub const AGENT_CONFIG_NAME: &str = "agent.json";
 const AUTO_NAME_PREFIX: &str = "talk-";
 const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin/master"];
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -424,13 +428,26 @@ fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), 
         &["rev-parse", "--verify", "--quiet", &format!("{root}:.caos")],
         None,
     )
-    .is_ok()
+    .is_err()
     {
-        return Err(format!(
-            "the {what} contains top-level .caos state; choose a clean workspace"
-        ));
+        return Ok(());
     }
-    Ok(())
+    // `.caos/agent.json` — checked-in repository instructions for the agent —
+    // is the one entry a workspace may legitimately carry at rest; the rest of
+    // `.caos` is harness state.
+    let entries = t.git_capture(&["ls-tree", "--name-only", &format!("{root}:.caos")], None)?;
+    let reserved: Vec<&str> = entries
+        .lines()
+        .filter(|name| !name.is_empty() && *name != AGENT_CONFIG_NAME)
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the {what} contains reserved top-level .caos state ({}); \
+         only .caos/{AGENT_CONFIG_NAME} may be checked in",
+        reserved.join(", ")
+    ))
 }
 
 /// Persist a message without taking ownership of the surrounding turn
@@ -2035,6 +2052,9 @@ fn workspace_diff(
 ) -> Result<WorkspaceDiff, String> {
     validate_hash(base_commit, "conversation workspace base")?;
     validate_hash(head, "conversation workspace head")?;
+    // Hide the transient merge-conflict record, but not `.caos/agent.json`:
+    // an edit to the checked-in repository instructions is a real workspace
+    // change that publishes with the conversation.
     let patch = t.git_capture(
         &[
             "diff",
@@ -2044,7 +2064,7 @@ fn workspace_diff(
             head,
             "--",
             ".",
-            ":(exclude).caos",
+            ":(exclude).caos/conflicts",
         ],
         None,
     )?;
@@ -4974,6 +4994,52 @@ mod tests {
             remote_ref(&transport, &refname).unwrap().as_deref(),
             Some(admitted.as_str())
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reserved_caos_permits_only_checked_in_agent_instructions() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caos-chat-agent-config-{}-{unique}",
+            std::process::id()
+        ));
+        let remote = root.join("remote.git");
+        let repo = root.join("client");
+        std::fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "--quiet", "--bare"]);
+        std::fs::create_dir_all(&repo).unwrap();
+        test_git(&repo, &["init", "--quiet"]);
+        configure_test_repo(&repo, "Alice");
+        test_git(
+            &repo,
+            &["remote", "add", CAOS_REMOTE, remote.to_str().unwrap()],
+        );
+        let transport = GitTransport::discover(&repo).unwrap();
+
+        std::fs::create_dir_all(repo.join(".caos")).unwrap();
+        std::fs::write(
+            repo.join(".caos/agent.json"),
+            "{\"instructions\":\"run the tests\"}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("workspace"), "base\n").unwrap();
+        test_git(&repo, &["add", "."]);
+        test_git(&repo, &["commit", "--quiet", "-m", "instructions only"]);
+        let instructions_only = test_git(&repo, &["rev-parse", "HEAD"]);
+        reject_reserved_caos(&transport, &instructions_only, "base tree").unwrap();
+
+        std::fs::write(repo.join(".caos/conflicts"), "").unwrap();
+        test_git(&repo, &["add", "."]);
+        test_git(&repo, &["commit", "--quiet", "-m", "with harness state"]);
+        let with_conflicts = test_git(&repo, &["rev-parse", "HEAD"]);
+        let error = reject_reserved_caos(&transport, &with_conflicts, "base tree").unwrap_err();
+        assert!(error.contains("conflicts"), "{error}");
+        assert!(error.contains("agent.json may be checked in"), "{error}");
 
         std::fs::remove_dir_all(root).unwrap();
     }

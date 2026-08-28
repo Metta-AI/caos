@@ -3916,14 +3916,13 @@ impl App {
         if self.selected().is_busy() {
             self.selected_mut()
                 .show_command_error("finish this conversation's operation before publishing it");
-        } else if self
-            .selected()
-            .diff
-            .as_ref()
-            .is_none_or(|diff| diff.patch.is_empty())
-        {
+        } else if self.selected().diff.is_none() {
+            // An empty workspace diff is NOT a blocker: the conversation
+            // history itself is worth publishing (and its changes may already
+            // be in the base). Only a conversation with no completed turn has
+            // nothing to point a branch at.
             self.selected_mut()
-                .show_command_error("there are no conversation changes to publish");
+                .show_command_error("this conversation has no completed turn to publish");
         } else if self.confirm_action.is_none() {
             let default_base = match remote_default_branch(&self.repo_dir) {
                 Ok(branch) => branch,
@@ -4032,19 +4031,21 @@ impl App {
     }
 }
 
+// No generic "build and test" here: how a workspace is validated is the
+// repository's call, made through its checked-in `.caos/agent.json`
+// instructions (folded into the agent's system prompt), not this client's.
 fn publish_turn_message(target: &str, base_is_ancestor: bool) -> String {
     if base_is_ancestor {
         format!(
             "Prepare this conversation for publication. The selected PR base `{target}` is \
              already an ancestor of this conversation, so do not call `merge` for it again. \
-             Build and test, then finish only when the workspace is ready to publish."
+             Finish only when the workspace is ready to publish."
         )
     } else {
         format!(
             "Prepare this conversation for publication. First call the existing `merge` tool \
-             with `theirs` exactly `{target}`. Resolve every entry in `.caos/conflicts`, remove \
-             `.caos/conflicts`, then build and test. Finish only when the workspace is ready to \
-             publish."
+             with `theirs` exactly `{target}`. Resolve every entry in `.caos/conflicts` and \
+             remove `.caos/conflicts`. Finish only when the workspace is ready to publish."
         )
     }
 }
@@ -4152,6 +4153,19 @@ mod tests {
         let needs_merge = publish_turn_message("abc123", false);
         assert!(needs_merge.contains("First call the existing `merge` tool"));
         assert!(needs_merge.contains("`theirs` exactly `abc123`"));
+    }
+
+    #[test]
+    fn publish_prompts_leave_validation_to_the_repository_instructions() {
+        // Validation policy lives in the repo's `.caos/agent.json`, which the
+        // harness folds into the system prompt; the publish request must not
+        // impose a generic build-and-test step on repositories that define
+        // their own.
+        for base_is_ancestor in [true, false] {
+            let message = publish_turn_message("abc123", base_is_ancestor);
+            assert!(!message.to_lowercase().contains("build and test"));
+            assert!(message.contains("ready to publish"));
+        }
     }
 
     fn summary(id: &str) -> UserConversationSummary {
@@ -6190,6 +6204,45 @@ mod tests {
         assert!(!app.selected().publish_prompt);
         std::fs::remove_dir_all(publish_repo).unwrap();
         std::fs::remove_dir_all(publish_remote).unwrap();
+    }
+
+    #[test]
+    fn publish_opens_the_base_prompt_for_an_empty_workspace_diff() {
+        let mut conversation = state("talk-1");
+        conversation.diff = Some(WorkspaceDiff {
+            base_commit: "a".repeat(40),
+            head: "b".repeat(40),
+            patch: String::new(),
+        });
+        let (mut app, _) = app_with(vec![conversation]);
+        let (repo, remote, _) = repo_with_default_branch("publish-empty-diff", "main");
+        app.repo_dir = repo.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.confirm_action,
+            Some(ConfirmAction::Publish {
+                default_base: "main".to_string(),
+                base_input: String::new(),
+            })
+        );
+        assert!(app.selected().command_error.is_none());
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_requires_a_completed_turn() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(app.confirm_action.is_none());
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("this conversation has no completed turn to publish")
+        );
     }
 
     #[test]

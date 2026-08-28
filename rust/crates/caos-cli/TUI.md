@@ -225,13 +225,19 @@ matches it exactly.
 
 Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
 branch prompt with `origin`'s advertised default selected; type another branch
-to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn that
-merges the exact fetched base with the standard `merge` tool, then resolves and
-tests the result. When that fetched base is already an ancestor of the current
-conversation head, the preparation turn runs without asking the agent to merge
-it again. For another base, only this conversation's delta is applied, so child
+to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn
+that merges the exact fetched base with the standard `merge` tool and resolves
+the result, validated per the repository's checked-in `.caos/agent.json`
+instructions (SPEC, "Repository agent instructions") — the request itself no
+longer imposes a generic build-and-test step. When that fetched base is
+already an ancestor of the current conversation head, the preparation turn
+runs without asking the agent to merge it again.
+For another base, only this conversation's delta is applied, so child
 conversations form clean PR stacks. Unresolved conflicts stop before the branch
 moves. The checkout and index remain untouched.
+Any conversation with a completed turn can be published, including one whose
+workspace diff is empty — the transcript history is the content, and its
+changes may already be part of the base.
 
 CAOS points `caos/<conversation>` directly at the validated conversation head,
 pushes it, and uses the authenticated `gh` CLI to find or open its pull
@@ -241,14 +247,14 @@ activity shows through, like an ordinary turn), validating the prepared
 workspace, pushing the branch, and finding or opening the pull request. The first publication carries the conversation history; later
 publications advance the branch by fast-forward. The selected PR base is an
 ancestor of the published head, and the final tree must contain no reserved
-`.caos` state.
+`.caos` state beyond a checked-in `.caos/agent.json`.
 
-`/publish-branch` is the sharing-only form of publication: it does not run the
-agent merge-and-test preparation turn and does not create a PR. It still checks
-the current tip for unresolved conflict records, conflict markers, and reserved
-`.caos` state before moving the branch. It can publish a completed conversation
-whose workspace diff is empty, since the transcript history itself is useful
-to another client.
+`/publish-branch` is the sharing-only form of publication: it does not run
+the agent merge-and-validate preparation turn and does not create a PR. It
+still checks the current tip for unresolved conflict records, conflict
+markers, and reserved `.caos` state before moving the branch. It can publish
+a completed conversation whose workspace diff is empty, since the transcript
+history itself is useful to another client.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git
@@ -261,7 +267,8 @@ the snapshot covers tracked edits, new files, and deletions, honoring
 left clean. That matters: after a later agent turn you can press `Ctrl+L` again
 to check out the new head without the clean-tree guard tripping on leftover
 local changes. The agent then runs over the changes you folded in. A working
-tree carrying the harness's reserved top-level `.caos` entry is refused.
+tree carrying reserved top-level `.caos` state (anything beyond a checked-in
+`.caos/agent.json`) is refused.
 
 The intended loop is `Ctrl+L` (check out the head) → edit files → `/update-tree
 <message>` → let the agent respond → `Ctrl+L` again. You can also commit the

@@ -110,7 +110,9 @@ A root user event is schematically:
 There is no `v` field. Durable object and request IDs accepted at protocol
 boundaries are canonical lowercase 40-character Git SHA-1 values. Ordinary
 workspace bases and user proposals may not introduce the reserved top-level
-`.caos` path.
+`.caos` path, with one exception: a checked-in `.caos/agent.json` carrying
+repository instructions for the agent (SPEC, "Repository agent
+instructions").
 
 Replay walks the first-parent event spine through its first `base` event, whose
 value must equal that event's first parent; ancestry below it is ordinary
@@ -237,11 +239,13 @@ histories differ. This applies only the user's `P..U` delta instead of treating
 all changes since `P` as user edits.
 
 PR publication is an ordinary turn: when the exact fetched base is not already
-an ancestor of the conversation head, the agent calls `merge` with it, then
-resolves and tests. When it is already an ancestor, the turn is explicitly told
-not to merge it again. A clean conversation head without `.caos` becomes the PR
-branch tip, preserving the conversation history so later publications are
-fast-forwards.
+an ancestor of the conversation head, the agent calls `merge` with it and
+resolves the result. When it is already an ancestor, the turn is explicitly
+told not to merge it again. Validation policy comes from the repository's own
+`.caos/agent.json` instructions rather than a generic build-and-test request.
+A clean conversation head whose `.caos` holds nothing beyond that checked-in
+`agent.json` becomes the PR branch tip, preserving the conversation history so
+later publications are fast-forwards.
 
 `/from` materializes a new conversation before its first new message. Its
 source must be a recognized conversation event whose complete inherited event

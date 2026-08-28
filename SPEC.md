@@ -416,6 +416,33 @@ TOOL taking a hash (`test` and `test-result`), not as richer printing.
   error there takes the agent's turn down with it
 - Unexpected failures die, per the reliability principles above
 
+# Repository agent instructions (`.caos/agent.json`)
+
+A repository steers the agent with a checked-in `.caos/agent.json`:
+
+```json
+{"instructions": "Build with `nix build`. Run the `test` tool before finishing a change."}
+```
+
+- `instructions` (a string) is standing guidance for every agent turn on that
+  tree: build/test commands, conventions, what "ready to publish" means.
+  Unknown fields are ignored so the schema can grow without breaking a
+  harness already baked into a worker image; a malformed file — bad JSON, or
+  a non-string `instructions` — fails the round loudly rather than silently
+  running without the repository's rules.
+- `llm-step` rereads the file from the CURRENT workspace on every round and
+  appends it to the curried system prompt — the same freshness contract as
+  the tool registry, so an agent that edits the file sees the change on its
+  next request. A subagent's snapshot keeps `agent.json` (and only it) when
+  the parent's `.caos` harness state is stripped.
+- `agent.json` is the ONE `.caos` entry a workspace may carry at rest.
+  Conversation bases, `/update-tree` proposals, and published PR tips accept
+  it and refuse everything else under `.caos`; the inline file tools read and
+  edit it like any other file.
+- Per-repo validation policy lives here: the TUI's publication-preparation
+  turn no longer instructs a generic "build and test", so a repository that
+  wants gates before a PR names them in its own instructions.
+
 # Merging and conflict resolution
 
 An agent resolves a git merge from inside a conversation. The obstacle is
@@ -553,9 +580,9 @@ step.json exists ONLY in a step-commit tree (`mint_step` injects it), never in
 inside a step tree, and the harness tells them apart by FILENAME. So four small
 local rules, no "persistence exemption":
 
-- **Inline tools** refuse `.caos/step.json` specifically, not all of `.caos/`,
-  so `.caos/conflicts` is editable like any file (deleting a path's rows is an
-  `edit`).
+- **Inline tools** refuse the reserved `.caos/` names, not the directory
+  wholesale: `.caos/conflicts` (deleting a path's rows is an `edit`) and the
+  checked-in `.caos/agent.json` are editable like any file.
 - **`mint_step`** PRESERVES an existing `.caos/` when it injects `step.json`
   (symlinking `.caos/conflicts` in alongside), rather than assuming `.caos/` is
   absent.
@@ -563,10 +590,11 @@ local rules, no "persistence exemption":
   included — it is workspace state. (A build run mid-merge keys on a tree that
   still carries the file, so it won't cache-hit the post-resolution build;
   negligible, and only during resolution.)
-- **Publish** (the tui's PR flow) requires the conversation TIP to have no
-  `.caos/` entry after the guard below. Earlier merge commits remain in the
-  published history with their conflict scaffolding, but the PR's final tree
-  cannot carry even a leftover empty `.caos/conflicts`.
+- **Publish** (the tui's PR flow) requires the conversation TIP's `.caos/` to
+  hold nothing beyond a checked-in `agent.json` after the guard below. Earlier
+  merge commits remain in the published history with their conflict
+  scaffolding, but the PR's final tree cannot carry even a leftover empty
+  `.caos/conflicts`.
 
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.
