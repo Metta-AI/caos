@@ -232,6 +232,9 @@ conversation head, the preparation turn runs without asking the agent to merge
 it again. For another base, only this conversation's delta is applied, so child
 conversations form clean PR stacks. Unresolved conflicts stop before the branch
 moves. The checkout and index remain untouched.
+Any conversation with a completed turn can be published, including one whose
+workspace diff is empty — the transcript history is the content, and its
+changes may already be part of the base.
 
 CAOS points `caos/<conversation>` directly at the validated conversation head,
 pushes it, and uses the authenticated `gh` CLI to find or open its pull

@@ -3909,14 +3909,13 @@ impl App {
         if self.selected().is_busy() {
             self.selected_mut()
                 .show_command_error("finish this conversation's operation before publishing it");
-        } else if self
-            .selected()
-            .diff
-            .as_ref()
-            .is_none_or(|diff| diff.patch.is_empty())
-        {
+        } else if self.selected().diff.is_none() {
+            // An empty workspace diff is NOT a blocker: the conversation
+            // history itself is worth publishing (and its changes may already
+            // be in the base). Only a conversation with no completed turn has
+            // nothing to point a branch at.
             self.selected_mut()
-                .show_command_error("there are no conversation changes to publish");
+                .show_command_error("this conversation has no completed turn to publish");
         } else if self.confirm_action.is_none() {
             let default_base = match remote_default_branch(&self.repo_dir) {
                 Ok(branch) => branch,
@@ -6161,6 +6160,45 @@ mod tests {
         assert!(!app.selected().publish_prompt);
         std::fs::remove_dir_all(publish_repo).unwrap();
         std::fs::remove_dir_all(publish_remote).unwrap();
+    }
+
+    #[test]
+    fn publish_opens_the_base_prompt_for_an_empty_workspace_diff() {
+        let mut conversation = state("talk-1");
+        conversation.diff = Some(WorkspaceDiff {
+            base_commit: "a".repeat(40),
+            head: "b".repeat(40),
+            patch: String::new(),
+        });
+        let (mut app, _) = app_with(vec![conversation]);
+        let (repo, remote, _) = repo_with_default_branch("publish-empty-diff", "main");
+        app.repo_dir = repo.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.confirm_action,
+            Some(ConfirmAction::Publish {
+                default_base: "main".to_string(),
+                base_input: String::new(),
+            })
+        );
+        assert!(app.selected().command_error.is_none());
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_requires_a_completed_turn() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(app.confirm_action.is_none());
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("this conversation has no completed turn to publish")
+        );
     }
 
     #[test]
