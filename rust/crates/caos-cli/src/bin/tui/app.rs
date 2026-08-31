@@ -4002,19 +4002,21 @@ impl App {
     }
 }
 
+// No generic "build and test" here: how a workspace is validated is the
+// repository's call, made through its checked-in `.caos/agent.json`
+// instructions (folded into the agent's system prompt), not this client's.
 fn publish_turn_message(target: &str, base_is_ancestor: bool) -> String {
     if base_is_ancestor {
         format!(
             "Prepare this conversation for publication. The selected PR base `{target}` is \
              already an ancestor of this conversation, so do not call `merge` for it again. \
-             Build and test, then finish only when the workspace is ready to publish."
+             Finish only when the workspace is ready to publish."
         )
     } else {
         format!(
             "Prepare this conversation for publication. First call the existing `merge` tool \
-             with `theirs` exactly `{target}`. Resolve every entry in `.caos/conflicts`, remove \
-             `.caos/conflicts`, then build and test. Finish only when the workspace is ready to \
-             publish."
+             with `theirs` exactly `{target}`. Resolve every entry in `.caos/conflicts` and \
+             remove `.caos/conflicts`. Finish only when the workspace is ready to publish."
         )
     }
 }
@@ -4122,6 +4124,19 @@ mod tests {
         let needs_merge = publish_turn_message("abc123", false);
         assert!(needs_merge.contains("First call the existing `merge` tool"));
         assert!(needs_merge.contains("`theirs` exactly `abc123`"));
+    }
+
+    #[test]
+    fn publish_prompts_leave_validation_to_the_repository_instructions() {
+        // Validation policy lives in the repo's `.caos/agent.json`, which the
+        // harness folds into the system prompt; the publish request must not
+        // impose a generic build-and-test step on repositories that define
+        // their own.
+        for base_is_ancestor in [true, false] {
+            let message = publish_turn_message("abc123", base_is_ancestor);
+            assert!(!message.to_lowercase().contains("build and test"));
+            assert!(message.contains("ready to publish"));
+        }
     }
 
     fn summary(id: &str) -> UserConversationSummary {
