@@ -2805,7 +2805,21 @@ fn conversations_from_refs(refs: &HashMap<String, String>) -> Vec<(String, Strin
 }
 
 fn warn_skipped_conversation(id: &str, error: &str) {
-    eprintln!("warning: skipping malformed conversation {id:?}: {error}");
+    if first_skip_warning(&format!("{id}: {error}")) {
+        eprintln!("warning: skipping malformed conversation {id:?}: {error}");
+    }
+}
+
+/// True the first time `message` is seen in this process. The TUI's remote
+/// poll re-lists conversations every 500ms, so an unchanged malformed ref
+/// would otherwise repeat its warning twice a second for the whole session.
+fn first_skip_warning(message: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(message.to_string())
 }
 
 struct RemoteConversationMetadata {
@@ -3459,6 +3473,13 @@ fn print_snapshot(snapshot: &ConversationSnapshot, output: &mut impl Write) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_warnings_print_once_per_message() {
+        assert!(first_skip_warning("skip-warning-test: message one"));
+        assert!(!first_skip_warning("skip-warning-test: message one"));
+        assert!(first_skip_warning("skip-warning-test: message two"));
+    }
 
     fn test_git(dir: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")

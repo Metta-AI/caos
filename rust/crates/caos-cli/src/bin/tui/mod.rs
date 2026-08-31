@@ -135,6 +135,86 @@ fn selection_lock_allows_redraw(was_locked: bool, is_locked: bool) -> bool {
     !is_locked || was_locked != is_locked
 }
 
+/// While the TUI owns the terminal, anything written to stderr — a library
+/// warning from a background thread (the 500ms remote poll can emit
+/// "skipping malformed conversation" lines), a dependency, a panicking
+/// thread — lands at the terminal cursor inside the alternate screen. The
+/// cursor rests in the composer, a few rows above the bottom, so a stray
+/// line and its newline overwrite and scroll exactly the rows the renderer
+/// believes are intact: the composer and footer vanish until something
+/// forces a full repaint. Redirect fd 2 into a log file for the TUI's
+/// lifetime instead; dropping the guard restores the real stderr.
+#[cfg(unix)]
+mod stderr_guard {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::path::PathBuf;
+
+    pub(super) struct StderrRedirect {
+        saved: libc::c_int,
+        path: PathBuf,
+    }
+
+    impl StderrRedirect {
+        /// Start capturing stderr. `None` (no capture) on any failure: a
+        /// terminal session must never be blocked on the log file.
+        pub(super) fn begin() -> Option<Self> {
+            let path =
+                std::env::temp_dir().join(format!("caos-tui-{}.stderr.log", std::process::id()));
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()?;
+            let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+            if saved < 0 {
+                return None;
+            }
+            if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+                unsafe { libc::close(saved) };
+                return None;
+            }
+            Some(Self { saved, path })
+        }
+
+        /// Restore the real stderr. Returns the log's path when anything was
+        /// captured; an untouched log is deleted.
+        pub(super) fn finish(self) -> Option<PathBuf> {
+            let grew = std::fs::metadata(&self.path).is_ok_and(|meta| meta.len() > 0);
+            if !grew {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            grew.then(|| self.path.clone())
+        }
+    }
+
+    impl Drop for StderrRedirect {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.saved, libc::STDERR_FILENO);
+                libc::close(self.saved);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod stderr_guard {
+    use std::path::PathBuf;
+
+    pub(super) struct StderrRedirect;
+
+    impl StderrRedirect {
+        pub(super) fn begin() -> Option<Self> {
+            None
+        }
+
+        pub(super) fn finish(self) -> Option<PathBuf> {
+            None
+        }
+    }
+}
+
 fn enter_screen(writer: &mut impl io::Write) -> io::Result<()> {
     execute!(
         writer,
@@ -254,6 +334,10 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     setup::ensure_model_secret(&transport)?;
     let mut app = App::new(args)?;
 
+    // From here until the terminal is restored, stderr must not reach the
+    // screen (see stderr_guard). The guard restores fd 2 when dropped, on
+    // every exit path.
+    let stderr_redirect = stderr_guard::StderrRedirect::begin();
     enable_raw_mode().map_err(|error| format!("enabling terminal raw mode: {error}"))?;
     app.set_enhanced_keyboard(supports_keyboard_enhancement().unwrap_or(false));
     let mut stdout = io::stdout();
@@ -277,6 +361,14 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     let screen_result = leave_screen(terminal.backend_mut())
         .and_then(|()| terminal.show_cursor())
         .map_err(|error| error.to_string());
+    if let Some(redirect) = stderr_redirect {
+        if let Some(path) = redirect.finish() {
+            eprintln!(
+                "caos tui: stderr from the session was captured in {}",
+                path.display()
+            );
+        }
+    }
     result?;
     raw_result.map_err(|error| format!("restoring terminal mode: {error}"))?;
     screen_result.map_err(|error| format!("leaving alternate screen: {error}"))?;
@@ -324,6 +416,29 @@ mod tests {
         assert!(selection_lock_allows_redraw(false, true));
         assert!(!selection_lock_allows_redraw(true, true));
         assert!(selection_lock_allows_redraw(true, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_redirect_captures_direct_writes_and_reports_the_log() {
+        let redirect = stderr_guard::StderrRedirect::begin().expect("stderr redirect starts");
+        // A raw fd-2 write, the same route a background thread's eprintln
+        // takes in a real session (libtest's capture shim only wraps the
+        // std macros, not the Stderr handle).
+        std::io::stderr()
+            .write_all(b"probe: redirected stderr line\n")
+            .unwrap();
+        std::io::stderr().flush().unwrap();
+        let path = redirect
+            .finish()
+            .expect("captured output reports the log path");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.contains("probe: redirected stderr line"));
+
+        // An untouched log is deleted and nothing is reported.
+        let redirect = stderr_guard::StderrRedirect::begin().expect("stderr redirect restarts");
+        assert_eq!(redirect.finish(), None);
     }
 
     #[test]
