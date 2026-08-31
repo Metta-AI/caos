@@ -35,10 +35,10 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<(), String> {
-    terminal
+    let completed = terminal
         .draw(|frame| render(app, frame))
         .map_err(|error| format!("drawing terminal: {error}"))?;
-    app.capture_screen(terminal.current_buffer_mut());
+    app.capture_screen(completed.buffer);
     let mut next_animation = Instant::now() + ANIMATION_TICK;
     let mut next_remote_poll = Instant::now();
     while !app.should_quit() {
@@ -122,10 +122,10 @@ fn run_app(
             }
         }
         if changed {
-            terminal
+            let completed = terminal
                 .draw(|frame| render(app, frame))
                 .map_err(|error| format!("drawing terminal: {error}"))?;
-            app.capture_screen(terminal.current_buffer_mut());
+            app.capture_screen(completed.buffer);
         }
     }
     Ok(())
@@ -285,7 +285,25 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui_core::backend::TestBackend;
+    use ratatui_core::text::Span;
+
     use super::*;
+
+    #[test]
+    fn capture_screen_must_read_the_completed_frame_because_draw_swaps_buffers() {
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+
+        let drawn = terminal
+            .draw(|frame| frame.render_widget(Span::raw("x"), frame.area()))
+            .unwrap()
+            .buffer[(0, 0)]
+            .symbol()
+            .to_string();
+
+        assert_eq!(drawn, "x");
+        assert_eq!(terminal.current_buffer_mut()[(0, 0)].symbol(), " ");
+    }
 
     #[test]
     fn terminal_lifecycle_enables_input_modes_and_restores_the_terminal() {
