@@ -537,10 +537,12 @@ fn render_live_activity(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let (verb, summary) = if state.publishing {
-        ("Publishing", state.status.as_str())
-    } else if let Some(activity) = state.running_activity() {
+    // A publish runs a real agent turn, so a tool in flight names the work
+    // more precisely than the generic publishing verb.
+    let (verb, summary) = if let Some(activity) = state.running_activity() {
         (activity.running_verb(), activity.running_summary())
+    } else if state.publishing {
+        ("Publishing", state.status.as_str())
     } else {
         (
             match state.turn_phase {

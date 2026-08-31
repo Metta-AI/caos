@@ -151,16 +151,18 @@ pub(crate) fn prepare_publish_workspace(
     })
 }
 
-/// Publish the validated conversation history without checking it out.
-pub(crate) fn publish_conversation_pr(
+/// Find the pushed branch's open PR against `pr_base` (refreshing its title),
+/// or open one. Split from the branch push so the publish flow can report
+/// each stage separately.
+pub(crate) fn find_or_open_conversation_pr(
     name: &str,
     title: &str,
+    branch: &str,
     conversation: &PreparedPublishConversation,
     pr_base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
     let title = conversation_pr_title(title);
-    let branch = publish_conversation_branch(name, conversation, cwd)?;
 
     let existing_url = capture_required(
         "gh",
@@ -168,7 +170,7 @@ pub(crate) fn publish_conversation_pr(
             "pr",
             "list",
             "--head",
-            &branch,
+            branch,
             "--base",
             pr_base,
             "--state",
@@ -191,8 +193,7 @@ pub(crate) fn publish_conversation_pr(
     capture_required(
         "gh",
         &[
-            "pr", "create", "--head", &branch, "--base", pr_base, "--title", &title, "--body",
-            &body,
+            "pr", "create", "--head", branch, "--base", pr_base, "--title", &title, "--body", &body,
         ],
         cwd,
     )
