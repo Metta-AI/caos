@@ -63,7 +63,7 @@ git push --quiet --force-with-lease="$conversation_ref:$escape_parent" \
 
 # Now let the held round return — with a tool call in it, which must NOT run.
 printf '%s\n' \
-  '{"content":[{"text":"I had started this response.","type":"text"},{"id":"toolu_interrupted","input":{"file_path":"interrupted.txt","content":"must not run\n"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  '{"content":[{"text":"I had started this response.","type":"text"},{"id":"toolu_interrupted","input":{"file-path":"interrupted.txt","content":"must not run\n"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
   > /tmp/stub/response-1.json
 
 head1=$(wait_turn) || {

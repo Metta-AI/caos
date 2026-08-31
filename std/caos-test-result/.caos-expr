@@ -1,0 +1,19 @@
+# The `caos-test-result` tool (SPEC, "Tools"): the std/bash worker image with
+# this directory's script curried onto it, plus the `help` the agent registers
+# it by. It moved out of caos-tools/ into std/ alongside caos-test so the agent
+# harness DEPends on it and offers it ALWAYS (design/flake-inputs.md, "the tui").
+# Unlike caos-build/caos-test it reads a record BY HASH and touches no workspace,
+# so it needs no wrong-tree guard and runs on plain std/bash.
+#
+# The docs are a HERE-STRING, so they live in the `.caos-expr` — which is
+# STRIPPED from the tree the expression is evaluated against. Editing them
+# re-keys this tool's arg tree and nothing else: no build sees these bytes.
+HELP=<<END
+Print one test's COMPLETE record from a `caos-test` run: the test's whole output —
+the report only carries its last few lines — or, with `log`, one of the inner
+stack's logs. Takes the hash the caos-test report prints beside each test's name;
+that hash is stable, so the record of a run stays readable long after the run.
+@param hash The hash the `caos-test` report prints beside a test's name.
+@param [log] Print this inner-stack log instead of the test's output: server, runnerd, redis or serve.
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP

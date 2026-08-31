@@ -106,7 +106,7 @@ git add -A && git commit -qm testtree
 # THE TEST, with everything it narrates captured once and used twice: relayed
 # to stderr, which is what a FAILING worker's error text carries (so the
 # report's excerpt is the test's own story), and published as the result blob
-# on success, which is what `test-result` prints.
+# on success, which is what `caos-test-result` prints.
 #
 # Captured rather than tee'd: the output has to be COMPLETE before it is
 # published, and a tee'd fd is not guaranteed to have flushed by then.

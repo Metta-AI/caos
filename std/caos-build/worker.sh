@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
-# The `build` tool: compile the tree with nix, in the dev image.
+# The `caos-build` tool: compile the tree with nix, in the dev image.
 #
-# It is an ORDINARY WORKER now — no container of its own to launch, no engine to
+# It is an ORDINARY WORKER — no container of its own to launch, no engine to
 # drive, no host paths to know. runnerd starts dev/test-stack, honours the volume grant
 # that image declares, and `/worker` runs this. What makes the compile fast is
 # that `/nix` is a persistent volume, so the second build is incremental against
 # the first rather than starting from an empty store.
 #
 # NO STACK IS BROUGHT UP HERE. `nix build` needs nix and a source tree, nothing
-# else; a dev stack is the `test` tool's business. What this replaced brought up
-# a whole stack in order to publish std, because it was also assembling a test
-# stack IMAGE — an artifact that no longer exists, since the thing that runs the
-# tests is now this image plus a volume.
+# else; a dev stack is the `caos-test` tool's business.
 set -euo pipefail
 
 fail() { echo "BUILD FAIL: $*" >&2; exit 1; }
@@ -20,7 +17,20 @@ fail() { echo "BUILD FAIL: $*" >&2; exit 1; }
 # tracked tree is 335 files and 2.76 MB, so this is not a place to be clever.
 caos get -r /cas/args/in || fail "materializing the workspace"
 cd /cas/args/in
-[ -f flake.nix ] || fail "no flake.nix in the workspace"
+
+# WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-build is registered on
+# every conversation (it is one of the harness's own tools), so it is offered
+# even when the workspace is not caos. There it has nothing to build: rather
+# than fail the turn, put a plain log saying so and exit 0, so the model reads a
+# calm "not applicable here" tool_result instead of a red one.
+if [ ! -f flake.nix ]; then
+  { echo "caos-build compiles the caos source tree with nix, and this workspace"
+    echo "has no flake.nix — there is nothing here for it to build."
+    echo "caos-build is specific to the caos codebase; run it there."
+  } > /tmp/build.log
+  caos put /tmp/build.log /cas/out
+  exit 0
+fi
 
 # NO `git init` HERE. A compile needs nix and a source tree; it is `caos-cli`
 # that refuses to run outside a working tree, and nothing in this tool calls it.

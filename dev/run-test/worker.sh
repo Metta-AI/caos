@@ -151,7 +151,7 @@ verdict)
   else
     caos get /cas/args/result || fail "reading --result"
     # A test's result is conventionally a BLOB of its own narration, which is
-    # what `test-result` prints. A test that returns a tree instead has nothing
+    # what `caos-test-result` prints. A test that returns a tree instead has nothing
     # to inline, and says so rather than dumping a directory listing.
     if [ -f /cas/args/result ]; then
       publish "RUN-TEST: PASS" /cas/args/result

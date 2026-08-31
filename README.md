@@ -43,7 +43,7 @@ Caos runs well-defined binaries with well-defined inputs and well-defined enviro
 | `worker-runner` | — (`std/runner`'s `/worker`) | The in-image runner trampoline: receives a compiled worker binary as its `worker1` arg and execs it, so every compiled worker rides one shared image as `curry(std/runner, worker1=<binary>)`. |
 | `worker-rustc` | — (run as `curry(runner, worker1)`) | Builds a worker from Rust source. See [workers](#workers). |
 | `worker-bash-tool`, `worker-llm-call`, `worker-llm-step`, `worker-rgrep` | — (run as `curry(runner, worker1)`) | The agent harness: bounded bash, stateless LLM calls, durable LLM turns, and recursive grep. See `design/chat.md` for the current chat protocol and `design/agent-harness.md` for its historical rationale. |
-| `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (pinned toolchain + pre-compiled deps + this binary as `/worker`; its image is host-built and streamed like the runner, `caos-worker-cargo-docker` — see `std/cargo/` and `design/cargo-workers.md`) — the agent's `build`/`test` tools. |
+| `worker-cargo` | — (`std/cargo`'s `/worker`) | Whole-workspace `cargo check/build/test` as `std/cargo` (pinned toolchain + pre-compiled deps + this binary as `/worker`; its image is host-built and streamed like the runner, `caos-worker-cargo-docker` — see `std/cargo/` and `design/cargo-workers.md`) — the agent's `caos-build`/`caos-test` tools. |
 | `llm-stub` | — | Scripted `POST /v1/messages` stand-in for the LLM worker tests. |
 
 ## Prerequisites
@@ -65,7 +65,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `rust/crates/server/` | The `server` crate → `caos-server` |
 | `rust/crates/worker-*/` | The worker crates |
 | `build-builtins.sh` | Bootstraps the seeded core and publishes `refs/caos/seed` |
-| `caos-tools/`, `tests/` | The `build`/`test`/`test-result` tools and the integration suites |
+| `tests/` | The integration suites (the `caos-build`/`caos-test`/`caos-test-result` tools now live under `std/`, offered by the agent harness) |
 
 ## Development
 
@@ -81,7 +81,7 @@ under that one directory, which is what lets a package DECLARE the workspace as
 a dependency (`../../rust rust` in a `DEPS`) rather than be handed the repo.
 `nix flake check` runs clippy, rustfmt and the doc build.
 
-**Tests run through caos, not through nix**: `caos-cli run-tool test` (see
+**Tests run through caos, not through nix**: `caos-cli run-tool caos-test` (see
 [local testing](#local-testing)) runs the unit tests and every integration
 suite. That is the only place the unit tests can pass — several spawn `git`,
 which the cargo worker's PATH carries and a nix builder's does not — so it is
@@ -92,7 +92,7 @@ caos's own internal pushes:
 
 ```bash
 if [ "${1:-}" != caos ]; then
-  time CAOS_SALT=$(date +%s) result/bin/caos-cli run-tool test
+  time CAOS_SALT=$(date +%s) result/bin/caos-cli run-tool caos-test
 fi
 ```
 
@@ -691,7 +691,7 @@ spawning no container.
   can be far older than the `flake.lock` that names it — and the symptom is an
   error that reads like a caos bug. `caos-cli`'s usage banner carries the same
   revision.
-- Test with `caos-cli run-tool test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
+- Test with `caos-cli run-tool caos-test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
 
 ```bash
 caosd up      # bring the stack up + publish all of std, then return. Updates it if already running
@@ -718,11 +718,11 @@ Declare it first (`./std/hello hello` in your `DEPS`, or reach it by locator:
 `--base:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/hello`).
 
 ```bash
-caos-cli run-tool build      # the worker images, from the deployed binaries
-caos-cli run-tool test       # images + the whole test suite
-caos-cli run-tool test --only="unit-test rgrep" # just these tests (cache shared
+caos-cli run-tool caos-build      # the worker images, from the deployed binaries
+caos-cli run-tool caos-test       # images + the whole test suite
+caos-cli run-tool caos-test --only="unit-test rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
-CAOS_SALT=$(date +%s) caos-cli run-tool test   # force a re-run (retry a flake)
+CAOS_SALT=$(date +%s) caos-cli run-tool caos-test   # force a re-run (retry a flake)
 ```
 
 nix builds only the *host* stack — the server, the runner daemon, the seeder,
@@ -731,12 +731,12 @@ tree under test, inside caos, by `std/cargo` and `std/rustc`; no host binary
 is handed in. (After a Rust edit: `nix build && caosd up`, then test. After
 editing anything under `std/`, the same — a std tree is part of the seed keys.)
 
-The test tool is `caos-tools/test/` — a DIRECTORY whose `.caos-expr` names the
+The test tool is `std/caos-test/` — a DIRECTORY whose `.caos-expr` names the
 image it runs on and carries its `help` (SPEC, "Tools"), with `worker.sh` as
 the suite worker, in six stages of one script: `suite` asks the server to
-evaluate `caos-tools/build` (a worker may not block on an evaluation's runs),
-`suite-run` runs the ArgTree that yields — the same one `run-tool build` and an
-agent's `build` call form — `deepener` and `deepen` expand every test's `DEPS`
+evaluate `std/caos-build` (a worker may not block on an evaluation's runs),
+`suite-run` runs the ArgTree that yields — the same one `run-tool caos-build` and an
+agent's `caos-build` call form — `deepener` and `deepen` expand every test's `DEPS`
 into `DEEP-DEPS/` mounts, `fanout` runs one job per `tests/<name>/cli.sh`,
 and `summarize` assembles the report. A test is a directory `tests/<name>/`
 with a `cli.sh`, which runs inside a test-stack worker, cwd'd into a client
@@ -752,8 +752,8 @@ hash of its record, then the last 20 lines of each failing test. Read a record
 in full with the second tool, by hash — no checkout, one object at a time:
 
 ```bash
-caos-cli run-tool test-result --hash=<hash>            # the test's full output
-caos-cli run-tool test-result --hash=<hash> --log=server  # an inner-stack log
+caos-cli run-tool caos-test-result --hash=<hash>            # the test's full output
+caos-cli run-tool caos-test-result --hash=<hash> --log=server  # an inner-stack log
 ```
 
 To get the whole tree on disk instead, `caos-cli get <hash> <path>`.

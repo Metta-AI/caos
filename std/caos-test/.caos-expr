@@ -1,20 +1,23 @@
-# The `test` tool (SPEC, "Tools"): the bash worker image with this directory's
-# script curried onto it, plus the `help` an agent registers it by.
+# The `caos-test` tool (SPEC, "Tools"): the dev/test-stack worker image with
+# this directory's script curried onto it, plus the `help` an agent registers
+# it by. It moved out of caos-tools/ into std/ so the agent harness can DEPend on
+# it and register it ALWAYS — the tool comes from the harness's own version, not
+# from the tree under test (design/flake-inputs.md, "the tui").
 #
 # The docs are a HERE-STRING, so they live here rather than in the script — and
 # a `.caos-expr` is STRIPPED from the tree it is evaluated against, so editing
 # them re-keys this tool's arg tree and nothing it builds. That split is why
 # `@param [test-salt]` can be reworded without re-running a single test.
 HELP=<<END
-caos-tools/test
-
-Build the test stack image from the tree and run the whole test suite — the
+Build the caos test stack image from the tree and run the whole test suite — the
 unit tests and every tests/<name> integration suite — as cached jobs: an
 unchanged test never re-runs. Returns the report: a line per test with its
 time and the hash of its record, the last few lines of every failing test,
-and a pass/fail banner. Pass a record's hash to `test-result` for that test's
+and a pass/fail banner. Pass a record's hash to `caos-test-result` for that test's
 full output or its inner-stack logs. Nothing is handed in from the host: the
-stack under test is compiled from these sources, inside workers.
+stack under test is compiled from these sources, inside workers. This tool is
+specific to the caos codebase; run in any other tree it reports cleanly that
+there is nothing for it to test.
 @param [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys the tests and nothing else.
 @param [only] Run only these tests — a space-separated list of tests/<name> directories.
 END

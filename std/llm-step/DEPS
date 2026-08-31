@@ -1,9 +1,10 @@
 # llm-step's dependencies (format `<path> <name>`, path relative to this dir):
 # the rustc worker factory that compiles it, the opt-in Git runner it executes
 # on, the llm-client and conversation-protocol crates it links, and THE TOOLS
-# IT DRIVES — bash-tool, rgrep, bash (the tree-tool shell), merge and
-# run-and-update-ref. LOCAL deps
-# (mounted under DEEP-DEPS/ by deepening) rather than /std, so std has no
+# IT DRIVES — bash-tool, rgrep, bash (the tree-tool shell), merge, the caos
+# build/test tools (caos-build, caos-test — moved out of caos-tools/ so the
+# harness offers them ALWAYS from its own version) and run-and-update-ref. LOCAL
+# deps (mounted under DEEP-DEPS/ by deepening) rather than /std, so std has no
 # ambient self-reference.
 #
 # The tools are declared HERE, rather than by whoever calls llm-step, because
@@ -18,4 +19,7 @@
 ../rgrep rgrep
 ../bash bash
 ../merge merge
+../caos-build caos-build
+../caos-test caos-test
+../caos-test-result caos-test-result
 ../run-and-update-ref run-and-update-ref

@@ -28,10 +28,10 @@ caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
 ws=$(caos hash /cas/ws)
 
 INLINE_CALLS='[
- {"id":"tu_w","input":{"file_path":"notes/new.txt","content":"hello world"},"name":"write","type":"tool_use"},
- {"id":"tu_r","input":{"file_path":"notes/new.txt"},"name":"read","type":"tool_use"},
- {"id":"tu_e","input":{"file_path":"notes/new.txt","old_string":"hello","new_string":"goodbye"},"name":"edit","type":"tool_use"},
- {"id":"tu_x","input":{"file_path":"notes/new.txt","old_string":"never there","new_string":"x"},"name":"edit","type":"tool_use"},
+ {"id":"tu_w","input":{"file-path":"notes/new.txt","content":"hello world"},"name":"write","type":"tool_use"},
+ {"id":"tu_r","input":{"file-path":"notes/new.txt"},"name":"read","type":"tool_use"},
+ {"id":"tu_e","input":{"file-path":"notes/new.txt","old-string":"hello","new-string":"goodbye"},"name":"edit","type":"tool_use"},
+ {"id":"tu_x","input":{"file-path":"notes/new.txt","old-string":"never there","new-string":"x"},"name":"edit","type":"tool_use"},
  {"id":"tu_l","input":{"path":"notes"},"name":"ls","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
@@ -65,7 +65,7 @@ grep -qF 'edited notes/new.txt (1 replacement)' /tmp/stub/request-2.json \
   || fail "edit result not sent"
 grep -qF 'new.txt\ntodo.txt' /tmp/stub/request-2.json || fail "ls listing not sent"
 grep -qF '"is_error":true' /tmp/stub/request-2.json || fail "bad edit not marked is_error"
-grep -qF 'old_string not found' /tmp/stub/request-2.json \
+grep -qF 'old-string not found' /tmp/stub/request-2.json \
   || fail "bad edit error not explained"
 [ ! -f /tmp/stub/request-3.json ] || fail "inline tools cost extra model rounds"
 

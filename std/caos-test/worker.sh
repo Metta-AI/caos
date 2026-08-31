@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The `test` tool: build the tree, stand a dev stack up in this container, and
-# run the suite on it.
+# The `caos-test` tool: build the tree, stand a dev stack up in this container,
+# and run the suite on it.
 #
 # TWO LEVELS OF CAOS, and keeping them straight is the whole shape of this file:
 #
@@ -35,8 +35,22 @@ phase() { echo "==> [+$((SECONDS - T0))s] $*" >&2; }
 caos get -r /cas/args/in || fail "materializing the workspace"
 phase "materialized the workspace"
 cd /cas/args/in
-[ -f flake.nix ] || fail "no flake.nix in the workspace"
-[ -x dev/stack-up ] || fail "no dev/stack-up in the workspace"
+
+# WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-test is registered on
+# every conversation (it is one of the harness's own tools), so it is offered
+# even when the workspace is not caos. There it has no stack to build and no
+# suite to run: rather than fail the turn, put a plain note saying so and exit 0,
+# so the model reads a calm "not applicable here" tool_result instead of a red
+# one. A plain blob renders through the same tool conventions as the report.
+if [ ! -f flake.nix ] || [ ! -x dev/stack-up ]; then
+  { echo "caos-test builds a caos dev stack from the tree and runs the caos suite"
+    echo "on it. This workspace is not the caos codebase (no flake.nix / dev/stack-up),"
+    echo "so there is nothing here for it to test."
+    echo "caos-test is specific to the caos codebase; run it there."
+  } > /tmp/not-caos
+  caos put /tmp/not-caos /cas/out
+  exit 0
+fi
 
 # The stack, and a client for it. `stack-up` compiles the tree, brings the
 # daemons up as children of THIS container, publishes std, and leaves the
@@ -99,7 +113,7 @@ fi
 #
 # That is what this does, and it is the one place in the tree where a secret is
 # written to disk: it arrives here at /secret/anthropic-api-key because the
-# caller's store names `caos-tools/test` as a reader, and it is written back as
+# caller's store names `std/caos-test` as a reader, and it is written back as
 # a store for the dev stack naming `tests/chat-online` as its reader. The value
 # never enters an ArgTree or the CAS.
 #
@@ -235,6 +249,6 @@ chmod u+w /tmp/suite/report
 # THE WHOLE RESULT TREE, not just the report. SPEC's tool conventions: a tree
 # with a `report` file has the report printed, and a FAILED banner in it marks
 # the call a failure — while `results/<test>` stays addressable, which is what
-# lets `test-result <hash>` read one test's full output.
+# lets `caos-test-result <hash>` read one test's full output.
 phase "done"
 caos put /tmp/suite /cas/out

@@ -62,6 +62,16 @@ struct Config {
     /// The git-bearing merge worker (std/merge). The `merge` tool is registered
     /// only when present.
     merge_image: Option<String>,
+    /// std/caos-build and std/caos-test — the caos build/test tools, moved out
+    /// of the workspace's caos-tools/ so the harness DEPends on them and offers
+    /// them ALWAYS, from its own version rather than the tree under work
+    /// (design/flake-inputs.md, "the tui"). Registered when present; each
+    /// reports cleanly when run against a tree that is not caos.
+    caos_build_image: Option<String>,
+    caos_test_image: Option<String>,
+    /// std/caos-test-result — reads one test's record BY HASH, so it touches no
+    /// workspace and applies on any tree; moved alongside caos-test.
+    caos_test_result_image: Option<String>,
     run_and_update_ref_image: Option<String>,
     /// The turn-start ref snapshot: `name <hash>` lines the `merge` tool
     /// resolves `--theirs` against (SPEC "Resolving `--theirs`"). Absent = the
@@ -102,6 +112,9 @@ impl Config {
             grep_image: image_arg("grep-image")?,
             tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
+            caos_build_image: image_arg("caos-build-image")?,
+            caos_test_image: image_arg("caos-test-image")?,
+            caos_test_result_image: image_arg("caos-test-result-image")?,
             run_and_update_ref_image,
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg("model")?,
@@ -460,6 +473,31 @@ fn drive(
                 }
             }
         }
+        // A harness-provided std tool (caos-build/caos-test)? Its image is a
+        // DEP of the harness, so it is offered ALWAYS, from the harness's own
+        // version — not discovered from the workspace like a tree tool. Its
+        // help (and so its params) come from the image, read the same way a tree
+        // tool's do; a valid call curries the model's args onto the image and
+        // runs it over the workspace.
+        if let Some((image, arg_name)) = std_tool_image(cfg, name) {
+            let tool = tools::std_tool(name, &arg(arg_name))?
+                .ok_or_else(|| format!("{name} image carries no help"))?;
+            match tools::tree_tool_args(&call, &tool) {
+                Err(block) => {
+                    append_tool_result(cfg, run, round, &base_head, &block, &cas_hash(&ws)?, None)?;
+                    let log = progress::conversation_log(conversation(cfg)?)?;
+                    (ws, wc) = canonical_workspace(&log)?;
+                    base_head = log.head;
+                    queue.remove(0);
+                    continue;
+                }
+                Ok(bound) => {
+                    return launch_std_tool(
+                        &call, name, image, &bound, &ws, &wc, run, round, &base_head,
+                    )
+                }
+            }
+        }
         // A built-in history tool (log/show/diff)? Like a tree tool, but the
         // script ships with the harness and it always gets the `@git` context.
         if githist::is_builtin(name) && cfg.tools_image.is_some() {
@@ -515,8 +553,8 @@ fn drive(
         if !tools::is_inline(name) {
             return Err(format!(
                 "model called unknown tool {name:?} (built-ins: bash, grep, read, \
-                 ls, write, edit, merge, spawn_agent; plus this \
-                 workspace's caos-tools/<name>/ tools)"
+                 ls, write, edit, merge, caos-build, caos-test, caos-test-result, \
+                 spawn_agent; plus this workspace's caos-tools/<name>/ tools)"
             ));
         }
         let (block, new_ws) = tools::execute(&call, &ws)?;
@@ -890,6 +928,62 @@ fn launch_grep(
         ],
     )?;
     run_then_catching(scope, Arg::Hash(&curried), Arg::Hash(&me))
+}
+
+/// A harness-provided std tool's image and its arg-tree path, if `name` is one
+/// and the harness was curried with it. `caos-build`/`caos-test` are DEPs of the
+/// harness (std/llm-step/DEPS), bound by its `.caos-expr`, so they are offered
+/// on every conversation regardless of the workspace.
+fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static str)> {
+    match name {
+        "caos-build" => cfg
+            .caos_build_image
+            .as_deref()
+            .map(|i| (i, "caos-build-image")),
+        "caos-test" => cfg
+            .caos_test_image
+            .as_deref()
+            .map(|i| (i, "caos-test-image")),
+        "caos-test-result" => cfg
+            .caos_test_result_image
+            .as_deref()
+            .map(|i| (i, "caos-test-result-image")),
+        _ => None,
+    }
+}
+
+/// Launch a harness-provided std tool (caos-build/caos-test). Its `image` is the
+/// tool's ArgTree already (base + worker1 + help), so unlike a tree tool there
+/// is NO eval stage: curry the model's `@param`s onto it and run it over the
+/// workspace, exactly as `launch_evaluated_tool` runs a tree tool's evaluated
+/// ArgTree. The result is a VALUE, rendered by the same callback arm as a tree
+/// tool's (the pre-run workspace rode our curry).
+#[allow(clippy::too_many_arguments)]
+fn launch_std_tool(
+    call: &Value,
+    name: &str,
+    image: &str,
+    bound: &[(String, String)],
+    ws: &str,
+    wc: &str,
+    run: &str,
+    round: u64,
+    base_head: &str,
+) -> Result<(), String> {
+    let id = call["id"]
+        .as_str()
+        .ok_or("tool_use block has no string id")?;
+    let kvs: Vec<(&str, Arg)> = bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))).collect();
+    let curried = caos_curry(Arg::Hash(image), &kvs)?;
+    let me = self_curry(
+        wc,
+        run,
+        round,
+        base_head,
+        id,
+        &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
+    )?;
+    run_then_catching(ws, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
 /// Launch a tree tool (`caos-tools/<name>/`, already resolved in the current
@@ -2131,6 +2225,24 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     // on the handed-in tools image, so they keep its gate.
     if cfg.tools_image.is_some() {
         tools.extend(githist::declarations());
+    }
+    // The harness-provided std tools (caos-build/caos-test): DEPs of the
+    // harness, so offered ALWAYS when curried — described by the `help` their
+    // images carry, the same shape a tree tool is described by.
+    for (name, arg_name, image) in [
+        ("caos-build", "caos-build-image", &cfg.caos_build_image),
+        ("caos-test", "caos-test-image", &cfg.caos_test_image),
+        (
+            "caos-test-result",
+            "caos-test-result-image",
+            &cfg.caos_test_result_image,
+        ),
+    ] {
+        if image.is_some() {
+            if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
+                tools.push(tools::tree_tool_declaration(&tool));
+            }
+        }
     }
     // Tree tools: whatever `caos-tools/<name>/` directories the CURRENT
     // workspace carries — re-discovered every round, so the set tracks the

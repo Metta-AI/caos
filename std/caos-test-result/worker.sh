@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# The `test-result` tool's worker. Its DOCS — the description and `@param`
+# The `caos-test-result` tool's worker. Its DOCS — the description and `@param`
 # tags an agent registers it by — live in the sibling `.caos-expr` here-string,
 # not in this header: that is what keeps a doc edit out of anything that reads
 # this file (SPEC, "Tools").
 #
-# The counterpart to caos-tools/test/worker.sh's report. A test's record —
+# The counterpart to std/caos-test/worker.sh's report. A test's record —
 # {verdict, seconds, output, server.log, runnerd.log, ...} — already rides in
 # the suite result (dev/run-test/worker.sh writes it), so nothing here re-runs
 # anything: this is a READ, addressed by hash, of a tree the suite already
-# published. That is why the report can afford to be short.
+# published. That is why the report can afford to be short — and why this tool
+# touches no workspace and needs no caos tree.
 #
 # The result is a BLOB, not a tree with a `report`: both readers print a blob
 # verbatim (crates/caos/src/lib.rs's report_conventions, and the harness's
@@ -30,7 +31,7 @@ out=/tmp/out
 caos get /cas/args/hash
 hash=$(tr -d '[:space:]' < /cas/args/hash)
 if ! printf '%s' "$hash" | grep -qE '^[0-9a-f]{40}$'; then
-  printf 'not a hash: %s\n\nPass the 40-character hash the `test` report prints beside a test.\n' \
+  printf 'not a hash: %s\n\nPass the 40-character hash the `caos-test` report prints beside a test.\n' \
     "$hash" > "$out"
   caos put "$out" /cas/out
   exit 0
@@ -60,7 +61,7 @@ fi
 if [ ! -e "/cas/rec/$want" ]; then
   { printf '%s has no %s. It holds: ' "$hash" "$want"
     ls -A /cas/rec | tr '\n' ' '
-    printf '\n\nA test record comes from the `results/<test>` entries of a `test` run.\n'
+    printf '\n\nA test record comes from the `results/<test>` entries of a `caos-test` run.\n'
   } > "$out"
   caos put "$out" /cas/out
   exit 0

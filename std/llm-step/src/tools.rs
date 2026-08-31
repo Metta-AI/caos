@@ -6,10 +6,10 @@
 //! resolves links by recorded hash — the same surgery `mint_step` does for
 //! `.caos`), so the never-materialize rule holds throughout.
 //!
-//! A failed call — missing file, non-unique `old_string`, a file where a
+//! A failed call — missing file, non-unique `old-string`, a file where a
 //! directory was expected — is an `is_error` tool_result the model reacts to,
 //! never a worker error. Parameter shapes mirror Claude Code's file tools
-//! (`file_path`, `content`, `old_string`/`new_string`/`replace_all`), which
+//! (`file-path`, `content`, `old-string`/`new-string`/`replace-all`), which
 //! models know well.
 
 use std::fs;
@@ -33,72 +33,61 @@ pub fn is_inline(name: &str) -> bool {
     matches!(name, "read" | "ls" | "write" | "edit")
 }
 
+/// Help text for the built-in tools, authored exactly like a caos-tools
+/// `.caos-expr`'s `HELP` here-string (SPEC, "Tools"): free description text,
+/// then dashed `@param` tags. They are parsed by the same `parse_help` the tree
+/// tools use, so a built-in and a project tool are described one way — the docs
+/// live with the tool, not inside a hand-written JSON schema.
+const READ_HELP: &str = "Read a file's contents. Defaults to the current workspace; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
+@param [file-path] Workspace-relative path (the workspace root is the repo root).
+@param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current workspace.
+@param [offset] 1-based first line to return.
+@param [limit] Number of lines to return.";
+
+const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Defaults to the current workspace; pass `root` (a commit or tree hash) to list it as of another revision, and `path` to descend within that root. Prefer this over `ls` via bash.
+@param [path] Directory to list (relative to `root`, or to the workspace root); omit for the root itself.
+@param [root] Optional commit or tree hash to list as of another revision. Omit for the current workspace.";
+
+const WRITE_HELP: &str = "Write a file into the workspace (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
+@param file-path Workspace-relative path (the workspace root is the repo root).
+@param content The full new file content.";
+
+const EDIT_HELP: &str = "Replace text in a workspace file. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
+@param file-path Workspace-relative path (the workspace root is the repo root).
+@param old-string Exact text to replace.
+@param new-string Replacement text.
+@param [replace-all] Replace every occurrence (default false).";
+
+const GREP_HELP: &str = "Search the workspace with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
+@param pattern The regular expression to search for.
+@param [path] Directory or file to search (relative to `root`, or to the workspace root); omit for everything.
+@param [root] Optional commit or tree hash to search as of another revision. Omit for the current workspace.";
+
+/// Build a built-in tool's registry entry from its help text, through the very
+/// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
+/// tool takes. `git` is always false: a built-in that needs history context
+/// (log/show/diff) lives in `githist.rs` and asks for it there.
+fn builtin_declaration(name: &str, help: &str) -> Value {
+    let (doc, args, _git) = parse_help(&format!("built-in {name}"), help);
+    tree_tool_declaration(&TreeTool {
+        name: name.to_string(),
+        doc,
+        args,
+        git: false,
+    })
+}
+
 /// The inline tools' registry entries, alongside `bash`'s.
 pub fn declarations() -> Vec<Value> {
-    let path_desc = "Workspace-relative path (the workspace root is the repo root).";
-    vec![
-        json!({
-            "name": "read",
-            "description": "Read a file's contents. Defaults to the current workspace; pass \
-        `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage \
-        oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree \
-        `root`, `file_path` names the file within it; with a blob `root`, omit `file_path` to \
-        read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no \
-        `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": path_desc},
-                    "root": {"type": "string", "description": "Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current workspace."},
-                    "offset": {"type": "integer", "description": "1-based first line to return."},
-                    "limit": {"type": "integer", "description": "Number of lines to return."}
-                }
-            }
-        }),
-        json!({
-            "name": "ls",
-            "description": "List a directory: one entry per line, directories with a \
-        trailing `/`. Defaults to the current workspace; pass `root` (a commit or tree hash) \
-        to list it as of another revision, and `path` to descend within that root. Prefer \
-        this over `ls` via bash.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory to list (relative to `root`, or to the workspace root); omit for the root itself."},
-                    "root": {"type": "string", "description": "Optional commit or tree hash to list as of another revision. Omit for the current workspace."}
-                }
-            }
-        }),
-        json!({
-            "name": "write",
-            "description": "Write a file into the workspace (creating parent directories, \
-        overwriting an existing file). Prefer this over heredocs/redirection via bash.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": path_desc},
-                    "content": {"type": "string", "description": "The full new file content."}
-                },
-                "required": ["file_path", "content"]
-            }
-        }),
-        json!({
-            "name": "edit",
-            "description": "Replace text in a workspace file. `old_string` must match the file \
-        content exactly and (unless `replace_all`) appear exactly once — include surrounding \
-        context to disambiguate. Prefer this over sed via bash.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": path_desc},
-                    "old_string": {"type": "string", "description": "Exact text to replace."},
-                    "new_string": {"type": "string", "description": "Replacement text."},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."}
-                },
-                "required": ["file_path", "old_string", "new_string"]
-            }
-        }),
+    [
+        ("read", READ_HELP),
+        ("ls", LS_HELP),
+        ("write", WRITE_HELP),
+        ("edit", EDIT_HELP),
     ]
+    .iter()
+    .map(|(name, help)| builtin_declaration(name, help))
+    .collect()
 }
 
 /// The grep tool's registry entry (present only when a `grep-image` is
@@ -106,23 +95,7 @@ pub fn declarations() -> Vec<Value> {
 /// contributes the declaration, the pre-launch validation, and the
 /// transcript-boundary rendering of its sparse result tree.
 pub fn grep_declaration() -> Value {
-    json!({
-        "name": "grep",
-        "description": "Search the workspace with a regular expression (Rust regex syntax, \
-    line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or \
-    file) to narrow the search; results are cached per unchanged subtree, so repeated and \
-    scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another \
-    revision. Prefer this over grep/find via bash.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "The regular expression to search for."},
-                "path": {"type": "string", "description": "Directory or file to search (relative to `root`, or to the workspace root); omit for everything."},
-                "root": {"type": "string", "description": "Optional commit or tree hash to search as of another revision. Omit for the current workspace."}
-            },
-            "required": ["pattern"]
-        }
-    })
+    builtin_declaration("grep", GREP_HELP)
 }
 
 // ---- Tree tools (caos-tools/<name>/, SPEC "Tools") -------------------------
@@ -142,6 +115,9 @@ const RESERVED_TOOLS: &[&str] = &[
     "log",
     "show",
     "diff",
+    "caos-build",
+    "caos-test",
+    "caos-test-result",
     "spawn_agent",
     "run_async",
 ];
@@ -372,6 +348,37 @@ pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
         }
     }
     Ok(out)
+}
+
+/// A harness-provided std tool (std/caos-build, std/caos-test), described by the
+/// `help` its curried IMAGE carries — read the same way a tree tool's help is,
+/// so a built-in std tool and a project caos-tools tool are one mechanism, just
+/// sourced differently. `dir` is the materialized arg-tree path
+/// (`/cas/args/<name>-image`): a curry with only a base is the tool's ready
+/// ArgTree, whose `help` entry is the blob the tool's `.caos-expr` bound.
+///
+/// `None` when the image carries no `help` — treated as a configuration error by
+/// the caller, since the harness itself curried the image.
+pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
+    caos(["get", dir])?;
+    let help_path = format!("{dir}/help");
+    if !Path::new(&help_path).exists() {
+        return Ok(None);
+    }
+    caos(["get", &help_path])?;
+    let help = fs::read_to_string(&help_path).map_err(|e| format!("reading {help_path}: {e}"))?;
+    let (doc, args, git) = parse_help(&format!("std/{name}"), &help);
+    let doc = if doc.is_empty() {
+        format!("Built-in tool {name} (no description).")
+    } else {
+        doc
+    };
+    Ok(Some(TreeTool {
+        name: name.to_string(),
+        doc,
+        args,
+        git,
+    }))
 }
 
 /// One discovered tool's registry entry. A tool with no `@param` tags takes
@@ -657,10 +664,10 @@ fn block(id: &str, text: &str, is_error: bool) -> Value {
 
 fn read(call: &Value, ws: &str) -> Result<String, Fail> {
     let root = opt_hash(call, "root");
-    let comps = components_opt(call, "file_path")?;
+    let comps = components_opt(call, "file-path")?;
     if root.is_none() && comps.is_empty() {
         return Err(User(
-            "read needs a `file_path` (or a `root` blob hash to read directly)".to_string(),
+            "read needs a `file-path` (or a `root` blob hash to read directly)".to_string(),
         ));
     }
     let p = resolve(root.as_deref(), ws, &comps)?;
@@ -710,7 +717,7 @@ fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fa
         Ok(p)
     } else {
         Err(User(format!(
-            "{hash} is a blob; it has no paths inside it (drop `file_path`/`path` to read it)"
+            "{hash} is a blob; it has no paths inside it (drop `file-path`/`path` to read it)"
         )))
     }
 }
@@ -751,11 +758,29 @@ fn valid_oid(oid: &str) -> bool {
 
 /// Apply `read`'s bounds to raw bytes: a line window when `offset`/`limit` is
 /// set, else a head-truncation at [`MAX_READ_BYTES`].
+/// Read an integer arg tolerantly — the model may send it as a JSON number or,
+/// since the built-in tools' `@param`s are untyped strings, as a numeric
+/// string. `None` when absent or unparseable.
+fn num(call: &Value, key: &str) -> Option<u64> {
+    let v = &call["input"][key];
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// Read a boolean arg tolerantly — a JSON bool, or a `"true"`/`"1"`/`"yes"`
+/// string. Anything else (including absent) is false.
+fn flag(call: &Value, key: &str) -> bool {
+    let v = &call["input"][key];
+    v.as_bool()
+        .or_else(|| v.as_str().map(|s| matches!(s.trim(), "true" | "1" | "yes")))
+        .unwrap_or(false)
+}
+
 fn bounded(bytes: &[u8], call: &Value) -> Result<String, Fail> {
     let total = bytes.len();
     let text = String::from_utf8_lossy(bytes);
-    let offset = call["input"]["offset"].as_u64().map(|n| n.max(1) as usize);
-    let limit = call["input"]["limit"].as_u64().map(|n| n as usize);
+    let offset = num(call, "offset").map(|n| n.max(1) as usize);
+    let limit = num(call, "limit").map(|n| n as usize);
     if offset.is_some() || limit.is_some() {
         let start = offset.unwrap_or(1) - 1;
         let lines: Vec<&str> = text.lines().collect();
@@ -815,7 +840,7 @@ fn ls(call: &Value, ws: &str) -> Result<String, Fail> {
 }
 
 fn write(call: &Value, ws: &str) -> Result<(String, String), Fail> {
-    let comps = components(call, "file_path")?;
+    let comps = components(call, "file-path")?;
     let content = call["input"]["content"]
         .as_str()
         .ok_or_else(|| User("write needs a string `content`".to_string()))?;
@@ -827,15 +852,15 @@ fn write(call: &Value, ws: &str) -> Result<(String, String), Fail> {
 }
 
 fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
-    let comps = components(call, "file_path")?;
-    let old = call["input"]["old_string"]
+    let comps = components(call, "file-path")?;
+    let old = call["input"]["old-string"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| User("edit needs a non-empty `old_string`".to_string()))?;
-    let new = call["input"]["new_string"]
+        .ok_or_else(|| User("edit needs a non-empty `old-string`".to_string()))?;
+    let new = call["input"]["new-string"]
         .as_str()
-        .ok_or_else(|| User("edit needs a string `new_string`".to_string()))?;
-    let replace_all = call["input"]["replace_all"].as_bool().unwrap_or(false);
+        .ok_or_else(|| User("edit needs a string `new-string`".to_string()))?;
+    let replace_all = flag(call, "replace-all");
 
     let p = materialize(ws, &comps)?;
     if p.is_dir() {
@@ -856,15 +881,15 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
     let replaced = match (count, replace_all) {
         (0, _) => {
             return Err(User(
-                "old_string not found in the file (it must match exactly, including \
+                "old-string not found in the file (it must match exactly, including \
                  whitespace)"
                     .to_string(),
             ))
         }
         (n, false) if n > 1 => {
             return Err(User(format!(
-                "old_string appears {n} times; include more surrounding context to make it \
-                 unique, or set replace_all"
+                "old-string appears {n} times; include more surrounding context to make it \
+                 unique, or set replace-all"
             )))
         }
         (_, true) => text.replace(old, new),
@@ -1122,7 +1147,7 @@ mod tests {
         // read-oid is gone — folded into `read` via `root`.
         assert!(!is_inline("read-oid"));
         assert!(!declarations().iter().any(|d| d["name"] == "read-oid"));
-        // read's file_path is no longer required (a blob `root` reads with none).
+        // read's file-path is no longer required (a blob `root` reads with none).
         let read = declarations()
             .into_iter()
             .find(|d| d["name"] == "read")

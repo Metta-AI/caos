@@ -22,9 +22,9 @@ caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
 ws=$(caos hash /cas/ws)
 
 MIXED_CALLS='[
- {"id":"tu_mw","input":{"file_path":"mix.txt","content":"hello"},"name":"write","type":"tool_use"},
+ {"id":"tu_mw","input":{"file-path":"mix.txt","content":"hello"},"name":"write","type":"tool_use"},
  {"id":"tu_mb","input":{"cmd":"tr a-z A-Z < mix.txt > mix3.txt","paths":["mix.txt"]},"name":"bash","type":"tool_use"},
- {"id":"tu_me","input":{"file_path":"mix.txt","old_string":"hello","new_string":"world"},"name":"edit","type":"tool_use"}]'
+ {"id":"tu_me","input":{"file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json

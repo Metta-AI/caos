@@ -71,7 +71,16 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     let dir = if tool.contains('/') {
         tool.trim_end_matches('/').to_string()
     } else {
-        format!("caos-tools/{tool}")
+        // A bare name is a caos-tools/<name> project tool, or — for the tools
+        // that moved into std so the agent harness can offer them always
+        // (caos-build, caos-test) — a std/<name> entry. Prefer the project tool
+        // when both exist.
+        let project = format!("caos-tools/{tool}");
+        if Path::new(&format!("{project}/.caos-expr")).is_file() {
+            project
+        } else {
+            format!("std/{tool}")
+        }
     };
     if !Path::new(&format!("{dir}/.caos-expr")).is_file() {
         return Err(format!(
@@ -119,7 +128,7 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
     let Some(entries) = fetch_tree_entries(t, result)? else {
         // Not a tree: the tool's whole answer IS the blob. Print it — the same
         // rendering the agent harness gives a blob result, so `run-tool
-        // test-result <hash>` by hand shows what the agent would have seen.
+        // caos-test-result <hash>` by hand shows what the agent would have seen.
         // Without this a text-valued tool prints its hash and nothing else.
         let (_, bytes) = t.get_object(result)?;
         let text = String::from_utf8_lossy(&bytes);
@@ -152,7 +161,7 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
     // and its record hash, that printed the same failure twice — and, worse,
     // showed a human something the agent never saw, when the point of the two
     // callers is that a tool cannot behave differently depending on who ran it.
-    // The full output is one `run-tool test-result <hash>` away, which the
+    // The full output is one `run-tool caos-test-result <hash>` away, which the
     // report says.
     if text.contains("FAILED") {
         return Err(format!("{name} reported FAILED"));

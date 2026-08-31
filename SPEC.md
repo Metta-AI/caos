@@ -74,7 +74,7 @@ Caos is reliable because:
 Caos is fast because:
 - It caches work based on the ArgTree. The same work is never run a second time
 - It takes pains to narrow trees before using them as keys, to avoid cache misses
-    - For example, caos-tools/build narrows the tree to just what the flake needs to build the stackbuilder image. Then it passes just the source files when running the stack-builder to build a stack
+    - For example, std/caos-build narrows the tree to just what the flake needs to build the stackbuilder image. Then it passes just the source files when running the stack-builder to build a stack
     - Compare with calculating custom keys based on a subset of the data: this causes stale values when it goes wrong
     - Compare with
 - It calculates keys quickly:
@@ -84,13 +84,13 @@ Caos is fast because:
 - It pushes to git only what's new
 
 Two things need to be fast:
-- Primary: Rebuild and retest everything: `time CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool test`
+- Primary: Rebuild and retest everything: `time CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool caos-test`
     - This doesn't rebuild the stack-builder image from the flake, because that's just a function of the flake and is cached in docker
 - Secondary: Build and restart on the host: `time nix build && time result/bin/caosd up`. Not part of the normal dev loop
 
 We have various kinds of salt to control what work gets redone:
 - `CAOS_SALT=$(date --iso=s)` to rerun all caos workers (but not rebuild flakes, which do not include this in their key)
-- `run-tool test --test-salt=$(date --iso=s)` to rerun all tests
+- `run-tool caos-test --test-salt=$(date --iso=s)` to rerun all tests
 
 If these become slow:
 - Sample `ps` during a run
@@ -201,7 +201,7 @@ Note that this means that the server sees all secrets. We can revisit if this be
 
 ## Before committing
 
-Run `time result/bin/caos-cli run-tool test`
+Run `time result/bin/caos-cli run-tool caos-test`
 
 ## General
 - A root-level flake.nix and flake.lock SHALL install all of the dependencies needed to build the code
@@ -290,8 +290,8 @@ The build and test tools use `dev/test-stack --tree=<hash> --command=<command>` 
 We use a single short-lived test worker with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
 
 The build and tools are:
-- `caos-tools/build <tree-oid>`: `run-in-test-container  --tree=<treeoid> --command="nix build"`
-- `caos-tools/test <tree-oid>`: `run-in-test-container --tree=<treeoid> --command="nix build && .../caosd up && .../caos-cli run dev/run-tests"`
+- `std/caos-build <tree-oid>`: `run-in-test-container  --tree=<treeoid> --command="nix build"`
+- `std/caos-test <tree-oid>`: `run-in-test-container --tree=<treeoid> --command="nix build && .../caosd up && .../caos-cli run dev/run-tests"`
 
 Some tests need to remain running/block while their child workers run. (Examples: anything that calls `caos-cli run`, and anything that needs to start a daemon that a worker talks to.) `--max-parallel` on the suite's `map-then` bounds how many tests are in flight (default 8), so the general pool has room for both tests and their children.
 
@@ -406,7 +406,7 @@ A tool's printed answer SHALL be the same for both callers. A convention that
 shows the human more than the agent — as an extra pass over the result tree
 once did — makes the tool untestable through the surface an agent uses. If a
 result needs more detail than its report carries, expose the detail as ANOTHER
-TOOL taking a hash (`test` and `test-result`), not as richer printing.
+TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 
 ## Failure
 

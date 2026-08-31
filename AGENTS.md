@@ -31,7 +31,7 @@ Every script here runs with it, and two constructs quietly break under it.
   `X="${VAR:?message}"` — inside double quotes the message is literal.
 - **A worker script only has what its image's flake lists.** `std/bash` is
   bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
-  `sed`**, and no awk. `sed 's/^/  /'` in `caos-tools/test/worker.sh` passed two
+  `sed`**, and no awk. `sed 's/^/  /'` in `std/caos-test/worker.sh` passed two
   green suites before it fired, because it only ran on the failing-test path:
   the report that exists to explain a failure was the thing that broke. Prefer
   a bash loop (`while IFS= read -r line`), and when reaching for a binary,
@@ -102,14 +102,14 @@ Every script here runs with it, and two constructs quietly break under it.
   object), which is what lets `tests/push-closure` reproduce at all — it used to
   have to delete the alternate itself.
 
-- **An unsalted `run-tool test` does not prove a push works.** `ensure_pushed`
+- **An unsalted `run-tool caos-test` does not prove a push works.** `ensure_pushed`
   asks before pushing — a `HEAD /object/<argtree>`, and on a hit it returns
   without running git at all — so re-running with an unchanged tree does not
   push, pack or traverse anything, and any defect in forming or packing the
   request is invisible. (It was invisible before that probe too: the push was a
   no-op update of a ref already at that hash.) Only a NEW ArgTree builds a real
   pack — which is why the primary gate is
-  `CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool test` (SPEC.md) and
+  `CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool caos-test` (SPEC.md) and
   why a green unsalted suite once sat next to a hard-failing salted one for a
   whole session. Run the salted form before believing a push-path change.
 
@@ -161,7 +161,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   reports `tail`'s status, so a failed command looks like a pass — that happened,
   and the next step ran against a stack that was not up. Use
   `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
-- **`run-tool test` does not cover `nix build`.** The suite compiles the tree
+- **`run-tool caos-test` does not cover `nix build`.** The suite compiles the tree
   with cargo over the real `rust/crates/` directory; `nix build` compiles a copy
   filtered by the flake's `src`. Anything that filter drops is invisible to a
   green suite — four `include_str!("githist/*.sh")` calls merged under a

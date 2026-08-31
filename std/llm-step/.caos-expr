@@ -11,12 +11,16 @@
 # resolves that mount through its own `.caos-expr` to the image it builds (a
 # curry with no args is the ready-to-run ArgTree), and `--k=$VAR` binds that
 # object BY REFERENCE. So a caller resolves llm-step and gets a step that
-# already knows its tools — it never has to name bash-tool, rgrep, bash or merge,
-# which are llm-step's dependencies and not the caller's business.
+# already knows its tools — it never has to name bash-tool, rgrep, bash, merge,
+# caos-build, caos-test or caos-test-result, which are llm-step's dependencies
+# and not the caller's business.
 BASH_TOOL=curry --base:@=DEEP-DEPS/bash-tool
 GREP=curry --base:@=DEEP-DEPS/rgrep
 TOOLS=curry --base:@=DEEP-DEPS/bash
 MERGE=curry --base:@=DEEP-DEPS/merge
+CAOS_BUILD=curry --base:@=DEEP-DEPS/caos-build
+CAOS_TEST=curry --base:@=DEEP-DEPS/caos-test
+CAOS_TEST_RESULT=curry --base:@=DEEP-DEPS/caos-test-result
 ASYNC_WORKER=curry --base:@=DEEP-DEPS/run-and-update-ref
 STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --dep1:@=DEEP-DEPS/conversation-protocol --output-runner:@=DEEP-DEPS/git-runner
-curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE --run-and-update-ref-image=$ASYNC_WORKER
+curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE --caos-build-image=$CAOS_BUILD --caos-test-image=$CAOS_TEST --caos-test-result-image=$CAOS_TEST_RESULT --run-and-update-ref-image=$ASYNC_WORKER

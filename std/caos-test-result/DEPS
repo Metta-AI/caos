@@ -1,0 +1,5 @@
+# This tool's worker image: the script runs on std/bash, named by a local
+# deep-deps mount (design/caos-expr.md). It is a DEP of std/llm-step, so the
+# harness deepens it and `DEEP-DEPS/bash` exists in the tree this directory's
+# `.caos-expr` is evaluated against.
+../../std/bash bash

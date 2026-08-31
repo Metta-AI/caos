@@ -1871,7 +1871,7 @@ fn tool_call_summary(name: &str, args: &Value) -> String {
         ),
         name @ ("read" | "write" | "edit") => format!(
             "{name} {}",
-            args.get("file_path").and_then(Value::as_str).unwrap_or("?")
+            args.get("file-path").and_then(Value::as_str).unwrap_or("?")
         ),
         "ls" => format!(
             "ls {}",
