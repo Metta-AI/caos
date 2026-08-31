@@ -4269,24 +4269,71 @@ pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String
     }
     let pinned = secrets_pinned_tree(t, dir)?;
     let mut store = Vec::new();
-    for (file_name, path) in local_secret_files(dir)? {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
-        let spec = parse_local_secret_spec(&file_name, &text)?;
-        let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
-        let readers = spec
+    for secret in load_local_secrets(dir)? {
+        let readers = secret
             .readers
             .iter()
             .map(|r| resolve_reader_client(t, &pinned, r))
             .collect::<Result<_, _>>()?;
         store.push(ClientSecret {
-            name: spec.name,
-            value,
-            entropy: spec.entropy.unwrap_or_default(),
+            name: secret.name,
+            value: secret.value,
+            entropy: secret.entropy,
             readers,
         });
     }
     Ok(store)
+}
+
+/// A local secret parsed and value-resolved, its readers still the declared
+/// expressions: the transport-free half of [`build_secret_store`].
+struct LocalSecret {
+    name: String,
+    value: String,
+    entropy: String,
+    readers: Vec<String>,
+}
+
+/// Read every secret file under `dir` — specs parsed, values loaded — without
+/// touching a reader. One reading path for [`build_secret_store`] and the
+/// parse-only [`local_secret_names`], so the two can never disagree on what
+/// the store declares.
+fn load_local_secrets(dir: &Path) -> Result<Vec<LocalSecret>, String> {
+    let mut secrets = Vec::new();
+    for (file_name, path) in local_secret_files(dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
+        let spec = parse_local_secret_spec(&file_name, &text)?;
+        let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
+        secrets.push(LocalSecret {
+            name: spec.name,
+            value,
+            entropy: spec.entropy.unwrap_or_default(),
+            readers: spec.readers,
+        });
+    }
+    Ok(secrets)
+}
+
+/// The names the local store declares, WITHOUT resolving readers: spec files
+/// are parsed and their values read (a malformed or half-written store still
+/// fails loudly), but no workspace tree is ingested and no reader expression
+/// is evaluated. Resolving a reader runs eval-path over the workspace, which
+/// dispatches real computation — the deepening run, and worker builds for a
+/// reader like `DEEP-DEPS/llm-step` whose entry compiles — so a presence
+/// check that resolved would stall an interactive client's startup for as
+/// long as those take (tens of seconds after a build that touches their
+/// inputs). [`build_secret_store`] remains the loader for anything that sends
+/// a request.
+pub fn local_secret_names() -> Result<Vec<String>, String> {
+    let dir = Path::new(SECRETS_DIR);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    Ok(load_local_secrets(dir)?
+        .into_iter()
+        .map(|secret| secret.name)
+        .collect())
 }
 
 /// Serialize the store for the `X-Caos-Secrets` header — a JSON array of
@@ -4936,7 +4983,71 @@ mod git_transport_tests {
 
 #[cfg(test)]
 mod local_secret_tests {
-    use super::{parse_local_secret_spec, LocalSecretValue};
+    use super::{load_local_secrets, parse_local_secret_spec, LocalSecretValue};
+
+    fn scratch_store(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "caos-local-secrets-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The parse-only load reads specs and values but leaves readers as the
+    /// declared expressions — nothing here has a transport to resolve with,
+    /// which is the point: an interactive preflight must know what the store
+    /// DECLARES without evaluating the workspace.
+    #[test]
+    fn loading_reads_specs_and_values_but_never_resolves_readers() {
+        let dir = scratch_store("load");
+        std::fs::write(dir.join(".key-value"), "hunter2").unwrap();
+        std::fs::write(
+            dir.join("api-key"),
+            "name=anthropic-api-key\nvalue:@=.key-value\nreader=DEEP-DEPS/llm-step\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("inline"), "value=plain\n").unwrap();
+
+        let secrets = load_local_secrets(&dir).unwrap();
+        // Sorted by file name, dotfiles (the value file) skipped as metadata.
+        assert_eq!(secrets.len(), 2);
+        assert_eq!(secrets[0].name, "anthropic-api-key");
+        assert_eq!(secrets[0].value, "hunter2");
+        assert_eq!(secrets[0].entropy, "");
+        assert_eq!(secrets[0].readers, ["DEEP-DEPS/llm-step"]);
+        assert_eq!(secrets[1].name, "inline");
+        assert_eq!(secrets[1].value, "plain");
+        assert!(secrets[1].readers.is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A half-written store (spec present, value file missing) is broken
+    /// configuration, and the parse-only load reports it — presence checks
+    /// built on it must surface the error, not offer to set up a new key.
+    #[test]
+    fn loading_fails_on_an_unreadable_value_file() {
+        let dir = scratch_store("missing-value");
+        std::fs::write(
+            dir.join("api-key"),
+            "name=anthropic-api-key\nvalue:@=.absent\n",
+        )
+        .unwrap();
+
+        // `.err()`, not `unwrap_err`: LocalSecret carries a secret value, so
+        // it derives no Debug — the same choice ClientSecret makes.
+        let error = load_local_secrets(&dir)
+            .err()
+            .expect("a spec without its value file was accepted");
+        assert!(error.contains("value:@=.absent"), "{error}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn one_parser_serves_entropy_maintenance_and_runtime_loading() {

@@ -2,18 +2,21 @@
 //! secret is missing, ask for the key — pasted, or a path to a file holding
 //! one — before the alternate screen takes the terminal, write the canonical
 //! `.caos-secrets` entry with fresh entropy included, make sure git ignores
-//! the store, prove it loads through the same loader every turn uses, and
-//! continue straight into the UI — no relaunch.
+//! the store, prove it reads back through the same store parser every turn
+//! starts from, and continue straight into the UI — no relaunch.
 //!
-//! A store that exists but fails to LOAD is not handled here on purpose: that
+//! A store that exists but fails to READ is not handled here on purpose: that
 //! is an existing configuration broken, and a setup prompt would hide the
-//! actual error (see [`caos_cli::model_secret_missing`]).
+//! actual error (see [`caos_cli::model_secret_missing`]). Reader expressions
+//! are deliberately NOT resolved anywhere in this preflight — resolution
+//! evaluates the workspace, and the first turn does it behind the tui's own
+//! progress UI instead of a blank terminal.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use caos::{fresh_entropy, GitTransport, SECRETS_DIR};
+use caos::{fresh_entropy, SECRETS_DIR};
 use caos_cli::{
     ensure_conversation_secret, model_secret_manual_setup, model_secret_missing, MODEL_API_SECRET,
     MODEL_API_SECRET_READERS, MODEL_API_SECRET_VALUE_FILE,
@@ -29,8 +32,8 @@ const MIN_KEY_CHARS: usize = 12;
 /// when none is configured, ask for one and install it instead of exiting
 /// with instructions. The caller has already verified stdin/stdout are a
 /// terminal and the server is reachable.
-pub(crate) fn ensure_model_secret(transport: &GitTransport) -> Result<(), String> {
-    if !model_secret_missing(transport)? {
+pub(crate) fn ensure_model_secret() -> Result<(), String> {
+    if !model_secret_missing()? {
         return Ok(());
     }
     let cols = terminal_size().map(|(cols, _)| cols).unwrap_or(80);
@@ -47,10 +50,12 @@ pub(crate) fn ensure_model_secret(transport: &GitTransport) -> Result<(), String
     for line in install_model_secret(&root, &key)? {
         println!("{line}");
     }
-    // Prove the new entry through the loader every turn uses — value read,
-    // readers resolved, credential present — while failures are still
-    // readable at the shell prompt.
-    ensure_conversation_secret(transport)?;
+    // Prove the new entry through the store parser every turn starts from —
+    // spec parsed, value read, credential present — while failures are still
+    // readable at the shell prompt. Readers stay unresolved here too: the
+    // written readers are constants, and resolving them evaluates the
+    // workspace, which the first turn does behind its own progress UI.
+    ensure_conversation_secret()?;
     println!("{MODEL_API_SECRET} configured; starting the tui");
     Ok(())
 }
