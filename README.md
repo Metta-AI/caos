@@ -7,7 +7,7 @@ functions, cached by redis
 
 ## Security
 
-Every package in your supply chain, and your agent, runs with full access to your computer (by default) and the auth tokens to that allow you to interact with github and many other services
+Every package in your supply chain, and your agent, runs with full access to your computer (by default) and the auth tokens that allow you to interact with github and many other services
 
 Caos runs all of these pieces in separate containers, with just the permissions that they need
 
