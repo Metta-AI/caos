@@ -1523,16 +1523,14 @@ struct Shortcut {
     keys: &'static str,
     label: &'static str,
     shifted: bool,
-    list_only: bool,
 }
 
 impl Shortcut {
-    const fn new(keys: &'static str, label: &'static str, shifted: bool, list_only: bool) -> Self {
+    const fn new(keys: &'static str, label: &'static str, shifted: bool) -> Self {
         Self {
             keys,
             label,
             shifted,
-            list_only,
         }
     }
 
@@ -1544,7 +1542,8 @@ impl Shortcut {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PaletteCommand {
     label: &'static str,
-    shortcut: Shortcut,
+    // None means the command is reachable only through the palette itself.
+    shortcut: Option<Shortcut>,
     keywords: &'static str,
     action: AppAction,
 }
@@ -1552,61 +1551,61 @@ struct PaletteCommand {
 const PALETTE_COMMANDS: [PaletteCommand; 10] = [
     PaletteCommand {
         label: "New conversation",
-        shortcut: Shortcut::new("n", "Ctrl+N", false, false),
+        shortcut: Some(Shortcut::new("n", "Ctrl+N", false)),
         keywords: "create start chat",
         action: AppAction::NewConversation,
     },
     PaletteCommand {
         label: "Check out conversation",
-        shortcut: Shortcut::new("l", "Ctrl+L", false, false),
+        shortcut: Some(Shortcut::new("l", "Ctrl+L", false)),
         keywords: "load workspace git",
         action: AppAction::Checkout,
     },
     PaletteCommand {
         label: "Publish pull request",
-        shortcut: Shortcut::new("p", "Ctrl+P twice", false, false),
+        shortcut: Some(Shortcut::new("p", "Ctrl+P twice", false)),
         keywords: "push pr github branch",
         action: AppAction::Publish,
     },
     PaletteCommand {
         label: "Show activity",
-        shortcut: Shortcut::new("t", "Ctrl+T", false, false),
+        shortcut: Some(Shortcut::new("t", "Ctrl+T", false)),
         keywords: "tools progress browser",
         action: AppAction::Activity,
     },
     PaletteCommand {
         label: "Show workspace changes",
-        shortcut: Shortcut::new("q", "Ctrl+Q", false, false),
+        shortcut: Some(Shortcut::new("q", "Ctrl+Q", false)),
         keywords: "diff files",
         action: AppAction::Changes,
     },
     PaletteCommand {
         label: "Show available tools",
-        shortcut: Shortcut::new("t", "Ctrl+Shift+T", true, false),
+        shortcut: Some(Shortcut::new("t", "Ctrl+Shift+T", true)),
         keywords: "commands agent",
         action: AppAction::Tools,
     },
     PaletteCommand {
         label: "Reload conversation",
-        shortcut: Shortcut::new("r", "Ctrl+R", false, false),
+        shortcut: Some(Shortcut::new("r", "Ctrl+R", false)),
         keywords: "refresh history",
         action: AppAction::Reload,
     },
     PaletteCommand {
         label: "Show keyboard help",
-        shortcut: Shortcut::new("h?/", "Ctrl+H", false, false),
+        shortcut: Some(Shortcut::new("h?/", "Ctrl+H", false)),
         keywords: "shortcuts documentation",
         action: AppAction::Help,
     },
     PaletteCommand {
         label: "Archive conversation",
-        shortcut: Shortcut::new("e", "Ctrl+E in list", false, true),
+        shortcut: None,
         keywords: "close remove",
         action: AppAction::Archive,
     },
     PaletteCommand {
         label: "Toggle native selection lock",
-        shortcut: Shortcut::new("y", "Ctrl+Y", false, false),
+        shortcut: Some(Shortcut::new("y", "Ctrl+Y", false)),
         keywords: "copy mouse terminal freeze",
         action: AppAction::SelectionLock,
     },
@@ -3050,9 +3049,10 @@ impl App {
                 PALETTE_COMMANDS
                     .iter()
                     .find(|command| {
-                        command.shortcut.shifted == shifted
-                            && (!command.shortcut.list_only || self.focus == Focus::List)
-                            && command.shortcut.keys.contains(input.to_ascii_lowercase())
+                        command.shortcut.is_some_and(|shortcut| {
+                            shortcut.shifted == shifted
+                                && shortcut.keys.contains(input.to_ascii_lowercase())
+                        })
                     })
                     .map(|command| command.action)
             }
@@ -3157,6 +3157,17 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
             self.select_relative(1);
             return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Only terminals with enhanced keyboard input report Ctrl+digit;
+            // plain ones send the bare digit, which types into the composer.
+            if let KeyCode::Char(digit @ '1'..='9') = key.code {
+                let index = digit as usize - '1' as usize;
+                if index < self.conversations.len() {
+                    self.select(index);
+                }
+                return;
+            }
         }
         if self.focus == Focus::List {
             match key.code {
@@ -3291,6 +3302,9 @@ impl App {
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.kill_line()
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.selected_mut().composer.delete()
             }
             KeyCode::Char(ch)
                 if !key
@@ -3909,14 +3923,13 @@ impl App {
         if self.selected().is_busy() {
             self.selected_mut()
                 .show_command_error("finish this conversation's operation before publishing it");
-        } else if self
-            .selected()
-            .diff
-            .as_ref()
-            .is_none_or(|diff| diff.patch.is_empty())
-        {
+        } else if self.selected().diff.is_none() {
+            // An empty workspace diff is NOT a blocker: the conversation
+            // history itself is worth publishing (and its changes may already
+            // be in the base). Only a conversation with no completed turn has
+            // nothing to point a branch at.
             self.selected_mut()
-                .show_command_error("there are no conversation changes to publish");
+                .show_command_error("this conversation has no completed turn to publish");
         } else if self.confirm_action.is_none() {
             let default_base = match remote_default_branch(&self.repo_dir) {
                 Ok(branch) => branch,
@@ -6165,6 +6178,45 @@ mod tests {
     }
 
     #[test]
+    fn publish_opens_the_base_prompt_for_an_empty_workspace_diff() {
+        let mut conversation = state("talk-1");
+        conversation.diff = Some(WorkspaceDiff {
+            base_commit: "a".repeat(40),
+            head: "b".repeat(40),
+            patch: String::new(),
+        });
+        let (mut app, _) = app_with(vec![conversation]);
+        let (repo, remote, _) = repo_with_default_branch("publish-empty-diff", "main");
+        app.repo_dir = repo.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.confirm_action,
+            Some(ConfirmAction::Publish {
+                default_base: "main".to_string(),
+                base_input: String::new(),
+            })
+        );
+        assert!(app.selected().command_error.is_none());
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_requires_a_completed_turn() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(app.confirm_action.is_none());
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("this conversation has no completed turn to publish")
+        );
+    }
+
+    #[test]
     fn idle_chat_header_keeps_only_the_title_and_head_metadata() {
         let mut conversation = state("A concise title");
         conversation.transcript.push(TranscriptEntry {
@@ -6771,18 +6823,29 @@ mod tests {
         assert!(!rendered.contains("Status"));
     }
 
+    // Archiving has no key binding; it runs through the command palette.
+    fn archive_via_palette(app: &mut App) {
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        for ch in "archive".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.palette.as_ref().unwrap().matches().len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
     #[test]
-    fn ctrl_e_removes_virtual_conversations_and_replaces_the_last_one() {
+    fn palette_archive_removes_virtual_conversations_and_replaces_the_last_one() {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
-        // Archiving lives in the conversation list, so focus it first.
-        app.focus = Focus::List;
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        let (dir, remote, tip) = repo_with_default_branch("ctrl-e", "main");
+        let (dir, remote, tip) = repo_with_default_branch("palette-archive", "main");
         app.repo_dir = dir.clone();
         app.selected = 1;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        archive_via_palette(&mut app);
         assert_eq!(
             app.conversations
                 .iter()
@@ -6792,10 +6855,10 @@ mod tests {
         );
         assert_eq!(app.selected().id, "talk-3");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        archive_via_palette(&mut app);
         assert_eq!(app.selected().id, "talk-1");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        archive_via_palette(&mut app);
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
@@ -6809,13 +6872,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_e_keeps_a_busy_conversation_open() {
+    fn palette_archive_keeps_a_busy_conversation_open() {
         let mut running = state("talk-1");
         running.running = true;
         let (mut app, _) = app_with(vec![running, state("talk-2")]);
-        app.focus = Focus::List;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        archive_via_palette(&mut app);
 
         assert_eq!(app.conversations.len(), 2);
         assert_eq!(app.selected().id, "talk-1");
@@ -6841,6 +6903,30 @@ mod tests {
         assert_eq!(app.selected().composer.cursor_row_col(), (1, 6));
         assert_eq!(app.conversations.len(), 2);
         assert_eq!(app.selected().composer.text, "first\nsecond");
+
+        // The retired list-focused archive binding stays gone.
+        app.focus = Focus::List;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.conversations.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_digits_jump_to_conversations_by_position() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().id, "talk-3");
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().id, "talk-1");
+
+        // A digit past the last conversation changes nothing.
+        app.handle_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().id, "talk-1");
+
+        // Without Ctrl, digits still type into the composer.
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.selected().id, "talk-1");
+        assert_eq!(app.selected().composer.text, "2");
     }
 
     #[test]
@@ -6873,6 +6959,22 @@ mod tests {
         app.selected_mut().composer.move_end();
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.selected().composer.text, "firstsecond");
+    }
+
+    #[test]
+    fn ctrl_d_deletes_the_character_to_the_right_in_the_conversation() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("abc");
+        app.selected_mut().composer.move_home();
+
+        // Ctrl+D deletes forward, like readline and Emacs delete-char.
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "bc");
+
+        // At the end of the text there is nothing to delete, so it is a no-op.
+        app.selected_mut().composer.move_end();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().composer.text, "bc");
     }
 
     #[test]

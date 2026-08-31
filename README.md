@@ -391,7 +391,10 @@ the object machinery through a one-way dependency. Their difference is the
     non-zero, for CI). Offline — no server (design/secrets.md).
 
 Conversations read their model credential from that local store rather than
-putting it in a curried worker. A minimal per-device setup is:
+putting it in a curried worker. The easiest setup is `caos tui`: when the store
+has no `anthropic-api-key`, it prompts for the key (pasted, or the path to a
+file holding it), then writes the entry below with fresh entropy and the
+ignore rule (rust/crates/caos-cli/TUI.md). The same setup by hand is:
 
 ```text
 # .gitignore
@@ -405,8 +408,10 @@ reader=DEEP-DEPS/llm-call
 ```
 
 Run `caos-cli secrets` once to add the random `entropy=` used for cache
-isolation. The file and value path stay local; only the entropy-derived identity
-enters an ArgTree, while the value is carried out of band for the run.
+isolation. The value file must hold the key verbatim — no trailing newline,
+since the value goes into the `x-api-key` header untouched. The file and value
+path stay local; only the entropy-derived identity enters an ArgTree, while the
+value is carried out of band for the run.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are

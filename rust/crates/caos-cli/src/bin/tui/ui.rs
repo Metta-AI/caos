@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     short_hash, ActivityState, App, Command, ConfirmAction, ConversationState, EntryRole, Focus,
-    ScrollState, TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
+    ScrollState, Shortcut, TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
 };
 use caos_cli::TurnPhase;
 
@@ -98,7 +98,7 @@ fn render_command_palette(app: &App, frame: &mut Frame<'_>) {
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{:<label_width$}", command.label)),
                     Span::styled(
-                        command.shortcut.label(),
+                        command.shortcut.map_or("", Shortcut::label),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]))
@@ -1403,14 +1403,16 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
+        Line::raw("  Ctrl+D          delete the character to the right"),
         Line::raw("  Esc             stop a running agent or dismiss the current layer"),
         Line::raw("  Ctrl+Up/Down    switch conversations"),
+        Line::raw("  Ctrl+1..9       jump to the Nth conversation"),
         Line::raw("  Ctrl+C          clear the prompt, then quit"),
     ];
     lines.extend(PALETTE_COMMANDS.iter().map(|command| {
         Line::raw(format!(
             "  {:<16}{}",
-            command.shortcut.label(),
+            command.shortcut.map_or("palette", Shortcut::label),
             command.label
         ))
     }));
@@ -1657,7 +1659,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         )
     } else if app.focus() == Focus::List {
         Line::raw(
-            " Conversations: Up/Dn select  Enter opens  ^N new  ^E archive  ^Up/Dn switch  ^C quit",
+            " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
         )
     } else if app.view == View::Activity {
         Line::raw(
