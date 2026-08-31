@@ -24,3 +24,9 @@ ratatui-widgets = { version = "0.3.2", default-features = false, features = ["st
 # Display-width measurement for laying out markdown tables in the transcript
 # (same crate ratatui measures cells with, so our column math matches the render).
 unicode-width = "0.2"
+
+# The TUI redirects fd 2 while it owns the terminal (dup/dup2), so a background
+# thread's stderr line cannot scroll the alternate screen out from under the
+# renderer's diff.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
