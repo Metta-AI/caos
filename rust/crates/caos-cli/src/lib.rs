@@ -10,7 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -2819,9 +2821,150 @@ fn warn_skipped_conversation(id: &str, error: &str) {
     eprintln!("warning: skipping malformed conversation {id:?}: {error}");
 }
 
+#[derive(Clone)]
 struct RemoteConversationMetadata {
     updated_unix: i64,
     parent: Option<String>,
+}
+
+/// Process-wide memo of [`remote_conversation_metadata`] answers, keyed by the
+/// head COMMIT hash. The key is content: a commit fixes its whole first-parent
+/// chain, so the metadata derived from that chain can never go stale, and an
+/// entry holds in any repo carrying the same commit — which is what lets one
+/// map serve every transport in the process (the tui's remote poll builds a
+/// fresh transport every tick).
+///
+/// Entries also persist, one line per head, in a sidecar file under the git
+/// dir ([`metadata_cache_file`]): the tui is a fresh process each launch, and
+/// without a durable boundary its first listing rewalks every conversation's
+/// whole history — O(events) commit reads per conversation, each one a server
+/// round trip when the commit is not yet local. With the sidecar, a walk stops
+/// at the previously listed head and reads only what landed since.
+struct ConversationMetadataCache {
+    entries: HashMap<String, RemoteConversationMetadata>,
+    /// Sidecar files already folded into `entries`, so each is read once per
+    /// process however many transports point at its repo.
+    loaded: HashSet<PathBuf>,
+}
+
+static CONVERSATION_METADATA: OnceLock<Mutex<ConversationMetadataCache>> = OnceLock::new();
+
+fn conversation_metadata_cache() -> std::sync::MutexGuard<'static, ConversationMetadataCache> {
+    CONVERSATION_METADATA
+        .get_or_init(|| {
+            Mutex::new(ConversationMetadataCache {
+                entries: HashMap::new(),
+                loaded: HashSet::new(),
+            })
+        })
+        .lock()
+        // A poisoned lock means another thread panicked; the map is still
+        // consistent, because nothing fallible runs while it is held.
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The sidecar this repo's entries persist to: one file per git dir, so linked
+/// worktrees each keep their own and a deleted checkout takes its cache with
+/// it.
+fn metadata_cache_file(t: &GitTransport) -> PathBuf {
+    t.git_dir().join("caos-conversation-metadata")
+}
+
+/// Rewrite bounds for the sidecar. Appends are one line (~75 bytes) per newly
+/// listed head, so growth tracks conversation events; once a load sees more
+/// than COMPACT_AT lines it rewrites the newest KEEP (later lines are more
+/// recent heads), keeping the file small for the life of a checkout.
+const METADATA_CACHE_COMPACT_AT: usize = 8192;
+const METADATA_CACHE_KEEP: usize = 2048;
+
+/// One sidecar line: `<head> <updated_unix>[ <parent>]`. The parent id is the
+/// line's tail on purpose: a conversation id can never contain a space
+/// (`ConversationId::parse` rejects every byte <= 0x20), and the other two
+/// fields are fixed-shape.
+fn metadata_cache_line(head: &str, metadata: &RemoteConversationMetadata) -> String {
+    match &metadata.parent {
+        Some(parent) => format!("{head} {} {parent}\n", metadata.updated_unix),
+        None => format!("{head} {}\n", metadata.updated_unix),
+    }
+}
+
+/// Parse one sidecar line, `None` for anything malformed (a torn append, a
+/// stray edit): a cache read must never fail a listing, and a skipped line
+/// only costs the rewalk it would have saved.
+fn parse_metadata_cache_line(line: &str) -> Option<(String, RemoteConversationMetadata)> {
+    let (head, rest) = line.split_once(' ')?;
+    validate_hash(head, "cached conversation head").ok()?;
+    let (updated, parent) = match rest.split_once(' ') {
+        Some((updated, parent)) => (updated, Some(parent)),
+        None => (rest, None),
+    };
+    let updated_unix = updated.parse::<i64>().ok()?;
+    let parent = match parent {
+        Some(parent) => {
+            conversation_ref(parent).ok()?;
+            Some(parent.to_string())
+        }
+        None => None,
+    };
+    Some((
+        head.to_string(),
+        RemoteConversationMetadata {
+            updated_unix,
+            parent,
+        },
+    ))
+}
+
+/// The cached metadata for `head`, folding this repo's sidecar into the memo
+/// first when this process has not read it yet.
+fn cached_conversation_metadata(
+    t: &GitTransport,
+    head: &str,
+) -> Option<RemoteConversationMetadata> {
+    let mut cache = conversation_metadata_cache();
+    let file = metadata_cache_file(t);
+    if cache.loaded.insert(file.clone()) {
+        let entries: Vec<_> = std::fs::read_to_string(&file)
+            .map(|text| text.lines().filter_map(parse_metadata_cache_line).collect())
+            .unwrap_or_default();
+        if entries.len() > METADATA_CACHE_COMPACT_AT {
+            let keep = &entries[entries.len() - METADATA_CACHE_KEEP..];
+            let text: String = keep
+                .iter()
+                .map(|(head, metadata)| metadata_cache_line(head, metadata))
+                .collect();
+            // Best-effort, temp-then-rename: a concurrent reader never sees a
+            // torn file, and a failure (a read-only checkout) costs nothing.
+            let tmp = file.with_extension("tmp");
+            let _ = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &file));
+        }
+        cache.entries.extend(entries);
+    }
+    cache.entries.get(head).cloned()
+}
+
+/// Record `head`'s metadata in the memo and append it to this repo's sidecar.
+/// The append is best-effort: a lost write (a read-only checkout, two
+/// processes racing a compaction) costs a rewalk, never a failed listing.
+fn store_conversation_metadata(
+    t: &GitTransport,
+    head: &str,
+    metadata: &RemoteConversationMetadata,
+) {
+    let mut cache = conversation_metadata_cache();
+    if cache
+        .entries
+        .insert(head.to_string(), metadata.clone())
+        .is_some()
+    {
+        // Already recorded — read from disk, or appended by this process.
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(metadata_cache_file(t))
+        .and_then(|mut file| file.write_all(metadata_cache_line(head, metadata).as_bytes()));
 }
 
 fn remote_commit_timestamp(t: &GitTransport, hash: &str) -> Result<i64, String> {
@@ -2833,13 +2976,16 @@ fn remote_conversation_metadata(
     hash: &str,
 ) -> Result<RemoteConversationMetadata, String> {
     validate_hash(hash, "conversation tip")?;
+    if let Some(cached) = cached_conversation_metadata(t, hash) {
+        return Ok(cached);
+    }
     let mut current = hash.to_string();
     let mut newest_activity_timestamp = None;
     // Worker events inherit their causal user's timestamp so recovery recreates
     // the same proposal. Follow raw commit objects (not their trees) to the
     // newest user event or locally-created fork marker, whose ordinary client
     // timestamp remains the useful measure of recent activity.
-    loop {
+    let metadata = loop {
         let (kind, content) = t.get_object(&current)?;
         if kind != "commit" {
             return Err(format!(
@@ -2889,13 +3035,28 @@ fn remote_conversation_metadata(
                     Some(parent.to_string())
                 }
             };
-            return Ok(RemoteConversationMetadata {
+            break RemoteConversationMetadata {
                 updated_unix,
                 parent,
-            });
+            };
+        }
+        // The chain below `parent` is content-addressed — it can never change
+        // — so a head already summarized ends the walk: the newest user
+        // activity is whichever comes first from this tip, and the durable
+        // parent lives on the root either way. This is what turns a listing
+        // from O(history) into O(new events): each poll summarizes only what
+        // landed since the head it last recorded (a fork stops at its source
+        // conversation's summarized spine the same way).
+        if let Some(cached) = cached_conversation_metadata(t, parent) {
+            break RemoteConversationMetadata {
+                updated_unix: newest_activity_timestamp.unwrap_or(cached.updated_unix),
+                parent: cached.parent,
+            };
         }
         current = parent.to_string();
-    }
+    };
+    store_conversation_metadata(t, hash, &metadata);
+    Ok(metadata)
 }
 
 fn first_parent_header(headers: &str) -> Option<&str> {
@@ -3896,6 +4057,151 @@ mod tests {
 
         let metadata = remote_conversation_metadata(&transport, &child).unwrap();
         assert_eq!(metadata.parent.as_deref(), Some("parent"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_cache_lines_round_trip_and_junk_is_skipped() {
+        let head = "a".repeat(40);
+        let with_parent = RemoteConversationMetadata {
+            updated_unix: 1_700_000_123,
+            parent: Some("proj/talk-1".to_string()),
+        };
+        let line = metadata_cache_line(&head, &with_parent);
+        let (parsed_head, parsed) = parse_metadata_cache_line(line.trim_end()).unwrap();
+        assert_eq!(parsed_head, head);
+        assert_eq!(parsed.updated_unix, 1_700_000_123);
+        assert_eq!(parsed.parent.as_deref(), Some("proj/talk-1"));
+
+        let rootless = RemoteConversationMetadata {
+            updated_unix: -7,
+            parent: None,
+        };
+        let line = metadata_cache_line(&head, &rootless);
+        let (_, parsed) = parse_metadata_cache_line(line.trim_end()).unwrap();
+        assert_eq!(parsed.updated_unix, -7);
+        assert_eq!(parsed.parent, None);
+
+        // A torn append, a hand edit, an invalid parent id: skipped, never an
+        // error — the cache must only ever cost the rewalk it failed to save.
+        for junk in [
+            "",
+            "not-a-hash 12",
+            &format!("{head} not-a-number"),
+            &format!("{head} 12 id with spaces"),
+            &format!("{head} 12 head"),
+            &head,
+        ] {
+            assert!(
+                parse_metadata_cache_line(junk).is_none(),
+                "accepted {junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advanced_heads_extend_cached_metadata_instead_of_rewalking_history() {
+        let (root, repo, transport, base) = conversation_index_fixture("metadata-cache");
+        let tree = test_git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let first = create_event_commit(
+            &transport,
+            &tree,
+            &base,
+            &json!({
+                "base": base,
+                "author": "user",
+                "username": "Alice",
+                "content": "hello",
+                "status": "idle",
+            }),
+        )
+        .unwrap();
+        let first_timestamp: i64 = test_git(&repo, &["show", "-s", "--format=%ct", &first])
+            .parse()
+            .unwrap();
+        let metadata = remote_conversation_metadata(&transport, &first).unwrap();
+        assert_eq!(metadata.updated_unix, first_timestamp);
+        assert_eq!(metadata.parent, None);
+
+        let second = create_event_commit(
+            &transport,
+            &tree,
+            &first,
+            &json!({
+                "author": "assistant",
+                "content": "hi",
+                "status": "idle",
+            }),
+        )
+        .unwrap();
+        // Delete the first event's loose object. `first` is summarized, so the
+        // walk from `second` must stop at that boundary without reading it — a
+        // rewalk would fail loudly trying to fetch it from the `caos` remote.
+        std::fs::remove_file(repo.join(format!(".git/objects/{}/{}", &first[..2], &first[2..])))
+            .unwrap();
+
+        let metadata = remote_conversation_metadata(&transport, &second).unwrap();
+        // Nothing user-authored above the boundary: the cached activity stands.
+        assert_eq!(metadata.updated_unix, first_timestamp);
+        assert_eq!(metadata.parent, None);
+
+        // Both heads are durable in the sidecar, so the NEXT process (the tui
+        // launches one per run) starts from these boundaries instead of the
+        // full history.
+        let sidecar =
+            std::fs::read_to_string(repo.join(".git").join("caos-conversation-metadata")).unwrap();
+        assert!(sidecar.contains(&first), "{sidecar}");
+        assert!(sidecar.contains(&second), "{sidecar}");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sidecar_entries_serve_a_fresh_repo_without_any_walk() {
+        let (root, repo, transport, _base) = conversation_index_fixture("metadata-sidecar");
+        // A head that exists nowhere as an object: only the sidecar can answer,
+        // exactly the position a fresh process is in before its first walk.
+        let head = format!("{:040x}", 0xfeed_d00d_u64);
+        std::fs::write(
+            repo.join(".git/caos-conversation-metadata"),
+            format!("{head} 1700000042 parent/talk\nnot a parseable line\n"),
+        )
+        .unwrap();
+
+        let metadata = remote_conversation_metadata(&transport, &head).unwrap();
+        assert_eq!(metadata.updated_unix, 1_700_000_042);
+        assert_eq!(metadata.parent.as_deref(), Some("parent/talk"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_sidecars_compact_to_the_newest_entries() {
+        let (root, repo, transport, _base) = conversation_index_fixture("metadata-compact");
+        let head_at = |index: usize| format!("{index:040x}");
+        let mut text = String::new();
+        for index in 0..METADATA_CACHE_COMPACT_AT + 8 {
+            text.push_str(&metadata_cache_line(
+                &head_at(index),
+                &RemoteConversationMetadata {
+                    updated_unix: index as i64,
+                    parent: None,
+                },
+            ));
+        }
+        let file = repo.join(".git/caos-conversation-metadata");
+        std::fs::write(&file, text).unwrap();
+
+        // Any lookup loads the sidecar; the newest entries still answer.
+        let newest = METADATA_CACHE_COMPACT_AT + 7;
+        let metadata = remote_conversation_metadata(&transport, &head_at(newest)).unwrap();
+        assert_eq!(metadata.updated_unix, newest as i64);
+
+        let rewritten = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(rewritten.lines().count(), METADATA_CACHE_KEEP);
+        assert!(rewritten.contains(&head_at(newest)));
+        assert!(!rewritten.contains(&head_at(0)));
 
         std::fs::remove_dir_all(root).unwrap();
     }

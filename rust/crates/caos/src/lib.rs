@@ -533,6 +533,13 @@ impl GitTransport {
         &self.work_dir
     }
 
+    /// The repository's git directory — where caos keeps per-checkout sidecar
+    /// state (client caches) alongside git's own files. A linked worktree gets
+    /// its private directory, so checkouts never share or clobber.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     /// Verify that the configured CAOS server accepts connections.
     ///
     /// The server deliberately returns 404 at its root, so any HTTP response
