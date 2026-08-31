@@ -13,7 +13,7 @@ Caos runs all of these pieces in separate containers, with just the permissions 
 
 ## Performance
 
-Today, when you or an agent make a change, you clone the repo or make a new worktree, then edit a file. You build and test everything. Unless you use bazel, it doesn't matter that the CI server has built and tested most of this already. You do it again, unless (maybe) you have a cache from a different worktree. When you push your code, the CI server checks it all out and builds and tests it all again. Or it copies a large cache file, that often isn't quite the right version, and still builds and tests more than you needed
+Today, when you or an agent makes a change, you clone the repo or make a new worktree, then edit a file. You build and test everything. Unless you use bazel, it doesn't matter that the CI server has built and tested most of this already. You do it again, unless (maybe) you have a cache from a different worktree. When you push your code, the CI server checks it all out and builds and tests it all again. Or it copies a large cache file, that often isn't quite the right version, and still builds and tests more than you needed
 
 Caos breaks building and testing into small pieces and caches the results. When you build and test, we never materialize the whole tree
 
