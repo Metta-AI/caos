@@ -431,10 +431,10 @@ fn std_tool_image(t: &GitTransport, entry: &str) -> Result<String, ToolError> {
     if let Some((_, image)) = cache.iter().find(|(name, _)| name == entry) {
         return Ok(image.clone());
     }
-    // Named by PATH, not `DEEP-DEPS/<name>`: this repo has no root `DEPS`, so
-    // `DEEP-DEPS` does not exist at its root. The walk still starts at the tree
-    // root, so the root expression deepens the tree before the descent reaches
-    // the entry and its own mounts.
+    // An ordinary tree path. `eval_path` walks it, evaluating any `.caos-expr`
+    // it meets and continuing inside the result — so the root expression deepens
+    // the tree before the descent reaches the entry, and the entry's own
+    // `DEEP-DEPS/` mounts exist by the time its expression names them.
     let image = eval_workspace_path(t, entry, &[]).map_err(Infra)?;
     cache.push((entry.to_string(), image.clone()));
     Ok(image)

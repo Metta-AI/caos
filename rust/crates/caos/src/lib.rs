@@ -32,9 +32,7 @@ use gix::objs::WriteTo;
 
 mod eval;
 mod watch;
-pub use eval::{
-    cli_eval_path, eval_workspace_dep, eval_workspace_dep_with_store, eval_workspace_path,
-};
+pub use eval::{cli_eval_path, eval_workspace_path};
 
 /// `run-tool <name | script> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool as a caos job over this repo's tree, exactly what an agent's tool

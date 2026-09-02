@@ -179,19 +179,23 @@ pub(crate) fn eval_path(
     caos_eval::eval_path(&host, start_tree, path)
 }
 
-/// Resolve a workspace entry point NAMED BY PATH: evaluate the tracked tree and
+/// Resolve one of the workspace's entry points: evaluate the tracked tree and
 /// descend to `path`.
 ///
-/// The sibling below reaches an entry through `DEEP-DEPS/<name>`, which is what
-/// a repo that DECLARED the dependency in a root `DEPS` gets. This tree has no
-/// root `DEPS` — `DEEP-DEPS` does not exist at its root at all — so a client
-/// here names a std entry by its path instead.
+/// This is how a client reaches a tool without an ambient library, and the
+/// descent is the whole mechanism: `eval_path` walks down `path`, and wherever
+/// it meets a `.caos-expr` it evaluates it and keeps walking inside the result.
+/// So the root expression runs first and deepens the tree, and by the time the
+/// walk reaches `std/<name>` that entry's own `DEEP-DEPS/` mounts exist — which
+/// is why naming the raw worktree directory works even though the expression
+/// there names dependencies that are nowhere on disk.
 ///
-/// That still evaluates, and evaluating is still not optional: the walk starts
-/// at the tree ROOT, so the root `.caos-expr` runs first and deepens the tree,
-/// and only then does the descent reach `std/<name>` — in the deepened tree,
-/// where its own `DEEP-DEPS/rustc` exists. Naming the raw worktree directory
-/// would not work, exactly as the sibling's doc says.
+/// `path` is an ordinary path in the tree and nothing more. This used to have a
+/// sibling that built `DEEP-DEPS/<name>` instead, which made a CLIENT depend on
+/// the callee having been deepened by a `DEPS` file in the ROOT — `DEEP-DEPS` is
+/// created by `std/deep-deps` for the directory that declared the deps, and is
+/// that directory's business, not a namespace for anyone else to address. When
+/// the root `DEPS` was removed, every conversation turn stopped resolving.
 pub fn eval_workspace_path(
     t: &dyn Transport,
     path: &str,
@@ -208,56 +212,6 @@ pub fn eval_workspace_path(
         ));
     }
     Ok(hash)
-}
-
-/// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
-/// tree and descend to `DEEP-DEPS/<name>`.
-///
-/// This is how a client reaches a tool without an ambient library. The workspace
-/// declares what it needs in a `DEPS` file (`./std/llm-step llm-step` here,
-/// `./flake-inputs/caos/std/llm-step llm-step` in a repo that mounted caos), the
-/// root `.caos-expr` expands that into `DEEP-DEPS/`, and this descends it — the
-/// same declaration, the same transform and the same mount names a worker sees.
-///
-/// Evaluating is not optional. A std entry's expression names its own
-/// dependencies by mount (`run --base:@=DEEP-DEPS/rustc …`), and those exist only in
-/// the DEEPENED tree — so resolving the raw `std/llm-step` directory out of the
-/// worktree cannot work, whatever the path is spelled.
-pub fn eval_workspace_dep(t: &dyn Transport, name: &str) -> Result<String, String> {
-    eval_workspace_dep_with_store(t, name, &[])
-}
-
-/// Resolve a workspace entry point while carrying the caller's secret store
-/// through expression evaluation. Conversation setup uses this form so a tool
-/// embedded by the llm-step expression keeps its secret-dependent identity in
-/// the enclosing turn request.
-pub fn eval_workspace_dep_with_store(
-    t: &dyn Transport,
-    name: &str,
-    store: &[ClientSecret],
-) -> Result<String, String> {
-    let (_, oid) = t
-        .ingest_path(".")?
-        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
-    eval_path(t, &oid.to_string(), &format!("DEEP-DEPS/{name}"), store)
-        .map(|(_kind, hash)| hash)
-        .map_err(|error| workspace_dep_error(name, &error))
-}
-
-fn workspace_dep_error(name: &str, error: &str) -> String {
-    let mut message = format!("resolving {name:?} from the workspace: {error}");
-    // A transport, worker, or expression failure does not imply a missing DEPS
-    // line. Offer the declaration hint only when the actual tree walk says its
-    // deep-deps mount is absent.
-    if error.starts_with("eval-path: ")
-        && error.contains(" not found in ")
-        && (error.contains("\"DEEP-DEPS\"") || error.contains(&format!("{name:?}")))
-    {
-        message.push_str(&format!(
-            "\n  declare it in ./DEPS, e.g. `./std/{name} {name}`"
-        ));
-    }
-    message
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
@@ -288,21 +242,4 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
     let (kind, hash) = eval_path(t, &start, path, &store)?;
     println!("{kind} {hash}");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::workspace_dep_error;
-
-    #[test]
-    fn workspace_dependency_hint_only_follows_a_missing_mount() {
-        let missing = workspace_dep_error(
-            "llm-step",
-            "eval-path: \"llm-step\" not found in 0123456789abcdef",
-        );
-        assert!(missing.contains("declare it in ./DEPS"), "{missing}");
-
-        let push = workspace_dep_error("llm-step", "git push failed: bad tree object");
-        assert!(!push.contains("declare it in ./DEPS"), "{push}");
-    }
 }

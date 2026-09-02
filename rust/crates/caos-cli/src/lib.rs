@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 
 use caos::{
     build_secret_store, compute_client_request_with_store, curry_client_object,
-    eval_workspace_dep_with_store, prepare_client_request_with_store,
-    run_client_request_with_store, ClientSecret, GitTransport, Transport, CAOS_REMOTE,
+    eval_workspace_path, prepare_client_request_with_store, run_client_request_with_store,
+    ClientSecret, GitTransport, Transport, CAOS_REMOTE,
 };
 #[cfg(test)]
 use conversation_protocol::MAX_CONVERSATION_ID_BYTES;
@@ -41,7 +41,12 @@ pub const MODEL_API_SECRET: &str = "anthropic-api-key";
 pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
 /// The readers granted the model credential: both conversation LLM workers
 /// (the turn engine, and the stateless title/auxiliary caller).
-pub const MODEL_API_SECRET_READERS: [&str; 2] = ["DEEP-DEPS/llm-step", "DEEP-DEPS/llm-call"];
+///
+/// Ordinary tree paths, resolved by eval-path like any other entry
+/// (`resolve_reader_image`). They used to be spelled `DEEP-DEPS/<name>`, which
+/// only ever resolved because a root `DEPS` happened to mount them there —
+/// `DEEP-DEPS` belongs to the directory whose `DEPS` created it, not to callers.
+pub const MODEL_API_SECRET_READERS: [&str; 2] = ["std/llm-step", "std/llm-call"];
 const AUTO_NAME_PREFIX: &str = "talk-";
 const MERGE_REF_CANDIDATES: &[&str] = &["main", "master", "origin/main", "origin/master"];
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -1106,7 +1111,7 @@ fn resolve_llm(
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
-    let llm_base = eval_workspace_dep_with_store(t, "llm-step", store)?;
+    let llm_base = eval_workspace_path(t, "std/llm-step", store)?;
     curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
 }
 
@@ -2229,7 +2234,7 @@ pub fn generate_conversation_title(
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = eval_workspace_dep_with_store(t, "llm-call", &store)?;
+    let llm_base = eval_workspace_path(t, "std/llm-call", &store)?;
     let llm = curry_client_object(t, &llm_base, &kvs)?.to_string();
     let messages = serde_json::to_string(&title_messages(first_message))
         .map_err(|error| format!("encoding title context: {error}"))?;
