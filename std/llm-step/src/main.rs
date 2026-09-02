@@ -2330,6 +2330,13 @@ fn bash_tool() -> Value {
 /// The tool_result block for the bash result tree at `--result`: exit code,
 /// stdout/stderr, the denied-paths retry hint when present — and `is_error`
 /// on a non-zero exit, so the model treats it as a failure to react to.
+/// The bash tool's result block.
+///
+/// The TEXT comes from the tool's own `report` blob rather than being composed
+/// here from `exit`/`stdout`/`stderr`/`denied`. Those parts are still read, but
+/// only for what they are: `exit` decides `is_error`, and `tree` (read by the
+/// caller) advances the workspace. Rendering that lived in the caller is how
+/// `grep` ended up with two implementations of one contract; bash keeps one.
 fn tool_result_block(current_id: &str) -> Result<Value, String> {
     caos(["get", &arg("result")])?;
     let leaf = |name: &str| -> Result<String, String> {
@@ -2339,25 +2346,11 @@ fn tool_result_block(current_id: &str) -> Result<Value, String> {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     };
     let exit = leaf("exit")?.trim().to_string();
-    let stdout = leaf("stdout")?;
-    let stderr = leaf("stderr")?;
-    let denied = if Path::new(&format!("{}/denied", arg("result"))).exists() {
-        Some(leaf("denied")?)
-    } else {
-        None
-    };
-
-    let mut text = format!("exit: {exit}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    if let Some(denied) = &denied {
-        text += &format!(
-            "\nunmaterialized paths touched: {}; retry with them in `paths`.",
-            denied.split_whitespace().collect::<Vec<_>>().join(", ")
-        );
-    }
+    let text = leaf("report")?;
     let mut block = json!({
         "type": "tool_result",
         "tool_use_id": current_id,
-        "content": [{"type": "text", "text": text}],
+        "content": [{"type": "text", "text": text.trim_end()}],
     });
     if exit != "0" {
         block["is_error"] = Value::Bool(true);

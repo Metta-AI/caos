@@ -24,6 +24,7 @@ place the tool server registers four tools over the conversation's workspace:
 | `read` | `file_path`, optional `offset`/`limit` (line-based) |
 | `ls` | optional `path` |
 | `grep` | `pattern`, optional `path` |
+| `bash` | `cmd`, optional `paths` |
 | `write` | `file_path`, `content` |
 | `edit` | `file_path`, `old_string`, `new_string`, optional `replace_all` |
 
@@ -45,7 +46,21 @@ knowing at the prompt:
   Scoping with `path` is what makes it cheap, which is why the tool description
   says so.
 
-Its output is `path:linenum:line`. Past a budget the rendering stops reading
+`bash` runs a command through `std/bash-tool` — the same sandbox the tui uses,
+where only the workspace paths listed in `paths` are materialized and touching
+any other existing path fails with EACCES and a retry hint naming it. It is the
+one tool here whose result advances the workspace: the command's output tree
+becomes the conversation's new one. A non-zero exit is a value, not a failure —
+the model reads stderr and reacts — and the workspace still advances, since the
+command may have written files before it failed.
+
+The `{tree, cmd, paths}` input is built byte for byte the way `llm-step` builds
+it, which matters because the ArgTree is the cache key: the same command run
+from the tui and from Claude Code is ONE cached job. Passing `bash-tool`'s
+direct `--cmd`/`--tree` arguments instead would work and would silently fork
+the cache.
+
+`grep`'s output is `path:linenum:line`. Past a budget the rendering stops reading
 contents but keeps counting, closing with `[truncated — N more matching
 file(s)]`, so a too-broad pattern says so instead of silently returning a
 prefix. That rendering lives in the tool, once: `llm-step`, this server, and
@@ -128,8 +143,8 @@ nowhere else.
 | Hook | Event |
 |---|---|
 | `UserPromptSubmit` | `{author: "user", username, content}` |
-| tool call (by the tool itself) | `{author: "assistant", content: "", calls: [...], result: {...}}` |
 | `Stop` | `{author: "assistant", content}` |
+| tool call | `{request, round, author: "assistant", content: "", calls: [...]}` then `{request, round, result: {...}}` |
 | `StopFailure` | `{status: "failed", error}` |
 
 A session's first prompt creates the conversation, taking its `base` from the
@@ -142,12 +157,29 @@ The conversation id is derived from the session id rather than stored in a map,
 so the ref is the whole record. `claude --resume` keeps its session id, so a
 resumed session extends the same conversation.
 
-A tool call is recorded as **one commit carrying both the call and its result**.
-The protocol keys tool activity on `(request, round, tool_use_id)` and falls
-back to `(commit, 0)` when those are absent (`durable_tool_scope`), so sharing a
-commit is what pairs a call with its result. It also keeps `request` off the
-event, which matters: `waterfall_string` would otherwise hoist it into the
-conversation-level projection for a request no worker will ever run.
+A tool call is recorded as **two events, the call before the tool runs and the
+result after** — the protocol's first invariant ("record an action before
+launching it and a result before consuming it") and exactly what `llm-step`
+does. So a long tool is visible in the tui while it runs rather than appearing
+only once it finishes, and a session that dies mid-call leaves a record that it
+was attempted. The call event is tree-neutral; the result event carries the
+workspace the tool produced.
+
+Both carry the same `(request, round)`, which is how the fold pairs them
+(`durable_tool_scope`). `request` is the turn, derived by hashing Claude Code's
+`prompt_id` into a git blob so it is a canonical object id like `llm-step`'s
+`run`. Claude Code does not expose the model's round number and does not need
+to: a `tool_use_id` is unique for the whole session, so one round per turn pairs
+exactly as `llm-step`'s calls do within a round, which is the only place the
+number does any work. Nothing dispatches that request, because nothing here ever
+writes `queued` or `running`.
+
+**Tool execution is serial**, matching `llm-step`'s single queue. The tool server
+reads and handles one JSON-RPC request at a time, so a batch of parallel calls
+from the model executes one after another, each starting from the head the
+previous one left. The compare-and-swap retries are therefore not a concurrency
+model — they protect against another writer, such as an interjection typed into
+the tui against the same conversation.
 
 Nothing here writes lifecycle state. The protocol's `queued`/`running` admission
 exists so a worker can claim a request, and nothing recorded this way is ever
@@ -155,19 +187,6 @@ claimed — Claude Code already ran the turn. `fold_events` defaults an
 unspecified status to `idle`, so omitting admission is both honest and what
 keeps `caos talk` and the TUI's `reconcile_active_requests` from trying to
 resume a request that was never dispatched.
-
-## Concurrent tool calls
-
-Claude Code issues independent tool calls in parallel, so two mutations
-routinely start from the same conversation head. Each tool runs its whole
-read-modify-write *inside* the compare-and-swap retry loop: a call that loses
-the CAS does not merge a stale result, it re-reads the new tree and applies
-itself again.
-
-For `edit` that is stronger than a three-way merge, because `old_string` is
-re-matched against the content that actually won. For `write` it is
-last-writer-wins on that one path, while every other path in the winner's tree
-is preserved. Eight concurrent edits to the same file all land.
 
 ## Not yet done
 
@@ -177,6 +196,6 @@ is preserved. Eight concurrent edits to the same file all land.
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
   events have no `model` field and the TUI shows a blank where it would name
   one.
-- **`bash` and project tools.** `grep` proved the dispatch path; `bash` and
-  everything under `caos-tools/` still run only inside `llm-step`. Until they
-  land the model cannot build, test, or run anything.
+- **Project tools.** `caos-tools/<name>` entries are not offered yet; they are
+  discovered from the workspace rather than resolved from a fixed path, which is
+  the one piece `run_tool` does not do.

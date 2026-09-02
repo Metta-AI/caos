@@ -13,7 +13,7 @@
 //! a conversation is: that belongs to the caller, which is what lets the whole
 //! read-modify-write run again unchanged when a concurrent writer wins the CAS.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -83,6 +83,7 @@ pub fn execute(
         "write" => write(t, tree, args),
         "edit" => edit(t, tree, args),
         "grep" => grep(t, tree, args),
+        "bash" => bash(t, tree, args),
         other => Err(User(format!("unknown tool {other:?}"))),
     }
 }
@@ -224,24 +225,197 @@ fn grep(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
     run_std_tool(t, tree, "std/rgrep-tool", &kvs).map(Outcome::read)
 }
 
-/// Run a std tool over `tree` and return its report.
+/// Run a shell command through `std/bash-tool`.
 ///
-/// The tool's own image carries what it needs (rgrep-tool binds the fold it
-/// drives), so a caller supplies only the workspace and the model's arguments.
+/// Unlike every other tool here this one MUTATES: its result carries the
+/// workspace the command left behind, under `tree`, and that becomes the
+/// conversation's new workspace. `exit` decides whether the model sees an
+/// error. Both are data the caller consumes; the text it shows comes from the
+/// tool's own `report`, so bash reads identically here and in `llm-step`.
+fn bash(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+    let cmd = string_arg(args, "cmd")?;
+    let paths = match args.get("paths") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| match entry.as_str() {
+                Some(path) => Ok(path.to_string()),
+                None => Err(User("every entry in `paths` must be a string".to_string())),
+            })
+            .collect::<Result<Vec<_>, ToolError>>()?
+            .join("\n"),
+        Some(Value::String(single)) => single.clone(),
+        Some(_) => return Err(User("`paths` must be an array of strings".to_string())),
+    };
+
+    let input = bash_input(t, tree, cmd, &paths)?;
+    let result = run_tool(t, &input, "std/bash-tool", &[])?;
+    let workspace = result
+        .entry("tree")
+        .ok_or_else(|| Infra("bash result carries no `tree` entry".to_string()))?;
+    let exit = result.leaf("exit").unwrap_or_default();
+    let text = result.report()?;
+    match exit.trim() {
+        "0" => Ok(Outcome::wrote(text, workspace)),
+        // A non-zero exit is a value, not a failure: the model must read stderr
+        // and react. The workspace still advances — the command may have written
+        // files before it failed, exactly as `llm-step` treats it.
+        _ => Err(User(text)),
+    }
+}
+
+/// Build the `{tree, cmd, paths}` input `std/bash-tool` expects.
+///
+/// This is the shape `llm-step` builds, byte for byte, and that is the point:
+/// the ArgTree is the cache key, so a command run from the tui and the same
+/// command run from Claude Code are ONE cached job rather than two. Passing
+/// bash-tool's direct `--cmd`/`--tree` arguments instead would work and would
+/// silently fork the cache.
+///
+/// `paths` is always written, empty included, for the same reason — an absent
+/// entry and an empty one are different trees.
+fn bash_input(t: &GitTransport, tree: &str, cmd: &str, paths: &str) -> Result<String, ToolError> {
+    let index = scratch_path(t, "bash-index")?;
+    let _ = std::fs::remove_file(&index);
+    // `read-tree --prefix` mounts the workspace under `tree/` without reading a
+    // single blob: the entries are copied by oid.
+    t.git_capture(&["read-tree", "--prefix=tree/", tree], Some(&index))
+        .map_err(ToolError::infra)?;
+    for (name, content) in [("cmd", cmd), ("paths", paths)] {
+        let blob = t
+            .put_object("blob", content.as_bytes())
+            .map_err(ToolError::infra)?
+            .to_string();
+        let cacheinfo = format!("{REGULAR_FILE},{blob},{name}");
+        t.git_capture(
+            &["update-index", "--add", "--cacheinfo", &cacheinfo],
+            Some(&index),
+        )
+        .map_err(ToolError::infra)?;
+    }
+    let input = t
+        .git_capture(&["write-tree"], Some(&index))
+        .map_err(ToolError::infra)?
+        .trim()
+        .to_string();
+    let _ = std::fs::remove_file(&index);
+    Ok(input)
+}
+
+/// Run a std tool over `tree` and return its report.
 fn run_std_tool(
     t: &GitTransport,
-    tree: &str,
+    input: &str,
     entry: &str,
     kvs: &[String],
 ) -> Result<String, ToolError> {
+    run_tool(t, input, entry, kvs)?.report()
+}
+
+/// A finished tool result, checked out so its parts can be read.
+///
+/// Checking out is what makes the result readable at all: it lives on the
+/// server, and `cli_get` is the host form of fetching it. NOT
+/// `fetch_and_materialize` — that is the worker's CAS form and writes
+/// hash-tagged placeholders for a later `caos get` to fill, so on the host every
+/// file arrives zero-length and a correct result reads as an empty one.
+struct ToolResult {
+    dir: PathBuf,
+    /// Entry name to object id, for the parts that are OBJECTS rather than text
+    /// — `bash`'s `tree` is a workspace, not something to read.
+    entries: Vec<(String, String)>,
+    kind: String,
+}
+
+impl Drop for ToolResult {
+    fn drop(&mut self) {
+        // Only the checkout is temporary; the objects it fetched stay in the
+        // repo, which is what makes a repeated call cheap.
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.dir);
+    }
+}
+
+impl ToolResult {
+    fn entry(&self, name: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, oid)| oid.clone())
+    }
+
+    fn leaf(&self, name: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.join(name)).ok()
+    }
+
+    /// The text a model reads, by the convention every caos caller follows: a
+    /// tree carrying a `report` blob IS that report, a tree without one is named
+    /// by its entries, and a blob result is its own text. `llm-step`'s
+    /// `tree_tool_result_block` and `run-tool`'s `report_conventions` apply the
+    /// same three rules.
+    fn report(&self) -> Result<String, ToolError> {
+        if self.kind != "tree" && !self.dir.is_dir() {
+            return std::fs::read_to_string(&self.dir)
+                .map(|text| text.trim_end().to_string())
+                .map_err(|error| Infra(format!("reading tool result: {error}")));
+        }
+        if let Some(report) = self.leaf("report") {
+            let text = report.trim_end().to_string();
+            // The one signal a tool has to say the CALL was wrong, as opposed to
+            // the work failing: `tree_tool_result_block` marks it is_error too.
+            return match text.contains("FAILED") {
+                true => Err(User(text)),
+                false => Ok(text),
+            };
+        }
+        let mut names: Vec<&str> = self.entries.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort();
+        Ok(format!("result tree: {}", names.join(" ")))
+    }
+}
+
+/// Run `entry` with `input` as its `--in`.
+///
+/// For most tools `input` IS the workspace tree, which is what
+/// `launch_std_tool` hands a std tool. `bash-tool` wants a `{tree, cmd, paths}`
+/// bundle instead, and reads `--in` in preference to its direct arguments — so
+/// the caller decides what `in` means, and this stays the one dispatch path.
+fn run_tool(
+    t: &GitTransport,
+    input: &str,
+    entry: &str,
+    kvs: &[String],
+) -> Result<ToolResult, ToolError> {
     let image = std_tool_image(t, entry)?;
     let curried = caos::curry_client_object(t, &image, kvs)
         .map_err(ToolError::infra)?
         .to_string();
     let (kind, result) =
-        run_client_request_with_store(t, &curried, &[format!("--in:hash={tree}")], &[])
+        run_client_request_with_store(t, &curried, &[format!("--in:hash={input}")], &[])
             .map_err(ToolError::infra)?;
-    read_report(t, &result, &kind)
+    let dir = scratch_path(t, "tool")?;
+    let path = dir
+        .to_str()
+        .ok_or_else(|| Infra(format!("scratch path is not UTF-8: {}", dir.display())))?;
+    cli_get(t, &result, path).map_err(ToolError::infra)?;
+    // `ls-tree` only sees local objects, and the checkout above is what brought
+    // them down — reading the entries before it would fail on a result that is
+    // perfectly fine.
+    let mut entries = Vec::new();
+    if kind == "tree" {
+        let listing = t
+            .git_capture(
+                &["ls-tree", "--format=%(objectname) %(path)", &result],
+                None,
+            )
+            .map_err(ToolError::infra)?;
+        for line in listing.lines() {
+            if let Some((oid, name)) = line.split_once(' ') {
+                entries.push((name.to_string(), oid.to_string()));
+            }
+        }
+    }
+    Ok(ToolResult { dir, entries, kind })
 }
 
 /// A std tool's image, resolved once per server process per entry.
@@ -264,54 +438,6 @@ fn std_tool_image(t: &GitTransport, entry: &str) -> Result<String, ToolError> {
     let image = eval_workspace_path(t, entry, &[]).map_err(Infra)?;
     cache.push((entry.to_string(), image.clone()));
     Ok(image)
-}
-
-/// Render a tool result the way every caos caller does: a tree carrying a
-/// `report` blob IS that report, a tree without one is named by its entries, and
-/// a blob result is its own text. `llm-step`'s `tree_tool_result_block` and
-/// `run-tool`'s `report_conventions` apply the same three rules, and a report
-/// containing `FAILED` is the tool telling the model it got the call wrong.
-///
-/// `cli_get` is what fetches it, NOT `fetch_and_materialize`: the latter is the
-/// worker's CAS form and writes hash-tagged placeholders for a later `caos get`
-/// to fill, so on the host every file arrives zero-length and a correct result
-/// reads as an empty one.
-fn read_report(t: &GitTransport, result: &str, kind: &str) -> Result<String, ToolError> {
-    let target = scratch_path(t, "tool")?;
-    let path = target
-        .to_str()
-        .ok_or_else(|| Infra(format!("scratch path is not UTF-8: {}", target.display())))?;
-    cli_get(t, result, path).map_err(ToolError::infra)?;
-    let text = report_text(&target, kind);
-    // Only the checkout is temporary; the objects it fetched stay in the repo.
-    let _ = std::fs::remove_dir_all(&target);
-    let _ = std::fs::remove_file(&target);
-    let text = text?;
-    match text.contains("FAILED") {
-        true => Err(User(text)),
-        false => Ok(text),
-    }
-}
-
-fn report_text(target: &Path, kind: &str) -> Result<String, ToolError> {
-    if kind != "tree" && !target.is_dir() {
-        return std::fs::read_to_string(target)
-            .map(|text| text.trim_end().to_string())
-            .map_err(|error| Infra(format!("reading tool result: {error}")));
-    }
-    let report = target.join("report");
-    if report.is_file() {
-        return std::fs::read_to_string(&report)
-            .map(|text| text.trim_end().to_string())
-            .map_err(|error| Infra(format!("reading tool report: {error}")));
-    }
-    let mut names: Vec<String> = std::fs::read_dir(target)
-        .map_err(|error| Infra(format!("reading tool result: {error}")))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .collect();
-    names.sort();
-    Ok(format!("result tree: {}", names.join(" ")))
 }
 
 // ---------------------------------------------------------------------------

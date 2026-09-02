@@ -28,7 +28,7 @@ use std::io::Read;
 
 use serde_json::{json, Value};
 
-use caos::GitTransport;
+use caos::{GitTransport, Transport};
 use conversation_protocol::ConversationId;
 
 use crate::{
@@ -64,16 +64,21 @@ fn usage() -> String {
         .to_string()
 }
 
-/// Run one workspace tool for `session` and record it as a conversation event.
+/// Run one workspace tool and record it the way `llm-step` records one.
 ///
-/// The whole read-modify-write runs INSIDE the compare-and-swap loop, which is
-/// what makes concurrent tool calls safe without any merge machinery. Claude
-/// Code issues tool calls in parallel, so two mutations routinely start from
-/// the same head; the loser does not merge a stale result, it re-reads the new
-/// tree and applies itself again. For `edit` that is strictly better than a
-/// merge — `old_string` is re-matched against the content that actually won —
-/// and for `write` it is last-writer-wins on that one path while every other
-/// path in the winner's tree is preserved.
+/// TWO events, not one: the call before the tool runs, the result after. That
+/// is the protocol's first invariant ("record an action before launching it and
+/// a result before consuming it", design/chat.md) and what `llm-step` does — so
+/// a long tool is visible in the tui while it runs instead of appearing only
+/// once it finishes, and a session that dies mid-call leaves a record that it
+/// was attempted.
+///
+/// Execution is serial, also matching `llm-step`'s single queue: the tool server
+/// reads and handles one JSON-RPC request at a time, so a batch of parallel
+/// calls from the model executes one after another, each starting from the head
+/// the previous one left. The compare-and-swap retries below are therefore not a
+/// concurrency model — they are protection against ANOTHER writer, such as an
+/// interjection typed into the tui against the same conversation.
 fn run_tool(
     t: &GitTransport,
     session: &str,
@@ -86,8 +91,122 @@ fn run_tool(
         .get("caos_tool_use_id")
         .and_then(Value::as_str)
         .unwrap_or(name);
+    let request = turn_request(t, session, args)?;
+    let declared = declared_args(args);
+
+    append_tool_event(
+        t,
+        &refname,
+        &id,
+        None,
+        json!({
+            "request": request,
+            "round": ROUND,
+            "author": "assistant",
+            "content": "",
+            "calls": [{ "id": tool_use_id, "name": name, "args": declared }],
+        }),
+    )?;
+
+    let mut outcome = None;
+    let tree = append_tool_event(
+        t,
+        &refname,
+        &id,
+        Some(&mut |workspace: &str| {
+            let run = match tools::execute(t, workspace, name, args) {
+                Ok(produced) => Ok(produced),
+                Err(ToolError::User(message)) => Err(message),
+                Err(ToolError::Infra(error)) => return Err(ToolError::Infra(error)),
+            };
+            let (text, tree) = match &run {
+                Ok(produced) => (
+                    produced.text.clone(),
+                    produced
+                        .tree
+                        .clone()
+                        .unwrap_or_else(|| workspace.to_string()),
+                ),
+                Err(message) => (message.clone(), workspace.to_string()),
+            };
+            let is_error = run.is_err();
+            outcome = Some(run.map(|_| text.clone()).map_err(ToolError::User));
+            Ok((
+                tree,
+                json!({
+                    "request": request,
+                    "round": ROUND,
+                    "result": {
+                        "tool_use_id": tool_use_id,
+                        "content": [{ "type": "text", "text": text }],
+                        "is_error": is_error,
+                    },
+                }),
+            ))
+        }),
+        Value::Null,
+    )?;
+    let _ = tree;
+    outcome.ok_or_else(|| ToolError::Infra("the tool produced no outcome".to_string()))?
+}
+
+/// Claude Code does not expose the model's round number, and it does not need
+/// to: the fold keys tool activity on `(request, round, tool_use_id)`, a
+/// `tool_use_id` is unique for the whole session, and a call and its result
+/// share all three. So one round per turn pairs exactly as `llm-step`'s calls do
+/// WITHIN a round, which is the only place the number does any work.
+const ROUND: u64 = 0;
+
+/// A stable 40-hex request id for the turn this call belongs to.
+///
+/// The protocol requires `request` to be a canonical object id and the fold
+/// validates it, so this hashes the prompt id into a git blob — deterministic,
+/// dependency-free, and the resulting object actually resolves. It names a turn,
+/// exactly as `llm-step`'s `run` does; nothing dispatches it, because nothing
+/// here ever writes `queued` or `running`.
+fn turn_request(t: &GitTransport, session: &str, args: &Value) -> Result<String, ToolError> {
+    let seed = match args.get("caos_prompt_id").and_then(Value::as_str) {
+        Some(prompt) => format!("{session}\0{prompt}"),
+        // No prompt id means the PreToolUse hook is older than this field.
+        // Falling back to the session keeps every call in one turn-shaped scope
+        // rather than failing a tool over a presentation detail.
+        None => session.to_string(),
+    };
+    t.put_object("blob", seed.as_bytes())
+        .map(|oid| oid.to_string())
+        .map_err(ToolError::Infra)
+}
+
+/// The model's own arguments, without the values the hook injected: those are
+/// plumbing, and showing them in the transcript would misrepresent the call the
+/// model actually made.
+fn declared_args(args: &Value) -> Value {
+    let mut declared = args.clone();
+    if let Some(object) = declared.as_object_mut() {
+        object.remove("caos_session");
+        object.remove("caos_tool_use_id");
+        object.remove("caos_prompt_id");
+    }
+    declared
+}
+
+/// Append one tool event at the conversation head, retrying the protocol's
+/// compare-and-swap when another writer wins.
+///
+/// With `produce`, the event and its workspace tree are computed INSIDE the
+/// loop, so a retry re-reads the new tree and applies the tool to it rather than
+/// committing a result derived from a tree that no longer exists. Without one,
+/// the event is tree-neutral and simply moves to the new head.
+#[allow(clippy::type_complexity)]
+fn append_tool_event(
+    t: &GitTransport,
+    refname: &str,
+    id: &str,
+    mut produce: Option<&mut dyn FnMut(&str) -> Result<(String, Value), ToolError>>,
+    event: Value,
+) -> Result<String, ToolError> {
     for _ in 0..MAX_APPEND_ATTEMPTS {
-        let head = remote_ref(t, &refname)
+        let head = remote_ref(t, refname)
             .map_err(ToolError::Infra)?
             .ok_or_else(|| {
                 ToolError::Infra(format!(
@@ -95,73 +214,25 @@ fn run_tool(
                      the UserPromptSubmit hook records a session's first event"
                 ))
             })?;
-        fetch_conversation_commit(t, &refname, &head).map_err(ToolError::Infra)?;
+        fetch_conversation_commit(t, refname, &head).map_err(ToolError::Infra)?;
         let workspace = t
             .git_capture(&["rev-parse", &format!("{head}^{{tree}}")], None)
             .map_err(ToolError::Infra)?
             .trim()
             .to_string();
-
-        // A tool that fails is still a durable event: the transcript should
-        // show the model being told its `old_string` did not match. Only an
-        // infrastructure failure aborts without recording anything.
-        let outcome = match tools::execute(t, &workspace, name, args) {
-            Ok(outcome) => Ok(outcome),
-            Err(ToolError::User(message)) => Err(message),
-            Err(ToolError::Infra(error)) => return Err(ToolError::Infra(error)),
+        let (tree, event) = match produce.as_mut() {
+            Some(produce) => produce(&workspace)?,
+            None => (workspace, event.clone()),
         };
-        let (text, tree) = match &outcome {
-            Ok(outcome) => (
-                outcome.text.clone(),
-                outcome.tree.clone().unwrap_or_else(|| workspace.clone()),
-            ),
-            Err(message) => (message.clone(), workspace.clone()),
-        };
-
-        let commit = create_event_commit(
-            t,
-            &tree,
-            &head,
-            &tool_event(tool_use_id, name, args, &text, outcome.is_err()),
-        )
-        .map_err(ToolError::Infra)?;
-        if push_head_cas(t, &refname, Some(&head), &commit).map_err(ToolError::Infra)? {
-            let _ = update_local_cache(t, &refname, &commit);
-            return match outcome {
-                Ok(_) => Ok(text),
-                Err(message) => Err(ToolError::User(message)),
-            };
+        let commit = create_event_commit(t, &tree, &head, &event).map_err(ToolError::Infra)?;
+        if push_head_cas(t, refname, Some(&head), &commit).map_err(ToolError::Infra)? {
+            let _ = update_local_cache(t, refname, &commit);
+            return Ok(tree);
         }
     }
     Err(ToolError::Infra(format!(
         "conversation {id:?} head moved during all {MAX_APPEND_ATTEMPTS} attempts"
     )))
-}
-
-/// One commit carrying both the call and its result.
-///
-/// The protocol keys tool activity on `(request, round, tool_use_id)` and, when
-/// those are absent, `durable_tool_scope` falls back to `(commit, 0)`. Putting
-/// the call and result in the SAME commit is what makes that fallback pair them
-/// — and it keeps `request` off the event entirely, which matters because
-/// `waterfall_string` would otherwise hoist any `request` field into the
-/// conversation-level projection for a request that no worker will ever run.
-fn tool_event(tool_use_id: &str, name: &str, args: &Value, text: &str, is_error: bool) -> Value {
-    let mut declared = args.clone();
-    if let Some(object) = declared.as_object_mut() {
-        object.remove("caos_session");
-        object.remove("caos_tool_use_id");
-    }
-    json!({
-        "author": "assistant",
-        "content": "",
-        "calls": [{ "id": tool_use_id, "name": name, "args": declared }],
-        "result": {
-            "tool_use_id": tool_use_id,
-            "content": [{ "type": "text", "text": text }],
-            "is_error": is_error,
-        },
-    })
 }
 
 /// Dispatch one hook payload. An event we do not record is not an error: Claude
@@ -239,6 +310,11 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     object.insert("caos_session".to_string(), json!(session));
     if let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) {
         object.insert("caos_tool_use_id".to_string(), json!(id));
+    }
+    // The turn this call belongs to, which becomes the event's `request` — the
+    // same job `llm-step`'s `run` does for a turn it drives itself.
+    if let Some(prompt) = payload.get("prompt_id").and_then(Value::as_str) {
+        object.insert("caos_prompt_id".to_string(), json!(prompt));
     }
     let response = json!({
         "hookSpecificOutput": {

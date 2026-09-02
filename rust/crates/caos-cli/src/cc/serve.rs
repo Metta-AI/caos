@@ -186,6 +186,31 @@ fn declarations() -> Vec<Value> {
             &["pattern"],
         ),
         declaration(
+            "bash",
+            "Run a shell command in the workspace (executed with `sh -c` from the \
+             workspace root). Use this for COMMANDS (builds, tests, scripts); for \
+             plain file access prefer read/ls/grep/write/edit, which are \
+             immediate. The workspace is materialized lazily: ONLY the files and \
+             directories you list in `paths` are readable — a command touching \
+             any other existing path fails with 'Permission denied' (EACCES), \
+             and the result names the unmaterialized paths it touched. When that \
+             happens, retry the same command with those paths added to `paths`. \
+             Creating new files or directories needs no declaration. The result \
+             reports the exit code, stdout and stderr (tails), and the workspace \
+             carries all changes forward. A non-zero exit is reported back to \
+             you, not an error — read stderr and react.",
+            json!({
+                "cmd": { "type": "string", "description": "The shell command to run." },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Workspace-relative paths the command reads or modifies; \
+                     only these are materialized into the sandbox.",
+                },
+            }),
+            &["cmd"],
+        ),
+        declaration(
             "write",
             "Write a file into the conversation workspace, creating parent \
              directories and overwriting any existing file. An existing file \
@@ -217,10 +242,12 @@ fn declarations() -> Vec<Value> {
 
 fn declaration(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     let mut properties = properties;
-    properties[SESSION_ARG] = json!({
-        "type": "string",
-        "description": "Supplied automatically by the caos PreToolUse hook; do not set it.",
-    });
+    for injected in [SESSION_ARG, "caos_tool_use_id", "caos_prompt_id"] {
+        properties[injected] = json!({
+            "type": "string",
+            "description": "Supplied automatically by the caos PreToolUse hook; do not set it.",
+        });
+    }
     json!({
         "name": name,
         "description": description,
@@ -296,6 +323,6 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["read", "ls", "grep", "write", "edit"]);
+        assert_eq!(names, ["read", "ls", "grep", "bash", "write", "edit"]);
     }
 }
