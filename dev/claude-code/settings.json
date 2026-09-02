@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "deny": [
+      "Read",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Bash",
+      "Glob",
+      "Grep"
+    ],
+    "allow": [
+      "mcp__caos"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__caos__.*",
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+        ]
+      }
+    ]
+  }
+}

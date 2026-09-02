@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Launch Claude Code against a caos workspace (see rust/crates/caos-cli/CC.md).
+#
+# Everything this sets up could be passed by hand -- `claude --settings
+# dev/claude-code/settings.json --mcp-config dev/claude-code/mcp.json
+# --strict-mcp-config` -- except one thing, which is why this script exists.
+#
+# `${CLAUDE_PROJECT_DIR}` expands in a HOOK command but NOT in mcp.json.
+# Claude Code sets that variable in the environment of a spawned stdio server;
+# it is not in Claude Code's OWN environment, which is what mcp.json expansion
+# reads. An unset variable there is not an error either: Claude Code warns, uses
+# the literal `${CLAUDE_PROJECT_DIR}` as the command, and still "loads" the
+# server -- so the failure surfaces only as a model that quietly has no caos
+# tools and cheerfully pretends it used them. So mcp.json reads `${CAOS_BIN}`
+# and this script exports it.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+
+CAOS_BIN="${CAOS_BIN:-$repo/result/bin/caos}"
+if [ ! -x "$CAOS_BIN" ]; then
+    echo "no caos binary at $CAOS_BIN -- run \`nix build\` first," >&2
+    echo "or set CAOS_BIN to one (e.g. rust/target/debug/caos-cli)." >&2
+    exit 1
+fi
+export CAOS_BIN
+
+# Prove the server actually answers before handing it to a session, so a broken
+# or stale binary is an error here rather than a toolless model later.
+#
+# The output is captured rather than piped into `grep -q`: grep exits at its
+# first match and closes the pipe, the server takes SIGPIPE, and under
+# `pipefail` that pipeline reports failure for a probe that in fact SUCCEEDED.
+probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    | "$CAOS_BIN" cc serve 2>/dev/null || true)"
+case "$probe" in
+    *caos_session*) ;;
+    *)
+        echo "$CAOS_BIN cc serve did not list its tools;" >&2
+        echo "it is probably older than \`caos cc\`. Rebuild it." >&2
+        exit 1
+        ;;
+esac
+
+exec claude \
+    --settings "$here/settings.json" \
+    --mcp-config "$here/mcp.json" \
+    --strict-mcp-config \
+    "$@"

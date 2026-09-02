@@ -38,56 +38,39 @@ like any other — `caos tui`, then `Ctrl+L`.
 
 ## Configuration
 
-The tool server is an ordinary child process, so it is configured like any
-stdio MCP server:
-
-```json
-{ "mcpServers": {
-    "caos": { "type": "stdio", "command": "caos", "args": ["cc", "serve"] } } }
-```
-
-and the session is launched against it:
+Everything is checked in under `dev/claude-code/`. Build first (`nix build`),
+then:
 
 ```bash
-claude --mcp-config .mcp.json --strict-mcp-config
+./dev/claude-code/run                 # a session against a caos workspace
+./dev/claude-code/run -p 'your task'  # or headless
 ```
 
-`.claude/settings.json` supplies the hooks and the deny list:
+Any argument is passed through to `claude`. To drive it by hand instead:
 
-```json
-{
-  "permissions": {
-    "deny": ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"],
-    "allow": ["mcp__caos"]
-  },
-  "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command",
-                                       "command": "caos cc hook" }] }],
-    "PreToolUse": [{ "matcher": "mcp__caos__.*",
-                     "hooks": [{ "type": "command",
-                                 "command": "caos cc hook" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "caos cc hook" }] }],
-    "StopFailure": [{ "hooks": [{ "type": "command",
-                                  "command": "caos cc hook" }] }]
-  }
-}
+```bash
+claude --settings dev/claude-code/settings.json \
+       --mcp-config dev/claude-code/mcp.json --strict-mcp-config
 ```
 
-Every hook is the same command. A payload names its own event
-(`hook_event_name`), so nothing here needs a wrapper script, `jq`, or any shell
-quoting — which is deliberate, given what CLAUDE.md records about this tree's
-shell.
+`settings.json` denies Claude Code's built-in file and shell tools, which
+removes them from the model's context rather than merely refusing their calls,
+and points every hook at `caos cc hook`. `mcp.json` declares the tool server.
 
-`PreToolUse` is not optional. The tool server is stateless, and that hook is the
-only thing that tells a tool which conversation it is working in: it adds
-`caos_session` and `caos_tool_use_id` to the call through `updatedInput`. Both
-are declared in every tool's schema, so a call remains schema-valid with or
-without them, and the hook only fills in values the tool already accepted.
-Without it, every tool call fails saying so.
+**`${CLAUDE_PROJECT_DIR}` expands in a hook command but NOT in `mcp.json`.**
+Claude Code sets that variable in the environment *of* a spawned stdio server;
+it is not in Claude Code's own environment, which is what `mcp.json` expansion
+reads. So the hooks in `settings.json` use it and `mcp.json` reads `${CAOS_BIN}`,
+which `dev/claude-code/run` exports.
 
-The hook emits no `permissionDecision`. Whether these tools run without a
-prompt belongs in `permissions.allow`, not in a hook that happens to sit in the
-call path.
+That distinction is worth the paragraph because of how it fails. An unset
+variable in `mcp.json` is not an error: Claude Code warns, uses the literal
+`${CLAUDE_PROJECT_DIR}` as the command, and still reports the server as loaded.
+The session then runs with **no caos tools at all** — and a model with no tools
+does not say so. Asked to write a file, it will emit a plausible `bash` block
+and report success, having written nothing. `dev/claude-code/run` therefore
+probes `tools/list` before launching, so a missing or stale binary is an error
+at startup instead of a fabricated result later.
 
 ## What gets recorded
 
