@@ -21,6 +21,9 @@
 //! `caos talk` and the TUI's `reconcile_active_requests` from trying to resume
 //! a request that was never dispatched.
 
+mod serve;
+mod tools;
+
 use std::io::Read;
 
 use serde_json::{json, Value};
@@ -33,6 +36,7 @@ use crate::{
     reject_reserved_caos, remote_ref, resolve_base, resolve_username,
     try_push_initial_conversation, update_local_cache, TurnOptions, MAX_APPEND_ATTEMPTS,
 };
+use tools::ToolError;
 
 /// Conversation ids for recorded sessions live under one component so they are
 /// obvious in the sidebar and cannot collide with a hand-named conversation.
@@ -40,15 +44,124 @@ use crate::{
 /// hex and dashes.
 const SESSION_PREFIX: &str = "cc/";
 
+/// Claude Code names an MCP tool `mcp__<server>__<tool>`. Only calls to our own
+/// server get a session injected; everything else this hook sees is left
+/// exactly as the model wrote it.
+const TOOL_PREFIX: &str = "mcp__caos__";
+
 pub fn cli_cc(t: &GitTransport, args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("hook") => hook(t),
+        Some("serve") => serve::serve(t),
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage:\n  caos cc hook   (reads one Claude Code hook payload on stdin)".to_string()
+    "usage:\n  \
+     caos cc hook    (reads one Claude Code hook payload on stdin)\n  \
+     caos cc serve   (workspace tool server; JSON-RPC on stdio)"
+        .to_string()
+}
+
+/// Run one workspace tool for `session` and record it as a conversation event.
+///
+/// The whole read-modify-write runs INSIDE the compare-and-swap loop, which is
+/// what makes concurrent tool calls safe without any merge machinery. Claude
+/// Code issues tool calls in parallel, so two mutations routinely start from
+/// the same head; the loser does not merge a stale result, it re-reads the new
+/// tree and applies itself again. For `edit` that is strictly better than a
+/// merge — `old_string` is re-matched against the content that actually won —
+/// and for `write` it is last-writer-wins on that one path while every other
+/// path in the winner's tree is preserved.
+fn run_tool(
+    t: &GitTransport,
+    session: &str,
+    name: &str,
+    args: &Value,
+) -> Result<String, ToolError> {
+    let id = conversation_id_for(session).map_err(ToolError::Infra)?;
+    let refname = conversation_ref(&id).map_err(ToolError::Infra)?;
+    let tool_use_id = args
+        .get("caos_tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or(name);
+    for _ in 0..MAX_APPEND_ATTEMPTS {
+        let head = remote_ref(t, &refname)
+            .map_err(ToolError::Infra)?
+            .ok_or_else(|| {
+                ToolError::Infra(format!(
+                    "no conversation {id:?} to work in; \
+                     the UserPromptSubmit hook records a session's first event"
+                ))
+            })?;
+        fetch_conversation_commit(t, &refname, &head).map_err(ToolError::Infra)?;
+        let workspace = t
+            .git_capture(&["rev-parse", &format!("{head}^{{tree}}")], None)
+            .map_err(ToolError::Infra)?
+            .trim()
+            .to_string();
+
+        // A tool that fails is still a durable event: the transcript should
+        // show the model being told its `old_string` did not match. Only an
+        // infrastructure failure aborts without recording anything.
+        let outcome = match tools::execute(t, &workspace, name, args) {
+            Ok(outcome) => Ok(outcome),
+            Err(ToolError::User(message)) => Err(message),
+            Err(ToolError::Infra(error)) => return Err(ToolError::Infra(error)),
+        };
+        let (text, tree) = match &outcome {
+            Ok(outcome) => (
+                outcome.text.clone(),
+                outcome.tree.clone().unwrap_or_else(|| workspace.clone()),
+            ),
+            Err(message) => (message.clone(), workspace.clone()),
+        };
+
+        let commit = create_event_commit(
+            t,
+            &tree,
+            &head,
+            &tool_event(tool_use_id, name, args, &text, outcome.is_err()),
+        )
+        .map_err(ToolError::Infra)?;
+        if push_head_cas(t, &refname, Some(&head), &commit).map_err(ToolError::Infra)? {
+            let _ = update_local_cache(t, &refname, &commit);
+            return match outcome {
+                Ok(_) => Ok(text),
+                Err(message) => Err(ToolError::User(message)),
+            };
+        }
+    }
+    Err(ToolError::Infra(format!(
+        "conversation {id:?} head moved during all {MAX_APPEND_ATTEMPTS} attempts"
+    )))
+}
+
+/// One commit carrying both the call and its result.
+///
+/// The protocol keys tool activity on `(request, round, tool_use_id)` and, when
+/// those are absent, `durable_tool_scope` falls back to `(commit, 0)`. Putting
+/// the call and result in the SAME commit is what makes that fallback pair them
+/// — and it keeps `request` off the event entirely, which matters because
+/// `waterfall_string` would otherwise hoist any `request` field into the
+/// conversation-level projection for a request that no worker will ever run.
+fn tool_event(tool_use_id: &str, name: &str, args: &Value, text: &str, is_error: bool) -> Value {
+    let mut declared = args.clone();
+    if let Some(object) = declared.as_object_mut() {
+        object.remove("caos_session");
+        object.remove("caos_tool_use_id");
+    }
+    json!({
+        "author": "assistant",
+        "content": "",
+        "calls": [{ "id": tool_use_id, "name": name, "args": declared }],
+        "result": {
+            "tool_use_id": tool_use_id,
+            "content": [{ "type": "text", "text": text }],
+            "is_error": is_error,
+        },
+    })
 }
 
 /// Dispatch one hook payload. An event we do not record is not an error: Claude
@@ -64,6 +177,7 @@ fn hook(t: &GitTransport) -> Result<(), String> {
     let event = string_field(&payload, "hook_event_name")?;
     match event {
         "UserPromptSubmit" => on_user_prompt(t, &payload),
+        "PreToolUse" => on_pre_tool_use(&payload),
         "Stop" => on_stop(t, &payload),
         "StopFailure" => on_stop_failure(t, &payload),
         _ => Ok(()),
@@ -95,6 +209,49 @@ fn on_user_prompt(t: &GitTransport, payload: &Value) -> Result<(), String> {
         },
     )
     .map(|_| ())
+}
+
+/// Tell a caos workspace tool which conversation it is working in.
+///
+/// The tool server is spawned once per session and is otherwise stateless, so
+/// this is the only thing that attributes a call to a conversation. Both values
+/// are declared in every tool's schema rather than smuggled in, so the model's
+/// own call stays schema-valid and this hook only fills in values the tool
+/// already accepted.
+///
+/// No `permissionDecision` is emitted. Injection and permission are separate
+/// concerns: allowing these tools without a prompt is a choice for
+/// `permissions.allow`, not something a hook should decide on the user's behalf
+/// just because it happened to be in the call path.
+fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
+    let tool = string_field(payload, "tool_name")?;
+    if !tool.starts_with(TOOL_PREFIX) {
+        return Ok(());
+    }
+    let session = string_field(payload, "session_id")?;
+    let mut input = payload
+        .get("tool_input")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(object) = input.as_object_mut() else {
+        return Err(format!("{tool} was called with a non-object tool_input"));
+    };
+    object.insert("caos_session".to_string(), json!(session));
+    if let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) {
+        object.insert("caos_tool_use_id".to_string(), json!(id));
+    }
+    let response = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": input,
+        }
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&response)
+            .map_err(|error| format!("encoding hook response: {error}"))?
+    );
+    Ok(())
 }
 
 /// The assistant's closing text for the turn. A turn that ended without any
@@ -227,7 +384,13 @@ fn append_event(
 /// A session's conversation id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
 fn conversation_id(payload: &Value) -> Result<String, String> {
-    let session = string_field(payload, "session_id")?;
+    conversation_id_for(string_field(payload, "session_id")?)
+}
+
+/// A session id is the one ref component we do not author, so it is validated
+/// through the protocol's own parser rather than trusted — whether it arrives
+/// in a hook payload or as a tool argument.
+fn conversation_id_for(session: &str) -> Result<String, String> {
     let id = format!("{SESSION_PREFIX}{session}");
     ConversationId::parse(&id)?;
     Ok(id)
