@@ -4,7 +4,7 @@
 //! (an ancestor `stack` for cycle detection) that is
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
 //! hash *is* the cache key with nothing keyed alongside it: the worker image,
-//! standard library `std`, and cache-busting `salt` all ride inside it under
+//! and cache-busting `salt` ride inside it under
 //! reserved entries. `/run?req=<argTreeHash>`
 //! reads it, then: cache lookup (Redis) → run-cycle detection → image
 //! resolution (a digest-pinned `docker://` ref used as-is, or a git-docker image
@@ -82,7 +82,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// context that is deliberately NOT part of its cache key — the ancestor `stack`
 /// (run-cycle detection). Only `arg_tree` is hashed and
 /// cached; `stack` rides alongside it. The ArgTree carries the
-/// worker image, std and salt under reserved entries, so its hash *is* the whole
+/// worker image and salt under reserved entries, so its hash *is* the whole
 /// cache key (`SPEC.md`: "The ArgTree is the cache key").
 #[derive(Clone, Copy)]
 struct WorkRequest<'a> {
@@ -115,12 +115,12 @@ pub(crate) fn resolve_image_endpoint(config: &Config, query: &str) -> Result<Vec
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
-/// the worker image, std and salt under reserved entries) and return its result
+/// the worker image and salt under reserved entries) and return its result
 /// as `"<type> <hash>"`. (`req` is the query param's historical name; its value
 /// is the ArgTree hash.)
 ///
 /// The ArgTree being a content-addressed object means its hash *is* the cache key
-/// (it captures everything — image, std, salt and the rest)
+/// (it captures everything — image, salt and the rest)
 /// and the rendezvous id: an external run also pins
 /// `refs/caos/res/<argTreeHash>` at the result, so a client can fetch it by ref.
 /// Most worker sub-runs are promise resolutions the server performs itself
@@ -202,7 +202,7 @@ fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, Ht
         return Err(HttpError::new(400, "request has empty image"));
     }
 
-    // The ArgTree hash is the cache key (it captures image, std, salt and every
+    // The ArgTree hash is the cache key (it captures image, salt and every
     // other arg), NAMESPACED by the stack — see `Config::cache_namespace`, which
     // covers the one thing the ArgTree cannot: which build of caos produced the
     // answer. The value is
@@ -1384,7 +1384,7 @@ fn continuation_result(
 
 /// Run image `image_ref` over the given call args as a promise sub-run: unwrap
 /// any curry layers and build the ArgTree — worker image folded in under its
-/// reserved `base` entry, salt under `salt`, and std under `std` — whose hash IS
+/// reserved `base` entry and salt under `salt` — whose hash IS
 /// the request, built server-side byte-identically to what a client would build,
 /// so the ArgTree hash (and cache key) is the same no matter who assembles it —
 /// and send it through [`run_work_request`]. Returns `"<type> <hash>"`.
@@ -1581,11 +1581,12 @@ fn args_entries(
 }
 
 /// Unpack an ArgTree into the reserved entries the server needs: the image ref
-/// (its `base` entry), the std-tree hash (its `std` entry, empty if none), and
-/// the salt (its `salt` entry, empty if none). `base`/`std`/`salt` are all
-/// entries of this one tree, so the ArgTree's hash *is* the cache key with
-/// nothing keyed alongside it — the ArgTree hash itself is the request identity,
-/// so it is not returned here.
+/// (its `base` entry) and the salt (its `salt` entry, empty if none). Those two
+/// are the whole reserved set — a dependency is not an arg at all, it rides
+/// inside the caller's own tree as a `DEEP-DEPS/<name>` mount (SPEC, "Work";
+/// design/caos-expr.md, "no ambient std"). Both are entries of this one tree, so
+/// the ArgTree's hash *is* the cache key with nothing keyed alongside it — the
+/// ArgTree hash itself is the request identity, so it is not returned here.
 fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), HttpError> {
     let entries = fetch_tree(config, arg_tree)
         .map_err(|e| HttpError::new(400, format!("reading arg tree: {e}")))?;
@@ -1604,7 +1605,7 @@ fn read_arg_tree(config: &Config, arg_tree: &str) -> Result<(String, String), Ht
                     blob_string(config, &entry.oid.to_string())?
                 });
             }
-            // std and salt are plain blobs (std NAMES the std tree; salt is opaque).
+            // The salt is a plain, opaque blob.
             "salt" => salt = blob_string(config, &entry.oid.to_string())?,
             _ => {}
         }

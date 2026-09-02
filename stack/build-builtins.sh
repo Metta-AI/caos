@@ -29,11 +29,21 @@
 # hash before any stack exists to compute it. It must agree with the deep-deps
 # worker BYTE FOR BYTE (tests/deep-deps and the suite are the guardrail).
 #
-# Usage: ./build-builtins.sh [name ...]   (default: all)
+# Usage: ./stack/build-builtins.sh [name ...]   (default: all)
 # Requires the dev server running and git + skopeo + curl on PATH. No docker:
 # this script composes no images — it pushes clean ones and describes deltas.
 set -euo pipefail
-cd "$(dirname "$0")"
+# IN `stack/` BECAUSE `stack/serve` IS ITS ONLY CALLER. It used to sit at the
+# repo root and be invoked from two places — `caosd std_build` on the host and
+# `dev/stack-up` inside the dev worker — which is exactly the duplication that
+# let a publish and the seeder consuming it drift apart. There is one publish
+# now, and it lives beside the one bring-up that performs it.
+#
+# `..` because THE TREE IS THE SUBJECT, not this directory: everything below
+# reads `$PROJECT/std/<name>` and `$PROJECT/rust/crates/worker-common`, and
+# `nix build .#…` resolves the flake at the cwd. So this script runs from the
+# repo root wherever the file itself happens to live.
+cd "$(dirname "$0")/.."
 PROJECT=$PWD
 
 names=("$@")
@@ -284,7 +294,16 @@ bts "staged worker layers"
 # composition at all — no docker, no build context, no manifest surgery.
 for name in "${image_names[@]}"; do
   tarball=${img_path[$name]}
-  ctag="clean-$name-$(printf '%s' "$tarball" | sha1sum | cut -c1-12)"
+  # KEYED ON THE TARBALL'S OWN STORE NAME, not on the path we reached it by.
+  # `$tarball` is `<inputs>/images/<hash>-caos-worker-<name>.tar.gz` — a symlink
+  # inside a per-BUILD aggregate — so hashing the whole path put the aggregate's
+  # hash in the tag, and every rebuild of the workspace re-pushed all three
+  # clean images even though not one byte of them had moved. That is 1.6 GB of
+  # `skopeo copy` (cargo alone is 1.5 GB) on a step that should have been three
+  # registry hits, and it is paid by every dev stack on every source edit. The
+  # basename is nix's own content-addressed name for the image, which is exactly
+  # the identity this tag wants.
+  ctag="clean-$name-$(basename "$tarball" | sha1sum | cut -c1-12)"
   digest=$(manifest_digest "$ctag")
   if [ -n "$digest" ]; then
     echo "$name: registry hit for $ctag" >&2
@@ -512,20 +531,44 @@ done
 
 # ---- seed records (design/caos-expr.md, Phase 3) ----------------------------
 # The irreducible core can't be built by the machinery it IS, so bootstrap
-# hand-builds each core artifact and publishes a SEED RECORD per item under
-# refs/caos/seed; the core-seeder-runner registers one poll per record and
-# answers the arg-tree key a caller forms, spawning no container.
+# hand-builds each core artifact and publishes a SEED RECORD per item; the
+# core-seeder-runner registers one poll per record and answers the arg-tree key
+# a caller forms, spawning no container.
 #
-#   refs/caos/seed -> tree { <name> -> { required: <JSON name→oid>, result: <obj> } }
+#   <seed tree> -> { <name> -> { required: <JSON name→oid>, result: <obj> } }
+#
+# THE TREE IS THIS SCRIPT'S RETURN VALUE — printed on stdout, and the caller
+# (`stack/serve`) hands it straight to the seeder it then starts. NOT a ref, and
+# not because a ref was inconvenient: a record is keyed by NAME, so a ref is a
+# channel a second publisher can take over, and both ways that goes wrong are
+# silent.
+#
+#   different `required` — the two publishers' trees differ, so the loser's keys
+#     simply vanish. Its jobs then park unanswered and the eventual 503 blames
+#     capacity, the one thing that is not wrong (CLAUDE.md, "an idle machine
+#     mid-run means a job is waiting").
+#   same `required`, different `result` — the publishers' sources are identical
+#     but their BINARIES are not, which is precisely two builds of caos. The
+#     loser's seeder answers with the WINNER's binaries and nothing disagrees.
+#
+# Reproduced, both of them, with two dev stacks against one host. Passing the
+# tree by value removes the name they fought over, and with it the seeder's
+# rescan, its stale-answer window, and the 0-5s gap on every bring-up where a
+# freshly published core had no registered answerer.
 #
 # bootstrap HAND-ASSEMBLES each `required` from the deltas it already built —
 # NOT by running the evaluator — so it needs no live answerer and no seeder
 # during publish (the deltas are known; the key a caller's eval forms is
-# reproduced here). `required` OMITS `std`/`salt`: a core item's output depends
-# only on its `image`+`in`, so the seeder answers under ANY std — which is what
-# lets the test harness hand each job a std SUBSET. The server matches a required
-# set as a SUBSET of the job's arg entries (runner::matches), still far more
-# specific than runnerd's empty required.
+# reproduced here). `required` OMITS `salt`: a core item's output depends only on
+# its `image`+`in`, and the server matches a required set as a SUBSET of the
+# job's arg entries (runner::matches) — so ONE record answers the whole family of
+# keys a caller can form, whatever salt the run carries and whatever else it
+# binds. That subset match is the thing a cache entry could not do: a cache is
+# keyed on one exact ArgTree, and `CAOS_SALT` moves that key on every run.
+#
+# (This used to say `std`/`salt`. There is no `std` arg any more — a
+# dependency rides inside `in` as a `DEEP-DEPS/<name>` mount — so `salt` is the
+# whole of what is omitted.)
 #
 # EVERY RECORD REQUIRES `required-pool=seeded`, and each seeded entry's
 # `.caos-expr` binds the same pair — which is what keeps the generic runner away
@@ -627,10 +670,20 @@ fi
 if [ -n "$seed_entries" ]; then
   seed_tree=$(printf '%s' "$seed_entries" | git -C "$CLIENT" mktree)
   bts "mktree"
-  git -C "$CLIENT" push -q --force caos "$seed_tree:refs/caos/seed"
-  git -C "$CLIENT" update-ref refs/caos/seed "$seed_tree"
-  echo "refs/caos/seed -> $seed_tree" >&2
+  # PUSHED UNDER `refs/caos/req/<hash>`, which is where every other pushed
+  # object in this system lands (`ensure_pushed`, crates/caos/src/lib.rs). The
+  # objects have to reach the server — the seeder opens the server's repo to
+  # read them — and a push needs a refspec; naming it by the tree's own hash
+  # makes it content-addressed, so two publishers into one repo cannot collide
+  # on it. Reusing the existing namespace rather than inventing one also means
+  # the server's request-ref pruner already sweeps it, and deleting it is safe
+  # for the reason that pruner gives: these refs anchor nothing, because GC is
+  # off here and almost every object is unreachable from any ref anyway.
+  git -C "$CLIENT" push -q --force caos "$seed_tree:refs/caos/req/$seed_tree"
+  echo "seed tree $seed_tree" >&2
 fi
 bts "pushed seed records"
 
+# THE RETURN VALUE, on stdout and alone there — everything else this script says
+# goes to stderr. `stack/serve` captures it and starts the seeder with it.
 echo "$seed_tree"

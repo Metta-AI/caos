@@ -18,11 +18,20 @@
   #   CAOS_GRANT_VOLUMES        persistent storage. `/mounted-nix` is a nix store
   #                             this image binds over its own (see ./worker), so
   #                             a rebuild is incremental rather than from nothing;
-  #                             `/caos-dev` is the dev stack's git repo. Both
-  #                             hold only content-addressed data, which is why
-  #                             they are shared rather than exclusive — several
-  #                             of these can run at once against one store and
-  #                             one object database.
+  #                             `/caos-dev` is the dev stacks' git repo and their
+  #                             per-run directories; `/caos-images` is their
+  #                             podman store. All three hold content-addressed
+  #                             data, which is why they are shared rather than
+  #                             exclusive — several of these run at once against
+  #                             one store and one object database.
+  #
+  #                             SHARED IS NOT UNSTRUCTURED. What is content-keyed
+  #                             is shared outright; the name-keyed remainder — a
+  #                             stack's logs, its client symlink, its publish
+  #                             client repo, its seed ref — is per CONTAINER,
+  #                             under `/caos-dev/runs/<id>` and reachable in here
+  #                             as `/caos-run`. dev/stack-up's header says which
+  #                             is which and what each one broke before it moved.
   #   CAOS_GRANT_SYS_ADMIN      that bind is the only way to replace a directory
   #                             whose replacement is on another filesystem.
   #   CAOS_GRANT_DEVICES        /dev/fuse, so the podman this image carries can

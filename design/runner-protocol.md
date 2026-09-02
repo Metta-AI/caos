@@ -77,9 +77,10 @@ The job payload is the rendezvous ids plus only what the runner can't derive:
 }
 ```
 
-No `args`/`std`/`salt`: those are exactly the entries of the `req` tree, which
-IS the ArgTree (`base`, `std` and `salt` are all reserved entries of it), which
-the runner unpacks itself (one tree fetch, plus the `std` ref blob) — `req`
+No `args`/`salt`: those are exactly the entries of the `req` tree, which
+IS the ArgTree (`base` and `salt` are its reserved entries — there is no `std`
+entry any more; a dependency rides inside the tree as a `DEEP-DEPS/<name>`
+mount), which the runner unpacks itself in one tree fetch — `req`
 has to travel anyway for the result post, and sending only it means the
 payload can't disagree with the request. `image_ref` is genuinely
 non-derivable: it's the docker-pullable ref produced by the server's git→OCI

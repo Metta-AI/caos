@@ -4,7 +4,6 @@ A WorkRequest is:
 - an ArgTree: a git tree containing named args:
     - image: See below
     - other args, by agreement between the caller and the worker, all as git files/trees/commits
-    - std (optional, but very common)
     - salt (optional): a string that is used to invalidate the cache
 - stack
 
@@ -84,7 +83,7 @@ Caos is fast because:
 - It pushes to git only what's new
 
 Two things need to be fast:
-- Primary: Rebuild and retest everything: `time CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool caos-test`
+- Primary: Rebuild and retest everything: `time result/bin/caos-cli run-tool caos-test --test-salt=$(date --iso=s)`
     - This doesn't rebuild the stack-builder image from the flake, because that's just a function of the flake and is cached in docker
 - Secondary: Build and restart on the host: `time nix build && time result/bin/caosd up`. Not part of the normal dev loop
 
@@ -349,7 +348,7 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `std`, `salt` and
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt` and
 `help` are refused: the interpreter, or the tool's own expression, binds those
 itself and currying SHALL fail on a rebind. A malformed `@param` tag is skipped
 with a message, never silently

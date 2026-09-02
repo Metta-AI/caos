@@ -4,11 +4,12 @@
 //! The irreducible core (`flake-builder`, and later `runner`/`cargo`/`rustc`/
 //! `deep-deps`) cannot be built by the machinery it *is*: forming
 //! `flake-builder`'s image by running `flake-builder` is a cycle. So
-//! `bootstrap`/`build-builtins.sh` hand-builds each core artifact and publishes
-//! a **seed record** per item under a ref (default `refs/caos/seed`):
+//! `bootstrap`/`build-builtins.sh` hand-builds each core artifact and prints a
+//! tree of **seed records**, one per item, which `stack/serve` hands straight
+//! to this process as `CAOS_SEED_TREE`:
 //!
 //! ```text
-//! refs/caos/seed -> tree {
+//! <CAOS_SEED_TREE> -> tree {
 //!   <name> -> tree {
 //!     required -> blob (JSON: { "<argname>": "<oid>", ... })
 //!     result   -> the pre-built object (a tree for an image, a blob otherwise)
@@ -16,7 +17,17 @@
 //! }
 //! ```
 //!
-//! This runner reads those records and long-polls the server's
+//! BY VALUE, and it is worth saying why, because this used to be a ref
+//! (`refs/caos/seed`) that this process polled every five seconds. A ref is a
+//! mutable name: two stacks sharing a server repo overwrite each other's
+//! records — same `required`, different `result` is exactly two builds of caos,
+//! and the loser then answers with the winner's binaries in silence. Polling
+//! also meant a 0-5s window on every bring-up where the core had no answerer,
+//! and a warm repo meant registering the PREVIOUS run's records first and
+//! swapping later. The publisher and this reader are two steps of one script,
+//! so there was never anything for a name to buy.
+//!
+//! This runner reads those records once and long-polls the server's
 //! `POST /runner/poll` (the ordinary runner protocol — *no server change*), one
 //! poll per record with `required` = that record's arg-tree entries. On a match
 //! it **posts the pre-built result directly** (`POST /runner/result`), spawning
@@ -43,40 +54,32 @@
 //!   `CAOS_SERVER_URL`  the server to poll (default `http://127.0.0.1`)
 //!   `CAOS_GIT_DIR`     the server's git repo, read for the seed records
 //!                      (required — the records live there, colocated)
-//!   `CAOS_SEED_REF`    the seed ref (default `refs/caos/seed`)
+//!   `CAOS_SEED_TREE`   the tree of seed records to answer from, as printed by
+//!                      build-builtins.sh (required; no default, because a
+//!                      seeder with nothing to seed is a stack whose core
+//!                      cannot be built at all)
 //!   `CAOS_RUNNER_TOKEN` bearer token, if the server requires one
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// The seed ref, unless `CAOS_SEED_REF` overrides it.
-const DEFAULT_SEED_REF: &str = "refs/caos/seed";
 
 /// How long each poll hangs before re-polling (a reconnect cadence; a seeder
 /// never idles out).
 ///
-/// This is also HOW STALE A PARKED POLL CAN BE. A poll carries the `required`
-/// its record had when it parked, so a republish that changes a record's key
-/// keeps being advertised under the OLD key until the poll turns over. The
-/// server treats a parked-but-disagreeing seeder as a permanent mismatch once
-/// `CAOS_SEEDED_GRACE_SECS` has passed (server/runner.rs `seeded_verdict`), so
-/// this bound plus `RESCAN` is what that grace has to clear. Kept short — five
-/// records re-polling every 20s is 15 requests a minute, and it buys both a
-/// tighter grace and a faster pickup of a republished record.
+/// It used to also bound HOW STALE A PARKED POLL COULD BE, because records
+/// could be republished under this process. They cannot any more — the seed
+/// tree is fixed for this seeder's whole life (see [`main`]) — so this is a
+/// reconnect cadence and nothing else. Kept short anyway: it is what
+/// `CAOS_SEEDED_GRACE_SECS` has to clear before the server may call a parked
+/// seeder a permanent mismatch (server/runner.rs `seeded_verdict`).
 const POLL_TTL: Duration = Duration::from_secs(20);
 
-/// Backoff after a failed poll or a git read (server or repo not ready).
+/// Backoff after a failed poll (server not ready).
 const RETRY: Duration = Duration::from_secs(2);
-
-/// How often the main loop re-reads the seed ref to pick up newly published
-/// records (the host publishes std+seed AFTER the stack is up).
-const RESCAN: Duration = Duration::from_secs(5);
 
 struct Config {
     server_url: String,
     git_dir: String,
-    seed_ref: String,
+    seed_tree: String,
     token: Option<String>,
 }
 
@@ -88,13 +91,6 @@ struct Record {
     required: serde_json::Map<String, serde_json::Value>,
     result: String,
 }
-
-/// The records currently on disk, by NAME — the whole of this runner's state.
-///
-/// Replaced wholesale on every rescan, never added to. The ref IS the complete
-/// list, so anything not in it has been withdrawn, and a name that is still
-/// there means "answer with THIS result now" regardless of what it said before.
-type Records = Arc<Mutex<HashMap<String, Record>>>;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -108,117 +104,106 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // THE SEED TREE IS PASSED BY VALUE, and that is the whole shape of this
+    // program. `stack/serve` runs build-builtins, which prints the tree it just
+    // published, and starts this with that oid — so the records are fixed for
+    // this process's life, read once, and cannot be replaced under it.
+    //
+    // It used to read `refs/caos/seed` on a 5s timer instead, and everything
+    // this file no longer contains was the cost of that: a rescan loop, a
+    // shared record map behind a mutex, a re-read per poll iteration and again
+    // after every claim, a withdraw path for names that vanished, and a
+    // `now answers X (was Y)` log line for the moment a republish landed
+    // underneath a parked poll. All of it existed because a mutable ref is a
+    // channel any number of publishers can write, on nobody's schedule.
+    //
+    // What that cost, concretely, before it was hardened: TWO live answerers
+    // for flake-builder and runner, THREE for cargo and rustc, handing out
+    // different results by coin flip, which alternated the builder image and
+    // made the suite recompile every std tool about half the time (35s against
+    // 67-85s). And after hardening it still left a 0-5s window on every stack
+    // bring-up where the core had no registered answerer at all.
+    let seed_tree = match std::env::var("CAOS_SEED_TREE") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!(
+                "core-seeder-runner: CAOS_SEED_TREE is required — the tree of seed records to \
+                 answer from, as printed by build-builtins.sh. A seeder with nothing to seed is \
+                 not a degraded stack, it is a stack whose core cannot be built at all, so this \
+                 refuses rather than idling."
+            );
+            std::process::exit(2);
+        }
+    };
     let config = Config {
         server_url: env_or("CAOS_SERVER_URL", "http://127.0.0.1"),
         git_dir,
-        seed_ref: env_or("CAOS_SEED_REF", DEFAULT_SEED_REF),
+        seed_tree,
         token: std::env::var("CAOS_RUNNER_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
     };
     eprintln!(
-        "core-seeder-runner: server {}, seed {} in {}",
-        config.server_url, config.seed_ref, config.git_dir
+        "core-seeder-runner: server {}, seed tree {} in {}",
+        config.server_url, config.seed_tree, config.git_dir
     );
 
-    // ONE THREAD PER NAME, and the disk REPLACES its state on every rescan.
-    //
-    // Threads used to be keyed on a record's whole CONTENT — name, required and
-    // result — on the reasoning that a stale one "keeps polling harmlessly (its
-    // now-absent required matches no current job)". That is false whenever a
-    // record is republished with the same `required` and a different `result`,
-    // which is the ordinary case: `caosd up` re-runs build-builtins, and a
-    // rebuilt host binary changes the flake-builder delta while its arg-tree
-    // key stays exactly the same. Both threads then match every job and race,
-    // so the answer alternates between the current image and a stale one.
-    //
-    // Observed after several `caosd up`s: TWO live answerers for flake-builder
-    // and runner, THREE for cargo and rustc, handing out different results by
-    // coin flip. Downstream that alternated the builder image, so the test
-    // stack image changed run to run, and the suite started a fresh stack and
-    // recompiled every std tool about half the time (35s against 67-85s).
-    //
-    // So: the ref is the complete list, a rescan replaces the map, and a
-    // thread reads the CURRENT record for its name every time round — carrying
-    // no snapshot of its own to go stale. A name that disappears leaves its
-    // thread idling rather than answering.
-    let records: Records = Arc::new(Mutex::new(HashMap::new()));
-    let mut threads: HashSet<String> = HashSet::new();
-    loop {
-        match read_records(&config) {
-            Ok(list) => {
-                let names: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
-                {
-                    let mut current = records.lock().expect("seed records");
-                    for rec in list {
-                        match current.get(&rec.name) {
-                            Some(prev) if prev.result == rec.result => {}
-                            Some(prev) => eprintln!(
-                                "core-seeder-runner: {} now answers {} (was {})",
-                                rec.name, rec.result, prev.result
-                            ),
-                            None => eprintln!(
-                                "core-seeder-runner: answering {} -> {}",
-                                rec.name, rec.result
-                            ),
-                        }
-                        current.insert(rec.name.clone(), rec);
-                    }
-                    // Whatever the ref no longer names is withdrawn.
-                    current.retain(|name, _| names.iter().any(|n| n == name));
-                }
-                for name in names {
-                    if threads.insert(name.clone()) {
-                        let server = config.server_url.clone();
-                        let token = config.token.clone();
-                        let records = Arc::clone(&records);
-                        std::thread::spawn(move || {
-                            poll_loop(&server, token.as_deref(), &name, &records)
-                        });
-                    }
-                }
-            }
-            Err(e) => eprintln!("core-seeder-runner: reading {}: {e}", config.seed_ref),
+    // Read once. A failure here is fatal for the same reason an absent
+    // CAOS_SEED_TREE is: there is no later attempt that could do better, and a
+    // seeder that comes up answering nothing turns every seeded job into a
+    // silent park and then a 503 that blames capacity.
+    let records = match read_records(&config) {
+        Ok(records) if !records.is_empty() => records,
+        Ok(_) => {
+            eprintln!(
+                "core-seeder-runner: seed tree {} holds no records",
+                config.seed_tree
+            );
+            std::process::exit(1);
         }
-        std::thread::sleep(RESCAN);
+        Err(e) => {
+            eprintln!(
+                "core-seeder-runner: reading seed tree {}: {e}",
+                config.seed_tree
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // One thread per record, each parked on its own long poll. They never
+    // exit — a seeder is standing capacity, not a one-shot answer — so the last
+    // one runs on this thread rather than being joined.
+    let mut spawned = Vec::new();
+    for rec in records {
+        eprintln!(
+            "core-seeder-runner: answering {} -> {}",
+            rec.name, rec.result
+        );
+        let server = config.server_url.clone();
+        let token = config.token.clone();
+        spawned.push(std::thread::spawn(move || {
+            poll_loop(&server, token.as_deref(), &rec)
+        }));
+    }
+    for t in spawned {
+        let _ = t.join();
     }
 }
 
-/// One NAME's poll thread: claim a matching job, post whatever that name
-/// currently answers with, repeat. Never exits — a seeder is standing capacity,
-/// and a name that is withdrawn may come back on the next publish.
+/// One RECORD's poll thread: claim a matching job, post that record's result,
+/// repeat. Never exits — a seeder is standing capacity, not a one-shot answer.
 ///
-/// The record is re-read from the shared map on every iteration AND again after
-/// a job is claimed, because a publish can land while this poll is parked. That
-/// is the whole point: the thread holds no result of its own to serve stale.
-fn poll_loop(server: &str, token: Option<&str>, name: &str, records: &Records) {
+/// The record is owned by this thread and never changes. That is what the seed
+/// tree being passed by value buys: there is no shared map, no re-read after a
+/// claim, and no window in which what we polled on and what we answer with can
+/// differ.
+fn poll_loop(server: &str, token: Option<&str>, rec: &Record) {
+    let name = &rec.name;
     loop {
-        let rec = records.lock().expect("seed records").get(name).cloned();
-        let Some(rec) = rec else {
-            // Withdrawn: idle rather than answer for something the ref no
-            // longer lists. It costs one sleep to come back if it returns.
-            std::thread::sleep(RESCAN);
-            continue;
-        };
-        match poll(server, token, &rec) {
+        match poll(server, token, rec) {
             Ok(Some((req, nonce))) => {
-                let current = records
-                    .lock()
-                    .expect("seed records")
-                    .get(name)
-                    .map(|r| r.result.clone());
-                match current {
-                    Some(result) => {
-                        if let Err(e) = post_result(server, token, &req, &nonce, &result) {
-                            eprintln!("core-seeder-runner: {name}: posting result: {e}");
-                        }
-                    }
-                    // Withdrawn while we were parked. Answering with the result
-                    // we polled on would serve exactly the staleness this
-                    // rewrite removes, so leave the job for another answerer.
-                    None => eprintln!(
-                        "core-seeder-runner: {name}: withdrawn while parked; not answering {req}"
-                    ),
+                if let Err(e) = post_result(server, token, &req, &nonce, &rec.result) {
+                    eprintln!("core-seeder-runner: {name}: posting result: {e}");
                 }
             }
             Ok(None) => {} // idle or evicted: re-poll
@@ -300,21 +285,21 @@ fn post(
     req.send().map_err(|e| format!("POST {url}: {e}"))
 }
 
-/// Read the seed records from `refs/caos/seed` in the server's git repo. An
-/// absent ref (not published yet) is an empty set, not an error — the host
-/// publishes std+seed after the stack is up, and the main loop rescans.
+/// Read the seed records out of `CAOS_SEED_TREE`, a tree of
+/// `<name> -> {required, result}` that build-builtins.sh has already pushed to
+/// this repo.
+///
+/// BY OID, not through a ref. The publisher and this reader are two steps of
+/// one script (`stack/serve`), so the tree can be handed over directly — which
+/// means there is no name for a second publisher to take over, nothing to poll
+/// for, and no moment where the records on disk are not the ones this process
+/// was told about. An unreadable tree is fatal at the call site: the objects
+/// were pushed seconds ago by the same script, so a miss is a broken stack, not
+/// a race to wait out.
 fn read_records(config: &Config) -> Result<Vec<Record>, String> {
     let repo = gix::open(&config.git_dir).map_err(|e| format!("open {}: {e}", config.git_dir))?;
-    let reference = match repo.find_reference(config.seed_ref.as_str()) {
-        Ok(r) => r,
-        // No such ref yet (or the repo has no refs): nothing to seed.
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut reference = reference;
-    let root = reference
-        .peel_to_id()
-        .map_err(|e| format!("peeling {}: {e}", config.seed_ref))?
-        .detach();
+    let root = gix::ObjectId::from_hex(config.seed_tree.as_bytes())
+        .map_err(|e| format!("{} is not an object id: {e}", config.seed_tree))?;
     let mut records = Vec::new();
     for entry in read_tree(&repo, &root)? {
         if !entry.mode.is_tree() {

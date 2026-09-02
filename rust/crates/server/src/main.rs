@@ -50,6 +50,7 @@ mod status;
 mod storage;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tiny_http::{Method, Request, Response, Server, StatusCode};
 
@@ -315,6 +316,39 @@ fn main() {
     }
 }
 
+/// How long a required Git command waits out another process's lock, and how
+/// often it retries — 5s in 50ms steps.
+///
+/// A SERVER REPO CAN HAVE A SECOND SERVER, and the settings above are asserted
+/// on EVERY boot rather than only on a repo this process created, so two
+/// servers coming up against one repo assert the same values at the same
+/// instant. `git config` publishes an edit by taking `config.lock`, so the
+/// loser gets `could not lock config file config: File exists` and — these
+/// being *required* commands — died with `fatal:` before it ever listened. That
+/// is the dev placement's ordinary case: several `dev/stack-up` stacks share
+/// `/caos-dev/git` deliberately (their objects are content-addressed), and it
+/// cost one of two concurrent stacks its whole bring-up, reported as "server
+/// never came up" with the real message a file away.
+///
+/// Waited out rather than tolerated: the assertion still has to happen, and
+/// what the loser is waiting for is a peer writing the very same value. Bounded
+/// because a lock held longer than this is a STALE one — a crashed writer's
+/// leftover `config.lock`, which no amount of patience clears and which a
+/// person has to see.
+const GIT_LOCK_WAIT_STEPS: u32 = 100;
+const GIT_LOCK_WAIT_STEP: Duration = Duration::from_millis(50);
+
+/// Does this failure say another process holds the lock on what we are editing?
+///
+/// git's lockfile layer reports it the same way for every ref, index and config
+/// edit: it tried to create `<thing>.lock` and `File exists`. Matched on the
+/// message because that is all `git config` gives us — its exit status for a
+/// lock collision is the generic 255.
+fn is_git_lock_contention(detail: &str) -> bool {
+    detail.contains("File exists")
+        && (detail.contains("could not lock") || detail.contains("Unable to create"))
+}
+
 /// Run one of the Git commands that establishes the server's storage
 /// contract. Ignoring one of these failures lets the server start in a mode
 /// where pushes, object fetches, or crash recovery are silently unsafe.
@@ -326,23 +360,37 @@ fn run_required_git(args: &[&str]) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let output = std::process::Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|error| format!("cannot run required command {command}: {error}"))?;
-    if output.status.success() {
-        return Ok(());
+    let mut last = String::new();
+    for attempt in 0..GIT_LOCK_WAIT_STEPS {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|error| format!("cannot run required command {command}: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        last = if detail.is_empty() {
+            format!("required command {command} exited with {}", output.status)
+        } else {
+            format!(
+                "required command {command} exited with {}: {detail}",
+                output.status
+            )
+        };
+        if !is_git_lock_contention(detail) {
+            return Err(last);
+        }
+        if attempt == 0 {
+            eprintln!("waiting for another process's git lock: {last}");
+        }
+        std::thread::sleep(GIT_LOCK_WAIT_STEP);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.trim();
-    Err(if detail.is_empty() {
-        format!("required command {command} exited with {}", output.status)
-    } else {
-        format!(
-            "required command {command} exited with {}: {detail}",
-            output.status
-        )
-    })
+    Err(format!(
+        "{last} (still held after {}s — a crashed writer's stale lock file?)",
+        GIT_LOCK_WAIT_STEPS as u64 * GIT_LOCK_WAIT_STEP.as_millis() as u64 / 1000
+    ))
 }
 
 fn configure_ref_advertisements(git_dir: &str) -> Result<(), String> {

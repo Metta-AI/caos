@@ -126,8 +126,14 @@ fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
 /// `wc`/`refs` are bound only for `@git` tools, but reserved unconditionally
 /// so a tool can't declare a model arg the interpreter would then clobber.
+///
+/// EVERY NAME HERE IS ONE SOMETHING BINDS. `std` used to be on this list and is
+/// not any more: there is no `std` arg, a dependency rides inside the tree as a
+/// `DEEP-DEPS/<name>` mount, so nothing would ever have collided with a tool
+/// declaring one. Reserving a name for its history costs a tool author a
+/// perfectly good parameter and tells the next reader that something binds it.
 const RESERVED_ARGS: &[&str] = &[
-    "in", "worker1", "base", "std", "salt", "wc", "refs",
+    "in", "worker1", "base", "salt", "wc", "refs",
     // The tool's own ArgTree binds `help` (SPEC, "Tools"), and `caos curry`
     // refuses to rebind — so a tool declaring `@param help` would fail at
     // invocation rather than here, where the model can be told why.

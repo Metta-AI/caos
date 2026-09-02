@@ -427,15 +427,22 @@
         # `builderImage`. That is what lets the tree handed to the
         # flake-builder be the reduced one.
         hostStackRoot = pkgs.runCommand "caos-host-stack-root" { } ''
-          # NO /caos/images and NO /caos/tree. They existed so that a stack
-          # could run build-builtins.sh from inside itself — the clean core
-          # tarballs to push, std/ and crates/worker-common to publish. Nothing
-          # publishes at runtime any more: the test stack is seeded when
-          # build.sh assembles it and the host publishes from the store (caosd
-          # std_build), so ~250 MB of tarballs and a copy of the tree came out
-          # of both images.
+          # ONE SCRIPT, and it is the one that cannot come from anywhere else.
+          # `bootstrap` is the entrypoint: it binds the store, builds the tree's
+          # stack inputs and execs `<tree>/stack/serve` — so serve, the publish
+          # and the daemons all come from the TREE, and editing any of them
+          # needs no `docker load`. This file changes about as often as the
+          # image's userland does, which is the property that keeps `nix build`
+          # from re-tarring 160 MB on a source edit.
+          #
+          # STILL NO /caos/images AND NO /caos/tree. They existed so a stack
+          # could run build-builtins.sh from inside itself, and were removed
+          # because ~250 MB of tarballs and a copy of the tree in the image
+          # re-keyed it constantly. Publishing from inside is back — but the
+          # tree arrives at runtime through the state mount, and the tarballs
+          # are built in here rather than carried in, so neither is baked.
           mkdir -p $out/caos/stack
-          install -m 755 ${./stack/serve} $out/caos/stack/serve
+          install -m 755 ${./stack/bootstrap} $out/caos/stack/bootstrap
         '';
         # The userland a caos stack shells out to, shared by both worlds.
         stackUserland = [
@@ -468,6 +475,18 @@
             linuxPkgs.distribution
             linuxPkgs.skopeo
             linuxPkgs.cacert
+            # THE STACK BUILDS WHAT IT RUNS (stack/bootstrap): one `nix build`
+            # of the tree's stack inputs, into a store volume shared with every
+            # other caos container on this host. This is what lets `caosd`
+            # carry a 4 MB tree instead of 1.6 GB of tarballs, and what takes
+            # the three clean images out of the host's own `nix build`.
+            # Measured: the flake-builder image is a complete nix image in
+            # 99 MB, so this is not the expensive part of a 160 MB userland.
+            linuxPkgs.nix
+            # mount(8) for the bind that swaps that store over this image's
+            # own, and flock(1) to serialise the copy that precedes it —
+            # several containers seed one volume (see stack/bootstrap).
+            linuxPkgs.util-linux
             (if pkgs.stdenv.hostPlatform.isLinux then
               linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
             else
@@ -487,6 +506,19 @@
           # existed. Only an image can ask — the grant is read from the
           # image's config, never from a job or its args.
           "CAOS_GRANT_ENGINE_SOCKET=1"
+          # Single-user, unsandboxed nix: root in a container with no nixbld
+          # group and no privilege to build a sandbox. `stack/bootstrap` runs
+          # one `nix build` here, and the same three settings the flake-builder
+          # and dev/test-stack pass for the same situation — as NIX_CONFIG, so a
+          # plain `nix build` inherits them.
+          ''NIX_CONFIG=experimental-features = nix-command flakes
+build-users-group =
+sandbox = false''
+          "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+          # Explicitly, alongside the /etc/passwd entry that makes it
+          # resolvable: git and skopeo both look HOME up, and the two answers
+          # disagreeing is a worse failure than either being absent.
+          "HOME=/root"
         ];
         # THE image this flake defines (`#caosImage`, the flake-builder
         # contract): the ENVIRONMENT a test stack is built and run in — never
@@ -568,14 +600,39 @@
           tag = "latest";
           contents = [ hostStackRoot ] ++ stackUserland;
           config = {
-            # bash EXPLICITLY, not serve's `#!/usr/bin/env bash` shebang:
+            # bash EXPLICITLY, not the script's `#!/usr/bin/env bash` shebang:
             # /usr/bin/env comes from the caos additions, which the
             # flake-builder stacks onto WORKER images. caosd runs this one
             # directly, so nothing has stacked anything — and the failure is a
             # bare "No such file or directory" naming the script, not env.
-            Entrypoint = [ "/bin/bash" "/caos/stack/serve" ];
+            Entrypoint = [ "/bin/bash" "/caos/stack/bootstrap" ];
             Env = stackEnv;
           };
+          # WHAT A BARE NIX ROOT DOES NOT HAVE, and now needs — because this
+          # image both BUILDS (stack/bootstrap's `nix build`) and PUBLISHES
+          # (serve's build-builtins) rather than being handed the results.
+          # dev/test-stack's image carries the same lines, and its comment
+          # records each as a distinct failure before it was a line:
+          #
+          #   /tmp, /var/tmp   a writable TMPDIR for every derivation nix
+          #                    realises, and for the nix-DB dump bootstrap
+          #                    takes before binding the store over /nix.
+          #                    Absent, that bind fails with a bare
+          #                    `/tmp/image-db.dump: No such file or directory`
+          #                    and the stack silently comes up on the image's
+          #                    own store, rebuilding everything every time.
+          #   /etc/passwd,     skopeo resolves HOME through the user database
+          #   /etc/group,      and dies `unable to resolve HOME directory:
+          #   /root            user: unknown userid 0` without one. It only
+          #                    surfaced when the publish moved in here: skopeo
+          #                    used to run on the host, where root is real.
+          fakeRootCommands = ''
+            mkdir -p tmp var/tmp
+            chmod 1777 tmp var/tmp
+            mkdir -p root etc
+            printf 'root:x:0:0:root:/root:/bin/bash\n' > etc/passwd
+            printf 'root:x:0:\n' > etc/group
+          '';
         };
 
 
@@ -742,14 +799,22 @@
         #   caosd reset  stop and wipe CAOS_DATA state for a clean slate.
         #   caosd logs   follow the running stack's logs (Ctrl-C returns; the stack
         #                keeps running).
-        #   caosd std-build  publish std to a running stack and return. What `up`
-        #                does after bring-up; separate so it can be run alone.
-        #   caosd std-check  verify the registry still holds everything std NAMES,
-        #                and fail loudly if not. `up` PUBLISHES rather than
-        #                checking — convenience for a person, who should get a
-        #                working stack and not homework — so this is the strict
-        #                gate for anything that runs against a stack it did not
-        #                just bring up (design/one-stack-image.md).
+        # NO std-build AND NO std-check, and both went for the same reason.
+        # Publishing is not separable from bring-up any more: `stack/serve`
+        # publishes and then starts the seeder with the tree that publish
+        # returned, because those two steps have to agree and the only way to
+        # guarantee it is to make one a value the other consumes. So there is
+        # nothing for `std-build` to do to a running stack — republishing is
+        # `up`.
+        #
+        # `std-check` verified that the registry still held every image the SEED
+        # RECORDS name. That divergence needed two things persisting
+        # independently: `refs/caos/seed` in the git dir, and the blobs under
+        # `stack/registry` — reachable because `image-cleanup` wipes the second
+        # and deliberately not the first. The seed does not persist at all now;
+        # it is recomputed on every bring-up, and build-builtins re-pushes any
+        # clean image the registry is missing. The invariant it checked is a
+        # property of how the seed is made, so there is nothing left to check.
         #   caosd image-cleanup  report rebuildable image-cache usage; with
         #                --execute, clear it while the stack is stopped. The
         #                next `up` republishes std and warms images on demand.
@@ -759,28 +824,29 @@
         #                `caosd` on PATH can be far older than the `flake.lock`
         #                that names it, and the symptom looks like a caos bug.
         #                `caos-cli`'s usage banner carries the same string.
-        # `up` hands build-builtins.sh a prebuilt caos-cli, the flake's worker
-        # images, and a writable client repo (all via env) so it needs neither
-        # `nix` nor a writable repo root — hence it runs from any directory,
-        # including a tree that only imports this flake. This is the SAME
-        # std-publish path fly and the tests use, so there's one implementation.
-        # Uses the host's docker / `docker compose`; CAOS_DATA (absolute) holds all
-        # persistent state — server repo, publish client repo, redis, registry.
+        # `up` HANDS OVER A TREE, not build products: it copies the flake source
+        # into the state mount and starts one container on `stack/bootstrap`,
+        # which binds a persistent nix store, builds the stack's inputs inside,
+        # and execs `stack/serve` to start the daemons, publish std and seed the
+        # core from what that publish returned. So this command carries no
+        # caos-cli, no worker images and no client repo, and runs no `nix`
+        # itself — hence it still works from any directory, including a tree
+        # that only imports this flake.
+        # Uses the host's docker; CAOS_DATA (absolute) holds all persistent
+        # state — server repo, the staged tree, publish client repo, redis,
+        # registry.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          # skopeo + gzip: build-builtins.sh pushes each CLEAN image straight
-          # from its nix tarball to the registry (gunzip because skopeo's
-          # docker-archive transport wants an uncompressed tar). It no longer
-          # needs jq or tar — it composes no images, so there is no manifest to
-          # parse and no build context to unpack.
+          # COREUTILS AND BASH, AND THAT IS ALL. This command starts a container
+          # and waits for a file; everything it used to shell out for now
+          # happens inside the stack. skopeo + gzip were for pushing clean
+          # images at std_build, git for walking the seed records at std_check,
+          # curl for probing :9090, diffutils' cmp for deciding whether the
+          # staged binaries had changed, util-linux's setsid for a compose
+          # group that no longer exists — all of those callers are gone. Adding
+          # one back is a sign that work has leaked out of the stack again.
           # docker rides in from the host PATH (caosd already requires it).
-          # util-linux: setsid, so a hung compose up dies as a whole group.
-          # diffutils: cmp, which decides whether the stack's staged server
-          # and runnerd actually changed (stage_bins).
-          runtimeInputs = [
-            pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.skopeo pkgs.gzip
-            pkgs.util-linux pkgs.diffutils
-          ];
+          runtimeInputs = [ pkgs.coreutils pkgs.bash ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
@@ -850,133 +916,110 @@
               exit 1
             }
 
-            CLIENT=$CAOS_DATA/publish-client-repo
+            # NOTHING IS STAGED FROM THE STORE ANY MORE. This used to copy
+            # `server`, `runnerd` and `core-seeder-runner` into /state/bin, and
+            # to hand build-builtins the flake's prebuilt images and a client
+            # repo — because the container had no nix and could build nothing.
+            # It has nix now (stack/bootstrap), so the daemons, the clean
+            # images and the publish client all come from one `nix build`
+            # INSIDE, off a tree we copy in. What crosses the boundary is 4 MB
+            # of source instead of 1.6 GB of tarballs, and `nix build` out here
+            # no longer has to produce any of them.
 
-            # The binaries the stack's daemons run. They are NOT in the image
-            # (hostStackRoot): baking them in re-keyed 181 MB of userland on
-            # every Rust edit, so `nix build` re-tarred it and `up` re-loaded
-            # it to move 61 MB the image shares with nothing.
+            # ---- repack, and ONLY here ------------------------------------
+            # A caos server repo accumulates one pack per push — a suite adds
+            # hundreds — and gix's object store has a fixed 32 slots. At 33
+            # packs the server starts answering `reading arg tree: object <oid>
+            # not found: The slotmap turned out to be too small with 32
+            # entries`, which reads as a missing object and is really a full
+            # table. Measured, not predicted.
             #
-            # STAGED THROUGH THE STATE MOUNT, not bind-mounted from the store:
-            # on macOS the engine is a VM that cannot see the host's
-            # /nix/store (BUILDING_ON_MACOS.md), while $CAOS_DATA is already
-            # shared with it — this is the one path that works in both places.
-            # EXACTLY the binaries serve runs — its documented contract is
-            # "CAOS_STACK_BIN: dir holding `server`, `runnerd`" and, when the
-            # seeder is enabled, `core-seeder-runner` (design/caos-expr.md Phase
-            # 3). Everything else the workspace builds reaches the stack as the
-            # seeded core (build-builtins.sh publishes it from the store), never
-            # through here — do not widen STACK_BINS to smuggle a worker in.
-            BINSRC=${workspaceBins}/bin
-            BINDIR=$CAOS_DATA/stack/bin
-            STACK_BINS=(server runnerd core-seeder-runner)
-
-            # Compared by BYTES, not by store path — the same way
-            # build-builtins keys its image deltas. A workspace rebuild
-            # renames every store path but usually changes neither of these
-            # two files, and then there is nothing to stage and no reason to
-            # restart the daemons: editing a worker leaves `up` with only the
-            # std publish to do.
-            bins_staged() {
-              local b
-              for b in "''${STACK_BINS[@]}"; do
-                cmp -s "$BINSRC/$b" "$BINDIR/$b" || return 1
-              done
-            }
-
-            # Staged via a temp dir and renamed: a half-copied /state/bin is
-            # what a restarting stack would try to come up from.
-            stage_bins() {
-              echo "==> staging server + runnerd into $BINDIR" >&2
-              local b
-              rm -rf "$BINDIR.new"
-              mkdir -p "$BINDIR.new"
-              for b in "''${STACK_BINS[@]}"; do
-                install -m 755 "$BINSRC/$b" "$BINDIR.new/$b"
-              done
-              rm -rf "$BINDIR"
-              mv "$BINDIR.new" "$BINDIR"
-            }
-
-            # Publish std to this stack: build-builtins.sh with the flake's own
-            # prebuilt images and binaries, so nothing is nix-built at runtime.
-            # THE SAME SHAPE THE DEV STACK USES: one aggregate store path
-            # (`stackInputs`) carrying the daemons under `bin/` and the worker
-            # images under `images/`, handed to build-builtins so it runs no
-            # nix. The two bring-ups differ only in where that path comes from
-            # — substituted at flake-build time here, one `nix build` of the
-            # tree under test there — and in placement, which is stack/serve's
-            # business rather than this script's.
-            std_build() {
-              echo "==> publishing stdlib (build-builtins.sh)" >&2
-              CAOS_SERVER_URL=http://localhost:9090 \
-              CAOS_REGISTRY_HTTP="$REGISTRY" \
-              CAOS_CLI=${caos-cli}/bin/caos-cli \
-              CAOS_CLIENT_REPO="$CLIENT" \
-              CAOS_BUILTIN_IMAGES="$(echo ${stackInputs "caos-stack-inputs" workspaceBins}/images/*)" \
-              CAOS_BUILTIN_BINS="${stackInputs "caos-stack-inputs" workspaceBins}" \
-                bash ${self}/build-builtins.sh >/dev/null
-            }
-
-            # Does the registry still hold every image the SEED RECORDS name? A
-            # seeded item's RESULT is a delta whose `base` is a digest ref, and a
-            # wiped registry leaves the seed pointing at blobs that are gone —
-            # which otherwise surfaces as every test failing deep inside the
-            # fan-out rather than as one clear statement here
-            # (design/one-stack-image.md).
+            # WHY THIS IS THE ONLY SAFE PLACE. A repack REWRITES the object
+            # store, and this repo's whole config exists to stop anything doing
+            # that behind a live reader's back: `gc.auto 0`, `receive.autogc
+            # false` and `maintenance.geometric-repack.enabled false` are three
+            # settings with one job. A server holds its repo open as a
+            # `gix::ThreadSafeRepository` for its lifetime, and when that
+            # object database re-consolidates against packs that moved under
+            # it, gix asserts and the request thread panics — the caller gets a
+            # body-less 500 and the log says nothing (see the server config
+            # above). `dev/stack-up` used to do this at every dev bring-up,
+            # which was harmless while one stack existed at a time and became a
+            # live peer's silent 500 as soon as two did.
             #
-            # Walk `refs/caos/seed`, NOT the entries under `std/`: an entry is a
-            # source directory carrying a `.caos-expr`, so it names no digest at
-            # all and a walk over entries would verify nothing.
+            # Here, nothing is reading: `up` has just removed the stack, and we
+            # refuse if any worker is still alive. So this is the one moment a
+            # rewrite is safe, and it covers BOTH repos — the host's own, and
+            # the one every dev stack shares.
             #
-            # Checked through $REGISTRY — the name the DOCKER DAEMON pulls
-            # with. The seed's refs spell the same registry caos-registry:5000,
-            # which is how the SERVER reaches it; one registry, two names, so the
-            # check says which one it used.
+            # `-a -d -k` and the `-k` is load-bearing: GC is off precisely
+            # because almost every object here is unreachable from any ref
+            # (SPEC), so a repack that dropped unreachable objects would delete
+            # most of the store.
             #
-            # `checked` must stay: a guard that silently verifies nothing is worse
-            # than no guard, so finding no digests is itself an error.
-            std_check() {
-              local reg="$REGISTRY" tree missing=0 checked=0 oid name base digest code
-              [ -d "$CLIENT" ] \
-                || { echo "caosd: no client repo at $CLIENT — run 'caosd std-build'" >&2; exit 1; }
-              tree=$(git -C "$CLIENT" rev-parse --verify -q refs/caos/seed) \
-                || { echo "caosd: no refs/caos/seed — run 'caosd std-build'" >&2; exit 1; }
-              echo "==> checking the seeded core ($tree) against the registry at $reg" >&2
-              while read -r _ _ oid name; do
-                # A seed result is either a git-docker DELTA, whose `base` is a
-                # `docker://…@sha256:…` ref, or a CURRY, whose `base` names
-                # another tree by hash. Only the former names the registry; a
-                # curry reaches it through the delta it is built on, which is a
-                # seed record in its own right (runner) and checked on its turn.
-                base=$(git -C "$CLIENT" cat-file -p "$oid:result/base" 2>/dev/null) || continue
-                digest=''${base##*@}
-                [ "$digest" != "$base" ] || continue
-                checked=$((checked + 1))
-                code=$(curl -sS -o /dev/null -w '%{http_code}' \
-                  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-                  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-                  "http://$reg/v2/caos/manifests/$digest") \
-                  || { echo "caosd: registry unreachable at $reg" >&2; exit 1; }
-                if [ "$code" = 200 ]; then
-                  echo "  ok       $name -> $digest" >&2
-                else
-                  echo "  MISSING  $name -> $digest (HTTP $code)" >&2
-                  missing=1
+            # IN A CONTAINER, for both, even though the host repo is a plain
+            # bind. It keeps one mechanism rather than two, and it is the only
+            # way to reach the dev repo at all — that one lives in a named
+            # volume, which on macOS is inside the engine's VM and has no host
+            # path. It also means this command needs no `git` of its own, which
+            # is why it now carries almost no runtime inputs.
+            DEV_VOLUME=caos-vol-caos-dev
+            REPACK_THRESHOLD=16
+
+            # Is anything alive that could be READING a server repo? Two
+            # sources, and both are needed — the same pair `image-cleanup`
+            # checks before it wipes:
+            #
+            #   the stack container   holds $CAOS_DATA/stack/git open. `up`
+            #                         removes it just above, but this function
+            #                         must not depend on its one caller having
+            #                         done so.
+            #   anything runnerd started   carries its owner label, and a dev
+            #                         stack IS a worker, so that one filter
+            #                         covers every holder of the dev repo.
+            caos_containers_running() {
+              local running
+              running=$(
+                if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
+                  echo "$NAME"
                 fi
-              done < <(git -C "$CLIENT" ls-tree "$tree")
-              if [ "$checked" = 0 ]; then
-                echo "caosd: found NO registry digests to check — this check is" >&2
-                echo "       verifying nothing, which means it has drifted from" >&2
-                echo "       where the images are recorded. Fix the check." >&2
-                exit 1
+                docker ps --filter label=caos.runnerd.owner --format '{{.Names}}'
+              )
+              [ -n "$running" ]
+            }
+
+            # ONE container, and it decides per repo. The threshold is a bound
+            # on ONE repository's slot table, so summing two repos' packs and
+            # comparing that would repack a 1 GB store because the other one
+            # grew. Counting inside also removes the window a count-then-repack
+            # pair would leave between them.
+            #
+            # The threshold rides in as `$1` rather than being interpolated
+            # into the script text: this is a nix string containing a shell
+            # string containing a shell script, and that is two layers of
+            # quoting too many to add a third.
+            repack_repos() {
+              # Skipped rather than fatal: a person running `up` while a suite
+              # is in flight wants a stack, not homework, and the next idle
+              # `up` will do it.
+              if caos_containers_running; then
+                echo "==> caos containers are still running — skipping the repack" >&2
+                return 0
               fi
-              if [ "$missing" != 0 ]; then
-                echo "caosd: the seeded core names images this registry no longer has." >&2
-                echo "       The registry was wiped; run 'caosd std-build'." >&2
-                exit 1
-              fi
-              echo "==> the seeded core is intact ($checked images)" >&2
+              docker run --rm --entrypoint /bin/bash \
+                -v "$CAOS_DATA/stack:/host" -v "$DEV_VOLUME:/dev-stack" \
+                caos-stack:latest -c '
+                  limit=$1
+                  for d in /host/git /dev-stack/git; do
+                    [ -d "$d" ] || continue
+                    packs=$(ls "$d"/objects/pack/*.pack 2>/dev/null | wc -l)
+                    if [ "$packs" -gt "$limit" ]; then
+                      echo "==> repacking $d ($packs packs)" >&2
+                      git -C "$d" repack -adkq || exit 1
+                    fi
+                  done
+                ' _ "$REPACK_THRESHOLD" \
+                || die "repacking the server repos"
             }
 
             # The registry and Redis are caches: git holds the image inputs and
@@ -1051,7 +1094,7 @@
 
             usage() {
               echo "caosd ($CAOS_REV)"
-              echo "usage: caosd [up|down|reset|logs|std-build|std-check|image-cleanup|version]"
+              echo "usage: caosd [up|down|reset|logs|image-cleanup|version]"
             }
 
             case "''${1:-up}" in
@@ -1061,96 +1104,115 @@
               ;;
             up)
               # ONE container runs the whole daemon group (design/
-              # one-stack-image.md): `caosd serve` is its entrypoint, and the
-              # image is the same one the suite runs — in the `host` world
-              # rather than the `test` one. No compose, no per-daemon images.
+              # one-stack-image.md), and it BUILDS WHAT IT RUNS: its entrypoint
+              # is `stack/bootstrap`, which binds a persistent nix store, does
+              # one `nix build` of the tree's stack inputs, and execs
+              # `stack/serve` — which starts the daemons, publishes std, and
+              # starts the seeder with the tree that publish returned.
+              #
+              # SO THIS COMMAND CARRIES NO BUILD PRODUCTS. It used to substitute
+              # `caos-stack-inputs` at flake time and hand them in, which meant
+              # producing this very binary built all three clean images —
+              # including the 1.5 GB cargo one — and then those 1.6 GB had to
+              # cross into the container. Now the tree crosses instead: 4 MB.
+              #
+              # ALWAYS RECREATE. There is no longer anything to compare: the
+              # daemons are built inside from a tree we copy in on every run, so
+              # "did the binaries move" is a question this side cannot answer
+              # and does not need to. A warm `up` costs a container restart and
+              # a cache-hit nix build; the reuse logic it replaces (bins_staged,
+              # image-id compare, start-the-stopped-one) existed only to dodge
+              # that cost and got the stale-deploy cases wrong in the process.
               load_once caos-stack ${hostStackImage}
               docker network inspect "$NET" >/dev/null 2>&1 \
                 || docker network create "$NET" >/dev/null
+              docker rm -f "$NAME" >/dev/null 2>&1 || true
 
-              # Stage before the container decision: whether the binaries
-              # moved is half of it.
-              if bins_staged; then
-                echo "==> server + runnerd are byte-identical — nothing to stage" >&2
-                fresh_bins=""
-              else
-                stage_bins
-                fresh_bins=1
-              fi
+              repack_repos
 
-              # Recreate when the running container is on a different image
-              # than the build just loaded, OR when the binaries under it just
-              # changed — server and runnerd are already-running processes, so
-              # restaging alone does not deploy them. An unchanged `up` is
-              # still a no-op.
-              want=$(docker image inspect -f '{{.Id}}' caos-stack:latest)
-              have=$(docker inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)
-              running=$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)
-              if [ -n "$have" ] && { [ "$have" != "$want" ] || [ -n "$fresh_bins" ]; }; then
-                echo "==> recreating onto the rebuilt stack" >&2
-                docker rm -f "$NAME" >/dev/null
-                have=""
-              elif [ -n "$have" ] && [ "$running" != true ]; then
-                # EXISTS BUT STOPPED — what a host or sandbox restart leaves
-                # behind. Its state is all in the bind mount, so starting it is
-                # enough; only checking existence here made `up` skip the run
-                # and then time out waiting, unrecoverably.
-                echo "==> starting the existing stack container" >&2
-                docker start "$NAME" >/dev/null
-              fi
-              if [ -z "$have" ]; then
-                echo "==> starting the stack (redis, registry, server, runnerd)" >&2
-                # Three aliases, one container: every name that resolved under
-                # compose still resolves — workers reach the server as
-                # `caos-server`, and the server pulls a delta's `base` as
-                # `caos-registry:5000` (design/one-stack-image.md, the netns
-                # section). Workers get their OWN netns on this bridge, which
-                # is what lets a test stack bind its own :80 — and is also why
-                # `caos-redis` has to exist as a NAME: a worker here shares no
-                # loopback with the stack, so the address the server uses
-                # (127.0.0.1) is meaningless to it.
-                docker run -d --name "$NAME" \
-                  --network "$NET" \
-                  --network-alias caos-server \
-                  --network-alias caos-registry \
-                  --network-alias caos-redis \
-                  -p 9090:80 -p "$REGISTRY_PORT:5000" \
-                  -v "$CAOS_DATA/stack:/state" \
-                  -v /var/run/docker.sock:/var/run/docker.sock \
-                  -e CAOS_STACK_STATE=/state \
-                  -e CAOS_STACK_LOGS=/state/logs \
-                  -e CAOS_STACK_BIN=/state/bin \
-                  -e CAOS_STACK_REDIS_PORT=6379 \
-                  -e CAOS_STACK_REDIS_PERSIST=yes \
-                  -e CAOS_STACK_REGISTRY=yes \
-                  -e CAOS_STACK_REDIS=yes \
-                  -e CAOS_STACK_RUNNERD=yes \
-                  -e CAOS_STACK_SEEDER=yes \
-                  -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
-                  -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
-                  -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
-                  -e CAOS_DOCKER_NETWORK="$NET" \
-                  -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \
-                  -e CAOS_PENDING_TIMEOUT_SECS=900 \
-                  caos-stack:latest >/dev/null
-              fi
+              # THE TREE, copied rather than mounted: a bind's source is
+              # resolved by the ENGINE, which on macOS is a VM that sees only
+              # the paths it has been given, while $CAOS_DATA is already shared
+              # with it — the same reason the binaries used to be staged here.
+              # `cp -RL` because a nix store path is a symlink farm and the
+              # container must get files (CLAUDE.md, "everything an image's
+              # contents puts on disk is a SYMLINK").
+              echo "==> staging the tree into $CAOS_DATA/stack/tree" >&2
+              rm -rf "$CAOS_DATA/stack/tree.new"
+              mkdir -p "$CAOS_DATA/stack"
+              cp -RL ${self} "$CAOS_DATA/stack/tree.new"
+              chmod -R u+w "$CAOS_DATA/stack/tree.new"
+              rm -rf "$CAOS_DATA/stack/tree"
+              mv "$CAOS_DATA/stack/tree.new" "$CAOS_DATA/stack/tree"
 
-              echo "==> waiting for caos-server on :9090 ..." >&2
+              echo "==> starting the stack (redis, registry, server, runnerd)" >&2
+              # Three aliases, one container: every name that resolved under
+              # compose still resolves — workers reach the server as
+              # `caos-server`, and the server pulls a delta's `base` as
+              # `caos-registry:5000` (design/one-stack-image.md, the netns
+              # section). Workers get their OWN netns on this bridge, which
+              # is what lets a test stack bind its own :80 — and is also why
+              # `caos-redis` has to exist as a NAME: a worker here shares no
+              # loopback with the stack, so the address the server uses
+              # (127.0.0.1) is meaningless to it.
+              #
+              # SYS_ADMIN and the store volume are for the bind in bootstrap:
+              # a volume cannot be mounted AT /nix, because this image's own
+              # userland lives there and would be shadowed. Not a widening —
+              # this container already holds the engine socket, which is
+              # root-equivalent over the engine.
+              docker run -d --name "$NAME" \
+                --network "$NET" \
+                --network-alias caos-server \
+                --network-alias caos-registry \
+                --network-alias caos-redis \
+                --cap-add SYS_ADMIN \
+                -p 9090:80 -p "$REGISTRY_PORT:5000" \
+                -v "$CAOS_DATA/stack:/state" \
+                -v caos-vol-mounted-nix:/mounted-nix \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -e CAOS_STACK_TREE=/state/tree \
+                -e CAOS_STACK_INPUTS_ATTR=caos-stack-inputs \
+                -e CAOS_STACK_STORE=/mounted-nix \
+                -e CAOS_STACK_STATE=/state \
+                -e CAOS_STACK_LOGS=/state/logs \
+                -e CAOS_STACK_READY=/state/stack.ready \
+                -e CAOS_CLIENT_REPO=/state/publish-client-repo \
+                -e CAOS_REGISTRY_HTTP=localhost:5000 \
+                -e CAOS_STACK_REDIS_PORT=6379 \
+                -e CAOS_STACK_REDIS_PERSIST=yes \
+                -e CAOS_STACK_REGISTRY=yes \
+                -e CAOS_STACK_REDIS=yes \
+                -e CAOS_STACK_RUNNERD=yes \
+                -e CAOS_STACK_SEEDER=yes \
+                -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
+                -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
+                -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
+                -e CAOS_DOCKER_NETWORK="$NET" \
+                -e CAOS_RUNNER_SOCKET=/var/run/docker.sock \
+                -e CAOS_PENDING_TIMEOUT_SECS=900 \
+                caos-stack:latest >/dev/null
+
+              # WAIT FOR THE READY FILE, not for :9090. The server answering is
+              # no longer the end of bring-up — std still has to be published
+              # and the seeder started from it — and serve touches this only
+              # once all of that is done. Waiting on the port instead would
+              # return a stack whose core has no answerer.
+              echo "==> waiting for the stack (build, publish, seed) ..." >&2
+              rm -f "$CAOS_DATA/stack/stack.ready"
               ok=""
-              for _ in $(seq 1 60); do
-                if curl -s -o /dev/null --max-time 2 http://localhost:9090/; then
+              for _ in $(seq 1 1800); do
+                if [ -e "$CAOS_DATA/stack/stack.ready" ]; then
                   ok=1
                   break
                 fi
                 # serve dies as a group, so the container exiting IS the
-                # diagnosis — don't wait out the full minute for it.
+                # diagnosis — don't wait out the full timeout for it.
                 docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null \
                   | grep -q true || die "the stack exited during bring-up"
                 sleep 1
               done
-              [ -n "$ok" ] || die "caos-server never answered on :9090"
-
-              std_build
+              [ -n "$ok" ] || die "the stack never finished bring-up"
 
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
               ;;
@@ -1168,12 +1230,6 @@
               # `docker logs` would interleave them); serve's own output is the
               # container's.
               tail -n +1 -f "$CAOS_DATA"/stack/logs/*.log
-              ;;
-            std-build)
-              std_build
-              ;;
-            std-check)
-              std_check
               ;;
             image-cleanup)
               shift

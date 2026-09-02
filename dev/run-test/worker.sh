@@ -61,7 +61,9 @@ publish() { # <verdict-line> <output-file>
   mkdir -p /tmp/out
   printf '%s\n' "$1" > /tmp/out/verdict
   cp "$2" /tmp/out/output
-  echo $(($(date +%s) - $(cat /cas/args/start))) > /tmp/out/seconds
+  # Its own assignment, not inline: `set -e` sees a failed `$( )` here, not in a word.
+  start=$(cat /cas/args/start)
+  echo $(($(date +%s) - start)) > /tmp/out/seconds
   caos put /tmp/out /cas/out
 }
 
@@ -82,13 +84,8 @@ eval)
   ;;
 
 launch)
-  # Args are lazy placeholders: `--start` has to be FETCHED before it can be
-  # read, and an unfetched one reads as empty — which surfaces two containers
-  # later as `1787683099 - : arithmetic syntax error` in the elapsed sum.
-  caos get /cas/args/start || fail "reading --start"
   # Expand the input before reading it: an unfetched directory answers "no" to
   # every question about its contents.
-
   caos get /cas/args/in || fail "expanding the test tree"
   if [ -e /cas/args/error ]; then
     # The EXPRESSION is broken — a missing `DEEP-DEPS/<name>`, a path that does

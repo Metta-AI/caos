@@ -64,7 +64,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `rust/crates/caos-cli/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
 | `rust/crates/server/` | The `server` crate → `caos-server` |
 | `rust/crates/worker-*/` | The worker crates |
-| `build-builtins.sh` | Bootstraps the seeded core and publishes `refs/caos/seed` |
+| `stack/` | The one bring-up: `bootstrap` (store + `nix build`), `serve` (daemons, publish, seeder), `build-builtins.sh` (the seeded core) |
 | `tests/` | The integration suites (the `caos-build`/`caos-test`/`caos-test-result` tools now live under `std/`, offered by the agent harness) |
 
 ## Development
@@ -677,14 +677,20 @@ declaration moves and the code does not.
 
 The five entries that cannot be built by the machinery they ARE — `flake-builder`
 (a flake built by the flake-builder), `cargo`, `runner`, `rustc` and `deep-deps`
-— name a `docker://seeded…` sentinel instead of a builder. `./build-builtins.sh`
-hand-builds what each expression would have produced and publishes it as a seed
-record under `refs/caos/seed`; the core-seeder-runner answers that exact key,
-spawning no container.
+— name a `docker://seeded…` sentinel instead of a builder.
+`stack/build-builtins.sh` hand-builds what each expression would have produced
+and prints a tree of seed records; the core-seeder-runner answers those exact
+keys, spawning no container.
+
+It is not run by hand in normal use, and it does not publish to a ref.
+`stack/serve` is its only caller: it publishes once the server and registry are
+up, and starts the seeder with the tree the publish returned — two adjacent
+steps with a value between them, so there is no name a second stack could
+overwrite. Bringing a stack up IS publishing; there is no separate command.
 
 ```bash
-./build-builtins.sh                 # bootstrap the seeded core
-./build-builtins.sh bash cargo      # a subset
+./stack/build-builtins.sh                 # bootstrap the seeded core, by hand
+./stack/build-builtins.sh bash cargo      # a subset
 ```
 
 ## Local testing
