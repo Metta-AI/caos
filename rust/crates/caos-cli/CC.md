@@ -46,12 +46,19 @@ then:
 ./dev/claude-code/run -p 'your task'  # or headless
 ```
 
-Any argument is passed through to `claude`. To drive it by hand instead:
+Any argument is passed through to `claude`. To drive it by hand instead, **from
+the repository root**:
 
 ```bash
 claude --settings dev/claude-code/settings.json \
        --mcp-config dev/claude-code/mcp.json --strict-mcp-config
 ```
+
+`mcp.json` names the server `${CAOS_BIN:-./result/bin/caos}`, so it finds the
+build without anything on `PATH`, and `CAOS_BIN` overrides it with another
+binary (`rust/target/debug/caos-cli`, say). The default is relative, so a
+by-hand launch from elsewhere will not find it; the launcher resolves an
+absolute path from its own location and has no such constraint.
 
 `settings.json` denies Claude Code's built-in file and shell tools, which
 removes them from the model's context rather than merely refusing their calls,
@@ -71,6 +78,28 @@ does not say so. Asked to write a file, it will emit a plausible `bash` block
 and report success, having written nothing. `dev/claude-code/run` therefore
 probes `tools/list` before launching, so a missing or stale binary is an error
 at startup instead of a fabricated result later.
+
+## When the server shows as broken
+
+`/mcp` reports a failed server but no reason, and neither the terminal nor
+`--debug` prints one. The error is in a per-server log:
+
+```bash
+ls -t ~/.cache/claude-cli-nodejs/*"$(pwd | tr / -)"*/mcp-logs-caos/ | head -1
+```
+
+or just look under
+`~/.cache/claude-cli-nodejs/<project-dir-with-slashes-as-dashes>/mcp-logs-caos/`
+and read the newest `.jsonl`. One line per connection attempt, and the failure
+is explicit:
+
+```json
+{"error":"Connection failed (ENOENT): Executable not found in $PATH: \"caos\""}
+```
+
+That is the log to check first for any "broken server" report — a wrong path,
+a binary too old to know `cc serve`, or a crash on startup all land there and
+nowhere else.
 
 ## What gets recorded
 
