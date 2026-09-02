@@ -195,6 +195,8 @@ summarize)
   # one broken test never hides the others.
   caos get /cas/args/children
   caos get /cas/args/start-time
+  # Its own assignment, not inline: `set -e` sees a failed `$( )` here, not in a word.
+  start_time=$(cat /cas/args/start-time)
   mkdir -p /tmp/rep
   passn=0 failn=0
   {
@@ -223,7 +225,7 @@ summarize)
       if [ ${#t} -gt "$width" ]; then width=${#t}; fi
     done
 
-    echo "tests ($(($(date +%s) - $(cat /cas/args/start-time)))s)"
+    echo "tests ($(($(date +%s) - start_time))s)"
     # A mark rather than a word, and no colour: this report is a VALUE in a git
     # tree, so a worker cannot know whether whoever reads it is a terminal, and
     # ANSI escapes would be baked into the artifact and every log that shows it.
