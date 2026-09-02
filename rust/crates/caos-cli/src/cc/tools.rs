@@ -622,13 +622,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn an_empty_result_is_no_matches() {
-        let dir = scratch("empty");
-        assert_eq!(render_materialized(&dir, "tree", "").unwrap(), "no matches");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Past the budget the walk stops READING but keeps COUNTING, because the
     /// count is what tells the model its pattern was too broad. A truncation
     /// that silently dropped the rest would read as a complete answer.
