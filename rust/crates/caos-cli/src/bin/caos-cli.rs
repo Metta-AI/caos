@@ -73,6 +73,11 @@ fn run(args: &[String]) -> Result<(), String> {
         // `--new` starts another); with no prompt on a terminal it loops, one
         // turn per line. Flag parsing and usage live in the conversation client.
         Some("talk") => caos_cli::cli_talk(&transport()?, &args[2..]),
+        // `cc hook` — record one Claude Code hook payload (read as JSON on
+        // stdin) into the session's CAOS conversation. Claude Code drives the
+        // model; this keeps the durable log, so a session recorded here replays
+        // in `caos tui` like any other conversation.
+        Some("cc") => caos_cli::cli_cc(&transport()?, &args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation on its shared canonical head. Flag parsing (and the
@@ -159,6 +164,7 @@ fn usage(args: &[String]) -> String {
          {prog} talk [<prompt>] [-c <name>] [--new] [--log] [--username <name>] [options]\n  \
          {prog} tui [-c <name>] [--new] [--username <name>] [options]\n  \
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [options]\n  \
+         {prog} cc hook\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \

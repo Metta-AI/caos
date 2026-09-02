@@ -161,6 +161,15 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   reports `tail`'s status, so a failed command looks like a pass — that happened,
   and the next step ran against a stack that was not up. Use
   `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
+- **`nix build` only sees GIT-TRACKED files.** A flake's source is the git
+  tree, so a NEW file that cargo compiles happily is simply absent from the
+  build — `mod cc;` failed with "to create the module `cc`, create file
+  ...cc.rs" while that exact file sat in the working tree. The error names the
+  file it is looking at, which reads as a typo rather than a missing `git add`.
+  This is NOT the `src` filter below (a `.rs` file is kept); dirty EDITS to
+  tracked files are picked up fine, which is what makes the exception easy to
+  forget. `git add` the file before believing a `nix build` failure about it.
+
 - **`run-tool caos-test` does not cover `nix build`.** The suite compiles the tree
   with cargo over the real `rust/crates/` directory; `nix build` compiles a copy
   filtered by the flake's `src`. Anything that filter drops is invisible to a

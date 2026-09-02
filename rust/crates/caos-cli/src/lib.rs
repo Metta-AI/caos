@@ -27,7 +27,10 @@ use conversation_protocol::{
     CONVERSATION_HEAD_SUFFIX as HEAD_SUFFIX, CONVERSATION_PREFIX,
 };
 
-const MAX_APPEND_ATTEMPTS: usize = 32;
+mod cc;
+pub use cc::cli_cc;
+
+pub(crate) const MAX_APPEND_ATTEMPTS: usize = 32;
 /// Local-store name of the conversation model credential (`/secret/<name>` in
 /// the granted workers). Public alongside its companions below so the tui's
 /// first-run setup writes exactly the store entry this crate requires.
@@ -424,7 +427,7 @@ pub fn submit_message_with_tree(
     submit_message_inner(t, options, id, message, false, Some(proposal))
 }
 
-fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), String> {
+pub(crate) fn reject_reserved_caos(t: &GitTransport, root: &str, what: &str) -> Result<(), String> {
     if t.git_capture(
         &["rev-parse", "--verify", "--quiet", &format!("{root}:.caos")],
         None,
@@ -2405,7 +2408,7 @@ pub fn describe_tool_set(
     Ok(ToolSetDescription { source, tools })
 }
 
-fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
+pub(crate) fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
     let rev = options.base.as_deref().unwrap_or("HEAD");
     t.resolve_revspec(rev)?
         .map(|oid| oid.to_string())
@@ -2445,7 +2448,7 @@ fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
     Ok(lines)
 }
 
-fn create_event_commit(
+pub(crate) fn create_event_commit(
     t: &GitTransport,
     tree: &str,
     parent: &str,
@@ -2484,7 +2487,7 @@ fn create_event_commit_with_parents(
 /// absent). `false` means a clean CAS race; errors mean the same expected value
 /// was observed after a failed push, so blindly retrying would hide a real
 /// transport or server failure.
-fn push_head_cas(
+pub(crate) fn push_head_cas(
     t: &GitTransport,
     refname: &str,
     expected: Option<&str>,
@@ -2542,7 +2545,7 @@ fn push_new_conversation(
     }
 }
 
-fn try_push_initial_conversation(
+pub(crate) fn try_push_initial_conversation(
     t: &GitTransport,
     user: &str,
     id: &str,
@@ -2776,7 +2779,7 @@ pub fn conversation_ref(id: &str) -> Result<String, String> {
     protocol_conversation_ref(id)
 }
 
-fn remote_ref(t: &GitTransport, refname: &str) -> Result<Option<String>, String> {
+pub(crate) fn remote_ref(t: &GitTransport, refname: &str) -> Result<Option<String>, String> {
     let output = t.git_capture(&["ls-remote", "--refs", CAOS_REMOTE, refname], None)?;
     let mut lines = output.lines();
     let result = lines.next().and_then(|line| line.split_whitespace().next());
@@ -2988,7 +2991,11 @@ fn fetch_commit_after(
     fetch_commit(t, hash)
 }
 
-fn fetch_conversation_commit(t: &GitTransport, refname: &str, hash: &str) -> Result<(), String> {
+pub(crate) fn fetch_conversation_commit(
+    t: &GitTransport,
+    refname: &str,
+    hash: &str,
+) -> Result<(), String> {
     let cached = t
         .git_capture(&["rev-parse", "--verify", "--quiet", refname], None)
         .ok()
@@ -3054,7 +3061,11 @@ fn first_parent_contains(t: &GitTransport, tip: &str, ancestor: &str) -> Result<
     Ok(history.lines().any(|commit| commit == ancestor))
 }
 
-fn update_local_cache(t: &GitTransport, refname: &str, hash: &str) -> Result<(), String> {
+pub(crate) fn update_local_cache(
+    t: &GitTransport,
+    refname: &str,
+    hash: &str,
+) -> Result<(), String> {
     t.git_capture(&["update-ref", refname, hash], None)
         .map(|_| ())
 }
@@ -3230,7 +3241,7 @@ fn waterfall_string(value: &Value, key: &str, target: &mut Option<String>) -> Re
     Ok(())
 }
 
-fn default_title(message: &str) -> String {
+pub(crate) fn default_title(message: &str) -> String {
     const MAX_CHARS: usize = 60;
     let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= MAX_CHARS {
