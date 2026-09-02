@@ -35,7 +35,24 @@
 # which is the failure this whole mechanism exists to avoid.
 set -euo pipefail
 
+# THE SEEDING IS SERIALISED ACROSS CONTAINERS, and this is the one place in the
+# whole scheme that needs a lock. Several of these run at once against one
+# volume (SPEC, "several of these can run at once against one store"), and while
+# nix itself is built for that — it locks per derivation and its db is sqlite —
+# `cp` is not: it writes each file straight to its destination rather than to a
+# temp and renaming, so a concurrent nix can read a store path that is HALF
+# THERE and believe it, or delete it as an invalid output and rebuild it out
+# from under this copy. That only bites when the two images differ, i.e. exactly
+# when two people are testing two trees, which is the case this exists for.
+#
+# The lock lives in the volume because that is what both containers can see, and
+# it is held across the bind so the db load lands inside it too. `-w`: waiting
+# for another container's seed is normal and takes seconds; waiting ten minutes
+# means something is wrong and should say so rather than proceed unsafely.
 if [ -d /mounted-nix ]; then
+  exec 9>/mounted-nix/.caos-seed.lock
+  flock -w 600 9 \
+    || { echo "test-stack: another container held the /mounted-nix seed lock for 600s" >&2; exit 1; }
   # -n: the volume's copy wins. It is the newer truth — it has whatever previous
   # runs built — and the image only ever supplies what is missing.
   cp -an /nix/. /mounted-nix/ 2>/dev/null || true
@@ -45,6 +62,7 @@ if [ -d /mounted-nix ]; then
   # Registers the image's paths in the volume's db. Harmless when they are
   # already there, which is the common case.
   nix-store --load-db < /tmp/image-db.dump 2>/dev/null || true
+  exec 9>&-
 fi
 
 # std/bash's contract from here: fetch the next executable in the chain and run

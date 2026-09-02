@@ -7,8 +7,8 @@ Every script here runs with it, and two constructs quietly break under it.
 - **`[ cond ] && action` exits the script when the condition is false**, if that
   list is the last command in its scope (a function, a loop body, a `{ }` block,
   the script). Write `if`. This is not hypothetical: it is the single largest
-  source of bugs in this tree's shell — `build-builtins.sh` still carries three
-  latent instances, one of which makes `./build-builtins.sh <name>` exit 1
+  source of bugs in this tree's shell — `stack/build-builtins.sh` still carries three
+  latent instances, one of which makes `./stack/build-builtins.sh <name>` exit 1
   before doing anything.
 - **`pipefail` makes a pipeline fail on its LEFTMOST failure**, not its last
   command. `curl -f ... | awk` returns curl's 22 on a 404, so a lookup whose
@@ -154,6 +154,65 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   Anything you hand-roll that forms a seeded key (a `caos run-then` against a
   sentinel, in `caos-tools/*/worker.sh`) must match `build-builtins.sh`'s record
   exactly, `strip_caos_expr` included; nothing else checks that agreement.
+
+# Several dev stacks at once
+
+Several `dev/test-stack` containers run against one host stack, each testing a
+different tree, and they share three volumes (`/mounted-nix`, `/caos-dev`,
+`/caos-images`) plus the host's redis and registry. The rule that makes that
+work is **share what is keyed by CONTENT, and give everything else a name of
+the container's own.** Where it was backwards, none of the failures looked like
+concurrency.
+
+- **A seed record is keyed by NAME, so a second publisher REPLACES yours.** This
+  is why the seed tree is now PASSED BY VALUE — `stack/serve` runs
+  `stack/build-builtins.sh`, takes the tree it prints on stdout, and starts the
+  seeder with it — rather than written to `refs/caos/seed` and polled for. With
+  a ref, two trees differing under `std/` differ in `required`, so the loser's
+  keys vanish and its jobs park until the 503 that blames capacity; and two
+  BUILDS of caos are worse, because `required` is identical and only `result`
+  differs, so the loser's seeder silently answers with the winner's binaries.
+  The whole visible trace of that was one line —
+  `core-seeder-runner: deep-deps now answers tree X (was tree Y)`. Both
+  reproduced with two dev stacks against one host. If you ever reintroduce a
+  name between a publisher and an answerer, this is what you are signing up for.
+- **One fixed path under a shared volume is one stack's answer for all of
+  them.** `/caos-dev/bin` was the symlink `std/caos-test` reads to find the
+  client it just built, so the stack that started second repointed it and the
+  first drove its own server with the OTHER build's `caos-cli`.
+  `/caos-dev/publish-client-repo` was two publishers staging `seed-deep-deps`
+  into one repo under one name — reproduced as `ln: failed to create symbolic
+  link '/caos-dev/publish-client-repo/layer-additions/usr/bin/env': File
+  exists`, which killed a whole bring-up. `/caos-dev/stack.ready` is `rm -f`'d
+  before serve starts, so a second stack could delete the first's after serve
+  wrote it and the first would wait out its 60s and die "never came up". All of
+  these live under `/caos-dev/runs/<container id>` now, reached as `/caos-run`
+  from inside the container — which is also where a dead stack's logs are.
+- **`git config` is a LOCK, and the server treats it as required.** The settings
+  a server asserts on EVERY boot are `git config` writes, so two servers coming
+  up on one repo race for `config.lock` and the loser died with `fatal: …
+  could not lock config file config: File exists` before it ever listened —
+  surfacing a file away as `caosd serve: server never came up`.
+  `run_required_git` waits a peer's lock out now (5s) instead of dying on it.
+- **What IS safe to share is anything content-addressed**, and most of this is:
+  the object database (`refs/caos/req|res/` are keyed by hash, and a test that
+  writes a mutable ref uniquifies it — `tests/README.md`), the registry, the
+  podman store, and redis under its `CAOS_CACHE_NAMESPACE`. The nix store too,
+  with one exception: `dev/test-stack/worker` seeds it with `cp`, which writes
+  each file in place rather than temp-and-rename, so a concurrent nix can read a
+  store path that is half there. That copy takes a flock in the volume.
+- **A concurrency fix is not tested by one stack.** Run two, from two trees that
+  really differ, at the same time — `git clone --local` two worktrees, put an
+  `eprintln!` marker in `worker-deep-deps` in each, `caos-cli run-tool caos-test
+  --only=hello` in both at once — and then read
+  `/caos-dev/runs/*/logs/core-seeder-runner.log`: each stack must answer its OWN
+  `deep-deps` tree, and each `runs/*/bin` must point at its own
+  `caos-test-stack-inputs`. A green suite from one of them proves nothing.
+  Do NOT diverge the trees by editing a SEEDED std entry (`std/deep-deps`,
+  `std/rustc`, `std/runner`, `std/cargo`, `std/flake-builder`): the HOST's
+  seeder has to answer for those while resolving `caos-test`'s own image, so the
+  run dies at the host with a 503 naming `docker://seeded-…` before either dev
+  stack exists. Diverge `rust/` instead.
 
 # Before committing
 

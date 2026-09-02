@@ -4,7 +4,6 @@ A WorkRequest is:
 - an ArgTree: a git tree containing named args:
     - image: See below
     - other args, by agreement between the caller and the worker, all as git files/trees/commits
-    - std (optional, but very common)
     - salt (optional): a string that is used to invalidate the cache
 - stack
 
@@ -349,7 +348,7 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `std`, `salt` and
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt` and
 `help` are refused: the interpreter, or the tool's own expression, binds those
 itself and currying SHALL fail on a rebind. A malformed `@param` tag is skipped
 with a message, never silently

@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# stack/bootstrap — turn a TREE into a running stack. The step before
+# `stack/serve` in every placement that has to build what it runs.
+#
+# serve configures itself from the environment and starts daemons; it does not
+# build. This does the two things that have to happen first and cannot be done
+# from outside a container:
+#
+#   1. give this container a nix store that OUTLIVES it, so a second build is
+#      incremental rather than from nothing
+#   2. `nix build` the tree's stack inputs — the daemons under `bin/` and the
+#      clean worker images under `images/` — and hand serve the result
+#
+# WHY THE BUILD IS IN HERE rather than on the host. The alternative is what the
+# host used to do: build on the host at FLAKE time and carry the result in.
+# That means `caosd` substitutes `caos-stack-inputs`, so producing the caosd
+# binary builds all three clean images including the 1.5 GB cargo one; and it
+# means those 1.6 GB have to cross into the container somehow — a `/nix/store`
+# bind (which the engine cannot see on macOS, and which would SHADOW this
+# image's own store, since the image's userland IS /nix) or a copy into the
+# state mount. Building here needs neither: the tree is 4 MB, the work lands in
+# a shared volume, and `nix build` on the host drops to the clients.
+#
+# Configuration (env), everything else being serve's:
+#   CAOS_STACK_TREE          the tree to build from (required). A flake root.
+#   CAOS_STACK_INPUTS_ATTR   which aggregate to build (required):
+#                            `caos-stack-inputs` for the host world,
+#                            `caos-test-stack-inputs` for the test world. This
+#                            single value IS the world split.
+#   CAOS_STACK_STORE         a persistent store to bind over /nix, if this
+#                            container has one to bind. Unset means the caller
+#                            has already arranged /nix (the dev placement's
+#                            image does it in its own worker before we run).
+set -euo pipefail
+
+fail() { echo "stack/bootstrap: $*" >&2; exit 1; }
+
+tree="${CAOS_STACK_TREE:?bootstrap needs CAOS_STACK_TREE}"
+attr="${CAOS_STACK_INPUTS_ATTR:?bootstrap needs CAOS_STACK_INPUTS_ATTR}"
+[ -f "$tree/flake.nix" ] || fail "no flake.nix in $tree"
+
+# ---- the persistent store ---------------------------------------------------
+# A BIND MOUNT, and nothing else can do this job. A volume and the container's
+# overlay are different filesystems, so `rename` and `renameat2(RENAME_EXCHANGE)`
+# are both EXDEV; and a two-step `mv` + `ln -s` cannot work at all, because every
+# binary here is a symlink into /nix/store — including `ln`, whose ELF
+# interpreter is under the path being replaced. Tested: `mv /nix /nix.image` is
+# immediately followed by `ln: command not found`. A bind has no such window.
+#
+# THE DB MOVES TOO. nix trusts /nix/var/nix/db, and a path present on disk but
+# absent from the db is one it considers invalid and will happily build again.
+# `cp -n` will not overwrite the volume's db with the image's, so the two are
+# MERGED by dump-and-load instead.
+#
+# SERIALISED ACROSS CONTAINERS. Several of these run at once against one volume,
+# and while nix itself is built for that (per-derivation locks, a sqlite db),
+# `cp` is not: it writes each file straight to its destination rather than to a
+# temp and renaming, so a concurrent nix can read a store path that is HALF
+# THERE, or delete it as an invalid output and rebuild it out from under this
+# copy. That only bites when two images differ, i.e. exactly when two people are
+# testing two trees.
+if [ -n "${CAOS_STACK_STORE:-}" ]; then
+  [ -d "$CAOS_STACK_STORE" ] || fail "no $CAOS_STACK_STORE — the caller must mount it"
+  exec 9>"$CAOS_STACK_STORE/.caos-seed.lock"
+  flock -w 600 9 \
+    || fail "another container held the $CAOS_STACK_STORE seed lock for 600s"
+  # -n: the volume's copy wins. It is the newer truth — it has whatever previous
+  # runs built — and the image only ever supplies what is missing.
+  cp -an /nix/. "$CAOS_STACK_STORE/" 2>/dev/null || true
+  nix-store --dump-db > /tmp/image-db.dump 2>/dev/null || : > /tmp/image-db.dump
+  mount --bind "$CAOS_STACK_STORE" /nix \
+    || fail "cannot bind $CAOS_STACK_STORE over /nix (CAP_SYS_ADMIN?)"
+  # Registers the image's paths in the volume's db. Harmless when they are
+  # already there, which is the common case.
+  nix-store --load-db < /tmp/image-db.dump 2>/dev/null || true
+  exec 9>&-
+fi
+
+# ---- the stack's inputs -----------------------------------------------------
+# ONE nix build for everything the stack needs: `bin/` (server, runnerd,
+# core-seeder-runner, caos-cli, caos) and `images/` (the clean worker images
+# build-builtins streams to the registry). One evaluation produces the lot —
+# this used to be four, which was 12 seconds of a 16-second bring-up.
+#
+# `path:` rather than a bare path, so nix reads the DIRECTORY as it is rather
+# than a git tree: a materialized workspace may not be a repo at all, and where
+# it is one, keying the eval cache on the rev would mint a new one per run.
+echo "stack/bootstrap: building $attr from $tree" >&2
+inputs=$(nix build "path:$tree#$attr" --no-link --print-out-paths) \
+  || fail "building $attr"
+for b in server runnerd core-seeder-runner caos-cli caos; do
+  [ -x "$inputs/bin/$b" ] || fail "no $b in $inputs/bin"
+done
+echo "stack/bootstrap: inputs $inputs" >&2
+
+# ---- hand over --------------------------------------------------------------
+# `exec`, so serve is this process: it supervises the group and dies with it,
+# and there is no extra shell between it and whatever started this container.
+#
+# What we set is what only we can know — where the inputs are, and that the
+# publish runs from this tree. Everything else about the placement (which redis,
+# which registry, which engine, which netns) is the caller's and reaches serve
+# through the environment we inherit.
+export CAOS_STACK_BIN="$inputs/bin"
+export CAOS_STACK_PUBLISH=yes
+export CAOS_STACK_PUBLISH_SCRIPT="$tree/stack/build-builtins.sh"
+export CAOS_CLI="$inputs/bin/caos-cli"
+export CAOS_BUILTIN_BINS="$inputs"
+CAOS_BUILTIN_IMAGES="$(echo "$inputs"/images/*)"
+export CAOS_BUILTIN_IMAGES
+exec bash "$tree/stack/serve"

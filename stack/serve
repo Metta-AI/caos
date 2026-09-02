@@ -54,10 +54,31 @@
 #                             which is what makes the seed legal inside the
 #                             flake-builder container (it holds no engine socket
 #                             grant, and does not need one).
+#   CAOS_STACK_PUBLISH        "yes" to publish std into this stack once the
+#                             server and registry are up — build-builtins.sh,
+#                             run HERE and nowhere else. This is the only
+#                             publish in the tree, and it is here because its
+#                             output (the seed tree) is what the seeder below
+#                             needs: adjacent lines, a value between them, no
+#                             name in the middle for anyone else to write.
+#   CAOS_STACK_PUBLISH_SCRIPT the build-builtins.sh to run (required when
+#                             PUBLISH=yes). Its DIRECTORY is the tree it
+#                             publishes from — build-builtins `cd`s to its own
+#                             dirname — so this names both at once. Its own
+#                             environment (CAOS_CLI, CAOS_BUILTIN_IMAGES,
+#                             CAOS_BUILTIN_BINS, CAOS_CLIENT_REPO,
+#                             CAOS_REGISTRY_HTTP) is inherited from ours;
+#                             CAOS_SERVER_URL is not, because this script knows
+#                             where its own server is.
 #   CAOS_STACK_SEEDER         "yes" to run the core-seeder-runner (the bootstrap
 #                             answerer, design/caos-expr.md Phase 3), "no"/unset
-#                             otherwise. Reads refs/caos/seed from the server
-#                             repo and answers seeded arg-tree keys. Default off.
+#                             otherwise. It answers seeded arg-tree keys from
+#                             the seed tree, spawning no container. Default off:
+#                             the seed placement only PUBLISHES.
+#   CAOS_SEED_TREE            the tree of seed records the seeder answers from.
+#                             Normally produced by the publish above; settable
+#                             directly for a placement that seeds without
+#                             publishing. Required when SEEDER=yes.
 #   CAOS_STACK_SEED_GIT       optional: a prebuilt server repo to start from.
 #                             std published at image build time rides in the
 #                             image as one of these (design/one-stack-image.md,
@@ -284,16 +305,47 @@ if [ "$CAOS_STACK_RUNNERD" = yes ]; then
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -
-# It reads refs/caos/seed from the server's git repo (CAOS_STACK_STATE/git) and
-# long-polls the server, answering each seeded arg-tree key with a pre-built
-# result (design/caos-expr.md, Phase 3). Optional and default OFF: the seed
-# placement only PUBLISHES (it starts no answerer), and a stack whose core is
-# not yet routed through the seeder gains nothing from it. An absent
-# refs/caos/seed is harmless — the seeder rescans and idles until it appears.
+# --- publish std, and seed the core from what it just published --------------
+# THE ONE PUBLISH IN THE TREE, for the same reason this is the one bring-up.
+# It used to be two — `caosd std_build` on the host and `dev/stack-up` inside
+# the dev worker — each with its own copy of build-builtins' environment, and
+# each responsible for getting the resulting records to a seeder it did not
+# start. Here the two steps are adjacent, so the seed tree is a VALUE handed
+# from one line to the next.
+#
+# ORDER. build-builtins needs the server (it pushes objects and asks
+# `HEAD /object/…`) and the registry (skopeo, and a `curl -I` for each manifest
+# digest) — both already up above. It needs NO runner and NO seeder: it
+# hand-assembles every `required` from deltas it built itself rather than by
+# running the evaluator, which is exactly what makes this order possible.
+#
+# STDOUT IS THE TREE. Everything build-builtins narrates goes to stderr, so the
+# capture below is the seed tree and nothing else.
+if [ "${CAOS_STACK_PUBLISH:-no}" = yes ]; then
+  publish="${CAOS_STACK_PUBLISH_SCRIPT:?serve needs CAOS_STACK_PUBLISH_SCRIPT when CAOS_STACK_PUBLISH=yes}"
+  [ -f "$publish" ] || fail "no publish script at $publish"
+  echo "caosd serve: publishing std ($publish)" >&2
+  CAOS_SEED_TREE=$(CAOS_SERVER_URL="$SERVER_URL" bash "$publish" 2>>"$CAOS_STACK_LOGS/publish.log") \
+    || { cat "$CAOS_STACK_LOGS/publish.log" >&2; fail "publishing std"; }
+  [ -n "$CAOS_SEED_TREE" ] || fail "the publish produced no seed tree (see $CAOS_STACK_LOGS/publish.log)"
+  echo "caosd serve: published, seed tree $CAOS_SEED_TREE" >&2
+fi
+
+# The bootstrap answerer (design/caos-expr.md, Phase 3): it reads the seed
+# records out of the tree we were just handed and long-polls the server,
+# answering each seeded arg-tree key with a pre-built result and spawning no
+# container. Optional and default OFF — the seed placement only PUBLISHES.
+#
+# Started AFTER the publish, with its records passed by value. There is no ref
+# and nothing to poll for: the process that produced the records starts the
+# process that serves them, so they cannot be replaced underneath it and there
+# is no window where the core is unanswered.
 if [ "${CAOS_STACK_SEEDER:-no}" = yes ]; then
+  : "${CAOS_SEED_TREE:?serve needs a seed tree for the seeder — set CAOS_STACK_PUBLISH=yes, or pass CAOS_SEED_TREE}"
   start core-seeder-runner env \
     CAOS_SERVER_URL="$SERVER_URL" \
     CAOS_GIT_DIR="$CAOS_STACK_STATE/git" \
+    CAOS_SEED_TREE="$CAOS_SEED_TREE" \
     "$CAOS_STACK_BIN/core-seeder-runner"
 fi
 

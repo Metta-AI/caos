@@ -194,7 +194,7 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
    A `docker://` ref passes straight through `resolve_expr_image` (needs a small
    addition — that resolver doesn't yet handle `docker://`; `resolve_run_image`
    already does), so evaluation never re-enters `/std/flake-builder`. The formed
-   key is `{ image: docker://seeded, in: <flake-builder tree>, std, salt }`,
+   key is `{ image: docker://seeded, in: <flake-builder tree>, salt }`,
    which is exactly what the seeder registers and answers. Nothing pulls
    `docker://seeded`: the seeder answers first; if it is absent, the job hits
    `runnerd` and fails loudly on a bogus image (an honest "bootstrap broken"
@@ -228,10 +228,12 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
   sole record is flake-builder's:
   `required = { image: <blob "docker://seeded">, in: <flake-builder source> }`,
   `result = <hand-built flake-builder image delta>`. `required` deliberately
-  **omits `std`/`salt`** (flake-builder's output depends only on `in`), so the
-  seeder answers under any std — which is what lets the test harness hand each
-  job a std *subset*. The server matches `required` as a **subset** of a job's
-  arg entries, so this still beats runnerd's empty required.
+  **omits `salt`** (flake-builder's output depends only on `in`). The server
+  matches `required` as a **subset** of a job's arg entries, so one record
+  answers the whole family of keys a caller can form — under any salt, and
+  alongside anything else the caller binds — and it still beats runnerd's empty
+  required. (This once said `std`/`salt`; the `std` arg is gone, so `salt` is
+  the whole of it.)
 - **`core-seeder-runner`** (`crates/server/src/bin/core-seeder-runner.rs`, a bin
   in the `server` crate — reuses its `gix`/`minreq`/`serde_json`/`caos-world`
   deps, no new workspace member): reads `refs/caos/seed` from the server's git

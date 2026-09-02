@@ -54,7 +54,14 @@ fi
 
 # The stack, and a client for it. `stack-up` compiles the tree, brings the
 # daemons up as children of THIS container, publishes std, and leaves the
-# client at /caos-dev/bin.
+# client at /caos-run/bin.
+#
+# `/caos-run` IS THIS CONTAINER'S, and that is the whole of why it is not
+# `/caos-dev`, which is a volume every dev stack on this host shares. Several
+# of these tools run at once, each testing a different tree; the fixed path
+# under the volume used to be repointed by whichever started last, so the first
+# then drove ITS OWN server with the OTHER build's caos-cli. dev/stack-up's
+# header has the rest.
 #
 # Its failure is an INFRASTRUCTURE failure, not a test verdict: nothing was
 # tested, so a caller must retry rather than read a red report. Hence the bare
@@ -70,11 +77,11 @@ inputs=$(nix build "path:$PWD#caos-test-stack-inputs" --no-link --print-out-path
   || fail "building the stack inputs"
 phase "bringing the dev stack up"
 ./dev/stack-up --inputs="$inputs" >&2 || fail "bringing the dev stack up"
-CLI=/caos-dev/bin/caos-cli
+CLI=/caos-run/bin/caos-cli
 [ -x "$CLI" ] || fail "no client at $CLI after stack-up"
 
 # THE TESTED CLIENT GOES INTO THE WORKSPACE. `:@=` ingests git-tracked paths
-# inside the worktree and nothing else, so a client sitting in /caos-dev is
+# inside the worktree and nothing else, so a client sitting in /caos-run is
 # rejected as "outside the git worktree".
 #
 # Copying it in is not a workaround, it is the honest shape: the client is part
@@ -240,9 +247,10 @@ chmod u+w /tmp/suite/report
   echo "and while a run is in flight, CAOS_WATCH_LINES=0 shows every node"
   echo "instead of the first 16."
   echo
-  if [ -f "/caos-dev/logs/runnerd.log" ]; then
-    echo "runnerd: $(grep -c 'running job' /caos-dev/logs/runnerd.log || true) claimed," \
-      "$(wc -l < /caos-dev/logs/runnerd.log) lines"
+  if [ -f "/caos-run/logs/runnerd.log" ]; then
+    echo "runnerd: $(grep -c 'running job' /caos-run/logs/runnerd.log || true) claimed," \
+      "$(wc -l < /caos-run/logs/runnerd.log) lines"
+    echo "this stack's logs, on the host: /caos-dev/runs/$(cat /etc/hostname)/logs"
   fi
 } >> /tmp/suite/report
 
