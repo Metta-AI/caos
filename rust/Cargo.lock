@@ -127,6 +127,7 @@ version = "0.1.0"
 dependencies = [
  "caos",
  "conversation-protocol",
+ "libc",
  "ratatui-core",
  "ratatui-crossterm",
  "ratatui-widgets",
