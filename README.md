@@ -92,12 +92,13 @@ caos's own internal pushes:
 
 ```bash
 if [ "${1:-}" != caos ]; then
-  time CAOS_SALT=$(date +%s) result/bin/caos-cli run-tool caos-test
+  time result/bin/caos-cli run-tool caos-test --test-salt=$(date +%s)
 fi
 ```
 
 Check the elapsed time too: a passing suite can still reveal a test timing
-regression.
+regression. Use the same `--test-salt` command on main and your branch, on the
+same machine, and compare runs with similar cache warmth.
 
 > Nix flakes only see files **tracked by git** (uncommitted edits to tracked
 > files are included, but new files are not). After adding a new source file,
@@ -675,6 +676,11 @@ and a repo that mounted caos writes the same lines against
 `./flake-inputs/caos/std/...`. Relative paths are stable under mounting, so the
 declaration moves and the code does not.
 
+This repository's root `DEPS` declares `llm-step` and `llm-call` for
+conversations and title generation. Keep that file tracked: the client ingests
+tracked worktree files, so an untracked declaration cannot supply these entry
+points.
+
 The five entries that cannot be built by the machinery they ARE — `flake-builder`
 (a flake built by the flake-builder), `cargo`, `runner`, `rustc` and `deep-deps`
 — name a `docker://seeded…` sentinel instead of a builder.
@@ -702,7 +708,9 @@ overwrite. Bringing a stack up IS publishing; there is no separate command.
   can be far older than the `flake.lock` that names it — and the symptom is an
   error that reads like a caos bug. `caos-cli`'s usage banner carries the same
   revision.
-- Test with `caos-cli run-tool caos-test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
+- Use `caos-cli run-tool caos-test` for a cached run, or add a fresh
+  `--test-salt` to rerun every test. The suite builds one shared dev stack from
+  the source under test; no need to rebuild or restart the host stack.
 
 ```bash
 caosd up      # bring the stack up + publish all of std, then return. Updates it if already running
@@ -733,8 +741,16 @@ caos-cli run-tool caos-build      # the worker images, from the deployed binarie
 caos-cli run-tool caos-test       # images + the whole test suite
 caos-cli run-tool caos-test --only="unit-test rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
-CAOS_SALT=$(date +%s) caos-cli run-tool caos-test   # force a re-run (retry a flake)
+time result/bin/caos-cli run-tool caos-test --test-salt=$(date +%s) # rerun all tests
 ```
+
+For routine test timing and retrying a flaky test, use `--test-salt`: it gives
+the test jobs fresh cache keys while allowing build and stack-setup work to
+reuse cached results. Combine it with `--only` to rerun selected tests.
+`CAOS_SALT` is broader: it re-keys all worker jobs, though flake builds retain
+their separate cache keys. Use it when intentionally exercising that wider
+path, such as push-path validation, rather than for the normal test benchmark.
+See [the performance section of SPEC.md](SPEC.md#principles-of-performance).
 
 nix builds only the *host* stack — the server, the runner daemon, the seeder,
 and the seeded core images. Everything the suite tests is compiled from the
