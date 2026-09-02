@@ -60,6 +60,17 @@ Every script here runs with it, and two constructs quietly break under it.
   binary and blame the code. Build one output per invocation. (`--refresh` is not
   needed: nix picks up dirty-tree edits fine.)
 
+- **`fetch_and_materialize` is the WORKER's materialization, not the host's.**
+  Its name reads like the obvious way to get a result onto disk, and host-side
+  it is the wrong one: it writes hash-tagged PLACEHOLDERS for a later `caos get`
+  to fill, and nothing on the host fills them. So every file arrives
+  ZERO-LENGTH and whatever reads them concludes the result was empty — a grep
+  over a correct result tree reported "no matches", which is a silent wrong
+  answer rather than an error. The host form is `checkout`, public as
+  `cli_get(t, hash, path)`: ordinary rw files, exec bit and symlinks preserved.
+  It is what `caos-cli run <output>` uses, which is why running the same job by
+  hand shows content and the in-process call does not.
+
 # Workers
 
 - **Workers are NOT network-free.** This gets asserted over and over and it is

@@ -13,11 +13,11 @@
 //! a conversation is: that belongs to the caller, which is what lets the whole
 //! read-modify-write run again unchanged when a concurrent writer wins the CAS.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use caos::{GitTransport, Transport};
+use caos::{cli_get, eval_workspace_path, run_client_request_with_store, GitTransport, Transport};
 
 /// Reads larger than this are truncated with a note, matching the worker's
 /// inline tools so a model sees one behavior wherever it runs.
@@ -82,6 +82,7 @@ pub fn execute(
         "ls" => ls(t, tree, args),
         "write" => write(t, tree, args),
         "edit" => edit(t, tree, args),
+        "grep" => grep(t, tree, args),
         other => Err(User(format!("unknown tool {other:?}"))),
     }
 }
@@ -206,6 +207,198 @@ fn edit(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
     Ok(Outcome::wrote(format!("replaced {times} in {path}"), tree))
 }
 
+/// Search the workspace by running the `rgrep` fold as an ordinary caos job.
+///
+/// This is the first DISPATCHED tool here: unlike read/ls/write/edit it does not
+/// compute an answer locally, it builds an ArgTree and runs it. The pattern
+/// rides curried on the image and the scope subtree is the input, so every level
+/// of the fold caches on exactly (subtree hash, pattern) — an unchanged subtree
+/// is never searched twice, across calls, sessions or users.
+///
+/// Note the two different trees. The SCOPE comes from the conversation's
+/// workspace, which is what the model is searching. The rgrep IMAGE comes from
+/// the host worktree, because it is the tool's implementation rather than the
+/// data under it — the same tree `run-tool` evaluates.
+fn grep(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+    let pattern = string_arg(args, "pattern")?;
+    if pattern.is_empty() {
+        return Err(User("grep needs a non-empty pattern".to_string()));
+    }
+    let path = optional_path_arg(args, "path")?;
+    let spec = match path.as_deref() {
+        None => tree.to_string(),
+        Some(path) => format!("{tree}:{path}"),
+    };
+    let scope = rev_parse(t, &spec).ok_or_else(|| {
+        User(format!(
+            "no such path: {}",
+            path.clone().unwrap_or_default()
+        ))
+    })?;
+
+    let image = rgrep_image(t)?;
+    let curried = caos::curry_client_object(t, &image, &[format!("--pattern={pattern}")])
+        .map_err(|error| classify_pattern(error, pattern))?
+        .to_string();
+    let (kind, result) =
+        run_client_request_with_store(t, &curried, &[format!("--in:hash={scope}")], &[])
+            .map_err(|error| classify_pattern(error, pattern))?;
+
+    render_grep(t, &result, &kind, path.as_deref().unwrap_or("")).map(Outcome::read)
+}
+
+/// The rgrep image, resolved once per server process.
+///
+/// Resolving walks and hashes the whole worktree, which is not something to
+/// repeat per call in a process that stays alive for a session. A failure is
+/// deliberately not cached: a server that started before `nix build` finished
+/// should recover on the next call rather than stay broken for the session.
+fn rgrep_image(t: &GitTransport) -> Result<String, ToolError> {
+    static IMAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut cached = IMAGE.lock().map_err(|error| Infra(error.to_string()))?;
+    if let Some(image) = cached.as_deref() {
+        return Ok(image.to_string());
+    }
+    // Named by PATH, not `DEEP-DEPS/rgrep`: this repo has no root `DEPS`, so
+    // `DEEP-DEPS` does not exist at its root. The walk still starts at the tree
+    // root, so the root expression deepens the tree before the descent reaches
+    // `std/rgrep` and its own mounts.
+    let image = eval_workspace_path(t, "std/rgrep", &[]).map_err(Infra)?;
+    *cached = Some(image.clone());
+    Ok(image)
+}
+
+/// A bad pattern is the model's mistake, not a broken repository, but it is the
+/// WORKER that validates it (adding a regex engine here to pre-check would
+/// duplicate the authority). So a run failure naming the pattern is reported
+/// back to the model instead of aborting the session.
+fn classify_pattern(error: String, pattern: &str) -> ToolError {
+    match error.contains("invalid pattern") {
+        true => User(format!("invalid pattern {pattern:?}: {error}")),
+        false => Infra(error),
+    }
+}
+
+/// Flatten rgrep's sparse result into classic `path:linenum:line`.
+///
+/// The result lives on the SERVER, so it is checked out before it can be read.
+/// `cli_get` is the host form of that and the reason this does not use
+/// `fetch_and_materialize`, whose name reads like the obvious choice: that one
+/// is the WORKER's CAS materialization, and it leaves hash-tagged PLACEHOLDERS
+/// for a later `caos get` to fill. On the host nothing fills them, so every
+/// match file arrives zero-length and the grep reports "no matches" for a
+/// result that is perfectly correct — a silent wrong answer, not an error.
+fn render_grep(
+    t: &GitTransport,
+    result: &str,
+    kind: &str,
+    scope: &str,
+) -> Result<String, ToolError> {
+    let target = scratch_path(t, "grep")?;
+    let path = target
+        .to_str()
+        .ok_or_else(|| Infra(format!("scratch path is not UTF-8: {}", target.display())))?;
+    cli_get(t, result, path).map_err(ToolError::infra)?;
+    let rendered = render_materialized(&target, kind, scope);
+    // Only the checkout is temporary; the objects it fetched stay in the repo,
+    // which is what makes a repeated grep cheap.
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_file(&target);
+    rendered
+}
+
+fn render_materialized(target: &Path, kind: &str, scope: &str) -> Result<String, ToolError> {
+    // A file-scoped grep's result IS the match blob: `linenum:line` lines that
+    // only the caller can prefix, because only the caller knows what it scoped.
+    if kind == "blob" || target.is_file() {
+        let text = std::fs::read_to_string(target)
+            .map_err(|error| Infra(format!("reading grep result: {error}")))?;
+        let rendered: String = text
+            .lines()
+            .map(|line| format!("{scope}:{line}\n"))
+            .collect();
+        return Ok(match rendered.is_empty() {
+            true => "no matches".to_string(),
+            false => rendered.trim_end().to_string(),
+        });
+    }
+    let prefix = match scope.is_empty() {
+        true => String::new(),
+        false => format!("{scope}/"),
+    };
+    let mut render = GrepRender {
+        out: String::new(),
+        overflow_files: 0,
+    };
+    render.walk(target, &prefix)?;
+    if render.out.is_empty() && render.overflow_files == 0 {
+        return Ok("no matches".to_string());
+    }
+    let mut text = render.out;
+    if render.overflow_files > 0 {
+        text += &format!(
+            "\n[truncated — {} more matching file(s); narrow the pattern or grep a \
+             subdirectory]",
+            render.overflow_files
+        );
+    }
+    Ok(text.trim_end().to_string())
+}
+
+/// The same walk `llm-step`'s `GrepRender` performs, so a grep reads identically
+/// whichever harness ran it: depth-first, and once the budget is spent stop
+/// reading contents but keep COUNTING matching files — the count is the part
+/// that tells the model its pattern was too broad.
+struct GrepRender {
+    out: String,
+    overflow_files: usize,
+}
+
+impl GrepRender {
+    fn walk(&mut self, dir: &Path, prefix: &str) -> Result<(), ToolError> {
+        let mut children: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|error| Infra(format!("reading grep result: {error}")))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        // `read_dir` order is filesystem order; a grep that lists its matches in
+        // a different order on every run is needlessly hard to read or diff.
+        children.sort();
+        for child in children {
+            let name = child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if child.is_dir() {
+                self.walk(&child, &format!("{prefix}{name}/"))?;
+                continue;
+            }
+            if self.out.len() >= MAX_READ_BYTES {
+                self.overflow_files += 1;
+                continue;
+            }
+            let text = std::fs::read_to_string(&child)
+                .map_err(|error| Infra(format!("reading {}: {error}", child.display())))?;
+            for line in text.lines() {
+                self.out.push_str(&format!("{prefix}{name}:{line}\n"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A private scratch path inside the git dir, named per process so two servers
+/// in one checkout cannot collide.
+fn scratch_path(t: &GitTransport, what: &str) -> Result<PathBuf, ToolError> {
+    let git_dir = t
+        .git_capture(&["rev-parse", "--absolute-git-dir"], None)
+        .map_err(ToolError::infra)?
+        .trim()
+        .to_string();
+    Ok(PathBuf::from(git_dir).join(format!("caos-cc-{what}-{}", std::process::id())))
+}
+
 // ---------------------------------------------------------------------------
 // Git plumbing
 // ---------------------------------------------------------------------------
@@ -250,12 +443,7 @@ fn put_file(t: &GitTransport, tree: &str, path: &str, content: &[u8]) -> Result<
 /// the user's staged changes. Named per process so two concurrent tools in the
 /// same checkout cannot corrupt each other's rebuild.
 fn index_path(t: &GitTransport) -> Result<PathBuf, ToolError> {
-    let git_dir = t
-        .git_capture(&["rev-parse", "--absolute-git-dir"], None)
-        .map_err(ToolError::infra)?
-        .trim()
-        .to_string();
-    Ok(PathBuf::from(git_dir).join(format!("caos-cc-index-{}", std::process::id())))
+    scratch_path(t, "index")
 }
 
 fn existing_mode(t: &GitTransport, tree: &str, path: &str) -> Option<String> {
@@ -384,6 +572,77 @@ mod tests {
     fn only_the_exact_reserved_entry_is_refused() {
         assert!(normalize("foo.caosmeta").unwrap().is_some());
         assert!(normalize("a/.caos").unwrap().is_some());
+    }
+
+    /// Build a sparse result like rgrep's: match blobs holding `linenum:line`,
+    /// nested by directory.
+    fn sparse(root: &Path, files: &[(&str, &str)]) {
+        for (path, body) in files {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("caos-cc-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_sparse_result_renders_as_path_linenum_line() {
+        let dir = scratch("render");
+        sparse(
+            &dir,
+            &[
+                ("a.rs", "3:fn one\n"),
+                ("sub/b.rs", "7:fn two\n8:fn three\n"),
+            ],
+        );
+        let out = render_materialized(&dir, "tree", "").unwrap();
+        assert_eq!(out, "a.rs:3:fn one\nsub/b.rs:7:fn two\nsub/b.rs:8:fn three");
+        let scoped = render_materialized(&dir, "tree", "crates").unwrap();
+        assert!(scoped.starts_with("crates/a.rs:3:fn one"), "{scoped}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file-scoped grep's result is the match blob alone, so only the caller
+    /// can supply the path — the blob does not know what was searched.
+    #[test]
+    fn a_file_scoped_result_is_prefixed_by_the_caller() {
+        let dir = scratch("blob");
+        let file = dir.join("matches");
+        std::fs::write(&file, "12:hit\n").unwrap();
+        assert_eq!(
+            render_materialized(&file, "blob", "src/lib.rs").unwrap(),
+            "src/lib.rs:12:hit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_result_is_no_matches() {
+        let dir = scratch("empty");
+        assert_eq!(render_materialized(&dir, "tree", "").unwrap(), "no matches");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the budget the walk stops READING but keeps COUNTING, because the
+    /// count is what tells the model its pattern was too broad. A truncation
+    /// that silently dropped the rest would read as a complete answer.
+    #[test]
+    fn an_overlong_result_counts_the_files_it_did_not_render() {
+        let dir = scratch("overflow");
+        let big = format!("1:{}\n", "x".repeat(MAX_READ_BYTES));
+        sparse(
+            &dir,
+            &[("a.rs", big.as_str()), ("b.rs", "1:y\n"), ("c.rs", "1:z\n")],
+        );
+        let out = render_materialized(&dir, "tree", "").unwrap();
+        assert!(out.contains("2 more matching file(s)"), "{:.120}", out);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

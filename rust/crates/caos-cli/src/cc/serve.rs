@@ -170,6 +170,22 @@ fn declarations() -> Vec<Value> {
             &[],
         ),
         declaration(
+            "grep",
+            "Search the conversation workspace with a regular expression (Rust \
+             regex syntax, line-based). Returns `path:linenum:line`. Scope with \
+             `path` to narrow it; results are cached per unchanged subtree, so \
+             repeated and scoped searches are cheap. Prefer this over reading \
+             files to look for something.",
+            json!({
+                "pattern": { "type": "string", "description": "The regular expression to search for." },
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search; omit for the whole workspace.",
+                },
+            }),
+            &["pattern"],
+        ),
+        declaration(
             "write",
             "Write a file into the conversation workspace, creating parent \
              directories and overwriting any existing file. An existing file \
@@ -280,6 +296,6 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["read", "ls", "write", "edit"]);
+        assert_eq!(names, ["read", "ls", "grep", "write", "edit"]);
     }
 }

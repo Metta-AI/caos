@@ -179,6 +179,37 @@ pub(crate) fn eval_path(
     caos_eval::eval_path(&host, start_tree, path)
 }
 
+/// Resolve a workspace entry point NAMED BY PATH: evaluate the tracked tree and
+/// descend to `path`.
+///
+/// The sibling below reaches an entry through `DEEP-DEPS/<name>`, which is what
+/// a repo that DECLARED the dependency in a root `DEPS` gets. This tree has no
+/// root `DEPS` — `DEEP-DEPS` does not exist at its root at all — so a client
+/// here names a std entry by its path instead.
+///
+/// That still evaluates, and evaluating is still not optional: the walk starts
+/// at the tree ROOT, so the root `.caos-expr` runs first and deepens the tree,
+/// and only then does the descent reach `std/<name>` — in the deepened tree,
+/// where its own `DEEP-DEPS/rustc` exists. Naming the raw worktree directory
+/// would not work, exactly as the sibling's doc says.
+pub fn eval_workspace_path(
+    t: &dyn Transport,
+    path: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    let (_, oid) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+    let (kind, hash) = eval_path(t, &oid.to_string(), path, store)
+        .map_err(|error| format!("resolving {path:?} from the workspace: {error}"))?;
+    if kind != "tree" {
+        return Err(format!(
+            "{path}/.caos-expr evaluates to a {kind}, not an ArgTree"
+        ));
+    }
+    Ok(hash)
+}
+
 /// Resolve one of the WORKSPACE's declared entry points: evaluate the tracked
 /// tree and descend to `DEEP-DEPS/<name>`.
 ///

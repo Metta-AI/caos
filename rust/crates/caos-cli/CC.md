@@ -23,12 +23,30 @@ place the tool server registers four tools over the conversation's workspace:
 |---|---|
 | `read` | `file_path`, optional `offset`/`limit` (line-based) |
 | `ls` | optional `path` |
+| `grep` | `pattern`, optional `path` |
 | `write` | `file_path`, `content` |
 | `edit` | `file_path`, `old_string`, `new_string`, optional `replace_all` |
 
-They are the host-side counterparts of the worker's inline tools
-(`std/llm-step/src/tools.rs`) and behave the same way, including the read
-truncation cap and `edit`'s must-match-exactly-once rule.
+`read`, `ls`, `write` and `edit` are the host-side counterparts of the worker's
+inline tools (`std/llm-step/src/tools.rs`) and behave the same way, including the
+read truncation cap and `edit`'s must-match-exactly-once rule.
+
+`grep` is different in kind: it is the first DISPATCHED tool, running `std/rgrep`
+as an ordinary caos job rather than computing an answer locally. The pattern
+rides curried on the image and the scope subtree is the input, so every level of
+the fold caches on exactly (subtree hash, pattern). Two consequences worth
+knowing at the prompt:
+
+- Repeating a grep is nearly free (0.14s here against 9s cold), and so is
+  re-running one after editing an unrelated part of the tree.
+- A NEW pattern over the whole repo re-folds from scratch — about 8 seconds.
+  Scoping with `path` is what makes it cheap, which is why the tool description
+  says so.
+
+Its output is `path:linenum:line`. Past a budget the rendering stops reading
+contents but keeps counting, closing with `[truncated — N more matching
+file(s)]`, so a too-broad pattern says so instead of silently returning a
+prefix.
 
 **The workspace is the conversation's tree, not your checkout.** A `write` never
 touches a file on disk; it produces a new tree and appends an event carrying it.
@@ -155,6 +173,6 @@ is preserved. Eight concurrent edits to the same file all land.
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
   events have no `model` field and the TUI shows a blank where it would name
   one.
-- **`bash` and project tools.** Only the four inline tools exist here. The
-  dispatched tools — `bash`, `grep`, and everything under `caos-tools/` — still
-  run only inside `llm-step`.
+- **`bash` and project tools.** `grep` proved the dispatch path; `bash` and
+  everything under `caos-tools/` still run only inside `llm-step`. Until they
+  land the model cannot build, test, or run anything.
