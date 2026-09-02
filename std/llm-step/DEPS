@@ -16,7 +16,7 @@
 ../llm-client llm-client
 ../../rust/crates/conversation-protocol conversation-protocol
 ../bash-tool bash-tool
-../rgrep rgrep
+../rgrep-tool rgrep-tool
 ../bash bash
 ../merge merge
 ../caos-build caos-build

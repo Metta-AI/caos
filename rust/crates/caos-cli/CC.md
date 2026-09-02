@@ -31,9 +31,11 @@ place the tool server registers four tools over the conversation's workspace:
 inline tools (`std/llm-step/src/tools.rs`) and behave the same way, including the
 read truncation cap and `edit`'s must-match-exactly-once rule.
 
-`grep` is different in kind: it is the first DISPATCHED tool, running `std/rgrep`
-as an ordinary caos job rather than computing an answer locally. The pattern
-rides curried on the image and the scope subtree is the input, so every level of
+`grep` is different in kind: it is the first DISPATCHED tool, running the
+`std/rgrep-tool` std tool as an ordinary caos job rather than computing an
+answer locally. That tool drives the `std/rgrep` fold and renders the result
+itself, so nothing here is grep-specific — it goes through `run_std_tool`, the
+same path `bash` and every `caos-tools/<name>` entry will use. Every level of
 the fold caches on exactly (subtree hash, pattern). Two consequences worth
 knowing at the prompt:
 
@@ -46,7 +48,9 @@ knowing at the prompt:
 Its output is `path:linenum:line`. Past a budget the rendering stops reading
 contents but keeps counting, closing with `[truncated — N more matching
 file(s)]`, so a too-broad pattern says so instead of silently returning a
-prefix.
+prefix. That rendering lives in the tool, once: `llm-step`, this server, and
+`run-tool rgrep-tool` all show the same thing because they all read the same
+`report`.
 
 **The workspace is the conversation's tree, not your checkout.** A `write` never
 touches a file on disk; it produces a new tree and appends an event carrying it.

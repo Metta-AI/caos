@@ -1,8 +1,15 @@
 #!/bin/bash
 # tests/chat-tools-grep — a WORKER test, in dev/worker-test (it needs git).
 #
-# Grep's llm-step integration: root and subtree dispatch plus invalid-pattern
-# preflight. Purpose-built files replace two unrelated prior chat turns.
+# Grep's llm-step integration: root and subtree dispatch plus an invalid
+# pattern. Purpose-built files replace two unrelated prior chat turns.
+#
+# These assertions are deliberately about what the MODEL saw, not how it got
+# there — which is what let them survive grep moving out of llm-step into
+# `std/rgrep-tool` unchanged. The invalid pattern is no longer prechecked by
+# the harness; the tool reports FAILED and the generic renderer marks it
+# is_error, and the assertion below cannot tell the difference. That is the
+# point.
 #
 # The client used to type `caos-cli chat`; that is the client's turn loop, not
 # llm-step's grep, and std/llm-test/worker-common.sh does those steps here. The

@@ -1,0 +1,26 @@
+# std/rgrep-tool's image (design/caos-expr.md, Phase 3): build this directory as
+# a Rust project with rustc, then bind the fold it drives and the `help` an
+# agent registers it by.
+#
+# THE FOLD IS BOUND HERE, not by the caller. `curry --base:@=DEEP-DEPS/rgrep`
+# resolves that mount to the image it builds and `--fold=$FOLD` binds it BY
+# REFERENCE, so a caller resolves rgrep-tool and gets a tool that already knows
+# how to recurse. That is the point of the split: a caller names one tool and
+# never has to know there is a fold underneath, let alone how to render it.
+#
+# The docs are a HERE-STRING, like std/caos-test's, so they live here rather
+# than in the worker — and a `.caos-expr` is STRIPPED from the tree it is
+# evaluated against, so rewording them re-keys this tool's arg tree and nothing
+# it builds.
+HELP=<<END
+Search the workspace with a regular expression (Rust regex syntax, line-based).
+Returns matches as `path:linenum:line`. Scope with `path` (a directory or file)
+to narrow the search; results are cached per unchanged subtree, so repeated and
+scoped searches are cheap while a fresh pattern over a whole repository is not.
+Prefer this over reading files to look for something.
+@param pattern The regular expression to search for.
+@param [path] Directory or file to search, relative to the workspace root; omit for everything.
+END
+FOLD=curry --base:@=DEEP-DEPS/rgrep
+TOOL=run --base:@=DEEP-DEPS/rustc --src:@=.
+curry --base=$TOOL --fold=$FOLD --help=$HELP

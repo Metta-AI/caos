@@ -186,15 +186,28 @@ Tool classes:
   up, results are git-diffable, and identical subtrees share one cached job.
   Cached per (subtree hash, pattern): after a one-file edit, re-grepping
   costs only the spine above the edit, and a scoped grep of `src/` IS the
-  cached `src/` node of the full grep. Flattening to `path:linenum:line` is
-  the caller's presentation choice — llm-step renders it at the transcript
-  boundary (100KB budget, then matching-file counts + a narrow-the-scope
-  hint); the pattern is validated in llm-step BEFORE the sub-run launches,
-  so a bad regex is an is_error tool_result, never a failed turn. A grep
-  result is not a workspace: the pre-grep workspace rides the continuation
-  curry, and only bash results advance the tree. `tests/rgrep` drives the
-  fold directly (sparse shape, binary skipping, file scope, empty tree,
-  cache hit); the LLM integration is covered in the `tests/chat-tools*`
+  cached `src/` node of the full grep.
+
+  **The fold is not the tool.** `std/rgrep` is the recursion above; `std/rgrep-tool`
+  is the tool over it — it resolves the scope, drives the fold, and flattens
+  the sparse tree to `path:linenum:line` (100KB budget, then matching-file
+  counts + a narrow-the-scope hint), returning the ordinary `{report}` tree
+  every caos tool returns. It validates the pattern itself and reports a bad
+  one as `FAILED`, which the generic renderer marks `is_error`, so a bad
+  regex is still never a failed turn.
+
+  That split is why `grep` needs no special code in any caller. Flattening
+  used to be "the caller's presentation choice", which meant llm-step carried
+  a precheck, a bespoke launcher and a renderer, and the `caos cc` tool server
+  grew a second copy of the same walk — one user-visible contract with two
+  implementations, reachable by neither `run-tool` nor anything else. Now
+  llm-step registers it beside caos-build/caos-test, `caos cc` runs it through
+  the same generic path, and `run-tool rgrep-tool` works by hand.
+
+  A grep result is not a workspace: the pre-grep workspace rides the
+  continuation curry, and only bash results advance the tree. `tests/rgrep`
+  drives the fold directly (sparse shape, binary skipping, file scope, empty
+  tree, cache hit); the LLM integration is covered in the `tests/chat-tools*`
   suites.
 - **ls/listing**: tree objects are names+oids — no content fetch at all.
 - **build/test**: the existing caos-native decompositions (rustc,
@@ -366,7 +379,7 @@ The workers are resolved from the WORKSPACE, which declares them in its own
 resolves to a `curry(runner, bin=<static binary>)` node, so the per-turn state
 (key, system, model…) is curried onto the llm-step curry and layers flatten.
 
-The tools a turn drives — bash-tool, rgrep, bash, merge — are NOT named by the
+The tools a turn drives — bash-tool, rgrep-tool, bash, merge — are NOT named by the
 caller. They are llm-step's dependencies, so `std/llm-step/DEPS` declares them
 and its `.caos-expr` binds them: resolving llm-step yields a step that already
 knows its tools. A caller says what the TURN is.

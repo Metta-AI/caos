@@ -52,7 +52,7 @@ struct Config {
     api_key: String,
     system: String,
     bash_image: String,
-    /// The rgrep fold worker's image; the `grep` tool is registered only when
+    /// The rgrep TOOL's image; the `grep` tool is registered only when
     /// present (older curries without it keep working).
     grep_image: Option<String>,
     /// The script-worker image (std/bash) the BUILT-IN HISTORY TOOLS run on
@@ -284,19 +284,6 @@ fn callback(cfg: &Config) -> Result<(), String> {
     }
 
     match current_tool.as_str() {
-        "grep" => {
-            let scope = read_arg_opt("scope")?.unwrap_or_default();
-            let result = tools::grep_result_block(&current_id, &arg("result"), &scope)?;
-            append_tool_result(
-                cfg,
-                &run,
-                round,
-                &base_head,
-                &result,
-                &cas_hash(&arg("ws"))?,
-                None,
-            )?;
-        }
         // `merge` returns a COMMIT (its two-parent M): M becomes the workspace
         // commit, its tree the workspace, and the model hears about any
         // conflicts. Unlike every other tool, the ancestry advanced — that is
@@ -317,9 +304,11 @@ fn callback(cfg: &Config) -> Result<(), String> {
                 Some(&cas_hash(&m)?),
             )?;
         }
-        // A tree tool's result (caos-tools/<name>/) is a VALUE — a report,
-        // a bin tree, diagnostics — never a workspace: the pre-run workspace
-        // and its commit rode our curry, exactly like grep.
+        // Every other dispatched tool's result is a VALUE — a report, a bin
+        // tree, diagnostics — never a workspace: the pre-run workspace and its
+        // commit rode our curry. `grep` comes through here now; it used to have
+        // an arm of its own only because `std/rgrep` returns a sparse tree that
+        // something had to flatten, and `std/rgrep-tool` does that itself.
         name if name != "bash" => {
             let result = tools::tree_tool_result_block(&current_id, &arg("result"))?;
             append_tool_result(
@@ -363,7 +352,7 @@ fn callback(cfg: &Config) -> Result<(), String> {
 
 /// Work through the call queue, threading the workspace `ws` AND its commit
 /// `wc` (SPEC "Tools thread a commit"): inline reads leave both unchanged;
-/// inline mutations advance `ws` and mint a child `wc`; a bash/grep/tree/merge
+/// inline mutations advance `ws` and mint a child `wc`; a bash/tree/merge
 /// call exits into its run-then sub-run (the tail call; `callback` re-enters).
 /// A drained queue sends every result back in ONE user message and fires the
 /// next LLM round.
@@ -453,26 +442,6 @@ fn drive(
                 }
             }
         }
-        if name == "grep" && cfg.grep_image.is_some() {
-            // Validate before launching: a bad pattern or scope is an
-            // is_error result and the queue continues — only a valid call
-            // exits into the fold sub-run.
-            match tools::grep_precheck(&call, &ws) {
-                Err(block) => {
-                    append_tool_result(cfg, run, round, &base_head, &block, &cas_hash(&ws)?, None)?;
-                    let log = progress::conversation_log(conversation(cfg)?)?;
-                    (ws, wc) = canonical_workspace(&log)?;
-                    base_head = log.head;
-                    queue.remove(0);
-                    continue;
-                }
-                Ok((scope, prefix)) => {
-                    return launch_grep(
-                        cfg, &call, &scope, &prefix, &ws, &wc, run, round, &base_head,
-                    )
-                }
-            }
-        }
         // A harness-provided std tool (caos-build/caos-test)? Its image is a
         // DEP of the harness, so it is offered ALWAYS, from the harness's own
         // version — not discovered from the workspace like a tree tool. Its
@@ -552,7 +521,7 @@ fn drive(
         }
         if !tools::is_inline(name) {
             return Err(format!(
-                "model called unknown tool {name:?} (built-ins: bash, grep, read, \
+                "model called unknown tool {name:?} (built-ins: bash, read, \
                  ls, write, edit, merge, caos-build, caos-test, caos-test-result, \
                  spawn_agent; plus this workspace's caos-tools/<name>/ tools)"
             ));
@@ -887,55 +856,13 @@ fn launch_merge(
     run_then_catching(ws, Arg::Hash(&curried), Arg::Hash(&me))
 }
 
-/// Launch a grep as a run-then sub-run of the rgrep fold worker: the input is
-/// the scope subtree itself and the pattern rides curried on the image, so
-/// every level of the fold caches on exactly (subtree hash, pattern). The
-/// result is a sparse tree, not a workspace — the current `ws` rides the
-/// continuation so the workspace is unchanged by a grep.
-#[allow(clippy::too_many_arguments)]
-fn launch_grep(
-    cfg: &Config,
-    call: &Value,
-    scope: &str,
-    scope_prefix: &str,
-    ws: &str,
-    wc: &str,
-    run: &str,
-    round: u64,
-    base_head: &str,
-) -> Result<(), String> {
-    let id = call["id"]
-        .as_str()
-        .ok_or("tool_use block has no string id")?;
-    let pattern = call["input"]["pattern"]
-        .as_str()
-        .ok_or("grep call has no string `pattern` (precheck admits only those)")?;
-    let image = cfg
-        .grep_image
-        .as_ref()
-        .ok_or("launch_grep without a grep_image (drive guards this)")?;
-    let curried = caos_curry(Arg::Hash(image), &[("pattern", Arg::Lit(pattern))])?;
-    let me = self_curry(
-        wc,
-        run,
-        round,
-        base_head,
-        id,
-        &[
-            ("current-tool", Arg::Lit("grep")),
-            ("ws", Arg::Path(ws)),
-            ("scope", Arg::Lit(scope_prefix)),
-        ],
-    )?;
-    run_then_catching(scope, Arg::Hash(&curried), Arg::Hash(&me))
-}
-
 /// A harness-provided std tool's image and its arg-tree path, if `name` is one
 /// and the harness was curried with it. `caos-build`/`caos-test` are DEPs of the
 /// harness (std/llm-step/DEPS), bound by its `.caos-expr`, so they are offered
 /// on every conversation regardless of the workspace.
 fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static str)> {
     match name {
+        "grep" => cfg.grep_image.as_deref().map(|i| (i, "grep-image")),
         "caos-build" => cfg
             .caos_build_image
             .as_deref()
@@ -2206,7 +2133,7 @@ fn record_failure(cfg: &Config, error: &str) -> Result<(), String> {
 // Blocks and small helpers.
 // ---------------------------------------------------------------------------
 
-/// The full tool registry: bash, grep and the cargo tools (the sub-run tools)
+/// The full tool registry: bash and the cargo tools (the sub-run tools)
 /// plus the inline file tools (`tools.rs`).
 fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     let mut tools = vec![bash_tool()];
@@ -2214,9 +2141,6 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     if cfg.run_and_update_ref_image.is_some() {
         tools.extend(subagents::declarations());
         tools.push(async_work::declaration());
-    }
-    if cfg.grep_image.is_some() {
-        tools.push(tools::grep_declaration());
     }
     if cfg.merge_image.is_some() {
         tools.push(merge_tool());
@@ -2226,10 +2150,17 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     if cfg.tools_image.is_some() {
         tools.extend(githist::declarations());
     }
-    // The harness-provided std tools (caos-build/caos-test): DEPs of the
+    // The harness-provided std tools (grep, caos-build/caos-test): DEPs of the
     // harness, so offered ALWAYS when curried — described by the `help` their
     // images carry, the same shape a tree tool is described by.
+    //
+    // `grep` is one of these now. It used to be special all the way down — its
+    // own registry entry, its own precheck, its own launcher and its own result
+    // rendering — because `std/rgrep` returns a sparse tree and something had to
+    // flatten it. `std/rgrep-tool` does that itself and returns an ordinary
+    // `{report}`, so the harness needs no grep-specific code at all.
     for (name, arg_name, image) in [
+        ("grep", "grep-image", &cfg.grep_image),
         ("caos-build", "caos-build-image", &cfg.caos_build_image),
         ("caos-test", "caos-test-image", &cfg.caos_test_image),
         (
