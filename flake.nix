@@ -837,19 +837,16 @@ sandbox = false''
         # registry.
         caosd = pkgs.writeShellApplication {
           name = "caosd";
-          # skopeo + gzip: build-builtins.sh pushes each CLEAN image straight
-          # from its nix tarball to the registry (gunzip because skopeo's
-          # docker-archive transport wants an uncompressed tar). It no longer
-          # needs jq or tar — it composes no images, so there is no manifest to
-          # parse and no build context to unpack.
+          # COREUTILS AND BASH, AND THAT IS ALL. This command starts a container
+          # and waits for a file; everything it used to shell out for now
+          # happens inside the stack. skopeo + gzip were for pushing clean
+          # images at std_build, git for walking the seed records at std_check,
+          # curl for probing :9090, diffutils' cmp for deciding whether the
+          # staged binaries had changed, util-linux's setsid for a compose
+          # group that no longer exists — all of those callers are gone. Adding
+          # one back is a sign that work has leaked out of the stack again.
           # docker rides in from the host PATH (caosd already requires it).
-          # util-linux: setsid, so a hung compose up dies as a whole group.
-          # diffutils: cmp, which decides whether the stack's staged server
-          # and runnerd actually changed (stage_bins).
-          runtimeInputs = [
-            pkgs.coreutils pkgs.git pkgs.curl pkgs.bash pkgs.skopeo pkgs.gzip
-            pkgs.util-linux pkgs.diffutils
-          ];
+          runtimeInputs = [ pkgs.coreutils pkgs.bash ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
@@ -928,6 +925,102 @@ sandbox = false''
             # INSIDE, off a tree we copy in. What crosses the boundary is 4 MB
             # of source instead of 1.6 GB of tarballs, and `nix build` out here
             # no longer has to produce any of them.
+
+            # ---- repack, and ONLY here ------------------------------------
+            # A caos server repo accumulates one pack per push — a suite adds
+            # hundreds — and gix's object store has a fixed 32 slots. At 33
+            # packs the server starts answering `reading arg tree: object <oid>
+            # not found: The slotmap turned out to be too small with 32
+            # entries`, which reads as a missing object and is really a full
+            # table. Measured, not predicted.
+            #
+            # WHY THIS IS THE ONLY SAFE PLACE. A repack REWRITES the object
+            # store, and this repo's whole config exists to stop anything doing
+            # that behind a live reader's back: `gc.auto 0`, `receive.autogc
+            # false` and `maintenance.geometric-repack.enabled false` are three
+            # settings with one job. A server holds its repo open as a
+            # `gix::ThreadSafeRepository` for its lifetime, and when that
+            # object database re-consolidates against packs that moved under
+            # it, gix asserts and the request thread panics — the caller gets a
+            # body-less 500 and the log says nothing (see the server config
+            # above). `dev/stack-up` used to do this at every dev bring-up,
+            # which was harmless while one stack existed at a time and became a
+            # live peer's silent 500 as soon as two did.
+            #
+            # Here, nothing is reading: `up` has just removed the stack, and we
+            # refuse if any worker is still alive. So this is the one moment a
+            # rewrite is safe, and it covers BOTH repos — the host's own, and
+            # the one every dev stack shares.
+            #
+            # `-a -d -k` and the `-k` is load-bearing: GC is off precisely
+            # because almost every object here is unreachable from any ref
+            # (SPEC), so a repack that dropped unreachable objects would delete
+            # most of the store.
+            #
+            # IN A CONTAINER, for both, even though the host repo is a plain
+            # bind. It keeps one mechanism rather than two, and it is the only
+            # way to reach the dev repo at all — that one lives in a named
+            # volume, which on macOS is inside the engine's VM and has no host
+            # path. It also means this command needs no `git` of its own, which
+            # is why it now carries almost no runtime inputs.
+            DEV_VOLUME=caos-vol-caos-dev
+            REPACK_THRESHOLD=16
+
+            # Is anything alive that could be READING a server repo? Two
+            # sources, and both are needed — the same pair `image-cleanup`
+            # checks before it wipes:
+            #
+            #   the stack container   holds $CAOS_DATA/stack/git open. `up`
+            #                         removes it just above, but this function
+            #                         must not depend on its one caller having
+            #                         done so.
+            #   anything runnerd started   carries its owner label, and a dev
+            #                         stack IS a worker, so that one filter
+            #                         covers every holder of the dev repo.
+            caos_containers_running() {
+              local running
+              running=$(
+                if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
+                  echo "$NAME"
+                fi
+                docker ps --filter label=caos.runnerd.owner --format '{{.Names}}'
+              )
+              [ -n "$running" ]
+            }
+
+            # ONE container, and it decides per repo. The threshold is a bound
+            # on ONE repository's slot table, so summing two repos' packs and
+            # comparing that would repack a 1 GB store because the other one
+            # grew. Counting inside also removes the window a count-then-repack
+            # pair would leave between them.
+            #
+            # The threshold rides in as `$1` rather than being interpolated
+            # into the script text: this is a nix string containing a shell
+            # string containing a shell script, and that is two layers of
+            # quoting too many to add a third.
+            repack_repos() {
+              # Skipped rather than fatal: a person running `up` while a suite
+              # is in flight wants a stack, not homework, and the next idle
+              # `up` will do it.
+              if caos_containers_running; then
+                echo "==> caos containers are still running — skipping the repack" >&2
+                return 0
+              fi
+              docker run --rm --entrypoint /bin/bash \
+                -v "$CAOS_DATA/stack:/host" -v "$DEV_VOLUME:/dev-stack" \
+                caos-stack:latest -c '
+                  limit=$1
+                  for d in /host/git /dev-stack/git; do
+                    [ -d "$d" ] || continue
+                    packs=$(ls "$d"/objects/pack/*.pack 2>/dev/null | wc -l)
+                    if [ "$packs" -gt "$limit" ]; then
+                      echo "==> repacking $d ($packs packs)" >&2
+                      git -C "$d" repack -adkq || exit 1
+                    fi
+                  done
+                ' _ "$REPACK_THRESHOLD" \
+                || die "repacking the server repos"
+            }
 
             # The registry and Redis are caches: git holds the image inputs and
             # `up` republishes the irreducible std images. Clearing both avoids
@@ -1034,6 +1127,8 @@ sandbox = false''
               docker network inspect "$NET" >/dev/null 2>&1 \
                 || docker network create "$NET" >/dev/null
               docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+              repack_repos
 
               # THE TREE, copied rather than mounted: a bind's source is
               # resolved by the ENGINE, which on macOS is a VM that sees only

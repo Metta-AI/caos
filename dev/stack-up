@@ -185,30 +185,19 @@ mkdir -p "$engine_store/store" "$engine_store/run"
 command -v podman >/dev/null 2>&1 || fail "no podman in this image"
 [ -e /dev/fuse ] || fail "no /dev/fuse — the image must declare CAOS_GRANT_DEVICES"
 
-# ---- keep the pack count under gix's slot limit -----------------------------
-# A SHARED, PERSISTENT REPO ACCUMULATES ONE PACK PER PUSH, and gix's object
-# store has a fixed number of slots. At 33 packs the server started answering
-# `reading arg tree: object <oid> not found: The slotmap turned out to be too
-# small with 32 entries, would need 1 more` — which reads as a missing object
-# and is really a full table. Measured, not predicted: the count was 33.
+# NO REPACK HERE, and this is the one place it is tempting. The shared repo
+# accumulates one pack per push and gix's object store has a fixed 32 slots, so
+# something must consolidate it — but a repack REWRITES the object store, and
+# every other dev stack's server is holding that same repo open as a
+# `gix::ThreadSafeRepository`. Doing it here was safe only while one stack
+# existed at a time; with two it is a live peer's request thread panicking and
+# answering a body-less 500, which is the exact failure `gc.auto 0` and its two
+# companions exist to prevent (crates/server/src/main.rs).
 #
-# `-k` IS LOAD-BEARING. GC is off in a caos repo precisely because almost every
-# object is unreachable from any ref (SPEC), so a repack that dropped unreachable
-# objects would delete most of the store. `-a -d -k` consolidates into one pack
-# and keeps everything.
-#
-# Only when it is worth doing: repacking 288 MB on every bring-up would be a
-# tax on a step that is otherwise seconds.
-phase "counting packs"
-if [ -d "$state/git/objects/pack" ]; then
-  packs=$(find "$state/git/objects/pack" -name '*.pack' | wc -l)
-else
-  packs=0
-fi
-if [ "$packs" -gt 16 ]; then
-  echo "==> repacking the dev repo ($packs packs)" >&2
-  git -C "$state/git" repack -adkq || fail "repacking the dev repo"
-fi
+# `caosd up` does it instead, for this repo AND the host's, after it has removed
+# the stack and checked no worker is running. That is the one moment nothing can
+# be reading. If the pack count climbs here, the fix is an idle `caosd up`, not
+# a repack from inside a stack that has peers.
 
 # ---- serve -----------------------------------------------------------------
 #
