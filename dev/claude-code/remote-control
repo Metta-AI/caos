@@ -66,14 +66,26 @@ for f in "$src/.credentials.json" "$account"; do
     fi
 done
 
-# THE CONFIG DIR PERSISTS. It used to be rebuilt from scratch on every launch,
-# which threw away every session: transcripts live in `projects/`, and the
-# session records Remote Control writes live in the `.claude.json` copy, so
-# `rm -rf` here is what made `--continue` and the session list on claude.ai come
-# up empty after a restart. Only the stateless parts are refreshed below.
+# THE CONFIG DIR PERSISTS, because that is where sessions live: transcripts in
+# `projects/`, and the session records Remote Control writes in the
+# `.claude.json` copy. Rebuilding it each launch is what made a restart leave
+# the web UI holding sessions this machine no longer served.
 #
-# To start over, delete it: rm -rf .git/caos-remote-control
-cfg="$repo/.git/caos-remote-control"
+# It lives in `.caos-data/`, the repo's own ignored state directory. It was in
+# `.git/` first, which was wrong: that directory belongs to git, and in a linked
+# worktree it is a FILE, so `mkdir` there fails outright.
+cfg="$repo/.caos-data/remote-control"
+
+# One-time moves of the earlier locations, so a restart does not lose sessions.
+for legacy in "$repo/.git/caos-remote-control" \
+              "${XDG_STATE_HOME:-$HOME/.local/state}/caos/remote-control/$(printf '%s' "$repo" | tr '/' '-' | sed 's/^-//')"; do
+    if [ -d "$legacy" ] && [ ! -d "$cfg" ]; then
+        mkdir -p "$(dirname "$cfg")"
+        mv "$legacy" "$cfg"
+        echo "moved remote-control state to $cfg" >&2
+    fi
+done
+
 mkdir -p "$cfg"
 chmod 700 "$cfg"
 
@@ -113,13 +125,36 @@ fi
 
 # ANTHROPIC_API_KEY is unset rather than emptied: Remote Control checks whether
 # the variable is SET, and an empty one still counts as api-key auth.
-# `same-dir` keeps every session in THIS checkout, which is what makes the caos
-# tools meaningful: the conversation's base is this repo's HEAD, and a worktree
-# per session would base them somewhere else. `--no-create-session-in-dir` skips
-# the session Remote Control otherwise pre-creates on start, so nothing is
-# running until you open one from claude.ai/code or the app.
+# NO FLAGS OF ITS OWN. This is a configuration wrapper, not an opinion about how
+# Remote Control should run, and each flag it used to add cost something:
 #
-# Both are defaults here rather than fixed: they come BEFORE "$@", so passing
-# `--spawn worktree` on the command line still overrides.
-exec env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
-    claude remote-control --spawn=same-dir --no-create-session-in-dir "$@"
+#   --no-create-session-in-dir  ARCHIVES the server's sessions when it stops, so
+#       there is nothing to resume. It was the reason a restart left the web UI
+#       holding sessions this machine no longer served ("Can't reach <host>").
+#
+#   --spawn=same-dir  is already the default, so it added nothing -- and
+#       `--continue`/`--session-id` are documented as incompatible with
+#       `--spawn`, which says an explicit one reads as "create sessions" rather
+#       than "resume them". With it passed, a restart brought back the
+#       pre-created in-dir session but NOT sessions created from the web.
+#
+# A plain `claude remote-control` "brings back every session the server was
+# serving", for about four hours after it stopped, in the same directory, as
+# long as no other server ran there meanwhile. That is the daemon behaviour, and
+# it wants no help.
+#
+# ANTHROPIC_API_KEY is unset rather than emptied: Remote Control checks whether
+# the variable is SET, and an empty one still counts as api-key auth.
+# Print what is about to run, quoted so it can be copied and edited by hand --
+# the flags here are load-bearing and worth being able to fiddle with directly.
+{
+    printf 'caos remote-control:\n'
+    printf '  CAOS_BIN=%q\n' "$CAOS_BIN"
+    printf '  config=%q\n' "$cfg"
+    printf '  exec:'
+    printf ' %q' env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+        "$(command -v claude || echo claude)" remote-control "$@"
+    printf '\n\n'
+} >&2
+
+exec env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" claude remote-control "$@"
