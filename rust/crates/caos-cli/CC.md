@@ -152,12 +152,19 @@ Two things about that dir are worth knowing:
   symlinked to the real one, and `~/.claude.json` is copied, because Remote
   Control also reads account and org fields from it and refuses without them.
   The copy is 0600, like the original.
-- **The copy is a snapshot.** Session history from remote-control sessions lands
-  in the throwaway dir rather than your real one, later changes to your real
-  `~/.claude.json` are not picked up until the launcher runs again, and any other
-  user-scope MCP servers you have come along for the ride. The caos tool server
-  is declared into the copy with `claude mcp add --scope user`, so your real
-  config is never modified.
+- **The dir persists, because that is where sessions live.** Transcripts land in
+  its `projects/`, and the session records Remote Control writes land in its
+  `.claude.json` — so the launcher seeds that file once and never re-copies it.
+  Rebuilding the dir on each launch is what used to make `--continue` and the
+  session list on claude.ai come up empty after a restart. To start over, delete
+  it: `rm -rf .git/caos-remote-control`.
+- **The account fields are a snapshot.** `claude auth login` refreshes the
+  credentials the dir symlinks, but not the org information copied into
+  `.claude.json` when it was seeded. If Remote Control starts refusing on
+  eligibility again, delete the dir so it reseeds. Any other user-scope MCP
+  servers you have also come along for the ride; the caos tool server is
+  declared into the copy with `claude mcp add --scope user`, so your real config
+  is never modified.
 
 ## When the server shows as broken
 

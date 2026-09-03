@@ -16,18 +16,20 @@
 #   .credentials.json  SYMLINKED to the real one -- Remote Control needs
 #                      claude.ai subscription auth, and an api key does not
 #                      count (it refuses outright when ANTHROPIC_API_KEY is set)
-#   .claude.json       a COPY of yours, with the tool server then declared into
-#                      it by `claude mcp add --scope user`. A copy and not a
-#                      symlink because that is where a session which cannot take
-#                      --mcp-config picks the server up, and writing it through
-#                      a symlink would add it to your real config for every
-#                      project. The account and org fields ride along -- Remote
-#                      Control refuses without them -- so it is 0600 like the
-#                      original.
+#   .claude.json       a COPY of yours, seeded once, with the tool server then
+#                      declared into it by `claude mcp add --scope user`. A copy
+#                      and not a symlink because that is where a session which
+#                      cannot take --mcp-config picks the server up, and writing
+#                      it through a symlink would add it to your real config for
+#                      every project. The account and org fields ride along --
+#                      Remote Control refuses without them -- so it is 0600 like
+#                      the original. It is also where session records land, which
+#                      is why it is seeded once and never re-copied.
 #
-# The copy is a SNAPSHOT: session history written by remote-control sessions
-# lands in the throwaway dir, not your real one, and later changes to your real
-# ~/.claude.json are not picked up until this runs again.
+# The dir PERSISTS between launches, because that is where sessions live. Session
+# history written by remote-control sessions stays there rather than in your real
+# config, and later changes to your real ~/.claude.json are not picked up at all
+# once it has been seeded.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,28 +66,50 @@ for f in "$src/.credentials.json" "$account"; do
     fi
 done
 
+# THE CONFIG DIR PERSISTS. It used to be rebuilt from scratch on every launch,
+# which threw away every session: transcripts live in `projects/`, and the
+# session records Remote Control writes live in the `.claude.json` copy, so
+# `rm -rf` here is what made `--continue` and the session list on claude.ai come
+# up empty after a restart. Only the stateless parts are refreshed below.
+#
+# To start over, delete it: rm -rf .git/caos-remote-control
 cfg="$repo/.git/caos-remote-control"
-rm -rf "$cfg"
 mkdir -p "$cfg"
 chmod 700 "$cfg"
-ln -s "$src/.credentials.json" "$cfg/.credentials.json"
 
-# 0600 BEFORE the content lands: the copy carries account and org fields.
-: > "$cfg/.claude.json"
-chmod 600 "$cfg/.claude.json"
-cat "$account" > "$cfg/.claude.json"
+# Stateless, so refreshed every launch: a symlink to whatever the real
+# credentials are now.
+ln -sfn "$src/.credentials.json" "$cfg/.credentials.json"
 
-# The same settings the other launcher passes with --settings. Its hook commands
-# read `${CAOS_BIN:-...}`, which the shell expands from the export above, so the
-# file needs no rewriting to work from a config dir.
+# SEEDED ONCE, then left alone -- this is the file that accumulates session
+# state. 0600 before any content lands in it: it carries account and org fields.
+#
+# The account fields are therefore a SNAPSHOT. `claude auth login` refreshes the
+# credentials this dir symlinks, but not the org information copied here; if
+# Remote Control ever starts refusing on eligibility again, delete the dir.
+if [ ! -e "$cfg/.claude.json" ]; then
+    : > "$cfg/.claude.json"
+    chmod 600 "$cfg/.claude.json"
+    cat "$account" > "$cfg/.claude.json"
+fi
+
+# Also stateless, and refreshed so an edit to dev/claude-code/settings.json takes
+# effect on the next launch. Its hook commands read `${CAOS_BIN:-...}`, which the
+# shell expands from the export above, so the file needs no rewriting.
 cp "$here/settings.json" "$cfg/settings.json"
 
-# `claude mcp add`, not hand-edited JSON: it is the supported way to declare a
-# server and makes no assumption about the shape of the file it is writing into.
-# `--scope user` means this config dir, which is the throwaway one.
-env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
-    claude mcp add caos --scope user -- "$CAOS_BIN" cc serve >/dev/null \
-    || { echo "could not declare the caos tool server" >&2; exit 1; }
+# The tool server, declared only when it is absent or points somewhere else --
+# `claude mcp add` refuses to overwrite an existing entry ("already exists"), so
+# a changed CAOS_BIN needs the removal first. Re-declaring unconditionally would
+# be a no-op at best and a lost binding at worst.
+declared="$(jq -r '.mcpServers.caos.command // ""' "$cfg/.claude.json")"
+if [ "$declared" != "$CAOS_BIN" ]; then
+    env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+        claude mcp remove caos --scope user >/dev/null 2>&1 || true
+    env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+        claude mcp add caos --scope user -- "$CAOS_BIN" cc serve >/dev/null \
+        || { echo "could not declare the caos tool server" >&2; exit 1; }
+fi
 
 # ANTHROPIC_API_KEY is unset rather than emptied: Remote Control checks whether
 # the variable is SET, and an empty one still counts as api-key auth.
