@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "SessionStart":     [ { "hooks": [ { "type": "command", "command": "printf 'SessionStart %s\\n' \"$(date -Is)\" >> hook-probe/SessionStart" } ] } ],
+    "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "printf 'UserPromptSubmit %s\\n' \"$(date -Is)\" >> hook-probe/UserPromptSubmit" } ] } ],
+    "PreToolUse":       [ { "hooks": [ { "type": "command", "command": "printf 'PreToolUse %s\\n' \"$(date -Is)\" >> hook-probe/PreToolUse" } ] } ],
+    "Stop":             [ { "hooks": [ { "type": "command", "command": "printf 'Stop %s\\n' \"$(date -Is)\" >> hook-probe/Stop" } ] } ]
+  }
+}
