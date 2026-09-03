@@ -29,7 +29,7 @@
 # hash before any stack exists to compute it. It must agree with the deep-deps
 # worker BYTE FOR BYTE (tests/deep-deps and the suite are the guardrail).
 #
-# Usage: ./stack/build-builtins.sh [name ...]   (default: all)
+# Usage: ./stack/build-builtins.sh   (no arguments; see `names` below)
 # Requires the dev server running and git + skopeo + curl on PATH. No docker:
 # this script composes no images — it pushes clean ones and describes deltas.
 set -euo pipefail
@@ -46,10 +46,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT=$PWD
 
-names=("$@")
-if [ ${#names[@]} -eq 0 ]; then
-  names=(runner cargo bash flake-builder git-runner merge rgrep bash-tool caos-build caos-test caos-test-result llm-client llm-call llm-step run-and-update-ref deep-deps rustc llm-stub)
-fi
+# A name here is staged, hand-deepened and stripped; where no `add_seed_record` below
+# consumes that work, it produces one line of stderr
+names=(runner cargo flake-builder deep-deps rustc)
 
 # Which entries have a HOST-BUILT nix image behind them. This is the whole
 # partition: everything else is a checked-in source directory this script

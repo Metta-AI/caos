@@ -6,4 +6,4 @@
 # git worktree anywhere. It used to be a one-line cli.sh whose whole body was
 # `$CAOS_CLI run --base:@=DEEP-DEPS/bash --worker1:@=check.sh` — a client test
 # whose only job was to launch a worker test.
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --tree:@=tree
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --tree:@=tree

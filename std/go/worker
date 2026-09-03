@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# std/go/worker is this script's only copy.
+# (env shebang: the flake image this defines (std/go) has bash at /bin/bash,
+# but the nix-builder images have only the nix profile's — /usr/bin/env, which
+# the flake-builder's caos delta guarantees, is the portable meeting point.)
+# The caos runner runs us as /worker, with /cas set up and the args
+# materialized under /cas/args. We are a script interpreter, the std/bash
+# worker with a different interpreter: fetch the next executable in the chain
+# (`worker1`) and run it with `go run`; on exit caos reads the hash of
+# /cas/out. If the script left no result there, store an empty blob so there's
+# something to read.
+set -euo pipefail
+caos get /cas/args/worker1
+# THE SCRIPT RUNS INSIDE THE PRELUDE MODULE, which is what lets a curried
+# script `import "caos/w"` at all: a lone `go run` file has no module, so it
+# may import nothing but the standard library. Copied rather than used in
+# place because /gomod is a read-only store tree and the script has to land
+# inside it. `cp -RL`, not `-R`: an image's contents are SYMLINKS into
+# /nix/store, so -R would copy links and the copy would still be read-only.
+mkdir -p /tmp/run
+cp -RL /gomod/. /tmp/run/
+# `go run` DISPATCHES ON THE SUFFIX: an argument not ending in `.go` is a
+# package path, so `go run worker1` fails with "go.mod file not found" rather
+# than running the file.
+cp /cas/args/worker1 /tmp/run/worker1.go
+cd /tmp/run
+go run worker1.go
+if [ ! -e /cas/out ]; then
+  : > /tmp/caos-empty-out
+  caos put /tmp/caos-empty-out /cas/out
+fi

@@ -138,13 +138,20 @@ fanout)
     if [ -n "$only" ]; then
       case "$only" in *" $t "*) ;; *) continue ;; esac
     fi
-    # Expand this test's directory before asking what is in it: args arrive as
-    # lazy placeholders, so an unfetched directory answers "no" to every
-    # question about its contents.
-    caos get "$d" || fail "expanding tests/$t"
-    # A TEST IS AN ENTRY WITH A SCRIPT — both, so a directory under tests/ that
-    # is neither is skipped rather than mapped over and failed.
-    if [ ! -e "$d/.caos-expr" ] || [ ! -e "$d/worker.sh" ]; then continue; fi
+    # A TEST IS A DIRECTORY UNDER tests/, AND NOTHING ELSE IS ASKED OF IT.
+    # DO NOT ADD A CONTENT CHECK HERE — not `.caos-expr`, and above all not a
+    # script by name. What a test is made of is the test's business: its
+    # `worker1` may be `worker.sh` on std/bash or `worker.go` on std/go, and
+    # its own `.caos-expr` names the pair.
+    #
+    # A check here can only SKIP, and a skipped test is invisible: `--only`
+    # then reports "matched no tests" for a name that is right there, blaming
+    # the name rather than the filter a hundred lines away. dev/run-test
+    # already makes the judgement properly — it evaluates each tree and runs
+    # the result in SEPARATE stages so a broken entry is caught at `launch`
+    # and says so, with `--catch` making that one test's FAIL rather than the
+    # suite's. A directory that is not a runnable entry belongs in the report
+    # with a diagnostic, not in silence.
 
     # THE CHILD IS THE TEST'S OWN DEEPENED TREE, and only that. One symlink:
     # `caos put` resolves it to the recorded hash, so no bytes move and the

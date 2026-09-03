@@ -690,8 +690,12 @@ overwrite. Bringing a stack up IS publishing; there is no separate command.
 
 ```bash
 ./stack/build-builtins.sh                 # bootstrap the seeded core, by hand
-./stack/build-builtins.sh bash cargo      # a subset
 ```
+
+It takes no arguments. The five entries it seeds are interdependent — cargo's
+record is keyed on flake-builder's delta, rustc's on runner's and cargo's — so
+a subset would not be a smaller bootstrap but a seed tree missing records,
+whose jobs park until a 503 that blames capacity.
 
 ## Local testing
 
