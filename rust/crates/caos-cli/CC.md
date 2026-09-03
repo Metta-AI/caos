@@ -25,12 +25,21 @@ place the tool server registers four tools over the conversation's workspace:
 | `ls` | optional `path` |
 | `grep` | `pattern`, optional `path` |
 | `bash` | `cmd`, optional `paths` |
+| `caos-build` | — |
+| `caos-test` | optional `only`, `test-salt` |
+| `caos-test-result` | `hash`, optional `log` |
 | `write` | `file_path`, `content` |
 | `edit` | `file_path`, `old_string`, `new_string`, optional `replace_all` |
 
 `read`, `ls`, `write` and `edit` are the host-side counterparts of the worker's
 inline tools (`std/llm-step/src/tools.rs`) and behave the same way, including the
 read truncation cap and `edit`'s must-match-exactly-once rule.
+
+`caos-build`, `caos-test` and `caos-test-result` are the harness's own std
+tools, offered here exactly as `llm-step` offers them. Their parameters are not
+written down in this client at all: they are read from the `help` each image
+carries and parsed by the same rules `parse_help` uses, so adding a std tool is
+a one-line change and rewording one needs no change here.
 
 `grep` is different in kind: it is the first DISPATCHED tool, running the
 `std/rgrep-tool` std tool as an ordinary caos job rather than computing an
@@ -232,4 +241,20 @@ resume a request that was never dispatched.
   one.
 - **Project tools.** `caos-tools/<name>` entries are not offered yet; they are
   discovered from the workspace rather than resolved from a fixed path, which is
-  the one piece `run_tool` does not do.
+  the one piece `run_tool` does not do. This repo has no `caos-tools/` of its
+  own, so today they would register nothing here anyway.
+- **The history tools** — `log`, `show`, `diff`. Their docs are now data
+  (`std/llm-step/src/githist/*.help`, read by the same `parse_help`), so the
+  descriptions are ready to share; what is not solved is handing the worker the
+  workspace COMMIT. `llm-step` binds it from a `/cas` path, where the object is
+  already present. From the host it has to be a gitlink, and git does not carry
+  a gitlink's target in a tree's push closure — the worker then fails with
+  `object not found on this server` for a commit the server demonstrably holds
+  (`HEAD /object/<oid>` is 200, and a worker can `caos get-hash` it). Neither
+  `ensure_pushed` (which short-circuits, since the server does hold it) nor an
+  explicit `refs/caos/req/<oid>` push changed that.
+- **`merge`.** Its result is a COMMIT, not a value, and it is the one tool that
+  advances the conversation's ancestry — `llm-step` has a dedicated callback arm
+  for it, so it is not a copy of the `grep` path.
+- **`spawn_agent` / `run_async`.** The independent-work pair. `run_async` is the
+  answer to a long build outliving its turn.

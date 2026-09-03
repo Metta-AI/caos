@@ -72,7 +72,7 @@ fn handle(t: &GitTransport, line: &str) -> Option<Value> {
     let id = id.unwrap_or(Value::Null);
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
-        "tools/list" => Some(reply(id, json!({ "tools": declarations() }))),
+        "tools/list" => Some(reply(id, json!({ "tools": declarations(t) }))),
         "tools/call" => Some(match call(t, &params) {
             Ok(result) => reply(id, result),
             // A tool that could not run at all is a JSON-RPC error; a tool that
@@ -143,8 +143,8 @@ fn fail(id: Value, code: i64, message: &str) -> Value {
 /// The tool registry. Descriptions carry the same guidance the worker's inline
 /// tools give (`std/llm-step/src/tools.rs`), because a model should meet one
 /// description of `edit` no matter which harness is running it.
-fn declarations() -> Vec<Value> {
-    vec![
+fn declarations(t: &GitTransport) -> Vec<Value> {
+    let mut tools = vec![
         declaration(
             "read",
             "Read a file from the conversation workspace. The workspace is the \
@@ -237,7 +237,44 @@ fn declarations() -> Vec<Value> {
             }),
             &["file_path", "old_string", "new_string"],
         ),
-    ]
+    ];
+    // The harness's own std tools, described by the `help` their images carry
+    // rather than by a copy of it here — the same source `llm-step` reads, so a
+    // tool reads one way wherever it is offered.
+    //
+    // A tool that cannot be described is SKIPPED, not fatal: `tools/list` is
+    // answered on every session start, and a std entry that fails to resolve
+    // (a half-built tree, a server that is not up) should cost that one tool
+    // rather than leaving the model with none at all.
+    for name in ["caos-build", "caos-test", "caos-test-result"] {
+        let Some(entry) = tools::std_tool_entry(name) else {
+            continue;
+        };
+        match tools::describe_std_tool(t, entry) {
+            Ok(help) => tools.push(std_declaration(name, &help)),
+            Err(error) => eprintln!("caos cc serve: skipping {name}: {error:?}"),
+        }
+    }
+    tools
+}
+
+/// A std tool's registry entry, from its parsed help. Every declared parameter
+/// is a string: an arg reaches a worker as a blob whatever JSON type it left the
+/// model as, which is the same choice `tree_tool_declaration` makes.
+fn std_declaration(name: &str, help: &tools::StdToolHelp) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for param in &help.params {
+        properties.insert(
+            param.name.clone(),
+            json!({ "type": "string", "description": param.doc }),
+        );
+        if param.required {
+            required.push(param.name.clone());
+        }
+    }
+    let required: Vec<&str> = required.iter().map(String::as_str).collect();
+    declaration(name, &help.doc, Value::Object(properties), &required)
 }
 
 fn declaration(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -299,7 +336,8 @@ mod tests {
     /// `updatedInput` would produce a call that fails schema validation.
     #[test]
     fn every_tool_declares_the_injected_session_arg() {
-        for tool in declarations() {
+        let Some(t) = transport() else { return };
+        for tool in declarations(&t) {
             let properties = &tool["inputSchema"]["properties"];
             assert!(
                 properties.get(SESSION_ARG).is_some(),
@@ -319,10 +357,13 @@ mod tests {
 
     #[test]
     fn the_registry_covers_exactly_the_implemented_tools() {
-        let names: Vec<String> = declarations()
+        let Some(t) = transport() else { return };
+        let names: Vec<String> = declarations(&t)
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["read", "ls", "grep", "bash", "write", "edit"]);
+        // The std tools are appended from their images, which needs a server;
+        // the built-in half is fixed and is what this pins.
+        assert_eq!(&names[..6], ["read", "ls", "grep", "bash", "write", "edit"]);
     }
 }

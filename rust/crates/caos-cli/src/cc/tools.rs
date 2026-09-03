@@ -84,6 +84,7 @@ pub fn execute(
         "edit" => edit(t, tree, args),
         "grep" => grep(t, tree, args),
         "bash" => bash(t, tree, args),
+        name if std_tool_entry(name).is_some() => std_tool(t, tree, name, args),
         other => Err(User(format!("unknown tool {other:?}"))),
     }
 }
@@ -302,6 +303,129 @@ fn bash_input(t: &GitTransport, tree: &str, cmd: &str, paths: &str) -> Result<St
     Ok(input)
 }
 
+/// The harness's own std tools, offered always, exactly as `llm-step` offers
+/// them (its `registry` binds their images through its `.caos-expr`). Named by
+/// path here for the same reason `grep` is — the client resolves an ordinary
+/// tree path rather than reaching into anyone's `DEEP-DEPS`.
+///
+/// `grep` is in this list too: it IS one of these, and having arrived first it
+/// simply has its own dispatch arm above.
+pub fn std_tool_entry(name: &str) -> Option<&'static str> {
+    match name {
+        "caos-build" => Some("std/caos-build"),
+        "caos-test" => Some("std/caos-test"),
+        "caos-test-result" => Some("std/caos-test-result"),
+        _ => None,
+    }
+}
+
+/// Run a std tool with the model's declared arguments.
+///
+/// The arguments are whatever the tool's own `help` declares, so nothing here
+/// knows what `caos-test` takes — adding a std tool to the list above is the
+/// whole change.
+fn std_tool(t: &GitTransport, tree: &str, name: &str, args: &Value) -> Result<Outcome, ToolError> {
+    let entry = std_tool_entry(name).ok_or_else(|| User(format!("unknown tool {name:?}")))?;
+    let declared = describe_std_tool(t, entry)?;
+    let mut kvs = Vec::new();
+    for param in &declared.params {
+        match args.get(&param.name) {
+            None | Some(Value::Null) => {
+                if param.required {
+                    return Err(User(format!("{name} needs `{}`", param.name)));
+                }
+            }
+            Some(Value::String(value)) => kvs.push(format!("--{}={value}", param.name)),
+            // Every arg reaches a worker as a blob whatever JSON type it left
+            // the model as, so a scalar is rendered rather than refused.
+            Some(Value::Bool(value)) => kvs.push(format!("--{}={value}", param.name)),
+            Some(Value::Number(value)) => kvs.push(format!("--{}={value}", param.name)),
+            Some(_) => return Err(User(format!("{name}'s `{}` must be a string", param.name))),
+        }
+    }
+    run_std_tool(t, tree, entry, &kvs).map(Outcome::read)
+}
+
+/// A std tool's docs and parameters, read from the `help` its image carries.
+///
+/// The same source `llm-step`'s `std_tool` reads, in the same format, so a tool
+/// is described one way wherever it is offered and rewording it needs no change
+/// here. Parsing mirrors `parse_help`/`parse_arg`: free description text, then
+/// `@param [name] doc` lines, with brackets meaning optional.
+pub struct StdToolHelp {
+    pub doc: String,
+    pub params: Vec<StdToolParam>,
+}
+
+pub struct StdToolParam {
+    pub name: String,
+    pub doc: String,
+    pub required: bool,
+}
+
+pub fn describe_std_tool(t: &GitTransport, entry: &str) -> Result<StdToolHelp, ToolError> {
+    let image = std_tool_image(t, entry)?;
+    // Top level when a tool is curried onto a plain image, under `args/` when
+    // its base is itself a curry node — which is what a rustc-built worker is.
+    // `llm-step`'s `std_tool` looks in both for the same reason.
+    let help = ["help", "args/help"]
+        .iter()
+        .find_map(|at| {
+            let oid = rev_parse(t, &format!("{image}:{at}"))?;
+            let (_, bytes) = t.get_object(&oid).ok()?;
+            String::from_utf8(bytes).ok()
+        })
+        .ok_or_else(|| Infra(format!("{entry} carries no help")))?;
+    Ok(parse_help(&help))
+}
+
+fn parse_help(text: &str) -> StdToolHelp {
+    let mut doc: Vec<&str> = Vec::new();
+    let mut params = Vec::new();
+    let mut in_tags = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        match trimmed.strip_prefix("@param") {
+            Some(rest) => {
+                in_tags = true;
+                if let Some(param) = parse_param(rest.trim()) {
+                    params.push(param);
+                }
+            }
+            // `@git` and any other block tag end the description without
+            // becoming one: a std tool reached from here gets no git context.
+            None if trimmed.starts_with('@') => in_tags = true,
+            None if !in_tags => doc.push(trimmed),
+            None => {}
+        }
+    }
+    StdToolHelp {
+        doc: doc.join(" ").trim().to_string(),
+        params,
+    }
+}
+
+fn parse_param(payload: &str) -> Option<StdToolParam> {
+    let (token, doc) = match payload.split_once(char::is_whitespace) {
+        Some((token, doc)) => (token, doc.trim()),
+        None => (payload, ""),
+    };
+    let (name, required) = match token.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        Some(inner) => (inner, false),
+        None => (token, true),
+    };
+    let ok = !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then(|| StdToolParam {
+        name: name.to_string(),
+        doc: doc.to_string(),
+        required,
+    })
+}
+
 /// Run a std tool over `tree` and return its report.
 fn run_std_tool(
     t: &GitTransport,
@@ -393,29 +517,37 @@ fn run_tool(
     let (kind, result) =
         run_client_request_with_store(t, &curried, &[format!("--in:hash={input}")], &[])
             .map_err(ToolError::infra)?;
-    let dir = scratch_path(t, "tool")?;
-    let path = dir
-        .to_str()
-        .ok_or_else(|| Infra(format!("scratch path is not UTF-8: {}", dir.display())))?;
-    cli_get(t, &result, path).map_err(ToolError::infra)?;
-    // `ls-tree` only sees local objects, and the checkout above is what brought
-    // them down — reading the entries before it would fail on a result that is
-    // perfectly fine.
-    let mut entries = Vec::new();
-    if kind == "tree" {
-        let listing = t
-            .git_capture(
-                &["ls-tree", "--format=%(objectname) %(path)", &result],
-                None,
-            )
-            .map_err(ToolError::infra)?;
-        for line in listing.lines() {
-            if let Some((oid, name)) = line.split_once(' ') {
-                entries.push((name.to_string(), oid.to_string()));
+    ToolResult::open(t, &result, &kind)
+}
+
+impl ToolResult {
+    /// Check a finished result out so its parts can be read.
+    fn open(t: &GitTransport, result: &str, kind: &str) -> Result<ToolResult, ToolError> {
+        let dir = scratch_path(t, "tool")?;
+        let path = dir
+            .to_str()
+            .ok_or_else(|| Infra(format!("scratch path is not UTF-8: {}", dir.display())))?;
+        cli_get(t, result, path).map_err(ToolError::infra)?;
+        // `ls-tree` only sees local objects, and the checkout above is what
+        // brought them down — reading the entries before it would fail on a
+        // result that is perfectly fine.
+        let mut entries = Vec::new();
+        if kind == "tree" {
+            let listing = t
+                .git_capture(&["ls-tree", "--format=%(objectname) %(path)", result], None)
+                .map_err(ToolError::infra)?;
+            for line in listing.lines() {
+                if let Some((oid, name)) = line.split_once(' ') {
+                    entries.push((name.to_string(), oid.to_string()));
+                }
             }
         }
+        Ok(ToolResult {
+            dir,
+            entries,
+            kind: kind.to_string(),
+        })
     }
-    Ok(ToolResult { dir, entries, kind })
 }
 
 /// A std tool's image, resolved once per server process per entry.

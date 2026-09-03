@@ -1,0 +1,4 @@
+Show one commit: its hash, parents, author, full message, and the unified diff it introduced (against its first parent). Optionally scope the diff to a path.
+@param [rev] The commit to show (default HEAD, the current workspace). A commit hash, a snapshot ref, or HEAD~N / ref^.
+@param [path] Restrict the shown diff to this workspace-relative path.
+@git

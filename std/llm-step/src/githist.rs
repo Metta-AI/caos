@@ -17,9 +17,18 @@
 
 use serde_json::Value;
 
-use crate::tools::{tree_tool_declaration, TreeArg, TreeTool};
+use crate::tools::{parse_help, tree_tool_declaration, TreeTool};
 
 const LIB: &str = include_str!("githist/lib.sh");
+/// The docs, as DATA beside the scripts rather than string literals here.
+///
+/// `caos cc`'s tool server offers these same three tools and needs the same
+/// descriptions; reading one file each is what keeps a tool described one way
+/// wherever it is offered, instead of two copies drifting apart. Same format as
+/// a std tool's `HELP` here-string, parsed by the same `parse_help`.
+const LOG_HELP: &str = include_str!("githist/log.help");
+const SHOW_HELP: &str = include_str!("githist/show.help");
+const DIFF_HELP: &str = include_str!("githist/diff.help");
 const LOG: &str = include_str!("githist/log.sh");
 const SHOW: &str = include_str!("githist/show.sh");
 const DIFF: &str = include_str!("githist/diff.sh");
@@ -43,56 +52,22 @@ pub fn script(name: &str) -> Option<String> {
     Some(format!("{LIB}\n{body}"))
 }
 
-fn opt(name: &str, doc: &str) -> TreeArg {
-    TreeArg {
-        name: name.to_string(),
-        doc: doc.to_string(),
-        required: false,
-    }
-}
-
-/// The registry descriptor for `name` — its docs and (all-optional) args. The
-/// `git` flag is set so the launch binds `wc`/`refs`, and `tree_tool_args`
-/// validates the model's call against these just like a tree tool's.
+/// The registry descriptor for `name` — its docs and (all-optional) args, from
+/// the help file beside its script. The `git` flag comes from that file's
+/// `@git` tag, and the launch binds `wc`/`refs` because of it.
 pub fn tool(name: &str) -> Option<TreeTool> {
-    let (doc, args): (&str, Vec<TreeArg>) = match name {
-        "log" => (
-            "Show the workspace's commit history newest-first (the conversation's turn/step \
-             commits and the repo history beneath them): one line per commit with its short \
-             hash, date, author and subject. Optionally start from a given revision and/or \
-             restrict to commits that changed a path. Reads git history the tree alone can't show.",
-            vec![
-                opt("rev", "Where to start (default HEAD, the current workspace). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^."),
-                opt("path", "Only show commits that changed this workspace-relative path."),
-                opt("count", "Maximum number of commits to show (default 20)."),
-            ],
-        ),
-        "show" => (
-            "Show one commit: its hash, parents, author, full message, and the unified diff it \
-             introduced (against its first parent). Optionally scope the diff to a path.",
-            vec![
-                opt("rev", "The commit to show (default HEAD, the current workspace). A commit hash, a snapshot ref, or HEAD~N / ref^."),
-                opt("path", "Restrict the shown diff to this workspace-relative path."),
-            ],
-        ),
-        "diff" => (
-            "Unified diff between two revisions of the workspace, optionally scoped to a path. \
-             Defaults compare the previous commit to the current workspace (what the latest \
-             step changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), \
-             HEAD/wc, or HEAD~N / ref^.",
-            vec![
-                opt("from", "The base revision (default HEAD~1, the commit before the workspace)."),
-                opt("to", "The revision to compare against the base (default HEAD, the current workspace)."),
-                opt("path", "Restrict the diff to this workspace-relative path."),
-            ],
-        ),
+    let help = match name {
+        "log" => LOG_HELP,
+        "show" => SHOW_HELP,
+        "diff" => DIFF_HELP,
         _ => return None,
     };
+    let (doc, args, git) = parse_help(&format!("githist/{name}"), help);
     Some(TreeTool {
         name: name.to_string(),
-        doc: doc.to_string(),
+        doc,
         args,
-        git: true,
+        git,
     })
 }
 

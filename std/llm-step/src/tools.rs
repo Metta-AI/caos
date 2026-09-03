@@ -194,7 +194,7 @@ fn parse_arg(payload: &str) -> Option<TreeArg> {
 /// for the caller to placeholder. A malformed `@param` is skipped with a
 /// message. This is the DURABLE parser: Phase 4 feeds it the isolated `--help`
 /// here-string; today it is fed text lifted from the script header (below).
-fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
+pub fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
     let mut git = false;

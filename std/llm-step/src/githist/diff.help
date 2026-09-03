@@ -1,0 +1,5 @@
+Unified diff between two revisions of the workspace, optionally scoped to a path. Defaults compare the previous commit to the current workspace (what the latest step changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.
+@param [from] The base revision (default HEAD~1, the commit before the workspace).
+@param [to] The revision to compare against the base (default HEAD, the current workspace).
+@param [path] Restrict the diff to this workspace-relative path.
+@git

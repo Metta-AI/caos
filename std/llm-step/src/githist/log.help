@@ -1,0 +1,5 @@
+Show the workspace's commit history newest-first (the conversation's turn/step commits and the repo history beneath them): one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
+@param [rev] Where to start (default HEAD, the current workspace). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^.
+@param [path] Only show commits that changed this workspace-relative path.
+@param [count] Maximum number of commits to show (default 20).
+@git
