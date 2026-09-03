@@ -22,10 +22,14 @@ REPO="${CAOS_REPO:-Metta-AI/caos}"
 VERSION="${CAOS_VERSION:-latest}"
 PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
+repo_files=yes
 
 for arg in "$@"; do
     case "$arg" in
         --force) force=yes ;;
+        # For a cloud environment, where the configuration is user-level and
+        # serves every repository: install the client and leave checkouts alone.
+        --no-repo-files) repo_files="" ;;
         --version=*) VERSION="${arg#--version=}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -90,10 +94,13 @@ place() { # <relative path> <asset name>
     curl -fsSL "${url%/*}/$name" -o "$dest"
     echo "wrote $1" >&2
 }
-place .claude/settings.json claude-settings.json
-place .mcp.json mcp.json
+if [ -n "$repo_files" ]; then
+    place .claude/settings.json claude-settings.json
+    place .mcp.json mcp.json
+fi
 
-cat >&2 <<'DONE'
+if [ -n "$repo_files" ]; then
+    cat >&2 <<'DONE'
 
 Done. Point the client at a caos server, then start a session:
 
@@ -103,3 +110,6 @@ Done. Point the client at a caos server, then start a session:
 `caos cc serve` is spawned by Claude Code from .mcp.json; the hooks in
 .claude/settings.json record the conversation. Neither needs a path.
 DONE
+else
+    echo "installed the client only; no repository files were written" >&2
+fi

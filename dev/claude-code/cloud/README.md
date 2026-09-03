@@ -1,60 +1,50 @@
 # Running a caos session in a cloud container
 
-Two separable things. The **client** is what a cloud session needs permanently:
-`caos cc hook` records the conversation and `caos cc serve` is the tool server,
-and both are one downloaded binary. The **stack** running inside the VM is a
-short-term experiment so there is a caos server at all — it lives and dies with
-the session, needs no hosting and no authentication work, and is off unless
-`CAOS_IN_VM_STACK` is set.
+A cloud session needs two things: the **client** (`caos cc hook` records the
+conversation, `caos cc serve` is the tool server — one downloaded binary), and a
+**caos server** to point it at. Neither requires the repository to carry
+anything.
 
-## The two pieces, and why they are two
+## Nothing is committed to a repository
 
-| | runs | where it is configured |
-|---|---|---|
-| `setup.sh` | ONCE, before Claude Code launches, then the filesystem is snapshotted and it is skipped | the environment's **Setup script** field at claude.ai/code |
-| `session-start.sh` | EVERY session, cloud or local, including resumed | the repo's `.claude/settings.json`, as a `SessionStart` hook |
+Configuration is user-level in the container, so one environment serves every
+repo. Three routes were possible; only one works:
 
-The split is forced by what the cache keeps. It is a filesystem snapshot:
-packages, docker images and `/nix` carry over; anything merely *running* does
-not. So `caosd up` cannot go in the setup script — a stack started there is not
-in the snapshot — and installing nix cannot go in the hook, or every session
-would pay for it.
+| source | |
+|---|---|
+| repo `.claude/settings.json` | works, but is a file in every repository |
+| managed settings | ruled out — an Anthropic-hosted session "doesn't read a device's MDM profile or file" |
+| **user-level settings written by the setup script** | **what this uses** |
+
+Measured, not assumed: a setup script that wrote `settings.json` into every
+candidate home found the hooks firing from `/root`. The CLI runs as root, even
+though the repo sits at `/home/user/repo` and Claude's own state under
+`/home/claude/.claude`. All three are written anyway; it costs nothing.
+
+`SessionStart` is what makes it repo-independent. The client finds caos through
+a `caos` git remote and an arbitrary checkout has none, so the hook adds it from
+`$CAOS_SERVER_URL` — per-repo configuration applied from user-level settings.
 
 ## Configuring the environment
 
-**Setup script**: paste `setup.sh`. By default it does one thing — fetch the
-release and run its `install.sh`, which drops `caos` on `PATH` and writes
-`.claude/settings.json` and `.mcp.json` into the checkout. Seconds, and it lands
-in the snapshot.
+**Setup script**: paste `setup.sh`. It downloads the client from the latest
+release, writes the hooks and deny list, declares the tool server, and touches
+no checkout.
 
-**Network access**: the default **Trusted** level already covers GitHub, so the
-client needs no change at all. Only the in-VM stack experiment needs **Custom**,
-adding what nix fetches from:
+**Environment variables**: `CAOS_SERVER_URL` for the caos server to use.
+Optionally `CAOS_VERSION` to pin a release.
 
-```text
-nixos.org
-*.nixos.org
-cache.nixos.org
-```
+**Network access**: the default **Trusted** level covers GitHub, which is where
+the client comes from. Reaching the caos server needs whatever that server's
+transport needs.
 
-**To run the stack in the VM too** (the experiment), set `CAOS_IN_VM_STACK=1` in
-the environment's variables and add the SessionStart hook to the repo's
-`.claude/settings.json`:
+## Still unproven
 
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [ { "type": "command",
-                     "command": "dev/claude-code/cloud/session-start.sh" } ] }
-    ]
-  }
-}
-```
-
-Without `CAOS_IN_VM_STACK` the setup script installs the client and stops, which
-is the shape once caos is hosted: point `CAOS_SERVER_URL` at the server and
-nothing else changes.
+The tool server is declared in `/root/.claude.json`, and while hooks are
+measured to be read from `/root/.claude/settings.json`, the MCP declaration
+beside it is NOT yet confirmed to be picked up. It is the same mechanism the
+remote-control launcher uses successfully, but that is reasoning rather than
+measurement.
 
 ## The risk worth measuring first
 
