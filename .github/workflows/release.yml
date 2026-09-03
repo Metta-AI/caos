@@ -42,8 +42,11 @@ jobs:
 
       # `nix build .#caos-cli` is the same build a developer runs; nothing about
       # the artifact is release-specific.
+      # No magic-nix-cache: it now requires a FlakeHub account and failed with
+      # "Unable to authenticate to FlakeHub", caching nothing. The build takes
+      # about four minutes without it, which is fine for now; a real cache is
+      # worth revisiting if that grows.
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build the client
         run: nix build .#caos-cli
@@ -82,8 +85,21 @@ jobs:
 
           # Prove the thing we are about to publish actually runs, rather than
           # discovering it from a cloud VM that cannot say why.
-          ./dist/caos-x86_64-linux 2>&1 | head -1
-          ./dist/caos-x86_64-linux cc 2>&1 | head -1
+          #
+          # ASSERT THE OUTPUT, NOT THE EXIT CODE. `caos` with no arguments
+          # prints its usage and exits NON-ZERO -- that is its contract -- so
+          # under `set -euo pipefail` running it as a bare command fails the
+          # step for a binary that is working perfectly.
+          banner="$(./dist/caos-x86_64-linux 2>&1 || true)"
+          case "$banner" in
+            *"usage:"*) printf '%s\n' "$banner" | head -1 ;;
+            *) echo "no usage banner from the built client:"; printf '%s\n' "$banner"; exit 1 ;;
+          esac
+          cc="$(./dist/caos-x86_64-linux cc 2>&1 || true)"
+          case "$cc" in
+            *"cc hook"*|*"cc serve"*) echo "cc subcommands present" ;;
+            *) echo "the built client has no \`cc\` surface:"; printf '%s\n' "$cc"; exit 1 ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       # Every build, so a branch push can be inspected without cutting a
