@@ -19,14 +19,17 @@
 # this needs no network-policy change at all.
 name: release
 
+# Builds on every push so a break is visible immediately; RELEASES only from a
+# tag, because a release is a promise about a name.
+#
+# `caos/**` is excluded deliberately: the tui publishes each conversation to
+# `caos/<conversation-id>` (rust/crates/caos-cli/TUI.md), so building those
+# would fire a job per published conversation.
 on:
   push:
-    tags: ["v*"]
+    branches-ignore: ["caos/**"]
+    tags: ["*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to publish (workflow_dispatch only)"
-        required: true
 
 permissions:
   contents: write
@@ -53,7 +56,14 @@ jobs:
         id: stage
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # A tag names itself; anything else is stamped with where it came
+          # from, so an artifact pulled off a branch build cannot be mistaken
+          # for a release.
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="${{ github.ref_name }}-$(git rev-parse --short HEAD)"
+          fi
           wrapper="$(readlink -f result/bin/caos-cli)"
           inner="$(grep -o '/nix/store/[^"]*caos-cli-bin/bin/caos-cli' "$wrapper" | tail -1)"
           test -n "$inner" || { echo "could not find the inner binary in $wrapper" >&2; exit 1; }
@@ -76,7 +86,15 @@ jobs:
           ./dist/caos-x86_64-linux cc 2>&1 | head -1
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # Every build, so a branch push can be inspected without cutting a
+      # release for it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caos-client-${{ steps.stage.outputs.tag }}
+          path: dist/
+
       - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
         with:
           tag_name: ${{ steps.stage.outputs.tag }}
           files: |
