@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Claude Code Remote Control against a caos workspace, driven from
+# claude.ai/code or the mobile app. See rust/crates/caos-cli/CC.md.
+#
+# `claude remote-control` takes NO --settings/--mcp-config: it is a persistent
+# server, so it reads configuration from the usual places rather than from its
+# command line. Putting ours in the usual places would mean `.claude/` in this
+# repo, which applies to EVERY Claude Code session here -- including an ordinary
+# one you want to keep its built-in tools. Claude Code reloads settings files
+# live, so that would disarm a session already running in this checkout.
+#
+# So this builds a throwaway config dir and points CLAUDE_CONFIG_DIR at it,
+# which scopes the whole thing to this invocation.
+#
+#   settings.json      the deny list and hooks (written here)
+#   .credentials.json  SYMLINKED to the real one -- Remote Control needs
+#                      claude.ai subscription auth, and an api key does not
+#                      count (it refuses outright when ANTHROPIC_API_KEY is set)
+#   .claude.json       a COPY of yours, with the tool server then declared into
+#                      it by `claude mcp add --scope user`. A copy and not a
+#                      symlink because that is where a session which cannot take
+#                      --mcp-config picks the server up, and writing it through
+#                      a symlink would add it to your real config for every
+#                      project. The account and org fields ride along -- Remote
+#                      Control refuses without them -- so it is 0600 like the
+#                      original.
+#
+# The copy is a SNAPSHOT: session history written by remote-control sessions
+# lands in the throwaway dir, not your real one, and later changes to your real
+# ~/.claude.json are not picked up until this runs again.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+
+CAOS_BIN="${CAOS_BIN:-$repo/result/bin/caos}"
+if [ ! -x "$CAOS_BIN" ]; then
+    echo "no caos binary at $CAOS_BIN -- run \`nix build\` first," >&2
+    echo "or set CAOS_BIN to one (e.g. rust/target/debug/caos-cli)." >&2
+    exit 1
+fi
+export CAOS_BIN
+
+# Same probe as ./run: a stale binary should fail here, not leave a session
+# quietly toolless (a model with no tools does not say so -- it improvises).
+probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    | "$CAOS_BIN" cc serve 2>/dev/null || true)"
+case "$probe" in
+    *caos_session*) ;;
+    *)
+        echo "$CAOS_BIN cc serve did not list its tools;" >&2
+        echo "it is probably older than \`caos cc\`. Rebuild it." >&2
+        exit 1
+        ;;
+esac
+
+src="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+account="${CLAUDE_ACCOUNT_JSON:-$HOME/.claude.json}"
+for f in "$src/.credentials.json" "$account"; do
+    if [ ! -e "$f" ]; then
+        echo "no $f -- run \`claude auth login\` first (Remote Control needs" >&2
+        echo "claude.ai subscription auth; an ANTHROPIC_API_KEY will not do)." >&2
+        exit 1
+    fi
+done
+
+cfg="$repo/.git/caos-remote-control"
+rm -rf "$cfg"
+mkdir -p "$cfg"
+chmod 700 "$cfg"
+ln -s "$src/.credentials.json" "$cfg/.credentials.json"
+
+# 0600 BEFORE the content lands: the copy carries account and org fields.
+: > "$cfg/.claude.json"
+chmod 600 "$cfg/.claude.json"
+cat "$account" > "$cfg/.claude.json"
+
+# The same settings the other launcher passes with --settings. Its hook commands
+# read `${CAOS_BIN:-...}`, which the shell expands from the export above, so the
+# file needs no rewriting to work from a config dir.
+cp "$here/settings.json" "$cfg/settings.json"
+
+# `claude mcp add`, not hand-edited JSON: it is the supported way to declare a
+# server and makes no assumption about the shape of the file it is writing into.
+# `--scope user` means this config dir, which is the throwaway one.
+env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+    claude mcp add caos --scope user -- "$CAOS_BIN" cc serve >/dev/null \
+    || { echo "could not declare the caos tool server" >&2; exit 1; }
+
+# ANTHROPIC_API_KEY is unset rather than emptied: Remote Control checks whether
+# the variable is SET, and an empty one still counts as api-key auth.
+# `same-dir` keeps every session in THIS checkout, which is what makes the caos
+# tools meaningful: the conversation's base is this repo's HEAD, and a worktree
+# per session would base them somewhere else. `--no-create-session-in-dir` skips
+# the session Remote Control otherwise pre-creates on start, so nothing is
+# running until you open one from claude.ai/code or the app.
+#
+# Both are defaults here rather than fixed: they come BEFORE "$@", so passing
+# `--spawn worktree` on the command line still overrides.
+exec env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+    claude remote-control --spawn=same-dir --no-create-session-in-dir "$@"

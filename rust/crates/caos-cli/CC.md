@@ -81,6 +81,7 @@ then:
 ```bash
 ./dev/claude-code/run                 # a session against a caos workspace
 ./dev/claude-code/run -p 'your task'  # or headless
+./dev/claude-code/remote-control      # driven from claude.ai/code or the app
 ```
 
 Any argument is passed through to `claude`. To drive it by hand instead, **from
@@ -115,6 +116,39 @@ does not say so. Asked to write a file, it will emit a plausible `bash` block
 and report success, having written nothing. `dev/claude-code/run` therefore
 probes `tools/list` before launching, so a missing or stale binary is an error
 at startup instead of a fabricated result later.
+
+## Remote Control
+
+```bash
+./dev/claude-code/remote-control
+```
+
+Then connect from claude.ai/code or the mobile app. Arguments pass through to
+`claude remote-control` (`--name`, `--spawn`, …).
+
+It needs its own launcher because `claude remote-control` accepts **no**
+`--settings` or `--mcp-config`: it is a persistent server, so it reads
+configuration from the usual places. The usual place for this repo would be
+`.claude/`, which applies to every Claude Code session here — and since Claude
+Code reloads settings files live, dropping the deny list there would disarm an
+ordinary session already running in this checkout. So the launcher builds a
+throwaway config dir under `.git/caos-remote-control` and points
+`CLAUDE_CONFIG_DIR` at it, scoping everything to the one invocation.
+
+Two things about that dir are worth knowing:
+
+- **It needs claude.ai subscription auth.** Remote Control refuses outright when
+  `ANTHROPIC_API_KEY` is set — even to an empty string, since it tests whether
+  the variable is set at all — so the launcher unsets it. `.credentials.json` is
+  symlinked to the real one, and `~/.claude.json` is copied, because Remote
+  Control also reads account and org fields from it and refuses without them.
+  The copy is 0600, like the original.
+- **The copy is a snapshot.** Session history from remote-control sessions lands
+  in the throwaway dir rather than your real one, later changes to your real
+  `~/.claude.json` are not picked up until the launcher runs again, and any other
+  user-scope MCP servers you have come along for the ride. The caos tool server
+  is declared into the copy with `claude mcp add --scope user`, so your real
+  config is never modified.
 
 ## When the server shows as broken
 
