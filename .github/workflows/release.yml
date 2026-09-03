@@ -1,0 +1,86 @@
+# Publish the caos Claude Code client.
+#
+# The release carries four assets, which together are everything a machine that
+# has never seen caos needs:
+#
+#   caos-x86_64-linux      the client, statically linked
+#   claude-settings.json   the hooks and the deny list
+#   mcp.json               the tool server declaration
+#   install.sh             fetches the three above and puts them in place
+#
+# WHY A RELEASE AND NOT A BUILD IN THE CONSUMER. A Claude Code cloud VM has a
+# five-minute setup budget and a filesystem snapshot; compiling there spends the
+# budget and, worse, anything built after the snapshot is never cached. A curl
+# of a static binary costs seconds and lands in the snapshot. It is also the
+# only way to reach a repository that is not this one -- there is no source
+# there to build.
+#
+# GitHub is already on the cloud environment's Trusted allowlist, so consuming
+# this needs no network-policy change at all.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (workflow_dispatch only)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `nix build .#caos-cli` is the same build a developer runs; nothing about
+      # the artifact is release-specific.
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build the client
+        run: nix build .#caos-cli
+
+      # `result/bin/caos-cli` is a WRAPPER script that sets CAOS_REV and execs
+      # the real binary elsewhere in the store. The wrapper is not distributable
+      # -- it names /nix/store paths that do not exist anywhere else -- so what
+      # ships is the inner executable, which is static and depends on nothing.
+      - name: Stage the assets
+        id: stage
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          wrapper="$(readlink -f result/bin/caos-cli)"
+          inner="$(grep -o '/nix/store/[^"]*caos-cli-bin/bin/caos-cli' "$wrapper" | tail -1)"
+          test -n "$inner" || { echo "could not find the inner binary in $wrapper" >&2; exit 1; }
+          # `file` says "static-pie linked" for this binary and `ldd` says
+          # "statically linked" -- accept either, and fail loudly rather than
+          # publish something that needs an interpreter the target lacks.
+          file "$inner" | grep -qE 'static-pie linked|statically linked' \
+            || { echo "$inner is not static:"; file "$inner"; exit 1; } >&2
+
+          mkdir -p dist
+          install -m 0755 "$inner" dist/caos-x86_64-linux
+          cp dev/claude-code/settings.json dist/claude-settings.json
+          cp dev/claude-code/mcp.json      dist/mcp.json
+          sed "s|@CAOS_RELEASE@|$tag|" dev/claude-code/install.sh > dist/install.sh
+          chmod 0755 dist/install.sh
+
+          # Prove the thing we are about to publish actually runs, rather than
+          # discovering it from a cloud VM that cannot say why.
+          ./dist/caos-x86_64-linux 2>&1 | head -1
+          ./dist/caos-x86_64-linux cc 2>&1 | head -1
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.stage.outputs.tag }}
+          files: |
+            dist/caos-x86_64-linux
+            dist/claude-settings.json
+            dist/mcp.json
+            dist/install.sh

@@ -2,7 +2,7 @@
   "mcpServers": {
     "caos": {
       "type": "stdio",
-      "command": "${CAOS_BIN:-./result/bin/caos}",
+      "command": "${CAOS_BIN:-caos}",
       "args": ["cc", "serve"]
     }
   }

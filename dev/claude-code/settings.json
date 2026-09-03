@@ -17,7 +17,7 @@
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook" }
         ]
       }
     ],
@@ -25,21 +25,21 @@
       {
         "matcher": "mcp__caos__.*",
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook" }
         ]
       }
     ],
     "StopFailure": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-${CLAUDE_PROJECT_DIR}/result/bin/caos}\" cc hook" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook" }
         ]
       }
     ]
