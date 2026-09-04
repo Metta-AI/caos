@@ -58,19 +58,6 @@ for arg in "$@"; do
     esac
 done
 
-# --base is the ONLY thing that decides which caos this is, so the variables
-# install.sh would otherwise read from the environment are cleared here rather
-# than merely left unmentioned. They outrank a branch inside install.sh, and an
-# exported one left over in a cloud environment would quietly install a client
-# from somewhere other than the ref every other file came from -- which is the
-# exact skew --base exists to make impossible.
-for stale in CAOS_VERSION CAOS_COMMIT CAOS_BRANCH CAOS_REPO; do
-    if [ -n "${!stale:-}" ]; then
-        echo "caos: ignoring $stale=${!stale} -- --base decides" >&2
-        unset "$stale"
-    fi
-done
-
 # The repo and the ref come back out of the base, which is why there is only
 # one thing to state. Peeled from BOTH ends rather than by field number: the
 # trailing `/dev/claude-code` is fixed, so whatever is left in the middle is

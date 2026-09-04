@@ -6,10 +6,10 @@
 #
 # WHICH BUILD, in increasing order of precedence:
 #
-#   (nothing)                  the newest build on main
-#   --branch=X  / CAOS_BRANCH  the newest build on branch X
-#   --commit=C  / CAOS_COMMIT  the build of commit C (short sha, full, any ref)
-#   --version=T / CAOS_VERSION release T, named outright, no API call
+#   (nothing)     the newest build on main
+#   --branch=X    the newest build on branch X (a sha or tag works too)
+#   --commit=C    the build of commit C (short sha, full, any ref)
+#   --version=T   release T, named outright, no API call
 #
 # Resolving a branch or commit needs `jq` and two anonymous GitHub API calls.
 # `--version` needs neither, and is the way out if either is unavailable.
@@ -28,12 +28,15 @@
 # path into somebody's checkout.
 set -euo pipefail
 
-REPO="${CAOS_REPO:-Metta-AI/caos}"
-VERSION="${CAOS_VERSION:-}"
-COMMIT="${CAOS_COMMIT:-}"
+# Arguments only. Which build to install is not read from the environment: it
+# is the kind of setting that gets exported once and then silently outranks the
+# argument someone is looking straight at.
+REPO="Metta-AI/caos"
+VERSION=""
+COMMIT=""
 # The default is a branch like any other, so the ordinary case and the pinned
 # case go down the same path and only one of them can be quietly broken.
-BRANCH="${CAOS_BRANCH:-main}"
+BRANCH="main"
 PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
 repo_files=yes
