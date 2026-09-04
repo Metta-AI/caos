@@ -204,4 +204,22 @@ EOF
     rm -f "$tmp"
 done
 
+# ---------------------------------------------------------------------------
+# When did this environment last get built?
+# ---------------------------------------------------------------------------
+# Because "did the rebuild happen?" has to be a FACT, not an inference. A setup
+# script runs once and is then frozen into a snapshot, and a session started
+# afterwards looks identical whether the environment was rebuilt or not -- so a
+# fix that was pushed but never picked up presents as a fix that did not work,
+# and the debugging goes to the code instead of to the snapshot. It cost two
+# rounds here before anyone thought to doubt the container.
+#
+# The session hook prints this, so every session says which environment it is.
+install -d /usr/local/share/caos
+{
+    echo "built:  $(date --iso-8601=seconds 2>/dev/null || date)"
+    echo "base:   $base"
+    echo "client: $(caos --version 2>&1 | head -1)"
+} > /usr/local/share/caos/setup-stamp
+
 exit 0

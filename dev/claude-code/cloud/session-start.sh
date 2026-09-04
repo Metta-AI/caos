@@ -25,6 +25,15 @@ done
 port="${CAOS_TUNNEL_PORT:-19090}"
 server="${CAOS_SERVER_URL:-}"
 
+# Which environment is this? Printed first, every session, so that a stale
+# snapshot announces itself instead of being mistaken for a broken fix.
+if [ -r /usr/local/share/caos/setup-stamp ]; then
+    while IFS= read -r line; do log "env $line"; done \
+        < /usr/local/share/caos/setup-stamp
+else
+    log "no setup stamp; this environment predates it"
+fi
+
 # ---------------------------------------------------------------------------
 # The client, refreshed
 # ---------------------------------------------------------------------------
