@@ -1,90 +1,97 @@
 #!/bin/bash
-# SessionStart hook for a caos cloud session.
+# Installed by the cloud setup script as /usr/local/bin/caos-cloud-session-start
+# and called from the user-level SessionStart hook. Runs at the start of every
+# session, so it is idempotent and quiet when there is nothing to do.
 #
-# Wired from the repo's `.claude/settings.json`, which is what a cloud session
-# reads ("Claude Code runs hooks from the repository"). Runs on EVERY session,
-# cloud or local, including resumed ones, so it is idempotent and cheap when
-# there is nothing to do.
+# Two jobs, both per-session because neither survives the environment snapshot:
 #
-# TWO JOBS, and only the first is permanent:
+#   1. Bring up the iroh tunnel, when CAOS_IROH_TICKET names one.
+#   2. Point this checkout's `caos` remote at whatever server results.
 #
-#   1. POINT THE CLIENT AT A SERVER. The client finds caos through the `caos`
-#      git remote, and a freshly cloned repo has none. This is the piece that
-#      still matters once caos is hosted: set CAOS_SERVER_URL on the
-#      environment and this needs no other change.
-#
-#   2. BRING UP A STACK (experiment). Only while caos runs inside this VM.
-#      Delete it when there is a server to point at.
+# The second is what makes the whole arrangement repo-independent: the client
+# finds caos through a `caos` git remote, an arbitrary clone has none, and this
+# adds it from user-level configuration rather than from anything committed.
 set -uo pipefail
 
-log() { printf 'caos session-start: %s\n' "$*" >&2; }
+log() { printf 'caos: %s\n' "$*" >&2; }
 
-if [ -n "${CAOS_SKIP_SESSION_START:-}" ]; then
-    log "CAOS_SKIP_SESSION_START set; doing nothing"
-    exit 0
-fi
+port="${CAOS_TUNNEL_PORT:-19090}"
+server="${CAOS_SERVER_URL:-}"
 
-# A local checkout already has its own remote and its own stack, and restarting
-# either under a developer would be rude. Absence of the `caos` remote is the
-# signal, not an Anthropic-specific marker: if the guess is ever wrong the worst
-# case is that this declines to act.
-if git remote get-url caos >/dev/null 2>&1; then
-    log "this checkout already has a caos remote; leaving it alone"
-    exit 0
-fi
-
-server="${CAOS_SERVER_URL:-http://localhost:9090}"
-git remote add caos "$server" || true
-log "caos remote -> $server"
-
-# Anything other than the in-VM stack means the server is someone else's
-# problem, which is the whole point of hosting it.
-case "$server" in
-    http://localhost:*|http://127.0.0.1:*) ;;
-    *) log "hosted server; not starting a stack"; exit 0 ;;
-esac
+# Liveness is an HTTP ROUND TRIP, never a TCP connect. `dumbpipe connect-tcp`
+# binds its local port before it has reached anything, and it accepts and then
+# silently drops connections when the far node is gone -- so a bound port reads
+# as "tunnel up" for a tunnel that carries nothing. A stale ticket presents
+# exactly that way, and the first caos job then hangs for minutes instead of
+# failing here. Any status code counts: a reply at all proves a live server.
+reachable() {
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://127.0.0.1:$1/info/refs?service=git-upload-pack" 2>/dev/null)"
+    [ -n "$code" ] && [ "$code" != 000 ]
+}
 
 # ---------------------------------------------------------------------------
-# The in-VM stack, while it still lives here
+# The tunnel
+# ---------------------------------------------------------------------------
+# A ticket names an iroh NODE, and the node id is the identity -- it comes from
+# the listener's IROH_SECRET, so a ticket keeps working across restarts of the
+# listener even though the address embedded in it goes stale. That is why one
+# ticket can live in the environment indefinitely.
+
+if [ -n "${CAOS_IROH_TICKET:-}" ]; then
+    # A live tunnel first: a resumed session may already have one, and then it
+    # does not matter whether dumbpipe is anywhere.
+    if reachable "$port"; then
+        log "tunnel already up on :$port"
+    elif ! command -v dumbpipe >/dev/null 2>&1; then
+        log "CAOS_IROH_TICKET is set but dumbpipe is not installed"
+    else
+        # A dumbpipe holding the port without serving anything would make the
+        # new one fail to bind and the failure would be attributed to iroh.
+        pkill -f "connect-tcp --addr 127.0.0.1:$port " 2>/dev/null
+
+        log "opening the iroh tunnel on :$port"
+        (dumbpipe connect-tcp --addr "127.0.0.1:$port" "$CAOS_IROH_TICKET" \
+            >/tmp/caos-tunnel.log 2>&1 &)
+        # Bounded wait: the first tool call would otherwise race the tunnel and
+        # fail with a connection error that says nothing about why.
+        for _ in $(seq 1 20); do
+            reachable "$port" && break
+            sleep 1
+        done
+        if reachable "$port"; then
+            log "tunnel up"
+        else
+            log "tunnel did not reach a caos server; see /tmp/caos-tunnel.log"
+        fi
+    fi
+    : "${server:=http://127.0.0.1:$port}"
+fi
+
+# ---------------------------------------------------------------------------
+# The remote
 # ---------------------------------------------------------------------------
 
-if curl -fsS --max-time 2 "$server/" >/dev/null 2>&1; then
-    log "a stack is already answering on $server"
+if [ -z "$server" ]; then
+    log "no CAOS_SERVER_URL and no CAOS_IROH_TICKET; leaving the remote alone"
     exit 0
 fi
 
-export PATH=/nix/var/nix/profiles/default/bin:$PATH
-if ! command -v nix >/dev/null 2>&1; then
-    log "no nix; not a provisioned caos environment, skipping the stack"
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    log "not a git repository; nothing to point at $server"
     exit 0
 fi
 
-if ! docker info >/dev/null 2>&1; then
-    log "starting dockerd"
-    (dockerd >/tmp/dockerd.log 2>&1 &)
-    for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+# An existing remote is left alone: a checkout that already names a caos server
+# has been set up deliberately, and repointing it from the environment would
+# silently move someone's work to a different stack.
+if current="$(git remote get-url caos 2>/dev/null)"; then
+    if [ "$current" != "$server" ]; then
+        log "caos remote already set to $current; leaving it (wanted $server)"
+    fi
+else
+    git remote add caos "$server" && log "caos remote -> $server"
 fi
-if ! docker info >/dev/null 2>&1; then
-    log "dockerd did not come up; see /tmp/dockerd.log"
-    exit 0
-fi
-
-# BACKGROUNDED: a cold `nix build` takes far longer than a session start should
-# wait, and a blocking SessionStart hook leaves the user looking at nothing. The
-# first caos tool call fails clearly rather than hanging, and the stack follows.
-marker=/tmp/caos-stack-bringup
-if [ -e "$marker" ]; then
-    log "bring-up already in progress (see $marker)"
-    exit 0
-fi
-: > "$marker"
-log "building and starting the stack in the background; watch $marker"
-(
-    {
-        echo "=== nix build ==="; nix build 2>&1
-        echo "=== caosd up ==="; ./result/bin/caosd up 2>&1
-        echo "=== done ==="
-    } >>"$marker" 2>&1
-) &
 
 exit 0
