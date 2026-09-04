@@ -17,9 +17,8 @@
 # URL -- no $0, no path, no referrer -- so it has to be told the thing it was
 # just fetched from.
 #
-# Resolving a ref needs `jq` and two anonymous GitHub API calls. GitHub is
-# already on a Claude Code cloud VM's Trusted allowlist, so this needs no
-# network-policy change there.
+# Resolving a ref needs `git` and one `ls-remote`, and downloading needs `curl`.
+# Nothing here touches api.github.com: see the note above the resolution.
 #
 # It installs three things into the CURRENT REPOSITORY plus one binary:
 #
@@ -83,39 +82,69 @@ esac
 # and since `-` is legal in a branch name, `cc` and `cc-conversations` made tags
 # no rule could separate; asking GitHub what is on a ref is the exact question
 # that name was a lossy encoding of.
-gh_api() { # <path> -- fails loudly, because rate limiting is the likely one
-    if ! curl -fsSL "https://api.github.com/repos/$REPO/$1"; then
-        echo "GitHub API: $REPO/$1 (rate limited? private? no such ref?)" >&2
-        return 1
-    fi
-}
-
-if ! command -v jq >/dev/null 2>&1; then
-    echo "resolving $REF needs jq" >&2
+# Resolved with `git ls-remote`, NOT api.github.com. The API is anonymous here,
+# so it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares
+# its egress address with every other cloud VM, so the budget is spent by
+# strangers. It failed exactly that way in a Claude Code cloud session:
+# raw.githubusercontent.com served the script and then api.github.com answered
+# 403, which the setup reported as "a release has to EXIST" -- blaming the one
+# thing that was fine.
+#
+# ls-remote has no such limit, needs no token, speaks to github.com like the
+# download does, and answers both halves of the question at once: the refs it
+# lists include the branch heads AND every `build-<commit>` tag.
+if ! command -v git >/dev/null 2>&1; then
+    echo "resolving $REF needs git" >&2
+    exit 1
+fi
+remote="https://github.com/$REPO"
+if ! refs="$(git ls-remote "$remote" 2>&1)"; then
+    echo "could not list the refs of $remote:" >&2
+    printf '%s\n' "$refs" | head -3 >&2
     exit 1
 fi
 
-# The newest commit at or before REF that actually HAS a build -- not REF's own
-# commit. A push and an install seconds apart would find the workflow still
-# running, and the previous build is a far better answer than a failure.
-#
-# One list of commits, one list of releases, then an intersection. `sha=` takes
-# "a SHA or branch to start listing from", so a branch, a tag and a commit all
-# work here and all mean the same useful thing.
-have="$(gh_api "releases?per_page=100" | jq -r '.[].tag_name')"
-commits="$(gh_api "commits?sha=$REF&per_page=30" | jq -r '.[].sha')"
-VERSION=""
-while IFS= read -r sha; do
-    candidate="build-$(printf '%s' "$sha" | cut -c1-12)"
-    if printf '%s\n' "$have" | grep -qxF "$candidate"; then
-        VERSION="$candidate"
-        break
+# Looked up before being guessed at: a name that IS a branch or a tag is one,
+# and only a name that is neither gets treated as a commit. Deciding by shape
+# instead would mean asking whether a string looks like a sha, and a branch may
+# be named anything at all.
+sha=""
+while IFS=$'\t' read -r s r; do
+    case "$r" in
+        # A peeled annotated tag is the commit; the unpeeled ref is the tag
+        # object, which nothing was ever built from.
+        "refs/tags/$REF^{}") sha="$s"; break ;;
+        "refs/heads/$REF"|"refs/tags/$REF") sha="$s" ;;
+    esac
+done <<< "$refs"
+
+builds=""
+while IFS=$'\t' read -r s r; do
+    case "$r" in refs/tags/build-*) builds="$builds${r#refs/tags/}"$'\n' ;; esac
+done <<< "$refs"
+
+if [ -n "$sha" ]; then
+    VERSION="build-${sha:0:12}"
+    case "$builds" in
+        *"$VERSION"$'\n'*) ;;
+        *)
+            echo "$REPO $REF is $sha, which has no build yet" >&2
+            echo "  (the workflow publishes build-<commit>; is it still running?)" >&2
+            exit 1
+            ;;
+    esac
+else
+    # Neither a branch nor a tag, so a commit -- and possibly an abbreviated
+    # one. The build tags carry 12 hex digits, so a shorter sha is a prefix of
+    # exactly the tag wanted, and nothing else has to expand it.
+    VERSION=""
+    while IFS= read -r b; do
+        case "${b#build-}" in "$REF"*) VERSION="$b"; break ;; esac
+    done <<< "$builds"
+    if [ -z "$VERSION" ]; then
+        echo "$REPO has no branch, tag or built commit called $REF" >&2
+        exit 1
     fi
-done <<< "$commits"
-if [ -z "$VERSION" ]; then
-    echo "no build published for any of the last 30 commits at $REPO $REF" >&2
-    echo '  (the workflow publishes build-<commit>; has it run?)' >&2
-    exit 1
 fi
 echo "$REPO $REF -> $VERSION" >&2
 

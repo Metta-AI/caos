@@ -95,8 +95,7 @@ echo "installing the caos client from $installer $args" >&2
 curl -fsSL "$installer" | bash -s -- $args
 if ! command -v caos >/dev/null 2>&1; then
     echo "FATAL: the caos client did not install from $installer" >&2
-    echo "  A release has to EXIST for the binary to come from anywhere." >&2
-    echo "  Check: curl -sI $installer" >&2
+    echo "  The installer's own error is above this line; read that, not this." >&2
     exit 1
 fi
 caos --version >&2 2>/dev/null || true
@@ -107,9 +106,13 @@ caos --version >&2 2>/dev/null || true
 # Only needed if CAOS_IROH_TICKET is set at session time, but installed
 # unconditionally: this is the one place that can write to the snapshot, and a
 # 4 MB binary is cheaper than discovering later that it is missing.
-dp_tag="$(curl -fsSL https://api.github.com/repos/n0-computer/dumbpipe/releases/latest 2>/dev/null \
-    | jq -r '.tag_name // empty')"
-dp_tag="${dp_tag:-v0.39.0}"
+#
+# PINNED, and not asked of api.github.com. That query was anonymous, so it is
+# rate limited per IP and a cloud VM shares its address with every other cloud
+# VM -- the same 403 that killed the client install, except this one fell back
+# silently and would have gone on doing so until the pinned version rotted.
+# A version bump here is a one-line edit; a mystery 403 is not.
+dp_tag=v0.39.0
 curl -fsSL "https://github.com/n0-computer/dumbpipe/releases/download/$dp_tag/dumbpipe-$dp_tag-linux-x86_64.tar.gz" \
     | tar xz -C /usr/local/bin ./dumbpipe || true
 chmod 0755 /usr/local/bin/dumbpipe 2>/dev/null || true
