@@ -6,9 +6,13 @@
 #
 # WHICH BUILD, in increasing order of precedence:
 #
-#   (nothing)                 the newest release of any kind
-#   --branch=X  / CAOS_BRANCH the newest release built from branch X
-#   --version=T / CAOS_VERSION exactly release T
+#   (nothing)                  the newest build on main
+#   --branch=X  / CAOS_BRANCH  the newest build on branch X
+#   --commit=C  / CAOS_COMMIT  the build of commit C (short sha, full, any ref)
+#   --version=T / CAOS_VERSION release T, named outright, no API call
+#
+# Resolving a branch or commit needs `jq` and two anonymous GitHub API calls.
+# `--version` needs neither, and is the way out if either is unavailable.
 #
 # Published as a release asset beside the binary it fetches, so one URL is
 # enough to provision a machine that has never seen caos -- including a Claude
@@ -25,8 +29,11 @@
 set -euo pipefail
 
 REPO="${CAOS_REPO:-Metta-AI/caos}"
-VERSION="${CAOS_VERSION:-latest}"
-BRANCH="${CAOS_BRANCH:-}"
+VERSION="${CAOS_VERSION:-}"
+COMMIT="${CAOS_COMMIT:-}"
+# The default is a branch like any other, so the ordinary case and the pinned
+# case go down the same path and only one of them can be quietly broken.
+BRANCH="${CAOS_BRANCH:-main}"
 PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
 repo_files=yes
@@ -39,6 +46,7 @@ for arg in "$@"; do
         --no-repo-files) repo_files="" ;;
         --version=*) VERSION="${arg#--version=}" ;;
         --branch=*) BRANCH="${arg#--branch=}" ;;
+        --commit=*) COMMIT="${arg#--commit=}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -54,44 +62,70 @@ case "$(uname -s)/$(uname -m)" in
         ;;
 esac
 
-# Track a BRANCH: install whatever that branch built most recently. GitHub has
-# no "latest release matching a prefix", so this lists releases and picks one.
-# The release workflow names a branch build `<branch>-<short sha>`, and that
-# naming is the whole mechanism -- the suffix must be pure hex, or branch `cc`
-# would claim `cc-conversations-<sha>` as its own.
+# A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
+# resolving one is a lookup rather than a parse. It was `<branch>-<sha>` once,
+# and since `-` is legal in a branch name, `cc` and `cc-conversations` made tags
+# no rule could separate; asking GitHub what is on a branch is the exact
+# question that name was a lossy encoding of.
 #
-# An explicit version wins: pinning is the stronger statement.
-if [ -n "$BRANCH" ] && [ "$VERSION" = latest ]; then
+# COMMIT wins over BRANCH, and an explicit VERSION wins over both: each is a
+# stronger statement than the one under it.
+gh_api() { # <path> -- fails loudly, because rate limiting is the likely one
+    if ! curl -fsSL "https://api.github.com/repos/$REPO/$1"; then
+        echo "GitHub API: $REPO/$1 (rate limited? private? no such ref?)" >&2
+        return 1
+    fi
+}
+
+if [ -z "$VERSION" ]; then
     if ! command -v jq >/dev/null 2>&1; then
-        echo "--branch needs jq (there is no prefix query in the releases API)" >&2
+        echo "resolving a branch or commit needs jq" >&2
+        echo "  (or name a release outright: --version=<tag>)" >&2
         exit 1
     fi
-    # Not `curl | jq`: under `pipefail` a 403 from the API would surface as a
-    # jq parse error, and rate limiting is the likeliest failure here.
-    if ! releases="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=100")"; then
-        echo "could not list releases of $REPO (rate limited? repo private?)" >&2
-        exit 1
+
+    if [ -n "$COMMIT" ]; then
+        # Through the API rather than used as given: this accepts a short sha,
+        # a full one, or anything else that names a commit, and returns the one
+        # canonical form the tag was built from.
+        # A 422 here means GitHub has never seen the commit, and the ordinary
+        # cause is that it exists only locally. Say so: "no such commit" about
+        # a sha sitting in `git log` reads as a bug in this script.
+        if ! sha="$(gh_api "commits/$COMMIT" | jq -r '.sha // empty')" || [ -z "$sha" ]; then
+            echo "$REPO does not have commit $COMMIT -- is it pushed?" >&2
+            exit 1
+        fi
+        VERSION="build-$(printf '%s' "$sha" | cut -c1-12)"
+        echo "commit $COMMIT -> $sha -> $VERSION" >&2
+    else
+        # The newest commit ON THE BRANCH that actually has a build. Not simply
+        # the branch head: a push and a session start seconds apart would find
+        # the workflow still running, and the previous build is a far better
+        # answer than a failure. Two calls, then a set intersection.
+        have="$(gh_api "releases?per_page=100" | jq -r '.[].tag_name')"
+        commits="$(gh_api "commits?sha=$BRANCH&per_page=30" | jq -r '.[].sha')"
+        VERSION=""
+        while IFS= read -r sha; do
+            candidate="build-$(printf '%s' "$sha" | cut -c1-12)"
+            if printf '%s\n' "$have" | grep -qxF "$candidate"; then
+                VERSION="$candidate"
+                break
+            fi
+        done <<< "$commits"
+        if [ -z "$VERSION" ]; then
+            echo "no build published for any of the last 30 commits on $BRANCH" >&2
+            echo '  (the workflow publishes build-<commit>; has it run?)' >&2
+            exit 1
+        fi
+        echo "branch $BRANCH -> $VERSION" >&2
     fi
-    # Newest by publication, not by position: only the first 100 are fetched,
-    # which is the right 100 because the API returns them newest first.
-    VERSION="$(printf '%s' "$releases" | jq -r --arg b "$BRANCH" '
-        [ .[] | select(.tag_name | startswith($b + "-"))
-              | select(.tag_name[($b|length)+1:] | test("^[0-9a-f]{7,40}$")) ]
-        | sort_by(.published_at) | last | .tag_name // empty')"
-    if [ -z "$VERSION" ]; then
-        echo "no release built from branch $BRANCH in $REPO" >&2
-        echo "  (a branch build publishes as <branch>-<short sha>; has it run?)" >&2
-        exit 1
-    fi
-    echo "branch $BRANCH -> $VERSION" >&2
 fi
 
-base="https://github.com/$REPO/releases"
-if [ "$VERSION" = latest ]; then
-    url="$base/latest/download/$asset"
-else
-    url="$base/download/$VERSION/$asset"
-fi
+# Always a named release by this point -- there is no `/releases/latest/`
+# route here on purpose. GitHub's "latest" is the newest release of ANY kind,
+# and with a release per push that is whichever branch pushed last, which is
+# nobody's intent.
+url="https://github.com/$REPO/releases/download/$VERSION/$asset"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -109,9 +143,7 @@ chmod +x "$tmp/caos"
 # a branch-tracking install reports forever.
 stamped="@CAOS_RELEASE@"
 case "$stamped" in
-    @CAOS_*)
-        if [ "$VERSION" = latest ]; then stamped="dev"; else stamped="$VERSION"; fi
-        ;;
+    @CAOS_*) stamped="$VERSION" ;;
 esac
 install -d "$PREFIX/bin" "$PREFIX/lib/caos"
 install -m 0755 "$tmp/caos" "$PREFIX/lib/caos/caos"

@@ -34,25 +34,30 @@ export DEBIAN_FRONTEND=noninteractive
 # work done after the snapshot is never cached either. GitHub is already on the
 # Trusted allowlist, so this needs no network-policy change.
 
-# WHICH BUILD, all from the environment so one setup script serves every case:
+# WHICH BUILD, all from the environment so one setup script serves every case
+# and nothing has to be edited between runs:
 #
-#   CAOS_BRANCH=X    track branch X -- the newest client it built
-#   CAOS_VERSION=T   pin release T exactly (wins over CAOS_BRANCH)
-#   neither          the newest release of any kind
+#   CAOS_COMMIT=C    that commit's build          (wins over CAOS_BRANCH)
+#   CAOS_BRANCH=X    the newest build on branch X
+#   neither          the newest build on main
+#   CAOS_VERSION=T   release T outright           (wins over both)
 #
-# Tracking a branch takes the INSTALLER from that branch too, raw from git
-# rather than from a release. Otherwise a branch would get its own binary but
+# The INSTALLER comes from the same place as the binary -- raw from git at that
+# branch or commit. Otherwise a branch would get its own binary driven by
 # somebody else's install logic, which is the confusing half of a version skew.
 
 repo="${CAOS_REPO:-Metta-AI/caos}"
 args="--no-repo-files"
 if [ -n "${CAOS_VERSION:-}" ]; then
     installer="https://github.com/$repo/releases/download/$CAOS_VERSION/install.sh"
-elif [ -n "${CAOS_BRANCH:-}" ]; then
-    installer="https://raw.githubusercontent.com/$repo/$CAOS_BRANCH/dev/claude-code/install.sh"
-    args="$args --branch=$CAOS_BRANCH"
 else
-    installer="https://github.com/$repo/releases/latest/download/install.sh"
+    ref="${CAOS_COMMIT:-${CAOS_BRANCH:-main}}"
+    installer="https://raw.githubusercontent.com/$repo/$ref/dev/claude-code/install.sh"
+    if [ -n "${CAOS_COMMIT:-}" ]; then
+        args="$args --commit=$CAOS_COMMIT"
+    else
+        args="$args --branch=${CAOS_BRANCH:-main}"
+    fi
 fi
 
 # `--no-repo-files`: the client goes on PATH, the configuration goes user-level

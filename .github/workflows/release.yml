@@ -22,7 +22,7 @@ name: release
 # Builds AND releases on every push: the release is how an unauthenticated
 # machine gets the binary at all, so gating it on a tag meant no cloud session
 # could be tested without minting a version first. A tag names itself; a branch
-# build is named <branch>-<short sha>.
+# build is named `build-<commit>`, by the commit alone.
 #
 # `caos/**` is excluded deliberately: the tui publishes each conversation to
 # `caos/<conversation-id>` (rust/crates/caos-cli/TUI.md), so building those
@@ -61,13 +61,19 @@ jobs:
         id: stage
         run: |
           set -euo pipefail
-          # A tag names itself; anything else is stamped with where it came
-          # from, so an artifact pulled off a branch build cannot be mistaken
-          # for a release.
+          # A tag names itself. A branch build is named by its COMMIT and
+          # nothing else -- `build-<12 hex>`.
+          #
+          # The branch name is deliberately absent. It was in this name once,
+          # as `<branch>-<sha>`, and `-` is legal in a branch name, so `cc` and
+          # `cc-conversations` produced tags no parse could tell apart. A
+          # consumer that wants a branch asks GitHub which commits are on it
+          # and looks each one up here; that is an exact question with an exact
+          # answer, where parsing a name back apart never was.
           if [ "${{ github.ref_type }}" = tag ]; then
             tag="${{ github.ref_name }}"
           else
-            tag="${{ github.ref_name }}-$(git rev-parse --short HEAD)"
+            tag="build-$(git rev-parse HEAD | cut -c1-12)"
           fi
           wrapper="$(readlink -f result/bin/caos-cli)"
           inner="$(grep -o '/nix/store/[^"]*caos-cli-bin/bin/caos-cli' "$wrapper" | tail -1)"
@@ -119,19 +125,18 @@ jobs:
       # promise about a name -- the name is the commit.
       #
       # No tag has to exist first: the action creates `tag_name` at this
-      # commit, and `stage` has already computed it as <branch>-<short sha>.
+      # commit, and `stage` has already computed it as `build-<commit>`.
       #
-      # Branch builds are NOT marked prerelease, deliberately, so that
-      # `releases/latest/download/...` resolves to the newest build and the
-      # cloud setup script needs no version pinned into its environment. The
-      # cost is real: a push to ANY branch repoints `latest` for every
-      # consumer. That is fine while the consumer is one person testing, and
-      # the day it is not, mark branch builds `prerelease: true` and pin
-      # CAOS_VERSION -- setup.sh already reads it.
+      # Branch builds are prereleases, so `latest` keeps meaning the newest
+      # real version rather than whichever branch pushed most recently. Nothing
+      # resolves through `latest` any more -- install.sh asks for a build by
+      # commit -- so this costs nothing and stops one branch's push from
+      # silently becoming everyone's default.
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.stage.outputs.tag }}
           name: ${{ steps.stage.outputs.tag }}
+          prerelease: ${{ github.ref_type != 'tag' }}
           files: |
             dist/caos-x86_64-linux
             dist/claude-settings.json
