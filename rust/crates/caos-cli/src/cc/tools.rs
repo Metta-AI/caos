@@ -326,6 +326,15 @@ pub fn std_tool_entry(name: &str) -> Option<&'static str> {
 /// whole change.
 fn std_tool(t: &GitTransport, tree: &str, name: &str, args: &Value) -> Result<Outcome, ToolError> {
     let entry = std_tool_entry(name).ok_or_else(|| User(format!("unknown tool {name:?}")))?;
+    // The same check `declarations` makes, for the same reason: the name map
+    // says yes in any repository, and describing the entry would push this
+    // workspace to caos before discovering that the entry is not in it.
+    if !t.work_dir().join(entry).is_dir() {
+        return Err(User(format!(
+            "{name} needs {entry}, which is not in this workspace \
+             (it is a caos repository tool)"
+        )));
+    }
     let declared = describe_std_tool(t, entry)?;
     let mut kvs = Vec::new();
     for param in &declared.params {

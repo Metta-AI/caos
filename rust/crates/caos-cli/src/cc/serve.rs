@@ -291,6 +291,22 @@ fn declarations(t: Result<&GitTransport, &String>) -> Vec<Value> {
             let Some(entry) = tools::std_tool_entry(name) else {
                 continue;
             };
+            // PRESENT BEFORE DESCRIBED, and this ordering is the whole point.
+            // Describing one pushes the workspace tree to the caos server, and
+            // `std_tool_entry` is a static name map that says yes in any
+            // repository -- so an ordinary checkout with no `std/` was pushing
+            // itself to caos three times at every session start, to describe
+            // tools that cannot exist there.
+            //
+            // Worse than wasteful: it put a network round trip in front of the
+            // MCP handshake. A caos server that REFUSES is harmless (the error
+            // is caught and the tool skipped), but one reached through a tunnel
+            // whose far end is gone does not refuse -- it accepts and swallows,
+            // so the push hangs, `tools/list` never answers, and the session
+            // reports a tool server that closed rather than one still waiting.
+            if !t.work_dir().join(entry).is_dir() {
+                continue;
+            }
             match tools::describe_std_tool(t, entry) {
                 Ok(help) => tools.push(std_declaration(name, &help)),
                 Err(error) => eprintln!("caos cc serve: skipping {name}: {error:?}"),
