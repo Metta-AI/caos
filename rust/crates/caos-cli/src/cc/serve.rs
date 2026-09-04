@@ -31,7 +31,26 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
-pub fn serve(t: &GitTransport) -> Result<(), String> {
+/// The workspace is passed in UNRESOLVED, and a failure to open it does not
+/// stop the server.
+///
+/// Exiting here was worse than useless: Claude Code reports a tool server that
+/// dies before it speaks as `CONNECTION_CLOSED`, which says nothing about a
+/// repository, a directory, or caos -- and the message it would have printed
+/// goes wherever a dead child's stderr goes. Answering `initialize` and then
+/// naming the problem on the first tool call puts the reason in front of the
+/// person who can fix it.
+pub fn serve(workspace: Result<GitTransport, String>) -> Result<(), String> {
+    let workspace = match workspace {
+        Ok(t) => Ok(t),
+        Err(error) => {
+            eprintln!("caos cc serve: cannot open the caos workspace: {error}");
+            eprintln!("caos cc serve: serving anyway; tools will report this when called");
+            Err(error)
+        }
+    };
+    let t = workspace.as_ref();
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -55,7 +74,7 @@ pub fn serve(t: &GitTransport) -> Result<(), String> {
 /// Handle one message. `None` means "say nothing", which is required rather
 /// than merely polite: a JSON-RPC notification has no `id`, and answering one
 /// is a protocol violation.
-fn handle(t: &GitTransport, line: &str) -> Option<Value> {
+fn handle(t: Result<&GitTransport, &String>, line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // A malformed line has no id to answer against, so the only correct
@@ -73,12 +92,30 @@ fn handle(t: &GitTransport, line: &str) -> Option<Value> {
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
         "tools/list" => Some(reply(id, json!({ "tools": declarations(t) }))),
-        "tools/call" => Some(match call(t, &params) {
-            Ok(result) => reply(id, result),
-            // A tool that could not run at all is a JSON-RPC error; a tool that
-            // ran and failed is a result with `isError`, which the model sees
-            // and can act on. Conflating them hides real breakage as advice.
-            Err(error) => fail(id, -32603, &error),
+        // A workspace we could not open is the model's problem to report, not
+        // a protocol error: `isError` reaches the transcript, where a -32603
+        // reaches a log nobody is reading.
+        "tools/call" => Some(match t {
+            Err(error) => reply(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": format!(
+                        "caos has no workspace, so no tool can run: {error}\n\
+                         The tool server is started by Claude Code, so it looks for the \
+                         repository at $CLAUDE_PROJECT_DIR and falls back to its working \
+                         directory. Neither was a git working tree."
+                    ) }],
+                    "isError": true,
+                }),
+            ),
+            Ok(t) => match call(t, &params) {
+                Ok(result) => reply(id, result),
+                // A tool that could not run at all is a JSON-RPC error; a tool
+                // that ran and failed is a result with `isError`, which the
+                // model sees and can act on. Conflating them hides real
+                // breakage as advice.
+                Err(error) => fail(id, -32603, &error),
+            },
         }),
         "ping" => Some(reply(id, json!({}))),
         other => Some(fail(id, -32601, &format!("unknown method {other:?}"))),
@@ -143,7 +180,7 @@ fn fail(id: Value, code: i64, message: &str) -> Value {
 /// The tool registry. Descriptions carry the same guidance the worker's inline
 /// tools give (`std/llm-step/src/tools.rs`), because a model should meet one
 /// description of `edit` no matter which harness is running it.
-fn declarations(t: &GitTransport) -> Vec<Value> {
+fn declarations(t: Result<&GitTransport, &String>) -> Vec<Value> {
     let mut tools = vec![
         declaration(
             "read",
@@ -246,13 +283,18 @@ fn declarations(t: &GitTransport) -> Vec<Value> {
     // answered on every session start, and a std entry that fails to resolve
     // (a half-built tree, a server that is not up) should cost that one tool
     // rather than leaving the model with none at all.
-    for name in ["caos-build", "caos-test", "caos-test-result"] {
-        let Some(entry) = tools::std_tool_entry(name) else {
-            continue;
-        };
-        match tools::describe_std_tool(t, entry) {
-            Ok(help) => tools.push(std_declaration(name, &help)),
-            Err(error) => eprintln!("caos cc serve: skipping {name}: {error:?}"),
+    // Without a workspace there is nothing to resolve these against, and the
+    // built-ins above are still worth declaring: a tools/list that answers is
+    // what lets the session start and say why, rather than dying unexplained.
+    if let Ok(t) = t {
+        for name in ["caos-build", "caos-test", "caos-test-result"] {
+            let Some(entry) = tools::std_tool_entry(name) else {
+                continue;
+            };
+            match tools::describe_std_tool(t, entry) {
+                Ok(help) => tools.push(std_declaration(name, &help)),
+                Err(error) => eprintln!("caos cc serve: skipping {name}: {error:?}"),
+            }
         }
     }
     tools
@@ -311,13 +353,13 @@ mod tests {
     fn notifications_are_never_answered() {
         let Some(t) = transport() else { return };
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(handle(&t, notification).is_none());
+        assert!(handle(Ok(&t), notification).is_none());
     }
 
     #[test]
     fn an_unparseable_line_produces_no_response() {
         let Some(t) = transport() else { return };
-        assert!(handle(&t, "{not json").is_none());
+        assert!(handle(Ok(&t), "{not json").is_none());
     }
 
     #[test]
@@ -337,7 +379,7 @@ mod tests {
     #[test]
     fn every_tool_declares_the_injected_session_arg() {
         let Some(t) = transport() else { return };
-        for tool in declarations(&t) {
+        for tool in declarations(Ok(&t)) {
             let properties = &tool["inputSchema"]["properties"];
             assert!(
                 properties.get(SESSION_ARG).is_some(),
@@ -358,7 +400,7 @@ mod tests {
     #[test]
     fn the_registry_covers_exactly_the_implemented_tools() {
         let Some(t) = transport() else { return };
-        let names: Vec<String> = declarations(&t)
+        let names: Vec<String> = declarations(Ok(&t))
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();

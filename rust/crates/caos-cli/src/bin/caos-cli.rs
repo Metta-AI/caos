@@ -77,7 +77,7 @@ fn run(args: &[String]) -> Result<(), String> {
         // stdin) into the session's CAOS conversation. Claude Code drives the
         // model; this keeps the durable log, so a session recorded here replays
         // in `caos tui` like any other conversation.
-        Some("cc") => caos_cli::cli_cc(&transport()?, &args[2..]),
+        Some("cc") => caos_cli::cli_cc(cc_transport(), &args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation on its shared canonical head. Flag parsing (and the
@@ -138,6 +138,34 @@ fn run(args: &[String]) -> Result<(), String> {
 /// The CLI talks to the server as the `caos` git remote, over the local repo.
 fn transport() -> Result<GitTransport, String> {
     GitTransport::from_cwd()
+}
+
+/// The transport for `caos cc`, which is NOT started by a person in a shell.
+///
+/// Claude Code spawns the hook and the tool server itself, and neither one's
+/// working directory is contractually the project: in a cloud session the
+/// checkout sits at `/home/user/<repo>` while `$HOME` resolves to `/root`. A
+/// wrong cwd does not produce a wrong answer here, it produces NO answer --
+/// `gix::discover` fails, the process exits before it has spoken, and Claude
+/// Code reports `CONNECTION_CLOSED`, which names neither the directory nor the
+/// repository it wanted. `$CLAUDE_PROJECT_DIR` is what Claude Code sets for
+/// exactly this, so ask it before falling back to where we happen to stand.
+fn cc_transport() -> Result<GitTransport, String> {
+    let t = match std::env::var("CLAUDE_PROJECT_DIR") {
+        Ok(dir) if !dir.is_empty() => GitTransport::discover(&dir)
+            .map_err(|error| format!("CLAUDE_PROJECT_DIR={dir}: {error}"))?,
+        _ => GitTransport::from_cwd()?,
+    };
+    // And then STAND there. Finding the repository is not enough on its own:
+    // plenty below here resolves a relative path against the process's cwd
+    // rather than against the transport, so a correct workspace reached from
+    // the wrong directory still fails -- `std/caos-test` came back ".: outside
+    // the git worktree", which reads as a broken entry rather than a wrong cwd.
+    // One chdir fixes every such caller at once, and leaves this process where
+    // a person running caos by hand would have been standing anyway.
+    std::env::set_current_dir(t.work_dir())
+        .map_err(|error| format!("entering {}: {error}", t.work_dir().display()))?;
+    Ok(t)
 }
 
 /// The caos revision this build came from, injected by the flake's wrapper

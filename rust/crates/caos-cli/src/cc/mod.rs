@@ -49,10 +49,14 @@ const SESSION_PREFIX: &str = "cc/";
 /// exactly as the model wrote it.
 const TOOL_PREFIX: &str = "mcp__caos__";
 
-pub fn cli_cc(t: &GitTransport, args: &[String]) -> Result<(), String> {
+/// The workspace arrives UNRESOLVED because only `serve` can carry on without
+/// one. A hook that cannot find the repository has nothing to record into and
+/// should say so; a tool server that cannot find it still has to answer, or
+/// the session sees `CONNECTION_CLOSED` and no reason at all.
+pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        Some("hook") => hook(t),
-        Some("serve") => serve::serve(t),
+        Some("hook") => hook(&workspace?),
+        Some("serve") => serve::serve(workspace),
         _ => Err(usage()),
     }
 }
