@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+pub mod v3;
+
 pub const CONVERSATION_PREFIX: &str = "refs/caos/v2/conversations/";
 pub const CONVERSATION_HEAD_SUFFIX: &str = "/head";
 pub const MAX_CONVERSATION_ID_BYTES: usize = 124;

@@ -21,10 +21,18 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
+# conversation-protocol (loose Git object compression)
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # std/rgrep, std/llm-step
 regex = "1"
 # std/llm-call, std/llm-step
 serde_json = "1"
+# conversation-protocol (v3 records)
+serde = { version = "1", features = ["derive"] }
+# conversation-protocol (v3 protocol ids)
+sha2 = "0.10"
+# conversation-protocol (in-memory validation overlay)
+sha1 = "0.10"
 # std/llm-step (https-rustls: the Messages API transport in llm-client)
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
 # std/llm-stub (the test-fixture HTTP server; the same dep the caos server uses)
