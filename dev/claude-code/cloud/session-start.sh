@@ -78,8 +78,17 @@ if [ -z "$server" ]; then
     exit 0
 fi
 
+# The repo is named, not assumed from cwd. A hook's working directory is not
+# contractually the project -- in a cloud session the checkout is at
+# /home/user/repo while $HOME resolves to /root -- and a wrong cwd here does not
+# error, it silently adds the remote to some other repository or to none, and
+# the failure only shows up much later as a client that cannot find a server.
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_PROJECT_DIR" ]; then
+    cd "$CLAUDE_PROJECT_DIR" || exit 0
+fi
+
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
-    log "not a git repository; nothing to point at $server"
+    log "$PWD is not a git repository; nothing to point at $server"
     exit 0
 fi
 
