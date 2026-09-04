@@ -34,12 +34,27 @@ export DEBIAN_FRONTEND=noninteractive
 # work done after the snapshot is never cached either. GitHub is already on the
 # Trusted allowlist, so this needs no network-policy change.
 
+# WHICH BUILD, all from the environment so one setup script serves every case:
+#
+#   CAOS_BRANCH=X    track branch X -- the newest client it built
+#   CAOS_VERSION=T   pin release T exactly (wins over CAOS_BRANCH)
+#   neither          the newest release of any kind
+#
+# Tracking a branch takes the INSTALLER from that branch too, raw from git
+# rather than from a release. Otherwise a branch would get its own binary but
+# somebody else's install logic, which is the confusing half of a version skew.
+
 repo="${CAOS_REPO:-Metta-AI/caos}"
+args="--no-repo-files"
 if [ -n "${CAOS_VERSION:-}" ]; then
     installer="https://github.com/$repo/releases/download/$CAOS_VERSION/install.sh"
+elif [ -n "${CAOS_BRANCH:-}" ]; then
+    installer="https://raw.githubusercontent.com/$repo/$CAOS_BRANCH/dev/claude-code/install.sh"
+    args="$args --branch=$CAOS_BRANCH"
 else
     installer="https://github.com/$repo/releases/latest/download/install.sh"
 fi
+
 # `--no-repo-files`: the client goes on PATH, the configuration goes user-level
 # below, and the checkout is left exactly as it was found.
 #
@@ -48,11 +63,11 @@ fi
 # looks clean while installing nothing at all. The failure then surfaces one
 # layer down as every hook dying on `caos: command not found`, which reads like
 # a hook problem. Fail here, where the cause is still visible.
-curl -fsSL "$installer" | bash -s -- --no-repo-files
+echo "installing the caos client from $installer $args" >&2
+curl -fsSL "$installer" | bash -s -- $args
 if ! command -v caos >/dev/null 2>&1; then
     echo "FATAL: the caos client did not install from $installer" >&2
-    echo "  A release must EXIST -- the workflow builds every push but only" >&2
-    echo "  publishes assets from a TAG, so an untagged branch has none." >&2
+    echo "  A release has to EXIST for the binary to come from anywhere." >&2
     echo "  Check: curl -sI $installer" >&2
     exit 1
 fi
