@@ -1,13 +1,5 @@
 #!/bin/bash
-# tests/chat-tools-grep — a WORKER test, in dev/worker-test (it needs git).
-#
-# Grep's llm-step integration: root and subtree dispatch plus invalid-pattern
-# preflight. Purpose-built files replace two unrelated prior chat turns.
-#
-# The client used to type `caos-cli chat`; that is the client's turn loop, not
-# llm-step's grep, and std/llm-test/worker-common.sh does those steps here. The
-# assertions about the client's progress RENDERING are gone with it — what is
-# left is the turn tree and what llm-step sent the model.
+# shellcheck disable=SC1091,SC2034,SC2154
 set -euo pipefail
 
 caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
@@ -20,8 +12,7 @@ llm_test_setup
 mkdir -p /tmp/ws/notes
 echo "hello notes" > /tmp/ws/notes/todo.txt
 echo "goodbye world" > /tmp/ws/notes/new.txt
-caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the search fixture"
-ws=$(caos hash /cas/ws)
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the search fixture")
 
 GREP_CALLS='[
  {"id":"tu_g1","input":{"pattern":"hello"},"name":"grep","type":"tool_use"},
@@ -33,25 +24,19 @@ printf '{"content":%s,"stop_reason":"tool_use"}' \
 printf '%s\n' \
   '{"content":[{"text":"grep done","type":"text"}],"stop_reason":"end_turn"}' \
   > /tmp/stub/response-2.json
-stub_pid=""
-port=""
-start_stub /tmp/stub stub_pid port
+start_stub /tmp/stub
 
-new_llm_conversation tools-grep "$port" "$ws"
+new_llm_conversation tools-grep "$STUB_PORT" "$ws"
+dispatch_turn "search the workspace"
+wait_turn || fail "the grep turn never reached a terminal head"
 
-stage "root, scoped, and invalid-pattern grep"
-dispatch_turn "$ws" "search the workspace"
-turn=$(wait_turn) || {
-  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
-  fail "the turn never reached a terminal event"
-}
-echo "  turn $turn" >&2
+[ "$(workspace_commit "$head")" = "$base" ] || fail "grep changed the main pointer"
+$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/grep-tools.jsonl
+jq -s -e '
+  length == 3 and
+  all(.[]; .workspace_name == "main" and .result.proposal == null)
+' /tmp/grep-tools.jsonl >/dev/null || fail "grep records have wrong workspace metadata"
 
-# GREP READS; it must not write. The turn's tree is compared against the
-# workspace it started from.
-[ "$(git rev-parse "$turn^{tree}")" = "$ws" ] || fail "grep changed the workspace tree"
-
-stage "and each result reached the model"
 grep -qF 'notes/todo.txt:1:hello notes' /tmp/stub/request-2.json \
   || fail "root grep match not sent"
 grep -qF 'notes/new.txt:1:goodbye world' /tmp/stub/request-2.json \
@@ -62,7 +47,4 @@ grep -qF 'invalid pattern' /tmp/stub/request-2.json \
   || fail "invalid pattern error not explained"
 [ ! -f /tmp/stub/request-3.json ] || fail "unexpected extra model round"
 
-stage "done"
-printf 'chat-tools-grep: ALL PASS\n' > /tmp/report
-cat /tmp/report >&2
-caos put /tmp/report /cas/out
+pass chat-tools-grep
