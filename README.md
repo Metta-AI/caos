@@ -676,6 +676,11 @@ and a repo that mounted caos writes the same lines against
 `./flake-inputs/caos/std/...`. Relative paths are stable under mounting, so the
 declaration moves and the code does not.
 
+This repository's root `DEPS` declares `llm-step` and `llm-call` for
+conversations and title generation. Keep that file tracked: the client ingests
+tracked worktree files, so an untracked declaration cannot supply these entry
+points.
+
 The five entries that cannot be built by the machinery they ARE — `flake-builder`
 (a flake built by the flake-builder), `cargo`, `runner`, `rustc` and `deep-deps`
 — name a `docker://seeded…` sentinel instead of a builder.
