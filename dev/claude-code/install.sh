@@ -154,6 +154,10 @@ echo "$REPO $REF -> $VERSION" >&2
 # nobody's intent.
 url="https://github.com/$REPO/releases/download/$VERSION/$asset"
 
+# A function, purely so the "already current" test below can skip it without
+# indenting a heredoc -- a `WRAPPER` terminator moved off column 0 swallows the
+# rest of the file, and an indented `#!` is not a shebang at all.
+install_client() {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -199,6 +203,22 @@ case "$banner" in
         ;;
 esac
 echo "installed $PREFIX/bin/caos ($stamped)" >&2
+}
+
+# Already current? Then skip the DOWNLOAD -- not the repo files below. This now
+# runs at EVERY session start, because a client installed by the setup script
+# is frozen into the environment's snapshot and a push never reaches it. So the
+# ordinary case has to cost one `ls-remote` and no transfer.
+#
+# The wrapper records the build it installed, which makes the question
+# answerable by reading three lines of shell. `--force` reinstalls regardless,
+# which is what to reach for when the binary itself is suspect.
+if [ -z "$force" ] && [ -x "$PREFIX/bin/caos" ] \
+   && grep -qF "CAOS_REV:-$VERSION}" "$PREFIX/bin/caos" 2>/dev/null; then
+    echo "$PREFIX/bin/caos is already $VERSION" >&2
+else
+    install_client
+fi
 
 # The repository files. NOT overwritten without --force: a checkout that already
 # has `.claude/settings.json` has someone's configuration in it, and replacing

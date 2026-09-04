@@ -15,8 +15,32 @@ set -uo pipefail
 
 log() { printf 'caos: %s\n' "$*" >&2; }
 
+base=""
+for arg in "$@"; do
+    case "$arg" in
+        --base=*) base="${arg#--base=}" ;;
+    esac
+done
+
 port="${CAOS_TUNNEL_PORT:-19090}"
 server="${CAOS_SERVER_URL:-}"
+
+# ---------------------------------------------------------------------------
+# The client, refreshed
+# ---------------------------------------------------------------------------
+# The setup script installed one, into a filesystem that was then FROZEN. A
+# push does not reach an existing environment, so a client installed there is
+# as old as the environment is -- which is how a wrapper with a dash-only
+# `exec -a` survived being fixed and pushed.
+#
+# Re-running the installer costs one `git ls-remote`, because it stops as soon
+# as it finds the build already installed. Not fatal on failure: a working
+# client that is out of date beats no session at all.
+if [ -n "$base" ]; then
+    if ! curl -fsSL "$base/install.sh" | bash -s -- --no-repo-files --base="$base"; then
+        log "could not refresh the client; carrying on with the installed one"
+    fi
+fi
 
 # Liveness is an HTTP ROUND TRIP, never a TCP connect. `dumbpipe connect-tcp`
 # binds its local port before it has reached anything, and it accepts and then

@@ -121,19 +121,37 @@ chmod 0755 /usr/local/bin/dumbpipe 2>/dev/null || true
 command -v dumbpipe >/dev/null 2>&1 \
     || echo "WARNING: dumbpipe did not install; CAOS_IROH_TICKET will not work" >&2
 
-# The per-session work: the tunnel and the git remote. Fetched from the same
-# ref as everything else rather than embedded here as a heredoc, which it was:
-# a copy inside this file had to be re-synced by hand after every edit to the
-# original, and a stale one would have installed the wrong hook while both
-# files looked right in a diff.
-if ! curl -fsSL "$base/cloud/session-start.sh" \
-     -o /usr/local/bin/caos-cloud-session-start; then
-    echo "FATAL: could not fetch $base/cloud/session-start.sh" >&2
-    exit 1
+# The per-session work: the tunnel and the git remote. What goes in the
+# snapshot is a BOOTSTRAP that fetches the real script every session, not the
+# script itself.
+#
+# Everything this file writes is frozen the moment the environment is
+# snapshotted, and later sessions skip this file entirely -- so a fix pushed to
+# git does NOT reach an existing environment, however many sessions are
+# started. That cost a whole round: a wrapper with the wrong shebang was fixed,
+# pushed, and a new session still ran the old one, because a new session is not
+# a new environment.
+#
+# Two lines in a settings form, one of them naming a ref, is a thing worth
+# keeping stable. The scripts behind it are not. So the only durable state here
+# is the base URL, and every session re-reads what that ref says today --
+# including the CLIENT, which the session script installs.
+cat > /usr/local/bin/caos-cloud-session-start <<EOF
+#!/bin/bash
+base="$base"
+EOF
+cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
+# Never fatal: a session that cannot reach GitHub should still start, with the
+# reason on stderr, rather than be blocked by its own setup.
+if ! script="$(curl -fsSL "$base/cloud/session-start.sh")"; then
+    echo "caos: could not fetch $base/cloud/session-start.sh; skipping" >&2
+    exit 0
 fi
+exec bash -c "$script" caos-cloud-session-start --base="$base"
+BOOTSTRAP
 chmod 0755 /usr/local/bin/caos-cloud-session-start
 bash -n /usr/local/bin/caos-cloud-session-start || {
-    echo "FATAL: $base/cloud/session-start.sh does not parse" >&2
+    echo "FATAL: the session-start bootstrap does not parse" >&2
     exit 1
 }
 
