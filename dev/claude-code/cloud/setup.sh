@@ -59,36 +59,28 @@ for arg in "$@"; do
 done
 
 # The repo and the ref come back out of the base, which is why there is only
-# one thing to state. Peeled from BOTH ends rather than by field number: the
-# trailing `/dev/claude-code` is fixed, so whatever is left in the middle is
-# the ref -- and that is what makes a slashed branch (`feature/x`) work, where
-# counting fields would silently take `feature` and fetch the wrong tree.
-rest="${base#"$RAW"/}"
-owner="${rest%%/*}"; rest="${rest#*/}"
-name="${rest%%/*}";  rest="${rest#*/}"
-ref="${rest%/dev/claude-code}"
-if [ "$base" = "$rest" ] || [ -z "$owner" ] || [ -z "$name" ] || [ -z "$ref" ]; then
-    echo "FATAL: --base must look like" >&2
-    echo "  $RAW/<owner>/<repo>/<ref>/dev/claude-code" >&2
-    echo "  got: $base" >&2
-    exit 1
-fi
-repo="$owner/$name"
-echo "caos: repo=$repo ref=$ref" >&2
+# one thing to state. Shape-checked only: install.sh takes the same --base and
+# does the real parse, so repeating that here would be a second rule to keep in
+# step. The check is worth its four lines anyway -- a typo caught now names the
+# typo, where the same typo caught later is a 404 on a URL nobody typed.
+case "$base" in
+    "$RAW"/*/*/*/dev/claude-code) ;;
+    *)
+        echo "FATAL: --base must look like" >&2
+        echo "  $RAW/<owner>/<repo>/<ref>/dev/claude-code" >&2
+        echo "  got: $base" >&2
+        exit 1
+        ;;
+esac
 
-# WHICH BUILD: the ref from --base, and nothing else. `--branch=$ref` covers a
-# ref that is a commit sha or a tag as well as a branch -- the commits API takes
-# "a SHA or branch to start listing from", so all of them mean "the newest build
-# at or before this point", which is the useful reading of each.
+# WHICH CLIENT: whatever --base names, passed straight through. There is no
+# branch or version to choose here, because choosing one could only mean
+# installing a client that does not match the scripts installing it.
 #
 # CAOS_IROH_TICKET is the one environment variable left, and could not be
 # anything else: it is read at SESSION start, long after this has run and been
 # snapshotted, so no argument here could carry it.
-#
-# The repo is passed too, not left to install.sh's default: a --base naming a
-# fork would otherwise fetch that fork's installer and then look for its builds
-# in Metta-AI/caos.
-args="--no-repo-files --repo=$repo --branch=$ref"
+args="--no-repo-files --base=$base"
 installer="$base/install.sh"
 
 # `--no-repo-files`: the client goes on PATH, the configuration goes user-level

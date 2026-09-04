@@ -1,22 +1,25 @@
 #!/bin/bash
 # Install the caos Claude Code client into a repository.
 #
-#   curl -fsSL <release-url>/install.sh | bash
-#   curl -fsSL <release-url>/install.sh | bash -s -- --force
+#   B=https://raw.githubusercontent.com/Metta-AI/caos/main/dev/claude-code
+#   curl -fsSL "$B/install.sh" | bash -s -- --base="$B"
 #
-# WHICH BUILD, in increasing order of precedence:
+# `--base` says which caos, and is the only thing that does. It names a repo and
+# a ref -- a branch, a tag or a sha -- and the client installed is the newest
+# build at or before that point. Swap `main` for anything else to install from
+# there.
 #
-#   (nothing)     the newest build on main
-#   --branch=X    the newest build on branch X (a sha or tag works too)
-#   --commit=C    the build of commit C (short sha, full, any ref)
-#   --version=T   release T, named outright, no API call
+# There is deliberately no --branch, --commit or --version. The URL already
+# names a ref, and a flag that could name a DIFFERENT one would only ever be
+# used to install a client that does not match the script installing it.
 #
-# Resolving a branch or commit needs `jq` and two anonymous GitHub API calls.
-# `--version` needs neither, and is the way out if either is unavailable.
+# Saying it twice is not redundant: a script piped into bash cannot see its own
+# URL -- no $0, no path, no referrer -- so it has to be told the thing it was
+# just fetched from.
 #
-# Published as a release asset beside the binary it fetches, so one URL is
-# enough to provision a machine that has never seen caos -- including a Claude
-# Code cloud VM, whose network allowlist already trusts GitHub.
+# Resolving a ref needs `jq` and two anonymous GitHub API calls. GitHub is
+# already on a Claude Code cloud VM's Trusted allowlist, so this needs no
+# network-policy change there.
 #
 # It installs three things into the CURRENT REPOSITORY plus one binary:
 #
@@ -31,12 +34,8 @@ set -euo pipefail
 # Arguments only. Which build to install is not read from the environment: it
 # is the kind of setting that gets exported once and then silently outranks the
 # argument someone is looking straight at.
-REPO="Metta-AI/caos"
-VERSION=""
-COMMIT=""
-# The default is a branch like any other, so the ordinary case and the pinned
-# case go down the same path and only one of them can be quietly broken.
-BRANCH="main"
+RAW="https://raw.githubusercontent.com"
+BASE="$RAW/Metta-AI/caos/main/dev/claude-code"
 PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
 repo_files=yes
@@ -47,14 +46,27 @@ for arg in "$@"; do
         # For a cloud environment, where the configuration is user-level and
         # serves every repository: install the client and leave checkouts alone.
         --no-repo-files) repo_files="" ;;
-        --version=*) VERSION="${arg#--version=}" ;;
-        --branch=*) BRANCH="${arg#--branch=}" ;;
-        --commit=*) COMMIT="${arg#--commit=}" ;;
-        --repo=*)   REPO="${arg#--repo=}" ;;
+        --base=*) BASE="${arg#--base=}"; BASE="${BASE%/}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+
+# Peeled from BOTH ends rather than by field number: the trailing
+# `/dev/claude-code` is fixed, so whatever is left in the middle is the ref --
+# which is what makes a slashed branch (`feature/x`) work, where counting
+# fields would silently take `feature` and resolve against the wrong tree.
+rest="${BASE#"$RAW"/}"
+owner="${rest%%/*}"; rest="${rest#*/}"
+name="${rest%%/*}";  rest="${rest#*/}"
+REF="${rest%/dev/claude-code}"
+if [ "$BASE" = "$rest" ] || [ -z "$owner" ] || [ -z "$name" ] || [ -z "$REF" ]; then
+    echo "--base must look like" >&2
+    echo "  $RAW/<owner>/<repo>/<ref>/dev/claude-code" >&2
+    echo "  got: $BASE" >&2
+    exit 2
+fi
+REPO="$owner/$name"
 
 case "$(uname -s)/$(uname -m)" in
     Linux/x86_64) asset=caos-x86_64-linux ;;
@@ -69,11 +81,8 @@ esac
 # A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
 # resolving one is a lookup rather than a parse. It was `<branch>-<sha>` once,
 # and since `-` is legal in a branch name, `cc` and `cc-conversations` made tags
-# no rule could separate; asking GitHub what is on a branch is the exact
-# question that name was a lossy encoding of.
-#
-# COMMIT wins over BRANCH, and an explicit VERSION wins over both: each is a
-# stronger statement than the one under it.
+# no rule could separate; asking GitHub what is on a ref is the exact question
+# that name was a lossy encoding of.
 gh_api() { # <path> -- fails loudly, because rate limiting is the likely one
     if ! curl -fsSL "https://api.github.com/repos/$REPO/$1"; then
         echo "GitHub API: $REPO/$1 (rate limited? private? no such ref?)" >&2
@@ -81,49 +90,34 @@ gh_api() { # <path> -- fails loudly, because rate limiting is the likely one
     fi
 }
 
-if [ -z "$VERSION" ]; then
-    if ! command -v jq >/dev/null 2>&1; then
-        echo "resolving a branch or commit needs jq" >&2
-        echo "  (or name a release outright: --version=<tag>)" >&2
-        exit 1
-    fi
-
-    if [ -n "$COMMIT" ]; then
-        # Through the API rather than used as given: this accepts a short sha,
-        # a full one, or anything else that names a commit, and returns the one
-        # canonical form the tag was built from.
-        # A 422 here means GitHub has never seen the commit, and the ordinary
-        # cause is that it exists only locally. Say so: "no such commit" about
-        # a sha sitting in `git log` reads as a bug in this script.
-        if ! sha="$(gh_api "commits/$COMMIT" | jq -r '.sha // empty')" || [ -z "$sha" ]; then
-            echo "$REPO does not have commit $COMMIT -- is it pushed?" >&2
-            exit 1
-        fi
-        VERSION="build-$(printf '%s' "$sha" | cut -c1-12)"
-        echo "commit $COMMIT -> $sha -> $VERSION" >&2
-    else
-        # The newest commit ON THE BRANCH that actually has a build. Not simply
-        # the branch head: a push and a session start seconds apart would find
-        # the workflow still running, and the previous build is a far better
-        # answer than a failure. Two calls, then a set intersection.
-        have="$(gh_api "releases?per_page=100" | jq -r '.[].tag_name')"
-        commits="$(gh_api "commits?sha=$BRANCH&per_page=30" | jq -r '.[].sha')"
-        VERSION=""
-        while IFS= read -r sha; do
-            candidate="build-$(printf '%s' "$sha" | cut -c1-12)"
-            if printf '%s\n' "$have" | grep -qxF "$candidate"; then
-                VERSION="$candidate"
-                break
-            fi
-        done <<< "$commits"
-        if [ -z "$VERSION" ]; then
-            echo "no build published for any of the last 30 commits on $BRANCH" >&2
-            echo '  (the workflow publishes build-<commit>; has it run?)' >&2
-            exit 1
-        fi
-        echo "branch $BRANCH -> $VERSION" >&2
-    fi
+if ! command -v jq >/dev/null 2>&1; then
+    echo "resolving $REF needs jq" >&2
+    exit 1
 fi
+
+# The newest commit at or before REF that actually HAS a build -- not REF's own
+# commit. A push and an install seconds apart would find the workflow still
+# running, and the previous build is a far better answer than a failure.
+#
+# One list of commits, one list of releases, then an intersection. `sha=` takes
+# "a SHA or branch to start listing from", so a branch, a tag and a commit all
+# work here and all mean the same useful thing.
+have="$(gh_api "releases?per_page=100" | jq -r '.[].tag_name')"
+commits="$(gh_api "commits?sha=$REF&per_page=30" | jq -r '.[].sha')"
+VERSION=""
+while IFS= read -r sha; do
+    candidate="build-$(printf '%s' "$sha" | cut -c1-12)"
+    if printf '%s\n' "$have" | grep -qxF "$candidate"; then
+        VERSION="$candidate"
+        break
+    fi
+done <<< "$commits"
+if [ -z "$VERSION" ]; then
+    echo "no build published for any of the last 30 commits at $REPO $REF" >&2
+    echo '  (the workflow publishes build-<commit>; has it run?)' >&2
+    exit 1
+fi
+echo "$REPO $REF -> $VERSION" >&2
 
 # Always a named release by this point -- there is no `/releases/latest/`
 # route here on purpose. GitHub's "latest" is the newest release of ANY kind,
@@ -139,16 +133,11 @@ curl -fsSL "$url" -o "$tmp/caos"
 chmod +x "$tmp/caos"
 
 # The published binary is the STATIC one, without the version wrapper nix adds,
-# so on its own it reports an empty rev. A small wrapper puts the release back:
+# so on its own it reports an empty rev. A small wrapper puts the build back:
 # telling a stale client from a current one is the only reason it prints at all.
-# The release workflow stamps the tag over the placeholder below. Unstamped
-# means this script came from the repo or raw from a branch -- and then the
-# resolved release is a better answer than "dev", which would otherwise be what
-# a branch-tracking install reports forever.
-stamped="@CAOS_RELEASE@"
-case "$stamped" in
-    @CAOS_*) stamped="$VERSION" ;;
-esac
+# It is the build that was resolved, so there is nothing for the release
+# workflow to stamp -- a placeholder here could only ever disagree with it.
+stamped="$VERSION"
 install -d "$PREFIX/bin" "$PREFIX/lib/caos"
 install -m 0755 "$tmp/caos" "$PREFIX/lib/caos/caos"
 cat > "$PREFIX/bin/caos" <<WRAPPER

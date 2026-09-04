@@ -88,8 +88,9 @@ jobs:
           install -m 0755 "$inner" dist/caos-x86_64-linux
           cp dev/claude-code/settings.json dist/claude-settings.json
           cp dev/claude-code/mcp.json      dist/mcp.json
-          sed "s|@CAOS_RELEASE@|$tag|" dev/claude-code/install.sh > dist/install.sh
-          chmod 0755 dist/install.sh
+          # Copied, not stamped. install.sh resolves the build from its --base
+          # and reports that; a tag baked in here could only ever disagree.
+          install -m 0755 dev/claude-code/install.sh dist/install.sh
 
           # Prove the thing we are about to publish actually runs, rather than
           # discovering it from a cloud VM that cannot say why.
