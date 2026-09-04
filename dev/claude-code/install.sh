@@ -169,13 +169,35 @@ chmod +x "$tmp/caos"
 stamped="$VERSION"
 install -d "$PREFIX/bin" "$PREFIX/lib/caos"
 install -m 0755 "$tmp/caos" "$PREFIX/lib/caos/caos"
+# `#!/bin/bash`, NOT `#!/bin/sh`: `exec -a` is a bash builtin, and /bin/sh is
+# dash on Debian and Ubuntu. Written as sh, every invocation died with
+# `/usr/local/bin/caos: 3: exec: -a: not found` -- so in a cloud container the
+# client was never able to run AT ALL, and the visible symptom was the MCP tool
+# server reporting CONNECTION_CLOSED, which reads as a network problem.
 cat > "$PREFIX/bin/caos" <<WRAPPER
-#!/bin/sh
+#!/bin/bash
 export CAOS_REV="\${CAOS_REV:-$stamped}"
 exec -a "\$(basename "\$0")" "$PREFIX/lib/caos/caos" "\$@"
 WRAPPER
 chmod 0755 "$PREFIX/bin/caos"
 ln -sf "$PREFIX/bin/caos" "$PREFIX/bin/caos-cli"
+
+# RUN IT. A wrapper is three lines of shell written by another shell, and the
+# one thing never checked was whether it executes -- `exec -a` under dash left
+# a `caos` on PATH that failed on every call, and the install said "installed".
+#
+# Assert the OUTPUT, not the exit code: `caos` with no arguments prints usage
+# and exits NON-ZERO, which is its contract, so testing the status would fail
+# for a binary that is working perfectly.
+banner="$("$PREFIX/bin/caos" 2>&1 || true)"
+case "$banner" in
+    *"usage:"*) ;;
+    *)
+        echo "the installed client does not run:" >&2
+        printf '%s\n' "$banner" | head -3 >&2
+        exit 1
+        ;;
+esac
 echo "installed $PREFIX/bin/caos ($stamped)" >&2
 
 # The repository files. NOT overwritten without --force: a checkout that already
