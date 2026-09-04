@@ -53,10 +53,22 @@ RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main/dev/claude-code"
 for arg in "$@"; do
     case "$arg" in
-        --base=*)    base="${arg#--base=}"; base="${base%/}" ;;
-        --version=*) CAOS_VERSION="${arg#--version=}" ;;
+        --base=*) base="${arg#--base=}"; base="${base%/}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
+done
+
+# --base is the ONLY thing that decides which caos this is, so the variables
+# install.sh would otherwise read from the environment are cleared here rather
+# than merely left unmentioned. They outrank a branch inside install.sh, and an
+# exported one left over in a cloud environment would quietly install a client
+# from somewhere other than the ref every other file came from -- which is the
+# exact skew --base exists to make impossible.
+for stale in CAOS_VERSION CAOS_COMMIT CAOS_BRANCH CAOS_REPO; do
+    if [ -n "${!stale:-}" ]; then
+        echo "caos: ignoring $stale=${!stale} -- --base decides" >&2
+        unset "$stale"
+    fi
 done
 
 # The repo and the ref come back out of the base, which is why there is only
@@ -77,23 +89,20 @@ fi
 repo="$owner/$name"
 echo "caos: repo=$repo ref=$ref" >&2
 
-# WHICH BUILD. The ref from --base selects it, and CAOS_VERSION in the
-# environment overrides that by naming a release outright -- the one case where
-# you want a client that is NOT the tree this setup came from.
+# WHICH BUILD: the ref from --base, and nothing else. `--branch=$ref` covers a
+# ref that is a commit sha or a tag as well as a branch -- the commits API takes
+# "a SHA or branch to start listing from", so all of them mean "the newest build
+# at or before this point", which is the useful reading of each.
 #
-# `--branch=$ref` also covers a ref that is a commit sha: the commits API takes
-# "a SHA or branch to start listing from", so both mean "the newest build at or
-# before this point", which is the useful reading of either.
+# CAOS_IROH_TICKET is the one environment variable left, and could not be
+# anything else: it is read at SESSION start, long after this has run and been
+# snapshotted, so no argument here could carry it.
 #
-# CAOS_IROH_TICKET stays an environment variable and could not be anything else
-# -- it is read at SESSION start, long after this has run and been snapshotted.
-args="--no-repo-files"
-if [ -n "${CAOS_VERSION:-}" ]; then
-    installer="https://github.com/$repo/releases/download/$CAOS_VERSION/install.sh"
-else
-    installer="$base/install.sh"
-    args="$args --branch=$ref"
-fi
+# The repo is passed too, not left to install.sh's default: a --base naming a
+# fork would otherwise fetch that fork's installer and then look for its builds
+# in Metta-AI/caos.
+args="--no-repo-files --repo=$repo --branch=$ref"
+installer="$base/install.sh"
 
 # `--no-repo-files`: the client goes on PATH, the configuration goes user-level
 # below, and the checkout is left exactly as it was found.

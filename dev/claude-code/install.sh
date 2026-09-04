@@ -47,6 +47,7 @@ for arg in "$@"; do
         --version=*) VERSION="${arg#--version=}" ;;
         --branch=*) BRANCH="${arg#--branch=}" ;;
         --commit=*) COMMIT="${arg#--commit=}" ;;
+        --repo=*)   REPO="${arg#--repo=}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
