@@ -1198,6 +1198,7 @@ impl ConversationState {
             .replay
             .turns
             .into_iter()
+            .filter(|turn| !turn.message.trim().is_empty())
             .map(|turn| TranscriptEntry {
                 role: match turn.role {
                     ConversationRole::Human if turn.author != current_user => {
@@ -1496,6 +1497,11 @@ impl ConversationState {
         else {
             return;
         };
+        // A follower failure does not undo a saved message. Keep its pending
+        // row until replay catches up, but never offer the same message to resend.
+        if pending.commit.is_some() {
+            return;
+        }
         self.discard_pending_submission(id);
         self.composer.restore_message(&pending.text);
     }
@@ -6538,10 +6544,15 @@ mod tests {
     fn pending_interjection_survives_a_stale_reload_until_its_commit_is_visible() {
         let (repo, remote, _) = repo_with_default_branch("pending-interjection", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let (head, _) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let transport = GitTransport::discover(&repo).unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
-        let durable_commit = load.replay.turns[0].commit.clone();
+        // Admission has already advanced the head past the message's own commit.
+        let durable_commit = transport
+            .git_capture(&["rev-parse", &format!("{head}^")], None)
+            .unwrap()
+            .trim()
+            .to_string();
         let mut conversation = state("talk-1");
         let pending_id = conversation.queue_pending_submission("another prompt".to_string());
 
@@ -6589,7 +6600,13 @@ mod tests {
                     error: None,
                 },
                 replay: ConversationReplay {
-                    turns: Vec::new(),
+                    turns: vec![caos_cli::ConversationTurn {
+                        commit: "e".repeat(40),
+                        author: "assistant".to_string(),
+                        role: ConversationRole::Agent,
+                        model: Some("test-model".to_string()),
+                        message: String::new(),
+                    }],
                     activity: vec![TurnEvent::ToolCall {
                         step_commit: "e".repeat(40),
                         request: request.clone(),
@@ -6613,6 +6630,10 @@ mod tests {
         assert_eq!(conversation.status, "running a tool");
         assert_eq!(conversation.turn_phase, TurnPhase::Model);
         assert_eq!(conversation.activities.len(), 1);
+        assert!(
+            conversation.transcript.is_empty(),
+            "tool-only replies have no text row"
+        );
         assert_eq!(conversation.activities[0].id, "sleep");
         assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
         assert_eq!(conversation.activity_selection, Some(0));
@@ -6678,6 +6699,12 @@ mod tests {
         assert!(conversation.pending_submissions.is_empty());
         assert!(conversation.transcript.is_empty());
         assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
+
+        let committed_id = conversation.queue_pending_submission("already saved".to_string());
+        conversation.mark_pending_submission(committed_id, "a".repeat(40));
+        conversation.restore_pending_submission(committed_id);
+        assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
+        assert_eq!(conversation.pending_submissions.len(), 1);
     }
 
     #[test]

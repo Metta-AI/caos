@@ -261,20 +261,9 @@ fn fetch_validated_head(
     };
     let local = local_conversation_heads(t)?.get(&refname).cloned();
     if local.as_ref() != Some(&head) || !already_validated(&head)? {
-        let refspec = format!("+{refname}:{refname}");
-        t.git_capture(
-            &[
-                "-c",
-                "fetch.negotiationAlgorithm=noop",
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--no-write-fetch-head",
-                CAOS_REMOTE,
-                &refspec,
-            ],
-            None,
-        )?;
+        // Fetch the observed commit without racing other readers to rewrite the
+        // local ref. The remote ref may also advance while this fetch runs.
+        store.fetch_object(&head)?;
         validate_cached(store, &head)?;
     }
     let _ = update_local_cache(t, &refname, head.as_str());
@@ -1159,12 +1148,38 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
             Role::System => ("CAOS".to_string(), ConversationRole::Agent),
         };
         turns.push(ConversationTurn {
-            commit: head.to_string(),
+            commit: String::new(),
             author,
             role,
             model: entry.model,
             message,
         });
+    }
+
+    // Transcript entries are append-only. The suffix absent from a parent
+    // belongs to that commit, even after later events advance the head.
+    let mut cursor = head.clone();
+    let mut remaining = turns.len();
+    while remaining > 0 {
+        let view = Conversation::open(store, &cursor)?;
+        let parent = view
+            .parent()
+            .cloned()
+            .ok_or_else(|| format!("conversation commit {cursor} has no parent"))?;
+        let inherited = if parent.as_str() == G3 {
+            0
+        } else {
+            usize::try_from(Conversation::open(store, &parent)?.transcript_len()?)
+                .map_err(|_| "conversation transcript is too long".to_string())?
+        };
+        if inherited > remaining {
+            return Err(format!("conversation transcript shrank at {cursor}"));
+        }
+        for turn in &mut turns[inherited..remaining] {
+            turn.commit = cursor.to_string();
+        }
+        remaining = inherited;
+        cursor = parent;
     }
 
     let mut activity = Vec::new();
@@ -3666,12 +3681,24 @@ mod tests {
             .unwrap(),
             Some(base.clone())
         );
+        // A background reader may hold this cache ref while another follower fetches.
+        let refname = conversation_ref("talk-1").unwrap();
+        git(transport.work_dir(), &["update-ref", "-d", &refname]);
+        let ref_lock = transport
+            .work_dir()
+            .join(".git")
+            .join(format!("{refname}.lock"));
+        std::fs::create_dir_all(ref_lock.parent().unwrap()).unwrap();
+        std::fs::write(&ref_lock, "another reader").unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
+        std::fs::remove_file(ref_lock).unwrap();
         assert_eq!(load.snapshot.status, RequestStatus::Queued);
         assert_eq!(load.replay.turns[0].message, "hello");
         assert_eq!(load.workspaces[0].name, "main");
         let head = oid(&load.snapshot.head, "head").unwrap();
         let store = open_store(&transport).unwrap();
+        let first_message = store.read_commit(&head).unwrap().parents[0].to_string();
+        assert_eq!(load.replay.turns[0].commit, first_message);
         assert!(validate_spine(&store, &head, &mut HashSet::new()).is_ok());
         let mut cursor = head.clone();
         loop {
@@ -3758,12 +3785,19 @@ mod tests {
         .unwrap();
         assert_eq!(next_request, "b".repeat(40));
         assert_ne!(next_request, base);
+        let replay = conversation_load(&transport, "talk-1")
+            .unwrap()
+            .unwrap()
+            .replay;
+        assert_eq!(replay.turns.len(), 3);
+        assert_eq!(replay.turns[0].commit, first_message);
+        assert_eq!(replay.turns[1].commit, active_head.to_string());
         assert_eq!(
-            conversation_load(&transport, "talk-1")
-                .unwrap()
-                .unwrap()
-                .replay
+            replay
                 .turns
+                .iter()
+                .map(|turn| &turn.commit)
+                .collect::<HashSet<_>>()
                 .len(),
             3
         );
