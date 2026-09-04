@@ -16,7 +16,7 @@ path = "src/bin/caos-cli.rs"
 
 [dependencies]
 caos = { path = "../caos" }
-conversation-protocol = { path = "../conversation-protocol" }
+conversation-protocol = { path = "../conversation-protocol", features = ["git-cli"] }
 serde_json = "1"
 ratatui-core = { version = "0.1.2", features = ["std"] }
 ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }

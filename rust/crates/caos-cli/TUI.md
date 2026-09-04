@@ -112,15 +112,14 @@ so it never leaves the conversation pane.
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
-| `Ctrl+P` twice | Choose a base, push a clean branch, and open a PR |
+| `/publish-branch` | Push the selected workspace to `refs/heads/caos/<conversation id>` on `origin` |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
 Failures from local UI commands are shown in a temporary red command-error
-panel instead of being inserted into the conversation transcript. A
-successfully opened PR is appended as a cyan `CAOS` entry so its URL remains
-available. Routine operation status is shown only while the operation is
-running and is not added to the transcript or title.
+panel instead of being inserted into the conversation transcript. Routine
+operation status is shown only while the operation is running and is not added
+to the transcript or title.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
@@ -134,15 +133,9 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Enter `/publish-branch` to push the selected conversation's complete event
-history to `origin/caos/<conversation-id>` without opening a PR. Enter
-`/load origin/caos/<conversation-id>` to import one of those branches into the
-current CAOS server and sidebar, or pass a GitHub PR URL such as
-`/load https://github.com/Metta-AI/caos/pull/34`. PR loading uses `gh` to
-recover the head branch's conversation ID and GitHub's pull ref to support PRs
-from forks. An import preserves the conversation ID and exact first-parent
-event spine. It may advance an existing copy of that conversation, but refuses
-divergent history with the same ID.
+Enter `/publish-branch` to push the selected workspace to
+`refs/heads/caos/<conversation id>` on `origin`. Pull request creation is not
+available.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -223,35 +216,16 @@ checkout. Loading changes requires one `Ctrl+L` press and a clean working
 tree, then detaches HEAD onto the conversation's head commit so the checkout
 matches it exactly.
 
-Publishing also leaves the checkout untouched. The first `Ctrl+P` opens a base
-branch prompt with `origin`'s advertised default selected; type another branch
-to override it, then press `Ctrl+P` again. CAOS starts a visible agent turn that
-merges the exact fetched base with the standard `merge` tool, then resolves and
-tests the result. When that fetched base is already an ancestor of the current
-conversation head, the preparation turn runs without asking the agent to merge
-it again. For another base, only this conversation's delta is applied, so child
-conversations form clean PR stacks. Unresolved conflicts stop before the branch
-moves. The checkout and index remain untouched.
-Any conversation with a completed turn can be published, including one whose
-workspace diff is empty — the transcript history is the content, and its
-changes may already be part of the base.
-
-CAOS points `caos/<conversation>` directly at the validated conversation head,
-pushes it, and uses the authenticated `gh` CLI to find or open its pull
-request. The live status names each publication stage as it runs — fetching
-the base tip, sending it to the CAOS server, the preparation turn (whose tool
-activity shows through, like an ordinary turn), validating the prepared
-workspace, pushing the branch, and finding or opening the pull request. The first publication carries the conversation history; later
-publications advance the branch by fast-forward. The selected PR base is an
-ancestor of the published head, and the final tree must contain no reserved
-`.caos` state.
-
-`/publish-branch` is the sharing-only form of publication: it does not run the
-agent merge-and-test preparation turn and does not create a PR. It still checks
-the current tip for unresolved conflict records, conflict markers, and reserved
-`.caos` state before moving the branch. It can publish a completed conversation
-whose workspace diff is empty, since the transcript history itself is useful
-to another client.
+Publishing also leaves the checkout and index untouched. `/publish-branch`
+pushes the selected workspace directly to
+`refs/heads/caos/<conversation id>` on `origin`; it does not run an agent
+merge-and-test preparation turn. Pull request creation is not available. The
+workspace tip must contain no reserved `.caos` state before the branch moves.
+Updates must fast-forward the remote branch; merge remote changes into the
+workspace before publishing again. Selecting another workspace cannot discard
+the branch's existing history. Retrying also records the observed outcome of
+unfinished publications; an unchanged remote is reported as uncertain, not as
+a failed push.
 
 `/update-tree <message>` is the one command that reads the working tree back
 into a conversation. It sends an ordinary user turn — authored by your git
@@ -269,7 +243,10 @@ tree carrying the harness's reserved top-level `.caos` entry is refused.
 The intended loop is `Ctrl+L` (check out the head) → edit files → `/update-tree
 <message>` → let the agent respond → `Ctrl+L` again. You can also commit the
 changes yourself first and then run `/update-tree <message>`; the already-clean
-tree is committed no further and its `HEAD` tree is what the turn receives.
+tree is committed no further. Both committed and uncommitted edits are reconciled
+from the shared ancestor of the local checkout and the selected workspace,
+so concurrent workspace edits are preserved or reported as conflicts. Unrelated
+histories or multiple merge bases are refused before staging local files.
 
 API responses currently arrive one completed model round at a time. The
 backend also does not yet provide reliable cancellation for a running turn;

@@ -14,8 +14,8 @@ use ratatui_widgets::paragraph::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    short_hash, ActivityState, App, Command, ConfirmAction, ConversationState, EntryRole, Focus,
-    ScrollState, Shortcut, TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
+    short_hash, ActivityState, App, Command, ConversationState, EntryRole, Focus, ScrollState,
+    TranscriptPoint, View, COMMANDS, PALETTE_COMMANDS,
 };
 use caos_cli::TurnPhase;
 
@@ -41,7 +41,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         View::Help => render_help(app, frame, areas.content),
     }
     if let Some(notice) = areas.notice {
-        render_notice(app, state, frame, notice);
+        render_notice(state, frame, notice);
     }
     render_composer(
         state,
@@ -98,7 +98,7 @@ fn render_command_palette(app: &App, frame: &mut Frame<'_>) {
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{:<label_width$}", command.label)),
                     Span::styled(
-                        command.shortcut.map_or("", Shortcut::label),
+                        command.shortcut.map_or("", |shortcut| shortcut.label),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]))
@@ -174,11 +174,11 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let composer_width = body[1].width.saturating_sub(2);
     let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
-        state.composer.completion_count() as u16
+        state.composer.completion_count(&state.workspace_names()) as u16
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() || state.publish_prompt {
+    let notice_height = if state.command_error.is_some() {
         3
     } else if state.reference_notice.is_some() {
         4
@@ -203,7 +203,7 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     }
 }
 
-fn render_notice(app: &App, state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
+fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     if let Some(error) = state.command_error.as_deref() {
         frame.render_widget(
             Paragraph::new(error)
@@ -215,38 +215,6 @@ fn render_notice(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
                         .border_style(Style::default().fg(Color::Red))
                         .borders(Borders::ALL),
                 ),
-            area,
-        );
-        return;
-    }
-    if let Some(ConfirmAction::Publish {
-        default_base,
-        base_input,
-    }) = app.confirm_action.as_ref()
-    {
-        let branch = if base_input.is_empty() {
-            Span::styled(
-                format!("{default_base} (default)"),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            Span::styled(base_input.clone(), Style::default().fg(Color::Cyan))
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Base branch: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                branch,
-                Span::styled("│", Style::default().fg(Color::Cyan)),
-            ]))
-            .block(
-                Block::default()
-                    .title(" Publish PR — type a base, Ctrl+P confirms, Esc cancels ")
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .borders(Borders::ALL),
-            ),
             area,
         );
         return;
@@ -281,7 +249,7 @@ pub(super) fn reference_copy_at(
     row: u16,
 ) -> Option<String> {
     let state = app.selected();
-    if state.command_error.is_some() || state.publish_prompt || app.palette.is_some() {
+    if state.command_error.is_some() || app.palette.is_some() {
         return None;
     }
     let reference = state.reference_notice.as_ref()?;
@@ -407,8 +375,13 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     }
     push_metadata(
         state
-            .current_hash()
-            .map(|hash| format!("head {}", short_hash(hash)))
+            .selected_workspace_diff()
+            .map(|workspace| format!("ws {} {}", workspace.name, short_hash(&workspace.head)))
+            .or_else(|| {
+                state
+                    .current_hash()
+                    .map(|hash| format!("head {}", short_hash(hash)))
+            })
             .or_else(|| {
                 state
                     .turn_options
@@ -1277,35 +1250,62 @@ fn activity_mark(state: ActivityState) -> (&'static str, Color) {
 }
 
 fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
-    let text = match &state.diff {
-        Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
-        Some(_) => "No workspace changes in this conversation.",
-        None => "This conversation has no completed turn yet.",
+    let mut lines = Vec::new();
+    if state.workspaces.len() > 1 {
+        lines.push(Line::from(
+            state
+                .workspaces
+                .iter()
+                .enumerate()
+                .flat_map(|(index, workspace)| {
+                    let separator = (index > 0).then(|| Span::raw(" "));
+                    let name =
+                        if state.selected_workspace.as_deref() == Some(workspace.name.as_str()) {
+                            Span::styled(
+                                format!("[{}]", workspace.name),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            Span::raw(workspace.name.clone())
+                        };
+                    separator.into_iter().chain(std::iter::once(name))
+                })
+                .collect::<Vec<_>>(),
+        ));
+    }
+    let text = if state.workspaces.is_empty() {
+        "This conversation has no workspace."
+    } else {
+        match state.selected_workspace_diff() {
+            Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
+            Some(_) => "No workspace changes in this conversation.",
+            None => "Choose a workspace with /workspace use <name>.",
+        }
     };
-    let lines: Vec<Line<'_>> = text
-        .lines()
-        .map(|line| {
-            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                Color::Green
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                Color::Red
-            } else if line.starts_with("@@") {
-                Color::Cyan
-            } else {
-                Color::Reset
-            };
-            Line::styled(line, Style::default().fg(color))
-        })
-        .collect();
+    lines.extend(text.lines().map(|line| {
+        let color = if line.starts_with('+') && !line.starts_with("+++") {
+            Color::Green
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Color::Red
+        } else if line.starts_with("@@") {
+            Color::Cyan
+        } else {
+            Color::Reset
+        };
+        Line::styled(line, Style::default().fg(color))
+    }));
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
+    let title = if state.selected_workspace_is_published() {
+        " Workspace diff · Published "
+    } else {
+        " Workspace diff "
+    };
     frame.render_widget(
         paragraph
-            .block(
-                Block::default()
-                    .title(" Workspace diff ")
-                    .borders(Borders::ALL),
-            )
+            .block(Block::default().title(title).borders(Borders::ALL))
             .scroll((scroll, 0)),
         area,
     );
@@ -1414,7 +1414,9 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
     lines.extend(PALETTE_COMMANDS.iter().map(|command| {
         Line::raw(format!(
             "  {:<16}{}",
-            command.shortcut.map_or("palette", Shortcut::label),
+            command
+                .shortcut
+                .map_or("palette", |shortcut| shortcut.label),
             command.label
         ))
     }));
@@ -1465,10 +1467,20 @@ fn render_composer(
     } else {
         Vec::new()
     };
+    let workspaces = if view == View::Chat {
+        state
+            .composer
+            .workspace_completion(&state.workspace_names())
+            .map(|completion| completion.values)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let command_height = (commands.len() + models.len()).min(inner.height as usize) as u16;
+    let command_height =
+        (commands.len() + models.len() + workspaces.len()).min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
     let composer_area = Rect::new(
         inner.x.saturating_add(2),
@@ -1502,6 +1514,7 @@ fn render_composer(
     render_command_menu(
         &commands,
         &models,
+        &workspaces,
         state.composer.command_selection,
         frame,
         command_area,
@@ -1597,6 +1610,7 @@ fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
 fn render_command_menu(
     commands: &[&Command],
     models: &[&str],
+    workspaces: &[String],
     selected: usize,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1627,8 +1641,25 @@ fn render_command_menu(
         };
         Line::styled(format!("{marker}{model}"), style)
     });
+    let workspace_lines = workspaces.iter().enumerate().map(|(index, completion)| {
+        let index = index + commands.len() + models.len();
+        let marker = if index == selected { "> " } else { "  " };
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Line::styled(format!("{marker}{completion}"), style)
+    });
     frame.render_widget(
-        Paragraph::new(command_lines.chain(model_lines).collect::<Vec<_>>()),
+        Paragraph::new(
+            command_lines
+                .chain(model_lines)
+                .chain(workspace_lines)
+                .collect::<Vec<_>>(),
+        ),
         area,
     );
 }
@@ -1640,10 +1671,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.selected().running
-        && (app.focus() != Focus::Conversation
-            || app.view != View::Chat
-            || app.palette.is_some()
-            || app.confirm_action.is_some())
+        && (app.focus() != Focus::Conversation || app.view != View::Chat || app.palette.is_some())
     {
         let send_shortcut = if app.enhanced_keyboard() {
             "^Enter"
@@ -1655,10 +1683,6 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
-    } else if matches!(app.confirm_action, Some(ConfirmAction::Publish { .. })) {
-        Line::raw(
-            " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
-        )
     } else if app.focus() == Focus::List {
         Line::raw(
             " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
@@ -1681,7 +1705,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ""
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P×2 publish  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
