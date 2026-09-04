@@ -1,10 +1,25 @@
 #!/bin/bash
 # Cloud-environment SETUP SCRIPT for caos sessions (claude.ai/code).
 #
-# Paste into the environment's "Setup script" field. Runs ONCE as root on Ubuntu
-# 24.04 before Claude Code launches; the filesystem is then snapshotted and
-# later sessions start from it with this skipped. What survives is what is
-# written to DISK -- anything merely RUNNING does not.
+# Runs ONCE as root on Ubuntu 24.04 before Claude Code launches; the filesystem
+# is then snapshotted and later sessions start from it with this skipped. What
+# survives is what is written to DISK -- anything merely RUNNING does not.
+#
+# DO NOT PASTE THIS FILE into the "Setup script" field. Paste these two lines,
+# so that editing this file is enough and the settings form never has to be
+# touched again:
+#
+#   B=https://raw.githubusercontent.com/Metta-AI/caos/main/dev/claude-code
+#   curl -fsSL "$B/cloud/setup.sh" | bash -s -- --base="$B"
+#
+# `--base` is the whole configuration: everything else -- which repo, which
+# branch or commit, where the sibling scripts live -- is read back out of it. A
+# script piped into bash cannot see its own URL (no $0, no path, no referrer),
+# so it has to be told once, and once is all it is told.
+#
+# Swap `main` for a branch or a commit sha to test a change: the setup script,
+# the installer, the session hook and the client then ALL come from that one
+# ref, and there is no second place to keep in step.
 #
 # NOTHING HERE TOUCHES A REPOSITORY. Everything is user-level configuration in
 # the container, so one environment serves every repo and no project has to
@@ -34,30 +49,50 @@ export DEBIAN_FRONTEND=noninteractive
 # work done after the snapshot is never cached either. GitHub is already on the
 # Trusted allowlist, so this needs no network-policy change.
 
-# WHICH BUILD, all from the environment so one setup script serves every case
-# and nothing has to be edited between runs:
-#
-#   CAOS_COMMIT=C    that commit's build          (wins over CAOS_BRANCH)
-#   CAOS_BRANCH=X    the newest build on branch X
-#   neither          the newest build on main
-#   CAOS_VERSION=T   release T outright           (wins over both)
-#
-# The INSTALLER comes from the same place as the binary -- raw from git at that
-# branch or commit. Otherwise a branch would get its own binary driven by
-# somebody else's install logic, which is the confusing half of a version skew.
+RAW="https://raw.githubusercontent.com"
+base="$RAW/Metta-AI/caos/main/dev/claude-code"
+for arg in "$@"; do
+    case "$arg" in
+        --base=*)    base="${arg#--base=}"; base="${base%/}" ;;
+        --version=*) CAOS_VERSION="${arg#--version=}" ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 
-repo="${CAOS_REPO:-Metta-AI/caos}"
+# The repo and the ref come back out of the base, which is why there is only
+# one thing to state. Peeled from BOTH ends rather than by field number: the
+# trailing `/dev/claude-code` is fixed, so whatever is left in the middle is
+# the ref -- and that is what makes a slashed branch (`feature/x`) work, where
+# counting fields would silently take `feature` and fetch the wrong tree.
+rest="${base#"$RAW"/}"
+owner="${rest%%/*}"; rest="${rest#*/}"
+name="${rest%%/*}";  rest="${rest#*/}"
+ref="${rest%/dev/claude-code}"
+if [ "$base" = "$rest" ] || [ -z "$owner" ] || [ -z "$name" ] || [ -z "$ref" ]; then
+    echo "FATAL: --base must look like" >&2
+    echo "  $RAW/<owner>/<repo>/<ref>/dev/claude-code" >&2
+    echo "  got: $base" >&2
+    exit 1
+fi
+repo="$owner/$name"
+echo "caos: repo=$repo ref=$ref" >&2
+
+# WHICH BUILD. The ref from --base selects it, and CAOS_VERSION in the
+# environment overrides that by naming a release outright -- the one case where
+# you want a client that is NOT the tree this setup came from.
+#
+# `--branch=$ref` also covers a ref that is a commit sha: the commits API takes
+# "a SHA or branch to start listing from", so both mean "the newest build at or
+# before this point", which is the useful reading of either.
+#
+# CAOS_IROH_TICKET stays an environment variable and could not be anything else
+# -- it is read at SESSION start, long after this has run and been snapshotted.
 args="--no-repo-files"
 if [ -n "${CAOS_VERSION:-}" ]; then
     installer="https://github.com/$repo/releases/download/$CAOS_VERSION/install.sh"
 else
-    ref="${CAOS_COMMIT:-${CAOS_BRANCH:-main}}"
-    installer="https://raw.githubusercontent.com/$repo/$ref/dev/claude-code/install.sh"
-    if [ -n "${CAOS_COMMIT:-}" ]; then
-        args="$args --commit=$CAOS_COMMIT"
-    else
-        args="$args --branch=${CAOS_BRANCH:-main}"
-    fi
+    installer="$base/install.sh"
+    args="$args --branch=$ref"
 fi
 
 # `--no-repo-files`: the client goes on PATH, the configuration goes user-level
@@ -95,116 +130,21 @@ chmod 0755 /usr/local/bin/dumbpipe 2>/dev/null || true
 command -v dumbpipe >/dev/null 2>&1 \
     || echo "WARNING: dumbpipe did not install; CAOS_IROH_TICKET will not work" >&2
 
-# The per-session work: the tunnel and the git remote. A script rather than an
-# inline hook command, because it is too long to read inside JSON.
-install -m 0755 /dev/stdin /usr/local/bin/caos-cloud-session-start <<'SESSIONSTART'
-#!/bin/bash
-# Installed by the cloud setup script as /usr/local/bin/caos-cloud-session-start
-# and called from the user-level SessionStart hook. Runs at the start of every
-# session, so it is idempotent and quiet when there is nothing to do.
-#
-# Two jobs, both per-session because neither survives the environment snapshot:
-#
-#   1. Bring up the iroh tunnel, when CAOS_IROH_TICKET names one.
-#   2. Point this checkout's `caos` remote at whatever server results.
-#
-# The second is what makes the whole arrangement repo-independent: the client
-# finds caos through a `caos` git remote, an arbitrary clone has none, and this
-# adds it from user-level configuration rather than from anything committed.
-set -uo pipefail
-
-log() { printf 'caos: %s\n' "$*" >&2; }
-
-port="${CAOS_TUNNEL_PORT:-19090}"
-server="${CAOS_SERVER_URL:-}"
-
-# Liveness is an HTTP ROUND TRIP, never a TCP connect. `dumbpipe connect-tcp`
-# binds its local port before it has reached anything, and it accepts and then
-# silently drops connections when the far node is gone -- so a bound port reads
-# as "tunnel up" for a tunnel that carries nothing. A stale ticket presents
-# exactly that way, and the first caos job then hangs for minutes instead of
-# failing here. Any status code counts: a reply at all proves a live server.
-reachable() {
-    local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        "http://127.0.0.1:$1/info/refs?service=git-upload-pack" 2>/dev/null)"
-    [ -n "$code" ] && [ "$code" != 000 ]
+# The per-session work: the tunnel and the git remote. Fetched from the same
+# ref as everything else rather than embedded here as a heredoc, which it was:
+# a copy inside this file had to be re-synced by hand after every edit to the
+# original, and a stale one would have installed the wrong hook while both
+# files looked right in a diff.
+if ! curl -fsSL "$base/cloud/session-start.sh" \
+     -o /usr/local/bin/caos-cloud-session-start; then
+    echo "FATAL: could not fetch $base/cloud/session-start.sh" >&2
+    exit 1
+fi
+chmod 0755 /usr/local/bin/caos-cloud-session-start
+bash -n /usr/local/bin/caos-cloud-session-start || {
+    echo "FATAL: $base/cloud/session-start.sh does not parse" >&2
+    exit 1
 }
-
-# ---------------------------------------------------------------------------
-# The tunnel
-# ---------------------------------------------------------------------------
-# A ticket names an iroh NODE, and the node id is the identity -- it comes from
-# the listener's IROH_SECRET, so a ticket keeps working across restarts of the
-# listener even though the address embedded in it goes stale. That is why one
-# ticket can live in the environment indefinitely.
-
-if [ -n "${CAOS_IROH_TICKET:-}" ]; then
-    # A live tunnel first: a resumed session may already have one, and then it
-    # does not matter whether dumbpipe is anywhere.
-    if reachable "$port"; then
-        log "tunnel already up on :$port"
-    elif ! command -v dumbpipe >/dev/null 2>&1; then
-        log "CAOS_IROH_TICKET is set but dumbpipe is not installed"
-    else
-        # A dumbpipe holding the port without serving anything would make the
-        # new one fail to bind and the failure would be attributed to iroh.
-        pkill -f "connect-tcp --addr 127.0.0.1:$port " 2>/dev/null
-
-        log "opening the iroh tunnel on :$port"
-        (dumbpipe connect-tcp --addr "127.0.0.1:$port" "$CAOS_IROH_TICKET" \
-            >/tmp/caos-tunnel.log 2>&1 &)
-        # Bounded wait: the first tool call would otherwise race the tunnel and
-        # fail with a connection error that says nothing about why.
-        for _ in $(seq 1 20); do
-            reachable "$port" && break
-            sleep 1
-        done
-        if reachable "$port"; then
-            log "tunnel up"
-        else
-            log "tunnel did not reach a caos server; see /tmp/caos-tunnel.log"
-        fi
-    fi
-    : "${server:=http://127.0.0.1:$port}"
-fi
-
-# ---------------------------------------------------------------------------
-# The remote
-# ---------------------------------------------------------------------------
-
-if [ -z "$server" ]; then
-    log "no CAOS_SERVER_URL and no CAOS_IROH_TICKET; leaving the remote alone"
-    exit 0
-fi
-
-# The repo is named, not assumed from cwd. A hook's working directory is not
-# contractually the project -- in a cloud session the checkout is at
-# /home/user/repo while $HOME resolves to /root -- and a wrong cwd here does not
-# error, it silently adds the remote to some other repository or to none, and
-# the failure only shows up much later as a client that cannot find a server.
-if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_PROJECT_DIR" ]; then
-    cd "$CLAUDE_PROJECT_DIR" || exit 0
-fi
-
-if ! git rev-parse --git-dir >/dev/null 2>&1; then
-    log "$PWD is not a git repository; nothing to point at $server"
-    exit 0
-fi
-
-# An existing remote is left alone: a checkout that already names a caos server
-# has been set up deliberately, and repointing it from the environment would
-# silently move someone's work to a different stack.
-if current="$(git remote get-url caos 2>/dev/null)"; then
-    if [ "$current" != "$server" ]; then
-        log "caos remote already set to $current; leaving it (wanted $server)"
-    fi
-else
-    git remote add caos "$server" && log "caos remote -> $server"
-fi
-
-exit 0
-SESSIONSTART
 
 # ---------------------------------------------------------------------------
 # Hooks and the tool server, user-level
