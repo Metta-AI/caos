@@ -42,7 +42,21 @@ else
 fi
 # `--no-repo-files`: the client goes on PATH, the configuration goes user-level
 # below, and the checkout is left exactly as it was found.
-curl -fsSL "$installer" | bash -s -- --no-repo-files || true
+#
+# Checked afterwards rather than trusted: `curl -fsSL <404> | bash` exits ZERO.
+# curl writes nothing, bash reads an empty script and succeeds, and the setup
+# looks clean while installing nothing at all. The failure then surfaces one
+# layer down as every hook dying on `caos: command not found`, which reads like
+# a hook problem. Fail here, where the cause is still visible.
+curl -fsSL "$installer" | bash -s -- --no-repo-files
+if ! command -v caos >/dev/null 2>&1; then
+    echo "FATAL: the caos client did not install from $installer" >&2
+    echo "  A release must EXIST -- the workflow builds every push but only" >&2
+    echo "  publishes assets from a TAG, so an untagged branch has none." >&2
+    echo "  Check: curl -sI $installer" >&2
+    exit 1
+fi
+caos --version >&2 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # dumbpipe, when the caos server is reached over iroh
@@ -56,6 +70,10 @@ dp_tag="${dp_tag:-v0.39.0}"
 curl -fsSL "https://github.com/n0-computer/dumbpipe/releases/download/$dp_tag/dumbpipe-$dp_tag-linux-x86_64.tar.gz" \
     | tar xz -C /usr/local/bin ./dumbpipe || true
 chmod 0755 /usr/local/bin/dumbpipe 2>/dev/null || true
+# Not fatal -- CAOS_SERVER_URL alone is a valid arrangement -- but said out
+# loud, because the alternative is discovering it at session start.
+command -v dumbpipe >/dev/null 2>&1 \
+    || echo "WARNING: dumbpipe did not install; CAOS_IROH_TICKET will not work" >&2
 
 # The per-session work: the tunnel and the git remote. A script rather than an
 # inline hook command, because it is too long to read inside JSON.
