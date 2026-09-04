@@ -1,72 +1,237 @@
-//! Minimal terminal-event append protocol for the finish stage.
-//!
-//! Ref coordination uses ordinary Git directly. Event appends are tree-neutral,
-//! so a CAS loser simply retries from the latest head with that head's tree.
+//! Append terminal async records or child checkpoints to a v3 conversation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 
-use conversation_protocol::{
-    validate_conversation_ref, ConversationEvent, EventBoundary, ObjectId,
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
+use conversation_protocol::v3::refs as conversation_refs;
+use conversation_protocol::v3::view::Conversation;
+use conversation_protocol::v3::{
+    validate_spine, AsyncStatus, ChildStatus, ChildWorkspace, CodeOps, GitStore, ObjectStore, Oid,
+    RefUpdate, RequestOutcome, RequestStatus,
 };
-use serde_json::{json, Value};
-use worker_common::git::Repo;
 
 const MAX_CAS_ATTEMPTS: usize = 32;
 
 pub fn validate_target_ref(refname: &str) -> Result<(), String> {
-    validate_conversation_ref(refname)
-        .map_err(|_| format!("target-ref is not a conversation head: {refname:?}"))
+    conversation_refs::parse_head_ref(refname).map(|_| ())
+}
+
+pub fn validate_child(child: &str) -> Result<(), String> {
+    conversation_refs::head_ref(child).map(|_| ())
 }
 
 pub fn append_status(refname: &str, task: &str, status: &str, result: &str) -> Result<(), String> {
     validate_target_ref(refname)?;
-    validate_hash(task, "task")?;
-    validate_hash(result, "result")?;
-    if !matches!(status, "complete" | "failed") {
-        return Err(format!("invalid async status {status:?}"));
-    }
-    let base = server_base()?;
-    let repo = Repo::new("run-and-update-ref-git")?;
-    let mut commits = HashMap::new();
+    let task = Oid::parse(task, "task")?;
+    let result = Oid::parse(result, "result")?;
+    let status = match status {
+        "complete" => AsyncStatus::Complete,
+        "failed" => AsyncStatus::Failed,
+        _ => return Err(format!("invalid async status {status:?}")),
+    };
+    let mut store = scratch_store()?;
+    append_status_with(&mut store, refname, &task, status, &result)
+}
 
-    for _ in 0..MAX_CAS_ATTEMPTS {
-        let head = repo
-            .read_ref(refname)?
-            .ok_or_else(|| format!("target conversation ref {refname} does not exist"))?;
-        let remote = fetch_commit_cached(&base, &head, &mut commits)?;
-        // A retry after a caught failure can legitimately succeed: caught
-        // failures are not cached, so rerunning the same Q may produce the
-        // other terminal outcome. Only the same status and result are
-        // idempotent. A different outcome must become the latest durable state
-        // so F agrees with the result this execution of Q will return and pin.
-        let next = TerminalOutcome {
-            status: status.to_string(),
-            result: result.to_string(),
+pub fn append_child_terminal(
+    refname: &str,
+    child: &str,
+    subrequest: &str,
+    relay: &str,
+) -> Result<(), String> {
+    validate_target_ref(refname)?;
+    validate_child(child)?;
+    let subrequest = Oid::parse(subrequest, "subrequest")?;
+    let relay = Oid::parse(relay, "relay")?;
+    let mut store = scratch_store()?;
+    let child_ref = conversation_refs::head_ref(child)?;
+    let terminal_head = store
+        .fetch_ref(&child_ref)?
+        .ok_or_else(|| format!("child conversation ref {child_ref} does not exist"))?;
+    validate_spine(&store, &terminal_head, &mut HashSet::new()).map_err(String::from)?;
+    let (status, child_workspaces) = terminal_facts(&store, &terminal_head, &subrequest)?;
+    append_child_terminal_with(
+        &mut store,
+        refname,
+        child,
+        &subrequest,
+        &relay,
+        &terminal_head,
+        status,
+        &child_workspaces,
+    )
+}
+
+fn terminal_facts(
+    store: &dyn ObjectStore,
+    terminal_head: &Oid,
+    subrequest: &Oid,
+) -> Result<(ChildStatus, BTreeMap<String, ChildWorkspace>), String> {
+    let conversation = Conversation::open(store, terminal_head)?;
+    let request = conversation
+        .request(subrequest)?
+        .ok_or_else(|| format!("child request {subrequest} does not exist at {terminal_head}"))?;
+    let status = match (request.status, request.outcome) {
+        (
+            RequestStatus::Idle,
+            Some(RequestOutcome::Idle {
+                interrupted: false, ..
+            }),
+        ) => ChildStatus::Completed,
+        (
+            RequestStatus::Idle,
+            Some(RequestOutcome::Idle {
+                interrupted: true, ..
+            }),
+        ) => ChildStatus::Cancelled,
+        (RequestStatus::Failed, Some(RequestOutcome::Failed { .. })) => ChildStatus::Failed,
+        _ => return Err("child request not terminal".to_string()),
+    };
+    let child_workspaces = conversation
+        .workspaces()?
+        .into_iter()
+        .map(|(name, workspace)| {
+            (
+                name,
+                ChildWorkspace {
+                    commit: workspace.commit,
+                    initial: workspace.initial,
+                },
+            )
+        })
+        .collect();
+    Ok((status, child_workspaces))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_child_terminal_with<S: RefStore>(
+    store: &mut S,
+    refname: &str,
+    child: &str,
+    subrequest: &Oid,
+    relay: &Oid,
+    terminal_head: &Oid,
+    status: ChildStatus,
+    child_workspaces: &BTreeMap<String, ChildWorkspace>,
+) -> Result<(), String> {
+    cas_append(store, refname, |store, head| {
+        let (head_tree, record) = {
+            let conversation = Conversation::open(store, head)?;
+            let record = conversation
+                .child(child)?
+                .ok_or_else(|| format!("subagent {child} was never recorded on {refname}"))?;
+            (conversation.tree().clone(), record)
         };
-        if matches!(
-            task_state(&base, &head, task, &mut commits)?.as_ref(),
-            Some(TaskState::Terminal(current)) if current == &next
-        ) {
-            return Ok(());
+        if record.request != *subrequest {
+            return Err(format!(
+                "subagent {child} records request {}, not {subrequest}",
+                record.request
+            ));
+        }
+        if record.relay != *relay {
+            return Err(format!(
+                "subagent {child} records relay {}, not {relay}",
+                record.relay
+            ));
+        }
+        if record.status != ChildStatus::Running {
+            if record.terminal_head.as_ref() == Some(terminal_head) {
+                return Ok(None);
+            }
+            return Err(format!(
+                "subagent {child} already settled at {:?}, not {terminal_head}",
+                record.terminal_head
+            ));
         }
 
-        let message = json!({"async": {"task": task, "status": status, "result": result}});
-        let message = serde_json::to_string(&message)
-            .map_err(|error| format!("serializing async status event: {error}"))?;
-        let commit = store_commit(&base, &remote.tree, &head, &message)?;
-        match repo.push_ref(refname, Some(&head), &commit) {
+        Ok(Some((
+            head_tree,
+            Transition::SubagentTerminal {
+                child: child.to_string(),
+                terminal_head: terminal_head.clone(),
+                status,
+                child_workspaces: child_workspaces.clone(),
+            },
+        )))
+    })
+}
+
+fn append_status_with<S: RefStore>(
+    store: &mut S,
+    refname: &str,
+    task: &Oid,
+    status: AsyncStatus,
+    result: &Oid,
+) -> Result<(), String> {
+    cas_append(store, refname, |store, head| {
+        let (head_tree, record) = {
+            let conversation = Conversation::open(store, head)?;
+            let record = conversation
+                .async_task(task)?
+                .ok_or_else(|| format!("task {task} was never recorded on {refname}"))?;
+            (conversation.tree().clone(), record)
+        };
+
+        if record.status != AsyncStatus::Pending {
+            if record.status == status && record.result.as_ref() == Some(result) {
+                return Ok(None);
+            }
+            return Err(format!(
+                "task {task} already settled with status {:?} and result {:?}",
+                record.status, record.result
+            ));
+        }
+
+        Ok(Some((
+            head_tree,
+            Transition::AsyncTerminal {
+                task: task.clone(),
+                status,
+                result: Some(result.clone()),
+                reason: None,
+            },
+        )))
+    })
+}
+
+fn cas_append<S: RefStore>(
+    store: &mut S,
+    refname: &str,
+    mut build: impl FnMut(&mut S, &Oid) -> Result<Option<(Oid, Transition)>, String>,
+) -> Result<(), String> {
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let head = store
+            .fetch_head(refname)?
+            .ok_or_else(|| format!("target conversation ref {refname} does not exist"))?;
+        let Some((head_tree, transition)) = build(store, &head)? else {
+            return Ok(());
+        };
+        let applied = apply(store, Some(&head_tree), &transition)?;
+        let signature = inherited_signature(store, &head)?;
+        let candidate = mint(store, &head, &applied.tree, transition.kind(), &signature)?;
+        let update = RefUpdate {
+            refname: refname.to_string(),
+            expected: Some(head.clone()),
+            new: Some(candidate.clone()),
+        };
+        match store.push_head(update) {
             Ok(()) => return Ok(()),
-            Err(error) => {
-                let observed = repo.read_ref(refname).map_err(|read_error| {
+            Err(push_error) => {
+                let observed = store.fetch_head(refname).map_err(|read_error| {
                     format!(
-                        "pushing {refname} failed ({error}); rereading it also failed: {read_error}"
+                        "pushing {refname} failed ({push_error}); rereading it also failed: {read_error}"
                     )
                 })?;
-                if observed.as_deref() == Some(commit.as_str()) {
+                let Some(observed) = observed else {
+                    return Err(format!(
+                        "pushing {refname} failed ({push_error}); the ref disappeared"
+                    ));
+                };
+                if store.is_ancestor(&candidate, &observed)? {
                     return Ok(());
                 }
-                if observed.as_deref() == Some(head.as_str()) {
-                    return Err(error);
+                if observed == head {
+                    return Err(push_error);
                 }
             }
         }
@@ -76,240 +241,462 @@ pub fn append_status(refname: &str, task: &str, status: &str, result: &str) -> R
     ))
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct TerminalOutcome {
-    status: String,
-    result: String,
+trait RefStore: ObjectStore {
+    fn fetch_head(&mut self, refname: &str) -> Result<Option<Oid>, String>;
+    fn push_head(&mut self, update: RefUpdate) -> Result<(), String>;
+    fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool, String>;
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum TaskState {
-    Pending,
-    Terminal(TerminalOutcome),
-}
-
-#[derive(Clone)]
-struct RemoteCommit {
-    tree: String,
-    parent: Option<String>,
-    message: String,
-}
-
-fn fetch_commit(base: &str, hash: &str) -> Result<RemoteCommit, String> {
-    let (kind, content) = get_object(base, hash)?;
-    if kind != "commit" {
-        return Err(format!("object {hash} is a {kind}, not a commit"));
+impl RefStore for GitStore {
+    fn fetch_head(&mut self, refname: &str) -> Result<Option<Oid>, String> {
+        self.fetch_ref(refname)
     }
-    let text = std::str::from_utf8(&content).map_err(|e| format!("commit is not UTF-8: {e}"))?;
-    let (headers, message) = text
-        .split_once("\n\n")
-        .ok_or("commit has no header/message separator")?;
-    let tree = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("tree "))
-        .ok_or("commit has no tree")?
-        .to_string();
-    validate_hash(&tree, "commit tree")?;
-    let parent = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("parent "))
-        .map(str::to_string);
-    if let Some(parent) = &parent {
-        validate_hash(parent, "commit parent")?;
+
+    fn push_head(&mut self, update: RefUpdate) -> Result<(), String> {
+        self.push(&[update])
     }
-    Ok(RemoteCommit {
-        tree,
-        parent,
-        message: message.to_string(),
-    })
-}
 
-fn fetch_commit_cached(
-    base: &str,
-    hash: &str,
-    cache: &mut HashMap<String, RemoteCommit>,
-) -> Result<RemoteCommit, String> {
-    cached_commit(cache, hash, || fetch_commit(base, hash))
-}
-
-fn cached_commit(
-    cache: &mut HashMap<String, RemoteCommit>,
-    hash: &str,
-    fetch: impl FnOnce() -> Result<RemoteCommit, String>,
-) -> Result<RemoteCommit, String> {
-    if let Some(commit) = cache.get(hash) {
-        return Ok(commit.clone());
-    }
-    let commit = fetch()?;
-    cache.insert(hash.to_string(), commit.clone());
-    Ok(commit)
-}
-
-fn task_state(
-    base: &str,
-    head: &str,
-    task: &str,
-    cache: &mut HashMap<String, RemoteCommit>,
-) -> Result<Option<TaskState>, String> {
-    let mut current = head.to_string();
-    let mut newest_state = None;
-    loop {
-        let hash = current;
-        let commit = fetch_commit_cached(base, &hash, cache)?;
-        let event = parse_spine_event(&commit.message, &hash)?;
-        let parent = required_event_parent(commit.parent.as_deref(), &hash)?;
-        let boundary = ConversationEvent::parse(&event)?.boundary(&parent)?;
-        if newest_state.is_none() {
-            newest_state = event_task_state(&event, task);
-        }
-        if boundary == EventBoundary::Root {
-            return Ok(newest_state);
-        }
-        current = parent;
+    fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool, String> {
+        CodeOps::is_ancestor(self, ancestor, descendant)
     }
 }
 
-fn parse_spine_event(message: &str, commit: &str) -> Result<Value, String> {
-    let event = serde_json::from_str::<Value>(message.trim())
-        .map_err(|error| format!("conversation history commit {commit} is not JSON: {error}"))?;
-    ConversationEvent::parse(&event)
-        .map_err(|error| format!("invalid conversation event {commit}: {error}"))?;
-    Ok(event)
-}
-
-fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
-    parent
-        .map(str::to_string)
-        .ok_or_else(|| format!("conversation event {event} has no first parent"))
-}
-
-/// Read one event defensively. Conversation history is append-only, so a
-/// malformed or future async payload must not prevent a valid finish event
-/// from being appended after it.
-fn event_task_state(event: &Value, wanted: &str) -> Option<TaskState> {
-    let state = event.get("async")?;
-    let parsed = (|| {
-        let task = state
-            .get("task")
-            .and_then(Value::as_str)
-            .ok_or("conversation async event has no string task")?;
-        let status = state
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or("conversation async event has no string status")?;
-        validate_hash(task, "async task")?;
-        if !matches!(status, "pending" | "complete" | "failed") {
-            return Err(format!("invalid async status {status:?}"));
-        }
-        if status == "pending" {
-            return Ok::<_, String>((task, TaskState::Pending));
-        }
-        let result = state
-            .get("result")
-            .and_then(Value::as_str)
-            .ok_or("terminal conversation async event has no string result")?;
-        validate_hash(result, "async result")?;
-        Ok((
-            task,
-            TaskState::Terminal(TerminalOutcome {
-                status: status.to_string(),
-                result: result.to_string(),
-            }),
-        ))
-    })();
-    match parsed {
-        Ok((task, state)) if task == wanted => Some(state),
-        Ok(_) => None,
-        Err(error) => {
-            eprintln!("run-and-update-ref: ignoring malformed async event: {error}");
-            None
-        }
-    }
-}
-
-fn store_commit(base: &str, tree: &str, parent: &str, message: &str) -> Result<String, String> {
-    validate_hash(tree, "commit tree")?;
-    validate_hash(parent, "commit parent")?;
-    let content = format!(
-        "tree {tree}\nparent {parent}\nauthor caos-async <caos@caos> 0 +0000\n\
-         committer caos-async <caos@caos> 0 +0000\n\n{message}"
-    );
-    store_object(base, "commit", content.as_bytes())
-}
-
-fn get_object(base: &str, hash: &str) -> Result<(String, Vec<u8>), String> {
-    validate_hash(hash, "object")?;
-    let url = format!("{base}/object/{hash}");
-    let response = minreq::get(&url)
-        .with_timeout(30)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "GET {url}: {} {}",
-            response.status_code, response.reason_phrase
-        ));
-    }
-    parse_object(response.as_bytes())
-}
-
-fn parse_object(serialized: &[u8]) -> Result<(String, Vec<u8>), String> {
-    let nul = serialized
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or("object has no NUL")?;
-    let header = std::str::from_utf8(&serialized[..nul])
-        .map_err(|e| format!("object header is not UTF-8: {e}"))?;
-    let (kind, size) = header.split_once(' ').ok_or("malformed object header")?;
-    let size: usize = size
-        .parse()
-        .map_err(|e| format!("invalid object size: {e}"))?;
-    let content = &serialized[nul + 1..];
-    if content.len() != size {
-        return Err(format!(
-            "object size {size} != content length {}",
-            content.len()
-        ));
-    }
-    Ok((kind.to_string(), content.to_vec()))
-}
-
-fn store_object(base: &str, kind: &str, content: &[u8]) -> Result<String, String> {
-    let mut body = format!("{kind} {}\0", content.len()).into_bytes();
-    body.extend_from_slice(content);
-    let url = format!("{base}/object/");
-    let response = minreq::post(&url)
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        return Err(format!(
-            "POST {url}: {} {}",
-            response.status_code, response.reason_phrase
-        ));
-    }
-    let hash = response
-        .as_str()
-        .map_err(|e| format!("POST {url}: {e}"))?
-        .trim();
-    validate_hash(hash, "stored object")?;
-    Ok(hash.to_string())
-}
-
-fn server_base() -> Result<String, String> {
-    std::env::var("CAOS_SERVER_URL")
-        .map(|base| base.trim_end_matches('/').to_string())
-        .map_err(|_| "CAOS_SERVER_URL not set".to_string())
+fn scratch_store() -> Result<GitStore, String> {
+    let server =
+        std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
+    GitStore::scratch("run-and-update-ref-git", server.trim_end_matches('/'))
 }
 
 pub(crate) fn validate_hash(hash: &str, what: &str) -> Result<(), String> {
-    ObjectId::parse(hash, what).map(|_| ())
+    Oid::parse(hash, what).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use conversation_protocol::v3::apply::client_signature;
+    use conversation_protocol::v3::oid::ensure_genesis;
+    use conversation_protocol::v3::{
+        AsyncRecord, Block, Identity, IdentityKind, MemoryStore, Mode, RequestRecord, Role,
+        TranscriptEntry, TreeBuilder,
+    };
+
     use super::*;
+
+    enum FirstPush {
+        Normal,
+        MoveTo(Oid),
+        AcceptThenAdvance,
+    }
+
+    struct FakeStore {
+        objects: MemoryStore,
+        head: Option<Oid>,
+        first_push: FirstPush,
+        pushes: Vec<Oid>,
+    }
+
+    impl FakeStore {
+        fn new(objects: MemoryStore, head: Oid) -> Self {
+            Self {
+                objects,
+                head: Some(head),
+                first_push: FirstPush::Normal,
+                pushes: Vec::new(),
+            }
+        }
+
+        fn head(&self) -> &Oid {
+            self.head.as_ref().expect("test ref exists")
+        }
+    }
+
+    conversation_protocol::delegate_object_store!(FakeStore, objects);
+
+    impl RefStore for FakeStore {
+        fn fetch_head(&mut self, _refname: &str) -> Result<Option<Oid>, String> {
+            Ok(self.head.clone())
+        }
+
+        fn push_head(&mut self, update: RefUpdate) -> Result<(), String> {
+            let new = update
+                .new
+                .ok_or_else(|| "test update unexpectedly deleted the ref".to_string())?;
+            self.pushes.push(new.clone());
+            match std::mem::replace(&mut self.first_push, FirstPush::Normal) {
+                FirstPush::MoveTo(winner) => {
+                    self.head = Some(winner);
+                    Err("injected CAS loss".to_string())
+                }
+                FirstPush::AcceptThenAdvance => {
+                    if update.expected != self.head {
+                        return Err("test lease mismatch".to_string());
+                    }
+                    self.head = Some(new.clone());
+                    let tree = self.read_commit(&new).map_err(String::from)?.tree;
+                    let transition = Transition::TitleSet {
+                        title: "Advanced after accepted push".to_string(),
+                    };
+                    let applied = apply(self, Some(&tree), &transition)?;
+                    let signature = inherited_signature(self, &new)?;
+                    let advanced = mint(self, &new, &applied.tree, transition.kind(), &signature)?;
+                    self.head = Some(advanced);
+                    Err("injected lost response".to_string())
+                }
+                FirstPush::Normal => {
+                    if update.expected != self.head {
+                        return Err("test lease mismatch".to_string());
+                    }
+                    self.head = Some(new);
+                    Ok(())
+                }
+            }
+        }
+
+        fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool, String> {
+            let mut current = descendant.clone();
+            loop {
+                if &current == ancestor {
+                    return Ok(true);
+                }
+                let commit = self.read_commit(&current).map_err(String::from)?;
+                let Some(parent) = commit.parents.first() else {
+                    return Ok(false);
+                };
+                current = parent.clone();
+            }
+        }
+    }
+
+    fn oid(character: char) -> Oid {
+        Oid::parse(&character.to_string().repeat(40), "test oid").unwrap()
+    }
+
+    fn signature() -> conversation_protocol::v3::Signature {
+        client_signature("Test", "test@example.com", 1_700_000_000)
+    }
+
+    fn commit_transition(store: &mut MemoryStore, parent: &Oid, transition: &Transition) -> Oid {
+        let parent_tree = store.read_commit(parent).unwrap().tree;
+        let applied = apply(store, Some(&parent_tree), transition).unwrap();
+        mint(
+            store,
+            parent,
+            &applied.tree,
+            transition.kind(),
+            &signature(),
+        )
+        .unwrap()
+    }
+
+    fn conversation(with_task: bool) -> (FakeStore, String, Oid) {
+        let refname = conversation_refs::head_ref("conversation").unwrap();
+        let task = oid('1');
+        let mut objects = MemoryStore::new();
+        let genesis = ensure_genesis(&mut objects).unwrap();
+        let root = Transition::ConversationRoot {
+            identity: Identity {
+                id: "conversation".to_string(),
+                kind: IdentityKind::Root,
+                owner: None,
+            },
+            title: "Conversation".to_string(),
+            workspaces: BTreeMap::new(),
+            files_seed: None,
+        };
+        let applied = apply(&mut objects, None, &root).unwrap();
+        let mut head = mint(
+            &mut objects,
+            &genesis,
+            &applied.tree,
+            root.kind(),
+            &signature(),
+        )
+        .unwrap();
+        if with_task {
+            head = commit_transition(
+                &mut objects,
+                &head,
+                &Transition::AsyncStart {
+                    record: AsyncRecord {
+                        task: task.clone(),
+                        status: AsyncStatus::Pending,
+                        target_ref: Some(refname.clone()),
+                        result: None,
+                        reason: None,
+                    },
+                },
+            );
+        }
+        (FakeStore::new(objects, head), refname, task)
+    }
+
+    fn stored_result(store: &mut FakeStore, contents: &[u8]) -> Oid {
+        store.write_blob(contents).unwrap()
+    }
+
+    fn stored_failure_tree(store: &mut FakeStore) -> Oid {
+        let mut builder = TreeBuilder::from(None);
+        builder.put("status", Mode::Blob, b"failed\n".to_vec());
+        builder.put("error", Mode::Blob, b"subrequest failed\n".to_vec());
+        builder.build(store).unwrap()
+    }
+
+    fn child_request_history(interrupted: Option<bool>) -> (MemoryStore, Oid, Oid) {
+        let mut store = MemoryStore::new();
+        let genesis = ensure_genesis(&mut store).unwrap();
+        let root = Transition::ConversationRoot {
+            identity: Identity {
+                id: "subagent-test".to_string(),
+                kind: IdentityKind::Root,
+                owner: None,
+            },
+            title: "Child".to_string(),
+            workspaces: BTreeMap::from([("main".to_string(), (oid('a'), None))]),
+            files_seed: None,
+        };
+        let applied = apply(&mut store, None, &root).unwrap();
+        let mut head = mint(
+            &mut store,
+            &genesis,
+            &applied.tree,
+            root.kind(),
+            &signature(),
+        )
+        .unwrap();
+        head = commit_transition(
+            &mut store,
+            &head,
+            &Transition::MessageAppend {
+                entry: TranscriptEntry {
+                    message_id: "prompt".to_string(),
+                    conversation: "subagent-test".to_string(),
+                    role: Role::User,
+                    actor: "owner".to_string(),
+                    request: None,
+                    round: None,
+                    model: None,
+                    blocks: vec![Block::Text {
+                        text: "work".to_string(),
+                    }],
+                    proposal: None,
+                    workspace_resolution: None,
+                },
+                payloads: Vec::new(),
+            },
+        );
+        let request = oid('7');
+        let request_workspaces = Conversation::open(&store, &head)
+            .unwrap()
+            .workspaces_tree()
+            .unwrap();
+        head = commit_transition(
+            &mut store,
+            &head,
+            &Transition::RequestAdmit {
+                record: RequestRecord {
+                    id: request.clone(),
+                    request_head: head.clone(),
+                    request_workspaces,
+                    model: "model".to_string(),
+                    configuration: "configuration".to_string(),
+                    round: 0,
+                    calls: Vec::new(),
+                    interjections: Vec::new(),
+                    status: RequestStatus::Queued,
+                    latest_message: None,
+                    escape_reason: None,
+                    outcome: None,
+                },
+            },
+        );
+        head = commit_transition(
+            &mut store,
+            &head,
+            &Transition::RequestClaim {
+                request: request.clone(),
+                latest_message: "prompt".to_string(),
+            },
+        );
+        if let Some(interrupted) = interrupted {
+            head = commit_transition(
+                &mut store,
+                &head,
+                &Transition::RequestTerminal {
+                    request: request.clone(),
+                    outcome: RequestOutcome::Idle {
+                        result: None,
+                        interrupted,
+                    },
+                },
+            );
+        }
+        (store, head, request)
+    }
+
+    fn task_record(store: &FakeStore, task: &Oid) -> AsyncRecord {
+        Conversation::open(store, store.head())
+            .unwrap()
+            .async_task(task)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn child_terminal_facts_derive_status_and_workspaces() {
+        for (interrupted, expected) in [
+            (false, ChildStatus::Completed),
+            (true, ChildStatus::Cancelled),
+        ] {
+            let (store, head, request) = child_request_history(Some(interrupted));
+            let (status, workspaces) = terminal_facts(&store, &head, &request).unwrap();
+            assert_eq!(status, expected);
+            assert_eq!(workspaces["main"].commit, oid('a'));
+            assert_eq!(workspaces["main"].initial, oid('a'));
+        }
+    }
+
+    #[test]
+    fn child_checkpoint_refuses_a_nonterminal_request() {
+        let (store, head, request) = child_request_history(None);
+        assert_eq!(
+            terminal_facts(&store, &head, &request).unwrap_err(),
+            "child request not terminal"
+        );
+    }
+
+    #[test]
+    fn appends_complete() {
+        let (mut store, refname, task) = conversation(true);
+        let result = stored_result(&mut store, b"complete");
+
+        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+
+        let record = task_record(&store, &task);
+        assert_eq!(record.status, AsyncStatus::Complete);
+        assert_eq!(record.result, Some(result));
+        assert_eq!(store.pushes.len(), 1);
+    }
+
+    #[test]
+    fn appends_failed_with_the_failure_tree_result() {
+        let (mut store, refname, task) = conversation(true);
+        let result = stored_failure_tree(&mut store);
+
+        append_status_with(&mut store, &refname, &task, AsyncStatus::Failed, &result).unwrap();
+
+        let record = task_record(&store, &task);
+        assert_eq!(record.status, AsyncStatus::Failed);
+        assert_eq!(record.result, Some(result));
+    }
+
+    #[test]
+    fn identical_terminal_replay_appends_nothing() {
+        let (mut store, refname, task) = conversation(true);
+        let result = stored_result(&mut store, b"complete");
+        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+        let settled_head = store.head().clone();
+        let push_count = store.pushes.len();
+
+        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+
+        assert_eq!(store.head(), &settled_head);
+        assert_eq!(store.pushes.len(), push_count);
+    }
+
+    #[test]
+    fn differing_terminal_replay_is_an_error() {
+        let (mut store, refname, task) = conversation(true);
+        let complete = stored_result(&mut store, b"complete");
+        let failed = stored_failure_tree(&mut store);
+        append_status_with(
+            &mut store,
+            &refname,
+            &task,
+            AsyncStatus::Complete,
+            &complete,
+        )
+        .unwrap();
+        let settled_head = store.head().clone();
+        let push_count = store.pushes.len();
+
+        let error = append_status_with(&mut store, &refname, &task, AsyncStatus::Failed, &failed)
+            .unwrap_err();
+
+        assert!(error.contains("already settled"), "{error}");
+        assert_eq!(store.head(), &settled_head);
+        assert_eq!(store.pushes.len(), push_count);
+    }
+
+    #[test]
+    fn absent_task_record_is_an_error() {
+        let (mut store, refname, task) = conversation(false);
+        let result = stored_result(&mut store, b"complete");
+
+        assert_eq!(
+            append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result,),
+            Err(format!("task {task} was never recorded on {refname}"))
+        );
+        assert!(store.pushes.is_empty());
+    }
+
+    #[test]
+    fn cas_loss_reapplies_to_the_moved_head() {
+        let (mut store, refname, task) = conversation(true);
+        let original = store.head().clone();
+        let concurrent = commit_transition(
+            &mut store.objects,
+            &original,
+            &Transition::TitleSet {
+                title: "Concurrent title".to_string(),
+            },
+        );
+        store.first_push = FirstPush::MoveTo(concurrent.clone());
+        let result = stored_result(&mut store, b"complete");
+
+        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+
+        assert_eq!(store.pushes.len(), 2);
+        assert_ne!(store.pushes[0], store.pushes[1]);
+        assert_eq!(
+            store.read_commit(store.head()).unwrap().parents,
+            vec![concurrent]
+        );
+        let conversation = Conversation::open(&store, store.head()).unwrap();
+        assert_eq!(conversation.title().unwrap(), "Concurrent title");
+        assert_eq!(
+            conversation.async_task(&task).unwrap().unwrap().status,
+            AsyncStatus::Complete
+        );
+    }
+
+    #[test]
+    fn lost_response_is_detected_when_candidate_is_on_the_parent_chain() {
+        let (mut store, refname, task) = conversation(true);
+        store.first_push = FirstPush::AcceptThenAdvance;
+        let result = stored_result(&mut store, b"complete");
+
+        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+
+        assert_eq!(store.pushes.len(), 1);
+        assert_eq!(
+            Conversation::open(&store, store.head())
+                .unwrap()
+                .title()
+                .unwrap(),
+            "Advanced after accepted push"
+        );
+        assert_eq!(task_record(&store, &task).status, AsyncStatus::Complete);
+    }
+
+    #[test]
+    fn target_ref_is_only_a_v3_conversation_head() {
+        let valid = conversation_refs::head_ref("chat-1").unwrap();
+        assert!(validate_target_ref(&valid).is_ok());
+        assert!(validate_target_ref("refs/heads/main").is_err());
+        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_err());
+    }
 
     #[test]
     fn durable_hashes_are_canonical_lowercase() {
@@ -317,222 +704,5 @@ mod tests {
         assert!(validate_hash(&"A".repeat(40), "test hash")
             .unwrap_err()
             .contains("lowercase"));
-    }
-
-    #[test]
-    fn recognized_root_event_is_rejected() {
-        let event = "a".repeat(40);
-        assert!(required_event_parent(None, &event)
-            .unwrap_err()
-            .contains("no first parent"));
-    }
-
-    #[test]
-    fn event_envelope_is_selected_by_the_ref_namespace() {
-        let head = "a".repeat(40);
-        assert_eq!(parse_spine_event(r#"{}"#, &head), Ok(json!({})));
-        assert!(parse_spine_event(r#"{"status":"idle"}"#, &head).is_ok());
-        assert!(parse_spine_event(r#"{"v":2}"#, &head).is_err());
-        assert!(parse_spine_event(r#"[]"#, &head).is_err());
-        assert!(parse_spine_event("ordinary commit", &head).is_err());
-    }
-
-    #[test]
-    fn explicit_base_must_match_the_first_parent() {
-        let base = "a".repeat(40);
-        assert_eq!(
-            ConversationEvent::parse(&json!({}))
-                .unwrap()
-                .boundary(&base),
-            Ok(EventBoundary::Ordinary)
-        );
-        assert_eq!(
-            ConversationEvent::parse(&json!({"base": base}))
-                .unwrap()
-                .boundary(&base),
-            Ok(EventBoundary::Root)
-        );
-        assert!(ConversationEvent::parse(&json!({"base": "b".repeat(40)}))
-            .unwrap()
-            .boundary(&base)
-            .is_err());
-        assert_eq!(
-            ConversationEvent::parse(&json!({"forked_from": base}))
-                .unwrap()
-                .boundary(&base),
-            Ok(EventBoundary::Fork)
-        );
-        assert!(
-            ConversationEvent::parse(&json!({"base": base, "forked_from": base}))
-                .unwrap()
-                .boundary(&base)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn task_status_validates_the_complete_spine_before_returning() {
-        let head = "a".repeat(40);
-        let parent = "b".repeat(40);
-        let task = "c".repeat(40);
-        let mut cache = HashMap::from([
-            (
-                head.clone(),
-                RemoteCommit {
-                    tree: "d".repeat(40),
-                    parent: Some(parent.clone()),
-                    message: json!({"async": {"task": task, "status": "complete"}}).to_string(),
-                },
-            ),
-            (
-                parent,
-                RemoteCommit {
-                    tree: "e".repeat(40),
-                    parent: None,
-                    message: "{}".to_string(),
-                },
-            ),
-        ]);
-
-        let error = task_state("unused", &head, &task, &mut cache).unwrap_err();
-        assert!(error.contains("no first parent"), "{error}");
-    }
-
-    #[test]
-    fn target_ref_is_only_a_conversation_head() {
-        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_ok());
-        assert!(validate_target_ref("refs/heads/main").is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/status").is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/a/head/b/head").is_err());
-        assert!(validate_target_ref("refs/caos/v2/conversations/a/title/b/head").is_err());
-        assert!(validate_target_ref(&format!(
-            "refs/caos/v2/conversations/{}/head",
-            "a".repeat(124)
-        ))
-        .is_ok());
-        assert!(validate_target_ref(&format!(
-            "refs/caos/v2/conversations/{}/head",
-            "a".repeat(125)
-        ))
-        .is_err());
-        assert!(validate_target_ref("refs/caos/conversations/chat-1/head").is_err());
-    }
-
-    #[test]
-    fn malformed_async_state_is_not_a_terminal_verdict() {
-        let task = "a".repeat(40);
-        assert_eq!(
-            event_task_state(
-                &json!({"async": {"task": "oops", "status": "complete"}}),
-                &task
-            ),
-            None
-        );
-        assert_eq!(
-            event_task_state(
-                &json!({"async": {
-                    "task": task,
-                    "status": "failed",
-                    "result": "b".repeat(40)
-                }}),
-                &task
-            )
-            .as_ref(),
-            Some(&TaskState::Terminal(TerminalOutcome {
-                status: "failed".to_string(),
-                result: "b".repeat(40),
-            }))
-        );
-    }
-
-    #[test]
-    fn newest_pending_shadows_an_older_terminal_outcome() {
-        let head = "a".repeat(40);
-        let root = "b".repeat(40);
-        let base = "c".repeat(40);
-        let task = "d".repeat(40);
-        let result = "e".repeat(40);
-        let mut cache = HashMap::from([
-            (
-                head.clone(),
-                RemoteCommit {
-                    tree: "f".repeat(40),
-                    parent: Some(root.clone()),
-                    message: json!({"async": {"task": task, "status": "pending"}}).to_string(),
-                },
-            ),
-            (
-                root,
-                RemoteCommit {
-                    tree: "f".repeat(40),
-                    parent: Some(base.clone()),
-                    message: json!({
-                        "base": base,
-                        "async": {"task": task, "status": "complete", "result": result}
-                    })
-                    .to_string(),
-                },
-            ),
-        ]);
-
-        assert_eq!(
-            task_state("unused", &head, &task, &mut cache),
-            Ok(Some(TaskState::Pending))
-        );
-    }
-
-    #[test]
-    fn terminal_outcome_identity_includes_status_and_result() {
-        let result = "a".repeat(40);
-        let failed = TerminalOutcome {
-            status: "failed".to_string(),
-            result: result.clone(),
-        };
-        assert_eq!(
-            failed,
-            TerminalOutcome {
-                status: "failed".to_string(),
-                result,
-            }
-        );
-        assert_ne!(
-            failed,
-            TerminalOutcome {
-                status: "complete".to_string(),
-                result: "a".repeat(40),
-            }
-        );
-        assert_ne!(
-            failed,
-            TerminalOutcome {
-                status: "failed".to_string(),
-                result: "b".repeat(40),
-            }
-        );
-    }
-
-    #[test]
-    fn immutable_commit_cache_reuses_spine_entries_across_retries() {
-        let hash = "a".repeat(40);
-        let fetches = std::cell::Cell::new(0);
-        let mut cache = HashMap::new();
-        let mut fetch = || {
-            fetches.set(fetches.get() + 1);
-            Ok(RemoteCommit {
-                tree: "b".repeat(40),
-                parent: None,
-                message: "{}".to_string(),
-            })
-        };
-
-        assert_eq!(
-            cached_commit(&mut cache, &hash, &mut fetch).unwrap().tree,
-            "b".repeat(40)
-        );
-        assert_eq!(
-            cached_commit(&mut cache, &hash, &mut fetch).unwrap().tree,
-            "b".repeat(40)
-        );
-        assert_eq!(fetches.get(), 1);
     }
 }

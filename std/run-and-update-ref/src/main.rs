@@ -1,21 +1,23 @@
 //! Run one already-complete CAOS request, then append its task status to a
 //! conversation ref without making the caller wait in a worker container.
 //!
-//! `Q = run-and-update-ref { subreq: R, target-ref: F }` has two positions:
+//! `Q = run-and-update-ref { subreq: R, target-ref: F }` has three positions:
 //! start emits `run-request-then R` with this same Q (minus the call result) as
-//! its callback; finish makes the result addressable, appends an async status
-//! event containing that result OID to F, and returns R's result unchanged. A
-//! caught R failure is represented as a small result tree because the current
-//! promise protocol can deliver a failure to a callback but cannot ask that
-//! callback to rethrow it.
+//! its callback; success and failure finishes make the result addressable,
+//! append an async terminal transition containing that result OID to F, and
+//! return R's result unchanged. When `child` is present, the finish position
+//! instead validates the child's terminal conversation head and checkpoints it
+//! on the parent before returning. A caught R failure is represented as a small
+//! result tree because the current promise protocol can deliver a failure to a
+//! callback but cannot ask that callback to rethrow it.
 
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, caos_curry, cas_hash, forward, own_args_tree, read_arg, run_request_then_catching,
-    run_worker, scratch, Arg,
+    arg, caos, caos_curry, cas_hash, forward, own_args_tree, read_arg, read_arg_opt,
+    run_request_then_catching, run_worker, scratch, Arg,
 };
 
 mod refs;
@@ -40,6 +42,9 @@ fn start() -> Result<(), String> {
     refs::validate_hash(&request, "subreq")?;
     let target_ref = read_arg("target-ref")?;
     refs::validate_target_ref(&target_ref)?;
+    if let Some(child) = read_arg_opt("child")? {
+        refs::validate_child(&child)?;
+    }
 
     // Curry the exact Q forward as the finish callback. `result`/`error` are
     // call-time args supplied later by the promise interpreter.
@@ -79,8 +84,11 @@ fn finish_failure() -> Result<(), String> {
 
 fn finish(status: &str, result: &str) -> Result<(), String> {
     let target_ref = read_arg("target-ref")?;
-    refs::validate_target_ref(&target_ref)?;
+    if let Some(child) = read_arg_opt("child")? {
+        let subrequest = read_arg("subreq")?;
+        let relay = read_arg("task")?;
+        return refs::append_child_terminal(&target_ref, &child, &subrequest, &relay);
+    }
     let task = read_arg("task")?;
-    refs::validate_hash(&task, "task")?;
     refs::append_status(&target_ref, &task, status, result)
 }
