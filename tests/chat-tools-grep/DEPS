@@ -1,8 +1,0 @@
-../../std/llm-step llm-step
-../../std/bash bash
-../../std/llm-stub llm-stub
-../../std/llm-test llm-test
-../../std/llm-test-tool llm-test-tool
-# The image this client test runs in, with the client-repo setup as its
-# /worker: a dependency, not a harness.
-../../dev/worker-test worker-test

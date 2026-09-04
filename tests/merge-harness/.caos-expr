@@ -1,7 +1,0 @@
-# tests/merge-harness, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
-# this directory yields the test's ARG TREE, which dev/run-test then runs.
-#
-# A WORKER TEST. The claim is about what the CANONICAL EVENT HEAD retains —
-# the real merge ancestry, not just llm-step's result object — and that is a
-# ref on the server. The client curried the turn and blocked on it.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh
