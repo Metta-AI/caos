@@ -19,8 +19,10 @@
 # this needs no network-policy change at all.
 name: release
 
-# Builds on every push so a break is visible immediately; RELEASES only from a
-# tag, because a release is a promise about a name.
+# Builds AND releases on every push: the release is how an unauthenticated
+# machine gets the binary at all, so gating it on a tag meant no cloud session
+# could be tested without minting a version first. A tag names itself; a branch
+# build is named <branch>-<short sha>.
 #
 # `caos/**` is excluded deliberately: the tui publishes each conversation to
 # `caos/<conversation-id>` (rust/crates/caos-cli/TUI.md), so building those
@@ -109,10 +111,27 @@ jobs:
           name: caos-client-${{ steps.stage.outputs.tag }}
           path: dist/
 
+      # EVERY build is a release, because a release is the only place GitHub
+      # will serve a file to an unauthenticated machine. Actions artifacts
+      # (above) need a token to download and they expire, so a cloud VM cannot
+      # use them; the binary is not in git; and building in the VM was the
+      # thing this exists to avoid. "Release" here is a file host, not a
+      # promise about a name -- the name is the commit.
+      #
+      # No tag has to exist first: the action creates `tag_name` at this
+      # commit, and `stage` has already computed it as <branch>-<short sha>.
+      #
+      # Branch builds are NOT marked prerelease, deliberately, so that
+      # `releases/latest/download/...` resolves to the newest build and the
+      # cloud setup script needs no version pinned into its environment. The
+      # cost is real: a push to ANY branch repoints `latest` for every
+      # consumer. That is fine while the consumer is one person testing, and
+      # the day it is not, mark branch builds `prerelease: true` and pin
+      # CAOS_VERSION -- setup.sh already reads it.
       - uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag'
         with:
           tag_name: ${{ steps.stage.outputs.tag }}
+          name: ${{ steps.stage.outputs.tag }}
           files: |
             dist/caos-x86_64-linux
             dist/claude-settings.json
