@@ -54,29 +54,9 @@ base="$RAW/Metta-AI/caos/main/dev/claude-code"
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}"; base="${base%/}" ;;
-        --keep-bash) keep_bash=yes ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
-
-# The deny list is what makes the caos tools the ONLY tools: a denied name is
-# removed from the model's context entirely, so work cannot happen off the
-# record. That is the point of the whole arrangement.
-#
-# `--keep-bash` leaves the built-in Bash in place, for bringing an environment
-# up. It is a real hole, not a formality -- with two bash tools in context the
-# model will often reach for the built-in, and anything it does there is absent
-# from the conversation caos records. Worth it while the question is "does this
-# container work at all", and worth removing the moment it is.
-#
-# It is a setup ARGUMENT rather than an edit to this file because settings.json
-# is written into the snapshot: toggling it costs an environment rebuild either
-# way, but as an argument it costs no push.
-deny='"Read", "Write", "Edit", "NotebookEdit", "Bash", "Glob", "Grep"'
-if [ -n "${keep_bash:-}" ]; then
-    deny='"Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep"'
-    echo "caos: --keep-bash: the built-in Bash stays; its work is NOT recorded" >&2
-fi
 
 # The repo and the ref come back out of the base, which is why there is only
 # one thing to state. Shape-checked only: install.sh takes the same --base and
@@ -183,6 +163,14 @@ for home in /root /home/claude /home/user; do
     [ -d "$home" ] || continue
     mkdir -p "$home/.claude"
 
+    # A denied name is removed from the model's context entirely, which is what
+    # makes the caos tools the only tools and keeps work on the record.
+    #
+    # Bash is NOT denied while this is being brought up. It is a real hole:
+    # with the built-in and mcp__caos__bash both in context the model often
+    # reaches for the built-in, and that work is absent from the conversation
+    # caos records. Put it back once the container is known to work.
+    #
     # The hooks are the recording. `caos cc hook` reads the event as JSON on
     # stdin and names its own event, so one command serves all of them.
     #
@@ -193,7 +181,7 @@ for home in /root /home/claude /home/user; do
     cat > "$home/.claude/settings.json" <<EOF
 {
   "permissions": {
-    "deny": [$deny],
+    "deny": ["Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep"],
     "allow": ["mcp__caos"]
   },
   "hooks": {
